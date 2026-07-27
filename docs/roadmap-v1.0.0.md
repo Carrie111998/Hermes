@@ -86,17 +86,20 @@ charterforge business payment-rails --test-webhook --rail nevermined
 
 ---
 
-## v0.22.0 — Postgres Authority Store
+## v0.22.0 — Postgres Authority Store (In Progress)
 
 **Goal:** Production-capable authority database with connection pooling
 
+**Status:** 🔶 Postgres authority store implemented. CI + integration tests pending.
+
 ### Deliverables
 
-- [ ] **Postgres Authority Adapter**
-  - Replace `objectives_db.py` SQLite with Postgres adapter
-  - Environment: `HERMES_AUTHORITY_DATABASE_URL`
-  - Connection pooling (asyncpg or psycopg3 pool)
-  - Migration script: SQLite → Postgres
+- [x] **Postgres Authority Adapter**
+  - `hermes_cli/postgres_authority.py` — claim/release/complete operations
+  - Environment: `AUTHORITY_POSTGRES_URL` or `DATABASE_URL`
+  - Execution permit flow (issue/consume)
+  - Automatic backend detection (postgres vs sqlite)
+  - Optional dependency: `charterforge[postgres]`
 
 - [ ] **Schema Migration**
   - `alembic` migrations for authority tables
@@ -106,6 +109,16 @@ charterforge business payment-rails --test-webhook --rail nevermined
 - [ ] **Health Check**
   - `charterforge business readiness --check` validates Postgres connection
   - Dashboard: `/health` endpoint returns database status
+
+- [ ] **CI Integration**
+  - Postgres service container in GH Actions
+  - Integration tests against real Postgres
+
+### Tests
+
+- 16 unit tests for authority operations
+- Schema isolation per test via unique search_path
+- Backend detection tests
 
 ### Validation
 
