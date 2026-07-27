@@ -646,6 +646,7 @@ def resolve_intervention(
         artifact_id = approval_artifacts.issue_for_intervention(
             conn,
             intervention_id=intervention_id,
+            organization_id=str(row["organization_id"]),
             actor=actor,
             evidence=evidence,
             default_ttl_seconds=max(

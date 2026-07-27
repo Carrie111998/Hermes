@@ -212,6 +212,7 @@ def issue_for_intervention(
     conn: sqlite3.Connection,
     *,
     intervention_id: str,
+    organization_id: str,
     actor: str,
     evidence: Mapping[str, Any],
     now: Optional[int] = None,
@@ -225,8 +226,9 @@ def issue_for_intervention(
             "exact action approval requires human identity and evidence"
         )
     intervention = conn.execute(
-        """SELECT * FROM intervention_queue WHERE id=? AND status='open'""",
-        (intervention_id,),
+        """SELECT * FROM intervention_queue
+            WHERE id=? AND organization_id=? AND status='open'""",
+        (intervention_id, organization_id),
     ).fetchone()
     if (
         intervention is None

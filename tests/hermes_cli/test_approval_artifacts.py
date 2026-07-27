@@ -124,11 +124,12 @@ def _charter(**overrides):
 
 
 def test_artifact_binds_exact_action_scope_policy_and_evidence(tmp_path):
-    conn, _, objective_id, action_id, intervention_id = _context(tmp_path)
+    conn, organization_id, objective_id, action_id, intervention_id = _context(tmp_path)
     now = int(time.time())
     artifact_id = approval_artifacts.issue_for_intervention(
         conn,
         intervention_id=intervention_id,
+        organization_id=organization_id,
         actor="human:advisor",
         evidence={"ticket": "APR-1", "expires_at": now + 300},
         now=now,
@@ -180,10 +181,11 @@ def test_artifact_binds_exact_action_scope_policy_and_evidence(tmp_path):
 
 
 def test_exact_approval_materializes_one_permit_then_consumes_on_execution(tmp_path):
-    conn, _, _, action_id, intervention_id = _context(tmp_path)
+    conn, organization_id, _, action_id, intervention_id = _context(tmp_path)
     artifact_id = approval_artifacts.issue_for_intervention(
         conn,
         intervention_id=intervention_id,
+        organization_id=organization_id,
         actor="human:advisor",
         evidence={"ticket": "APR-2"},
     )
@@ -233,10 +235,11 @@ def test_exact_approval_materializes_one_permit_then_consumes_on_execution(tmp_p
 
 
 def test_materialized_approval_can_be_revoked_before_execution(tmp_path):
-    conn, _, _, action_id, intervention_id = _context(tmp_path)
+    conn, organization_id, _, action_id, intervention_id = _context(tmp_path)
     artifact_id = approval_artifacts.issue_for_intervention(
         conn,
         intervention_id=intervention_id,
+        organization_id=organization_id,
         actor="human:advisor",
         evidence={"ticket": "APR-3"},
     )
@@ -276,10 +279,11 @@ def test_materialized_approval_can_be_revoked_before_execution(tmp_path):
 
 
 def test_master_pause_revokes_all_unexecuted_approval_authority(tmp_path):
-    conn, _, _, action_id, intervention_id = _context(tmp_path)
+    conn, organization_id, _, action_id, intervention_id = _context(tmp_path)
     artifact_id = approval_artifacts.issue_for_intervention(
         conn,
         intervention_id=intervention_id,
+        organization_id=organization_id,
         actor="human:advisor",
         evidence={"ticket": "APR-KILL"},
     )
@@ -332,6 +336,7 @@ def test_non_eligible_authority_gap_cannot_be_approved_once(tmp_path):
         approval_artifacts.issue_for_intervention(
             conn,
             intervention_id=intervention_id,
+            organization_id=organization_id,
             actor="human:advisor",
             evidence={"ticket": "APR-4"},
         )
@@ -339,10 +344,11 @@ def test_non_eligible_authority_gap_cannot_be_approved_once(tmp_path):
 
 
 def test_unused_approval_expiry_terminates_action_and_wakes_replanning(tmp_path):
-    conn, _, objective_id, action_id, intervention_id = _context(tmp_path)
+    conn, organization_id, objective_id, action_id, intervention_id = _context(tmp_path)
     artifact_id = approval_artifacts.issue_for_intervention(
         conn,
         intervention_id=intervention_id,
+        organization_id=organization_id,
         actor="human:advisor",
         evidence={"ticket": "APR-EXP", "expires_at": 1100},
         now=1000,
@@ -373,6 +379,7 @@ def test_stale_state_and_cross_action_replay_are_rejected(tmp_path):
     artifact_id = approval_artifacts.issue_for_intervention(
         conn,
         intervention_id=intervention_id,
+        organization_id=organization_id,
         actor="human:advisor",
         evidence={"ticket": "APR-BOUND"},
     )
@@ -449,6 +456,7 @@ def test_stale_state_and_cross_action_replay_are_rejected(tmp_path):
         approval_artifacts.issue_for_intervention(
             conn,
             intervention_id=stale_intervention,
+            organization_id=organization_id,
             actor="human:advisor",
             evidence={"ticket": "APR-STALE"},
             now=1060,
