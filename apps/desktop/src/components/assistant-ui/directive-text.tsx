@@ -113,7 +113,7 @@ const SLASH_CHIP_VARIANT: Record<SlashChipKind, string> = {
 }
 
 export const SLASH_CHIP_BASE_CLASS =
-  'mx-0.5 inline-flex max-w-64 items-center gap-1 rounded px-1.5 py-0.5 align-middle text-[0.86em] font-medium leading-none'
+  'mx-0.5 inline-flex max-w-64 items-center gap-1 rounded px-1.5 py-0.5 align-[-0.12em] text-[0.86em] font-medium leading-none'
 
 export function slashChipClass(kind: SlashChipKind): string {
   return `${SLASH_CHIP_BASE_CLASS} ${SLASH_CHIP_VARIANT[kind]}`
@@ -145,9 +145,15 @@ const DirectiveIcon: FC<{ type: string; className?: string }> = ({
 
 /** Shared chip styling — used by both the rendered <DirectiveChip> and the
  * raw HTML composer chips in `rich-editor.ts`. Neutral subtle wash + plain
- * muted-foreground text so chips read as quiet tags on any bubble color. */
+ * muted-foreground text so chips read as quiet tags on any bubble color.
+ *
+ * `align-[-0.12em]` rather than `align-middle`: `middle` centers the pill on
+ * the x-height midpoint, which sits above the center of the surrounding text
+ * box, so the chip visibly rides low next to the words it's nestled in. The
+ * em nudge lands the chip's own text baseline on the line's baseline (measured
+ * to within 0.08px) without growing the line box. */
 export const DIRECTIVE_CHIP_CLASS =
-  'mx-0.5 inline-flex max-w-56 items-center gap-1 rounded px-1.5 py-0.5 align-middle text-[0.86em] font-normal leading-none bg-[color-mix(in_srgb,currentColor_8%,transparent)] text-muted-foreground'
+  'mx-0.5 inline-flex max-w-56 items-center gap-1 rounded px-1.5 py-0.5 align-[-0.12em] text-[0.86em] font-normal leading-none bg-[color-mix(in_srgb,currentColor_8%,transparent)] text-muted-foreground'
 
 /**
  * Parses our composer's `@type:value` references into directive segments
@@ -277,7 +283,7 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
         start: match.index ?? 0,
         end: (match.index ?? 0) + match[0].length,
         type: match[1] || 'file',
-        label: shortLabel(match[1] as HermesRefType, id),
+        label: refChipLabel(match[1] || 'file', id),
         id
       }
     }),
@@ -320,23 +326,28 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
   return segments
 }
 
-function shortLabel(type: HermesRefType, id: string): string {
+/** Display text for a `@kind:value` chip. Shared with the composer's
+ *  contenteditable chips so a link reads the same before and after send: the
+ *  host leads (scheme and `www.` are noise) and the path rides along for the
+ *  chip's `truncate` to cut — a bare hostname can't tell two links apart. */
+export function refChipLabel(type: string, id: string): string {
   if (type === 'terminal') {
     return id || 'terminal'
   }
 
+  if (type === 'session') {
+    return sessionRefFallbackLabel(id)
+  }
+
   if (type === 'url') {
     try {
-      const parsed = new URL(id)
+      const { hostname, pathname, search } = new URL(id)
+      const path = `${pathname}${search}`.replace(/\/$/, '')
 
-      return parsed.hostname || id
+      return `${hostname.replace(/^www\./i, '')}${path}` || id
     } catch {
       return id
     }
-  }
-
-  if (type === 'session') {
-    return sessionRefFallbackLabel(id)
   }
 
   const tail = id.split(/[\\/]/).filter(Boolean).pop()

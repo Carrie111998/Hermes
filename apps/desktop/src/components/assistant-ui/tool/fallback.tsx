@@ -16,6 +16,7 @@ import {
   useState
 } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { AnsiText } from '@/components/assistant-ui/ansi-text'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
@@ -39,7 +40,6 @@ import { normalize } from '@/lib/text'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { recordPreviewArtifact } from '@/store/preview-status'
-import { $activeSessionId, $currentCwd } from '@/store/session'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import { $toolDisclosureOpen, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
@@ -364,9 +364,12 @@ function ToolEntry({ part }: ToolEntryProps) {
 
   // Surface a previewable artifact (HTML file / localhost URL) as a compact link
   // in the composer status stack rather than a bulky inline card. Uses the same
-  // detected target the old inline card did, keyed to the active session the
-  // stack reads from. Idempotent + dedup'd, so re-renders don't churn.
+  // detected target the old inline card did. Idempotent + dedup'd, so re-renders
+  // don't churn.
   const previewTarget = view.previewTarget
+  // The session whose transcript this row is IN, which is not necessarily the
+  // primary one: a tool row inside a session tile must feed that tile's composer.
+  const { $cwd: $sessionCwd, $runtimeId: $sessionRuntimeId } = useSessionView()
 
   useEffect(() => {
     if (isPending || !previewTarget || !isPreviewableTarget(previewTarget)) {
@@ -376,12 +379,12 @@ function ToolEntry({ part }: ToolEntryProps) {
     // Read (don't subscribe) session/cwd: this only fires when a previewable
     // target appears, and subscribing re-rendered every tool row on any session
     // or cwd change.
-    const activeSessionId = $activeSessionId.get()
+    const sessionId = $sessionRuntimeId.get()
 
-    if (activeSessionId) {
-      recordPreviewArtifact(activeSessionId, previewTarget, $currentCwd.get() || '')
+    if (sessionId) {
+      recordPreviewArtifact(sessionId, previewTarget, $sessionCwd.get() || '')
     }
-  }, [isPending, previewTarget])
+  }, [$sessionCwd, $sessionRuntimeId, isPending, previewTarget])
 
   const detailSections = useMemo(() => {
     if (!view.detail) {
@@ -700,29 +703,24 @@ function TerminalTranscript({ command, exitCode }: TerminalTranscriptProps) {
 // auto-scrolling window; fewer than this stays a plain inline stack.
 const TOOL_GROUP_SCROLL_THRESHOLD = 3
 
-// Tools whose body (an interactive form, a full-size image, a syntax-
-// highlighted code/diff block) must never be trapped behind the window's
-// max-height + fade mask. A run holding any of them stays a plain, fully-
-// visible stack no matter how long it is.
+// Tools whose body must never be trapped behind the window's max-height +
+// fade mask. A run holding any of them stays a plain, fully-visible stack no
+// matter how long it is.
 //
-// A row rendered by ToolEntry carries `data-tool-row`, so once the user
-// expands it the `:has([data-tool-row][data-tool-open])` rule in styles.css
-// lifts the cap on its own. That escape hatch is why most tools are safe to
-// bound. These are the ones it cannot reach:
+// This list is deliberately tiny. A row rendered by ToolEntry carries
+// `data-tool-row`, and the `:has([data-tool-row][data-tool-open])` rule in
+// styles.css lifts the cap whenever one is open — so anything ToolEntry
+// renders takes care of itself. A code/diff row mounts open (see
+// `defaultOpen`), lifting the cap the moment it appears; a collapsed row is a
+// one-line status with no body in the DOM at all, so there is nothing to clip.
 //
-//   - `clarify` / `image_generate` render their own components and never emit
-//     `data-tool-row`, so no amount of expanding frees them.
-//   - the code tools *do* emit it, but their body is a code block the user
-//     reads rather than a one-line status — peering at a diff through a
-//     ~2-row viewport until you think to expand it is the bug. Console output
-//     (`terminal`) stays boundable: it's a log tail, and the last lines are
-//     the ones that matter, which is exactly what the window pins.
-const CODE_BODY_TOOLS = ['execute_code', 'read_file']
-
-const UNBOUNDABLE_TOOLS = new Set(['clarify', 'image_generate', ...CODE_BODY_TOOLS])
+// Only components that bypass ToolEntry need this opt-out: `clarify` and
+// `image_generate` render their own markup, never emit `data-tool-row`, and so
+// the CSS escape hatch can never reach them.
+const UNBOUNDABLE_TOOLS = new Set(['clarify', 'image_generate'])
 
 export function isUnboundableTool(toolName: string): boolean {
-  return UNBOUNDABLE_TOOLS.has(toolName) || isFileEditTool(toolName)
+  return UNBOUNDABLE_TOOLS.has(toolName)
 }
 
 export function shouldBoundToolGroup(childCount: number, hasUnboundable: boolean) {
@@ -760,7 +758,25 @@ function useToolWindow(enabled: boolean) {
       return
     }
 
-    const pin = () => {
+    // Track the content's HEIGHT and only pin when it grows. The observer also
+    // fires for width changes — a sidebar sash drag resizes every tool window
+    // once per frame — and pinning there is (a) pointless, the list didn't
+    // grow, and (b) expensive: `pin` writes scrollTop then `syncFade` reads it
+    // back, a write->read forced reflow per tool group per frame. Measured on
+    // a real session while dragging the sash: 927ms of `pin` script plus
+    // 2.7s of style recalc across one 60-frame drag. Reading the height off
+    // the RO entry keeps the check reflow-free.
+    let lastHeight = -1
+
+    const pin = (entries: readonly ResizeObserverEntry[]) => {
+      const height = entries[entries.length - 1]?.borderBoxSize?.[0]?.blockSize ?? -1
+      const grew = height < 0 || height > lastHeight
+      lastHeight = height
+
+      if (!grew) {
+        return
+      }
+
       if (stickRef.current) {
         el.scrollTop = el.scrollHeight
       }
