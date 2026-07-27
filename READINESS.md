@@ -85,7 +85,8 @@ determination until a newer evidence commit is recorded.
 
 The exact acceptance command set plus the installer contract was rerun against
 current `main` at baseline commit
-`9e93cc1edfcc7cb7ec3ac45e3527e0f91a362cf7` (the payment-rail discovery fix).
+`f468dd7c19138583bbab352eba829a16da02cdce` (the readiness security-policy
+surface).
 This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
@@ -113,9 +114,10 @@ tag above.
 - Packaging artifact regression: **2 passed, 0 failed**.
 - Combined governed-runtime and packaging command: **84 passed, 0 failed**.
 - Bootstrap/operator regression additions: **6 passed, 0 failed**.
-- Expanded current-main validation command: **95 passed, 0 failed** across 10
+- Expanded current-main validation command: **98 passed, 0 failed** across 10
   files, including the independent installer contract, security-readiness
-  escalation, and credential-safe payment-rail discovery regression.
+  escalation, credential-safe payment-rail discovery, and deterministic
+  readiness-blocker regressions.
 - Current-tree container worker smoke passed with image ID
   `sha256:83bb9a85e36ecc948c67a1051445566a7e6a6f3d00f63e7c5756b962da346db4`:
   separate bootstrap, `objectives worker --once`, and `worker-status`
