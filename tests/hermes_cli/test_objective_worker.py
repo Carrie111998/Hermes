@@ -123,7 +123,7 @@ def test_worker_exits_when_recovery_is_blocked(tmp_path):
 
     def tick():
         calls.append(True)
-        return SimpleNamespace(status="recovery_blocked")
+        return SimpleNamespace(status="recovery_blocked", reason="snapshot unavailable")
 
     assert objective_worker.run_forever(
         db_path=path, interval_seconds=900, tick=tick, max_cycles=10
@@ -133,6 +133,7 @@ def test_worker_exits_when_recovery_is_blocked(tmp_path):
     assert calls == [True]
     assert worker["status"] == "stopped"
     assert worker["last_cycle_status"] == "recovery_blocked"
+    assert worker["last_error"] == "snapshot unavailable"
     assert worker["stop_reason"] == "runtime_blocked:recovery_blocked"
 
 

@@ -459,8 +459,12 @@ def run_forever(
                         outcome = tick()
                         heartbeat_keeper.assert_healthy()
                         status = str(getattr(outcome, "status", "unknown"))
+                        reason = str(getattr(outcome, "reason", "") or "")
                         consecutive_failures = heartbeat(
-                            conn, worker_id, cycle_status=status
+                            conn,
+                            worker_id,
+                            cycle_status=status,
+                            error=(reason if status in FAIL_CLOSED_STATUSES else None),
                         )
                         if status in FAIL_CLOSED_STATUSES:
                             shutdown_reason = (
