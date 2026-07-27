@@ -3021,6 +3021,13 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # SOL-FD-005: dispatcher_ticks retention.  Age-based prune deletes
+        # rows older than N days; row-cap prune keeps only the newest N
+        # rows per board.  Both bounds are applied together (AND) so a
+        # busy board can't grow unbounded between GC runs, and a quiet
+        # board still drops ancient ticks.  0 disables that bound.
+        "dispatcher_tick_retention_days": 14,
+        "dispatcher_tick_retention_rows": 2000,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

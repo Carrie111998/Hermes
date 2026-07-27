@@ -927,6 +927,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
     )
+    p_gc.add_argument(
+        "--tick-retention-days", type=int, default=None,
+        help="Delete dispatcher_ticks older than N days "
+             "(default: kanban.dispatcher_tick_retention_days / 14).",
+    )
+    p_gc.add_argument(
+        "--tick-retention-rows", type=int, default=None,
+        help="Keep only the newest N dispatcher_ticks per board "
+             "(default: kanban.dispatcher_tick_retention_rows / 2000).",
+    )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
@@ -3055,15 +3065,25 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
+    tick_days = getattr(args, "tick_retention_days", None)
+    tick_rows = getattr(args, "tick_retention_rows", None)
     with kb.connect_closing() as conn:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
+        )
+        # SOL-FD-005: prune dispatcher_ticks for the active board.
+        # None → resolve from config/defaults inside gc_dispatcher_ticks.
+        removed_ticks = kb.gc_dispatcher_ticks(
+            conn,
+            retention_days=tick_days,
+            retention_rows=tick_rows,
         )
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_ticks} tick row(s), "
+          f"{removed_logs} log file(s) removed")
     return 0
 
 

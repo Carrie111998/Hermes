@@ -778,6 +778,112 @@ def test_gc_worker_logs_deletes_old_files(kanban_home):
     assert young.exists()
 
 
+def test_prune_dispatcher_ticks_age_and_row_cap(kanban_home):
+    """SOL-FD-005: age prune + row cap keep recent rows, delete expired."""
+    conn = kb.connect()
+    try:
+        now = int(time.time())
+        board = "default"
+        # Insert 5 ticks: 3 old (20 days ago), 2 recent.
+        for i, age_days in enumerate([20, 20, 20, 1, 0]):
+            finished = now - age_days * 24 * 3600
+            conn.execute(
+                "INSERT INTO dispatcher_ticks "
+                "(board, started_at, finished_at, reclaimed, promoted, spawned) "
+                "VALUES (?, ?, ?, 0, 0, 0)",
+                (board, finished - 1, finished),
+            )
+        conn.commit()
+        # Age prune at 14 days → removes 3 old rows.
+        removed = kb.prune_dispatcher_ticks(
+            conn, board=board, retention_days=14, retention_rows=0, now=now,
+        )
+        assert removed == 3
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM dispatcher_ticks WHERE board = ?",
+            (board,),
+        ).fetchone()[0]
+        assert remaining == 2
+
+        # Insert 5 more recent rows so we have 7 total, then row-cap to 3.
+        for _ in range(5):
+            conn.execute(
+                "INSERT INTO dispatcher_ticks "
+                "(board, started_at, finished_at, reclaimed, promoted, spawned) "
+                "VALUES (?, ?, ?, 0, 0, 0)",
+                (board, now - 10, now),
+            )
+        conn.commit()
+        removed = kb.prune_dispatcher_ticks(
+            conn, board=board, retention_days=0, retention_rows=3, now=now,
+        )
+        assert removed == 4  # 7 - 3 = 4
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM dispatcher_ticks WHERE board = ?",
+            (board,),
+        ).fetchone()[0]
+        assert remaining == 3
+    finally:
+        conn.close()
+
+
+def test_prune_dispatcher_ticks_cross_board_isolation(kanban_home):
+    """SOL-FD-005: pruning board A must not touch board B's ticks."""
+    conn = kb.connect()
+    try:
+        now = int(time.time())
+        old = now - 30 * 24 * 3600
+        for board in ("alpha", "beta"):
+            conn.execute(
+                "INSERT INTO dispatcher_ticks "
+                "(board, started_at, finished_at, reclaimed, promoted, spawned) "
+                "VALUES (?, ?, ?, 0, 0, 0)",
+                (board, old - 1, old),
+            )
+        conn.commit()
+        removed = kb.prune_dispatcher_ticks(
+            conn, board="alpha", retention_days=14, retention_rows=0, now=now,
+        )
+        assert removed == 1
+        alpha = conn.execute(
+            "SELECT COUNT(*) FROM dispatcher_ticks WHERE board = 'alpha'",
+        ).fetchone()[0]
+        beta = conn.execute(
+            "SELECT COUNT(*) FROM dispatcher_ticks WHERE board = 'beta'",
+        ).fetchone()[0]
+        assert alpha == 0
+        assert beta == 1
+    finally:
+        conn.close()
+
+
+def test_prune_dispatcher_ticks_preserves_recent(kanban_home):
+    """SOL-FD-005: recent rows within both bounds are never deleted."""
+    conn = kb.connect()
+    try:
+        now = int(time.time())
+        for i in range(3):
+            finished = now - i * 60
+            conn.execute(
+                "INSERT INTO dispatcher_ticks "
+                "(board, started_at, finished_at, reclaimed, promoted, spawned) "
+                "VALUES ('default', ?, ?, 0, 0, 0)",
+                (finished - 1, finished),
+            )
+        conn.commit()
+        removed = kb.prune_dispatcher_ticks(
+            conn, board="default",
+            retention_days=14, retention_rows=100, now=now,
+        )
+        assert removed == 0
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM dispatcher_ticks WHERE board = 'default'",
+        ).fetchone()[0]
+        assert remaining == 3
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Log rotation + accessor
 # ---------------------------------------------------------------------------

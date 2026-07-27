@@ -4123,19 +4123,32 @@ def _finalize_tick(
     surfaced via ``result.tick_error`` so callers can log them and
     downstream telemetry can tell "tick happened, recording failed" from
     "tick did not happen at all" (SOL-FD-003).
+
+    After a successful record, prunes expired ``dispatcher_ticks`` rows
+    for this board only (SOL-FD-005).  Prune failures are non-fatal —
+    they do not set ``tick_error`` because the tick itself was written.
     """
     _tick_finished_at = int(time.time())
     if not dry_run:
+        board_slug = board or get_current_board()
         try:
             _record_dispatcher_tick(
                 conn,
-                board=board or get_current_board(),
+                board=board_slug,
                 started_at=started_at,
                 finished_at=_tick_finished_at,
                 result=result,
             )
         except Exception as exc:
             result.tick_error = str(exc)
+        else:
+            # Best-effort local retention prune (SOL-FD-005).  Failures
+            # must not surface as tick write errors — the tick row is
+            # already durable.
+            try:
+                prune_dispatcher_ticks(conn, board=board_slug)
+            except Exception:
+                pass
     return result
 
 
@@ -4233,6 +4246,125 @@ def get_dispatcher_ticks_since(
         (board_slug, since),
     ).fetchall()
     return list(rows)
+
+
+# SOL-FD-005 defaults — mirrored in DEFAULT_CONFIG["kanban"].  Kept as
+# module constants so callers that don't load config (tests, GC CLI) get
+# the same safe bounds without inventing a new env var.
+DEFAULT_DISPATCHER_TICK_RETENTION_DAYS = 14
+DEFAULT_DISPATCHER_TICK_RETENTION_ROWS = 2000
+
+
+def _resolve_tick_retention(
+    *,
+    retention_days: Optional[int] = None,
+    retention_rows: Optional[int] = None,
+) -> tuple[int, int]:
+    """Resolve day/row retention bounds from explicit args or config.
+
+    Explicit kwargs win.  Otherwise reads ``kanban.dispatcher_tick_retention_*``
+    from config.yaml (via ``load_config``).  Falls back to the module
+    defaults when config is unavailable.  0 disables that bound.
+    """
+    days = retention_days
+    rows = retention_rows
+    if days is None or rows is None:
+        try:
+            from hermes_cli.config import load_config
+            cfg = (load_config() or {}).get("kanban") or {}
+            if days is None:
+                days = cfg.get(
+                    "dispatcher_tick_retention_days",
+                    DEFAULT_DISPATCHER_TICK_RETENTION_DAYS,
+                )
+            if rows is None:
+                rows = cfg.get(
+                    "dispatcher_tick_retention_rows",
+                    DEFAULT_DISPATCHER_TICK_RETENTION_ROWS,
+                )
+        except Exception:
+            if days is None:
+                days = DEFAULT_DISPATCHER_TICK_RETENTION_DAYS
+            if rows is None:
+                rows = DEFAULT_DISPATCHER_TICK_RETENTION_ROWS
+    return int(days or 0), int(rows or 0)
+
+
+def prune_dispatcher_ticks(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    retention_days: Optional[int] = None,
+    retention_rows: Optional[int] = None,
+    now: Optional[int] = None,
+) -> int:
+    """Delete expired ``dispatcher_ticks`` rows for one board (SOL-FD-005).
+
+    Applies two independent bounds (either may be 0 = disabled):
+
+    * **Age**: delete rows whose ``finished_at`` is older than
+      ``retention_days`` days.
+    * **Row cap**: keep only the newest ``retention_rows`` rows per board
+      (by ``id`` DESC); delete the rest.
+
+    Always scoped to a single board so multi-board installs cannot prune
+    each other.  Returns the total number of rows deleted.
+    """
+    board_slug = board or get_current_board()
+    days, rows = _resolve_tick_retention(
+        retention_days=retention_days,
+        retention_rows=retention_rows,
+    )
+    if now is None:
+        now = int(time.time())
+    deleted = 0
+
+    if days > 0:
+        cutoff = now - days * 24 * 3600
+        cur = conn.execute(
+            "DELETE FROM dispatcher_ticks "
+            "WHERE board = ? AND finished_at < ?",
+            (board_slug, cutoff),
+        )
+        deleted += int(cur.rowcount or 0)
+
+    if rows > 0:
+        # Keep the newest N rows for this board; delete older ones by id.
+        # Uses a subquery so the index on (board, finished_at) / primary
+        # key can drive the scan without loading all rows into Python.
+        cur = conn.execute(
+            "DELETE FROM dispatcher_ticks "
+            "WHERE board = ? AND id NOT IN ("
+            "  SELECT id FROM dispatcher_ticks "
+            "  WHERE board = ? "
+            "  ORDER BY id DESC "
+            "  LIMIT ?"
+            ")",
+            (board_slug, board_slug, rows),
+        )
+        deleted += int(cur.rowcount or 0)
+
+    return deleted
+
+
+def gc_dispatcher_ticks(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    retention_days: Optional[int] = None,
+    retention_rows: Optional[int] = None,
+) -> int:
+    """Public GC entry for ``dispatcher_ticks`` retention (SOL-FD-005).
+
+    Thin wrapper around :func:`prune_dispatcher_ticks` so the CLI GC path
+    and the per-tick prune share one implementation.  Returns rows deleted.
+    """
+    return prune_dispatcher_ticks(
+        conn,
+        board=board,
+        retention_days=retention_days,
+        retention_rows=retention_rows,
+    )
 
 
 def _end_run(
