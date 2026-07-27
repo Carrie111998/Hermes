@@ -7,12 +7,12 @@ sidebar_position: 3
 
 # Руководство по Windows (нативный режим)
 
-Hermes нативно работает на Windows 10 и Windows 11 — без WSL, без Cygwin, без Docker. Эта страница подробно объясняет, что именно работает нативно, что остаётся только для WSL, что делает установщик, и какие Windows-специфичные настройки могут понадобиться.
+Hermes нативно работает в Windows 10 и Windows 11 — без WSL, Cygwin и Docker. На этой странице описано, что доступно в нативном режиме, какие возможности требуют WSL, как работает установщик и какие настройки, специфические для Windows, могут понадобиться.
 
 Если вам нужно просто установить Hermes, достаточно одной команды на [главной странице](/) или на [странице установки](/getting-started/installation). Возвращайтесь сюда, когда захотите разобраться в деталях.
 
 :::tip Нужен WSL вместо этого?
-Если вам нужна полноценная POSIX-среда для встроенной терминальной вкладки веб-панели, семантики `fork`, файловых наблюдателей в стиле Linux и похожих вещей, смотрите **[руководство по Windows (WSL2)](./windows-wsl-quickstart.md)**. Оба варианта спокойно сосуществуют: нативные данные лежат в `%LOCALAPPDATA%\hermes`, а данные WSL — в `~/.hermes`.
+Для полноценной POSIX-среды со встроенным терминалом веб-панели, поддержкой `fork` и механизмами наблюдения за файлами Linux используйте **[Hermes в Windows с WSL2](./windows-wsl-quickstart.md)**. Нативная версия и версия для WSL могут работать одновременно: первая хранит данные в `%LOCALAPPDATA%\hermes`, вторая — в `~/.hermes`.
 :::
 
 ## Быстрая установка
@@ -23,9 +23,9 @@ Hermes нативно работает на Windows 10 и Windows 11 — без 
 iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1)
 ```
 
-Админские права не нужны. Установщик развернётся в `%LOCALAPPDATA%\hermes\` и добавит `hermes` в ваш **пользовательский PATH** — после завершения откройте новый терминал.
+Права администратора не требуются. Установщик развернёт Hermes в `%LOCALAPPDATA%\hermes\` и добавит команду `hermes` в пользовательскую переменную `PATH`. После завершения установки откройте новый терминал.
 
-**Параметры установщика** (для передачи аргументов нужен вариант со scriptblock):
+**Параметры установщика** (для передачи аргументов используйте вариант с `[scriptblock]`):
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1))) -NoVenv -SkipSetup -Branch main
@@ -41,7 +41,7 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 | `-HermesHome` | `%LOCALAPPDATA%\hermes` | Переопределить каталог данных |
 | `-InstallDir` | `%LOCALAPPDATA%\hermes\hermes-agent` | Переопределить каталог с кодом |
 
-Установщик автоматически повторяет неудачные `git fetch` и удаляет BOM из любого скачанного `install.ps1`, так что UTF-8 BOM, попавший в файл при HTTP-загрузке, больше не ломает форму `[scriptblock]::Create((irm ...))`.
+Установщик автоматически повторяет `git fetch` после временных сбоев. Вариант с `[scriptblock]` не удаляет UTF-8 BOM из загруженного `install.ps1`. Если PowerShell сообщает `The assignment expression is not valid`, используйте однострочную команду `irm | iex` или сначала сохраните скрипт в UTF-8 без BOM.
 
 ### Графический установщик (альтернатива) {#desktop-installer-alternative}
 
@@ -51,7 +51,7 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 
 ### Автоматическая подготовка зависимостей (`dep_ensure`)
 
-При первом запуске (и по требованию, когда Hermes обнаруживает, что чего-то не хватает) он запускает небольшой bootstrap-скрипт на Python — `hermes_cli/dep_ensure.py`. Он проверяет и при необходимости поднимает зависимости, не связанные с Python. На Windows к ним относятся:
+При первом запуске, а затем при обнаружении отсутствующего инструмента Hermes запускает небольшой вспомогательный скрипт на Python: `hermes_cli/dep_ensure.py`. Он проверяет наличие необходимых зависимостей, не связанных с Python, и при необходимости устанавливает их. В Windows к ним относятся:
 
 | Зависимость | Зачем она нужна Hermes |
 |---|---|
@@ -59,7 +59,7 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 | **Node.js 22** | Нужен для браузерного инструмента (`agent-browser`), веб-моста TUI и моста WhatsApp. |
 | **ffmpeg** | Конвертация аудиоформатов для TTS / голосовых сообщений. |
 | **ripgrep** | Быстрый поиск по файлам — при отсутствии откатывается на `grep`. |
-| **npm packages** | `agent-browser`, Playwright Chromium и любые Node-зависимости для наборов инструментов ставятся один раз при первом использовании браузерного инструмента. |
+| **Пакеты npm** | `agent-browser`, Playwright Chromium и любые зависимости Node.js для наборов инструментов устанавливаются один раз при первом использовании браузерного инструмента. |
 
 У каждой зависимости есть проверка в стиле `shutil.which(...)`; если бинарника нет и запуск интерактивный, `dep_ensure` предложит установить его, а саму установку делегирует `scripts\install.ps1 -ensure <dep>`. Неинтерактивные запуски (шлюз, cron, запуски настольного приложения без графического интерфейса) пропускают диалог и вместо этого показывают понятную ошибку `this feature needs <dep>`.
 
@@ -67,16 +67,16 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 
 По порядку, сверху вниз:
 
-1. **Подготавливает `uv`** — быстрый менеджер Python от Astral. Устанавливается в `%USERPROFILE%\.local\bin`.
+1. **Подготавливает `uv`** — быстрый менеджер Python от Astral. По умолчанию устанавливается в `%LOCALAPPDATA%\hermes\bin`.
 2. **Ставит Python 3.11** через `uv`. Существующий Python не нужен.
-3. **Устанавливает Node.js 22** (через winget, если он доступен, иначе распаковывает портативный tarball Node в `%LOCALAPPDATA%\hermes\node`). Он нужен для браузерного инструмента и моста WhatsApp.
-4. **Ставит портативный Git** — если `git` уже есть в PATH, установщик использует его; иначе он скачивает урезанный самодостаточный **PortableGit** (~45 МБ, из официального релиза `git-for-windows`) в `%LOCALAPPDATA%\hermes\git`. Без админских прав, без реестра Windows Installer, без какого-либо конфликта с уже установленным Git.
+3. **Устанавливает Node.js 22** — сначала пытается распаковать переносимый ZIP-архив в `%LOCALAPPDATA%\hermes\node`, а при неудаче использует winget. Node.js нужен для браузерного инструмента и моста WhatsApp.
+4. **Устанавливает переносимый Git** — если `git` уже доступен через `PATH`, установщик использует его. В противном случае он загружает компактный автономный пакет **PortableGit** (около 45 МБ из официального выпуска Git for Windows) в `%LOCALAPPDATA%\hermes\git`. Права администратора не требуются; установка не использует реестр Windows Installer и не влияет на другие версии Git.
 5. **Клонирует репозиторий** в `%LOCALAPPDATA%\hermes\hermes-agent` и создаёт внутри него виртуальное окружение.
-6. **Многоступенчатая установка через `uv pip install`** — сначала пробует `.[all]`, а если `git+https`-зависимость упирается в ограничение GitHub по запросам, откатывается к всё более компактным наборам (`[messaging,dashboard,ext]` → `[messaging]` → `.`). Это убирает режим, когда единичный сбой оставляет вас с урезанной установкой.
+6. **Устанавливает зависимости Python** — при наличии `uv.lock` предпочитает проверенный по хешам вариант `uv sync --extra all --locked`. Если он завершается ошибкой, установщик последовательно пробует редактируемую установку через `uv pip install`: `.[all]`, набор `[all]` без известных проблемных компонентов, затем базовый пакет `.`.
 7. **Автоматически устанавливает SDK для мессенджеров** по `.env` — если присутствуют `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` / `WHATSAPP_ENABLED`, он запускает `python -m ensurepip --upgrade` и точечные `pip install`, чтобы SDK каждой платформы действительно можно было импортировать.
 8. **Задаёт `HERMES_GIT_BASH_PATH`** на найденный `bash.exe`, чтобы Hermes детерминированно находил его в новых сеансах оболочки.
 9. **Добавляет `%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts` в пользовательский PATH и задаёт `HERMES_HOME=%LOCALAPPDATA%\hermes`** — так команда `hermes` становится доступна после открытия нового терминала, а Hermes использует правильный каталог данных.
-10. **Запускает `hermes setup`** — обычный мастер первого запуска (модель, провайдер, toolsets). Его можно пропустить через `-SkipSetup`.
+10. **Запускает `hermes setup`** — обычный мастер первого запуска (модель, провайдер, наборы инструментов). Его можно пропустить с помощью `-SkipSetup`.
 
 :::tip Быстрая настройка провайдера на Windows
 На Windows настройка API-ключей для отдельных инструментов (Firecrawl, FAL, Browser Use, OpenAI TTS) обычно занимает больше всего времени. Подписка [Nous Portal](/user-guide/features/tool-gateway) покрывает и модель, и все эти инструменты через один OAuth-вход. После завершения установщика выполните `hermes setup --portal`, чтобы связать всё автоматически.
@@ -95,13 +95,13 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 | Браузерный инструмент (Chromium через Node) | ✓ | ✓ |
 | MCP-серверы (stdio и HTTP) | ✓ | ✓ |
 | Локальные Ollama / LM Studio / llama-server | ✓ | ✓ (через WSL networking) |
-| Веб-панель (сеансы, задачи, метрики, конфигурация) | ✓ | ✓ |
+| Веб-панель (сессии, задачи, метрики, конфигурация) | ✓ | ✓ |
 | Встроенная терминальная вкладка `/chat` веб-панели | ✗ (нужен POSIX PTY) | ✓ |
 | Автозапуск при входе | ✓ (schtasks) | ✓ (systemd) |
 
 Вкладка `/chat` во встроенной веб-панели встраивает настоящий терминал через POSIX PTY (`ptyprocess`). В нативном режиме Windows такого примитива нет; в теории подошли бы `pywinpty` / Windows ConPTY, но это отдельная реализация — считайте это будущей работой. **Вся остальная веб-панель работает нативно** — только эта вкладка показывает баннер вида «используйте WSL2 для этого».
 
-## Как Hermes запускает shell-команды в Windows {#how-hermes-runs-shell-commands-on-windows}
+## Как Hermes запускает команды оболочки в Windows {#how-hermes-runs-shell-commands-on-windows}
 
 Терминальный инструмент Hermes запускает команды через **Git Bash**, как это делает Claude Code. Это позволяет обойти разрыв между POSIX и Windows, не переписывая каждый инструмент.
 
@@ -113,7 +113,7 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 4. Системная установка Git for Windows (`%ProgramFiles%\Git\bin\bash.exe` и т. п.).
 5. MSYS2, Cygwin или любой другой `bash.exe` в PATH — как самый последний вариант.
 
-Установщик задаёт `HERMES_GIT_BASH_PATH` явно, чтобы свежим PowerShell-сессиям не приходилось заново искать Bash. Переопределите этот путь, если хотите, чтобы Hermes использовал конкретный bash — например, системный Git Bash или bash, проброшенный из WSL через symlink.
+Установщик задаёт `HERMES_GIT_BASH_PATH` явно, чтобы новым сеансам PowerShell не приходилось заново искать Bash. Переопределите этот путь, если хотите, чтобы Hermes использовал конкретный bash, например системный Git Bash или bash из WSL, доступный через символическую ссылку.
 
 **Подводный камень:** у MinGit другая раскладка, чем у полного Git for Windows — `bash` лежит в `usr\bin\bash.exe`, а не в `bin\bash.exe`. Hermes проверяет оба варианта. Если вы вручную распаковываете архив MinGit, берите **не busybox-вариант** (`MinGit-*-64-bit.zip`, а не `MinGit-*-busybox*.zip`) — busybox-сборки поставляют `ash` вместо `bash`, и большинство coreutils там отсутствует.
 
@@ -121,7 +121,7 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 
 По умолчанию Python stdio в Windows использует активную кодовую страницу консоли — обычно `cp1252` или `cp437`. Баннер Hermes, список слэш-команд, вывод инструментов, панели Rich и описания навыков содержат Unicode. Без дополнительной настройки это быстро приводит к `UnicodeEncodeError: 'charmap' codec can't encode character…`.
 
-Исправление находится в `hermes_cli/stdio.py::configure_windows_stdio()`, которая вызывается рано в каждой точке входа (`cli.py::main`, `hermes_cli/main.py::main`, `gateway/run.py::main`). Она:
+За настройку отвечает функция `hermes_cli/stdio.py::configure_windows_stdio()`, которую Hermes вызывает в начале работы каждой точки входа (`cli.py::main`, `hermes_cli/main.py::main`, `gateway/run.py::main`). Она выполняет следующие действия:
 
 1. Переключает кодовую страницу консоли на CP_UTF8 (65001) через `kernel32.SetConsoleCP` / `SetConsoleOutputCP`.
 2. Перенастраивает `sys.stdout` / `sys.stderr` / `sys.stdin` на UTF-8 с `errors='replace'`.
@@ -130,7 +130,7 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 
 Повторный вызов безопасен. На платформах, отличных от Windows, функция ничего не делает.
 
-**Как отключить:** `HERMES_DISABLE_WINDOWS_UTF8=1` в окружении возвращает старый путь stdio с кодовой страницей `cp1252`. Это полезно для поиска регрессий, связанных с кодировкой, но в обычной работе почти наверняка не нужно.
+**Как отключить:** переменная окружения `HERMES_DISABLE_WINDOWS_UTF8=1` отключает настройку UTF-8 и возвращает стандартным потокам кодовую страницу текущей локали. Это полезно при поиске регрессий, связанных с кодировкой, но в обычной работе почти наверняка не требуется.
 
 ## Редактор (`Ctrl-X Ctrl-E`, `/edit`)
 
@@ -152,7 +152,7 @@ Windows-обёртка stdio в Hermes теперь задаёт `EDITOR=notepad
 Чтобы задать это постоянно, добавьте переменную в профиль PowerShell:
 
 ```powershell
-# В $PROFILE
+# In $PROFILE
 $env:EDITOR = "code --wait"
 ```
 
@@ -160,7 +160,7 @@ $env:EDITOR = "code --wait"
 
 ## `Ctrl+Enter` для новой строки в CLI
 
-Windows Terminal передаёт `Ctrl+Enter` как отдельную последовательность клавиш. Hermes привязывает её к действию "вставить новую строку", чтобы можно было писать многострочные промпты в CLI, не переходя к схеме `Esc` → `Enter`. Это работает в Windows Terminal, во встроенном терминале VS Code и в любом современном консольном хосте Windows, который понимает VT-последовательности.
+Windows Terminal передаёт `Ctrl+Enter` как отдельную последовательность клавиш. Hermes связывает её с действием «вставить новую строку», чтобы в CLI можно было вводить многострочные запросы без сочетания `Esc` и `Enter`. Это работает в Windows Terminal, во встроенном терминале VS Code и в любом современном консольном хосте Windows с поддержкой управляющих VT-последовательностей.
 
 В старом `cmd.exe` `Ctrl+Enter` обрабатывается как обычный `Enter` — тогда используйте `Esc Enter` или обновитесь до Windows Terminal (он бесплатен и по умолчанию установлен в Windows 11).
 
@@ -178,18 +178,18 @@ hermes gateway install
 
 1. `schtasks /Create /SC ONLOGON /RL LIMITED /TN HermesGateway` — регистрирует задачу, которая стартует при входе пользователя со стандартными, не повышенными правами. Без UAC-подтверждения.
 2. Если `schtasks` блокируется групповой политикой, Hermes откатывается к созданию ярлыка `start /min cmd.exe /d /c <wrapper>` в `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`. Эффект тот же, реализация чуть грубее.
-3. Запускает шлюз **через `pythonw.exe` и в detached-режиме** — не через `python.exe`. У `pythonw.exe` нет прикреплённой консоли, поэтому его не задевают `CTRL_C_EVENT`, которые рассылаются соседним процессам в той же группе (это реальная проблема, из-за которой шлюз раньше падал, когда вы жали Ctrl+C где-нибудь рядом).
+3. Запускает шлюз как отсоединённый процесс через `pythonw.exe`, а не через `python.exe`. У `pythonw.exe` нет связанной консоли, поэтому события `CTRL_C_EVENT`, которые получают соседние процессы той же группы, на шлюз не действуют. Раньше из-за этой проблемы шлюз завершался, когда пользователь нажимал Ctrl+C в другом процессе той же группы.
 
 Флаги запуска: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB`.
 
 ### Управление
 
 ```powershell
-hermes gateway status      # Сводный вид: schtasks + папка автозапуска + запущенный PID
-hermes gateway start       # Запускает задачу сейчас
-hermes gateway stop        # Мягкий эквивалент SIGTERM (TerminateProcess через psutil)
+hermes gateway status      # Merged view: schtasks + Startup folder + running PID
+hermes gateway start       # Starts the scheduled task now
+hermes gateway stop        # Graceful SIGTERM equivalent (TerminateProcess via psutil)
 hermes gateway restart
-hermes gateway uninstall   # Удаляет запись schtasks, ярлык в папке автозапуска и pid-файл
+hermes gateway uninstall   # Removes schtasks entry, Startup shortcut, pid file
 ```
 
 `hermes gateway status` идемпотентен — вызывайте его хоть тысячу раз подряд, шлюз случайно не завершится. (До PR #21561 он мог незаметно завершать шлюз из-за `os.kill(pid, 0)`, который на уровне C конфликтовал с `CTRL_C_EVENT` — если интересна история, см. раздел про внутренности управления процессами ниже.)
@@ -206,9 +206,9 @@ hermes gateway uninstall   # Удаляет запись schtasks, ярлык в
 | `%LOCALAPPDATA%\hermes\git\` | PortableGit (только если его поставил сам установщик). |
 | `%LOCALAPPDATA%\hermes\node\` | Portable Node.js (только если его поставил сам установщик). |
 | `%LOCALAPPDATA%\hermes\bin\` | Служебный `uv.exe`, которым управляет Hermes, — менеджер Python, используемый для обновлений. |
-| `%LOCALAPPDATA%\hermes\` (корень) | Ваша конфигурация, данные авторизации, навыки, сессии и журналы (`config.yaml`, `.env`, `skills\`, `sessions\`, `logs\`, …). **Переживает переустановки.** |
+| `%LOCALAPPDATA%\hermes\` (корень) | Конфигурация, данные авторизации, навыки, сессии и журналы (`config.yaml`, `.env`, `skills\`, `sessions\`, `logs\`, …). **Эти данные сохраняются при переустановке.** |
 
-В нативной Windows установщик задаёт `HERMES_HOME=%LOCALAPPDATA%\hermes`, поэтому данные и служебная инфраструктура установки живут под одним корнем `%LOCALAPPDATA%\hermes`: установка и среда выполнения находятся в подкаталогах `hermes-agent\`, `git\`, `node\` и `bin\`, а ваши данные лежат прямо в `%LOCALAPPDATA%\hermes`. Переустановка заменяет только рабочую копию `hermes-agent\`, так что данные сохраняются. Но поскольку они делят общий корень, **не выполняйте** `Remove-Item -Recurse %LOCALAPPDATA%\hermes`, если хотите сохранить данные; удаляйте только подкаталог `hermes-agent\`. По структуре каталог данных совпадает с Linux `~/.hermes`, поэтому его можно зеркалировать между машинами.
+При нативной установке установщик задаёт `HERMES_HOME=%LOCALAPPDATA%\hermes`. Служебные компоненты размещаются в подкаталогах `hermes-agent\`, `git\`, `node\` и `bin\`, а пользовательские данные — в корне `%LOCALAPPDATA%\hermes`. Переустановка заменяет только рабочую копию `hermes-agent\` и не затрагивает данные. Поэтому для сохранения данных **не удаляйте** весь каталог командой `Remove-Item -Recurse %LOCALAPPDATA%\hermes`; удалите только подкаталог `hermes-agent\`. Структура пользовательских данных совпадает со структурой Linux-каталога `~/.hermes`, что позволяет синхронизировать их между компьютерами.
 
 **Переопределить `HERMES_HOME`:** задайте эту переменную окружения, чтобы указать другой каталог данных, например `%USERPROFILE%\.hermes`, если хотите совпасть со структурой каталогов Linux/WSL. Работает так же, как на Linux.
 
@@ -229,7 +229,7 @@ hermes gateway uninstall   # Удаляет запись schtasks, ярлык в
 Проверка:
 
 ```powershell
-Get-Command hermes        # должен вывести C:\Users\<you>\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe
+Get-Command hermes        # should print C:\Users\<you>\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe
 hermes --version
 ```
 
@@ -262,14 +262,14 @@ TELEGRAM_BOT_TOKEN=...
 hermes uninstall
 ```
 
-Это «чистый» путь — он удаляет запись `schtasks`, ярлык в Startup, обёртку `hermes.cmd`, стирает `%LOCALAPPDATA%\hermes\hermes-agent\` и сокращает пользовательский PATH. Остальная часть `%LOCALAPPDATA%\hermes\` остаётся нетронутой (конфигурация, данные авторизации, навыки, сессии и журналы) на случай, если вы потом захотите переустановить Hermes.
+Это рекомендуемый способ удаления. Команда удаляет задачу из Планировщика заданий, ярлык из папки автозагрузки, каталог `%LOCALAPPDATA%\hermes\hermes-agent\` и добавленные Hermes записи из пользовательской переменной `PATH`. Конфигурация, данные авторизации, навыки, сессии и журналы в `%LOCALAPPDATA%\hermes\` сохраняются, поэтому Hermes можно установить повторно без потери данных.
 
 Если нужно снести вообще всё:
 
 ```powershell
 hermes uninstall
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\hermes"
-# Также удалите устаревший каталог данных CLI/WSL, если когда-то его использовали:
+# Also remove a legacy CLI/WSL data dir if you ever used one:
 Remove-Item -Recurse -Force "$env:USERPROFILE\.hermes"
 ```
 
@@ -277,45 +277,45 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\.hermes"
 
 ## Внутренности управления процессами
 
-Это фоновый материал — пропустите его, если не отлаживаете странность уровня «оно само себя убивает».
+Это справочный раздел. Он нужен только при диагностике случаев, когда процесс Hermes неожиданно завершает сам себя.
 
 В Linux и macOS идиома `os.kill(pid, 0)` — это безвредная проверка прав: «жив ли этот PID и могу ли я отправить ему сигнал?». В Windows Python `os.kill` сопоставляет `sig=0` с `CTRL_C_EVENT` — у них одинаковое числовое значение 0 — и прокидывает вызов через `GenerateConsoleCtrlEvent(0, pid)`, который рассылает Ctrl+C **по всей консольной группе процессов**, где живёт целевой PID. Это [bpo-14484](https://bugs.python.org/issue14484), открытый с 2012 года. Исправлять это не будут, потому что изменение сломает скрипты, которые полагаются на нынешнее поведение.
 
-Следствие: любой код, который использовал `os.kill(pid, 0)` на Windows как «проверку, жив ли PID», тихо завершал цель. Hermes перевёл все такие места (14 в 11 файлах) на `gateway.status._pid_exists()`, а тот использует `psutil.pid_exists()` (который, в свою очередь, применяет `OpenProcess + GetExitCodeProcess` на Windows — без сигналов). Если вы пишете плагин или патч, используйте либо `psutil.pid_exists()`, либо `gateway.status._pid_exists()` — никогда не используйте `os.kill(pid, 0)`.
+Следствие: в Windows любой код, который использовал `os.kill(pid, 0)` для проверки существования PID, мог незаметно завершить целевой процесс. Hermes заменил все такие вызовы (14 вызовов в 11 файлах) на `gateway.status._pid_exists()`. Эта функция использует `psutil.pid_exists()`, которая в Windows вызывает `OpenProcess + GetExitCodeProcess` без отправки сигналов. При разработке плагина или патча используйте `psutil.pid_exists()` или `gateway.status._pid_exists()`; не используйте `os.kill(pid, 0)`.
 
 `scripts/check-windows-footguns.py` закрепляет это в CI: любой новый вызов `os.kill(pid, 0)` проваливает проверку `Windows footguns (blocking)`, если только рядом нет маркера `# windows-footgun: ok — <reason>`.
 
 ## Типичные ловушки
 
 **`hermes: command not found` сразу после установки.**
-Откройте новое окно PowerShell. Установщик уже добавил `%LOCALAPPDATA%\hermes\bin` в пользовательский PATH, но уже открытым сеансам оболочки нужен перезапуск, чтобы его увидеть. Пока можно запустить Hermes напрямую: `& "$env:LOCALAPPDATA\hermes\bin\hermes.cmd"`.
+Откройте новое окно PowerShell. Установщик уже добавил `%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts` в пользовательскую переменную `PATH`, но уже открытые оболочки увидят изменение только после перезапуска. До этого Hermes можно запустить напрямую: `& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\hermes.exe"`.
 
 **`WinError 193: %1 is not a valid Win32 application` при запуске инструмента.**
-Вы наткнулись на shebang-скрипт, минуя `.cmd`-обёртку. Hermes резолвит команды через `shutil.which(cmd, path=local_bin)`, чтобы PATHEXT подхватывал `.CMD`. Если вы вызываете инструмент по жёстко заданному пути, переключитесь на `.cmd`-вариант (например, `npx.cmd`, а не `npx`).
+Вы запустили скрипт с shebang напрямую, в обход `.cmd`-обёртки. Hermes находит команды через `shutil.which(cmd, path=local_bin)`, чтобы PATHEXT учитывал расширение `.CMD`. Если инструмент вызывается по явно заданному пути, используйте вариант с `.cmd`, например `npx.cmd` вместо `npx`.
 
-**`[scriptblock]::Create(...)` падает с `The assignment expression is not valid`.**
+**`[scriptblock]::Create(...)` завершается ошибкой `The assignment expression is not valid`.**
 Ваш `install.ps1` был скачан с UTF-8 BOM. Форма `irm | iex` удаляет BOM автоматически, а `[scriptblock]::Create((irm ...))` — нет. Повторите установку в простой форме `irm | iex` или скачайте скрипт вручную и сохраните его без BOM через `[IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false))`.
 
 **Шлюз не остаётся запущенным после перезапуска.**
 Проверьте `hermes gateway status` — он объединяет запись `schtasks`, ярлык в папке автозагрузки (если он использовался) и живой PID. Если `schtasks` зарегистрирован, но шлюз не стартует, групповая политика может блокировать триггеры `ONLOGON`. Выполните `schtasks /Query /TN HermesGateway /V /FO LIST`, чтобы увидеть причину сбоя, или откатитесь к сценарию с папкой автозагрузки, удалив и установив Hermes заново с `HERMES_GATEWAY_FORCE_STARTUP=1`.
 
 **`/edit` по-прежнему ничего не делает после задания `$env:EDITOR`.**
-Вы задали переменную только в текущем процессе; закройте и откройте оболочку заново либо задайте её на уровне User в System Properties → Environment Variables. Проверить можно через `echo $env:EDITOR` в новом окне PowerShell.
+Вы задали переменную только для текущего процесса. Перезапустите оболочку или задайте переменную для пользователя в разделе «Свойства системы» > «Переменные среды». Проверить значение можно командой `echo $env:EDITOR` в новом окне PowerShell.
 
-**Браузерный инструмент запускается, но инструменты тайм-аутятся.**
+**Браузерный инструмент запускается, но операции завершаются по тайм-ауту.**
 Chromium ставится автоматически при первом запуске. Если установка сорвалась из-за ограничения GitHub по запросам или сбоя на Playwright CDN, запустите `hermes doctor` — он покажет, что именно не хватает, и выведет точную команду `npx playwright install chromium` для исправления.
 
-**`agent-browser` падает с какой-то странной ошибкой версии Node.**
-Установщик разворачивает Node 22 в `%LOCALAPPDATA%\hermes\node`, но в PATH раньше может стоять более старый системный Node 18. Либо поднимите каталог Node от Hermes выше в PATH, либо удалите системную установку, если Node вам больше нигде не нужен.
+**`agent-browser` завершается с ошибкой, связанной с версией Node.js.**
+Установщик размещает Node.js 22 в `%LOCALAPPDATA%\hermes\node`, но раньше него в `PATH` может находиться системная версия Node.js 18. Переместите каталог Node.js, установленный Hermes, выше в `PATH` или удалите системную версию, если она больше не используется.
 
 **Китайские / японские / арабские символы показываются как `?` в CLI.**
-Обёртка stdio для UTF-8 не активировалась. Проверьте, что `HERMES_DISABLE_WINDOWS_UTF8` НЕ задан (`Get-ChildItem env:HERMES_DISABLE_WINDOWS_UTF8`). Если переменная пуста, а `?` всё равно остаются, возможно, сам консольный хост (очень старый `cmd.exe`) вообще не поддерживает UTF-8 — тогда переходите на Windows Terminal.
+Обёртка stdio для UTF-8 не активировалась. Проверьте, что переменная `HERMES_DISABLE_WINDOWS_UTF8` не задана (`Get-ChildItem env:HERMES_DISABLE_WINDOWS_UTF8`). Если переменная пуста, а `?` всё равно отображаются, возможно, используемый консольный хост, например очень старая версия `cmd.exe`, вообще не поддерживает UTF-8. В таком случае перейдите на Windows Terminal.
 
 **Шлюз не может отправить фото в Telegram — "`BadRequest: payload contains invalid characters`".**
-Это не связано с Windows, но иногда первым проявляется именно там. Обычно причина в том, что путь к файлу содержит неэкранированные обратные слеши в теле JSON. Telegram должен получать пути, которые уже нормализовал Hermes, а не сырой путь Windows — если это всплывает внутри кастомного плагина, убедитесь, что вы передаёте путь от Hermes, а не `str(Path(...))` из пользовательского ввода.
+Эта ошибка не связана непосредственно с Windows, но иногда впервые проявляется именно там. Обычно она означает, что путь к файлу содержит неэкранированные обратные косые черты в теле JSON. Telegram должен получать путь, нормализованный Hermes, а не исходный путь Windows. Если ошибка возникает в пользовательском плагине, передавайте путь, предоставленный Hermes, а не результат `str(Path(...))`, построенный из пользовательского ввода.
 
 **Странности с кодировкой в духе «Works on my other machine» после `git pull`.**
-Если вы редактировали конфиг Hermes или skill на Windows в редакторе без UTF-8 (старый Notepad, некоторые китайские IME), файл мог сохраниться с BOM. Hermes обычно терпит `utf-8-sig` при чтении config, но BOM внутри folded YAML scalar (`description: >`) может незаметно сломать YAML-парсер. Сохраните файл как обычный UTF-8 без BOM.
+Если файл конфигурации Hermes или навык редактировался в Windows без использования UTF-8, он мог сохраниться с BOM. Hermes обычно поддерживает `utf-8-sig` при чтении конфигурации, но BOM внутри многострочного скалярного значения YAML (`description: >`) может нарушить разбор документа. Сохраните файл в UTF-8 без BOM.
 
 ## Куда дальше
 
