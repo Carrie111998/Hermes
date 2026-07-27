@@ -1,9 +1,10 @@
 """Tests for plugins/memory/honcho/session.py — HonchoSession and helpers."""
 
+import sys
 import time
 
 from datetime import datetime
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from plugins.memory.honcho.client import HonchoClientConfig
@@ -100,8 +101,25 @@ class TestHonchoSession:
         assert session.updated_at >= original
 
 
+class _FakeSessionPeerConfig:
+    def __init__(self, *, observe_me, observe_others):
+        self.observe_me = observe_me
+        self.observe_others = observe_others
+
+
+def _install_fake_honcho_sdk(monkeypatch):
+    honcho_module = ModuleType("honcho")
+    honcho_module.__path__ = []
+    session_module = ModuleType("honcho.session")
+    session_module.SessionPeerConfig = _FakeSessionPeerConfig
+    honcho_module.session = session_module
+    monkeypatch.setitem(sys.modules, "honcho", honcho_module)
+    monkeypatch.setitem(sys.modules, "honcho.session", session_module)
+
+
 class TestSessionPeerObservationConfig:
-    def test_explicit_local_config_updates_existing_session(self):
+    def test_explicit_local_config_updates_existing_session(self, monkeypatch):
+        _install_fake_honcho_sdk(monkeypatch)
         cfg = HonchoClientConfig(
             observation_explicit=True,
             user_observe_me=True,
@@ -133,7 +151,8 @@ class TestSessionPeerObservationConfig:
         assert ai_call.args[1].observe_others is True
         remote_session.get_peer_configuration.assert_not_called()
 
-    def test_unspecified_local_config_uses_server_values(self):
+    def test_unspecified_local_config_uses_server_values(self, monkeypatch):
+        _install_fake_honcho_sdk(monkeypatch)
         cfg = HonchoClientConfig(observation_explicit=False)
         mgr = HonchoSessionManager(config=cfg)
         honcho = MagicMock()
