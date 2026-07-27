@@ -44,6 +44,22 @@ def local_commits() -> list[tuple[str, str]]:
     return rows
 
 
+def _is_ledger_only(sha: str) -> bool:
+    """True when a commit touches nothing but the ledger itself.
+
+    Without this the check is an infinite regress: recording commit N in the
+    ledger creates commit N+1, which is then itself missing. A commit that only
+    edits PATCH_LEDGER.md carries no patch to record, so it needs no entry.
+    """
+    out = subprocess.run(
+        ["git", "show", "--name-only", "--format=", sha],
+        cwd=REPO, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    files = {line.strip() for line in out.stdout.splitlines() if line.strip()}
+    return bool(files) and files <= {"PATCH_LEDGER.md"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--list", action="store_true")
@@ -59,7 +75,8 @@ def main() -> int:
 
     commits = local_commits()
     missing = [(sha, subj) for sha, subj in commits
-               if not any(sha.startswith(r) or r.startswith(sha) for r in recorded)]
+               if not any(sha.startswith(r) or r.startswith(sha) for r in recorded)
+               and not _is_ledger_only(sha)]
 
     if args.list:
         for sha, subj in missing:
