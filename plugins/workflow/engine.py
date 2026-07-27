@@ -2880,6 +2880,36 @@ class WorkflowEngine:
                 # Stay in this layer — don't advance
                 continue
 
+            # ── Post-monitor review check ──
+            # After _monitor_layer returns, check if any node in the
+            # workflow has an active review. If so, go back to layer 0
+            # so the review waiting loop can re-engage.
+            any_active_review = False
+            for nid, state in states.items():
+                node = workflow.nodes.get(nid)
+                if node and node.reviews:
+                    for rev_entry in node.reviews:
+                        rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                        if rev_id and rev_id in states:
+                            rev_state = states[rev_id]
+                            if rev_state.status in ("running", "blocked"):
+                                any_active_review = True
+                                break
+                            if rev_state.kanban_card_id:
+                                try:
+                                    card = self.get_card_status(rev_state.kanban_card_id)
+                                    card_status = card.get("status", "").lower()
+                                    if card_status in ("running", "blocked", "ready"):
+                                        any_active_review = True
+                                        break
+                                except Exception:
+                                    pass
+                    if any_active_review:
+                        break
+            if any_active_review:
+                layer_idx = 0
+                continue
+
             # Re-check blocked nodes — if their dependencies unblocked,
             # dispatch them now instead of waiting for the next layer.
             blocked_nodes = [
