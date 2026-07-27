@@ -56,6 +56,13 @@ from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
 
+# Platform check as a module constant rather than a live ``os.name`` read, so
+# tests can select the branch by patching this name. Patching ``os.name``
+# itself would work here but corrupts the whole interpreter: ``pathlib.Path()``
+# dispatches on it, so every later ``Path(...)`` in the process — including
+# ones inside pytest — raises "cannot instantiate 'PosixPath' on your system".
+_IS_WINDOWS = os.name == "nt"
+
 # ---------------------------------------------------------------------------
 # Lazy imports -- MCP SDK with OAuth support is optional
 # ---------------------------------------------------------------------------
@@ -312,7 +319,7 @@ def _can_open_browser() -> bool:
     if os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
         return False
     # macOS and Windows usually have a display
-    if os.name == "nt":
+    if _IS_WINDOWS:
         return True
     try:
         if os.uname().sysname == "Darwin":

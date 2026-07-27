@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import os
 import sqlite3
 import subprocess
@@ -4749,6 +4750,24 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _posix_reaping():
+    """Select the POSIX zombie-reaping branch on any host.
+
+    Two things block it on Windows: ``_IS_WINDOWS`` short-circuits the reap,
+    and ``os.WNOHANG`` does not exist — the production loop catches the
+    resulting AttributeError and quietly reaps nothing, so the assertions see
+    an empty list. Do NOT select the branch by patching ``os.name`` instead:
+    ``pathlib.Path`` dispatches on it, so every later ``Path(...)`` in the
+    process raises and pytest itself dies with an INTERNALERROR.
+    """
+    from unittest.mock import patch
+
+    with patch("hermes_cli.kanban_db._IS_WINDOWS", False), \
+         patch("hermes_cli.kanban_db.os.WNOHANG", 1, create=True):
+        yield
+
+
 def test_reap_worker_zombies_returns_count():
     """reap_worker_zombies() returns the list of reaped PIDs."""
     from unittest.mock import patch
@@ -4763,7 +4782,8 @@ def test_reap_worker_zombies_returns_count():
             return p, 0
         return 0, 0
 
-    with patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
+    with _posix_reaping(), \
+         patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
         with patch("hermes_cli.kanban_db._record_worker_exit"):
             pids = kb.reap_worker_zombies()
     assert pids == [12345, 67890, 11111]
@@ -4773,7 +4793,7 @@ def test_reap_worker_zombies_noop_on_windows(monkeypatch):
     """reap_worker_zombies() returns 0 and never calls os.waitpid on Windows."""
     from unittest.mock import patch
 
-    monkeypatch.setattr("hermes_cli.kanban_db.os.name", "nt")
+    monkeypatch.setattr("hermes_cli.kanban_db._IS_WINDOWS", True)
     with patch("hermes_cli.kanban_db.os.waitpid") as mock_waitpid:
         result = kb.reap_worker_zombies()
     mock_waitpid.assert_not_called()
@@ -4802,7 +4822,8 @@ def test_reap_worker_zombies_records_exit_status():
             return 12345, 0
         return 0, 0
 
-    with patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
+    with _posix_reaping(), \
+         patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
         with patch(
             "hermes_cli.kanban_db._record_worker_exit",
             side_effect=lambda p, s: calls.append((p, s)),
@@ -4833,7 +4854,8 @@ def test_zombie_reaper_runs_despite_board_connect_failure():
             return [12345, 67890][call_count[0] - 1], 0
         return 0, 0
 
-    with patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
+    with _posix_reaping(), \
+         patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
         with patch("hermes_cli.kanban_db._record_worker_exit"):
             # Simulate a board tick failure before reaping
             try:
@@ -4868,7 +4890,7 @@ def test_zombie_reaper_survives_all_boards_failing():
     # 5 ticks, 2 zombies per tick = 10 total
     for tick in range(5):
         pids = [tick * 100 + 1, tick * 100 + 2]
-        with patch(
+        with _posix_reaping(), patch(
             "hermes_cli.kanban_db.os.waitpid", side_effect=make_fake_waitpid(pids)
         ):
             with patch("hermes_cli.kanban_db._record_worker_exit"):
@@ -4890,9 +4912,10 @@ def test_dispatch_once_still_reaps_via_extracted_fn(kanban_home):
             return 99999, 0
         return 0, 0
 
-    with patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
+    with _posix_reaping(), \
+         patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
         with patch("hermes_cli.kanban_db._record_worker_exit"):
-            with patch("hermes_cli.kanban_db.os.name", "posix"):
+            with _posix_reaping():
                 pids = kb.reap_worker_zombies()
 
     assert pids == [99999]

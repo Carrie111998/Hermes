@@ -6501,7 +6501,10 @@ def reap_worker_zombies() -> "list[int]":
     children (returns []). No-op on Windows.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    # Module constant, not a live os.name read: tests select this branch by
+    # patching it, and patching os.name instead would break pathlib.Path for
+    # the whole process (it dispatches on os.name).
+    if not _IS_WINDOWS:
         try:
             while True:
                 try:
