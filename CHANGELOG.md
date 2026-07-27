@@ -14,6 +14,8 @@
 - Worker exception handling now checks the persisted autonomy mode, so a
   provider failure caused by an in-flight emergency stop cannot trigger retry
   loops.
+- Durable audit and planner-lineage records now redact credential-like fields
+  before persistence while preserving ordinary response evidence unchanged.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.

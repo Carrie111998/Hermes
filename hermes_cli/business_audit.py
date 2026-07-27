@@ -55,7 +55,11 @@ def append(
     sequence = (int(previous["sequence"]) + 1) if previous else 1
     previous_hash = previous["event_hash"] if previous else None
     created_at = int(time.time())
-    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    from hermes_cli.audit_redaction import sanitize
+
+    payload_json = json.dumps(
+        sanitize(payload), separators=(",", ":"), sort_keys=True
+    )
     material = json.dumps(
         {
             "action_id": action_id,

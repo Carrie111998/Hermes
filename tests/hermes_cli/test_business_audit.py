@@ -35,6 +35,23 @@ def test_audit_chain_rejects_database_tampering():
     assert business_audit.verify_chain(conn, "org_1")
 
 
+def test_durable_audit_redacts_credential_like_fields():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    business_audit.append(
+        conn,
+        organization_id="org_1",
+        event_type="action.proposed",
+        payload={"api_key": "sk_live_secret", "nested": {"token": "abc"}},
+    )
+    payload = conn.execute(
+        "SELECT payload_json FROM business_audit_events"
+    ).fetchone()["payload_json"]
+    assert "sk_live_secret" not in payload
+    assert "[REDACTED]" in payload
+    assert business_audit.verify_chain(conn, "org_1")
+
+
 def test_audit_export_is_tenant_scoped_and_self_verifying(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")
     org_1 = organization_db.create_organization(

@@ -74,10 +74,29 @@ def record(
         ).fetchone()
         if event is None or str(event["objective_id"]) != objective_id:
             raise PermissionError("planner inference event belongs elsewhere")
-    request_json = _canonical(dict(request))
+    from hermes_cli.audit_redaction import sanitize
+
+    request_json = _canonical(sanitize(dict(request)))
+    if response_text is None:
+        safe_response_text = None
+    else:
+        try:
+            parsed_response = json.loads(response_text)
+            sanitized_response = sanitize(parsed_response)
+            safe_response_text = (
+                response_text
+                if sanitized_response == parsed_response
+                else _canonical(sanitized_response)
+            )
+        except (TypeError, json.JSONDecodeError):
+            # Preserve malformed-response evidence without attempting to parse
+            # or persist a credential-like mapping.
+            from hermes_cli.audit_redaction import sanitize_text
+
+            safe_response_text = sanitize_text(response_text)
     response_hash = (
-        hashlib.sha256(response_text.encode()).hexdigest()
-        if response_text is not None
+        hashlib.sha256(safe_response_text.encode()).hexdigest()
+        if safe_response_text is not None
         else None
     )
     inference_id = f"inference_{uuid.uuid4().hex}"
@@ -99,7 +118,7 @@ def record(
                 model,
                 request_json,
                 hashlib.sha256(request_json.encode()).hexdigest(),
-                response_text,
+                safe_response_text,
                 response_hash,
                 parse_status,
                 error,

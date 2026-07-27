@@ -11,6 +11,9 @@ External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
 records. Payment integration is non-custodial: providers hold instruments and
 funds; Charterforge stores opaque references and verified state.
+Durable business-audit payloads and planner lineage redact credential-like
+fields before hashing and persistence; ordinary non-sensitive planner response
+text remains byte-for-byte evidence.
 
 The optional Stripe package follows this boundary: it uses an in-memory HTTP
 client, sends the secret only to Stripe, and records no raw card or bank data.
