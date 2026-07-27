@@ -706,6 +706,19 @@ def create_objective(
             )
         except sqlite3.OperationalError:
             organization_id = "__unscoped__"
+    elif organization_id != "__unscoped__":
+        # Production organization stores carry a tenant authority table. Do
+        # not allow an objective to be attached to a guessed or foreign tenant
+        # ID; lightweight unscoped stores used by isolated subsystems retain
+        # their compatibility behavior when that table is absent.
+        try:
+            organization_row = conn.execute(
+                "SELECT 1 FROM organizations WHERE id=?", (organization_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            organization_row = True
+        if organization_row is None:
+            raise ValueError("objective organization is not configured")
     with conn:
         conn.execute(
             """

@@ -1105,6 +1105,24 @@ def test_ceo_originated_objective_is_accepted_without_advisor_dispatch(tmp_path)
     assert "standing organizational authority" in accepted["payload_json"]
 
 
+def test_objective_admission_rejects_unknown_enterprise_organization(tmp_path):
+    conn = db.connect(tmp_path / "authority.db")
+    organization_db.bootstrap_solo_founder(
+        conn,
+        organization_name="Tenant Company",
+        purpose="Enforce tenant binding",
+        profile_name="default",
+        charter=charter(),
+    )
+    with pytest.raises(ValueError, match="organization is not configured"):
+        db.create_objective(
+            conn,
+            organization_id="org-not-configured",
+            desired_outcome="Must not cross tenant boundaries",
+            originator="external:test",
+        )
+
+
 def test_stale_objective_intent_blocks_until_reaffirmed(tmp_path):
     conn = db.connect(tmp_path / "authority.db")
     objective = accepted_objective(conn)
