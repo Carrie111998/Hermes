@@ -82,6 +82,20 @@ export const markActiveComposer = (target: ComposerTarget) => {
   activeTarget = target
 }
 
+/** Hand the routing key back when a composer unmounts, so `'active'` can never
+ *  resolve to a composer that no longer has a subscriber — such a request is
+ *  dispatched and then dropped by every mounted composer's target filter, and
+ *  nothing re-marks the active composer on its own.
+ *
+ *  Guarded on identity: a composer unmounting AFTER another one claimed the key
+ *  (closing a background tile, a deferred edit-close cleanup) must not steal it
+ *  from the live claimant. */
+export const releaseActiveComposer = (target: ComposerTarget) => {
+  if (activeTarget === target) {
+    activeTarget = 'main'
+  }
+}
+
 /** The composer that last held focus — the target `'active'` resolves to.
  *  Used by broadcast listeners (voice, Esc-to-stop) to act on exactly one. */
 export const getActiveComposer = (): ComposerTarget => activeTarget

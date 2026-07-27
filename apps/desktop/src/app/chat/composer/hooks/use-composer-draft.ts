@@ -17,7 +17,8 @@ import {
   markActiveComposer,
   onComposerFocusRequest,
   onComposerInsertRefsRequest,
-  onComposerInsertRequest
+  onComposerInsertRequest,
+  releaseActiveComposer
 } from '../focus'
 import { type InlineRefInput, insertInlineRefsIntoEditor } from '../inline-refs'
 import { composerPlainText, placeCaretEnd, REF_RE, renderComposerContents } from '../rich-editor'
@@ -152,6 +153,13 @@ export function useComposerDraft({
       focusInput()
     }
   }, [focusInput, focusKey, focusRequestId, inputDisabled])
+
+  // The mirror of the `markActiveComposer` above: give the key back when this
+  // composer goes away (a session tile closing, a pane unmounting). Covers both
+  // claim sites for this composer — `focusInput` here and ChatBar's `onFocus` —
+  // since they mark the same scope target. Without it `'active'` keeps
+  // resolving to a dead tile and every routed focus/insert request is dropped.
+  useEffect(() => () => releaseActiveComposer(target), [target])
 
   useEffect(() => {
     if (inputDisabled) {
