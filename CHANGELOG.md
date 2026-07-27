@@ -292,3 +292,5 @@ recorded.
   obligation records for unknown or retired compliance regimes.
 - `540b1f1054461929f6d749d1420290204e740c3e` — rejected already-expired
   compliance control evidence at admission time.
+- `f8b09c922f523079e0099a5e48efae83bfaf008b` — made compliance applicability,
+  obligation, and control-evidence records append-only.
