@@ -1,0 +1,4 @@
+name: free_image
+version: 1.0.0
+description: "Native /image slash command for generating images via pollinations without API keys."
+author: "https://github.com/vksaini-d"

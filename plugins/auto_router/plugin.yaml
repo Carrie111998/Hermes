@@ -1,0 +1,4 @@
+name: auto_router
+version: "1.0.0"
+description: "Slash command /auto that routes a prompt to the best available free model."
+author: "https://github.com/vksaini-d"
