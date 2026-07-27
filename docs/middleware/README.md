@@ -1,23 +1,23 @@
-# Hermes Middleware
+# Charterforge Middleware
 
-Hermes middleware is the behavior-changing companion to observer hooks.
+Charterforge middleware is the behavior-changing companion to observer hooks.
 Observer hooks report what happened. Middleware can change what happens by
 rewriting a request before execution or by wrapping the execution callback
 itself.
 
 This contract is intentionally backend-neutral. A plugin can use it for local
 policy, request shaping, tracing, adaptive routing, cache control, sandbox
-selection, or handoff to runtimes such as NeMo Relay without changing Hermes'
+selection, or handoff to runtimes such as NeMo Relay without changing Charterforge's
 planner, model provider adapters, tool registry, memory, or CLI UX.
 
 With middleware enabled, plugins can:
 
-- Rewrite LLM provider request kwargs before Hermes calls the provider.
+- Rewrite LLM provider request kwargs before Charterforge calls the provider.
 - Rewrite tool arguments before guardrails, approval checks, hooks, and tool
   execution see them.
-- Wrap the actual LLM execution callback while preserving Hermes retry,
+- Wrap the actual LLM execution callback while preserving Charterforge retry,
   streaming, interrupt, and hook behavior.
-- Wrap the actual tool execution callback while preserving Hermes guardrails,
+- Wrap the actual tool execution callback while preserving Charterforge guardrails,
   approval, post-tool hooks, and tool-result transformation.
 
 ## Contract
