@@ -980,6 +980,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
     return result["response"]
 
 
+def _normalize_provider_for_profile(provider: str | None) -> str:
+    """Normalize named custom provider keys for profile lookup.
+
+    ``custom:<name>`` pools resolve to the generic ``custom`` profile.
+    The provider registry stores ``custom``, not arbitrary named keys.
+    """
+    p = str(provider or "").strip().lower()
+    if p.startswith("custom:") or p.startswith("custom_"):
+        return "custom"
+    return p
+
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
@@ -1157,7 +1168,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # found, delegate fully; otherwise fall through to the legacy flag path.
     try:
         from providers import get_provider_profile
-        _profile = get_provider_profile(agent.provider)
+        _profile = get_provider_profile(_normalize_provider_for_profile(agent.provider))
     except Exception:
         _profile = None
 
@@ -2092,7 +2103,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             try:
                 from providers import get_provider_profile
 
-                provider_profile = get_provider_profile(agent.provider)
+                provider_profile = get_provider_profile(_normalize_provider_for_profile(agent.provider))
                 if provider_profile is not None:
                     profile_extra_body = provider_profile.build_extra_body(
                         session_id=getattr(agent, "session_id", None),
