@@ -1726,6 +1726,11 @@ def setup_agentic_settings(config: dict):
     existing = config.get("agentic")
     if isinstance(existing, dict):
         current.update(existing)
+    else:
+        # A fresh autonomous business starts with fail-closed runtime drift
+        # enforcement. Migrated installations retain the explicit setting in
+        # their existing charter until an advisor reviews it.
+        current.setdefault("security", {})["require_runtime_baseline"] = True
 
     modes = [
         "Autonomous — operator advises; in-charter actions proceed automatically (recommended)",

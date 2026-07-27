@@ -45,8 +45,8 @@
 - Trademark clearance for Charterforge.
 - High-availability database replication or disaster-recovery drill evidence.
 - Runtime drift enforcement remains opt-in for migrated installations; fresh
-  setup records a baseline, but operators must enable the strict gate in the
-  charter after reviewing deployment policy.
+  agentic setup enables the strict gate and records a baseline. Migrated
+  installations should enable it after reviewing deployment policy.
 
 ## Validation evidence
 

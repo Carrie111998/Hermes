@@ -46,6 +46,7 @@ def test_setup_agentic_defaults_to_advisor_autonomy(monkeypatch):
     assert charter["enabled"] is True
     assert charter["operating_mode"] == "autonomous"
     assert charter["operator_role"] == "advisor"
+    assert charter["security"]["require_runtime_baseline"] is True
     assert charter["runtime_host"] == "gateway"
     assert charter["allowed_capabilities"] == ["crm.write", "email.send"]
     assert charter["allowed_systems"] == ["crm", "agentmail"]
