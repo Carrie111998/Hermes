@@ -23,8 +23,8 @@ not a claim of production autonomous-business readiness.
   in [READINESS.md](READINESS.md) pass at the recorded evidence commit.
 - Production autonomous business operation: **NOT READY**.
 - Universal legal, tax, payment, and compliance operation: **NOT PROVEN**.
-- Evidence commit SHA: recorded in [READINESS.md](READINESS.md) after the
-  baseline commit is created.
+- Evidence commit SHA: `4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe`, with exact
+  commands and results recorded in [READINESS.md](READINESS.md).
 
 ## Unreleased
 

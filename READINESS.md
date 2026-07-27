@@ -25,7 +25,7 @@ The acceptance test and the release-evidence files are committed before the
 commands are run. The exact evidence commit SHA is recorded here after that
 baseline commit and is immutable for this determination.
 
-- Evidence commit SHA: **TO BE RECORDED AFTER BASELINE COMMIT**
+- Evidence commit SHA: **4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe**
 - Branch: `main`
 - Date: 2026-07-27
 - Repository: independent Charterforge fork; no upstream submission is implied
@@ -57,6 +57,21 @@ git diff --check
 The recorded result must include the test-file counts, zero failures, a
 successful compilation, and a clean diff check. A green result does not erase
 the explicit **NOT READY** and **NOT PROVEN** boundaries above.
+
+## Recorded result at the evidence commit
+
+The commands above were run from the repository root at commit
+`4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe`:
+
+- `test_agentic_business_e2e.py`: **6 passed, 0 failed**.
+- Objective service/runtime/worker sweep: **41 passed, 0 failed** across 3
+  files.
+- Finance and outcome-attribution sweep: **18 passed, 0 failed** across 2
+  files.
+- `python3 -m py_compile ...`: completed successfully with no output.
+- `git diff --check`: completed successfully with no output.
+- Final observed baseline: `git status --short --branch` reported no working
+  tree changes; `git rev-parse HEAD` returned the evidence SHA above.
 
 ## Release gates that remain open
 
