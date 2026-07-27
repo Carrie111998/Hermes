@@ -54,6 +54,7 @@ def _consume_abandoned_task(task: asyncio.Task) -> None:
 # timeout (including this helper's own expiry hand-off) goes silent, so the
 # gateway hangs at "attempt 1/8" with no further output (#63309).
 _LOOP_BLOCKED_DUMP_GRACE = 5.0
+_TELEGRAM_MESSAGE_ID_MAX = 2_147_483_647
 
 
 def _dump_loop_blocked_diagnostics(timeout: float, grace: float) -> None:
@@ -1108,12 +1109,31 @@ class TelegramAdapter(BasePlatformAdapter):
         topic_id = metadata.get("direct_messages_topic_id") or metadata.get("telegram_direct_messages_topic_id")
         return str(topic_id) if topic_id is not None else None
 
+    @staticmethod
+    def _normalize_reply_to_message_id(value: Any) -> Optional[int]:
+        """Return a positive Telegram message ID or ``None`` for invalid input."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if 0 < value <= _TELEGRAM_MESSAGE_ID_MAX else None
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        if (
+            not stripped.isascii()
+            or not stripped.isdigit()
+            or len(stripped) > len(str(_TELEGRAM_MESSAGE_ID_MAX))
+        ):
+            return None
+        parsed = int(stripped)
+        return parsed if 0 < parsed <= _TELEGRAM_MESSAGE_ID_MAX else None
+
     @classmethod
     def _metadata_reply_to_message_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[int]:
         if not metadata:
             return None
         reply_to = metadata.get("telegram_reply_to_message_id")
-        return int(reply_to) if reply_to is not None else None
+        return cls._normalize_reply_to_message_id(reply_to)
 
     @classmethod
     def _is_private_dm_topic_send(
@@ -1147,8 +1167,10 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         reply_to_mode: Optional[str] = None,
     ) -> Optional[int]:
-        if reply_to:
-            return int(reply_to)
+        if reply_to is not None:
+            normalized_reply_to = cls._normalize_reply_to_message_id(reply_to)
+            if normalized_reply_to is not None:
+                return normalized_reply_to
         if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
             if reply_to_mode == "off":
                 return None
@@ -1190,7 +1212,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "message_thread_id": None,
                         "direct_messages_topic_id": int(direct_topic_id),
                     }
-                return {}
+                raise ValueError(cls._dm_topic_missing_anchor_error())
             return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
         direct_topic_id = cls._metadata_direct_messages_topic_id(metadata)
         if direct_topic_id is not None:
@@ -1734,23 +1756,32 @@ class TelegramAdapter(BasePlatformAdapter):
         rich, let the legacy path handle it" — used for the DM-topic fail-loud
         case so the legacy path stays the single source of the refuse result.
         """
-        metadata_reply_to = self._metadata_reply_to_message_id(metadata)
         private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
         dm_topic_reply_to_off = (
             private_dm_topic_send
             and self._reply_to_mode == "off"
             and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
         )
-        reply_to_source = reply_to or (
-            str(metadata_reply_to)
-            if private_dm_topic_send and metadata_reply_to is not None
-            else None
-        )
         if private_dm_topic_send:
-            should_thread = reply_to_source is not None and self._reply_to_mode != "off"
+            reply_to_id = (
+                None
+                if dm_topic_reply_to_off
+                else self._reply_to_message_id_for_send(
+                    reply_to,
+                    metadata,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
         else:
-            should_thread = self._should_thread_reply(reply_to_source, 0)
-        reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+            should_thread = self._should_thread_reply(reply_to, 0)
+            reply_to_id = (
+                self._normalize_reply_to_message_id(reply_to)
+                if should_thread
+                else None
+            )
+        if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
+            if self._metadata_direct_messages_topic_id(metadata) is None:
+                return None
         thread_kwargs = self._thread_kwargs_for_send(
             chat_id,
             thread_id,
@@ -4382,7 +4413,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
-                metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
                 # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path
                 # is an explicit user opt-in to "message_thread_id alone is enough" (PR #23994
@@ -4394,17 +4424,23 @@ class TelegramAdapter(BasePlatformAdapter):
                     and self._reply_to_mode == "off"
                     and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
                 )
-                reply_to_source = reply_to or (
-                    str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
-                )
                 if private_dm_topic_send:
-                    should_thread = (
-                        reply_to_source is not None
-                        and self._reply_to_mode != "off"
+                    reply_to_id = (
+                        None
+                        if dm_topic_reply_to_off
+                        else self._reply_to_message_id_for_send(
+                            reply_to,
+                            metadata,
+                            reply_to_mode=self._reply_to_mode,
+                        )
                     )
                 else:
-                    should_thread = self._should_thread_reply(reply_to_source, i)
-                reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+                    should_thread = self._should_thread_reply(reply_to, i)
+                    reply_to_id = (
+                        self._normalize_reply_to_message_id(reply_to)
+                        if should_thread
+                        else None
+                    )
                 if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
                     return SendResult(
                         success=False,
