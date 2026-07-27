@@ -90,6 +90,16 @@ gateway:
     always_singular:       "✅ تمت الموافقة على الأمر (النمط مُوافق عليه دائمًا). الوكيل يستأنف..."
     always_plural:         "✅ تمت الموافقة على الأوامر (النمط مُوافق عليه دائمًا) ({count} أوامر). الوكيل يستأنف..."
 
+  auto_reset:
+    notice:                "◐ Session automatically reset ({reason}). Conversation history cleared.\nUse /resume to browse and restore a previous session.\nAdjust reset timing in config.yaml under session_reset."
+    reason_suspended:      "previous session was stopped or interrupted"
+    reason_resume_pending_expired: "gateway restart recovery timed out"
+    reason_daily:          "daily schedule at {hour}:00"
+    reason_idle:           "inactive for {duration}"
+    duration_hours_minutes: "{hours}h {minutes}m"
+    duration_hours:        "{hours}h"
+    duration_minutes:      "{minutes}m"
+
   background:
     usage:                 "الاستخدام: /background <prompt>\nمثال: /background لخّص أهم قصص HN اليوم\n\nيشغّل الموجِّه في جلسة منفصلة. يمكنك متابعة المحادثة — ستظهر النتيجة هنا عند الانتهاء."
     started:               "🔄 بدأت مهمة خلفية: \"{preview}\"\nمعرّف المهمة: {task_id}\nيمكنك متابعة المحادثة — ستظهر النتائج عند الانتهاء."
@@ -303,6 +313,15 @@ gateway:
     not_enabled:           "نقاط التحقق غير مفعّلة، لذا لا يوجد خط أساس للجلسة.\nفعّلها في config.yaml:\n```\ncheckpoints:\n  enabled: true\n```\nلا يزال /diff العادي يعمل — فهو يستخدم git مباشرة."
     no_changes:            "لا توجد تغييرات."
     failed:                "{error}"
+
+  session_info:
+    model:                 "◆ Model: `{model}`"
+    provider:              "◆ Provider: {provider}"
+    context:               "◆ Context: {context} tokens ({source})"
+    endpoint:              "◆ Endpoint: {endpoint}"
+    ctx_source_config:     "config"
+    ctx_source_default:    "default — set model.context_length in config to override"
+    ctx_source_detected:   "detected"
 
   set_home:
     save_failed:           "فشل حفظ القناة الرئيسية: {error}"
