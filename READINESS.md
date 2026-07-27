@@ -682,6 +682,24 @@ Result: **20 passed, 0 failed**. The integrity path independently checks
 parent-grant scope, budget, expiry, and revocation instead of trusting child
 records alone.
 
+The independent installer was validated against a freshly built wheel on
+current `main` commit `8bbe0fe25ebe52e82f131761611147679e1583b9` with:
+
+```sh
+artifact_dir="$(mktemp -d)"
+install_dir="$(mktemp -d)"
+uv build --wheel --out-dir "$artifact_dir"
+wheel_path="$(find "$artifact_dir" -maxdepth 1 -name '*.whl' -print -quit)"
+CHARTERFORGE_SOURCE="$wheel_path" \
+  CHARTERFORGE_INSTALL_DIR="$install_dir" \
+  scripts/install-charterforge.sh
+"$install_dir/bin/charterforge" --version
+```
+
+Result: **Charterforge v0.19.0 (2026.7.20)**. This proves local isolated
+installation from the project artifact; package-index publication remains
+separately authorized and unproven.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
