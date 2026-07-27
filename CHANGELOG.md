@@ -218,3 +218,6 @@ recorded.
 - `71330197889f03c0ae67ba8424038aaed4bda54c` — rejected explicit objective
   organization IDs that are not present in the enterprise tenant authority
   store.
+- `dee2818df7f12949911e87419b33545c350080ce` — required provider payment
+  read-backs to carry a non-empty reference/status and valid amount/currency
+  fields before settlement or receipt recording.

@@ -90,6 +90,8 @@ acceptance evidence.
   them to `accepted` and emits a fresh wake event.
 - Explicit organization-bound objective admission rejects unknown tenant IDs
   when the enterprise organization authority schema is present.
+- Provider payment read-back rejects missing references, statuses, invalid
+  amounts, and malformed currencies before settlement is recorded.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -165,7 +167,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`71330197889f03c0ae67ba8424038aaed4bda54c` passed 6 Founder/CEO E2E tests, 48
+`dee2818df7f12949911e87419b33545c350080ce` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
