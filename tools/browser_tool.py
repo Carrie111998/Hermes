@@ -2892,9 +2892,10 @@ def _remember_snapshot_refs(
             original_snapshot,
         )
         data["snapshot"] = (
-            original_without_refs.rstrip()
-            + "\n\nGuarded interactive controls:\n"
+            "Guarded interactive controls:\n"
             + "\n".join(snapshot_lines)
+            + "\n\nPage accessibility tree (refs intentionally removed):\n"
+            + original_without_refs.rstrip()
         ).strip()
         data["url"] = current_url
         data["guarded_refs_available"] = True

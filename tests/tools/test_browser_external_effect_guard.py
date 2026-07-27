@@ -966,6 +966,9 @@ def test_snapshot_refs_require_stable_page_and_bind_duplicate_nodes(
     assert context["refs"]["e1"]["backend_node_id"] == 10
     assert context["refs"]["e2"]["backend_node_id"] == 11
     assert snapshot["data"]["guarded_refs_available"] is True
+    assert snapshot["data"]["snapshot"].startswith(
+        'Guarded interactive controls:\n- textbox "Answer" [ref=e1]'
+    )
 
     monkeypatch.setattr(
         browser_tool,
