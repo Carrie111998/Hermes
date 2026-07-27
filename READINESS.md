@@ -720,6 +720,21 @@ durable objective loop, worker coordination, delegation authority, finance,
 readiness, and Founder/CEO end-to-end surfaces; it does not establish the
 external production gates listed below.
 
+The integrated organizational decision path was validated on current `main`
+commit `da756f5f5559cd86823f452fc4af62d73f354a9d` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_hiring_policy.py \
+  tests/hermes_cli/test_procurement_policy.py \
+  tests/hermes_cli/test_objective_adapters.py
+```
+
+Result: **39 passed, 0 failed**. This covers evidence-based contractor/FTE
+selection, budget and headcount enforcement, hierarchical provisioning,
+build/FOSS/buy ordering, procurement idempotency, and governed adapter
+execution/read-back.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
