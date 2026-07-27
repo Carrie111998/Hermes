@@ -183,7 +183,7 @@ source of the complete inventory.
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.
 
-## Unreleased (commits after 0.19.0-agentic-foundation)
+## Post-boundary commit comparison
 
 This section is derived from `4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe..HEAD`.
 The current branch is ahead of the validated boundary; these changes do not
