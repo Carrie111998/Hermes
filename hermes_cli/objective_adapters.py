@@ -1309,7 +1309,7 @@ def register_kanban_adapters(
                 if authority_conn is not None:
                     try:
                         grant = workforce_delegation.validate_task_result_authority(
-                            authority_conn, task_id
+                            authority_conn, task_id, board=board
                         )
                         expected_body = (
                             workforce_delegation.worker_scope(

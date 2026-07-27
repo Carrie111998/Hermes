@@ -580,7 +580,7 @@ def sync_kanban_events(conn, *, board: Optional[str] = None) -> int:
 
             try:
                 workforce_delegation.validate_task_result_authority(
-                    conn, task_id
+                    conn, task_id, board=board
                 )
             except workforce_delegation.DelegationError as exc:
                 operational_control.raise_intervention(

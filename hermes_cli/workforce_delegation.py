@@ -804,7 +804,7 @@ def validate_worker_launch(
 
 
 def validate_task_result_authority(
-    conn: sqlite3.Connection, task_id: str
+    conn: sqlite3.Connection, task_id: str, *, board: str | None = None
 ) -> dict[str, Any]:
     """Require the employee and exact mandate to remain live at handoff time."""
     from hermes_cli import operational_control
@@ -830,6 +830,26 @@ def validate_task_result_authority(
         raise DelegationError(
             "employee authority changed before task result handoff"
         )
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing(board=board) as kanban:
+        task = kanban_db.get_task(kanban, task_id)
+    original_body = assigned_work_body(task.body if task is not None else None)
+    expected_body = (
+        worker_scope(conn, str(grant["id"]))
+        + "\n\n## Assigned work\n"
+        + original_body
+    )
+    if (
+        task is None
+        or task.execution_contract_id != str(grant["id"])
+        or task.assignee != grant["assignee_profile"]
+        or task.tenant != grant["organization_id"]
+        or _hash(task.title) != grant["title_sha256"]
+        or _hash(original_body) != grant["body_sha256"]
+        or task.body != expected_body
+    ):
+        raise DelegationError("Kanban task no longer matches employee task grant")
     return grant
 
 

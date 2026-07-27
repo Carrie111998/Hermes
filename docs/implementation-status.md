@@ -36,6 +36,9 @@ acceptance evidence.
 - Delegated worker launch and result handoff independently re-run the full
   immutable grant-chain integrity projection, rather than relying only on the
   live mandate and revocation checks.
+- Result handoff also revalidates the exact Kanban task contract (board,
+  tenant, assignee, title, body, and grant binding) before a completion event
+  can wake CEO planning; board selection is explicit across process boundaries.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

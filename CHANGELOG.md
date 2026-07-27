@@ -45,6 +45,9 @@
   cannot exceed the parent grant ceiling.
 - Delegated worker launch and result handoff now require an independent full
   grant-chain integrity verification in addition to live mandate checks.
+- Result handoff now revalidates the exact Kanban task contract and accepts an
+  explicit board identity, preventing a tampered or cross-board task from
+  waking CEO planning.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy
