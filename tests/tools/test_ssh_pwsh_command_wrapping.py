@@ -284,7 +284,9 @@ try {{
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh required")
-def test_snapshot_assembly_failure_preserves_user_exit_code(env, tmp_path):
+def test_snapshot_assembly_failure_preserves_user_exit_code(tmp_path):
+    env = object.__new__(SSHPwshEnvironment)
+    ssh_env.BaseEnvironment.__init__(env, cwd=str(tmp_path), timeout=60)
     env._snapshot_path = str(tmp_path / "missing" / "snapshot.ps1")
     env._snapshot_ready = True
     wrapped = env._wrap_command("$global:LASTEXITCODE = 7", str(tmp_path))
