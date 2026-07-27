@@ -86,6 +86,11 @@ these artifacts.
   `recovery_blocked` result; repair or replace the known-good authority
   snapshot/storage and resolve the recovery intervention before resuming
   autonomy.
+- **Security readiness blocked:** the worker records `security_blocked`, opens
+  one organization-scoped `security_readiness_blocked` advisor intervention
+  containing the exact violations, and records that no external action was
+  attempted. Resolve the underlying isolation/secret-manager policy through
+  supported setup; never dismiss the intervention by editing the database.
 
 ## Container restart evidence
 

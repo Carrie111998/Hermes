@@ -28,6 +28,8 @@ acceptance evidence.
   fail-closed when the provider/evidence boundary is unavailable.
 - Fail-closed worker cycle reasons are retained in `last_error` for operator
   diagnosis instead of being reduced to a status-only signal.
+- Security-readiness blocks now create deduplicated, organization-scoped
+  advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.
 - Exact solo-founder and employee delegation grants.
 - Evidence-based contractor/FTE decision and hierarchical profiles.
@@ -212,7 +214,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`6e0557637945de6a9775e2da0747871aa994fafd`. It passed 6 Founder/CEO E2E tests, 48
+`dbb9fd52da932f29bb4782884d6ee5f590f76152`. It passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -241,7 +243,7 @@ The packaging artifact regression passed 2 tests for wheel and sdist creation;
 an isolated dependency-backed wheel install also launched `charterforge
 --version` successfully. The combined command passed 84 tests, 0 failed.
 The bootstrap/operator regression additions passed 6 tests. The expanded
-current-main validation command passed 93 tests across 10 files, 0 failed. A real temporary
+current-main validation command passed 94 tests across 10 files, 0 failed. A real temporary
 state-directory smoke ran the non-interactive bootstrap twice, observed stable
 IDs, and confirmed configured business status after the second run.
 The built image also passed the complete Docker restart regression: 4 tests,
