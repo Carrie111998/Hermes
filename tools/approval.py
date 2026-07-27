@@ -1096,6 +1096,9 @@ _COMMAND_WRAPPER_WORDS = {
     "command",
     "builtin",
 }
+_EXTERNAL_TIME_PARENT_WRAPPERS = {
+    "command", "sudo", "env", "exec", "nohup", "setsid", "external-time",
+}
 _COMMAND_WRAPPER_OPTIONS_WITHOUT_ARG = {
     "command": {"-p"},
     "exec": {"-c", "-l"},
@@ -2084,10 +2087,12 @@ def _iter_shell_command_word_spans(command: str):
             if wrapper_name in _COMMAND_WRAPPER_WORDS:
                 skip_wrapper_options = wrapper_name in {"sudo", "env"}
                 allow_wrapper_end_of_options = True
+                time_is_external = wrapper_name == "time" and (
+                    "/" in deobfuscated
+                    or wrapper in _EXTERNAL_TIME_PARENT_WRAPPERS
+                )
                 active_wrapper = (
-                    "external-time"
-                    if wrapper_name == "time" and "/" in deobfuscated
-                    else wrapper_name
+                    "external-time" if time_is_external else wrapper_name
                 )
                 pos = word_end
                 continue

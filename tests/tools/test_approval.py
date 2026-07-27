@@ -2657,6 +2657,12 @@ class TestRuntimeSelfPidKillGuard:
             "/usr/bin/time -p /bin/kill {pid}",
             "/usr/bin/time -f %e /bin/kill {pid}",
             "/usr/bin/time -p kill --signal TERM {pid}",
+            "env time kill --signal TERM {pid}",
+            "command time kill --signal TERM {pid}",
+            "exec time kill --signal TERM {pid}",
+            "sudo time kill --signal TERM {pid}",
+            "nohup time kill --signal TERM {pid}",
+            "setsid time kill --signal TERM {pid}",
             "/usr/bin/nohup /bin/kill {pid}",
             "env -u UNUSED /bin/kill {pid}",
             "env -u UNUSED -- /bin/kill {pid}",
@@ -2683,6 +2689,8 @@ class TestRuntimeSelfPidKillGuard:
             "kill --queue 7 {pid}",
             "kill --timeout 100 TERM {pid}",
             "time -f %e /bin/kill {pid}",
+            "builtin time kill --signal TERM {pid}",
+            "time time kill --signal TERM {pid}",
         ],
     )
     def test_bash_kill_unsupported_long_options_are_not_flagged(self, template):
