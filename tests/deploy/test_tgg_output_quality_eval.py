@@ -47,6 +47,23 @@ def snapshot() -> dict:
         "cases": [{"id": 7, "job_no": "AM/JOB/2607/0001", "state": "completed"}],
     }
 
+def two_case_snapshot() -> dict:
+    value = snapshot()
+    value["events"].extend([completed(12, "wa-12"), completed(13, "wa-13")])
+    value["observations"].append(
+        {
+            "id": 3,
+            "case_id": 8,
+            "source_ref": None,
+            "fields": json.dumps({"source_refs": ["wa-12", "wa-13"]}),
+            "_matched_source_refs": ["wa-12", "wa-13"],
+        }
+    )
+    value["cases"].append(
+        {"id": 8, "job_no": "AM/JOB/2607/0002", "state": "in_progress"}
+    )
+    return value
+
 
 def judgment(checker: str = "judge-2") -> dict:
     registry = core.load_registry()
@@ -129,6 +146,12 @@ def test_bundle_mapping_keeps_unmapped_completed_rows_visible():
     bundles, unmapped = core.make_bundles(value)
     assert [item["message_id"] for item in bundles[0]["messages"]] == ["wa-10", "wa-11"]
     assert unmapped == ["wa-unmapped"]
+
+def test_bundle_mapping_refuses_observation_without_case_row():
+    value = snapshot()
+    value["observations"][0]["case_id"] = 999
+    with pytest.raises(core.EvalError, match="missing case row"):
+        core.make_bundles(value)
 
 
 def test_exact_public_per_case_url():
@@ -259,26 +282,6 @@ def test_strict_judgment_preserves_unsure_and_rejects_maker():
         core.validate_judgment(broken, registry, "maker-1")
 
 
-def test_injected_judge_command_refuses_single_pass_bypass(tmp_path):
-    bundle = tmp_path / "bundle.json"
-    bundle.write_text("{}")
-    screen = tmp_path / "screen.png"
-    screen.write_bytes(b"x")
-    with pytest.raises(core.EvalError, match="two isolated passes"):
-        core.Judge(command_argv=["fixture-judge"]).judge(
-            bundle,
-            {
-                "screenshot": str(screen),
-                "portal_screenshot": str(screen),
-                "snapshot": str(bundle),
-                "portal_snapshot": str(bundle),
-                "url": core.case_url("AM/JOB/2607/0001"),
-            },
-            core.load_registry(),
-            "maker-1",
-        )
-
-
 def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle.json"
     source_image = tmp_path / "source.jpg"
@@ -288,6 +291,7 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     screen.write_bytes(b"png")
     monkeypatch.setenv("CODEX_THREAD_ID", "maker-thread")
     monkeypatch.setenv("MARSHAL_SESSION_ID", "maker-thread")
+    monkeypatch.setenv("TGG_OUTPUT_EVAL_JUDGE_COMMAND", "forbidden-single-pass")
     seen = {"argv": [], "env": [], "prompts": []}
 
     def command(argv, **kwargs):
@@ -345,6 +349,7 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
         assert item.statement not in seen["prompts"][0]
     assert all("CODEX_THREAD_ID" not in env for env in seen["env"])
     assert all("MARSHAL_SESSION_ID" not in env for env in seen["env"])
+    assert all(argv[0:2] == ["codex", "exec"] for argv in seen["argv"])
     image_args = [
         seen["argv"][0][index + 1]
         for index, value in enumerate(seen["argv"][0])
@@ -594,6 +599,15 @@ class FakeJudge:
             return json.loads((core.FIXTURE_DIR / "golden-judge.json").read_text())
         return judgment()
 
+class SecondCaseFailJudge(FakeJudge):
+    def judge(self, *args, **kwargs):
+        source = Path(args[0])
+        if source.name != "golden-source.json":
+            value = json.loads(source.read_text())
+            if value["case"]["job_no"] == "AM/JOB/2607/0002":
+                raise core.EvalError("second case broke")
+        return super().judge(*args, **kwargs)
+
 
 class FakeFiler:
     def __init__(self):
@@ -653,6 +667,40 @@ def test_successful_run_commits_cursor_after_artifacts_and_defects(tmp_path, mon
     assert json.loads(receipt.read_text())["completed_rows"] == 2
     second = evaluator.run(trigger="interval", maker_session_id="maker-1")
     assert second["ran"] is False
+
+def test_multi_case_run_judges_every_touched_case(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
+    store = core.StateStore(tmp_path)
+    judge = FakeJudge()
+    result = core.Evaluator(
+        store,
+        collect=lambda _cursor: two_case_snapshot(),
+        browser=FakeBrowser(),
+        judge=judge,
+        filer=FakeFiler(),
+        clock=lambda: NOW,
+    ).run(trigger="deploy", maker_session_id="maker-1")
+    assert result["cases_evaluated"] == 2
+    assert result["committed_cursor"] == 13
+    assert judge.calls == 3  # golden plus both touched cases
+
+
+def test_multi_case_failure_keeps_cursor_and_files_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
+    store = core.StateStore(tmp_path)
+    filer = FakeFiler()
+    evaluator = core.Evaluator(
+        store,
+        collect=lambda _cursor: two_case_snapshot(),
+        browser=FakeBrowser(),
+        judge=SecondCaseFailJudge(),
+        filer=filer,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(core.EvalError, match="second case broke"):
+        evaluator.run(trigger="deploy", maker_session_id="maker-1")
+    assert store.load()["cursor"] == 0
+    assert filer.calls == []
 
 
 def test_successful_run_reconciles_prior_failed_occurrences(tmp_path, monkeypatch):

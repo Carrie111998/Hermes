@@ -5,7 +5,6 @@ import fcntl
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import tempfile
 import urllib.parse
@@ -327,6 +326,7 @@ def make_bundles(snapshot: dict[str, Any]) -> tuple[list[dict[str, Any]], list[s
     events = snapshot["events"]
     event_by_id = {str(item["message_id"]): item for item in events}
     event_ids = set(event_by_id)
+    case_ids = {int(item["id"]) for item in snapshot["cases"]}
     observations_by_case: dict[int, list[dict[str, Any]]] = {}
     mapped: set[str] = set()
     for observation in snapshot["observations"]:
@@ -355,6 +355,8 @@ def make_bundles(snapshot: dict[str, Any]) -> tuple[list[dict[str, Any]], list[s
                     stack.extend(value)
             observation = {**observation, "_matched_source_refs": sorted(refs & event_ids)}
         case_id = int(observation["case_id"])
+        if case_id not in case_ids:
+            raise EvalError(f"observation references missing case row: {case_id}")
         observations_by_case.setdefault(case_id, []).append(observation)
         mapped.update(str(item) for item in observation.get("_matched_source_refs", []))
     bundles: list[dict[str, Any]] = []
@@ -590,10 +592,8 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
 
 
 class Judge:
-    def __init__(self, command: Command = run_command, command_argv: Sequence[str] | None = None):
+    def __init__(self, command: Command = run_command):
         self.command = command
-        configured = os.environ.get("TGG_OUTPUT_EVAL_JUDGE_COMMAND")
-        self.command_argv = list(command_argv or (shlex.split(configured) if configured else []))
 
     def judge(
         self,
@@ -622,9 +622,6 @@ class Judge:
             f"source_bundle={bundle_path}\ncase_snapshot={captures['snapshot']}\n"
             f"portal_snapshot={captures['portal_snapshot']}\nregistry={REGISTRY_PATH}\n"
         )
-        if self.command_argv:
-            raise EvalError("injected judge commands are disabled; two isolated passes are required")
-
         with tempfile.TemporaryDirectory(prefix="tgg-output-judge-") as tmp:
             try:
                 source_bundle = json.loads(bundle_path.read_text())

@@ -7,6 +7,7 @@
   "elapsed_seconds": 54.499,
   "exit_code": 0,
   "fixture": "tests/fixtures/clients/tgg/output-quality",
+  "maker_session_id": "synthetic-golden-maker",
   "naive_argv_contract": [
     "codex",
     "exec",
