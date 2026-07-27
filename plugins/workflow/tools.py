@@ -298,8 +298,10 @@ def _handle_workflow_start_predefined(
 
     # Capture session info and inject into context (which persists in state file)
     _sess = _capture_session_for_engine()
-    _ctx = context or {}
+    _ctx = context or None
     if _sess:
+        if _ctx is None:
+            _ctx = {}
         _ctx["_session_info"] = _sess
 
     # Fire-and-forget: create all kanban cards and subscribe the final
