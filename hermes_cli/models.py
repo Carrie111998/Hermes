@@ -41,6 +41,8 @@ def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: floa
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Anthropic
     ("anthropic/claude-fable-5",               ""),
+    ("anthropic/claude-opus-5",                ""),
+    ("anthropic/claude-opus-5-fast",           "2x price, higher output speed"),
     ("anthropic/claude-opus-4.8",              ""),
     ("anthropic/claude-opus-4.8-fast",         "2x price, higher output speed"),
     ("anthropic/claude-sonnet-5",              ""),
@@ -192,6 +194,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
         # Anthropic
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
         "anthropic/claude-haiku-4.5",
@@ -387,8 +390,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "deepseek": [
         "deepseek-v4-pro",
         "deepseek-v4-flash",
-        "deepseek-chat",
-        "deepseek-reasoner",
     ],
     "xiaomi": [
         "mimo-v2.5-pro",
@@ -2082,11 +2083,25 @@ def _provider_keys(provider: str) -> set[str]:
     return {k for k in (key, normalized) if k}
 
 
+# Retired model IDs kept for /model auto-detect only — not shown in pickers.
+# DeepSeek cut these off on 2026-07-24; model_normalize remaps them on the wire.
+_PROVIDER_RETIRED_ALIASES: dict[str, tuple[str, ...]] = {
+    "deepseek": ("deepseek-chat", "deepseek-reasoner"),
+}
+
+
+def _provider_catalog_names(provider: str) -> tuple[str, ...]:
+    """Active picker models plus retired aliases recognized for detection."""
+    active = tuple(_PROVIDER_MODELS.get(provider, []))
+    retired = _PROVIDER_RETIRED_ALIASES.get(provider, ())
+    return active + retired
+
+
 def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
     return any(
         name_lower == model.lower()
         for provider in providers
-        for model in _PROVIDER_MODELS.get(provider, [])
+        for model in _provider_catalog_names(provider)
     )
 
 
@@ -2232,7 +2247,7 @@ def detect_static_provider_for_model(
         current_provider == "custom"
         or current_provider.startswith("custom:")
     )
-    for pid, models in _PROVIDER_MODELS.items():
+    for pid in _PROVIDER_MODELS:
         if (
             pid in current_keys
             or pid in _AGGREGATOR_PROVIDERS
@@ -2241,7 +2256,7 @@ def detect_static_provider_for_model(
             continue
         if _is_custom_current:
             continue
-        if any(name_lower == m.lower() for m in models):
+        if any(name_lower == m.lower() for m in _provider_catalog_names(pid)):
             return (pid, name)
 
     # Borrow-list providers (re-expose other vendors' models) only after every
@@ -2249,7 +2264,7 @@ def detect_static_provider_for_model(
     for pid in _BORROWED_MODEL_PROVIDERS:
         if pid in current_keys:
             continue
-        if any(name_lower == m.lower() for m in _PROVIDER_MODELS.get(pid, [])):
+        if any(name_lower == m.lower() for m in _provider_catalog_names(pid)):
             return (pid, name)
 
     return None
