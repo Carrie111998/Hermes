@@ -396,11 +396,29 @@ def test_planner_cannot_invent_sustained_hiring_evidence(tmp_path):
     second_id, repeated = evaluate_hiring_case_from_state(
         conn,
         organization_id=organization_id,
-        case={"objective_id": "ignored-on-idempotent-retry"},
-        policy={},
+        case={
+            "objective_id": objective.id,
+            "missing_capability": "market.research",
+            "blocked_objectives": 500,
+            "capability_gap_cycles": 500,
+            "annual_cost_minor": 0,
+            "expected_duration_cycles": 3,
+            "scoped_deliverable": "research report",
+        },
+        policy=default_hiring_policy(),
         idempotency_key="hire-market-researcher-0001",
         evaluated_by="control:hiring",
     )
+
+    with pytest.raises(PermissionError, match="different parameters"):
+        evaluate_hiring_case_from_state(
+            conn,
+            organization_id=organization_id,
+            case={"objective_id": objective.id, "annual_cost_minor": 1},
+            policy=default_hiring_policy(),
+            idempotency_key="hire-market-researcher-0001",
+            evaluated_by="control:hiring",
+        )
 
     assert decision.verdict == "defer"
     assert decision.evidence["authoritative_blocked_objectives"] == 0

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS hiring_decisions (
     organization_id TEXT NOT NULL,
     objective_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,
+    request_sha256 TEXT NOT NULL DEFAULT '',
     proposed_case_json TEXT NOT NULL,
     derived_evidence_json TEXT NOT NULL,
     policy_json TEXT NOT NULL,
@@ -77,7 +78,24 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hiring_decisions'"
     ).fetchone():
         return
-    conn.executescript(SCHEMA_SQL)
+    if not (
+        conn.in_transaction
+        and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='hiring_decisions'"
+        ).fetchone()
+    ):
+        conn.executescript(SCHEMA_SQL)
+    columns = {
+        row["name"] for row in conn.execute(
+            "PRAGMA table_info(hiring_decisions)"
+        )
+    }
+    if "request_sha256" not in columns:
+        conn.execute(
+            "ALTER TABLE hiring_decisions ADD COLUMN "
+            "request_sha256 TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def _serialized_hiring_mutation(function):
@@ -119,11 +137,28 @@ def evaluate_hiring_case_from_state(
     organization_db.ensure_schema(conn)
     if len(idempotency_key.strip()) < 16:
         raise ValueError("hiring decision requires a high-entropy idempotency key")
+    request_sha256 = hashlib.sha256(
+        _json(
+            {
+                "organization_id": organization_id,
+                "case": dict(case),
+                "policy": dict(policy),
+                "evaluated_by": evaluated_by,
+            }
+        ).encode()
+    ).hexdigest()
     existing = conn.execute(
         "SELECT * FROM hiring_decisions WHERE idempotency_key=?",
         (idempotency_key,),
     ).fetchone()
     if existing is not None:
+        if (
+            not str(existing["request_sha256"])
+            or str(existing["request_sha256"]) != request_sha256
+        ):
+            raise PermissionError(
+                "hiring idempotency key was reused with different parameters"
+            )
         return str(existing["id"]), HiringDecision(
             str(existing["verdict"]),
             str(existing["reason"]),
@@ -216,10 +251,10 @@ def evaluate_hiring_case_from_state(
         conn.execute(
             """INSERT INTO hiring_decisions (
                  id,organization_id,objective_id,idempotency_key,
-                 proposed_case_json,derived_evidence_json,policy_json,
+                 proposed_case_json,derived_evidence_json,policy_json,request_sha256,
                  verdict,reason,employment_class,evidence_sha256,
                  evaluated_by,created_at
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 decision_id,
                 organization_id,
@@ -228,6 +263,7 @@ def evaluate_hiring_case_from_state(
                 _json(dict(case)),
                 evidence_json,
                 _json(dict(policy)),
+                request_sha256,
                 recorded.verdict,
                 recorded.reason,
                 recorded.employment_class,
