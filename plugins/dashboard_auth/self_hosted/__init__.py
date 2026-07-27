@@ -615,6 +615,12 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             )
         except jwt.PyJWKClientError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
+        except jwt.InvalidTokenError as exc:
+            # Not shaped like a JWT at all (e.g. a session issued by a
+            # different provider) — not an IDP/JWKS reachability problem.
+            # verify_session() catches this and returns None so other
+            # providers in the chain get a turn.
+            raise InvalidCodeError(f"token is not a valid JWT: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 
