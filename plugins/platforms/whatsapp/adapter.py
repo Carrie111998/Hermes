@@ -1240,7 +1240,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return
         if await self._check_managed_bridge_exit():
             return
-        if not chat_id or not message_id or not emoji:
+        # Baileys removes an existing reaction by sending the same key with an
+        # empty text value, so only None is invalid here.
+        if not chat_id or not message_id or emoji is None:
             return
 
         try:
@@ -1298,6 +1300,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             emoji = "✅"
         elif outcome == ProcessingOutcome.FAILURE:
             emoji = "❌"
+        elif outcome == ProcessingOutcome.CANCELLED:
+            # Clear the in-progress reaction so a cancelled run does not leave
+            # a permanent false "still processing" indicator.
+            emoji = ""
         else:
             return
 

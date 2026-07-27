@@ -27,7 +27,9 @@ export function registerReactionRoute(app, {
     }
 
     const { chatId, messageId, emoji, senderId, fromMe } = req.body;
-    if (!chatId || !messageId || !emoji) {
+    // Baileys uses an empty reaction text to remove the account's existing
+    // reaction from the target message; reject only a missing field.
+    if (!chatId || !messageId || emoji === undefined || emoji === null) {
       return res.status(400).json({ error: 'chatId, messageId, and emoji are required' });
     }
 

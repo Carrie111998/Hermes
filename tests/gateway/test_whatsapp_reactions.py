@@ -119,13 +119,16 @@ class TestWhatsAppLifecycleReactions:
         assert payload["emoji"] == "❌"
 
     @pytest.mark.asyncio
-    async def test_cancelled_completion_is_noop(self):
+    async def test_cancelled_completion_clears_processing_reaction(self):
         adapter = _make_adapter()
-        adapter._http_session.post = MagicMock()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"success": True})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
 
         await adapter.on_processing_complete(_event(), ProcessingOutcome.CANCELLED)
 
-        adapter._http_session.post.assert_not_called()
+        payload = adapter._http_session.post.call_args.kwargs["json"]
+        assert payload["emoji"] == ""
 
     @pytest.mark.asyncio
     async def test_disabled_reactions_are_noop(self):

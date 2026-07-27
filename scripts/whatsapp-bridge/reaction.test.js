@@ -62,6 +62,17 @@ test('buildReactionPayload preserves fromMe for self-chat messages', () => {
   assert.equal(payload.react.key.fromMe, true);
 });
 
+test('buildReactionPayload uses empty text to remove a reaction', () => {
+  const payload = buildReactionPayload({
+    chatId: '123@s.whatsapp.net',
+    messageId: 'msg-4',
+    emoji: '',
+    fromMe: false,
+  });
+
+  assert.equal(payload.react.text, '');
+});
+
 test('fromMe survives bridge event extraction into the reaction key', async () => {
   const event = await extractBridgeEvent({
     msg: {
@@ -127,4 +138,36 @@ test('registered /react route sends through the injected serialized send path', 
   assert.equal(sendCalls[0][0], '123@g.us');
   assert.equal(sendCalls[0][1].react.key.fromMe, true);
   assert.equal(sendCalls[0][1].react.key.participant, '456@s.whatsapp.net');
+});
+
+test('registered /react route accepts empty emoji to remove a reaction', async () => {
+  let routeHandler;
+  const app = {
+    post(_path, handler) {
+      routeHandler = handler;
+    },
+  };
+  const sendCalls = [];
+  registerReactionRoute(app, {
+    getSocket: () => ({}),
+    getConnectionState: () => 'connected',
+    sendWithTimeout: async (...args) => {
+      sendCalls.push(args);
+    },
+  });
+
+  const res = responseRecorder();
+  await routeHandler({
+    body: {
+      chatId: '123@s.whatsapp.net',
+      messageId: 'msg-6',
+      emoji: '',
+      fromMe: false,
+    },
+  }, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.payload, { success: true });
+  assert.equal(sendCalls.length, 1);
+  assert.equal(sendCalls[0][1].react.text, '');
 });
