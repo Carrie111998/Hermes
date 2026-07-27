@@ -114,6 +114,10 @@ def _hash(value: str) -> str:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     organization_db.ensure_schema(conn)
+    if conn.in_transaction and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_task_grants'"
+    ).fetchone():
+        return
     conn.executescript(SCHEMA_SQL)
 
 
@@ -274,9 +278,8 @@ def create_grant(
             raise DelegationError("action already has a different employee task grant")
         return str(existing["id"]), False
     grant_id = f"taskgrant_{uuid.uuid4().hex}"
-    with conn:
-        conn.execute(
-            """INSERT INTO employee_task_grants (
+    conn.execute(
+        """INSERT INTO employee_task_grants (
                  id,organization_id,objective_id,action_id,manager_employee_id,
                  employee_id,assignee_profile,mandate_id,mandate_version,
                  title_sha256,body_sha256,capabilities_json,systems_json,
@@ -548,6 +551,7 @@ def is_revoked(conn: sqlite3.Connection, grant_id: str) -> bool:
     )
 
 
+@_serialized_grant_mutation
 def revoke_active_grants(
     conn: sqlite3.Connection,
     *,
@@ -556,7 +560,6 @@ def revoke_active_grants(
     reason: str,
 ) -> list[str]:
     """Append revocations for every still-live grant after authority changes."""
-    ensure_schema(conn)
     if not actor.strip() or not reason.strip():
         raise ValueError("grant revocation requires actor and reason")
     now = int(time.time())
@@ -571,22 +574,21 @@ def revoke_active_grants(
         (organization_id, now),
     ).fetchall()
     revoked: list[str] = []
-    with conn:
-        for row in rows:
-            grant_id = str(row["id"])
-            conn.execute(
-                """INSERT INTO employee_task_grant_revocations
+    for row in rows:
+        grant_id = str(row["id"])
+        conn.execute(
+            """INSERT INTO employee_task_grant_revocations
                    (id,grant_id,actor,reason,revoked_at)
                    VALUES (?,?,?,?,?)""",
-                (
-                    f"taskgrantrev_{uuid.uuid4().hex}",
-                    grant_id,
-                    actor.strip(),
-                    reason.strip(),
-                    now,
-                ),
-            )
-            revoked.append(grant_id)
+            (
+                f"taskgrantrev_{uuid.uuid4().hex}",
+                grant_id,
+                actor.strip(),
+                reason.strip(),
+                now,
+            ),
+        )
+        revoked.append(grant_id)
     return revoked
 
 

@@ -183,6 +183,14 @@ def _json(value: Any) -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    # ``executescript`` implicitly commits an active SQLite transaction. Do
+    # not let read helpers invoked inside an authority admission transaction
+    # release its write lock; top-level callers initialize/migrate the schema
+    # before opening the transaction.
+    if conn.in_transaction and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='organizations'"
+    ).fetchone():
+        return
     conn.executescript(SCHEMA_SQL)
     columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(employee_mandates)")
