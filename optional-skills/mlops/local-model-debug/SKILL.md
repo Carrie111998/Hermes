@@ -1,6 +1,6 @@
 ---
 name: local-model-debug
-description: Debug common issues with locally-run LLMs (llama.cpp, Ollama, etc.). Covers think mode quirks (reasoning_content vs content), chat template mismatches, CPU inference tuning, context window limits, and model file corruption.
+description: Debug local LLM issues: think mode, templates, and context.
 version: 1.0.0
 author: ligl0325
 license: MIT
@@ -40,7 +40,7 @@ toolsets: [terminal]
 
 - Check tok/s: compare with expected for model size (1B: 15-25 tok/s, 3B: 8-15 tok/s, 7B: 3-8 tok/s on modern CPU)
 - Increase threads: `-t N` (N = core count)
-- Context size: `-c 2048` or `4096` (larger = slower but more memory)
+- Context size: `-c 8192` or `16384` (larger = slower but more memory)
 - Batch size: `-b 512` (larger batch = faster prompt processing)
 - Flash attention: `--flash-attn` (faster but memory tradeoff)
 - KV cache quantization: `--cache-type-k q8_0` (reduces memory)

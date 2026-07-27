@@ -4,7 +4,7 @@ description: Diagnose and recover file synchronization across multiple machines 
 version: 1.0.0
 author: ligl0325
 license: MIT
-platforms: [linux, macos, windows]
+platforms: [linux, macos]
 metadata:
   hermes:
     tags: [syncthing, zerotier, sync, multi-machine, network]
