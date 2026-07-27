@@ -291,9 +291,10 @@ acceptance evidence.
   rules (tax-bearing metered invoices remain blocked until configured).
 - PCI DSS, SOC 2, SOX, GDPR, EU AI Act, CASL, CAN-SPAM, or other certification.
 - A published package-index release, container registry image, production
-  deployment, or repository rename. Local wheel/sdist builds, the independent
-  local installer, and a local Docker image/startup smoke are supported and
-  verified; publication remains unreleased work.
+  deployment, or repository rename. Local wheel/sdist builds, independent
+  artifact/container CI workflows, the local installer, and a local Docker
+  image/startup smoke are supported and verified; publication remains
+  separately authorized unreleased work.
 - Trademark clearance for Charterforge.
 - High-availability database replication or a full disaster-recovery drill;
   local authority snapshot restore smoke is verified and documented.

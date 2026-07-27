@@ -64,7 +64,7 @@ deployment action.
 
 ## Current boundary
 
-Source installation, local artifact installation, and the checked-in local
-installer are supported. A published package-index release and
-container-registry image remain release work. Do not use the upstream Hermes
-installer for this independent project.
+Source installation, local artifact installation, the checked-in local
+installer, and independent artifact/container CI verification are supported.
+A published package-index release and container-registry image remain release
+work. Do not use the upstream Hermes installer for this independent project.
