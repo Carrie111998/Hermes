@@ -1605,6 +1605,27 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production media-provider credentials, quotas, or external authorization.
 
+## Code execution authority evidence (9cf2e75646)
+
+`code.execute` permits now use a SHA-256 resource derived from the exact
+script, task identity, effective sandbox tool allow-list, and terminal backend.
+Changing the script or requesting broader RPC tools requires a new grant, and
+the permit cannot be replayed against another execution environment.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/code_execution_tool.py tests/tools/test_code_execution.py
+uv run --extra dev pytest -q tests/tools/test_code_execution.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **77 code-execution regression tests passed, Ruff passed, and
+current-tree agentic acceptance passed**. The acceptance image manifest digest
+was `sha256:3660e2b4ba99b2cc0b6c19711543c97f187ca70503154739612524b7b1e68b43`.
+This remains deterministic local-provider evidence and does not establish
+production sandbox deployment or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

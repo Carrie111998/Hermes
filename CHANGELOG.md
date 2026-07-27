@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `execute_code` permits now bind the script, task identity, effective sandbox
+  tool allow-list, and backend environment; a script grant cannot be replayed
+  with broader RPC capabilities or a different execution target.
 - Remote image and video ingestion now requires URL-bound `vision.read` and
   `video.read` permits before any download; local media grants do not imply
   authority to fetch arbitrary external media.
