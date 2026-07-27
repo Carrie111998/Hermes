@@ -3258,14 +3258,27 @@ class BasePlatformAdapter(ABC):
             return None
         if not transcript:
             return None
-        # Exclude the current turn's assistant message, which has already been
-        # persisted by the time we reach delivery but must not be treated as
-        # "history" for dedup purposes.
+        # Exclude the current turn entirely.  The current turn starts after
+        # the last user message and may contain multiple entries (tool calls,
+        # tool results, and the final assistant response).  Removing only the
+        # last assistant message leaves tool-call/result entries that carry
+        # the same MEDIA: path, causing the collector to mark newly generated
+        # images as "already delivered".  See #72536.
         history = list(transcript)
-        for msg in reversed(history):
-            if msg.get("role") == "assistant":
-                history.remove(msg)
+        last_user_idx = None
+        for idx in range(len(history) - 1, -1, -1):
+            if history[idx].get("role") == "user":
+                last_user_idx = idx
                 break
+        if last_user_idx is not None:
+            history = history[:last_user_idx]
+        else:
+            # No user message found — drop the last assistant entry as a
+            # best-effort fallback (original behaviour).
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    history.remove(msg)
+                    break
         if not history:
             return None
         # Avoid circular import: gateway.run already imports this module.
