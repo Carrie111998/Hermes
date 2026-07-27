@@ -51,6 +51,7 @@ Usage:
 
 import atexit
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -2802,7 +2803,11 @@ def _redact_browser_output(value: Any) -> Any:
 # Browser Tool Functions
 # ============================================================================
 
-def _authorize_browser_action(capability: str, task_id: Optional[str]) -> str:
+def _authorize_browser_action(
+    capability: str,
+    task_id: Optional[str],
+    target_resource: Optional[str] = None,
+) -> str:
     """Authorize one browser operation against one exact session resource."""
     effective_task_id = _last_session_key(task_id or "default")
     from hermes_cli.workforce_delegation import authorize_worker_action
@@ -2810,7 +2815,7 @@ def _authorize_browser_action(capability: str, task_id: Optional[str]) -> str:
     authorize_worker_action(
         capability=capability,
         system="browser",
-        target_resource=f"browser-session:{effective_task_id}",
+        target_resource=target_resource or f"browser-session:{effective_task_id}",
     )
     return effective_task_id
 
@@ -2848,12 +2853,17 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
 
     # Governed workers must hold an exact navigation grant. A browser
-    # toolset alone is not authority to visit arbitrary external destinations.
-    from hermes_cli.workforce_delegation import authorize_worker_action
-    authorize_worker_action(
-        capability="browser.navigate",
-        system="browser",
-        target_resource=url,
+    # toolset alone is not authority to visit arbitrary external destinations;
+    # the permit is also bound to the browser session that will receive the
+    # navigation so it cannot be replayed in another worker's session.
+    effective_task_id = _authorize_browser_action(
+        "browser.navigate",
+        task_id,
+        target_resource=(
+            "browser-navigation:"
+            f"{_last_session_key(task_id or 'default')}:url:"
+            f"{hashlib.sha256(url.encode('utf-8')).hexdigest()}"
+        ),
     )
 
     # SSRF protection — block private/internal addresses before navigating.
@@ -2864,7 +2874,6 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # private URL + ``browser.auto_local_for_private_urls`` enabled) — the
     # cloud provider never sees the URL in that case.  Can also be opted
     # out globally via ``browser.allow_private_urls`` in config.
-    effective_task_id = task_id or "default"
     nav_session_key = _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
 
