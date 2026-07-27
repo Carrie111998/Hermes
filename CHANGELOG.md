@@ -23,6 +23,8 @@
   and current AML/sanctions-screened provider assessment per declared direction.
 - Recorded a cross-process authority snapshot restore smoke that preserves
   accounting integrity, pauses autonomy, and opens reconciliation handoff.
+- Split control-plane readiness from worker liveness: readiness may pass before
+  startup and reports `runtime_active` separately for the supervised CEO.
 
 ## 0.19.0-agentic-foundation — 2026-07-27
 

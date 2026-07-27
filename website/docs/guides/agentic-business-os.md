@@ -189,9 +189,10 @@ charterforge business payment-rails
 
 Use `charterforge business readiness` for the corresponding deterministic
 operator projection. It is read-only and returns explicit blocker codes for
-bootstrap, autonomy mode, supervised-worker health, runtime drift, and open
-advisor interventions. A ready projection is not a legal, tax, compliance, or
-provider certification.
+bootstrap, autonomy mode, security, runtime drift, and open advisor
+interventions. It also reports `runtime_active` separately, because a worker
+can be started only after control-plane readiness passes. A ready projection is
+not a legal, tax, compliance, or provider certification.
 
 This command is read-only and safe before credentials are configured. It
 reports each discovered inbound/outbound rail as `available: true` or

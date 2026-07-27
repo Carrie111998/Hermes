@@ -22,13 +22,15 @@ charterforge business readiness
 
 `business readiness` is a read-only deterministic projection. It reports
 `ready: false` with an exact blocker list until bootstrap, autonomy mode,
-runtime-worker health, security readiness, drift gates, open advisor
+security readiness, drift gates, open advisor
 interventions, and any payment rails declared by the charter all permit
 unattended operation. If the
 charter grants `payments.receive` or `payments.send`, a credential-ready rail,
 a current screened provider assessment, and a non-custodial compliance profile
 are required for the corresponding direction. It never enables autonomy or
-attempts a provider action.
+attempts a provider action. The projection also reports `runtime_active`; it is
+false until a supervised CEO worker is started, but worker liveness is
+intentionally separate from the control-plane readiness decision.
 
 The checked-in example charter admits both supervised gateway and standalone
 worker hosts (`runtime_host: "either"`). To exercise the standalone process

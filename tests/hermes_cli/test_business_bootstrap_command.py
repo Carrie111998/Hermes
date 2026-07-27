@@ -139,9 +139,9 @@ def test_business_readiness_reports_authoritative_runtime_blockers(monkeypatch):
     readiness = business.build_business_readiness(conn)
     assert readiness["ready"] is False
     assert readiness["state"] == "blocked"
+    assert readiness["runtime_active"] is False
     assert [item["code"] for item in readiness["blockers"]] == [
         "autonomy_not_enabled",
-        "runtime_worker_not_ready",
         "runtime_drift_blocked",
         "advisor_intervention_open",
     ]
