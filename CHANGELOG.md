@@ -42,6 +42,8 @@
   tokenized instrument until provider read-back settles or releases the hold.
 - Payment and metered-billing schema checks no longer release active authority
   transactions on already-initialized stores.
+- Outcome attribution reconciliation now uses the same guarded payment schema
+  initialization path.
 - Hardened durable runtime ledgers so schema checks preserve active authority
   transactions across finance, accounting, payments, compliance, approvals,
   event ingress, billing, commitments, metrics, worker state, and audit

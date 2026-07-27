@@ -25,6 +25,17 @@ def test_attribution_schema_read_preserves_active_transaction(tmp_path):
     conn.rollback()
 
 
+def test_sync_schema_reads_preserve_active_transaction(tmp_path):
+    conn, organization_id, _ = _company(tmp_path)
+    payments.ensure_schema(conn)
+    business_metrics.ensure_schema(conn)
+    outcome_attribution.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    outcome_attribution.sync_authoritative_links(conn, organization_id)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def _company(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")
     organization_id, _ = organization_db.bootstrap_solo_founder(

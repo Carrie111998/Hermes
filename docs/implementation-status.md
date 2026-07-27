@@ -22,6 +22,8 @@
   releases them.
 - Payment and metered-billing schema initialization preserves active authority
   transactions when the durable tables already exist.
+- Outcome attribution synchronization uses the guarded payment schema path and
+  preserves active authority transactions during cross-ledger reconciliation.
 - Immutable usage-event metering and exact-event metered invoicing with
   idempotent allocation guards against duplicate billing.
 - Metered-invoice verification independently reconciles the exact usage-event

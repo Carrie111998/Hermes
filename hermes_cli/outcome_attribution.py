@@ -426,7 +426,7 @@ def sync_authoritative_links(
     from hermes_cli import business_metrics, payments
 
     business_metrics.ensure_schema(conn)
-    conn.executescript(payments.SCHEMA_SQL)
+    payments.ensure_schema(conn)
     ensure_schema(conn)
     counts = {
         "action_verifications": 0,
