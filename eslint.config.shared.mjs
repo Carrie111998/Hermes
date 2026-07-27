@@ -15,7 +15,6 @@ import js from '@eslint/js'
 import typescriptEslint from '@typescript-eslint/eslint-plugin'
 import typescriptParser from '@typescript-eslint/parser'
 import perfectionist from 'eslint-plugin-perfectionist'
-import reactPlugin from 'eslint-plugin-react'
 import hooksPlugin from 'eslint-plugin-react-hooks'
 import unusedImports from 'eslint-plugin-unused-imports'
 import globals from 'globals'
@@ -25,6 +24,17 @@ export default [
     ignores: ['**/node_modules/**', '**/dist/**', 'src/**/*.js', '**/package-lock.json']
   },
   js.configs.recommended,
+  {
+    // `no-useless-assignment` and `preserve-caught-error` were promoted into
+    // js.configs.recommended in ESLint 10. They flag ~30 pre-existing sites
+    // across the workspaces, so they are kept at 'warn' to keep the ESLint 10
+    // upgrade a dependency-only change.
+    // TODO: clean up the flagged sites and promote these back to 'error'.
+    rules: {
+      'no-useless-assignment': 'warn',
+      'preserve-caught-error': 'warn'
+    }
+  },
   {
     files: ['**/*.{ts,tsx}'],
     languageOptions: {
@@ -41,7 +51,6 @@ export default [
     plugins: {
       '@typescript-eslint': typescriptEslint,
       perfectionist,
-      react: reactPlugin,
       'react-hooks': hooksPlugin,
       'unused-imports': unusedImports
     },
@@ -95,9 +104,6 @@ export default [
       'react-hooks/exhaustive-deps': 'warn',
       'react-hooks/rules-of-hooks': 'error',
       'unused-imports/no-unused-imports': 'error'
-    },
-    settings: {
-      react: { version: 'detect' }
     }
   },
   {
