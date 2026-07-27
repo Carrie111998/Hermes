@@ -26,10 +26,10 @@ def _company(tmp_path, monkeypatch):
         purpose="Delegate within exact authority",
         profile_name="default",
         charter={
-            "allowed_capabilities": ["work.delegate", "web.read"],
-            "allowed_systems": ["kanban", "web"],
+            "allowed_capabilities": ["work.delegate", "web.read", "file.read"],
+            "allowed_systems": ["kanban", "web", "localhost"],
             "solo_founder": {
-                "toolsets": ["web"],
+                "toolsets": ["web", "files"],
                 "skills": ["research"],
             },
             "max_action_spend_minor": 1_000,
@@ -54,9 +54,9 @@ def _company(tmp_path, monkeypatch):
         responsibilities=["research"],
         decision_rights=["read public sources"],
         prohibited_actions=["publish", "purchase"],
-        capabilities=["web.read"],
-        systems=["web"],
-        toolsets=["web"],
+        capabilities=["web.read", "file.read"],
+        systems=["web", "localhost"],
+        toolsets=["web", "files"],
         skills=["research"],
         kpis=["evidence delivered"],
         escalation={"to": ceo_id},
@@ -78,7 +78,7 @@ def _company(tmp_path, monkeypatch):
         organization_id=organization_id,
         desired_outcome="Understand customer demand",
         originator=f"employee:{ceo_id}",
-        permitted_systems=["kanban", "web"],
+        permitted_systems=["kanban", "web", "localhost"],
     )
     objectives_db.transition_objective(
         conn, objective.id, "accepted", actor=f"employee:{ceo_id}"
@@ -156,12 +156,12 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
         payload={
             "system": "kanban",
             "target_resource": "default",
-            "task_capabilities": ["web.read"],
-            "task_systems": ["web"],
-            "task_toolsets": ["web"],
+            "task_capabilities": ["file.read"],
+            "task_systems": ["localhost"],
+            "task_toolsets": ["files"],
             "task_skills": ["research"],
-            "task_system": "web",
-            "task_target_resource": "/tmp/allowed-evidence.txt",
+            "task_system": "localhost",
+            "task_target_resource": "/home/mike/ceofile.txt",
         },
         expected_outcome="bounded worker task",
         required_capability="work.delegate",
@@ -179,9 +179,9 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
         assignee_profile="ada-research",
         title="Interview synthesis",
         body="Summarize independently sourced customer evidence.",
-        capabilities=["web.read"],
-        systems=["web"],
-        toolsets=["web"],
+        capabilities=["file.read"],
+        systems=["localhost"],
+        toolsets=["files"],
         skills=["research"],
         budget_minor=200,
         expires_at=int(time.time()) + 1_800,
@@ -192,7 +192,7 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
         (grant_id,),
     ).fetchone()
     assert row["worker_resource_scope_json"] == (
-        '{"system":"web","target_resource":"/tmp/allowed-evidence.txt"}'
+        '{"system":"localhost","target_resource":"/home/mike/ceofile.txt"}'
     )
 
     # The worker permit is an operation-and-resource capability, not a broad
@@ -224,25 +224,25 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "ada-research")
 
     workforce_delegation.authorize_worker_action(
-        capability="web.read",
-        system="web",
-        target_resource="/tmp/allowed-evidence.txt",
+        capability="file.read",
+        system="localhost",
+        target_resource="/home/mike/ceofile.txt",
     )
     with pytest.raises(
         workforce_delegation.DelegationError, match="resource exceeds"
     ):
         workforce_delegation.authorize_worker_action(
-            capability="web.read",
-            system="web",
-            target_resource="/tmp/not-allowed-evidence.txt",
+            capability="file.read",
+            system="localhost",
+            target_resource="/home/mike/notceofile.txt",
         )
     with pytest.raises(
         workforce_delegation.DelegationError, match="capability .* not granted"
     ):
         workforce_delegation.authorize_worker_action(
             capability="file.write",
-            system="web",
-            target_resource="/tmp/allowed-evidence.txt",
+            system="localhost",
+            target_resource="/home/mike/ceofile.txt",
         )
 
     with pytest.raises(
@@ -258,9 +258,9 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
             assignee_profile="ada-research",
             title="Interview synthesis",
             body="Summarize independently sourced customer evidence.",
-            capabilities=["web.read"],
-            systems=["web"],
-            toolsets=["web"],
+            capabilities=["file.read"],
+            systems=["localhost"],
+            toolsets=["files"],
             skills=[],
             budget_minor=200,
             expires_at=int(time.time()) + 1_800,
