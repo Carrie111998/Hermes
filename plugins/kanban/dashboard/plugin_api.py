@@ -567,15 +567,24 @@ class WorkInboxClarificationResponseBody(BaseModel):
     version: Literal[2]
     kind: Literal["clarification_response"]
     intake_id: str
-    response: str
+    response: str = Field(min_length=1, max_length=20_000)
     session_id: Optional[str] = None
-    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+
+
+class WorkInboxRetryBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[2]
+    kind: Literal["retry"]
+    intake_id: str
 
 
 WorkInboxBody = Annotated[
     WorkInboxNewWorkBody
     | WorkInboxAssignedDeliveryBody
-    | WorkInboxClarificationResponseBody,
+    | WorkInboxClarificationResponseBody
+    | WorkInboxRetryBody,
     Field(discriminator="kind"),
 ]
 
@@ -692,18 +701,55 @@ def submit_work_inbox(
             )
             return JSONResponse(status_code=202, content=receipt)
 
+        if isinstance(payload, WorkInboxRetryBody):
+            expected_source = (
+                f"work-inbox:{principal.provider}:{principal.principal}"
+            )
+            record = kanban_db.get_qualification_intake(conn, payload.intake_id)
+            if record is None or record["source"] != expected_source:
+                raise HTTPException(status_code=404, detail="intake not found")
+            try:
+                ok = kanban_db.retry_qualification_intake(
+                    conn, payload.intake_id
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            if not ok:
+                raise HTTPException(status_code=409, detail="retry was not scheduled")
+            kanban_intake._wake_intake_qualifier()
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "intake_id": payload.intake_id,
+                    "status": "qualification_required",
+                    "intake_status": "pending",
+                },
+            )
+
         if isinstance(payload, WorkInboxClarificationResponseBody):
             expected_source = (
                 f"work-inbox:{principal.provider}:{principal.principal}"
             )
+            safe_response = redact_sensitive_text(payload.response, force=True)
+            safe_attachments_json = redact_sensitive_text(
+                json.dumps(payload.attachments, ensure_ascii=False),
+                force=True,
+            )
+            try:
+                safe_attachments = json.loads(safe_attachments_json)
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=422,
+                    detail="clarification attachments could not be safely processed",
+                ) from None
             try:
                 ok = kanban_db.respond_to_qualification_clarification(
                     conn,
                     payload.intake_id,
                     source=expected_source,
-                    response=payload.response,
+                    response=safe_response,
                     session_id=payload.session_id,
-                    attachments=tuple(payload.attachments),
+                    attachments=tuple(safe_attachments),
                 )
             except PermissionError:
                 raise HTTPException(status_code=404, detail="intake not found") from None
@@ -711,6 +757,7 @@ def submit_work_inbox(
                 raise HTTPException(status_code=409, detail=str(exc)) from None
             if not ok:
                 raise HTTPException(status_code=409, detail="clarification was not applied")
+            kanban_intake._wake_intake_qualifier()
             return JSONResponse(
                 status_code=202,
                 content={

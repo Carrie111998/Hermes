@@ -337,20 +337,28 @@ def _validate_late_entry(
         return
     evidence_corpus = _evidence_corpus(intake)
     po_evidence = decision.get("po_evidence")
-    if (
-        isinstance(po_evidence, Mapping)
-        and po_evidence.get("surface") == "work_inbox_intake"
-        and type(po_evidence.get("run_id")) is int
-    ):
-        evidence_corpus += (
-            f"\nwork_inbox_intake_run:{po_evidence['run_id']}"
+    direct_marker = (
+        f"work_inbox_intake_run:{po_evidence['run_id']}"
+        if (
+            isinstance(po_evidence, Mapping)
+            and po_evidence.get("surface") == "work_inbox_intake"
+            and type(po_evidence.get("run_id")) is int
         )
+        else None
+    )
     for item in skipped:
         reason = item.get("reason")
         evidence = item.get("evidence")
         if not isinstance(reason, str) or not reason.strip() or not _non_empty_strings(evidence):
             errors.append("each skipped phase requires a reason and evidence")
             break
+        if (
+            direct_marker is not None
+            and entry_phase == "architecture"
+            and evidence == [direct_marker]
+            and item.get("phase") in expected
+        ):
+            continue
         missing = [reference for reference in evidence if reference not in evidence_corpus]
         if missing:
             errors.append(
@@ -613,12 +621,14 @@ def validate_decision(
     return normalized
 
 
-def _task_graph(conn: Any) -> list[dict[str, Any]]:
+def _task_graph(conn: Any, *, limit: int = 200) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT id, title, status, work_item_kind, current_step_key, assignee
-        FROM tasks WHERE status != 'archived' ORDER BY created_at, id
-        """
+        FROM tasks WHERE status != 'archived' ORDER BY created_at DESC, id
+        LIMIT ?
+        """,
+        (max(1, min(int(limit), 200)),),
     ).fetchall()
     return [dict(row) for row in rows]
 

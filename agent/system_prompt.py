@@ -186,7 +186,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _task_scoped_claude_capability = (
             "product-owner-intake"
             if os.environ.get("HERMES_WORK_INBOX_INTAKE")
-            and os.environ.get("HERMES_PROFILE") == "productowner"
             else CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(
                 (os.environ.get("HERMES_PROFILE") or "").strip()
             )

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 
 
@@ -19,14 +21,16 @@ def _strict_board(tmp_path, monkeypatch, board="po-intake"):
     return board
 
 
-def _active_intake(conn, monkeypatch, *, now=100):
+def _active_intake(
+    conn, monkeypatch, *, now=100, session_id="session-1", title="Build export"
+):
     intake_id = kb.create_qualification_intake(
         conn,
         raw_request=json.dumps(
-            {"kind": "task_create", "request": {"title": "Build export"}}
+            {"kind": "task_create", "request": {"title": title}}
         ),
         source="work-inbox",
-        session_id="session-1",
+        session_id=session_id,
         created_at=now,
     )
     run = kb.claim_qualification_intake(
@@ -323,9 +327,190 @@ def test_clarification_stays_inert_and_two_invalid_decisions_need_attention(
         )
         assert result["status"] == "needs_clarification"
         assert kb.get_qualification_intake(conn, second_id)["status"] == "needs_clarification"
-        assert kb.list_qualification_intake_events(conn, second_id)[0]["payload"][
-            "question"
-        ] == "Which customer segment?"
+        clarification = next(
+            event
+            for event in kb.list_qualification_intake_events(conn, second_id)
+            if event["kind"] == "clarification_requested"
+        )
+        assert clarification["payload"]["question"] == "Which customer segment?"
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_accepted_epic_materializes_all_stories_ready_at_architecture(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-epic")
+    conn = kb.connect(board=board)
+    _intake_id, _run = _active_intake(conn, monkeypatch)
+    proposal = _proposal()
+    proposal["work"]["item_kind"] = "epic"
+    proposal["work"]["title"] = "Export reporting"
+    proposal["routing"] = {
+        "entry_phase": None,
+        "assignee": None,
+        "epic_id": None,
+        "dependencies": [],
+    }
+    proposal.pop("entry_assessment")
+    proposal["handover"]["next_phase"] = None
+    proposal["handover"]["next_role"] = None
+    proposal["stories"] = [
+        {
+            "title": "Export data",
+            "outcome": "CSV can be generated",
+            "scope": ["CSV generation"],
+            "out_of_scope": ["Download UI"],
+            "done_when": ["CSV is valid"],
+            "depends_on": [],
+        },
+        {
+            "title": "Download export",
+            "outcome": "User can download CSV",
+            "scope": ["Download UI"],
+            "out_of_scope": ["PDF"],
+            "done_when": ["Download succeeds"],
+            "depends_on": [0],
+        },
+    ]
+    try:
+        result = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="A bounded Epic is needed",
+            proposal=proposal,
+        )
+        stories = [kb.get_task(conn, task_id) for task_id in kb.list_epic_members(
+            conn, result["task_id"]
+        )]
+    finally:
+        conn.close()
+
+    assert [(story.current_step_key, story.assignee, story.status) for story in stories] == [
+        ("architecture", "architect", "ready"),
+        ("architecture", "architect", "ready"),
+    ]
+
+
+def test_dependency_is_ignored_at_architecture_then_reapplied_at_development(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-dependencies")
+    conn = kb.connect(board=board)
+    _active_intake(conn, monkeypatch, session_id="parent", title="Parent")
+    parent_proposal = _proposal()
+    parent_proposal["work"]["title"] = "Parent"
+    parent = kanban_po_intake.decide_product_owner_intake(
+        conn,
+        board=board,
+        disposition="accepted",
+        reason="Parent is required",
+        proposal=parent_proposal,
+    )["task_id"]
+
+    _active_intake(
+        conn, monkeypatch, now=200, session_id="child", title="Child"
+    )
+    child_proposal = _proposal()
+    child_proposal["work"]["title"] = "Child"
+    child_proposal["routing"]["dependencies"] = [parent]
+    child = kanban_po_intake.decide_product_owner_intake(
+        conn,
+        board=board,
+        disposition="accepted",
+        reason="Child depends on parent implementation",
+        proposal=child_proposal,
+    )["task_id"]
+
+    assert kb.get_task(conn, child).status == "ready"
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?",
+            (child,),
+        )
+    with kb.authorized_governance_write():
+        assert kb.unblock_task(conn, child)
+    assert kb.get_task(conn, child).status == "ready"
+    claimed = kb.claim_task(conn, child, board=board, claimer="architect")
+    assert claimed is not None
+    assert kb.handoff(
+        conn,
+        child,
+        board=board,
+        summary="Architecture complete",
+        expected_run_id=claimed.current_run_id,
+        expected_phase="architecture",
+    )
+    assert (kb.get_task(conn, child).current_step_key, kb.get_task(conn, child).status) == (
+        "development",
+        "todo",
+    )
+
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+    assert kb.recompute_ready(conn) == 1
+    assert kb.get_task(conn, child).status == "ready"
+    conn.close()
+
+
+def test_materialization_failure_rolls_back_every_governance_write(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_intake, kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-rollback")
+    conn = kb.connect(board=board)
+    intake_id, run = _active_intake(conn, monkeypatch)
+    monkeypatch.setattr(
+        kanban_intake,
+        "_create_materialized_task",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected materialization failure")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="injected materialization"):
+        kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Valid but injected failure",
+            proposal=_proposal(),
+        )
+
+    assert conn.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM qualification_intake_decisions"
+    ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == "running"
+    assert kb.get_qualification_intake_run(conn, run["id"])["status"] == "running"
+    conn.close()
+
+
+def test_explicit_rejection_is_terminal_and_creates_no_card(tmp_path, monkeypatch):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-rejected")
+    conn = kb.connect(board=board)
+    intake_id, _run = _active_intake(conn, monkeypatch)
+    result = kanban_po_intake.decide_product_owner_intake(
+        conn,
+        board=board,
+        disposition="rejected",
+        reason="Conflicts with explicit product policy",
+    )
+
+    assert result["status"] == "rejected"
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == "rejected"
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert "explicitly_rejected" in [
+        event["kind"]
+        for event in kb.list_qualification_intake_events(conn, intake_id)
+    ]
+    conn.close()

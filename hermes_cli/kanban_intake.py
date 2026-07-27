@@ -743,11 +743,26 @@ def _epic_story_contract(
     phases = list(phase_assignees)
     if not phases:
         raise WorkContractError("strict board has no workflow phases")
-    entry_phase = phases[0]
+    direct_po_intake = (
+        epic_contract.get("qualification_path") == "po"
+        and epic_contract.get("po_evidence", {}).get("surface")
+        == "work_inbox_intake"
+    )
+    if direct_po_intake:
+        if "architecture" not in phases:
+            raise WorkContractError("strict board has no architecture phase")
+        entry_phase = "architecture"
+    else:
+        entry_phase = phases[0]
     assignee = phase_assignees[entry_phase]
     if assignee is None:
         raise WorkContractError("the first workflow phase must have an assignee")
-    next_phase = phases[1] if len(phases) > 1 else "done"
+    entry_index = phases.index(entry_phase)
+    next_phase = (
+        phases[entry_index + 1]
+        if entry_index + 1 < len(phases)
+        else "done"
+    )
     next_role = phase_assignees.get(next_phase)
     intake_labels = [
         label
@@ -773,11 +788,32 @@ def _epic_story_contract(
             "epic_id": epic_id,
             "dependencies": dependencies,
         },
-        "entry_assessment": {
-            "reason": "Qualified Epic member starts at the first workflow phase",
-            "skipped_phases": [],
-            "evidence": [],
-        },
+        "entry_assessment": (
+            {
+                "reason": "Product Owner intake assessment completed",
+                "skipped_phases": [
+                    {
+                        "phase": phase,
+                        "reason": "The configured Product Owner assessed the intake",
+                        "evidence": [
+                            f"work_inbox_intake_run:"
+                            f"{epic_contract['po_evidence']['run_id']}"
+                        ],
+                    }
+                    for phase in phases[:entry_index]
+                ],
+                "evidence": [
+                    f"work_inbox_intake_run:"
+                    f"{epic_contract['po_evidence']['run_id']}"
+                ],
+            }
+            if direct_po_intake
+            else {
+                "reason": "Qualified Epic member starts at the first workflow phase",
+                "skipped_phases": [],
+                "evidence": [],
+            }
+        ),
         "handover": {
             "deliverables": [story["outcome"]],
             "required_evidence": copy.deepcopy(story["done_when"]),

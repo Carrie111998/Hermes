@@ -258,6 +258,23 @@ class TestCapabilitySets:
         )
         assert not any(name.startswith("kanban_") for name in selected)
 
+    def test_capability_selection_does_not_leak_between_runs(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        task_tools = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner"}
+        )
+        intake_tools = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner-intake"}
+        )
+        task_tools_again = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner"}
+        )
+
+        assert task_tools_again == task_tools
+        assert intake_tools == m.PRODUCT_OWNER_INTAKE_TOOLS
+        assert set(task_tools).isdisjoint(intake_tools)
+
     def test_reviewer_capabilities_are_read_and_lifecycle_only(self):
         from agent.transports import hermes_tools_mcp_server as m
 

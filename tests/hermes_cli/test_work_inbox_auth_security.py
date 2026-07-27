@@ -273,6 +273,123 @@ def test_work_inbox_credential_can_observe_its_intake_status_only(
         headers={"Authorization": "Bearer wrong"},
     ).status_code == 401
 
+
+def test_same_credential_can_answer_clarification_and_retry_attention(
+    app_client, strict_board, strong_secret,
+):
+    headers = {"Authorization": f"Bearer {strong_secret}"}
+    submitted = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {"functional_intent": {"title": "Clarify me"}},
+            "session_id": "clarify-session",
+            "attachments": [{"name": "original.md"}],
+        },
+    )
+    intake_id = submitted.json()["intake_id"]
+    with kb.connect(board=strict_board) as conn:
+        run = kb.claim_qualification_intake(
+            conn,
+            intake_id,
+            profile="productowner",
+            runtime_identity={
+                "provider": "claude-cli",
+                "model": "opus",
+                "effort": "high",
+            },
+        )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            run_id=run["id"],
+            kind="clarification_requested",
+            payload={"question": "Which customer?"},
+        )
+        assert kb.finish_qualification_intake_run(
+            conn,
+            intake_id=intake_id,
+            run_id=run["id"],
+            claim_lock=run["claim_lock"],
+            intake_status="needs_clarification",
+            outcome="needs_clarification",
+        )
+
+    status = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers=headers,
+    )
+    assert status.json()["question"] == "Which customer?"
+
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={
+            "version": 2,
+            "kind": "clarification_response",
+            "intake_id": intake_id,
+            "response": "Enterprise customers",
+            "session_id": "clarify-session",
+            "attachments": [{"name": "answer.md"}],
+        },
+    )
+    assert response.status_code == 202, response.text
+    with kb.connect(board=strict_board) as conn:
+        record = kb.get_qualification_intake(conn, intake_id)
+        assert record["status"] == "pending"
+        assert record["attachments"] == [{"name": "original.md"}]
+        assert kb.list_qualification_intake_events(conn, intake_id)[-1][
+            "payload"
+        ]["response"] == "Enterprise customers"
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'attention_required' "
+            "WHERE id = ?",
+            (intake_id,),
+        )
+
+    retried = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={"version": 2, "kind": "retry", "intake_id": intake_id},
+    )
+    assert retried.status_code == 202, retried.text
+    with kb.connect(board=strict_board) as conn:
+        assert kb.get_qualification_intake(conn, intake_id)["status"] == "pending"
+        assert kb.list_qualification_intake_events(conn, intake_id)[-1][
+            "kind"
+        ] == "retry_scheduled"
+
+
+def test_clarification_response_cannot_cross_intake_source(
+    app_client, strict_board, strong_secret,
+):
+    with kb.connect(board=strict_board) as conn:
+        intake_id = kb.create_qualification_intake(
+            conn,
+            raw_request='{"kind":"task_create","request":{"title":"Foreign"}}',
+            source="work-inbox:other:principal",
+        )
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'needs_clarification' "
+            "WHERE id = ?",
+            (intake_id,),
+        )
+
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers={"Authorization": f"Bearer {strong_secret}"},
+        json={
+            "version": 2,
+            "kind": "clarification_response",
+            "intake_id": intake_id,
+            "response": "Do not accept",
+        },
+    )
+    assert response.status_code == 404
+
     with kb.connect(board=strict_board) as conn:
         private_intake = kb.create_qualification_intake(
             conn,

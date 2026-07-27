@@ -183,7 +183,7 @@ def _check_work_inbox_mode() -> bool:
         os.environ.get("HERMES_WORK_INBOX_INTAKE")
         and os.environ.get("HERMES_WORK_INBOX_RUN_ID")
         and os.environ.get("HERMES_WORK_INBOX_CLAIM_LOCK")
-        and os.environ.get("HERMES_PROFILE") == "productowner"
+        and os.environ.get("HERMES_PROFILE")
     ):
         return False
     capability = os.environ.get("HERMES_MCP_CAPABILITY_SET")

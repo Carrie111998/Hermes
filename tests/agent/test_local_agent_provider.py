@@ -723,9 +723,11 @@ def test_task_scoped_claude_rejects_unapproved_profile(
         )
 
 
+@pytest.mark.parametrize("profile", ["productowner", "custom-product-owner"])
 def test_work_inbox_claude_selects_intake_only_mcp_capability(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    profile: str,
 ) -> None:
     from agent.local_agent_provider import _task_scoped_claude_options
 
@@ -738,7 +740,7 @@ def test_work_inbox_claude_selects_intake_only_mcp_capability(
         "HERMES_KANBAN_DB": str(tmp_path / "kanban.db"),
         "HERMES_KANBAN_BOARD": "product",
         "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
-        "HERMES_PROFILE": "productowner",
+        "HERMES_PROFILE": profile,
     }
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     for key, value in values.items():

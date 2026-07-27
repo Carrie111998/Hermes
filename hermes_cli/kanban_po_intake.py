@@ -49,11 +49,19 @@ def dispatch_product_owner_intake(
     intake_id: str,
     spawn_fn: Optional[Callable[..., Optional[int]]] = None,
     now: Optional[int] = None,
+    failure_limit: int = kanban_db.DEFAULT_FAILURE_LIMIT,
 ) -> dict[str, Any]:
     """Claim and launch one direct Product Owner attempt without waiting."""
 
+    metadata = kanban_db.read_board_metadata(board)
+    phase_assignees = (
+        (metadata.get("qualification") or {}).get("phase_assignees") or {}
+    )
+    profile = str(
+        phase_assignees.get("backlog") or PRODUCT_OWNER_PROFILE
+    ).strip()
     identity = kanban_db.resolve_profile_runtime_identity(
-        PRODUCT_OWNER_PROFILE,
+        profile,
         source="work_inbox_intake",
         surface="work_inbox_intake",
     )
@@ -64,7 +72,7 @@ def dispatch_product_owner_intake(
     run = kanban_db.claim_qualification_intake(
         conn,
         intake_id,
-        profile=PRODUCT_OWNER_PROFILE,
+        profile=profile,
         runtime_identity=identity,
         now=now,
     )
@@ -83,14 +91,14 @@ def dispatch_product_owner_intake(
             ):
                 raise RuntimeError("Product Owner intake claim changed during spawn")
     except Exception as exc:
-        kanban_db.finish_qualification_intake_run(
+        kanban_db.fail_qualification_intake_run(
             conn,
             intake_id=intake_id,
             run_id=int(run["id"]),
             claim_lock=str(run["claim_lock"]),
-            intake_status="pending",
             outcome="spawn_failed",
             error=str(exc),
+            failure_limit=failure_limit,
             now=now,
         )
         raise
@@ -112,7 +120,7 @@ def _spawn_product_owner_intake(
 
     from hermes_cli.profiles import resolve_profile_env
 
-    profile = PRODUCT_OWNER_PROFILE
+    profile = str(run.get("profile") or PRODUCT_OWNER_PROFILE)
     env = dict(os.environ)
     for name in (
         "HERMES_KANBAN_TASK",
@@ -211,6 +219,7 @@ def active_intake_scope(conn) -> tuple[str, dict[str, Any], str]:
         or run["intake_id"] != intake_id
         or run["claim_lock"] != claim_lock
         or run["status"] != "running"
+        or run["profile"] != os.environ.get("HERMES_PROFILE")
     ):
         raise ValueError("Work Inbox intake authority is stale or does not match")
     current = conn.execute(
@@ -338,6 +347,51 @@ def decide_product_owner_intake(
 
     intake = kanban_db.get_qualification_intake(conn, intake_id)
     metadata = kanban_db.read_board_metadata(board)
+
+    def invalid_decision(errors: list[str]) -> dict[str, Any]:
+        with kanban_db.write_txn(conn):
+            updated = conn.execute(
+                "UPDATE qualification_intake_runs "
+                "SET validation_attempts = validation_attempts + 1 "
+                "WHERE id = ? AND status = 'running'",
+                (int(run["id"]),),
+            )
+            attempts_row = conn.execute(
+                "SELECT validation_attempts FROM qualification_intake_runs WHERE id = ?",
+                (int(run["id"]),),
+            ).fetchone()
+            attempts = int(attempts_row["validation_attempts"])
+            kanban_db.append_qualification_intake_event(
+                conn,
+                intake_id=intake_id,
+                run_id=int(run["id"]),
+                kind="validation_rejected",
+                payload={"errors": errors, "attempt": attempts},
+            )
+            landed = "invalid"
+            if updated.rowcount == 1 and attempts >= 2:
+                if kanban_db.finish_qualification_intake_run(
+                    conn,
+                    intake_id=intake_id,
+                    run_id=int(run["id"]),
+                    claim_lock=claim_lock,
+                    intake_status="attention_required",
+                    outcome="invalid_decision",
+                    error="; ".join(errors),
+                ):
+                    landed = "attention_required"
+                    kanban_db.append_qualification_intake_event(
+                        conn,
+                        intake_id=intake_id,
+                        run_id=int(run["id"]),
+                        kind="attention_required",
+                        payload={
+                            "reason": "invalid_decision",
+                            "attempt": attempts,
+                        },
+                    )
+        return {"status": landed, "errors": errors, "attempt": attempts}
+
     decision = copy.deepcopy(proposal)
     decision["qualification_path"] = "po"
     decision["po_evidence"] = {
@@ -347,6 +401,15 @@ def decide_product_owner_intake(
     work = decision.get("work") if isinstance(decision.get("work"), dict) else {}
     if work.get("item_kind") != "epic":
         phase_assignees = metadata["qualification"]["phase_assignees"]
+        phases = list(phase_assignees)
+        if "architecture" not in phases:
+            raise ValueError("board policy has no architecture phase")
+        architecture_index = phases.index("architecture")
+        next_phase = (
+            phases[architecture_index + 1]
+            if architecture_index + 1 < len(phases)
+            else "done"
+        )
         decision["routing"] = {
             **(
                 decision.get("routing")
@@ -361,10 +424,11 @@ def decide_product_owner_intake(
             "reason": "Product Owner intake assessment completed",
             "skipped_phases": [
                 {
-                    "phase": "backlog",
+                    "phase": phase,
                     "reason": "The configured Product Owner assessed the intake",
                     "evidence": [marker],
                 }
+                for phase in phases[:architecture_index]
             ],
             "evidence": [marker],
         }
@@ -375,9 +439,18 @@ def decide_product_owner_intake(
         )
         decision["handover"] = {
             **handover,
-            "next_phase": "development",
-            "next_role": phase_assignees["development"],
+            "next_phase": next_phase,
+            "next_role": phase_assignees.get(next_phase),
         }
+    else:
+        decision.setdefault(
+            "entry_assessment",
+            {
+                "reason": "Epic container has no executable phase",
+                "skipped_phases": [],
+                "evidence": [],
+            },
+        )
     try:
         validated = kanban_qualifier.validate_decision(
             conn,
@@ -386,32 +459,7 @@ def decide_product_owner_intake(
             decision=decision,
         )
     except kanban_qualifier.QualificationValidationError as exc:
-        with kanban_db.write_txn(conn):
-            updated = conn.execute(
-                "UPDATE qualification_intake_runs "
-                "SET validation_attempts = validation_attempts + 1 "
-                "WHERE id = ? AND status = 'running'",
-                (int(run["id"]),),
-            )
-            attempts = conn.execute(
-                "SELECT validation_attempts FROM qualification_intake_runs WHERE id = ?",
-                (int(run["id"]),),
-            ).fetchone()["validation_attempts"]
-            if updated.rowcount == 1 and attempts >= 2:
-                kanban_db.finish_qualification_intake_run(
-                    conn,
-                    intake_id=intake_id,
-                    run_id=int(run["id"]),
-                    claim_lock=claim_lock,
-                    intake_status="attention_required",
-                    outcome="invalid_decision",
-                    error="; ".join(exc.errors),
-                )
-        return {
-            "status": "attention_required" if attempts >= 2 else "invalid",
-            "errors": list(exc.errors),
-            "attempt": attempts,
-        }
+        return invalid_decision(list(exc.errors))
 
     contract = {
         "version": int(metadata["qualification"].get("contract_version", 1)),
@@ -446,7 +494,10 @@ def decide_product_owner_intake(
     }
     if validated["work"]["item_kind"] == "epic":
         contract["stories"] = copy.deepcopy(validated["stories"])
-    signed = kanban_intake.sign_work_contract(contract)
+    try:
+        signed = kanban_intake.sign_work_contract(contract)
+    except kanban_intake.WorkContractError as exc:
+        return invalid_decision([str(exc)])
     with kanban_db.write_txn(conn):
         task_id = kanban_intake.materialize_contract(
             conn, board=board, signed_contract=signed

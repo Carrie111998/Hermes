@@ -255,16 +255,20 @@ def test_intake_run_claim_heartbeat_events_and_explicit_retry(conn):
         now=126,
     )
 
-    assert kb.list_qualification_intake_events(conn, intake_id) == [
-        {
-            "id": event_id,
-            "intake_id": intake_id,
-            "run_id": run["id"],
-            "kind": "clarification_requested",
-            "payload": {"question": "Which customer?"},
-            "created_at": 125,
-        }
+    events = kb.list_qualification_intake_events(conn, intake_id)
+    assert [event["kind"] for event in events] == [
+        "submitted",
+        "claimed",
+        "clarification_requested",
     ]
+    assert events[-1] == {
+        "id": event_id,
+        "intake_id": intake_id,
+        "run_id": run["id"],
+        "kind": "clarification_requested",
+        "payload": {"question": "Which customer?"},
+        "created_at": 125,
+    }
     assert kb.get_qualification_intake(conn, intake_id)["status"] == "needs_clarification"
     assert kb.get_qualification_intake_run(conn, run["id"])["status"] == "completed"
 
@@ -318,6 +322,131 @@ def test_legacy_intake_schema_migrates_without_losing_rows(tmp_path):
         assert kb.get_qualification_intake(migrated, "qi_legacy")["status"] == "running"
     finally:
         migrated.close()
+
+
+def test_stale_intake_runs_retry_once_then_require_attention(conn):
+    intake_id = kb.create_qualification_intake(
+        conn, raw_request="recover me", source="chat", created_at=10
+    )
+    runtime = {"provider": "claude-cli", "model": "opus", "effort": "high"}
+
+    first = kb.claim_qualification_intake(
+        conn,
+        intake_id,
+        profile="productowner",
+        runtime_identity=runtime,
+        lease_seconds=5,
+        now=20,
+    )
+    assert kb.recover_stale_qualification_intakes(
+        conn,
+        failure_limit=2,
+        now=26,
+        pid_alive=lambda _pid: False,
+    ) == {"retried": 1, "attention_required": 0}
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == "pending"
+    assert kb.get_qualification_intake_run(conn, first["id"])["outcome"] == "reclaimed"
+
+    second = kb.claim_qualification_intake(
+        conn,
+        intake_id,
+        profile="productowner",
+        runtime_identity=runtime,
+        lease_seconds=5,
+        now=30,
+    )
+    assert kb.recover_stale_qualification_intakes(
+        conn,
+        failure_limit=2,
+        now=36,
+        pid_alive=lambda _pid: False,
+    ) == {"retried": 0, "attention_required": 1}
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == "attention_required"
+    assert kb.get_qualification_intake_run(conn, second["id"])["outcome"] == "reclaimed"
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_interrupted_modern_table_migration_recovers_orphaned_legacy_rows(tmp_path):
+    db_path = tmp_path / "interrupted.db"
+    conn = kb.connect(db_path)
+    intake_id = kb.create_qualification_intake(
+        conn, raw_request="preserve me", source="chat"
+    )
+    conn.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        DROP TRIGGER IF EXISTS qualification_intake_no_delete;
+        CREATE TABLE qualification_intake_legacy AS
+            SELECT id, raw_request, source, session_id, attachments_json,
+                   status, created_at, updated_at
+            FROM qualification_intake;
+        DELETE FROM qualification_intake;
+        """
+    )
+    raw.close()
+
+    kb.init_db(db_path)
+    recovered = kb.connect(db_path)
+    try:
+        assert kb.get_qualification_intake(recovered, intake_id)["raw_request"] == "preserve me"
+        assert recovered.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='qualification_intake_legacy'"
+        ).fetchone() is None
+    finally:
+        recovered.close()
+
+
+def test_terminal_intake_cannot_be_reopened_without_a_new_terminal_decision(conn):
+    intake_id = kb.create_qualification_intake(
+        conn, raw_request="reject me", source="chat"
+    )
+    kb.record_qualification_decision(
+        conn,
+        intake_id=intake_id,
+        decision="rejected",
+        actor_profile="productowner",
+        reason="not product work",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be reopened"):
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'pending' WHERE id = ?",
+            (intake_id,),
+        )
+
+
+def test_divergent_intake_heartbeat_rolls_back_run_lease(conn):
+    intake_id = kb.create_qualification_intake(
+        conn, raw_request="heartbeat", source="chat", created_at=10
+    )
+    run = kb.claim_qualification_intake(
+        conn,
+        intake_id,
+        profile="productowner",
+        runtime_identity={"provider": "claude-cli", "model": "opus", "effort": "high"},
+        lease_seconds=10,
+        now=20,
+    )
+    original_expiry = run["claim_expires"]
+    conn.execute(
+        "UPDATE qualification_intake SET claim_lock = 'changed' WHERE id = ?",
+        (intake_id,),
+    )
+
+    with pytest.raises(RuntimeError, match="changed during heartbeat"):
+        kb.heartbeat_qualification_intake(
+            conn,
+            intake_id=intake_id,
+            run_id=run["id"],
+            claim_lock=run["claim_lock"],
+            lease_seconds=50,
+            now=25,
+        )
+
+    assert kb.get_qualification_intake_run(conn, run["id"])["claim_expires"] == original_expiry
 
 
 @pytest.mark.parametrize("decision", ["qualified", "rejected", "overridden"])

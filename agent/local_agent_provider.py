@@ -173,7 +173,7 @@ def _task_scoped_claude_options(
 
     capability_set = (
         "product-owner-intake"
-        if intake_scoped and profile == "productowner"
+        if intake_scoped
         else CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
     )
     if capability_set is None:
@@ -425,7 +425,6 @@ def run_cli_acting(
         capability_set = (
             "product-owner-intake"
             if os.environ.get("HERMES_WORK_INBOX_INTAKE")
-            and profile == "productowner"
             else CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
         )
     effective_timeout = float(timeout) if timeout is not None else provider_timeout(provider)

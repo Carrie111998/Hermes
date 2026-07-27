@@ -33,6 +33,7 @@ def _process_pending_qualification_intakes(
     board: str,
     per_tick: int,
     qualify=None,
+    failure_limit: Optional[int] = None,
 ) -> dict[str, int]:
     """Process a bounded pending-intake batch before normal dispatch."""
 
@@ -40,6 +41,16 @@ def _process_pending_qualification_intakes(
     if route_directly:
         from hermes_cli.kanban_po_intake import route_pending_intake
 
+    recover = getattr(_kb, "recover_stale_qualification_intakes", None)
+    if callable(recover):
+        recover(
+            conn,
+            failure_limit=(
+                int(failure_limit)
+                if failure_limit is not None
+                else int(getattr(_kb, "DEFAULT_FAILURE_LIMIT", 2))
+            ),
+        )
     limit = max(1, int(per_tick))
     pending = _kb.list_qualification_intakes(conn, status="pending")[:limit]
     counts = {"attempted": 0, "qualified": 0, "rejected": 0, "failed": 0}
@@ -85,6 +96,7 @@ def _qualify_then_dispatch(
         board=slug,
         per_tick=qualification_per_tick,
         qualify=qualify,
+        failure_limit=dispatch_kwargs.get("failure_limit"),
     )
     return _dispatch_once_then_reconcile(
         _kb, conn, slug, **dispatch_kwargs
