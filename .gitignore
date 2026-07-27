@@ -185,3 +185,6 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+
+# Graphify output
+graphify-out/
