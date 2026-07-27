@@ -126,6 +126,76 @@ class TestToolProgressCallback:
             step_cb(2, [{"name": "terminal", "result": "ok-2"}])
             assert "terminal" not in tool_call_ids
 
+    def test_tool_completed_emits_update_without_next_step(self, mock_conn, event_loop_fixture):
+        """A tool completing in the last step of a turn must still be closed.
+
+        make_step_cb only reports the *previous* step's tools, so tools of the
+        final step before the answer never got a terminal update and stayed
+        pending in the client UI.
+        """
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+
+            cb("tool.started", "read_file", None, {"path": "/etc/hosts"})
+            assert len(tool_call_ids["read_file"]) == 1
+            mock_rcts.reset_mock()
+
+            cb("tool.completed", "read_file", None, None, result="127.0.0.1 localhost")
+
+        mock_rcts.assert_called_once()
+        assert "read_file" not in tool_call_ids
+        assert tool_call_meta == {}
+
+    def test_tool_completed_and_step_cb_do_not_double_report(self, mock_conn, event_loop_fixture):
+        """Both completion paths share the FIFO entry — the second is a no-op."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+
+        progress_cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+        step_cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+
+            progress_cb("tool.started", "terminal", "$ ls", {"command": "ls"})
+            mock_rcts.reset_mock()
+
+            progress_cb("tool.completed", "terminal", None, None, result="ok")
+            assert mock_rcts.call_count == 1
+
+            # The next step still lists the tool — must not emit a second update.
+            step_cb(1, [{"name": "terminal", "result": "ok"}])
+
+        assert mock_rcts.call_count == 1
+
+    def test_tool_completed_without_start_is_ignored(self, mock_conn, event_loop_fixture):
+        """A completion with no matching start must not invent a tool call."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+
+            cb("tool.completed", "terminal", None, None, result="ok")
+
+        mock_rcts.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Thinking callback

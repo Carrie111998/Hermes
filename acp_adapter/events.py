@@ -125,14 +125,43 @@ def make_tool_progress_cb(
 
         tool_progress_callback(event_type: str, name: str, preview: str, args: dict, **kwargs)
 
-    Emits ``ToolCallStart`` for ``tool.started`` events and tracks IDs in a FIFO
-    queue per tool name so duplicate/parallel same-name calls still complete
-    against the correct ACP tool call.  Other event types (``tool.completed``,
-    ``reasoning.available``) are silently ignored.
+    Emits ``ToolCallStart`` for ``tool.started`` and ``ToolCallUpdate`` for
+    ``tool.completed``, tracking IDs in a FIFO queue per tool name so
+    duplicate/parallel same-name calls still complete against the correct ACP
+    tool call.  Other event types (``reasoning.available``) are ignored.
+
+    Completion is also emitted by ``make_step_cb`` from the *next* step's
+    ``prev_tools`` list.  Both paths consume the same FIFO entry, so whichever
+    fires first wins and the other becomes a no-op — no duplicate updates.
+    Handling ``tool.completed`` here is what closes tools of the **last** step
+    of a turn: there is no next step to carry them, so before this they stayed
+    pending forever in the client's UI.
     """
 
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
-        # Only emit ACP ToolCallStart for tool.started; ignore other event types
+        if event_type == "tool.completed":
+            queue = tool_call_ids.get(name or "")
+            if isinstance(queue, str):
+                queue = deque([queue])
+                tool_call_ids[name] = queue
+            if not queue:
+                # No matching start, or make_step_cb already completed it.
+                return
+            tc_id = queue.popleft()
+            meta = tool_call_meta.pop(tc_id, {})
+            if not queue:
+                tool_call_ids.pop(name, None)
+            result = kwargs.get("result")
+            update = build_tool_complete(
+                tc_id,
+                name,
+                result=str(result) if result is not None else None,
+                function_args=meta.get("args"),
+                snapshot=meta.get("snapshot"),
+            )
+            _send_update(conn, session_id, loop, update)
+            return
+
         if event_type != "tool.started":
             return
         if isinstance(args, str):
