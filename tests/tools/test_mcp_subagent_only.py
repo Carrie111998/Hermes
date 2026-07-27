@@ -148,10 +148,14 @@ def test_get_tool_definitions_cache_key_isolation(monkeypatch):
     monkeypatch.setattr("tools.registry.registry", reg)
     monkeypatch.setattr("model_tools.registry", reg)
 
+    # skip_tool_search_assembly=True: test scoping at the registry level,
+    # not tiered-disclosure bridge behavior (tested separately in tool_search tests).
     main_defs = get_tool_definitions(
-        enabled_toolsets=["mcp-srv"], quiet_mode=True, include_subagent_only=False)
+        enabled_toolsets=["mcp-srv"], quiet_mode=True, include_subagent_only=False,
+        skip_tool_search_assembly=True)
     child_defs = get_tool_definitions(
-        enabled_toolsets=["mcp-srv"], quiet_mode=True, include_subagent_only=True)
+        enabled_toolsets=["mcp-srv"], quiet_mode=True, include_subagent_only=True,
+        skip_tool_search_assembly=True)
 
     main_names = {d["function"]["name"] for d in main_defs}
     child_names = {d["function"]["name"] for d in child_defs}
