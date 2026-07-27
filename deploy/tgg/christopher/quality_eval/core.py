@@ -539,7 +539,22 @@ class Judge:
                 captures["portal_screenshot"],
                 "-",
             ]
-            result = self.command(argv, input=prompt, capture_output=True)
+            # `codex exec` inherits CODEX_THREAD_ID in managed sessions and
+            # otherwise resumes the maker's thread. Remove only session
+            # bindings so the checker is a genuinely fresh vision seat while
+            # retaining the configured Codex home and credentials.
+            checker_env = os.environ.copy()
+            for key in (
+                "CODEX_THREAD_ID",
+                "MARSHAL_SESSION_ID",
+                "MARSHAL_SPAWNED_BY",
+                "CLAUDE_SESSION_ID",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_CODE_BRIDGE_SESSION_ID",
+                "CLAUDE_CODE_CHILD_SESSION",
+            ):
+                checker_env.pop(key, None)
+            result = self.command(argv, input=prompt, capture_output=True, env=checker_env)
             if result.returncode:
                 raise EvalError(f"vision judge failed: {result.stderr.strip()}")
             checker_id = None

@@ -252,6 +252,43 @@ def test_injected_judge_command_receives_paths_and_is_strict(tmp_path):
     assert seen["request"]["maker_session_id"] == "maker-1"
 
 
+def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text("{}")
+    screen = tmp_path / "screen.png"
+    screen.write_bytes(b"png")
+    monkeypatch.setenv("CODEX_THREAD_ID", "maker-thread")
+    monkeypatch.setenv("MARSHAL_SESSION_ID", "maker-thread")
+    seen = {}
+
+    def command(argv, **kwargs):
+        seen["env"] = kwargs["env"]
+        output = Path(argv[argv.index("--output-last-message") + 1])
+        output.write_text(json.dumps(judgment("ignored-model-value")))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps({"type": "thread.started", "thread_id": "fresh-checker"}) + "\n",
+            "",
+        )
+
+    result = core.Judge(command=command).judge(
+        bundle,
+        {
+            "screenshot": str(screen),
+            "portal_screenshot": str(screen),
+            "snapshot": str(bundle),
+            "portal_snapshot": str(bundle),
+            "url": core.case_url("AM/JOB/2607/0001"),
+        },
+        core.load_registry(),
+        "maker-thread",
+    )
+    assert result["checker_session_id"] == "fresh-checker"
+    assert "CODEX_THREAD_ID" not in seen["env"]
+    assert "MARSHAL_SESSION_ID" not in seen["env"]
+
+
 def test_defect_filing_dedupes_locally(tmp_path):
     store = core.StateStore(tmp_path)
     calls = []
