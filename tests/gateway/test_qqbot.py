@@ -2254,3 +2254,97 @@ class TestReadEventsClosedWsGuard:
         adapter._ws = None
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
+
+
+# ---------------------------------------------------------------------------
+# Reconnect-exhaustion hand-off (regression: silent adapter death)
+# ---------------------------------------------------------------------------
+
+class TestReconnectExhaustionHandoff:
+    """Regression: when reconnect attempts are exhausted, _listen_loop must hand
+    off to the gateway reconnect watcher (a retryable fatal error plus a
+    scheduled notify task) instead of silently calling _mark_disconnected() and
+    leaving the listener task dead with nothing watching it.
+
+    Covers all three exhaustion paths in _listen_loop:
+      1. generic Exception handler
+      2. QQCloseError generic reconnect/backoff path
+      3. rate-limited (4008) path
+    """
+
+    def _make_adapter(self):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    def _arm(self, adapter, monkeypatch, *, max_attempts):
+        import gateway.platforms.qqbot.adapter as qq_adapter
+        monkeypatch.setattr(qq_adapter, "MAX_RECONNECT_ATTEMPTS", max_attempts)
+        # Neutralize quick-disconnect detection so a synthetic instant failure
+        # can't divert into the qq_quick_disconnect branch.
+        monkeypatch.setattr(qq_adapter, "QUICK_DISCONNECT_THRESHOLD", -1.0)
+        adapter._running = True
+        adapter._mark_transport_disconnected = mock.Mock()
+        adapter._fail_pending = mock.Mock()
+        adapter._mark_disconnected = mock.Mock()
+        adapter._set_fatal_error = mock.Mock()
+        adapter._notify_fatal_error = mock.AsyncMock()
+
+    async def _assert_handoff(self, adapter):
+        # A retryable-fatal error was set so the gateway watcher takes over.
+        adapter._set_fatal_error.assert_called_once()
+        args, kwargs = adapter._set_fatal_error.call_args
+        assert args[0] == "qq_reconnect_exhausted"
+        assert kwargs.get("retryable") is True
+        # The old silent-death path must NOT be taken.
+        adapter._mark_disconnected.assert_not_called()
+        # Notify is scheduled as a detached task (not awaited inline) so the
+        # listen loop can finish before disconnect() cancels this task.
+        assert adapter._fatal_notify_task is not None
+        await adapter._fatal_notify_task
+        adapter._notify_fatal_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_exhaustion_hands_off(self, monkeypatch):
+        adapter = self._make_adapter()
+        self._arm(adapter, monkeypatch, max_attempts=0)
+        adapter._read_events = mock.AsyncMock(side_effect=RuntimeError("boom"))
+        adapter._reconnect = mock.AsyncMock(return_value=False)
+
+        await adapter._listen_loop()
+
+        await self._assert_handoff(adapter)
+
+    @pytest.mark.asyncio
+    async def test_qqclose_reconnect_exhaustion_hands_off(self, monkeypatch):
+        from gateway.platforms.qqbot.adapter import QQCloseError
+        adapter = self._make_adapter()
+        self._arm(adapter, monkeypatch, max_attempts=1)
+        # 4009 is a non-fatal, session-preserving close code, so it falls
+        # through to the generic reconnect/backoff path at the bottom of the
+        # QQCloseError handler.
+        adapter._read_events = mock.AsyncMock(
+            side_effect=QQCloseError(4009, "timeout")
+        )
+        adapter._reconnect = mock.AsyncMock(return_value=False)
+
+        await adapter._listen_loop()
+
+        await self._assert_handoff(adapter)
+        adapter._reconnect.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_exhaustion_hands_off(self, monkeypatch):
+        from gateway.platforms.qqbot.adapter import QQCloseError
+        adapter = self._make_adapter()
+        self._arm(adapter, monkeypatch, max_attempts=0)
+        # 4008 = rate limited; with attempts already exhausted the handler must
+        # hand off before sleeping RATE_LIMIT_DELAY (no extra reconnect).
+        adapter._read_events = mock.AsyncMock(
+            side_effect=QQCloseError(4008, "rate limited")
+        )
+        adapter._reconnect = mock.AsyncMock(return_value=False)
+
+        await adapter._listen_loop()
+
+        await self._assert_handoff(adapter)
+        adapter._reconnect.assert_not_awaited()
