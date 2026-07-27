@@ -217,6 +217,18 @@ def _run_setup_browser(assume_yes: bool = False) -> int:
 
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
+    # Same guard as ``hermes_cli.main:main``.  ``hermes-acp`` is its own
+    # [project.scripts] entry point and did not cross it, so it could drive a
+    # full agent session — session store included — on an unsupported
+    # interpreter linking WAL-vulnerable SQLite.  Only the import is defensive:
+    # a guard that silently no-ops is the bug it exists to prevent.
+    try:
+        from hermes_cli.runtime_guard import enforce as _enforce_runtime
+    except Exception:
+        _enforce_runtime = None
+    if _enforce_runtime is not None:
+        _enforce_runtime()
+
     args = _parse_args(argv)
     if args.version:
         _print_version()

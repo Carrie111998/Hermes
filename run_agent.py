@@ -6130,13 +6130,74 @@ class AIAgent:
         from agent.chat_completion_helpers import build_api_kwargs
         return build_api_kwargs(self, api_messages)
 
+    def _reasoning_passthrough_override(self) -> Optional[bool]:
+        """Operator opt-in/out for sending reasoning effort on this route.
+
+        Cached per agent: config is read once, and a read failure resolves to
+        None (auto-detect) so a broken config can never force a field onto a
+        provider that rejects it.
+        """
+        cached = getattr(self, "_reasoning_passthrough_cached", "unset")
+        if cached != "unset":
+            return cached
+        override: Optional[bool] = None
+        try:
+            from agent.reasoning_status import passthrough_override
+            from hermes_cli.config import load_config
+
+            override = passthrough_override(load_config())
+        except Exception as exc:
+            logger.debug("reasoning passthrough override unavailable: %s", exc)
+        self._reasoning_passthrough_cached = override
+        return override
+
+    def reasoning_status(self) -> dict:
+        """Structured truth about whether reasoning effort reaches the provider.
+
+        Side-effect free, safe to call from diagnostics. Exists because every
+        other surface reports the *configured* effort, which is not the same as
+        the effort actually transmitted.
+        """
+        from agent.reasoning_status import configured_effort, describe
+
+        cfg = {}
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+        configured = configured_effort(cfg)
+        if configured is None and isinstance(getattr(self, "reasoning_config", None), dict):
+            configured = str(self.reasoning_config.get("effort") or "") or None
+        return describe(
+            configured=configured,
+            supported=self._supports_reasoning_extra_body(),
+            provider=str(self.provider or ""),
+            model=str(self.model or ""),
+            base_url=str(getattr(self, "_base_url_lower", "") or ""),
+            override=self._reasoning_passthrough_override(),
+        )
+
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
         OpenRouter forwards unknown extra_body fields to upstream providers.
         Some providers/routes reject `reasoning` with 400s, so gate it to
         known reasoning-capable model families and direct Nous Portal.
+
+        ``agent.reasoning_passthrough`` overrides the auto-detection in either
+        direction. Without it, a self-hosted endpoint (a LiteLLM proxy on
+        127.0.0.1, say) falls through every branch below to ``return False``,
+        so a configured ``reasoning_effort`` is silently discarded with no
+        signal anywhere — see agent/reasoning_status.py. The override
+        authorizes a standard OpenAI-compatible field on a route Hermes cannot
+        probe; it never invents a provider-specific parameter, and leaving it
+        unset preserves the historical behaviour exactly.
         """
+        _override = self._reasoning_passthrough_override()
+        if _override is not None:
+            return _override
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
         if (
@@ -6822,9 +6883,23 @@ def main(
     Toolset Examples:
         - "research": Web search, extract, crawl + vision tools
     """
+    # Same guard as ``hermes_cli.main:main`` — this is the ``hermes-agent``
+    # console script, a separate [project.scripts] entry point that never
+    # crossed it.  It reaches SessionDB (``from hermes_state import SessionDB``
+    # below), so on the 3.14 interpreter that ``hermes`` resolves to it opened
+    # already-WAL databases with a SQLite build carrying the WAL-reset bug —
+    # exactly what the guard exists to stop, one door down.  Only the import is
+    # defensive: a guard that silently no-ops is the bug it exists to prevent.
+    try:
+        from hermes_cli.runtime_guard import enforce as _enforce_runtime
+    except Exception:
+        _enforce_runtime = None
+    if _enforce_runtime is not None:
+        _enforce_runtime()
+
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
-    
+
     # Handle tool listing
     if list_tools:
         from model_tools import get_all_tool_names, get_available_toolsets

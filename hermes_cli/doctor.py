@@ -900,6 +900,51 @@ def run_doctor(args):
         except ImportError:
             check_warn(name, "(optional, not installed)")
     
+    _section("Reasoning Effort")
+    # Report the EFFECTIVE effort, not the configured one. The wire gate
+    # (AIAgent._supports_reasoning_extra_body) is an allowlist of routes known
+    # to accept a reasoning field; on any other route a configured
+    # reasoning_effort is dropped, and until this check existed nothing
+    # anywhere said so.
+    try:
+        from agent.reasoning_status import (
+            configured_effort,
+            describe as _describe_reasoning,
+            passthrough_override,
+        )
+
+        from hermes_cli.config import load_config as _load_cfg
+
+        _rcfg = _load_cfg() or {}
+        _effort = configured_effort(_rcfg)
+        _model_cfg = _rcfg.get("model") if isinstance(_rcfg.get("model"), dict) else {}
+        _base = str((_model_cfg or {}).get("base_url") or _rcfg.get("base_url") or "").lower()
+        _prov = str((_model_cfg or {}).get("provider") or _rcfg.get("provider") or "")
+        _override = passthrough_override(_rcfg)
+        # Mirror the gate's route allowlist without importing the agent.
+        _auto = any(host in _base for host in (
+            "nousresearch.com", "openrouter", "models.github.ai",
+            "githubcopilot.com", "ollama.com",
+        )) or _prov.strip().lower() == "lmstudio"
+        _supported = _override if _override is not None else _auto
+        _status = _describe_reasoning(
+            configured=_effort, supported=_supported, provider=_prov,
+            model=str((_model_cfg or {}).get("default") or ""), base_url=_base,
+            override=_override,
+        )
+        if not _effort:
+            check_info("No reasoning effort configured (provider default applies)")
+        elif _status["will_be_sent"]:
+            check_ok(f"Reasoning effort {_effort!r} is sent to the provider")
+        else:
+            check_warn(
+                f"Reasoning effort {_effort!r} is configured but NOT sent",
+                _status["reason"] or "",
+            )
+        check_info(f"Route: provider={_prov or 'unset'} base_url={_base or 'unset'}")
+    except Exception as e:
+        check_warn(f"Reasoning-effort probe failed: {e}")
+
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()

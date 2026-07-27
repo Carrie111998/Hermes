@@ -140,3 +140,39 @@ def test_cli_main_invokes_the_guard():
     source = (REPO_ROOT / "hermes_cli" / "main.py").read_text(encoding="utf-8")
     assert "runtime_guard" in source, "hermes_cli/main.py no longer imports runtime_guard"
     assert re.search(r"_enforce_runtime\s*\(", source), "runtime_guard.enforce() is never called"
+
+
+# ── every console script must cross the guard, not just `hermes` ─────────────
+
+def test_every_console_script_enforces_the_guard():
+    """Each [project.scripts] entry point must call ``runtime_guard.enforce``.
+
+    The guard originally landed only in ``hermes_cli.main:main``. The other two
+    entry points -- ``hermes-agent`` (run_agent:main) and ``hermes-acp``
+    (acp_adapter.entry:main) -- were installed on the 3.14 interpreter that
+    ``hermes`` resolves to, exited 0 there, and reach SessionDB. A guard on one
+    of three doors is not a guard; this test fails if a new entry point is added
+    without one.
+    """
+    import tomllib
+
+    pyproject = REPO_ROOT / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts, "no [project.scripts] found -- test is looking in the wrong place"
+
+    unguarded = []
+    for name, target in scripts.items():
+        module_path, _, func = target.partition(":")
+        src_file = REPO_ROOT / (module_path.replace(".", "/") + ".py")
+        if not src_file.is_file():
+            pkg_init = REPO_ROOT / module_path.replace(".", "/") / "__init__.py"
+            src_file = pkg_init if pkg_init.is_file() else src_file
+        assert src_file.is_file(), f"{name}: cannot locate source for {target}"
+
+        source = src_file.read_text(encoding="utf-8", errors="replace")
+        if "runtime_guard" not in source:
+            unguarded.append(f"{name} -> {target} ({src_file.name})")
+
+    assert not unguarded, (
+        "console script(s) bypass the runtime guard: " + "; ".join(unguarded)
+    )
