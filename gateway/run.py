@@ -8846,19 +8846,46 @@ class GatewayRunner(
             if isinstance(worker_bridge, dict)
             else {}
         )
+        review_continuation = (
+            worker_bridge.get("review_continuation", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
+        stage_successors = (
+            worker_bridge.get("stage_successors", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
         alerts_enabled = (
             isinstance(gateway_alerts, dict)
             and gateway_alerts.get("enabled") is True
         )
-        successors_enabled = not (
+        failure_successors_enabled = not (
             isinstance(failure_successors, dict)
             and failure_successors.get("enabled") is False
         )
-        if not alerts_enabled and not successors_enabled:
+        review_continuation_enabled = not (
+            isinstance(review_continuation, dict)
+            and review_continuation.get("enabled") is False
+        )
+        stage_successors_enabled = not (
+            isinstance(stage_successors, dict)
+            and stage_successors.get("enabled") is False
+        )
+        # Every successor policy runs inside the notifier watcher's tick, so the
+        # watcher must start if ANY of them is live. Gating it on alerts and
+        # failure successors alone silently disabled review continuations and
+        # stage successors for anyone who enabled only those.
+        if not (
+            alerts_enabled
+            or failure_successors_enabled
+            or review_continuation_enabled
+            or stage_successors_enabled
+        ):
             return
 
         # The recovered watcher handles terminal notifications, orphaned
-        # ``queued`` tasks, idle nudges, and bounded failure successors.
+        # ``queued`` tasks, idle nudges, and bounded successor policies.
         self._spawn_supervised(
             self._worker_bridge_notifier_watcher,
             "worker_bridge_notifier_watcher",

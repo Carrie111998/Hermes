@@ -40,6 +40,11 @@ non-negative integer. A task whose current
 `metadata.successor_chain_depth >= max_chain` does not produce another
 successor.
 
+`successor_chain_depth` is shared with success-stage successors and
+review-findings continuations. Mixed plan → build → review → fix → retry
+pipelines therefore consume one bounded budget instead of resetting the limit
+at each policy boundary.
+
 ## Exclusions
 
 No successor is created for:
