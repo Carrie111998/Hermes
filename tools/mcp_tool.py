@@ -5630,11 +5630,22 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _server_config_changed(server: Any, new_config: dict) -> bool:
+    old_config = getattr(server, "_config", None)
+    if not isinstance(old_config, dict):
+        return False
+    keys_to_compare = ("command", "args", "url", "env", "headers", "tool_timeout")
+    for key in keys_to_compare:
+        if old_config.get(key) != new_config.get(key):
+            return True
+    return False
+
+
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
-    Idempotent for already-connected server names. Servers with
-    ``enabled: false`` are skipped without disconnecting existing sessions.
+    Idempotent for already-connected server names unless their configuration changed.
+    Servers with ``enabled: false`` are skipped without disconnecting existing sessions.
 
     Args:
         servers: Mapping of ``{server_name: server_config}``.
@@ -5651,27 +5662,23 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
-    # Only attempt servers that aren't already connected and are enabled
-    # (enabled: false skips the server entirely without removing its config)
+    # Only attempt servers that aren't already connected (or whose config changed)
+    # and are enabled
     with _lock:
-        new_servers = {
-            k: v
-            for k, v in servers.items()
-            if k not in _servers
-            and _parse_boolish(v.get("enabled", True), default=True)
-            # Skip a server still serving its post-failure backoff. Without
-            # this, a server that fails to connect (and is therefore never
-            # recorded in ``_servers``) would be re-spawned on every worker
-            # session's discovery pass -- the #50394 restart storm. The
-            # cooldown is cleared automatically on the next successful
-            # connect or by a manual /mcp refresh.
-            and not _connect_cooldown_active(k)
-        }
-        # Cached entries with no live session are parked or mid-reconnect.
-        # Their tools are deregistered, so nothing else can reach
-        # _signal_reconnect — without this nudge a new session silently
-        # waits up to _PARKED_RETRY_INTERVAL for the next self-probe
-        # (#50170). Wake them now so their tools come back promptly.
+        new_servers = {}
+        for k, v in servers.items():
+            if not _parse_boolish(v.get("enabled", True), default=True):
+                continue
+            if _connect_cooldown_active(k):
+                continue
+            if k in _servers:
+                if _server_config_changed(_servers[k], v):
+                    logger.info("MCP server '%s': config changed, reconnecting with new configuration", k)
+                    _servers.pop(k, None)
+                    new_servers[k] = v
+            else:
+                new_servers[k] = v
+
         stale_cached = [
             _servers[k]
             for k in servers
