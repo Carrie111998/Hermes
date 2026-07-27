@@ -30,6 +30,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     parser.add_argument("--db", type=Path)
     sub = parser.add_subparsers(dest="business_command", required=True)
     sub.add_parser("status", help="Show organization, runway, and financial statements")
+    bootstrap = sub.add_parser(
+        "bootstrap",
+        help="Create or resume the solo-founder business from a charter file",
+    )
+    bootstrap.add_argument(
+        "--charter-file", type=Path, required=True,
+        help="JSON file containing the non-interactive agentic operating charter",
+    )
     sub.add_parser("payment-rails", help="List installed standalone payment rails")
     audit = sub.add_parser(
         "audit-export",
@@ -380,6 +388,32 @@ def build_business_snapshot(conn) -> dict:
 
 
 def business_command(args: argparse.Namespace) -> int:
+    if args.business_command == "bootstrap":
+        from hermes_cli.config import save_config
+        from hermes_cli.setup import _bootstrap_agentic_business
+
+        charter_path = args.charter_file.expanduser().resolve()
+        charter = _json_object(charter_path.read_text(encoding="utf-8"))
+        if charter.get("enabled") is False:
+            raise ValueError("agentic bootstrap requires an enabled charter")
+        organization_id, objective_id = _bootstrap_agentic_business(charter)
+        # Persist the exact charter only after the durable business bootstrap
+        # succeeds. A failed bootstrap must not leave configuration claiming
+        # that unattended operation is ready.
+        save_config({"agentic": charter}, merge_existing=True)
+        print(
+            json.dumps(
+                {
+                    "status": "bootstrapped",
+                    "organization_id": organization_id,
+                    "objective_id": objective_id,
+                    "charter_file": str(charter_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.business_command == "recovery-restore":
         from hermes_cli import authority_recovery
 
