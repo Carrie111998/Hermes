@@ -723,14 +723,21 @@ class WorkflowEngine:
             ]
             if run_id:
                 cmd.extend(["--run-id", run_id])
+            log_dir = str(self.STATE_DIR)
+            log_path = os.path.join(log_dir, f"supervisor-{run_id}.log")
+            log_fd = open(log_path, "w")
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
             _sp.Popen(
                 cmd,
-                stdout=_sp.DEVNULL,
-                stderr=_sp.DEVNULL,
+                stdout=log_fd,
+                stderr=log_fd,
                 stdin=_sp.DEVNULL,
                 start_new_session=True,
+                env=env,
             )
             print(f"   👤 supervisor spawned for {workflow_name} (run: {run_id})")
+            print(f"   📝 supervisor log: {log_path}")
         except Exception as e:
             print(f"   ⚠ failed to spawn supervisor: {e}")
 
@@ -921,6 +928,28 @@ class WorkflowEngine:
                                  card.get("body",
                                           card.get("reason",
                                                    card.get("description", "")))))
+
+    def _check_pending_review(self, card_id: str) -> bool:
+        """Check if a card is blocked with reason "pending review".
+
+        The block reason is stored in the most recent ``blocked`` event
+        payload, NOT in the task body.  This method queries the event
+        log directly.
+        """
+        try:
+            with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                row = _conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY rowid DESC LIMIT 1",
+                    (card_id,),
+                ).fetchone()
+                if row and row[0]:
+                    import json as _json
+                    payload = _json.loads(row[0])
+                    reason = payload.get("reason", "")
+                    return reason.strip().lower() == "pending review"
+        except Exception:
+            pass
+        return False
 
     # ── Template substitution ───────────────────────────────────
     #
@@ -1694,6 +1723,52 @@ class WorkflowEngine:
                 lines.append(f"⚠ {alert}")
             return "\n".join(lines)
         return None
+
+    def _classify_block_reason(self, nid: str, body: str,
+                                workflow: "Workflow",
+                                context: dict = None) -> bool:
+        """Use the auxiliary to classify why a reviewer blocked.
+
+        Returns True if the block is a quality review result (enrich upstream,
+        unblock reviewer, continue loop). Returns False if it's a technical
+        issue (notify calling agent).
+
+        Falls back to heuristic: if the body contains review-like keywords,
+        treat as quality block. Otherwise treat as technical.
+        """
+        try:
+            from plugins.workflow.analyst import analyze_block_notification
+        except Exception:
+            return self._heuristic_quality_check(body)
+
+        ctx = context or {}
+        project = ctx.get("project", "")
+        workflow_context = f"Project: {project}" if project else ""
+
+        outcome = analyze_block_notification(
+            node_id=nid,
+            workflow_name=workflow.name,
+            node_task=workflow.nodes[nid].task if nid in workflow.nodes else "",
+            block_reason=body[:500],
+            workflow_context=workflow_context,
+        )
+
+        if outcome.success and isinstance(outcome.result, dict):
+            block_type = outcome.result.get("block_type", "quality")
+            return block_type == "quality"
+
+        return self._heuristic_quality_check(body)
+
+    @staticmethod
+    def _heuristic_quality_check(body: str) -> bool:
+        """Fallback heuristic: check if body looks like review feedback."""
+        body_lower = body.lower()
+        quality_keywords = [
+            "review", "feedback", "failed", "issue", "bug", "error",
+            "incorrect", "wrong", "fix", "improve", "quality",
+            "does not", "should", "expected", "actual",
+        ]
+        return any(kw in body_lower for kw in quality_keywords)
 
     # ── Validation ─────────────────────────────────────────────
 
@@ -2636,7 +2711,25 @@ class WorkflowEngine:
                     print(f"   🔓 {nid} — SYNTHETIC (auto-complete)")
                     continue
 
-                # Create the card
+                # Create the card — skip if already has one
+                if state.kanban_card_id:
+                    # Card already exists — update kanban status to running
+                    # so the worker picks it up again.
+                    state.status = "running"
+                    state.started_at = datetime.now(timezone.utc).isoformat()
+                    print(f"   🔄 {nid} → reusing card {state.kanban_card_id}")
+                    try:
+                        with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                            _conn.execute(
+                                "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+                                (state.kanban_card_id,)
+                            )
+                            _conn.commit()
+                            kanban_db.heartbeat_worker(_conn, state.kanban_card_id)
+                    except Exception:
+                        pass
+                    continue
+
                 state.status = "running"
                 state.started_at = datetime.now(timezone.utc).isoformat()
                 state.attempts += 1
@@ -2683,7 +2776,8 @@ class WorkflowEngine:
             ]
             if running_nodes:
                 revision_result = self._monitor_layer(
-                    workflow, running_nodes, states, results, context
+                    workflow, running_nodes, states, results, context,
+                    layers=layers,
                 )
             else:
                 revision_result = None
@@ -2731,7 +2825,8 @@ class WorkflowEngine:
             # Re-monitor if we dispatched new nodes
             if len(running_nodes) > 0 and not revision_result:
                 revision_result = self._monitor_layer(
-                    workflow, running_nodes, states, results, context
+                    workflow, running_nodes, states, results, context,
+                    layers=layers,
                 )
 
             # Check for revision loops
@@ -2810,6 +2905,7 @@ class WorkflowEngine:
                     rev_results = {}
                     self._monitor_layer(
                         workflow, rev_layer, rev_states, rev_results, context,
+                        layers=layers,
                         skip_loop_detection=True  # Don't recurse
                     )
 
@@ -2832,7 +2928,26 @@ class WorkflowEngine:
                         layer_idx += 1
             else:
                 # No loops — advance to next layer
-                layer_idx += 1
+                # BUT: if any node in this layer has reviews and the
+                # reviewer is still in-flight (not done), stay in this
+                # layer — the review loop is still active.
+                has_active_review = False
+                for nid in layer:
+                    node = workflow.nodes.get(nid)
+                    if node and node.reviews:
+                        for rev_entry in node.reviews:
+                            rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                            if rev_id and rev_id in states:
+                                rev_status = states[rev_id].status
+                                if rev_status not in ("done", "skipped", "failed", "timed_out"):
+                                    has_active_review = True
+                                    break
+                        if has_active_review:
+                            break
+                if has_active_review:
+                    print(f"   🔄 Review loop active — staying in layer {layer_idx + 1}")
+                else:
+                    layer_idx += 1
 
             print()
 
@@ -2861,6 +2976,7 @@ class WorkflowEngine:
     def _monitor_layer(self, workflow: Workflow, layer: list[str],
                        states: dict[str, NodeState], results: dict,
                        context: dict = None,
+                       layers: list[list[str]] = None,
                        skip_loop_detection: bool = False
                        ) -> Optional[dict]:
         """
@@ -3012,7 +3128,7 @@ class WorkflowEngine:
                                         enrichment = f"\n\n--- Review Passed ({nid}) ---\n{reviewer_body}"
                                         new_body = existing_body + enrichment
                                         conn.execute(
-                                            "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL WHERE id = ?",
+                                            "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
                                             (new_body, upstream_state.kanban_card_id)
                                         )
                                         conn.commit()
@@ -3027,46 +3143,46 @@ class WorkflowEngine:
                     elif card_status_lower in ("blocked",):
                         body = self.get_card_body(state.kanban_card_id)
 
-                        # Check for "pending review" block convention
-                        pending_review = body.strip().lower().startswith("pending review")
+                        # Check for "pending review" block convention.
+                        # The block reason is stored in the most recent
+                        # ``blocked`` event payload, NOT in the task body.
+                        pending_review = self._check_pending_review(state.kanban_card_id)
 
                         if pending_review:
                             # Node blocked itself pending review — find reviewer
                             node = workflow.nodes.get(nid)
                             if node and node.reviews:
-                                # Determine which reviewer to dispatch (next in pipeline)
-                                # and check retry limits
-                                dispatched = False
                                 for review_entry in node.reviews:
-                                    # Support both string and dict review entries
                                     if isinstance(review_entry, dict):
                                         rev_id = review_entry.get("review", "")
-                                        per_review_max = review_entry.get("max_retries")
                                     else:
                                         rev_id = review_entry
-                                        per_review_max = None
-
                                     if not rev_id:
                                         continue
 
-                                    # Check if this reviewer has already been dispatched
                                     rev_state = states.get(rev_id)
-                                    if rev_state and rev_state.status in ("running", "done"):
-                                        continue  # Skip — already dispatched or completed
-
-                                    # Resolve max retries: per-review > node > workflow > engine default
-                                    max_retries = per_review_max or node.max_retries or workflow.max_retries
-
-                                    # Check retry count
-                                    current_count = state.review_counts.get(rev_id, 0)
-                                    if current_count >= max_retries:
-                                        print(f"   ⚠ {nid} → {rev_id} hit max retries ({current_count}/{max_retries})")
+                                    reviewer_node = workflow.nodes.get(rev_id)
+                                    if not reviewer_node:
                                         continue
 
-                                    # Dispatch the reviewer
-                                    print(f"   📋 {nid} pending review → dispatching {rev_id} (attempt {current_count + 1}/{max_retries})")
-                                    reviewer_node = workflow.nodes.get(rev_id)
-                                    if reviewer_node:
+                                    if rev_state and rev_state.kanban_card_id:
+                                        # Reviewer card already exists.
+                                        # Only unblock if it's actually blocked.
+                                        if rev_state.status == "blocked":
+                                            try:
+                                                with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                                                    kanban_db.unblock_task(_conn, rev_state.kanban_card_id)
+                                                rev_state.status = "ready"
+                                                rev_state.completed_at = None
+                                                rev_state.result = None
+                                                print(f"   🔄 {nid} pending review → unblocked {rev_id} (card {rev_state.kanban_card_id})")
+                                            except Exception as e:
+                                                print(f"   ⚠  Failed to unblock reviewer card: {e}")
+                                        else:
+                                            # Already running or ready — keep polling
+                                            print(f"   ⏳ {nid} — {rev_id} already in-flight (status: {rev_state.status})")
+                                    else:
+                                        # First time — create the reviewer card
                                         try:
                                             reviewer_card_id = self.dispatch_node(
                                                 states[rev_id], reviewer_node, context,
@@ -3076,22 +3192,12 @@ class WorkflowEngine:
                                                 states[rev_id].kanban_card_id = reviewer_card_id
                                                 states[rev_id].status = "running"
                                                 states[rev_id].started_at = datetime.now(timezone.utc).isoformat()
-                                                state.review_counts[rev_id] = current_count + 1
-                                                # Add reviewer to pending set so _monitor_layer
-                                                # polls its status and detects block/completion.
+                                                state.review_counts[rev_id] = state.review_counts.get(rev_id, 0) + 1
                                                 pending.add(rev_id)
-                                                print(f"   ✓ {rev_id} → card {reviewer_card_id}")
-                                                dispatched = True
-                                                break  # Dispatch one reviewer at a time
+                                                print(f"   📋 {nid} pending review → created {rev_id} (card {reviewer_card_id})")
                                         except Exception as e:
-                                            print(f"   ⚠  Failed to dispatch reviewer: {e}")
-                                if not dispatched:
-                                    # All reviewers exhausted or already dispatched
-                                    state.status = "blocked"
-                                    state.error = f"Blocked: all reviewers exhausted for {nid}"
-                                    results[nid] = "blocked"
-                                    print(f"   🚫 {nid} BLOCKED — all reviewers exhausted")
-                                    pending.discard(nid)
+                                            print(f"   ⚠  Failed to create reviewer card: {e}")
+                                    break  # One reviewer at a time
                             else:
                                 # No reviews attribute — treat as genuine blocker
                                 state.status = "blocked"
@@ -3101,7 +3207,8 @@ class WorkflowEngine:
                                 pending.discard(nid)
                                 self._try_block_notify(workflow, nid, state, body, context)
                         else:
-                            # Check if this node is a reviewer for an upstream node
+                            # Not "pending review" — check if this node is a reviewer
+                            # for an upstream node (i.e., it blocked with review results)
                             reviewer_for = None
                             for upstream_nid, upstream_state in states.items():
                                 upstream_node = workflow.nodes.get(upstream_nid)
@@ -3110,34 +3217,56 @@ class WorkflowEngine:
                                     break
 
                             if reviewer_for:
-                                # Reviewer blocked — enrich upstream with failure
+                                # Reviewer blocked — use auxiliary to classify the reason
                                 upstream_state = states[reviewer_for]
-                                state.status = "blocked"
-                                state.error = f"Review failed: {body[:100]}"
-                                results[nid] = "blocked"
-                                print(f"   🚫 {nid} BLOCKED (reviewer) — enriching {reviewer_for} with feedback")
-                                pending.discard(nid)
+                                is_quality_block = self._classify_block_reason(
+                                    nid, body, workflow, context
+                                )
 
-                                # Enrich upstream card with review feedback and reset to ready
-                                if upstream_state.kanban_card_id:
-                                    try:
-                                        with kanban_db.connect_closing(board=self.kanban_board) as conn:
-                                            existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
-                                            feedback = f"\n\n--- Review Failed ({nid}) ---\n{body}"
-                                            new_body = existing_body + feedback
-                                            conn.execute(
-                                                "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL WHERE id = ?",
-                                                (new_body, upstream_state.kanban_card_id)
-                                            )
-                                            conn.commit()
-                                        upstream_state.status = "ready"
-                                        upstream_state.completed_at = None
-                                        upstream_state.result = None
-                                        print(f"   ↩  {reviewer_for} enriched with failure feedback, reset to ready")
-                                    except Exception as e:
-                                        print(f"   ⚠  Failed to enrich upstream card: {e}")
+                                if is_quality_block:
+                                    # Quality review results — enrich upstream, reset, unblock
+                                    print(f"   📋 {nid} BLOCKED (quality review) — enriching {reviewer_for}")
+                                    if upstream_state.kanban_card_id:
+                                        try:
+                                            with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                                existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
+                                                feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
+                                                new_body = existing_body + feedback
+                                                conn.execute(
+                                                    "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                                    (new_body, upstream_state.kanban_card_id)
+                                                )
+                                                conn.commit()
+                                            upstream_state.status = "ready"
+                                            upstream_state.completed_at = None
+                                            upstream_state.result = None
+                                            print(f"   ↩  {reviewer_for} enriched with review feedback, reset to ready")
+                                        except Exception as e:
+                                            print(f"   ⚠  Failed to enrich upstream card: {e}")
+
+                                    # Unblock the reviewer card so it's ready for next round
+                                    if state.kanban_card_id:
+                                        try:
+                                            with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                                                kanban_db.unblock_task(_conn, state.kanban_card_id)
+                                            state.status = "ready"
+                                            state.completed_at = None
+                                            state.result = None
+                                            # Reset poll counter — review iteration completed
+                                            polls = 0
+                                            print(f"   🔓 {nid} unblocked — ready for next review round")
+                                        except Exception as e:
+                                            print(f"   ⚠  Failed to unblock reviewer: {e}")
+                                else:
+                                    # Technical block — notify calling agent
+                                    state.status = "blocked"
+                                    state.error = f"Reviewer blocked (technical): {body[:100]}"
+                                    results[nid] = "blocked"
+                                    print(f"   🚫 {nid} BLOCKED (technical) — notifying calling agent")
+                                    pending.discard(nid)
+                                    self._try_block_notify(workflow, nid, state, body, context)
                             else:
-                                # Genuine blocker — not pending review
+                                # Genuine blocker — not pending review, not a reviewer
                                 state.status = "blocked"
                                 state.error = f"Blocked: {body[:100]}"
                                 results[nid] = "blocked"
