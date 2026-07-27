@@ -44,7 +44,8 @@ class TestConfigParsing:
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(None)
         assert cfg.enabled == "auto"
-        assert cfg.threshold_pct == 5.0
+        assert cfg.search_default_limit == 5
+        assert cfg.max_search_limit == 20
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -66,12 +67,14 @@ class TestConfigParsing:
         cfg = ToolSearchConfig.from_raw({"enabled": "maybe"})
         assert cfg.enabled == "auto"
 
-    def test_threshold_clamped(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw({"threshold_pct": 150})
-        assert cfg.threshold_pct == 100.0
-        cfg = ToolSearchConfig.from_raw({"threshold_pct": -5})
-        assert cfg.threshold_pct == 0.0
+    def test_full_config_helper_distinguishes_stable_and_direct_modes(self):
+        from tools.tool_search import is_enabled_in_config
+
+        assert is_enabled_in_config({})
+        assert is_enabled_in_config({"tools": {"tool_search": {"enabled": "on"}}})
+        assert not is_enabled_in_config({
+            "tools": {"tool_search": {"enabled": "off"}},
+        })
 
     def test_search_limits_clamped(self):
         from tools.tool_search import ToolSearchConfig
@@ -129,20 +132,20 @@ class TestClassification:
 
 
 # ---------------------------------------------------------------------------
-# Token estimation + threshold gate
+# Token estimation + stable-bridge activation
 # ---------------------------------------------------------------------------
 
 
-class TestThresholdGate:
+class TestActivationGate:
     def test_off_never_activates(self):
         from tools.tool_search import ToolSearchConfig, should_activate
         cfg = ToolSearchConfig.from_raw({"enabled": "off"})
         assert not should_activate(cfg, deferrable_tokens=1_000_000, context_length=200_000)
 
-    def test_zero_deferrable_never_activates(self):
+    def test_zero_deferrable_keeps_bridge_active(self):
         from tools.tool_search import ToolSearchConfig, should_activate
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
-        assert not should_activate(cfg, deferrable_tokens=0, context_length=200_000)
+        assert should_activate(cfg, deferrable_tokens=0, context_length=200_000)
 
     def test_on_activates_with_any_deferrable(self):
         from tools.tool_search import ToolSearchConfig, should_activate
@@ -150,28 +153,13 @@ class TestThresholdGate:
         assert should_activate(cfg, deferrable_tokens=100, context_length=200_000)
 
     def test_auto_activates_with_any_deferrable(self):
-        """Tiered disclosure: ANY deferrable tool activates the bridge —
-        the threshold now bounds the listing, not activation."""
+        """Auto always keeps the cache-stable bridge present."""
         from tools.tool_search import ToolSearchConfig, should_activate
-        cfg = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
+        cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
+        assert should_activate(cfg, deferrable_tokens=0, context_length=200_000)
         assert should_activate(cfg, deferrable_tokens=100, context_length=200_000)
         assert should_activate(cfg, deferrable_tokens=50_000, context_length=200_000)
-        # unknown context length: still activates
         assert should_activate(cfg, deferrable_tokens=100, context_length=0)
-
-    def test_listing_budget_min_of_pct_and_cap(self):
-        from tools.tool_search import ToolSearchConfig, listing_token_budget
-        cfg = ToolSearchConfig.from_raw(
-            {"threshold_pct": 5, "listing_max_tokens": 8000})
-        # 5% of 200K = 10K > cap 8K → cap wins
-        assert listing_token_budget(cfg, 200_000) == 8000
-        # 5% of 50K = 2.5K < cap 8K → pct leg wins
-        assert listing_token_budget(cfg, 50_000) == 2500
-        # unknown context → 10K fallback for the pct leg, still capped
-        assert listing_token_budget(cfg, 0) == 8000
-        assert listing_token_budget(cfg, None) == 8000
-        # default threshold is 5%
-        assert ToolSearchConfig.from_raw(None).threshold_pct == 5.0
 
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas
@@ -238,22 +226,28 @@ class TestRetrieval:
 
 
 # ---------------------------------------------------------------------------
-# Assembly — the full passthrough/activate decision.
+# Assembly — the full stable-bridge/direct-mode decision.
 # ---------------------------------------------------------------------------
 
 
 class TestAssembly:
-    def test_no_deferrable_returns_unchanged(self):
-        """Pure-core toolset: pass-through, no bridge tools added."""
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+    def test_no_deferrable_still_includes_stable_bridge(self):
+        """The bridge exists before the first MCP tool arrives."""
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
         defs = [_td("terminal", "Run shell"), _td("read_file", "Read a file")]
         result = assemble_tool_defs(
             defs,
             context_length=200_000,
             config=ToolSearchConfig.from_raw({"enabled": "on"}),
         )
-        assert not result.activated
-        assert {t["function"]["name"] for t in result.tool_defs} == {"terminal", "read_file"}
+        assert result.activated
+        assert {t["function"]["name"] for t in result.tool_defs} == {
+            "terminal", "read_file", *BRIDGE_TOOL_NAMES,
+        }
 
     @staticmethod
     def _register_mcp(name):
@@ -269,9 +263,8 @@ class TestAssembly:
             toolset="mcp-tiertest",
         )
 
-    def test_small_deferrable_surface_defers_with_full_listing(self):
-        """Tiered disclosure: even a tiny MCP/plugin surface defers (tier 1),
-        with the full name+description listing embedded."""
+    def test_small_deferrable_surface_uses_search_only_bridge(self):
+        """MCP names and descriptions never leak into the bridge schema."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
         for n in ("tier_small_a", "tier_small_b", "tier_small_c"):
             self._register_mcp(n)
@@ -281,81 +274,45 @@ class TestAssembly:
         result = assemble_tool_defs(
             defs,
             context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10}),
+            config=ToolSearchConfig.from_raw({"enabled": "auto"}),
         )
         assert result.activated
-        assert result.tier == 1
-        assert result.listing_form == "full"
+        assert result.tier == 2
+        assert result.listing_form == "none"
         names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
         assert "tool_search" in names
         assert "terminal" in names  # core stays eager
         search = next(t for t in result.tool_defs
                       if t["function"]["name"] == "tool_search")
-        assert "tier_small_a" in search["function"]["description"]
+        assert "tier_small_a" not in search["function"]["description"]
+        assert "Deferred capability description" not in search["function"]["description"]
 
-    def test_oversized_catalog_degrades_to_server_summary_tier2(self):
-        """When even the names-only listing exceeds the budget, tier 2:
-        bare bridge + one-line-per-server summary (no per-tool names)."""
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        names = [f"tier2_very_long_tool_name_number_{i:04d}_extra" for i in range(400)]
-        for n in names:
-            self._register_mcp(n)
-        defs = [_td(n, "A description that will not matter at this size.")
-                for n in names]
-        result = assemble_tool_defs(
-            defs,
-            context_length=200_000,
-            config=ToolSearchConfig.from_raw(
-                {"enabled": "auto", "threshold_pct": 10, "listing_max_tokens": 200}),
+    def test_catalog_edits_leave_bridge_schema_byte_stable(self):
+        """Add/remove/swap/schema edits must not change model-facing bridges."""
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
         )
-        assert result.activated
-        assert result.tier == 2
-        assert result.listing_form == "groups"
-        search = next(t for t in result.tool_defs
-                      if t["function"]["name"] == "tool_search")
-        desc = search["function"]["description"]
-        # No individual tool names...
-        assert "tier2_very_long_tool_name_number_0000" not in desc
-        # ...but the server (toolset) is named with its tool count, and the
-        # model is told to search rather than substitute/deny.
-        assert "tiertest" in desc
-        assert "(400 tools" in desc
-        assert "search here FIRST" in desc
 
-    def test_mixed_catalog_small_server_keeps_listing(self):
-        """Per-server degradation: an oversized server collapses to a
-        summary line while a small co-attached server keeps per-tool names
-        (the Cloudflare+Linear shape)."""
-        from tools.tool_search import build_catalog_listing_with_form
-        from tools.registry import registry
-        import json as _json
+        for name in ("stable_alpha", "stable_beta"):
+            self._register_mcp(name)
+        cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
 
-        def _h(args, task_id=None, **kw):
-            return _json.dumps({"ok": True})
+        def bridges(defs):
+            assembled = assemble_tool_defs(defs, context_length=200_000, config=cfg)
+            return [
+                tool for tool in assembled.tool_defs
+                if tool["function"]["name"] in BRIDGE_TOOL_NAMES
+            ]
 
-        big = [f"bigsrv_tool_{i:04d}_with_a_long_name" for i in range(300)]
-        small = ["smallsrv_create_item", "smallsrv_list_items"]
-        for n in big:
-            registry.register(name=n, handler=_h,
-                              schema=_td(n, "Big server tool.")["function"],
-                              toolset="mcp-bigsrv")
-        for n in small:
-            registry.register(name=n, handler=_h,
-                              schema=_td(n, "Small server tool.")["function"],
-                              toolset="mcp-smallsrv")
-        defs = ([_td(n, "Big server tool.") for n in big]
-                + [_td(n, "Small server tool.") for n in small])
-        # Budget fits the small server's lines + big server's summary,
-        # but not the big server's 300 names.
-        text, form = build_catalog_listing_with_form(defs, max_tokens=300)
-        assert form == "mixed"
-        assert text is not None
-        assert "smallsrv_create_item" in text          # small server listed
-        assert "bigsrv_tool_0000" not in text          # big server names dropped
-        assert "bigsrv (300 tools" in text             # ...but summarized
-        # deterministic (cache safety)
-        text2, _ = build_catalog_listing_with_form(list(reversed(defs)), max_tokens=300)
-        assert text == text2
+        empty = bridges([])
+        one = bridges([_td("stable_alpha", "old description")])
+        swapped = bridges([_td("stable_beta", "different description")])
+        schema_changed = bridges([
+            _td("stable_beta", "updated", {"new_arg": {"type": "string"}})
+        ])
+        assert empty == one == swapped == schema_changed
 
     def test_idempotent_when_bridge_already_present(self):
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES
@@ -456,6 +413,39 @@ class TestHandleFunctionCallIntegration:
         # dispatch path completed without error.
         assert "matches" in parsed or "error" in parsed
 
+    def test_search_reads_tool_registered_after_bridge_assembly(self):
+        """The bridge snapshot stays fixed while dispatch sees the live registry."""
+        import model_tools
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        before = assemble_tool_defs(
+            [],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "auto"}),
+        ).tool_defs
+        name = "mcp_live_after_assembly_create_issue"
+        registry.register(
+            name=name,
+            handler=lambda args, **kw: json.dumps({"ok": True}),
+            schema=_td(name, "Create an issue.")["function"],
+            toolset="mcp-live-after-assembly",
+        )
+
+        result = model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "live after assembly create issue"},
+            enabled_toolsets=["mcp-live-after-assembly"],
+        )
+        after = assemble_tool_defs(
+            [_td(name, "Create an issue.")],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "auto"}),
+        ).tool_defs
+
+        assert any(match["name"] == name for match in json.loads(result)["matches"])
+        assert before == after
+
 
 class TestRegression_OpenClawCron84141:
     """Regression guard for the OpenClaw cron-tool-loss class of bug.
@@ -492,9 +482,9 @@ class TestRegression_OpenClawCron84141:
             config=ToolSearchConfig.from_raw({"enabled": "on"}),
         )
         names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
-        # terminal must be present; bridges are only added if there are
-        # deferrable tools to put behind them.
+        # terminal and the cache-stable bridges must all be present.
         assert "terminal" in names
+        assert BRIDGE_TOOL_NAMES.issubset(names)
 
     def test_unwrap_rejects_core_tool_attempt(self):
         """Even if the model tries to invoke a core tool through tool_call,
@@ -631,114 +621,34 @@ class TestRegression_ToolsetScoping:
 
 
 # ---------------------------------------------------------------------------
-# Catalog listing (skills-style progressive disclosure)
+# Stable bridge schemas
 # ---------------------------------------------------------------------------
 
 
-class TestCatalogListing:
-    def test_config_defaults(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw(None)
-        assert cfg.listing == "auto"
-        assert cfg.listing_max_tokens == 20000
-        # legacy bool shapes keep defaults too
-        assert ToolSearchConfig.from_raw(True).listing == "auto"
-
-    def test_config_listing_off_and_clamp(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw({"listing": "off", "listing_max_tokens": 999999})
-        assert cfg.listing == "off"
-        assert cfg.listing_max_tokens == 60000
-        cfg2 = ToolSearchConfig.from_raw({"listing": "garbage", "listing_max_tokens": -5})
-        assert cfg2.listing == "auto"
-        assert cfg2.listing_max_tokens == 200
-
-    def test_short_desc_first_sentence_and_clip(self):
-        from tools.tool_search import _short_desc
-        assert _short_desc("Open an issue. Second sentence dropped.") == "Open an issue."
-        long = "word " * 40
-        s = _short_desc(long)
-        assert len(s) <= 61  # 60 + ellipsis char
-        assert s.endswith("…")
-        assert _short_desc("") == ""
-
-    def test_listing_grouped_and_deterministic(self):
-        from tools.tool_search import build_catalog_listing
-        defs = [
-            _td("zeta_tool", "Does zeta."),
-            _td("alpha_tool", "Does alpha."),
-        ]
-        a = build_catalog_listing(defs)
-        b = build_catalog_listing(list(reversed(defs)))
-        assert a == b  # byte-stable regardless of input order (cache safety)
-        assert a.index("alpha_tool") < a.index("zeta_tool")
-
-    def test_listing_budget_falls_back_to_names_then_none(self):
-        from tools.tool_search import build_catalog_listing
-        defs = [_td(f"tool_{i:03d}", "A tool that does something moderately verbose.")
-                for i in range(50)]
-        full = build_catalog_listing(defs, max_tokens=20000)
-        assert full is not None and "- tool_000:" in full
-        names_only = build_catalog_listing(defs, max_tokens=300)
-        assert names_only is not None
-        assert "- tool_000:" not in names_only  # descriptions dropped
-        assert "tool_000" in names_only
-        assert build_catalog_listing(defs, max_tokens=200) is None or "tool_000" in build_catalog_listing(defs, max_tokens=200)
-
-    def test_bridge_embeds_listing(self):
+class TestStableBridgeSchemas:
+    def test_schema_contains_no_dynamic_catalog_state(self):
         from tools.tool_search import bridge_tool_schemas
-        bridges = bridge_tool_schemas(5, listing="github tools (2):\n- a: x\n- b: y")
-        search = next(b for b in bridges if b["function"]["name"] == "tool_search")
-        assert "github tools (2)" in search["function"]["description"]
-        assert "do NOT claim it is unavailable" in search["function"]["description"]
-        # other bridges unchanged
-        bare = bridge_tool_schemas(5)
-        assert bare[1] == bridges[1] and bare[2] == bridges[2]
 
-    @staticmethod
-    def _register(name):
-        from tools.registry import registry
+        first = bridge_tool_schemas()
+        second = bridge_tool_schemas()
+        assert first == second
+        serialized = json.dumps(first)
+        assert "additional tools" not in serialized
+        assert "Deferred tool catalog" not in serialized
+        assert "live catalog" in serialized
 
-        def _handler(args, task_id=None, **kw):
-            return json.dumps({"ok": True})
+    def test_legacy_listing_config_is_ignored(self):
+        """Old config files remain loadable without restoring dynamic schemas."""
+        from tools.tool_search import ToolSearchConfig
 
-        registry.register(
-            name=name,
-            handler=_handler,
-            schema=_td(name, "Deferred capability description.")["function"],
-            toolset="mcp-listingtest",
-        )
-
-    def test_assembly_embeds_listing_when_active(self):
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        for i in range(30):
-            self._register(f"mcp_x_{i}")
-        defs = [_td("terminal", "Run shell")] + [
-            _td(f"mcp_x_{i}", "Deferred capability description.",
-                {"a": {"type": "string", "description": "x" * 200}})
-            for i in range(30)
-        ]
-        result = assemble_tool_defs(
-            defs, context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "on"}),
-        )
-        assert result.activated
-        search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
-        assert "mcp_x_0" in search["function"]["description"]
-        assert "listingtest tools (30):" in search["function"]["description"]
-
-    def test_assembly_listing_off_keeps_legacy_description(self):
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        for i in range(30):
-            self._register(f"mcp_x_{i}")
-        defs = [_td(f"mcp_x_{i}", "Deferred.") for i in range(30)]
-        result = assemble_tool_defs(
-            defs, context_length=1000,
-            config=ToolSearchConfig.from_raw({"enabled": "on", "listing": "off"}),
-        )
-        assert result.activated
-        search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
-        assert "mcp_x_0" not in search["function"]["description"]
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "auto",
+            "threshold_pct": 99,
+            "listing": "on",
+            "listing_max_tokens": 60000,
+        })
+        assert cfg.enabled == "auto"
+        assert not hasattr(cfg, "listing")
 
 
 class TestDeferredCallSchemaProbe:

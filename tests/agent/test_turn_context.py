@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
-from agent.turn_context import TurnContext, build_turn_context
+from agent.turn_context import TurnContext, build_turn_context, prepend_user_note
 from hermes_state import SessionDB
 
 
@@ -403,26 +403,41 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
 # not timing permutations.
 
 
-def test_between_turns_refresh_adds_late_tool_when_servers_registered():
+def test_between_turns_refresh_adds_late_tool_when_mcp_module_loaded():
     """R1: a tool that registered since build lands in this turn's snapshot."""
     agent = _FakeAgent()
 
     new_def = {"type": "function", "function": {"name": "mcp_x_tool", "description": "", "parameters": {}}}
 
     import model_tools
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
-         patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
+    import tools.mcp_tool  # noqa: F401 -- activates the cheap sys.modules gate
+    with patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
         _build(agent)
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
 
 
-def test_between_turns_refresh_skipped_when_no_servers():
-    """R6: the common case (no MCP servers) never walks the registry."""
+def test_between_turns_refresh_observes_removal_to_empty_catalog():
+    """Once MCP loaded, refresh still runs after the last tool is removed."""
     agent = _FakeAgent()
     import model_tools
+    import tools.mcp_tool  # noqa: F401 -- activates the cheap sys.modules gate
 
+    with patch.object(model_tools, "get_tool_definitions", return_value=[]) as gtd:
+        _build(agent)
+
+    gtd.assert_called_once()
+
+
+def test_between_turns_refresh_skips_synchronized_empty_catalog():
+    """An empty catalog does not trigger a full schema rebuild every turn."""
+    agent = _FakeAgent()
+    import model_tools
+    import tools.mcp_tool  # noqa: F401 -- activates the cheap sys.modules gate
+    from tools.registry import registry
+
+    agent._tool_snapshot_generation = registry._generation
     with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
          patch.object(model_tools, "get_tool_definitions") as gtd:
         _build(agent)
@@ -438,8 +453,7 @@ def test_between_turns_refresh_skipped_when_skip_flag_set():
     agent._skip_mcp_refresh = True
     import model_tools
 
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
-         patch.object(model_tools, "get_tool_definitions") as gtd:
+    with patch.object(model_tools, "get_tool_definitions") as gtd:
         _build(agent)
 
     gtd.assert_not_called()
@@ -454,14 +468,40 @@ def test_between_turns_refresh_no_churn_when_unchanged():
     agent.valid_tool_names = {"a"}
 
     import model_tools
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
-         patch.object(
+    with patch.object(
              model_tools, "get_tool_definitions",
              return_value=[{"type": "function", "function": {"name": "a", "description": "", "parameters": {}}}],
          ):
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
+
+
+def test_pending_mcp_notice_folds_into_next_real_user_turn_once():
+    agent = _FakeAgent()
+    agent._skip_mcp_refresh = True
+    agent._pending_mcp_catalog_notice = "[MCP CATALOG UPDATED]"
+
+    first = _build(agent)
+    assert first.messages[-1]["content"] == "[MCP CATALOG UPDATED]\n\nhello"
+    assert first.original_user_message == "hello"
+    assert agent._pending_mcp_catalog_notice is None
+
+    second = _build(agent)
+    assert second.messages[-1]["content"] == "hello"
+
+
+def test_prepend_user_note_preserves_multimodal_parts():
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+    parts = [{"type": "text", "text": "caption"}, image]
+
+    result = prepend_user_note(parts, "[NOTICE]")
+
+    assert result == [
+        {"type": "text", "text": "[NOTICE]\n\ncaption"},
+        image,
+    ]
+    assert parts[0]["text"] == "caption"  # caller-owned input was not mutated
 
 
 def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):

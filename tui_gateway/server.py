@@ -5540,12 +5540,11 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     the agent's callable tools and the banner count catch up — the same
     rebuild ``/reload-mcp`` performs, but automatic.
 
-    Cache safety: the rebuild only runs while the session is still pre-first-
-    turn (no API call made yet → nothing cached to invalidate). If the user
-    has already sent a message, we leave the snapshot frozen rather than
-    invalidate the prompt cache mid-conversation — those late tools then
-    require an explicit ``/reload-mcp`` (which gates on user consent), exactly
-    as today. No-op when discovery already finished before the agent build.
+    Cache safety: a session using the stable Tool Search bridge may refresh
+    after its first turn because its model-facing schemas stay byte-identical.
+    Direct-schema mode keeps the historical pre-first-turn guard because a
+    rebuild there changes ``tools=``. No-op when discovery already finished
+    before the agent build.
     """
     try:
         from tui_gateway.entry import mcp_discovery_in_flight, join_mcp_discovery
@@ -5564,12 +5563,21 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             # Session may have been closed/reset while we waited.
             if session is None or session.get("agent") is not agent:
                 return
-            # Cache safety: never rebuild the tool list once the conversation
-            # has started — that would invalidate the cached prompt prefix.
-            if (
+            # Cache safety: after a conversation starts, only the byte-stable
+            # bridge may observe late catalog changes automatically. Direct
+            # schemas still require an explicit user-approved reload.
+            _started = (
                 int(getattr(agent, "_user_turn_count", 0) or 0) > 0
                 or int(getattr(agent, "_api_call_count", 0) or 0) > 0
-            ):
+            )
+            try:
+                from tools.tool_search import BRIDGE_TOOL_NAMES
+                _stable_bridge = BRIDGE_TOOL_NAMES.issubset(
+                    set(getattr(agent, "valid_tool_names", set()) or set())
+                )
+            except Exception:
+                _stable_bridge = False
+            if _started and not _stable_bridge:
                 return
             try:
                 from tools.mcp_tool import refresh_agent_mcp_tools
@@ -14877,23 +14885,23 @@ def _finish_reload(rid, params: dict, *, coalesced: bool) -> dict:
 def _(rid, params: dict) -> dict:
     session = _sessions.get(params.get("session_id", ""))
     try:
-        # Gate: /reload-mcp invalidates the prompt cache for this session.
-        # Respect the ``approvals.mcp_reload_confirm`` config toggle — if
-        # set (default true) AND the caller did not pass ``confirm=true``
-        # in params, surface a warning to the transcript instead of just
-        # reloading silently.  Users pass confirm=true either by
-        # re-invoking after reading the warning, or by setting the
-        # config key to false permanently.
+        # The stable Tool Search bridge is cache-safe and reloads immediately.
+        # Only direct-schema mode (Tool Search off) needs the historical prompt
+        # cache warning and ``approvals.mcp_reload_confirm`` gate.
         user_confirm = bool(params.get("confirm", False))
         if not user_confirm:
             try:
                 from hermes_cli.config import load_config as _load_config
+                from tools.tool_search import is_enabled_in_config as _tool_search_enabled
 
                 _cfg = _load_config()
-                _approvals = _cfg.get("approvals") if isinstance(_cfg, dict) else None
-                _confirm_required = True
-                if isinstance(_approvals, dict):
-                    _confirm_required = bool(_approvals.get("mcp_reload_confirm", True))
+                if _tool_search_enabled(_cfg):
+                    _confirm_required = False
+                else:
+                    _approvals = _cfg.get("approvals") if isinstance(_cfg, dict) else None
+                    _confirm_required = True
+                    if isinstance(_approvals, dict):
+                        _confirm_required = bool(_approvals.get("mcp_reload_confirm", True))
             except Exception:
                 _confirm_required = True
             if _confirm_required:

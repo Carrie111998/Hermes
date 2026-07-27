@@ -49,6 +49,31 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+def prepend_user_note(content: Any, note: str) -> Any:
+    """Prepend an API-only note to string or multimodal user content.
+
+    The caller preserves the original content separately for persistence. This
+    keeps message alternation intact and avoids an out-of-band synthetic user
+    turn while still notifying the model at the next real turn boundary.
+    """
+    note = str(note or "").strip()
+    if not note:
+        return content
+    if isinstance(content, str):
+        return f"{note}\n\n{content}" if content else note
+    if isinstance(content, list):
+        parts = list(content)
+        for index, part in enumerate(parts):
+            if isinstance(part, dict) and part.get("type") == "text":
+                merged = dict(part)
+                text = merged.get("text", "")
+                merged["text"] = f"{note}\n\n{text}" if text else note
+                parts[index] = merged
+                return parts
+        return [{"type": "text", "text": note}, *parts]
+    return content
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -395,15 +420,10 @@ def build_turn_context(
         pass
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
-    # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
-    # connect, missing the bounded startup wait) lands in THIS turn's tool
-    # snapshot.  This is cache-safe by construction: it runs in the per-turn
-    # prologue, before this turn's first API call assembles ``tools=``, so it
-    # only ever extends a fresh request prefix — it never mutates the cached
-    # prefix of an in-flight turn.  No-op when no MCP servers are registered
-    # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
-    # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
-    # name and leaves the snapshot untouched on no-change).
+    # the previous turn lands in the live catalog for THIS turn. The stable
+    # Tool Search bridge remains byte-identical; direct-schema mode publishes
+    # a full-schema diff. Call even after the last MCP tool was removed so the
+    # removal generation is observed and a one-shot model note can be queued.
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
             # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
@@ -416,11 +436,35 @@ def build_turn_context(
             # without changing behavior for MCP users.
             import sys as _sys
             if "tools.mcp_tool" in _sys.modules:
-                from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-                if has_registered_mcp_tools():
+                from tools.mcp_tool import (
+                    has_registered_mcp_tools,
+                    refresh_agent_mcp_tools,
+                )
+                from tools.registry import registry as _tool_registry
+
+                _published_generation = getattr(
+                    agent, "_tool_snapshot_generation", -1
+                )
+                if (
+                    has_registered_mcp_tools()
+                    or _published_generation != _tool_registry._generation
+                ):
                     refresh_agent_mcp_tools(agent, quiet_mode=True)
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
+
+    # A refresh queues this note instead of injecting a standalone user-role
+    # message. Fold it into the next real user turn and keep the clean input as
+    # the persistence override, exactly like model/skill reload notes.
+    pending_mcp_notice = getattr(agent, "_pending_mcp_catalog_notice", None)
+    if pending_mcp_notice:
+        clean_user_message = (
+            persist_user_message if persist_user_message is not None else user_message
+        )
+        user_message = prepend_user_note(user_message, pending_mcp_notice)
+        if persist_user_message is None:
+            persist_user_message = clean_user_message
+        agent._pending_mcp_catalog_notice = None
 
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):

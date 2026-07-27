@@ -3,9 +3,8 @@
 ``refresh_agent_mcp_tools`` is the single rebuild path used by the TUI
 ``reload.mcp`` RPC, the gateway reload, and the late-binding refresh thread —
 so a slow MCP server that connects after the agent's one-time tool snapshot is
-picked up everywhere identically.  These assert the *contracts* those callers
-rely on (name-based diff, in-place mutation, agent-scoped filtering) rather than
-freezing any particular tool list.
+picked up everywhere identically. These assert the stable-bridge cache contract,
+full-schema direct-mode diffing, atomic mutation, and agent-scoped filtering.
 """
 
 import threading
@@ -59,6 +58,63 @@ def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch)
 
     assert added == set()
     assert agent.tools is original_tools  # not replaced → no churn / no cache thrash
+
+
+def test_stable_bridge_catalog_change_preserves_tools_prefix(monkeypatch):
+    """MCP registry edits queue a search nudge without swapping tools=."""
+    from tools.registry import registry
+    from tools.tool_search import bridge_tool_schemas
+
+    stable_defs = [_tool("read_file"), *bridge_tool_schemas()]
+    agent = _agent([])
+    agent.tools = stable_defs
+    agent.valid_tool_names = {t["function"]["name"] for t in stable_defs}
+    agent._tool_snapshot_generation = registry._generation
+    original_tools = agent.tools
+
+    name = "mcp_cache_stable_refresh_probe"
+    registry.register(
+        name=name,
+        handler=lambda args, **kw: "{}",
+        schema=_tool(name)["function"],
+        toolset="mcp-cache-stable",
+    )
+    try:
+        import model_tools
+        monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: stable_defs)
+
+        added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+        assert added == set()
+        assert agent.tools is original_tools
+        assert "Re-run tool_search" in agent._pending_mcp_catalog_notice
+        assert agent._tool_snapshot_generation == registry._generation
+    finally:
+        registry.deregister(name)
+
+
+def test_direct_mode_refresh_detects_same_name_schema_change(monkeypatch):
+    """Tool Search off must publish description/parameter edits, not just names."""
+    old = _tool("mcp_same_name")
+    new = _tool("mcp_same_name")
+    new["function"]["description"] = "updated schema"
+    new["function"]["parameters"] = {
+        "type": "object",
+        "properties": {"fresh": {"type": "string"}},
+    }
+    agent = _agent([])
+    agent.tools = [old]
+    agent.valid_tool_names = {"mcp_same_name"}
+    original_tools = agent.tools
+
+    import model_tools
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [new])
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools is not original_tools
+    assert agent.tools == [new]
 
 
 def test_refresh_detects_equal_size_swap(monkeypatch):
