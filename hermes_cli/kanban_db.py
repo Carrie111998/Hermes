@@ -6619,6 +6619,27 @@ def get_qualification_intake_run(
     return _qualification_intake_run_dict(row) if row else None
 
 
+def set_qualification_intake_worker_pid(
+    conn: sqlite3.Connection,
+    *,
+    intake_id: str,
+    run_id: int,
+    claim_lock: str,
+    worker_pid: int,
+) -> bool:
+    with write_txn(conn):
+        updated = conn.execute(
+            """
+            UPDATE qualification_intake_runs
+               SET worker_pid = ?
+             WHERE id = ? AND intake_id = ? AND status = 'running'
+               AND claim_lock = ?
+            """,
+            (int(worker_pid), int(run_id), intake_id, claim_lock),
+        )
+    return updated.rowcount == 1
+
+
 def heartbeat_qualification_intake(
     conn: sqlite3.Connection,
     *,
@@ -16508,9 +16529,16 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
-def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
-    """Resolve the fixed profile runtime selected for this dispatched run."""
-    if not task.assignee:
+def resolve_profile_runtime_identity(
+    profile_name: str,
+    *,
+    provider_override: Optional[str] = None,
+    model_override: Optional[str] = None,
+    source: str = "dispatcher",
+    surface: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Resolve provider, model, and effective effort from one named profile."""
+    if not profile_name:
         return None
     try:
         from hermes_constants import (
@@ -16521,7 +16549,7 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
         from hermes_cli.config import load_config
         from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
-        profile = normalize_profile_name(task.assignee)
+        profile = normalize_profile_name(profile_name)
         profile_home = resolve_profile_env(profile)
         token = set_hermes_home_override(profile_home)
         try:
@@ -16532,10 +16560,10 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
         if not isinstance(model_config, dict):
             model_config = {"default": model_config}
         provider = str(
-            task.provider_override or model_config.get("provider") or ""
+            provider_override or model_config.get("provider") or ""
         ).strip().lower()
         model = str(
-            task.model_override
+            model_override
             or model_config.get("default")
             or model_config.get("model")
             or ""
@@ -16566,20 +16594,30 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
             "provider": provider,
             "model": model,
             "effort": effort,
-            "surface": (
-                "claude-cli" if provider == "claude-cli" else "hermes-primary"
-            ),
-            "source": "dispatcher",
+            "surface": surface
+            or ("claude-cli" if provider == "claude-cli" else "hermes-primary"),
+            "source": source,
             "version": 1,
         }
     except Exception as exc:
         _log.warning(
             "kanban worker: could not resolve canonical runtime identity for "
             "profile=%r (%s)",
-            task.assignee,
+            profile_name,
             exc,
         )
         return None
+
+
+def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
+    """Resolve the fixed profile runtime selected for this dispatched run."""
+    if not task.assignee:
+        return None
+    return resolve_profile_runtime_identity(
+        task.assignee,
+        provider_override=task.provider_override,
+        model_override=task.model_override,
+    )
 
 
 def _stamp_run_executor_identity(

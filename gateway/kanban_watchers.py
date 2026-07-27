@@ -36,8 +36,9 @@ def _process_pending_qualification_intakes(
 ) -> dict[str, int]:
     """Process a bounded pending-intake batch before normal dispatch."""
 
-    if qualify is None:
-        from hermes_cli.kanban_qualifier import qualify_intake as qualify
+    route_directly = qualify is None
+    if route_directly:
+        from hermes_cli.kanban_po_intake import route_pending_intake
 
     limit = max(1, int(per_tick))
     pending = _kb.list_qualification_intakes(conn, status="pending")[:limit]
@@ -46,7 +47,10 @@ def _process_pending_qualification_intakes(
         intake_id = str(intake["id"])
         counts["attempted"] += 1
         try:
-            result = qualify(conn, board=board, intake_id=intake_id)
+            if route_directly:
+                result = route_pending_intake(conn, board=board, intake=intake)
+            else:
+                result = qualify(conn, board=board, intake_id=intake_id)
         except Exception:
             counts["failed"] += 1
             logger.exception(
