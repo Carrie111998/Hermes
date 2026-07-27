@@ -58,3 +58,25 @@ def test_build_activity_snapshot_maps_missing_provenance_to_unknown():
         now=2.0,
     )
     assert snap["last_activity_provenance"] == "unknown"
+
+
+def test_build_activity_snapshot_preserves_compression_transition_provenances():
+    """Compaction / timeout / cooldown share the observation source (#72424)."""
+    for provenance, desc in (
+        (ActivityProvenance.AGENT_COMPRESSION, "context compression in progress"),
+        (ActivityProvenance.AGENT_COMPRESSION_TIMEOUT, "context compression timed out"),
+        (
+            ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
+            "compression blocked (cooldown: 30s remaining)",
+        ),
+    ):
+        snap = build_activity_snapshot(
+            last_activity_at=50.0,
+            last_activity_description=desc,
+            last_activity_provenance=provenance,
+            now=55.0,
+        )
+        assert snap["last_activity_provenance"] == provenance.value
+        assert snap["provenance"] == provenance.value
+        assert snap["last_activity_description"] == desc
+        assert snap["seconds_since_activity"] == 5.0

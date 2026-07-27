@@ -13958,6 +13958,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 self._hygiene_compression_failure_cooldowns[
                                                     session_entry.session_id
                                                 ] = time.time() + _hyg_failure_cooldown_seconds
+                                            try:
+                                                from agent.session_activity import (
+                                                    ActivityProvenance,
+                                                )
+
+                                                _hyg_agent._touch_activity(
+                                                    "session hygiene compression timed out",
+                                                    provenance=(
+                                                        ActivityProvenance.AGENT_COMPRESSION_TIMEOUT
+                                                    ),
+                                                )
+                                            except Exception:
+                                                logger.debug(
+                                                    "hygiene compression timeout "
+                                                    "activity stamp failed",
+                                                    exc_info=True,
+                                                )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
@@ -14103,6 +14120,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             self._hygiene_compression_failure_cooldowns[
                                                 session_entry.session_id
                                             ] = time.time() + _hyg_failure_cooldown_seconds
+                                        try:
+                                            from agent.session_activity import (
+                                                ActivityProvenance,
+                                            )
+
+                                            _hyg_agent._touch_activity(
+                                                "session hygiene compression aborted",
+                                                provenance=(
+                                                    ActivityProvenance.AGENT_COMPRESSION_COOLDOWN
+                                                ),
+                                            )
+                                        except Exception:
+                                            logger.debug(
+                                                "hygiene compression abort "
+                                                "activity stamp failed",
+                                                exc_info=True,
+                                            )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message

@@ -183,3 +183,81 @@ def test_reset_activity_labels_after_turn_swallows_db_errors():
     assert agent._last_activity_ts == 99.0
     assert agent._last_activity_desc == ""
     assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+
+
+def test_warn_context_overflow_blocked_stamps_compression_cooldown(monkeypatch):
+    agent = _agent_with_db()
+    agent._last_ctx_overflow_warn = None
+    agent._emit_warning = MagicMock()
+    agent._touch_activity = run_agent.AIAgent._touch_activity.__get__(
+        agent, SimpleNamespace
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_100.0)
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: 2000.0)
+
+    run_agent.AIAgent._warn_context_overflow_blocked(
+        agent, "cooldown: 30s remaining", 80_000, 40_000
+    )
+
+    assert agent._last_activity_provenance is ActivityProvenance.AGENT_COMPRESSION_COOLDOWN
+    assert "compression blocked" in agent._last_activity_desc
+    agent._emit_warning.assert_called_once()
+
+    # Deduped re-entry must not re-touch or re-emit.
+    agent._session_db.touch_session_activity.reset_mock()
+    prev_desc = agent._last_activity_desc
+    run_agent.AIAgent._warn_context_overflow_blocked(
+        agent, "cooldown: 29s remaining", 80_000, 40_000
+    )
+    assert agent._last_activity_desc == prev_desc
+    agent._emit_warning.assert_called_once()
+
+
+def test_warn_context_overflow_blocked_stamps_cooldown_for_ineffective(monkeypatch):
+    agent = _agent_with_db()
+    agent._last_ctx_overflow_warn = None
+    agent._emit_warning = MagicMock()
+    agent._touch_activity = run_agent.AIAgent._touch_activity.__get__(
+        agent, SimpleNamespace
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_100.0)
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: 2000.0)
+
+    run_agent.AIAgent._warn_context_overflow_blocked(
+        agent, "ineffective: last pass saved 0 tokens", 80_000, 40_000
+    )
+
+    assert agent._last_activity_provenance is ActivityProvenance.AGENT_COMPRESSION_COOLDOWN
+    agent._emit_warning.assert_called_once()
+
+
+def test_compression_transition_provenances_surface_in_activity_summary(monkeypatch):
+    """Compaction / timeout / cooldown publish through get_activity_summary."""
+    agent = _agent_with_db()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_200.0)
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: 3000.0)
+
+    transitions = (
+        (
+            ActivityProvenance.AGENT_COMPRESSION,
+            "context compression in progress",
+        ),
+        (
+            ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+            "context compression timed out",
+        ),
+        (
+            ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
+            "compression blocked (cooldown: 30s remaining)",
+        ),
+    )
+    for provenance, desc in transitions:
+        agent._touch_activity(desc, provenance=provenance)
+        summary = agent.get_activity_summary()
+        assert summary["last_activity_provenance"] == provenance.value
+        assert summary["provenance"] == provenance.value
+        assert summary["last_activity_description"] == desc
+        assert summary["last_activity_desc"] == desc

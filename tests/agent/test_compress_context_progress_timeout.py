@@ -238,6 +238,7 @@ class TestCompressContextForwarderOwnsTimeout:
         agent.session_id = "s1"
         agent._cached_system_prompt = "sys"
         agent._emit_warning = MagicMock()
+        agent._touch_activity = MagicMock()
         agent._build_system_prompt = MagicMock(return_value="sys")
         agent._conversation_root_id = MagicMock(return_value=None)
         agent.context_compressor = MagicMock()
@@ -289,6 +290,12 @@ class TestCompressContextForwarderOwnsTimeout:
         )
         assert cooldown_args[0] == 60.0
         assert "host compress_context timeout" in cooldown_args[1]
+        from agent.session_activity import ActivityProvenance
+
+        agent._touch_activity.assert_called_with(
+            "context compression timed out",
+            provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+        )
 
     def test_fallback_prompt_resolved_lazily_on_timeout(self, monkeypatch):
         """Eager prompt rebuild must not run before compression starts."""
@@ -298,6 +305,7 @@ class TestCompressContextForwarderOwnsTimeout:
         agent.session_id = "s1"
         agent._cached_system_prompt = None
         agent._emit_warning = MagicMock()
+        agent._touch_activity = MagicMock()
         agent._conversation_root_id = MagicMock(return_value=None)
         agent.context_compressor = MagicMock()
         agent.context_compressor._consecutive_timeout_failures = 0

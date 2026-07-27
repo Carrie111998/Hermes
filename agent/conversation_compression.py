@@ -48,6 +48,7 @@ from agent.context_engine import (
     sanitize_memory_context,
 )
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.session_activity import ActivityProvenance
 
 logger = logging.getLogger(__name__)
 
@@ -791,7 +792,7 @@ class _CompressionActivityHeartbeat:
         try:
             touch = getattr(self._agent, "_touch_activity", None)
             if callable(touch):
-                touch(desc)
+                touch(desc, provenance=ActivityProvenance.AGENT_COMPRESSION)
         except Exception:
             logger.debug("compression activity heartbeat touch failed", exc_info=True)
 

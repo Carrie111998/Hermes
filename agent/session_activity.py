@@ -23,7 +23,7 @@ class ActivityProvenance(str, Enum):
     """Where a durable/in-memory activity stamp came from."""
 
     UNKNOWN = "unknown"
-    # Reserved for #72424 writers; not stamped by #72039 call sites yet.
+    # Compression writers (#72424 / activity contract): heartbeat, host timeout, cooldown.
     AGENT_COMPRESSION = "agent.compression"
     AGENT_COMPRESSION_TIMEOUT = "agent.compression_timeout"
     AGENT_COMPRESSION_COOLDOWN = "agent.compression_cooldown"

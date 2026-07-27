@@ -308,7 +308,7 @@ async def test_check_session_stalls_scans_profile_adapters():
 
 @pytest.mark.asyncio
 async def test_check_session_stalls_logs_compression_provenance(caplog):
-    """Provenance from the shared contract stays visible in stall diagnostics."""
+    """Stale compression stamps still stall, but provenance stays visible."""
     import logging
 
     adapter = _FakeAdapter()
@@ -325,6 +325,24 @@ async def test_check_session_stalls_logs_compression_provenance(caplog):
         assert await runner._check_session_stalls(60) == 1
     assert any("agent.compression" in r.message for r in caplog.records)
     assert any("compressing context" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_skips_active_compression_heartbeat():
+    """Fresh agent.compression heartbeats are progress, not a silent stall."""
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:compacting"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(
+        time.time() - 5,
+        description="context compression in progress",
+        provenance=ActivityProvenance.AGENT_COMPRESSION,
+    )
+
+    assert await runner._check_session_stalls(60) == 0
+    assert adapter.sent == []
+    assert session_key not in runner._session_stall_notified
 
 
 @pytest.mark.asyncio

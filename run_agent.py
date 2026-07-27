@@ -964,6 +964,12 @@ class AIAgent:
             from agent.conversation_compression import (
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
             )
+            # cooldown + anti-thrash (ineffective) are both "compression blocked".
+            if _warn_kind in ("cooldown", "ineffective"):
+                self._touch_activity(
+                    f"compression blocked ({reason})",
+                    provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
+                )
             self._emit_warning(
                 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
                     tokens=preflight_tokens,
@@ -6730,6 +6736,18 @@ class AIAgent:
                     waited,
                     total_ceiling,
                 )
+                touch = getattr(self, "_touch_activity", None)
+                if callable(touch):
+                    try:
+                        touch(
+                            "context compression timed out",
+                            provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "compress_context timeout activity touch failed",
+                            exc_info=True,
+                        )
                 # Same timeout cooldown ladder as summary-LLM timeouts
                 # (#62452): avoid re-burning the full idle budget every turn.
                 compressor = getattr(self, "context_compressor", None)

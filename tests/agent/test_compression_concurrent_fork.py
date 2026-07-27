@@ -127,7 +127,7 @@ def test_compression_activity_heartbeat_touches_agent_during_long_compress(tmp_p
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
 
     def _slow_compress(*_a, **_kw):
         _wait_for_touch(touch_calls, "context compression in progress")
@@ -156,7 +156,7 @@ def test_compression_activity_heartbeat_stops_on_compress_exception(tmp_path: Pa
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
 
     def _failing_compress(*_a, **_kw):
         _wait_for_touch(touch_calls, "context compression in progress")
@@ -182,7 +182,7 @@ def test_compression_activity_heartbeat_ignores_touch_errors(tmp_path: Path) -> 
 
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
-    agent._touch_activity = lambda _desc: (_ for _ in ()).throw(RuntimeError("touch boom"))
+    agent._touch_activity = lambda _desc, **_kw: (_ for _ in ()).throw(RuntimeError("touch boom"))
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
@@ -207,7 +207,7 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = "not-a-number"
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    agent._touch_activity = lambda desc, **_kw: touch_calls.append(desc)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     strict_calls: list[int | None] = []
@@ -240,7 +240,13 @@ def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: 
 
     agent = _build_agent_with_db(db, session_id)
     touch_calls: list[str] = []
-    agent._touch_activity = lambda desc: touch_calls.append(desc)
+    touch_provenances: list = []
+
+    def _capture(desc, *, provenance=None):
+        touch_calls.append(desc)
+        touch_provenances.append(provenance)
+
+    agent._touch_activity = _capture
 
     heartbeat = _CompressionActivityHeartbeat(agent, interval_seconds=float("inf"))
 
@@ -248,7 +254,12 @@ def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: 
     heartbeat.start()
     heartbeat.stop()
     assert touch_calls == ["context compression started", "context compression completed"]
+    from agent.session_activity import ActivityProvenance
 
+    assert touch_provenances == [
+        ActivityProvenance.AGENT_COMPRESSION,
+        ActivityProvenance.AGENT_COMPRESSION,
+    ]
 
 
 def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
