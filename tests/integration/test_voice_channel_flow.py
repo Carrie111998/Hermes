@@ -254,6 +254,54 @@ class TestRealNaClWithDAVE:
 
         assert len(receiver._buffers.get(100, b"")) == 0
 
+    def test_dave_session_initialized_after_receiver_start_is_used(self, monkeypatch):
+        """A DAVE session negotiated after voice connect decrypts later packets."""
+        monkeypatch.setattr(
+            discord.opus,
+            "Decoder",
+            lambda: SimpleNamespace(decode=lambda _payload: b"\x00" * 3840),
+        )
+        key = _make_secret_key()
+        receiver = _make_voice_receiver(key, dave_session=None)
+        receiver.map_ssrc(100, 42)
+
+        dave = MagicMock()
+        dave.ready = True
+        dave.decrypt.return_value = b"\xf8\xff\xfe"
+        receiver._vc._connection.dave_session = dave
+
+        packet = _build_encrypted_rtp_packet(key, b"\xf8\xff\xfe", ssrc=100)
+        receiver._on_packet(packet)
+
+        dave.decrypt.assert_called_once()
+        assert 100 in receiver._buffers
+        assert len(receiver._buffers[100]) > 0
+
+    def test_dave_session_transition_uses_current_connection_session(self, monkeypatch):
+        """A DAVE epoch transition must not keep using the startup session."""
+        monkeypatch.setattr(
+            discord.opus,
+            "Decoder",
+            lambda: SimpleNamespace(decode=lambda _payload: b"\x00" * 3840),
+        )
+        key = _make_secret_key()
+        old_dave = MagicMock()
+        old_dave.ready = True
+        receiver = _make_voice_receiver(key, dave_session=old_dave)
+        receiver.map_ssrc(100, 42)
+
+        new_dave = MagicMock()
+        new_dave.ready = True
+        new_dave.decrypt.return_value = b"\xf8\xff\xfe"
+        receiver._vc._connection.dave_session = new_dave
+
+        packet = _build_encrypted_rtp_packet(key, b"\xf8\xff\xfe", ssrc=100)
+        receiver._on_packet(packet)
+
+        old_dave.decrypt.assert_not_called()
+        new_dave.decrypt.assert_called_once()
+        assert len(receiver._buffers[100]) > 0
+
 
 class TestRTPPaddingStrip:
     """RFC 3550 §5.1 — strip RTP padding before DAVE/Opus decode."""

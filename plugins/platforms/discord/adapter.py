@@ -446,7 +446,6 @@ class VoiceReceiver:
 
         # Decryption
         self._secret_key: Optional[bytes] = None
-        self._dave_session = None
         self._bot_ssrc: int = 0
 
         # SSRC -> user_id mapping (populated from SPEAKING events)
@@ -474,7 +473,6 @@ class VoiceReceiver:
         """Start listening for voice packets."""
         conn = self._vc._connection
         self._secret_key = bytes(conn.secret_key)
-        self._dave_session = conn.dave_session
         self._bot_ssrc = conn.ssrc
 
         self._install_speaking_hook(conn)
@@ -671,13 +669,19 @@ class VoiceReceiver:
                 return
 
         # --- DAVE E2EE decrypt ---
-        if self._dave_session:
+        # Discord marks the voice connection ready once the transport secret is
+        # available, before the mandatory DAVE session is necessarily ready.
+        # Read the live connection state for every packet so initial negotiation
+        # and later MLS epoch transitions cannot leave the receiver pinned to a
+        # missing or stale DAVE session.
+        dave_session = getattr(self._vc._connection, "dave_session", None)
+        if dave_session is not None and getattr(dave_session, "ready", True):
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
             if user_id:
                 try:
                     import davey
-                    decrypted = self._dave_session.decrypt(
+                    decrypted = dave_session.decrypt(
                         user_id, davey.MediaType.audio, decrypted
                     )
                 except Exception as e:
