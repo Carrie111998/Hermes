@@ -167,3 +167,34 @@ def test_operator_opt_out_disables_even_a_supported_route():
     """The override must work in both directions, including over Nous Portal."""
     assert _gate("https://inference-api.nousresearch.com/v1", "nous", None) is True
     assert _gate("https://inference-api.nousresearch.com/v1", "nous", False) is False
+
+
+# ── acceptance is not proof of effect ────────────────────────────────────────
+
+def test_opt_in_sending_is_not_reported_as_proof_of_effect():
+    """A route can accept reasoning_effort and ignore it.
+
+    Probing this profile's LiteLLM router (2026-07-27) returned HTTP 200 for
+    every effort level while reasoning-token medians stayed non-monotonic
+    (minimal 56.5 > high 51.0 > control 53.5 > low 37.0, n=4 each) and the
+    control with no field at all already produced reasoning. Reporting "IS
+    sent" without that caveat would recreate the silent over-claim this module
+    exists to prevent.
+    """
+    status = describe(
+        configured="high", supported=True, provider="custom:litellm",
+        base_url="http://127.0.0.1:4000/v1", override=True,
+    )
+    assert status["will_be_sent"] is True
+    assert status["reason"], "opt-in must carry the acceptance-vs-effect caveat"
+    assert "not proof of effect" in status["reason"]
+
+
+def test_auto_detected_route_carries_no_caveat():
+    """Only the operator opt-in path is unverified; auto-detected routes are
+    ones Hermes already knows honor the field."""
+    status = describe(
+        configured="high", supported=True, provider="openrouter",
+        base_url="https://openrouter.ai/api/v1", override=None,
+    )
+    assert status["reason"] is None
