@@ -444,8 +444,6 @@ class VoiceReceiver:
         self._pcm_callback = pcm_callback
         self._running = False
 
-        # Decryption
-        self._secret_key: Optional[bytes] = None
         self._bot_ssrc: int = 0
 
         # SSRC -> user_id mapping (populated from SPEAKING events)
@@ -472,7 +470,6 @@ class VoiceReceiver:
     def start(self):
         """Start listening for voice packets."""
         conn = self._vc._connection
-        self._secret_key = bytes(conn.secret_key)
         self._bot_ssrc = conn.ssrc
 
         self._install_speaking_hook(conn)
@@ -632,7 +629,12 @@ class VoiceReceiver:
 
         try:
             import nacl.secret  # noqa: E402 — delayed import, only in voice path
-            box = nacl.secret.Aead(self._secret_key)
+            # SESSION_DESCRIPTION can replace the transport key after the
+            # receiver has started (for example during voice reconnects).
+            # Resolve the connection-owned key at packet time, just like the
+            # live DAVE session below, instead of pinning the startup value.
+            secret_key = bytes(self._vc._connection.secret_key)
+            box = nacl.secret.Aead(secret_key)
             decrypted = box.decrypt(encrypted, header, bytes(nonce))
         except Exception as e:
             if self._packet_debug_count <= 10:

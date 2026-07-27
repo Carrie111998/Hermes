@@ -154,6 +154,27 @@ class TestRealNaClDecrypt:
         assert 100 in receiver._buffers
         assert len(receiver._buffers[100]) > 0
 
+    def test_transport_key_rotation_uses_current_connection_key(self):
+        """A later Discord session description must replace the startup key."""
+        startup_key = _make_secret_key()
+        rotated_key = _make_secret_key()
+        receiver = _make_voice_receiver(startup_key)
+        receiver._vc._connection.secret_key = list(rotated_key)
+
+        packet = _build_padded_rtp_packet(
+            rotated_key,
+            b"\xf8\xff\xfe",
+            pad_len=4,
+            ext_words=1,
+            ssrc=100,
+        )
+        assert len(packet[:16]) == 16
+        assert len(packet[16:-4]) == 27
+        receiver._on_packet(packet)
+
+        assert 100 in receiver._buffers
+        assert len(receiver._buffers[100]) > 0
+
     def test_wrong_key_packet_dropped(self):
         """Packet encrypted with wrong key → NaCl fails → not buffered."""
         real_key = _make_secret_key()
