@@ -658,36 +658,96 @@ def _live_system_guard(request, monkeypatch):
     import subprocess as _subprocess
 
     test_pid = _os.getpid()
-    # Capture the test process's existing children at fixture start —
-    # any *new* children spawned by the test are also allowlisted via
-    # the live psutil walk below. Static set keeps the fast path cheap.
+    # Capture the test process's existing children at fixture start by
+    # identity, not raw PID. PIDs/PGIDs are reusable live-system integers.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
+
+        _initial_children = {}
+        for child in _psutil.Process(test_pid).children(recursive=True):
+            try:
+                _initial_children[child.pid] = child.create_time()
+            except Exception:
+                pass
     except Exception:
         _psutil = None
-        _initial_children = set()
+        _initial_children = {}
+
+    _recorded_children = {}
+    _MISSING = object()
+
+    def _is_no_such_process(exc: Exception) -> bool:
+        if isinstance(exc, ProcessLookupError):
+            return True
+        return _psutil is not None and isinstance(
+            exc, getattr(_psutil, "NoSuchProcess", ())
+        )
+
+    def _current_create_time(pid: int):
+        if _psutil is None:
+            return None
+        try:
+            return _psutil.Process(pid).create_time()
+        except Exception as exc:
+            if _is_no_such_process(exc):
+                raise ProcessLookupError(pid) from exc
+            return None
+
+    def _record_child(pid) -> None:
+        try:
+            pid = int(pid)
+        except Exception:
+            return
+        if pid <= 0:
+            return
+        try:
+            create_time = _current_create_time(pid)
+        except ProcessLookupError:
+            return
+        _recorded_children[pid] = create_time
+
+    def _identity_matches(pid: int, expected_create_time) -> bool:
+        if expected_create_time is None:
+            return False
+        return _current_create_time(pid) == expected_create_time
+
+    def _recorded_identity_matches(pid: int):
+        expected = _recorded_children.get(pid, _MISSING)
+        if expected is _MISSING:
+            return None
+        return _identity_matches(pid, expected)
+
+    def _recorded_child_owns_process_group(pid: int) -> bool:
+        try:
+            if _recorded_identity_matches(pid) is not True:
+                return False
+        except ProcessLookupError:
+            return False
+        if not hasattr(_os, "getsid"):
+            return False
+        try:
+            return _os.getpgid(pid) == pid and _os.getsid(pid) == pid
+        except Exception:
+            return False
 
     def _is_own_subtree(pid: int) -> bool:
-        # PID 0 means "our own process group"; -1 means "every process we
-        # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
-        # but pid 0 is technically scoped to our group so allow it; pid -1
-        # is treated as foreign (refuse).
-        if pid == 0:
-            return True
-        if pid < 0:
+        # PID 0 means "our own process group" and negative PIDs target process
+        # groups or every signalable process. Destructive uses are never safe.
+        if pid <= 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid:
             return True
+        if pid in _initial_children:
+            try:
+                return _identity_matches(pid, _initial_children[pid])
+            except ProcessLookupError:
+                return False
         if _psutil is None:
             return False
         try:
             walker = _psutil.Process(pid)
         except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
-            return True
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
@@ -706,7 +766,18 @@ def _live_system_guard(request, monkeypatch):
         # test_entire_tree_is_sigkilled_not_just_parent.
         if int(sig) == 0:
             return real_kill(pid, sig, *args, **kwargs)
-        if _is_own_subtree(int(pid)):
+        pid_int = int(pid)
+        try:
+            recorded_match = _recorded_identity_matches(pid_int)
+        except ProcessLookupError:
+            raise
+        if recorded_match is False:
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked os.kill("
+                f"{pid}, {sig}) — recorded child PID identity is stale or "
+                "unverifiable."
+            )
+        if recorded_match is True or _is_own_subtree(pid_int):
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
@@ -722,24 +793,22 @@ def _live_system_guard(request, monkeypatch):
     monkeypatch.setattr(_os, "kill", _guarded_kill)
 
     # ``os.killpg`` is the same risk class — sends a signal to every
-    # process in a group. The gateway is a session leader (its own
-    # PGID == its PID), so killpg(gateway_pid, SIGTERM) is a one-shot
-    # kill of the live process. Allow it only when the target PGID is
-    # the test process's own group.
+    # process in a group. A PGID is not process identity, so destructive
+    # group signals are allowed only for a recorded child that still proves
+    # it owns a fresh session/process group (start_new_session=True).
     if hasattr(_os, "killpg"):
         real_killpg = _os.killpg
-        own_pgid = _os.getpgrp()
 
         def _guarded_killpg(pgid, sig, *args, **kwargs):
             # Signal 0 is a pure liveness probe — never destructive.
             if int(sig) == 0:
                 return real_killpg(pgid, sig, *args, **kwargs)
-            if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
+            if _recorded_child_owns_process_group(int(pgid)):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
-                f"os.killpg({pgid}, {sig}) — PGID is outside the test "
-                "process group. See _live_system_guard for the why."
+                f"killpg({pgid}, {sig}) — PGID ownership is stale or "
+                "unverifiable. See _live_system_guard for the why."
             )
 
         monkeypatch.setattr(_os, "killpg", _guarded_killpg)
@@ -891,6 +960,7 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                _record_child(self.pid)
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -963,11 +1033,15 @@ def _live_system_guard(request, monkeypatch):
             _check_subprocess_cmd(
                 "asyncio.create_subprocess_exec", [program, *args]
             )
-            return await real_async_exec(program, *args, **kwargs)
+            proc = await real_async_exec(program, *args, **kwargs)
+            _record_child(proc.pid)
+            return proc
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
             _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
-            return await real_async_shell(cmd, *args, **kwargs)
+            proc = await real_async_shell(cmd, *args, **kwargs)
+            _record_child(proc.pid)
+            return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
         monkeypatch.setattr(

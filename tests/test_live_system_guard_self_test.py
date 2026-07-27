@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import types
 
 import pytest
@@ -29,9 +30,86 @@ import pytest
 FOREIGN_PID = 1
 
 
+_SLEEP_FOR_TEST = "import time; time.sleep(30)"
+_PID_ZERO_CANARY_CHILD = "HERMES_LIVE_GUARD_PID_ZERO_CANARY_CHILD"
+
+
+def _sleeping_child(**kwargs) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [sys.executable, "-c", _SLEEP_FOR_TEST],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        **kwargs,
+    )
+
+
+def _cleanup_child(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=2)
+
+
+def _patch_psutil_process_for_pid(
+    monkeypatch: pytest.MonkeyPatch,
+    pid: int,
+    *,
+    parents: list[int] | None = None,
+    create_time_delta: float = 0.0,
+    access_denied: bool = False,
+    no_such_process: bool = False,
+) -> None:
+    import psutil
+
+    real_process = psutil.Process
+
+    class FakeProcess:
+        def __init__(self, current_pid: int):
+            if current_pid == pid and no_such_process:
+                raise psutil.NoSuchProcess(pid)
+            self.pid = current_pid
+            self._real = real_process(current_pid)
+
+        def create_time(self):
+            if self.pid == pid and access_denied:
+                raise psutil.AccessDenied(pid=pid)
+            value = self._real.create_time()
+            if self.pid == pid:
+                return value + create_time_delta
+            return value
+
+        def parents(self):
+            if self.pid == pid and parents is not None:
+                return [types.SimpleNamespace(pid=parent) for parent in parents]
+            return self._real.parents()
+
+        def __getattr__(self, name: str):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(psutil, "Process", FakeProcess)
+
+
+def _stub_systemctl(tmp_path, monkeypatch) -> None:
+    stub = tmp_path / "systemctl"
+    stub.write_text(
+        "#!/bin/sh\nprintf 'stub-systemctl:%s\\n' \"$*\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
 # ──────────────────── fail-closed self-protection ──────────────
 #
-# This file executes REAL kill primitives — os.kill(-1, SIGTERM), os.killpg,
+# This file executes REAL kill primitives — os.kill(-1, SIGTERM), killpg,
 # pkill -f python — and depends entirely on the autouse ``_live_system_guard``
 # fixture in tests/conftest.py to intercept them. That makes the canary
 # fail-OPEN: in any collection context where this file is present but its home
@@ -76,7 +154,7 @@ def _refuse_to_fire_live_weapons(request):
             "REFUSING TO RUN: the live-system guard from tests/conftest.py is "
             "not active in this interpreter (os.kill is still the raw C "
             "builtin). This canary file executes real kill primitives — "
-            "os.kill(-1, SIGTERM), os.killpg, pkill -f python — and relies on "
+            "os.kill(-1, SIGTERM), killpg, pkill -f python — and relies on "
             "the guard to intercept them; unguarded, they SIGTERM every process "
             "the current user owns. This usually means the file was collected "
             "without its home tests/conftest.py (note: a test*.py copy glob "
@@ -116,10 +194,184 @@ def test_os_kill_blocks_negative_one():
         os.kill(-1, signal.SIGTERM)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX PID-zero semantics")
+def test_os_kill_blocks_destructive_zero_pid():
+    """A broken guard may kill only the isolated child session, never pytest's parent."""
+    if os.environ.get(_PID_ZERO_CANARY_CHILD) == "1":
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            os.kill(0, signal.SIGTERM)
+        return
+
+    env = os.environ.copy()
+    env[_PID_ZERO_CANARY_CHILD] = "1"
+    test_node = f"{__file__}::test_os_kill_blocks_destructive_zero_pid"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", test_node],
+        env=env,
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
 def test_os_killpg_blocks_foreign_pgid():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        os.killpg(FOREIGN_PID, signal.SIGTERM)
+        os.killpg(FOREIGN_PID, signal.SIGTERM)  # windows-footgun: ok — POSIX-only
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+def test_recorded_new_session_child_killpg_passes_with_hidden_parent_chain(
+    monkeypatch,
+):
+    proc = _sleeping_child(start_new_session=True)
+    try:
+        with monkeypatch.context() as mp:
+            _patch_psutil_process_for_pid(mp, proc.pid, parents=[])
+            os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only
+        proc.wait(timeout=2)
+    finally:
+        _cleanup_child(proc)
+    assert proc.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+def test_recorded_non_session_leader_child_killpg_is_blocked():
+    proc = _sleeping_child()
+    try:
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only
+        assert proc.poll() is None
+    finally:
+        _cleanup_child(proc)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+def test_recorded_exited_new_session_child_killpg_is_blocked():
+    proc = _sleeping_child(start_new_session=True)
+    pid = proc.pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+        proc.wait(timeout=2)
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            os.killpg(pid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only
+    finally:
+        _cleanup_child(proc)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+@pytest.mark.parametrize(
+    "identity_override",
+    [
+        {"create_time_delta": 1000.0},
+        {"access_denied": True},
+    ],
+    ids=["mismatched", "unverifiable"],
+)
+def test_recorded_new_session_child_killpg_requires_current_identity(
+    monkeypatch, identity_override
+):
+    proc = _sleeping_child(start_new_session=True)
+    try:
+        with monkeypatch.context() as mp:
+            _patch_psutil_process_for_pid(mp, proc.pid, **identity_override)
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only
+        assert proc.poll() is None
+    finally:
+        _cleanup_child(proc)
+
+
+def test_recorded_child_mismatched_identity_blocks_os_kill(monkeypatch):
+    proc = _sleeping_child()
+    try:
+        with monkeypatch.context() as mp:
+            _patch_psutil_process_for_pid(
+                mp,
+                proc.pid,
+                parents=[os.getpid()],
+                create_time_delta=1000.0,
+            )
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.kill(proc.pid, signal.SIGTERM)
+        assert proc.poll() is None
+    finally:
+        _cleanup_child(proc)
+
+
+def test_recorded_child_unverifiable_identity_blocks_os_kill(monkeypatch):
+    proc = _sleeping_child()
+    try:
+        with monkeypatch.context() as mp:
+            _patch_psutil_process_for_pid(
+                mp,
+                proc.pid,
+                parents=[os.getpid()],
+                access_denied=True,
+            )
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.kill(proc.pid, signal.SIGTERM)
+        assert proc.poll() is None
+    finally:
+        _cleanup_child(proc)
+
+
+def test_recorded_child_missing_during_identity_check_raises_process_lookup(
+    monkeypatch,
+):
+    proc = _sleeping_child()
+    try:
+        with monkeypatch.context() as mp:
+            _patch_psutil_process_for_pid(mp, proc.pid, no_such_process=True)
+            with pytest.raises(ProcessLookupError):
+                os.kill(proc.pid, signal.SIGTERM)
+        assert proc.poll() is None
+    finally:
+        _cleanup_child(proc)
+
+
+@pytest.mark.parametrize("use_shell", [False, True], ids=["exec", "shell"])
+def test_asyncio_recorded_child_kill_passes_with_hidden_parent_chain(
+    monkeypatch, use_shell
+):
+    import asyncio
+
+    async def _exercise():
+        if use_shell:
+            command = subprocess.list2cmdline(
+                [sys.executable, "-c", _SLEEP_FOR_TEST]
+            )
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                _SLEEP_FOR_TEST,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        try:
+            with monkeypatch.context() as mp:
+                _patch_psutil_process_for_pid(mp, proc.pid, parents=[])
+                os.kill(proc.pid, signal.SIGTERM)
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        finally:
+            if proc.returncode is None:
+                try:
+                    os.kill(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                except ProcessLookupError:
+                    pass
+                await asyncio.wait_for(proc.wait(), timeout=2)
+        assert proc.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
+
+    asyncio.run(_exercise())
 
 
 # ──────────────────── subprocess regex bypasses ────────────────
@@ -278,51 +530,50 @@ def test_subprocess_killall_hermes_blocked():
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
-def test_systemctl_status_passes_through():
+def test_systemctl_status_passes_through(tmp_path, monkeypatch):
     """Read-only systemctl probes (status/show/list-units) are fine."""
-    # Run with check=False so we don't fail on the gateway's exit code.
+    _stub_systemctl(tmp_path, monkeypatch)
     r = subprocess.run(
         ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert r is not None  # Did not raise — the guard let it through.
+    assert "stub-systemctl:" in r.stdout
 
 
-def test_systemctl_show_passes_through():
+def test_systemctl_show_passes_through(tmp_path, monkeypatch):
+    _stub_systemctl(tmp_path, monkeypatch)
     r = subprocess.run(
         ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert r is not None
+    assert "stub-systemctl:" in r.stdout
 
 
-def test_systemctl_list_units_passes_through():
+def test_systemctl_list_units_passes_through(tmp_path, monkeypatch):
+    _stub_systemctl(tmp_path, monkeypatch)
     r = subprocess.run(
         ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert r is not None
+    assert "stub-systemctl:" in r.stdout
 
 
-def test_systemctl_unrelated_unit_passes_through():
-    """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
-    # Use --dry-run so we don't actually try to restart anything; just
-    # verify the guard doesn't block the call. systemctl supports
-    # --dry-run via the privileged API; on user scope it usually fails
-    # quickly without side effects.
+def test_systemctl_unrelated_unit_passes_through(tmp_path, monkeypatch):
+    """Read-only systemctl probes of non-Hermes units are allowed."""
+    _stub_systemctl(tmp_path, monkeypatch)
     r = subprocess.run(
         ["systemctl", "--user", "show", "fake-not-real-unit"],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert r is not None
+    assert "stub-systemctl:" in r.stdout
 
 
 def test_kill_own_subtree_passes_through():
@@ -348,7 +599,13 @@ def test_subprocess_pkill_with_unrelated_pattern_passes_through():
 
 def test_normal_subprocess_run_passes_through():
     """Plain non-systemctl subprocess.run should work normally."""
-    r = subprocess.run(["echo", "hello"], capture_output=True, text=True)
+    r = subprocess.run(
+        ["echo", "hello"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     assert r.stdout.strip() == "hello"
 
 
@@ -356,6 +613,7 @@ def test_normal_subprocess_run_passes_through():
 
 
 @pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal-0 probe")
 def test_bypass_marker_disables_guard():
     """The bypass marker exists for tests that genuinely need real signal delivery
     (e.g. PTY tests SIGINTing their own child). Verify it works.
@@ -366,4 +624,4 @@ def test_bypass_marker_disables_guard():
     # With bypass, the guard yields without installing the monkeypatch,
     # so we get the real os.kill. Calling os.kill(os.getpid(), 0) just
     # checks that the PID exists — harmless.
-    os.kill(os.getpid(), 0)  # No exception — guard is OFF.
+    os.kill(os.getpid(), 0)  # windows-footgun: ok — POSIX-only signal-0 probe
