@@ -6048,7 +6048,8 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries, resume_lane "
+            "SELECT id, status, block_kind, consecutive_failures, "
+            "max_retries, resume_lane "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -6062,6 +6063,13 @@ def recompute_ready(
             target_status = (
                 "review" if row["resume_lane"] == "review" else "ready"
             )
+            if cur_status == "blocked" and row["block_kind"] == "needs_input":
+                # A needs_input block is an explicit human gate.  In
+                # particular, dispatcher-observed waiting_for_user_control
+                # clean exits park the card here without emitting a normal
+                # kanban_block event; recompute_ready must not immediately
+                # promote that wait point back into the claim queue.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -12966,6 +12974,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    waiting_for_user_control: bool = False,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -13003,9 +13012,32 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
+            if waiting_for_user_control:
+                meta_row = conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                run_metadata: dict[str, Any] = {}
+                if meta_row is not None and meta_row["metadata"]:
+                    try:
+                        parsed = json.loads(meta_row["metadata"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        run_metadata = dict(parsed)
+                run_metadata["waiting_for_user_control"] = True
+                run_metadata["waiting_for_user_control_at"] = now
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (json.dumps(run_metadata, ensure_ascii=False), run_id),
+                )
+        payload: Optional[dict[str, Any]] = {"note": note} if note else None
+        if waiting_for_user_control:
+            payload = dict(payload or {})
+            payload["waiting_for_user_control"] = True
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            payload,
             run_id=run_id,
         )
     return True
@@ -13427,6 +13459,21 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+def _metadata_waiting_for_user_control(raw_metadata: Any) -> bool:
+    if not raw_metadata:
+        return False
+    if isinstance(raw_metadata, dict):
+        return raw_metadata.get("waiting_for_user_control") is True
+    try:
+        payload = json.loads(raw_metadata)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("waiting_for_user_control") is True
+    )
+
+
 def detect_crashed_workers(
     conn: sqlite3.Connection,
     *,
@@ -13474,7 +13521,7 @@ def detect_crashed_workers(
             "SELECT t.id, t.current_run_id, t.worker_pid, t.claim_lock, t.started_at, "
             "       r.owner_node_id, r.owner_boot_id, r.worker_start_token, "
             "       r.worker_pgid, r.handoff_safety_required, "
-            "       r.process_cleanup_unsafe "
+            "       r.process_cleanup_unsafe, r.metadata AS run_metadata "
             "FROM tasks t "
             "LEFT JOIN task_runs r ON r.id = t.current_run_id "
             "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
@@ -13555,33 +13602,50 @@ def detect_crashed_workers(
                 else _classify_worker_exit(pid)
             )
             rate_limited_exit = False
+            waiting_for_user_control_exit = False
             if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
+                if _metadata_waiting_for_user_control(row["run_metadata"]):
+                    # The worker explicitly declared that it reached an
+                    # operator-controlled wait point. Do not respawn,
+                    # hand off, or send it to review after the session exits:
+                    # park the card in a durable human-waiting state.
+                    protocol_violation = False
+                    waiting_for_user_control_exit = True
+                    error_text = "waiting_for_user_control"
+                    event_kind = "waiting_for_user_control"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                        "waiting_for_user_control": True,
+                    }
+                else:
+                    # Worker subprocess returned 0 but its task is still
+                    # ``running`` in the DB — it exited without calling
+                    # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
+                    # work itself succeeded and only the paperwork was skipped, so
+                    # a retry usually completes; the corrective sentence below is
+                    # surfaced to the retry worker via the prior-attempt error in
+                    # ``build_worker_context`` (guidance approach from #61817).
+                    protocol_violation = True
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation. "
+                        "If the prior run already did the work, verify it and "
+                        "report the result via kanban_complete; a run that ends "
+                        "without a terminal kanban call counts as failed no "
+                        "matter what it did."
+                    )
+                    event_kind = "protocol_violation"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                        # Durable marker for _protocol_violation_streak: _end_run
+                        # copies this payload into the run metadata, which is how
+                        # the violation-only retry budget is derived later.
+                        "protocol_violation": True,
+                    }
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -13618,25 +13682,46 @@ def detect_crashed_workers(
             if owner_rebooted:
                 event_payload["exit_proof"] = "owner_rebooted"
 
-            retry_status = _claimable_status_for_task(conn, row["id"])
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND current_run_id IS ? AND worker_pid = ? AND claim_lock IS ?",
-                (
-                    retry_status,
-                    row["id"],
-                    row["current_run_id"],
-                    pid,
-                    row["claim_lock"],
-                ),
-            )
+            if waiting_for_user_control_exit:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "block_kind = 'needs_input', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "last_failure_error = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND current_run_id IS ? AND worker_pid = ? AND claim_lock IS ?",
+                    (
+                        row["id"],
+                        row["current_run_id"],
+                        pid,
+                        row["claim_lock"],
+                    ),
+                )
+            else:
+                retry_status = _claimable_status_for_task(conn, row["id"])
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND current_run_id IS ? AND worker_pid = ? AND claim_lock IS ?",
+                    (
+                        retry_status,
+                        row["id"],
+                        row["current_run_id"],
+                        pid,
+                        row["claim_lock"],
+                    ),
+                )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                if waiting_for_user_control_exit:
+                    _run_outcome = "waiting_for_user_control"
+                elif rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -13654,6 +13739,8 @@ def detect_crashed_workers(
                     event_payload,
                     run_id=run_id,
                 )
+                if waiting_for_user_control_exit:
+                    continue
                 if rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the

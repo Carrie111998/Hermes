@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.managed_short_task import (
@@ -552,6 +553,106 @@ def _managed_completion_path_guard(
     if guarded_metadata is not None and "artifacts" in guarded_metadata:
         guarded_metadata["artifacts"] = list(canonical)
     return None, guarded_metadata, canonical if declared else artifacts
+
+
+def _task_requires_user_control_wait(kb, conn, task_id: str, task) -> bool:
+    text = f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}"
+    if not _task_text_has_explicit_wait_control_contract(text):
+        return False
+    try:
+        from hermes_cli.kanban_control_guard import (
+            authorize_managed_task_mutation,
+        )
+
+        decision = authorize_managed_task_mutation(conn, task_id, None)
+    except Exception:
+        return False
+    if getattr(decision, "managed", False) and (
+        getattr(task, "validation_class", None)
+        == getattr(kb, "PHASE1_FILE_REVIEW_VALIDATION_CLASS", "text_mechanism")
+    ):
+        return True
+    return _task_workspace_in_short_handoff_allowlist(task)
+
+
+def _task_text_has_explicit_wait_control_contract(text: str) -> bool:
+    if "waiting_for_user_control=true" not in text:
+        return False
+    lowered = text.lower()
+    completion_stop = (
+        "不要调用 kanban_complete" in text
+        or "do not call kanban_complete" in lowered
+    )
+    block_stop = (
+        "不要调用 kanban_block" in text
+        or "do not call kanban_block" in lowered
+    )
+    human_wait = (
+        "等待后续人工停止" in text
+        or "等待人工停止" in text
+        or "等待用户停止" in text
+        or "wait for operator stop" in lowered
+        or "wait for user stop" in lowered
+    )
+    return completion_stop and block_stop and human_wait
+
+
+def _task_workspace_in_short_handoff_allowlist(task) -> bool:
+    workspace_path = str(getattr(task, "workspace_path", "") or "").strip()
+    if not workspace_path:
+        return False
+    try:
+        from agent.kanban_auto_handoff import (
+            POLICY_HOME_ENV,
+            load_current_dispatcher_policy_snapshot,
+        )
+
+        snapshot = load_current_dispatcher_policy_snapshot(
+            policy_home=os.environ.get(POLICY_HOME_ENV) or None
+        )
+        if snapshot.get("enabled") is not True or snapshot.get("validation_error"):
+            return False
+        roots = snapshot.get("allowed_workspace_roots") or []
+        workspace = Path(workspace_path).resolve(strict=False)
+        for raw_root in roots:
+            root_text = str(raw_root or "").strip()
+            if not root_text:
+                continue
+            root = Path(root_text).resolve(strict=False)
+            try:
+                workspace.relative_to(root)
+                return True
+            except ValueError:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _run_marked_user_control_wait(kb, conn, task_id: str) -> bool:
+    try:
+        run = kb.latest_run(conn, task_id)
+    except Exception:
+        return False
+    metadata = getattr(run, "metadata", None) if run else None
+    return isinstance(metadata, dict) and metadata.get("waiting_for_user_control") is True
+
+
+def _waiting_control_completion_error(kb, conn, task_id: str, task) -> Optional[str]:
+    """Return a hard-stop message for tasks that must wait for the operator."""
+    if _run_marked_user_control_wait(kb, conn, task_id):
+        return (
+            "kanban_complete refused: this run already entered "
+            "waiting_for_user_control=true. Do not complete or submit review; "
+            "leave the task waiting for the operator stop command."
+        )
+    if _task_requires_user_control_wait(kb, conn, task_id, task):
+        return (
+            "kanban_complete refused: this task requires an explicit "
+            "kanban_heartbeat(waiting_for_user_control=true) wait point and "
+            "must not be completed or submitted for review."
+        )
+    return None
 
 
 def _review_completion_process_error() -> Optional[str]:
@@ -1087,6 +1188,11 @@ def _handle_complete(args: dict, **kw) -> str:
             if mutation_err:
                 return mutation_err
             task = kb.get_task(conn, tid)
+            waiting_complete_err = _waiting_control_completion_error(
+                kb, conn, tid, task
+            )
+            if waiting_complete_err:
+                return tool_error(waiting_complete_err)
             worker_run_id = _worker_run_id(tid)
             # The implementation submission transaction is durable before
             # this tool response reaches the worker. A transport retry will
@@ -1484,6 +1590,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     note = args.get("note")
+    waiting_for_user_control, waiting_err = _parse_bool_arg(
+        args, "waiting_for_user_control", default=False
+    )
+    if waiting_err:
+        return tool_error(waiting_err)
     board = args.get("board")
     scope_err = _enforce_short_task_worker_scope(
         tid, board, "kanban_heartbeat"
@@ -1498,6 +1609,17 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             )
             if mutation_err:
                 return mutation_err
+            task = kb.get_task(conn, tid)
+            if (
+                not waiting_for_user_control
+                and _task_requires_user_control_wait(kb, conn, tid, task)
+                and "waiting_for_user_control=true" in str(note or "")
+            ):
+                return tool_error(
+                    "kanban_heartbeat refused: note text cannot set "
+                    "waiting_for_user_control. Retry the tool call with the "
+                    "boolean argument waiting_for_user_control=true."
+                )
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
             # (see _default_spawn in kanban_db.py); falling back to the
@@ -1511,12 +1633,16 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
+                waiting_for_user_control=waiting_for_user_control,
             )
             if not ok:
                 return tool_error(
                     f"could not heartbeat {tid} (unknown id or not running)"
                 )
-            return _ok(task_id=tid)
+            return _ok(
+                task_id=tid,
+                waiting_for_user_control=waiting_for_user_control,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -2716,6 +2842,16 @@ KANBAN_HEARTBEAT_SCHEMA = {
                 ),
             },
             "board": _board_schema_prop(),
+            "waiting_for_user_control": {
+                "type": "boolean",
+                "description": (
+                    "Set true only when this worker is intentionally keeping "
+                    "the task running until a human stop/unblock/control "
+                    "command arrives. Ordinary progress heartbeats must leave "
+                    "this false so short-task auto-handoff can still continue."
+                ),
+                "default": False,
+            },
         },
         "required": [],
     },

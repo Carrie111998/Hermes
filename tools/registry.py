@@ -376,6 +376,13 @@ class ToolRegistry:
         except Exception:
             return ""
 
+    @staticmethod
+    def _handler_module(handler: Callable) -> str:
+        try:
+            return handler.__globals__.get("__name__", "") or ""  # type: ignore[attr-defined]
+        except AttributeError:
+            return ""
+
     def register(
         self,
         name: str,
@@ -402,6 +409,18 @@ class ToolRegistry:
         """
         with self._lock:
             existing = self._tools.get(name)
+            if (
+                existing
+                and existing.toolset == toolset == "file"
+                and self._handler_module(existing.handler) == "tools.managed_file_tools"
+                and self._handler_module(handler) == "tools.file_tools"
+            ):
+                logger.info(
+                    "Tool '%s': keeping managed file handler; ignoring later "
+                    "ordinary file handler registration",
+                    name,
+                )
+                return
             if existing and existing.toolset != toolset:
                 # Allow MCP-to-MCP overwrites (legitimate: server refresh,
                 # or two MCP servers with overlapping tool names).

@@ -530,6 +530,24 @@ def test_soft_limit_requires_terminal_free_eligible_leaf():
         messages=[{"role": "tool", "name": "kanban_complete", "content": "ok"}],
         eligibility_check=lambda: True,
     )
+    assert handoff.should_request_handoff(
+        policy=_policy(),
+        api_call_count=4,
+        messages=[{"role": "tool", "name": "kanban_heartbeat", "content": '{"ok": true}'}],
+        eligibility_check=lambda: True,
+    )
+    assert not handoff.should_request_handoff(
+        policy=_policy(),
+        api_call_count=4,
+        messages=[
+            {
+                "role": "tool",
+                "name": "kanban_heartbeat",
+                "content": '{"ok": true, "waiting_for_user_control": true}',
+            }
+        ],
+        eligibility_check=lambda: True,
+    )
     assert not handoff.should_request_handoff(
         policy=_policy(),
         api_call_count=4,

@@ -1022,6 +1022,72 @@ def test_detect_crashed_workers_grace_period_env_override(
         assert tid in kb.detect_crashed_workers(conn)
 
 
+def test_waiting_for_user_control_clean_exit_parks_supervised_task(
+    kanban_home, monkeypatch,
+):
+    """A declared human-control wait point is not a protocol violation."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(
+        _kb,
+        "_classify_worker_exit",
+        lambda _pid: ("clean_exit", 0),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="wait for operator stop", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        pid = 12345
+        state, run_id = _seed_supervised_identity(conn, tid, monkeypatch, pid=pid)
+
+        assert kb.heartbeat_worker(
+            conn,
+            tid,
+            note="waiting for operator stop",
+            expected_run_id=run_id,
+            waiting_for_user_control=True,
+        )
+        state["pid_alive"] = False
+        state["group_alive"] = False
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert task.current_run_id is None
+        assert task.worker_pid is None
+        assert task.claim_lock is None
+        assert task.last_failure_error is None
+
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.status == "waiting_for_user_control"
+        assert run.outcome == "waiting_for_user_control"
+        assert run.metadata is not None
+        assert run.metadata.get("waiting_for_user_control") is True
+
+        events = kb.list_events(conn, tid)
+        assert any(
+            event.kind == "heartbeat"
+            and event.payload
+            and event.payload.get("waiting_for_user_control") is True
+            for event in events
+        )
+        assert any(event.kind == "waiting_for_user_control" for event in events)
+        assert not any(event.kind == "protocol_violation" for event in events)
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.claim_task(conn, tid) is None
+    finally:
+        conn.close()
+
+
 def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
     """Bad env values fall back to DEFAULT_CRASH_GRACE_SECONDS."""
     import hermes_cli.kanban_db as _kb

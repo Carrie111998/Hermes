@@ -438,9 +438,15 @@ def should_request_handoff(
     # A worker that already called kanban_complete/kanban_block has reached a
     # durable terminal state.  Never manufacture a continuation after that.
     try:
-        from agent.kanban_stop import session_called_kanban_terminal
+        from agent.kanban_stop import (
+            session_called_kanban_terminal,
+            session_called_kanban_waiting_tool,
+        )
 
-        if session_called_kanban_terminal(messages):
+        if (
+            session_called_kanban_terminal(messages)
+            or session_called_kanban_waiting_tool(messages)
+        ):
             return False
     except Exception:
         return False

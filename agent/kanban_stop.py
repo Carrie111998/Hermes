@@ -19,6 +19,7 @@ from typing import Any, Iterable, Optional
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_WAITING_KANBAN_TOOLS = frozenset({"kanban_heartbeat"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -81,6 +82,35 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def session_called_kanban_waiting_tool(messages: Iterable[dict] | None) -> bool:
+    """True after an explicit wait-for-human-control Kanban tool succeeded.
+
+    Ordinary ``kanban_heartbeat`` only means the worker is alive during longer
+    work and must not suppress handoff.  Suppression is reserved for heartbeat
+    results that explicitly carry ``waiting_for_user_control=true``.
+    """
+    if not messages:
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "tool":
+            continue
+        if str(msg.get("name") or "") not in _WAITING_KANBAN_TOOLS:
+            continue
+        content = msg.get("content")
+        if not _terminal_result_succeeded(content):
+            continue
+        if isinstance(content, str):
+            try:
+                content = json.loads(content.strip())
+            except Exception:
+                content = {}
+        if isinstance(content, dict) and content.get("waiting_for_user_control") is True:
+            return True
+    return False
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -98,6 +128,8 @@ def build_kanban_stop_nudge(
     if attempts >= max_attempts:
         return None
     if session_called_kanban_terminal(messages):
+        return None
+    if session_called_kanban_waiting_tool(messages):
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
@@ -119,5 +151,6 @@ def build_kanban_stop_nudge(
 __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
+    "session_called_kanban_waiting_tool",
     "session_called_kanban_terminal",
 ]

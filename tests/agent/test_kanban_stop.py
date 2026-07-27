@@ -7,6 +7,7 @@ import pytest
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
+    session_called_kanban_waiting_tool,
     session_called_kanban_terminal,
 )
 
@@ -77,6 +78,33 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
         {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
     ]
     assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_ordinary_heartbeat_is_not_waiting_or_terminal(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {"role": "tool", "name": "kanban_heartbeat", "tool_call_id": "1", "content": '{"ok": true}'},
+    ]
+
+    assert session_called_kanban_waiting_tool(messages) is False
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_explicit_waiting_heartbeat_is_waiting_but_not_terminal(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_heartbeat",
+            "tool_call_id": "1",
+            "content": '{"ok": true, "waiting_for_user_control": true}',
+        },
+    ]
+
+    assert session_called_kanban_waiting_tool(messages) is True
+    assert session_called_kanban_terminal(messages) is False
     assert build_kanban_stop_nudge(messages=messages) is None
 
 

@@ -102,6 +102,8 @@ def _resolve_path(
             if cursor.exists() or cursor.is_symlink():
                 if cursor.is_symlink():
                     return None, "Managed file paths cannot traverse symbolic links."
+        if require_exists and not candidate.exists():
+            return None, f"Managed file not found in assigned workspace: {raw_path!r}."
         resolved = candidate.resolve(strict=require_exists)
         resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError):

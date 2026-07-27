@@ -39,6 +39,7 @@ def test_four_managed_file_tools_work_without_terminal_backend(
         pytest.fail("managed file operation attempted to launch a process")
 
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
+    preexisting_modules = set(sys.modules)
 
     written = _payload(managed.write_file_tool("notes/item.txt", "alpha\n"))
     read = _payload(managed.read_file_tool("notes/item.txt"))
@@ -60,9 +61,10 @@ def test_four_managed_file_tools_work_without_terminal_backend(
     assert patched["success"] is True
     assert searched["total_count"] == 1
     assert (workspace / "notes" / "item.txt").read_text() == "beta\n"
-    assert "tools.terminal_tool" not in sys.modules
-    assert "tools.file_tools" not in sys.modules
-    assert "tools.file_operations" not in sys.modules
+    imported_during_call = set(sys.modules) - preexisting_modules
+    assert "tools.terminal_tool" not in imported_during_call
+    assert "tools.file_tools" not in imported_during_call
+    assert "tools.file_operations" not in imported_during_call
 
 
 @pytest.mark.parametrize(
@@ -93,6 +95,19 @@ def test_all_managed_file_tools_reject_absolute_or_parent_escape(
     assert result.get("error")
     assert (outside / "outside.txt").read_text() == "outside\n"
     assert not (outside / "new.txt").exists()
+
+
+def test_missing_managed_read_reports_not_found_without_claiming_workspace_escape(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _managed_env(monkeypatch, workspace)
+
+    result = _payload(managed.read_file_tool("missing.txt"))
+
+    assert "not found" in result["error"]
+    assert "limited to the assigned workspace" not in result["error"]
 
 
 @pytest.mark.parametrize("operation", ["read", "write", "patch", "search"])
@@ -315,3 +330,65 @@ print(json.dumps({{
     assert "tools.terminal_tool" not in evidence["modules"]
     assert "tools.file_tools" not in evidence["modules"]
     assert "tools.file_operations" not in evidence["modules"]
+
+
+def test_incidental_ordinary_file_tools_import_does_not_replace_managed_handlers(tmp_path):
+    repo_root = Path(__file__).resolve().parents[2]
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "candidate.txt").write_text("approved evidence\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_KANBAN_TASK": "t_review_canary",
+            "HERMES_KANBAN_RUN_ID": "17",
+            "HERMES_KANBAN_MANAGED_LANE": "review",
+            "HERMES_KANBAN_REVIEW_MODE": "1",
+            "HERMES_KANBAN_MANAGED_BOOTSTRAP": "1",
+            "HERMES_KANBAN_MANAGED_BOOTSTRAP_VERIFIED": "1",
+            "HERMES_KANBAN_WORKSPACE": str(workspace),
+            "PYTHONPYCACHEPREFIX": "/private/tmp/hermes-short-task-pycache",
+        }
+    )
+    env.pop("HERMES_KANBAN_MANAGED_BOOTSTRAP_ERROR", None)
+    script = f"""
+import json, sys
+sys.path.insert(0, {str(repo_root)!r})
+import model_tools
+import tools.file_tools
+from tools.registry import registry
+read = json.loads(registry.dispatch('read_file', {{'path': 'candidate.txt'}}))
+write = json.loads(registry.dispatch('write_file', {{'path': 'new.txt', 'content': 'no\\n'}}))
+patch = json.loads(registry.dispatch('patch', {{'path': 'candidate.txt', 'old_string': 'approved', 'new_string': 'changed'}}))
+from tools.managed_file_tools import managed_review_read_evidence
+print(json.dumps({{
+    'read': read,
+    'write': write,
+    'patch': patch,
+    'evidence': managed_review_read_evidence(),
+    'modules': sorted(sys.modules),
+}}))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-I", "-s", "-E", "-c", script],
+        cwd=workspace,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    observed = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert observed["read"]["resolved_path"] == str(workspace / "candidate.txt")
+    assert "只能读取文件" in observed["write"]["error"]
+    assert "只能读取文件" in observed["patch"]["error"]
+    assert observed["evidence"] == [
+        {
+            "path": "candidate.txt",
+            "sha256": "707d635f4f9218777f7d48c16cf92eb6a4d4a877e9bf3c2b926d4d82306e51da",
+            "size": len(b"approved evidence\n"),
+        }
+    ]
+    assert "tools.file_tools" in observed["modules"]

@@ -1901,6 +1901,218 @@ def test_heartbeat_without_note(worker_env):
     assert d["ok"] is True
 
 
+def test_plain_task_can_complete_when_it_mentions_waiting_control(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            (
+                "实现 waiting_for_user_control=true 支持并完成代码。",
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_complete({"summary": "implemented parameter support"})
+    assert json.loads(out).get("ok") is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "done"
+
+
+def test_waiting_control_note_cannot_impersonate_boolean_arg(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _arm_managed_worker_env(monkeypatch, worker_env)
+    policy = json.loads(_short_task_policy_snapshot(enabled=True))
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY",
+        json.dumps(policy),
+    )
+    conn = kb.connect()
+    try:
+        _bind_short_task_policy(conn, worker_env, policy)
+        conn.execute(
+            "UPDATE tasks SET validation_class='text_mechanism', body = ? "
+            "WHERE id = ?",
+            (
+                "必须调用 kanban_heartbeat 并明确设置 waiting_for_user_control=true；"
+                "不要调用 kanban_complete，不要调用 kanban_block，等待后续人工停止指令。",
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_heartbeat({"note": "waiting_for_user_control=true"})
+    err = json.loads(out).get("error", "")
+
+    assert "note text cannot set waiting_for_user_control" in err
+    with kb.connect() as conn:
+        events = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "heartbeat"
+        ]
+    assert events == []
+
+
+def test_waiting_control_task_rejects_completion(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _arm_managed_worker_env(monkeypatch, worker_env)
+    policy = json.loads(_short_task_policy_snapshot(enabled=True))
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SHORT_TASK_HANDOFF_POLICY",
+        json.dumps(policy),
+    )
+    conn = kb.connect()
+    try:
+        _bind_short_task_policy(conn, worker_env, policy)
+        conn.execute(
+            "UPDATE tasks SET validation_class='text_mechanism', body = ? "
+            "WHERE id = ?",
+            (
+                "必须调用 kanban_heartbeat 并明确设置 waiting_for_user_control=true；"
+                "不要调用 kanban_complete，不要调用 kanban_block，等待后续人工停止指令。",
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_complete({"summary": "done after fake waiting note"})
+    err = json.loads(out).get("error", "")
+
+    assert "requires an explicit kanban_heartbeat" in err
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_allowed_workspace_waiting_control_task_rejects_note_and_completion(
+    monkeypatch, worker_env, tmp_path,
+):
+    from agent import kanban_auto_handoff as handoff
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "allowed-wait"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_SHORT_TASK_POLICY_HOME", "/dispatcher-home")
+    policy_homes: list[str | None] = []
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=?, body=? "
+            "WHERE id=?",
+            (
+                str(workspace),
+                "必须调用 kanban_heartbeat 并明确设置 waiting_for_user_control=true；"
+                "不要调用 kanban_complete，不要调用 kanban_block，等待后续人工停止指令。",
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        handoff,
+        "load_current_dispatcher_policy_snapshot",
+        lambda **kwargs: (
+            policy_homes.append(kwargs.get("policy_home"))
+            or {
+                "enabled": True,
+                "validation_error": None,
+                "allowed_workspace_roots": [str(workspace)],
+            }
+        ),
+    )
+
+    heartbeat = json.loads(
+        kt._handle_heartbeat({"note": "waiting_for_user_control=true"})
+    )
+    assert "note text cannot set waiting_for_user_control" in heartbeat.get(
+        "error", ""
+    )
+
+    complete = json.loads(kt._handle_complete({"summary": "done anyway"}))
+    assert "requires an explicit kanban_heartbeat" in complete.get("error", "")
+    assert policy_homes and set(policy_homes) == {"/dispatcher-home"}
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_allowed_workspace_plain_parameter_task_can_complete(
+    monkeypatch, worker_env, tmp_path,
+):
+    from agent import kanban_auto_handoff as handoff
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "allowed-ordinary"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_SHORT_TASK_POLICY_HOME", "/dispatcher-home")
+    policy_homes: list[str | None] = []
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=?, body=? "
+            "WHERE id=?",
+            (
+                str(workspace),
+                "实现 waiting_for_user_control=true 支持并正常完成代码。",
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        handoff,
+        "load_current_dispatcher_policy_snapshot",
+        lambda **kwargs: (
+            policy_homes.append(kwargs.get("policy_home"))
+            or {
+                "enabled": True,
+                "validation_error": None,
+                "allowed_workspace_roots": [str(workspace)],
+            }
+        ),
+    )
+
+    out = kt._handle_complete({"summary": "implemented parameter support"})
+    assert json.loads(out).get("ok") is True
+    assert policy_homes == []
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "done"
+
+
+def test_run_marked_waiting_control_rejects_completion(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_heartbeat({"waiting_for_user_control": True})
+    assert json.loads(out).get("waiting_for_user_control") is True
+
+    out = kt._handle_complete({"summary": "done after waiting"})
+    err = json.loads(out).get("error", "")
+
+    assert "already entered waiting_for_user_control=true" in err
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
 def test_heartbeat_extends_claim_expires(worker_env):
     """The kanban_heartbeat tool MUST extend claim_expires, not just
     update last_heartbeat_at — otherwise long-running workers loop the
@@ -3405,6 +3617,19 @@ def test_board_param_in_all_schemas():
         assert "board" not in schema["parameters"].get("required", []), (
             f"{schema['name']} marks board as required; must be optional"
         )
+
+
+def test_waiting_for_user_control_is_only_on_heartbeat_schema():
+    from tools import kanban_tools as kt
+
+    heartbeat_props = kt.KANBAN_HEARTBEAT_SCHEMA["parameters"]["properties"]
+    show_props = kt.KANBAN_SHOW_SCHEMA["parameters"]["properties"]
+
+    assert heartbeat_props["waiting_for_user_control"]["type"] == "boolean"
+    assert "waiting_for_user_control" not in show_props
+    assert "waiting_for_user_control" not in kt.KANBAN_HEARTBEAT_SCHEMA[
+        "parameters"
+    ].get("required", [])
 
 
 # ---------------------------------------------------------------------------
