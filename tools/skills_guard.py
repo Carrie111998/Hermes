@@ -580,24 +580,77 @@ _BOM_ENCODINGS = (
 )
 
 
-def _decode_text(raw: bytes):
-    """Decode a candidate text file, honouring a leading BOM.
+# A single byte that is not valid UTF-8 must not excuse the scanner from
+# looking at a file: /bin/sh runs a script with an invalid byte in a comment
+# just as happily, and legacy-encoded scripts (latin-1, cp1251) are ordinary
+# text. Undecodable bytes are replaced rather than rejected, which preserves
+# every ASCII threat pattern; only content that classifies as binary is
+# skipped, and that decision is made on the bytes, not on a decode failure.
+_TEXT_CONTROL_BYTES = frozenset(b'\t\n\r\f\v\x08\x1b')
+_BINARY_SNIFF_BYTES = 8192
+_BINARY_CONTROL_RATIO = 0.30
 
-    Returns the decoded text, or None when the bytes are not text at all so
-    the caller can skip a genuine binary. The BOM itself is dropped rather
-    than decoded to U+FEFF, which would otherwise trip the invisible-unicode
-    check on every BOM-marked file.
+
+def _looks_like_bomless_utf16(raw: bytes) -> str:
+    """Return 'utf-16-le'/'utf-16-be' when the NUL pattern says so, else ''.
+
+    ASCII encoded as UTF-16 puts a NUL beside every character, so the nulls
+    land consistently on one side. Checked before the binary test, since NUL
+    bytes are otherwise the strongest binary signal there is.
+    """
+    sample = raw[:_BINARY_SNIFF_BYTES]
+    if len(sample) < 4 or b'\x00' not in sample:
+        return ''
+    pairs = len(sample) // 2
+    even_nul = sum(1 for i in range(pairs) if sample[2 * i] == 0)
+    odd_nul = sum(1 for i in range(pairs) if sample[2 * i + 1] == 0)
+    if odd_nul >= pairs * 0.9 and even_nul <= pairs * 0.1:
+        return 'utf-16-le'
+    if even_nul >= pairs * 0.9 and odd_nul <= pairs * 0.1:
+        return 'utf-16-be'
+    return ''
+
+
+def _looks_binary(raw: bytes) -> bool:
+    """Classify on the bytes themselves, the way file(1) and git do.
+
+    A NUL byte, or a large share of control bytes that no text format uses,
+    means this is not a script however it would decode.
+    """
+    sample = raw[:_BINARY_SNIFF_BYTES]
+    if not sample:
+        return False
+    if b'\x00' in sample:
+        return True
+    control = sum(
+        1 for b in sample if b < 0x20 and b not in _TEXT_CONTROL_BYTES
+    )
+    return control > len(sample) * _BINARY_CONTROL_RATIO
+
+
+def _decode_text(raw: bytes):
+    """Decode a candidate script file as permissively as a shell would.
+
+    Returns the decoded text, or None only when the bytes classify as binary.
+    A leading BOM is honoured and dropped rather than decoded to U+FEFF,
+    which would otherwise trip the invisible-unicode check on every
+    BOM-marked file.
     """
     for bom, encoding in _BOM_ENCODINGS:
         if raw.startswith(bom):
             try:
                 return raw[len(bom):].decode(encoding)
             except UnicodeDecodeError:
-                return None
-    try:
-        return raw.decode('utf-8')
-    except UnicodeDecodeError:
+                return raw[len(bom):].decode(encoding, errors='replace')
+
+    utf16 = _looks_like_bomless_utf16(raw)
+    if utf16:
+        return raw.decode(utf16, errors='replace')
+
+    if _looks_binary(raw):
         return None
+
+    return raw.decode('utf-8', errors='replace')
 
 
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
