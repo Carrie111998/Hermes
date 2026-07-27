@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -203,6 +204,48 @@ def test_external_receipt_redacts_credential_like_ingress_fields(company):
     assert "provider-secret" not in receipt["authentication_evidence_json"]
     assert "[REDACTED]" in event["payload_json"]
     assert "[REDACTED]" in receipt["authentication_evidence_json"]
+
+
+def test_concurrent_authenticated_delivery_fans_out_once(company):
+    conn, organization_id, objective_id = company
+    objective_triggers.subscribe(
+        conn,
+        organization_id=organization_id,
+        objective_id=objective_id,
+        source_type="crm",
+        event_type="lead.changed",
+    )
+    db_path = conn.execute("PRAGMA database_list").fetchone()["file"]
+    kwargs = {
+        "organization_id": organization_id,
+        "source_type": "crm",
+        "event_type": "lead.changed",
+        "source_reference": "concurrent-lead-v1",
+        "payload": {"lead_id": "lead-concurrent", "stage": "qualified"},
+        "authentication_evidence": {
+            "method": "provider_hmac",
+            "signature_validated": True,
+        },
+    }
+
+    def deliver(_):
+        worker_conn = objectives_db.connect(db_path)
+        try:
+            return objective_triggers.route_external_event(worker_conn, **kwargs)
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        routed = list(pool.map(deliver, (1, 2)))
+    assert routed[0] == routed[1]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM external_event_receipts WHERE source_reference=?",
+        ("concurrent-lead-v1",),
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM objective_inbox WHERE objective_id=?",
+        (objective_id,),
+    ).fetchone()[0] == 1
 
 
 def test_schedule_restart_catchup_emits_one_event_and_skips_storm(company):
