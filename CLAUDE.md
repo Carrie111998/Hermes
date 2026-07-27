@@ -298,6 +298,13 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   ("Authoring IYARI-Agent Skills (in-repo)"), se replica por consistencia, no es un
   bug nuevo. 10 headings cambiaron, sin anchors internos que los referenciaran. Build
   limpio: 98/98 warnings idénticos a la baseline.
+- Lote 9 (este commit): `skills/optional/{autonomous-ai-agents,blockchain,communication,
+  creative,devops,dogfood,email,finance,health}` = 27 (parte 1 de `optional/`, 81 en
+  total; sin `gaming`/`payments` en el mirror zh). 9 `Nous Research` verificados contra
+  inglés (todas filas de autor: `Hermes Agent (Nous Research)`,
+  `Anthropic（由 Nous Research 改编）`×7, `Hermes Agent + Nous Research`) — transformación
+  normal, coincide exacto con `Digital Services LLC` ya commiteado en inglés. 2 headings
+  cambiaron, sin anchors internos. Build limpio: 98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 

@@ -23,7 +23,7 @@ description: "通过 AgentMail 为 Agent 提供专属电子邮件收件箱"
 ## 参考：完整 SKILL.md
 
 :::info
-以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 Agent 所看到的指令内容。
+以下是 IYARI 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 Agent 所看到的指令内容。
 :::
 
 # AgentMail — Agent 专属电子邮件收件箱
@@ -62,7 +62,7 @@ mcp_servers:
       AGENTMAIL_API_KEY: "am_your_key_here"
 ```
 
-### 3. 重启 Hermes
+### 3. 重启 IYARI
 ```bash
 hermes
 ```
