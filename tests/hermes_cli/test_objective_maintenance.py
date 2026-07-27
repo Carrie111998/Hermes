@@ -108,6 +108,37 @@ def test_housekeeping_expires_dormant_authority_and_releases_capital(tmp_path):
     assert objective_triggers.dispatch_due(conn, now=now + 100) == 0
 
 
+def test_housekeeping_requeues_active_objective_without_a_wakeup(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    objective = objectives_db.create_objective(
+        conn,
+        desired_outcome="Continue operating after a control-plane restart",
+        originator="employee:ceo",
+        success_criteria=[
+            {"verifier": "accounting.books_balanced", "params": {}}
+        ],
+    )
+    objectives_db.transition_objective(
+        conn, objective.id, "accepted", actor="human:advisor"
+    )
+    # Simulate a direct lifecycle transition whose external wake was lost.
+    conn.execute("DELETE FROM objective_inbox WHERE objective_id=?", (objective.id,))
+    conn.commit()
+
+    first = objective_maintenance.run_housekeeping(conn)
+    second = objective_maintenance.run_housekeeping(conn)
+
+    assert first["requeued_objectives"] == [objective.id]
+    assert second["requeued_objectives"] == []
+    event = conn.execute(
+        "SELECT event_type,payload_json FROM objective_inbox WHERE objective_id=?",
+        (objective.id,),
+    ).fetchone()
+    assert event["event_type"] == "objective.accepted.reconcile"
+    assert "objective_maintenance" in event["payload_json"]
+    conn.close()
+
+
 def test_stale_compute_cost_escalates_once_and_cli_reconciles_with_evidence(
     tmp_path,
 ):

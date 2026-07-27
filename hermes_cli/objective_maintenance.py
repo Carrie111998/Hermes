@@ -48,6 +48,7 @@ def run_housekeeping(
     started = int(time.time())
     summary: dict[str, Any] = {
         "expired_objectives": [],
+        "requeued_objectives": [],
         "revoked_permits": [],
         "released_reservations": [],
         "suspended_employees": [],
@@ -65,6 +66,41 @@ def run_housekeeping(
     from hermes_cli import operational_control
 
     operational_control.ensure_schema(conn)
+
+    # Lifecycle state and its wake event can be committed by separate control
+    # paths (for example an operator accepting an objective outside the worker
+    # process). Reconcile that boundary before schedule dispatch so an active
+    # objective cannot become permanently idle after a lost wake or restart.
+    # The objective version makes the repair idempotent across workers.
+    active_objectives = conn.execute(
+        """SELECT o.id, o.version, o.status
+             FROM objectives o
+            WHERE o.status IN ('accepted', 'planned')
+              AND NOT EXISTS (
+                    SELECT 1 FROM objective_inbox i
+                     WHERE i.objective_id=o.id
+                       AND i.status IN ('pending', 'processing')
+              )
+            ORDER BY o.updated_at, o.id"""
+    ).fetchall()
+    for row in active_objectives:
+        objective_id = str(row["id"])
+        objectives_db.enqueue_objective_event(
+            conn,
+            objective_id=objective_id,
+            event_type=f"objective.{row['status']}.reconcile",
+            payload={
+                "source": "objective_maintenance",
+                "status": str(row["status"]),
+                "objective_version": int(row["version"]),
+                "reason": "active objective had no pending or processing wake",
+            },
+            dedupe_key=(
+                f"objective-maintenance-wakeup:{objective_id}:"
+                f"{int(row['version'])}:{row['status']}"
+            ),
+        )
+        summary["requeued_objectives"].append(objective_id)
     for gap in resource_budget.stale_compute_reservations(
         conn,
         now=ts,
