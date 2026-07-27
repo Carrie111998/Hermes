@@ -991,6 +991,35 @@ def test_sidebar_recovery_key_lookup_returns_none_after_complete_zero_scan(
     ]
 
 
+def test_sidebar_recovery_key_lookup_scales_past_fifty_inventory_pages(
+    tmp_path: Path,
+) -> None:
+    active_pages = [
+        {"data": [], "nextCursor": f"active-{index + 1}"}
+        for index in range(50)
+    ]
+    active_pages.append({"data": []})
+    client = FakeRequestClient({
+        "thread/list": [*active_pages, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    assert (
+        verifier.find_by_recovery_key(
+            "hermes-session-bridge-create-v1:absent-at-scale",
+            expected_cwd=str(tmp_path),
+            deadline=30.0,
+        )
+        is None
+    )
+    assert [method for method, _, _ in client.calls] == ["thread/list"] * 52
+
+
 def test_sidebar_recovery_key_lookup_rejects_duplicate_native_threads(
     tmp_path: Path,
 ) -> None:

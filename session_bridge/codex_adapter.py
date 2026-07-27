@@ -154,7 +154,7 @@ class SidebarThreadVerifier:
         marker_secret: bytes,
         reconciliation_interval: float,
         poll_interval: float = 0.25,
-        inventory_page_cap: int = 50,
+        inventory_page_cap: int = 250,
         inventory_thread_cap: int = 250,
         monotonic=time.monotonic,
         sleep=time.sleep,
