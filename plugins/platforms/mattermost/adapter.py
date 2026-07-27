@@ -19,6 +19,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,12 +60,69 @@ _HIGGSFIELD_IMAGE_MODEL_ALIASES = {
     "nano banana 2 lite": "nano_banana_2_lite",
     "gpt image 2": "gpt_image_2",
     "gpt 이미지 2": "gpt_image_2",
+    "seedream 5.0 pro": "seedream_v5_pro",
+    "seedream 5 pro": "seedream_v5_pro",
+    "seedream 5.0 lite": "seedream_v5_lite",
+    "seedream 5 lite": "seedream_v5_lite",
     "seedream 4.5": "seedream_v4_5",
     "seedream": "seedream_v4_5",
     "recraft v4.1": "recraft_v4_1",
     "recraft": "recraft_v4_1",
     "z image": "z_image",
 }
+
+_HIGGSFIELD_IMAGE_REFERENCE_JOB_TYPES = {
+    "gpt_image_2",
+    "nano_banana_2_lite",
+    "nano_banana_pro",
+    "seedream_v4_5",
+    "seedream_v5_lite",
+    "seedream_v5_pro",
+}
+_HIGGSFIELD_RESOLUTION_JOB_TYPES = {
+    "gpt_image_2",
+    "nano_banana_2_lite",
+    "nano_banana_pro",
+    "recraft_v4_1",
+    "seedream_v5_pro",
+}
+
+_HIGGSFIELD_MODEL_HELP_TEXT = """Higgsfield 추천 모델
+
+이미지/디자인
+- GPT Image 2 — 일반 이미지 생성·편집, 배너/썸네일/텍스트 포함 디자인에 가장 무난합니다.
+- Nano Banana Pro — 첨부 이미지 기반 편집, 스타일 변경, 인물/제품 레퍼런스 유지에 좋습니다.
+- Seedream 4.5 — 얼굴/인물 유지와 복잡한 장면 합성에 강합니다.
+- Seedream 5.0 Pro — Higgsfield 홈페이지 추천 최신 고품질 이미지 모델입니다.
+- Recraft V4.1 — 로고, 아이콘, 벡터 스타일, 브랜드 그래픽 제작용입니다. 첨부 이미지 편집 모델은 아닙니다.
+- Z Image — 빠른 시안/아이디어 초안 제작용입니다.
+
+영상/기타
+- Seedance 2.0 — 고품질 영상 생성 기본 추천 모델입니다.
+- Gemini Omni Flash — 이미지/영상 등 다양한 입력 기반 영상 생성·편집용입니다.
+- Multi-Image to 3D — 여러 참고 이미지로 3D/GLB 에셋을 만듭니다.
+- Seed Audio 1.0 — 효과음, 분위기음, 짧은 오디오 생성용입니다.
+- Virality Predictor — 완성 영상의 후킹/주의집중/바이럴 가능성을 분석합니다.
+
+추천: 이미지 편집은 Nano Banana Pro, 얼굴 유지 합성은 Seedream 4.5, 로고는 Recraft V4.1, 빠른 시안은 Z Image, 배너/텍스트 디자인은 GPT Image 2를 쓰세요.
+예상 크레딧은 요청·해상도마다 달라서 실행 전에 Hermes가 자동 계산해 최종 결과에 표시합니다."""
+
+
+def _parse_csv_set(value: str) -> set[str]:
+    return {item.strip() for item in (value or "").split(",") if item.strip()}
+
+
+def _parse_csv_list(*values: str) -> List[str]:
+    """Parse comma-separated env values, preserving order and de-duping."""
+    seen: set[str] = set()
+    items: List[str] = []
+    for value in values:
+        for item in (value or "").split(","):
+            item = item.strip()
+            if item and item not in seen:
+                seen.add(item)
+                items.append(item)
+    return items
 
 
 def _detect_higgsfield_image_job_type(text: str) -> str:
@@ -77,18 +136,176 @@ def _detect_higgsfield_image_job_type(text: str) -> str:
     return ""
 
 
+def _is_higgsfield_model_help_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", (text or "").lower())
+    return normalized in {"힉스필드모델", "higgsfield모델", "higgsfieldmodels", "higgsfieldmodel"}
+
+
+def _is_higgsfield_image_edit_template_trigger(text: str) -> bool:
+    """Exact Samitech template trigger; do not treat it as an edit job."""
+    return re.sub(r"\s+", "", (text or "").strip()) == "이미지편집"
+
+
+def _is_higgsfield_text_image_generation_request(text: str) -> bool:
+    """Text-only image generation command for Samitech image channels."""
+    lowered = (text or "").lower()
+    compact = re.sub(r"\s+", "", lowered)
+    if not compact or _is_higgsfield_image_edit_template_trigger(text):
+        return False
+    triggers = (
+        "이미지생성", "새이미지생성", "새로운이미지생성", "이미지제작",
+        "새이미지제작", "사진생성", "새사진생성", "그림생성", "새그림생성",
+        "imagegenerate", "generateimage", "newimagegenerate", "createimage",
+    )
+    return any(trigger in compact for trigger in triggers)
+
+
+def _extract_higgsfield_text_image_generation_prompt(text: str) -> str:
+    """Remove the text-image command prefix and return the user's visual brief."""
+    prompt = (text or "").strip()
+    patterns = (
+        r"^\s*(?:새로운\s*)?새\s*(?:이미지|사진|그림)\s*(?:생성|제작)\s*[:：,-]?\s*",
+        r"^\s*(?:이미지|사진|그림)\s*(?:생성|제작)\s*[:：,-]?\s*",
+        r"^\s*(?:generate|create)\s+(?:a\s+)?(?:new\s+)?image\s*[:：,-]?\s*",
+        r"^\s*(?:new\s+)?image\s+(?:generate|create)\s*[:：,-]?\s*",
+    )
+    for pattern in patterns:
+        prompt = re.sub(pattern, "", prompt, count=1, flags=re.I)
+    return prompt.strip()
+
+
+def _is_higgsfield_image_edit_end_command(text: str) -> bool:
+    """Commands that stop photo-free follow-up edits for this user/channel."""
+    normalized = re.sub(r"\s+", "", (text or "").lower())
+    return normalized in {
+        "이미지편집종료",
+        "이미지수정종료",
+        "이어수정종료",
+        "이어서수정종료",
+        "사진없이수정종료",
+        "이미지편집끝",
+        "이미지편집그만",
+        "이미지편집취소",
+        "stopimageedit",
+        "stopimageediting",
+        "endimageedit",
+    }
+
+
+def _is_higgsfield_new_image_edit_command(text: str) -> bool:
+    """Commands that mean the next edit should start from a newly attached image."""
+    normalized = re.sub(r"\s+", "", (text or "").lower())
+    return normalized in {
+        "새이미지편집",
+        "새로운이미지편집",
+        "새사진편집",
+        "새로운사진편집",
+        "이미지편집새로시작",
+        "이미지수정새로시작",
+        "새로이미지편집",
+        "새로사진편집",
+        "newimageedit",
+        "newimageediting",
+        "startnewimageedit",
+    }
+
+
+def _is_higgsfield_history_list_command(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", (text or "").lower())
+    return normalized in {
+        "이미지편집목록",
+        "이미지수정목록",
+        "편집이미지목록",
+        "이전이미지목록",
+        "이미지목록",
+        "imageedithistory",
+        "imagehistory",
+    }
+
+
+def _extract_higgsfield_history_offset(text: str) -> int:
+    """Return zero-based history offset: 0=latest, 1=two results ago."""
+    lowered = (text or "").lower()
+    compact = re.sub(r"\s+", "", lowered)
+    if any(term in compact for term in ("직전", "최신", "최근", "latest", "last")):
+        return 0
+
+    number_words = {
+        "두": 2,
+        "둘": 2,
+        "세": 3,
+        "셋": 3,
+        "네": 4,
+        "넷": 4,
+        "다섯": 5,
+    }
+    for word, number in number_words.items():
+        if f"{word}번전" in compact or f"{word}번째이전" in compact:
+            return max(0, number - 1)
+    if "이전이전" in compact:
+        return 1
+
+    patterns = (
+        r"(\d+)\s*번\s*(?:이미지|결과|사진)",
+        r"(\d+)\s*번째\s*(?:이전|이미지|결과|사진)",
+        r"(\d+)\s*번\s*전",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return max(0, int(match.group(1)) - 1)
+    return 0
+
+
 def _looks_like_higgsfield_image_edit_request(text: str, *, has_image: bool) -> bool:
     """Heuristic for the Mattermost-only Higgsfield CLI bypass."""
-    if not has_image:
+    if _is_higgsfield_image_edit_template_trigger(text):
         return False
     lowered = (text or "").lower()
-    if _detect_higgsfield_image_job_type(lowered):
+    job_type = _detect_higgsfield_image_job_type(lowered)
+    if has_image and job_type:
         return True
+    if not has_image and job_type:
+        create_terms = ("생성", "제작", "만들", "로고", "아이콘", "logo", "icon", "generate", "create")
+        return any(term in lowered for term in create_terms)
+    if not has_image:
+        return False
     media_terms = ("이미지", "사진", "image", "photo", "첨부")
     edit_terms = ("편집", "수정", "변경", "바꿔", "바꾸", "edit", "change")
     return any(term in lowered for term in media_terms) and any(
         term in lowered for term in edit_terms
     )
+
+
+def _looks_like_higgsfield_followup_edit_request(text: str) -> bool:
+    """Return True for short follow-up edits that rely on the latest result.
+
+    Dedicated Samitech image-edit channels allow iterative requests such as
+    "색감 더 따뜻하게" without re-attaching the image. Keep the heuristic
+    intentionally edit-specific so ordinary chat in the channel still falls
+    through to the normal agent path.
+    """
+    lowered = (text or "").lower().strip()
+    if not lowered:
+        return False
+    if _is_higgsfield_image_edit_template_trigger(lowered):
+        return False
+    edit_terms = (
+        "수정", "편집", "변경", "바꿔", "바꾸", "조정", "보정", "적용",
+        "색감", "톤", "따뜻", "차갑", "밝게", "어둡게", "선명", "채도",
+        "명도", "대비", "배경", "로고", "텍스트", "유지", "제거", "살려",
+        "조명", "빛", "구도", "각도", "포즈", "자세", "표정", "헤어", "머리",
+        "옷", "의상", "복장", "제품", "오브젝트", "사물",
+        "모핑", "모프", "형태", "전환", "연결", "경계", "이어", "이어지",
+        "부드럽", "자연스럽", "어색", "장면", "요소", "흐름", "움직임",
+        "edit", "change", "adjust", "color", "tone", "warmer", "brighter",
+        "lighting", "pose", "angle", "expression", "hair", "clothes", "outfit",
+        "morph", "morphing", "transition", "smooth", "natural", "seamless",
+    )
+    return any(term in lowered for term in edit_terms)
+
+
+_HIGGSFIELD_ARCHIVE_MARKER = "HERMES_HIGGSFIELD_IMAGE_RESULT"
 
 
 def _is_higgsfield_confirmation(text: str) -> bool:
@@ -149,18 +366,113 @@ def _extract_higgsfield_generation_params(text: str) -> Tuple[str, str]:
     return aspect, resolution
 
 
-def _build_higgsfield_edit_prompt(text: str) -> str:
-    """Build a robust prompt for reference-image clothing/profile edits."""
+_HIGGSFIELD_EDIT_INTENTS: Dict[str, Tuple[Tuple[str, ...], str, Tuple[str, ...]]] = {
+    "background": (
+        ("배경", "background", "backdrop"),
+        "Change or remove only the background as requested; do not preserve the old background. If the user asks for white, make it a clean pure white background. Keep subject edges clean with no halos, artifacts, or leftover background.",
+        ("background", "lighting"),
+    ),
+    "lighting_color": (
+        ("색감", "톤", "따뜻", "차갑", "밝게", "어둡게", "선명", "채도", "명도", "대비", "조명", "빛", "color", "tone", "warmer", "brighter", "lighting", "contrast", "saturation"),
+        "Change only the requested color, tone, brightness, contrast, or lighting. Do not change shapes, identity, pose, composition, text, logos, or background content unless explicitly requested.",
+        ("skin tone", "lighting"),
+    ),
+    "pose_composition": (
+        ("포즈", "자세", "구도", "각도", "카메라", "시점", "pose", "posture", "composition", "angle", "camera"),
+        "Change only the requested pose, composition, framing, or camera angle. Preserve the subject identity and core product/person details.",
+        ("pose", "camera angle"),
+    ),
+    "hair_expression": (
+        ("표정", "헤어", "머리", "머리카락", "웃", "expression", "hair", "hairstyle"),
+        "Change only the requested hair or expression details. Preserve identity, facial structure, body, clothing/product details, background, and camera angle.",
+        ("expression", "hairstyle", "hair flow"),
+    ),
+    "clothing_product": (
+        ("옷", "의상", "복장", "상의", "하의", "제품", "clothes", "clothing", "outfit", "product"),
+        "Change only the requested clothing, outfit, or product-detail area. Preserve identity, pose, body proportions, background, lighting, and camera angle.",
+        ("clothing/product details",),
+    ),
+    "text_logo": (
+        ("텍스트", "문구", "글자", "로고", "logo", "text", "lettering", "typography"),
+        "Change only the requested text, lettering, typography, or logo area. Preserve all other visual content, layout, colors, and subject details unless explicitly requested.",
+        ("logo/shape",),
+    ),
+    "edge_morph": (
+        ("윤곽", "경계", "테두리", "모핑", "모프", "전환", "연결", "이어", "부드럽", "자연스럽", "어색", "edge", "outline", "border", "morph", "transition", "seamless", "smooth"),
+        "Refine only the requested edges, seams, morphing transition, outlines, or boundary artifacts. Preserve colors, background, subject identity, pose, and composition unless explicitly requested.",
+        (),
+    ),
+    "object_removal": (
+        ("제거", "삭제", "없애", "지워", "remove", "delete", "erase"),
+        "Remove only the object or artifact the user named. Reconstruct the area naturally and preserve everything else.",
+        (),
+    ),
+}
+
+
+def _higgsfield_edit_intents(text: str) -> List[str]:
+    lowered = (text or "").lower()
+    preserve_markers = {
+        "background": ("배경 그대로", "배경은 그대로", "배경 유지", "background unchanged", "keep background"),
+        "lighting_color": ("색감 그대로", "색감은 그대로", "색감을 수정하지", "색감 유지", "color unchanged", "keep color"),
+        "pose_composition": ("포즈 그대로", "자세 그대로", "구도 유지", "각도 유지", "keep pose", "keep angle"),
+        "hair_expression": ("표정 그대로", "헤어 그대로", "머리 그대로", "keep expression", "keep hair"),
+        "text_logo": ("로고 그대로", "텍스트 그대로", "문구 유지", "keep logo", "keep text"),
+    }
+    intents: List[str] = []
+    for name, (terms, _instruction, _exclusions) in _HIGGSFIELD_EDIT_INTENTS.items():
+        if any(marker in lowered for marker in preserve_markers.get(name, ())):
+            continue
+        if any(term in lowered for term in terms):
+            intents.append(name)
+    return intents
+
+
+def _build_higgsfield_edit_prompt(text: str, *, use_reference: bool = True) -> str:
+    """Build an edit prompt that preserves only non-target attributes."""
     user_request = " ".join((text or "").split())
-    base = (
-        "Edit the reference image according to the user's request. Preserve the face, "
-        "identity, facial features, expression, skin tone, hairstyle, hair flow, pose, "
-        "body proportions, background, lighting, camera angle, and realistic photo "
-        "quality unless the user explicitly asks to change them. Do not change the face. "
-        "Return a natural professional result."
-    )
+    if use_reference:
+        intents = _higgsfield_edit_intents(user_request)
+        preserve_items = [
+            "face",
+            "identity",
+            "facial features",
+            "expression",
+            "skin tone",
+            "hairstyle",
+            "hair flow",
+            "pose",
+            "body proportions",
+            "clothing/product details",
+            "logo/shape",
+            "background",
+            "lighting",
+            "camera angle",
+            "realistic photo quality",
+        ]
+        excluded = {
+            item
+            for intent in intents
+            for item in _HIGGSFIELD_EDIT_INTENTS[intent][2]
+        }
+        keep = [item for item in preserve_items if item not in excluded]
+        intent_instructions = " ".join(
+            _HIGGSFIELD_EDIT_INTENTS[intent][1] for intent in intents
+        ) or "Edit only what the user explicitly requested."
+        base = (
+            "Use the attached image as the primary reference and perform a targeted image-to-image edit, "
+            "not a new text-to-image generation. "
+            f"{intent_instructions} "
+            f"Preserve all non-target attributes, especially: {', '.join(keep)}. "
+            "Do not make unrelated changes. Return a natural professional result."
+        )
+    else:
+        base = (
+            "Create the requested image from the user's brief. If this is a logo, icon, or brand graphic, "
+            "make it clean, scalable, balanced, and suitable for real brand use. Do not assume there is an attached image reference."
+        )
     if user_request:
-        return f"{base}\n\nUser request: {user_request}"
+        return f"{base} User request: {user_request}"
     return base
 
 
@@ -289,6 +601,7 @@ class MattermostAdapter(BasePlatformAdapter):
         # ``channel_id:sender_id`` so a user can confirm the credit estimate
         # without the request going through the LLM/session cache.
         self._pending_higgsfield_edits: Dict[str, Dict[str, Any]] = {}
+        self._higgsfield_followup_disabled: set[str] = set()
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -574,17 +887,75 @@ class MattermostAdapter(BasePlatformAdapter):
     def _higgsfield_pending_key(self, channel_id: str, sender_id: str) -> str:
         return f"{channel_id}:{sender_id}"
 
+    async def _maybe_handle_higgsfield_image_edit_control(
+        self,
+        *,
+        channel_id: str,
+        sender_id: str,
+        message_text: str,
+        has_image: bool,
+    ) -> bool:
+        """Handle explicit user commands for iterative image editing state."""
+        if not self._is_higgsfield_image_edit_channel(channel_id):
+            return False
+        key = self._higgsfield_pending_key(channel_id, sender_id)
+        if _is_higgsfield_image_edit_end_command(message_text):
+            self._pending_higgsfield_edits.pop(key, None)
+            self._higgsfield_followup_disabled.add(key)
+            await self.send(
+                channel_id,
+                "이미지 편집 이어수정을 종료했습니다.\n"
+                "새 작업은 원본 이미지를 첨부하고 `새 이미지 편집` 또는 `이미지 편집`이라고 보내주세요.",
+            )
+            return True
+        if _is_higgsfield_new_image_edit_command(message_text) and not has_image:
+            self._pending_higgsfield_edits.pop(key, None)
+            self._higgsfield_followup_disabled.add(key)
+            await self.send(
+                channel_id,
+                "새 이미지 편집을 시작하려면 원본 이미지를 첨부해서 다시 보내주세요.\n"
+                "예: `새 이미지 편집` + 원본 사진 첨부 + 요청사항",
+            )
+            return True
+        if _is_higgsfield_history_list_command(message_text):
+            await self._send_higgsfield_image_history_list(
+                channel_id=channel_id,
+                sender_id=sender_id,
+            )
+            return True
+        return False
+
+    def _higgsfield_image_archive_channels(self) -> List[str]:
+        """Return Mattermost channels used as durable Higgsfield image history.
+
+        Explicit archive vars add extra history channels, but every channel in
+        `HIGGSFIELD_IMAGE_EDIT_CHANNELS` is always included so all configured
+        image-edit channels support attachment-free follow-up edits.
+        """
+        return _parse_csv_list(
+            os.getenv("HIGGSFIELD_IMAGE_ARCHIVE_CHANNELS", "")
+            or os.getenv("HIGGSFIELD_IMAGE_ARCHIVE_CHANNEL", ""),
+            os.getenv("HIGGSFIELD_IMAGE_CHANNELS", "")
+            or os.getenv("HIGGSFIELD_IMAGE_CHANNEL", ""),
+            os.getenv("HIGGSFIELD_IMAGE_EDIT_CHANNELS", ""),
+        )
+
     async def _run_higgsfield_cli(self, args: List[str], *, timeout: float = 600.0) -> Tuple[int, str, str]:
         """Run the Higgsfield CLI without exposing secrets to the LLM."""
         exe = shutil.which("higgsfield")
         if not exe:
             return 127, "", "higgsfield CLI not found on PATH"
 
+        create_kwargs: Dict[str, Any] = {}
+        if os.name == "nt":
+            create_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
         proc = await asyncio.create_subprocess_exec(
             exe,
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **create_kwargs,
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -607,8 +978,9 @@ class MattermostAdapter(BasePlatformAdapter):
         message_text: str,
         media_urls: List[str],
         media_types: List[str],
+        force: bool = False,
     ) -> bool:
-        """Intercept image-edit requests and ask for cost confirmation.
+        """Intercept image-edit requests and launch Higgsfield directly.
 
         Returns True when the message was handled and should not enter the
         normal LLM path.
@@ -617,34 +989,91 @@ class MattermostAdapter(BasePlatformAdapter):
             path for path, mime in zip(media_urls, media_types)
             if mime.startswith("image/") and path
         ]
-        if not _looks_like_higgsfield_image_edit_request(message_text, has_image=bool(image_paths)):
+        state_key = self._higgsfield_pending_key(channel_id, sender_id)
+        if image_paths:
+            self._higgsfield_followup_disabled.discard(state_key)
+        text_image_generation = (
+            not image_paths
+            and self._is_higgsfield_image_generation_channel(channel_id)
+            and _is_higgsfield_text_image_generation_request(message_text)
+        )
+        followup_without_image = (
+            not text_image_generation
+            and not image_paths
+            and self._is_higgsfield_image_edit_channel(channel_id)
+            and _looks_like_higgsfield_followup_edit_request(message_text)
+        )
+        if followup_without_image and state_key in self._higgsfield_followup_disabled:
+            await self.send(
+                channel_id,
+                "이전 이미지 이어수정은 종료된 상태입니다.\n"
+                "새 작업은 원본 이미지를 첨부하고 `새 이미지 편집`이라고 보내주세요.",
+            )
+            return True
+        if (
+            not force
+            and not text_image_generation
+            and not followup_without_image
+            and not _looks_like_higgsfield_image_edit_request(message_text, has_image=bool(image_paths))
+        ):
             return False
 
-        job_type = _detect_higgsfield_image_job_type(message_text) or "nano_banana_pro"
+        if text_image_generation:
+            prompt = _extract_higgsfield_text_image_generation_prompt(message_text)
+            if not prompt:
+                await self.send(
+                    channel_id,
+                    "생성할 이미지 설명을 같이 적어주세요.\n"
+                    "예: `이미지 생성 흰 배경의 미니멀한 화장품 광고 이미지`",
+                )
+                return True
+            job_type = _detect_higgsfield_image_job_type(message_text) or "gpt_image_2"
+        else:
+            prompt = ""
+            job_type = _detect_higgsfield_image_job_type(message_text) or "nano_banana_pro"
         aspect, resolution = _extract_higgsfield_generation_params(message_text)
-        prompt = _build_higgsfield_edit_prompt(message_text)
-        image_path = image_paths[0]
+        accepts_image_reference = job_type in _HIGGSFIELD_IMAGE_REFERENCE_JOB_TYPES
+        image_path = image_paths[0] if image_paths and accepts_image_reference else ""
+        if not image_path and accepts_image_reference and followup_without_image:
+            history_offset = _extract_higgsfield_history_offset(message_text)
+            image_path = await self._higgsfield_image_reference_at(
+                channel_id=channel_id,
+                sender_id=sender_id,
+                offset=history_offset,
+            )
+            if not image_path:
+                target = "이전 결과" if history_offset == 0 else f"{history_offset + 1}번 이전 결과"
+                await self.send(
+                    channel_id,
+                    f"이어서 수정할 {target} 이미지를 찾지 못했습니다. "
+                    "`이미지 편집 목록`으로 저장된 결과를 확인하거나 먼저 편집할 이미지를 첨부해 주세요.",
+                    reply_to=post_id,
+                )
+                return True
+        if not text_image_generation:
+            prompt = _build_higgsfield_edit_prompt(message_text, use_reference=bool(image_path))
 
         cost_args = [
             "generate", "cost", job_type,
             "--prompt", prompt,
-            "--image", image_path,
             "--aspect_ratio", aspect,
-            "--resolution", resolution,
         ]
+        if image_path:
+            cost_args.extend(["--image-references", image_path])
+        if job_type in _HIGGSFIELD_RESOLUTION_JOB_TYPES:
+            cost_args.extend(["--resolution", resolution])
+        if job_type in {"seedream_v4_5", "seedream_v5_lite"} and resolution != "1k":
+            cost_args.extend(["--quality", "high"])
+        if job_type == "recraft_v4_1":
+            cost_args.extend(["--model_type", "vector"])
         code, stdout, stderr = await self._run_higgsfield_cli(cost_args, timeout=120)
         if code != 0:
             logger.warning("Mattermost Higgsfield cost failed: %s", (stderr or stdout)[:500])
-            await self.send(
-                channel_id,
-                "Higgsfield 비용 산정에 실패했습니다.\n"
-                f"오류: {(stderr or stdout or 'unknown error')[:800]}",
-            )
-            return True
+            cost = "확인 불가"
+        else:
+            cost = " ".join(stdout.strip().split()) or "확인 불가"
 
-        cost = " ".join(stdout.strip().split()) or "확인 불가"
-        key = self._higgsfield_pending_key(channel_id, sender_id)
-        self._pending_higgsfield_edits[key] = {
+        pending = {
             "job_type": job_type,
             "prompt": prompt,
             "image_path": image_path,
@@ -652,16 +1081,272 @@ class MattermostAdapter(BasePlatformAdapter):
             "resolution": resolution,
             "cost": cost,
             "reply_to": post_id,
+            "sender_id": sender_id,
+            "origin_post_id": post_id,
+            "mode": "generate" if text_image_generation else "edit",
         }
-        await self.send(
-            channel_id,
-            "Higgsfield로 바로 실행할 수 있습니다.\n"
-            f"- 모델: {job_type}\n"
-            f"- 비율/해상도: {aspect} / {resolution.upper()}\n"
-            f"- 예상 크레딧: {cost}\n\n"
-            "진행하려면 `진행` 또는 `네`라고 답해주세요. 취소하려면 `취소`라고 답해주세요.",
+        asyncio.create_task(
+            self._run_pending_higgsfield_edit(channel_id, post_id, pending)
         )
         return True
+
+    def _is_higgsfield_image_edit_channel(self, channel_id: str) -> bool:
+        configured = _parse_csv_set(os.getenv("HIGGSFIELD_IMAGE_EDIT_CHANNELS", ""))
+        return bool(channel_id and channel_id in configured)
+
+    def _is_higgsfield_image_generation_channel(self, channel_id: str) -> bool:
+        configured = _parse_csv_set(os.getenv("HIGGSFIELD_IMAGE_GENERATION_CHANNELS", ""))
+        return bool(
+            channel_id
+            and (channel_id in configured or self._is_higgsfield_image_edit_channel(channel_id))
+        )
+
+    def _extract_higgsfield_archive_payload(self, message: str) -> Dict[str, Any]:
+        """Extract the JSON payload from an archive-channel marker post."""
+        if _HIGGSFIELD_ARCHIVE_MARKER not in (message or ""):
+            return {}
+        match = re.search(
+            rf"{re.escape(_HIGGSFIELD_ARCHIVE_MARKER)}\s*```json\s*(.*?)\s*```",
+            message or "",
+            flags=re.S,
+        )
+        if not match:
+            return {}
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def _cache_remote_higgsfield_image_reference(self, url: str) -> str:
+        """Download a previous result URL into Hermes' image cache for re-editing."""
+        if not url:
+            return ""
+        try:
+            import aiohttp
+            from gateway.platforms.base import cache_image_from_bytes
+
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status >= 400:
+                    logger.warning("Mattermost: previous Higgsfield image download failed: HTTP %s", resp.status)
+                    return ""
+                content_type = resp.content_type or "image/png"
+                if not content_type.startswith("image/"):
+                    logger.warning("Mattermost: previous Higgsfield result is not an image: %s", content_type)
+                    return ""
+                data = await resp.read()
+            ext = ".jpg" if "jpeg" in content_type else ".png"
+            return cache_image_from_bytes(data, ext)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Mattermost: failed to cache previous Higgsfield image: %s", exc)
+            return ""
+
+    async def _cache_mattermost_file_image_reference(self, file_id: str) -> str:
+        """Download an uploaded Mattermost image file into Hermes' image cache."""
+        if not file_id:
+            return ""
+        try:
+            import aiohttp
+            from gateway.platforms.base import cache_image_from_bytes
+
+            info = await self._api_get(f"files/{file_id}/info")
+            content_type = str(info.get("mime_type") or info.get("mime") or "image/png")
+            name = str(info.get("name") or "mattermost-image.png")
+            if not content_type.startswith("image/"):
+                logger.warning("Mattermost: archived file is not an image: %s", content_type)
+                return ""
+
+            url = f"{self._base_url}/api/v4/files/{file_id}"
+            headers = {"Authorization": f"Bearer {self._token}"}
+            async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status >= 400:
+                    logger.warning("Mattermost: archived image download failed: HTTP %s", resp.status)
+                    return ""
+                data = await resp.read()
+            suffix = Path(name).suffix or (".jpg" if "jpeg" in content_type else ".png")
+            return cache_image_from_bytes(data, suffix)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Mattermost: failed to cache archived Mattermost image: %s", exc)
+            return ""
+
+    async def _cache_nearby_higgsfield_result_file(
+        self,
+        posts_data: Dict[str, Any],
+        archive_index: int,
+    ) -> str:
+        """Use the uploaded result image next to an archive marker as a fallback.
+
+        The Higgsfield CDN URL can expire or reject direct downloads. In edit
+        channels, the successful result image post sits right before the archive
+        marker chronologically, so in Mattermost's newest-first order it appears
+        just after the marker. That uploaded file is stable and avoids passing a
+        raw Higgsfield job UUID back as an image reference.
+        """
+        posts = posts_data.get("posts", {}) if isinstance(posts_data, dict) else {}
+        order = posts_data.get("order", []) if isinstance(posts_data, dict) else []
+        for nearby_post_id in order[archive_index + 1:archive_index + 8]:
+            post = posts.get(nearby_post_id) if isinstance(posts, dict) else None
+            if not isinstance(post, dict):
+                continue
+            message = str(post.get("message") or "")
+            if "Higgsfield 이미지 편집이 완료" not in message and "Higgsfield 이미지 생성이 완료" not in message:
+                continue
+            for file_id in post.get("file_ids") or []:
+                cached = await self._cache_mattermost_file_image_reference(str(file_id))
+                if cached:
+                    return cached
+        return ""
+
+    async def _higgsfield_image_history_records(
+        self,
+        *,
+        channel_id: str,
+        sender_id: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Return newest-first archived Higgsfield results for this user/channel."""
+        records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        archive_channels = self._higgsfield_image_archive_channels()
+        if channel_id and channel_id not in archive_channels:
+            archive_channels.append(channel_id)
+        for archive_channel in archive_channels:
+            posts_data = await self._api_get(f"channels/{archive_channel}/posts?page=0&per_page=80")
+            posts = posts_data.get("posts", {}) if isinstance(posts_data, dict) else {}
+            order = posts_data.get("order", []) if isinstance(posts_data, dict) else []
+            for idx, post_id in enumerate(order):
+                post = posts.get(post_id) if isinstance(posts, dict) else None
+                if not isinstance(post, dict):
+                    continue
+                payload = self._extract_higgsfield_archive_payload(post.get("message", ""))
+                if not payload:
+                    continue
+                if payload.get("source") != "hermes_higgsfield_edit":
+                    continue
+                if payload.get("user_id") != sender_id:
+                    continue
+                # First prefer the current channel, but accept same-user history
+                # in the dedicated archive channel as a practical fallback.
+                if payload.get("origin_channel_id") not in {channel_id, ""} and archive_channel == channel_id:
+                    continue
+                dedupe_key = "|".join(
+                    str(payload.get(key) or "")
+                    for key in ("origin_post_id", "result_url", "result_job_id")
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                records.append({
+                    "payload": payload,
+                    "posts_data": posts_data,
+                    "archive_index": idx,
+                    "archive_channel": archive_channel,
+                    "created_at": post.get("create_at") or 0,
+                })
+                if len(records) >= limit:
+                    return records
+        return records
+
+    async def _higgsfield_image_reference_at(
+        self,
+        *,
+        channel_id: str,
+        sender_id: str,
+        offset: int = 0,
+    ) -> str:
+        """Find an archived result by offset and return a local image reference."""
+        records = await self._higgsfield_image_history_records(
+            channel_id=channel_id,
+            sender_id=sender_id,
+            limit=max(10, offset + 1),
+        )
+        if offset < 0 or offset >= len(records):
+            return ""
+        record = records[offset]
+        payload = record["payload"]
+        result_url = str(payload.get("result_url") or "").strip()
+        cached = await self._cache_remote_higgsfield_image_reference(result_url)
+        if cached:
+            return cached
+        return await self._cache_nearby_higgsfield_result_file(
+            record["posts_data"],
+            int(record["archive_index"]),
+        )
+
+    async def _latest_higgsfield_image_reference(self, *, channel_id: str, sender_id: str) -> str:
+        return await self._higgsfield_image_reference_at(
+            channel_id=channel_id,
+            sender_id=sender_id,
+            offset=0,
+        )
+
+    async def _send_higgsfield_image_history_list(self, *, channel_id: str, sender_id: str) -> None:
+        records = await self._higgsfield_image_history_records(
+            channel_id=channel_id,
+            sender_id=sender_id,
+            limit=10,
+        )
+        if not records:
+            await self.send(channel_id, "이 채널에서 찾을 수 있는 이전 이미지 편집 결과가 없습니다.")
+            return
+        lines = ["최근 이미지 편집 결과 목록입니다. 원하는 번호를 지정해 수정할 수 있어요.", ""]
+        for idx, record in enumerate(records, start=1):
+            payload = record["payload"]
+            created_at = int(record.get("created_at") or 0)
+            timestamp = "시간 정보 없음"
+            if created_at:
+                timestamp = datetime.fromtimestamp(created_at / 1000).strftime("%m-%d %H:%M")
+            label = "직전" if idx == 1 else f"{idx}번"
+            job_type = payload.get("job_type") or "unknown"
+            lines.append(f"{idx}. {label} 결과 · {timestamp} · 모델: {job_type}")
+        lines.extend([
+            "",
+            "사용 예:",
+            "`2번 이미지에서 배경만 흰색으로 바꿔줘`",
+            "`두 번 전 이미지에서 윤곽선만 자연스럽게 수정해줘`",
+        ])
+        await self.send(channel_id, "\n".join(lines))
+
+    async def _archive_higgsfield_image_result(
+        self,
+        *,
+        origin_channel_id: str,
+        origin_post_id: str,
+        pending: Dict[str, Any],
+        result_url: str,
+        result_job_id: str,
+    ) -> None:
+        """Post a durable image-edit record to the configured archive channel."""
+        if not pending.get("sender_id"):
+            return
+        if not result_url and not result_job_id:
+            return
+        payload = {
+            "source": "hermes_higgsfield_edit",
+            "origin_channel_id": origin_channel_id,
+            "origin_post_id": origin_post_id or pending.get("origin_post_id", ""),
+            "user_id": pending.get("sender_id", ""),
+            "job_type": pending.get("job_type", ""),
+            "result_url": result_url,
+            "result_job_id": result_job_id,
+        }
+        caption = (
+            "계속 수정용 Higgsfield 이미지 기록\n"
+            f"{_HIGGSFIELD_ARCHIVE_MARKER}\n"
+            "```json\n"
+            f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n"
+            "```"
+        )
+        for archive_channel in self._higgsfield_image_archive_channels():
+            try:
+                if archive_channel == origin_channel_id:
+                    await self.send(archive_channel, caption)
+                elif result_url:
+                    await self.send_image(archive_channel, result_url, caption=caption)
+                else:
+                    await self.send(archive_channel, caption)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Mattermost: failed to archive Higgsfield result in %s: %s", archive_channel, exc)
 
     async def _maybe_finish_pending_higgsfield_edit(
         self,
@@ -702,14 +1387,21 @@ class MattermostAdapter(BasePlatformAdapter):
         create_args = [
             "generate", "create", pending["job_type"],
             "--prompt", pending["prompt"],
-            "--image", pending["image_path"],
             "--aspect_ratio", pending["aspect"],
-            "--resolution", pending["resolution"],
             "--wait",
             "--wait-timeout", "20m",
             "--wait-interval", "5s",
             "--json",
         ]
+        if pending.get("image_path"):
+            create_args.extend(["--image-references", pending["image_path"]])
+        job_type = pending["job_type"]
+        if job_type in _HIGGSFIELD_RESOLUTION_JOB_TYPES:
+            create_args.extend(["--resolution", pending["resolution"]])
+        if job_type in {"seedream_v4_5", "seedream_v5_lite"} and pending["resolution"] != "1k":
+            create_args.extend(["--quality", "high"])
+        if job_type == "recraft_v4_1":
+            create_args.extend(["--model_type", "vector"])
         code, stdout, stderr = await self._run_higgsfield_cli(create_args, timeout=1500)
         if code != 0:
             logger.warning("Mattermost Higgsfield create failed: %s", (stderr or stdout)[:500])
@@ -721,36 +1413,81 @@ class MattermostAdapter(BasePlatformAdapter):
             return
 
         result_url = _extract_higgsfield_result_url(stdout)
+        job_id = _extract_higgsfield_job_id(stdout)
         if not result_url:
-            job_id = _extract_higgsfield_job_id(stdout)
             if job_id:
-                get_code, get_stdout, get_stderr = await self._run_higgsfield_cli(
-                    ["generate", "get", job_id, "--json"], timeout=120
-                )
-                if get_code == 0:
-                    result_url = _extract_higgsfield_result_url(get_stdout)
-                else:
-                    logger.warning(
-                        "Mattermost Higgsfield get failed for %s: %s",
-                        job_id,
-                        (get_stderr or get_stdout)[:500],
-                    )
+                result_url = await self._resolve_higgsfield_result_url(job_id)
 
+        caption_title = (
+            "Higgsfield 이미지 생성이 완료되었습니다."
+            if pending.get("mode") == "generate"
+            else "Higgsfield 이미지 편집이 완료되었습니다."
+        )
         caption = (
-            "Higgsfield 이미지 편집이 완료되었습니다.\n"
+            f"{caption_title}\n"
             f"- 모델: {pending['job_type']}\n"
             f"- 비용: {pending.get('cost', '확인 불가')}\n"
             f"- 비율/해상도: {pending['aspect']} / {str(pending['resolution']).upper()}"
         )
         if result_url:
-            caption += f"\n- 결과 URL: {result_url}"
-            await self.send_image(channel_id, result_url, caption=caption)
+            await self.send_image(channel_id, result_url, caption=caption, reply_to=reply_to)
+            await self._archive_higgsfield_image_result(
+                origin_channel_id=channel_id,
+                origin_post_id=reply_to,
+                pending=pending,
+                result_url=result_url,
+                result_job_id=job_id,
+            )
         else:
             await self.send(
                 channel_id,
                 caption + "\n\n결과 URL을 자동으로 찾지 못했습니다. 원본 출력:\n"
                 f"```text\n{stdout[:1200]}\n```",
+                reply_to=reply_to,
             )
+
+    async def _resolve_higgsfield_result_url(self, job_id: str) -> str:
+        """Resolve a Higgsfield job UUID to a final media URL, retrying briefly.
+
+        Some `higgsfield generate create --wait --json` runs print only the job
+        UUID, and an immediate `generate get` can briefly return before
+        `result_url` is populated. Polling avoids surfacing the UUID-only output
+        to Mattermost users as a false failure.
+        """
+        last_error = ""
+        for attempt in range(6):
+            get_code, get_stdout, get_stderr = await self._run_higgsfield_cli(
+                ["generate", "get", job_id, "--json"], timeout=120
+            )
+            if get_code == 0:
+                result_url = _extract_higgsfield_result_url(get_stdout)
+                if result_url:
+                    return result_url
+                last_error = get_stdout[:500]
+            else:
+                last_error = (get_stderr or get_stdout)[:500]
+                logger.warning(
+                    "Mattermost Higgsfield get failed for %s: %s",
+                    job_id,
+                    last_error,
+                )
+
+            if attempt < 5:
+                await asyncio.sleep(5)
+
+        wait_code, wait_stdout, wait_stderr = await self._run_higgsfield_cli(
+            ["generate", "wait", job_id, "--json"], timeout=600
+        )
+        if wait_code == 0:
+            result_url = _extract_higgsfield_result_url(wait_stdout)
+            if result_url:
+                return result_url
+        logger.warning(
+            "Mattermost Higgsfield URL unresolved for %s: %s",
+            job_id,
+            (wait_stderr or wait_stdout or last_error)[:500],
+        )
+        return ""
 
     # ------------------------------------------------------------------
     # Optional overrides
@@ -1254,6 +1991,10 @@ class MattermostAdapter(BasePlatformAdapter):
         if message_text.startswith("/"):
             msg_type = MessageType.COMMAND
 
+        if msg_type != MessageType.COMMAND and _is_higgsfield_model_help_request(message_text):
+            await self.send(channel_id, _HIGGSFIELD_MODEL_HELP_TEXT, reply_to=post_id)
+            return
+
         # Download file attachments immediately (URLs require auth headers
         # that downstream tools won't have).
         media_urls: List[str] = []
@@ -1307,6 +2048,15 @@ class MattermostAdapter(BasePlatformAdapter):
         # "I'll prepare a prompt" when a directly executable Higgsfield CLI
         # path is available.
         if msg_type != MessageType.COMMAND:
+            has_higgsfield_image = any(m.startswith("image/") for m in media_types)
+            if await self._maybe_handle_higgsfield_image_edit_control(
+                channel_id=channel_id,
+                sender_id=sender_id,
+                message_text=message_text,
+                has_image=has_higgsfield_image,
+            ):
+                return
+
             if await self._maybe_finish_pending_higgsfield_edit(
                 channel_id=channel_id,
                 sender_id=sender_id,
@@ -1322,6 +2072,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 message_text=message_text,
                 media_urls=media_urls,
                 media_types=media_types,
+                force=self._is_higgsfield_image_edit_channel(channel_id) and has_higgsfield_image,
             ):
                 return
 
