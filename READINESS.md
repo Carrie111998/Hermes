@@ -747,6 +747,19 @@ Both commands passed. This validates Compose configuration syntax and
 interpolation only; it does not establish a production deployment or external
 service availability.
 
+Human intervention-boundary controls were validated on current `main` commit
+`4d20cc99d4ea74bc68e65f610d5c0202511dcb79` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_operational_control.py \
+  tests/hermes_cli/test_objective_runtime.py
+```
+
+Result: **37 passed, 0 failed**. Employee, worker, and runtime identities are
+rejected when attempting to resolve an open intervention; explicitly
+identified human advisor identities remain the resolution boundary.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
