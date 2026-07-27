@@ -8,6 +8,9 @@
 - Payment-provider assessments now use the same immutable supersession lineage:
   revoked screening or registry evidence cannot remain implicitly authorized,
   and readiness ignores superseded provider records.
+- `business provider-verify` now exposes bounded `--supersedes-id` and
+  `--supersession-reason` options so advisor/legal updates use the governed
+  replacement path rather than direct database access.
 - Reran the complete current-tree install-to-master-stop acceptance on the
   current branch, including scheduled replanning, uncertain provider
   read-back, inbound tax-bearing settlement, and durable autonomy revocation;

@@ -154,6 +154,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     provider.add_argument("--evidence", required=True, metavar="JSON")
     provider.add_argument("--aml-screening", action="store_true")
     provider.add_argument("--sanctions-screening", action="store_true")
+    provider.add_argument("--supersedes-id")
+    provider.add_argument("--supersession-reason")
 
     assess = sub.add_parser(
         "compliance-assess", help="Record time-bound regime applicability"
@@ -753,6 +755,8 @@ def business_command(args: argparse.Namespace) -> int:
                 verified_at=int(time.time()),
                 expires_at=args.expires_at,
                 evidence=_json_object(args.evidence),
+                supersedes_id=args.supersedes_id,
+                supersession_reason=args.supersession_reason,
             )
             print(json.dumps({"provider_assessment_id": assessment_id}))
             return 0

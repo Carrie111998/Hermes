@@ -26,6 +26,35 @@ def test_example_charter_grants_bounded_successor_authority():
     assert "objectives" in charter["allowed_systems"]
 
 
+def test_provider_verify_exposes_supersession_controls():
+    args = _parser().parse_args(
+        [
+            "business",
+            "provider-verify",
+            "--provider",
+            "rail",
+            "--direction",
+            "outbound",
+            "--jurisdiction",
+            "CA",
+            "--registry-authority",
+            "registry",
+            "--registry-reference",
+            "ref",
+            "--expires-at",
+            "9999999999",
+            "--evidence",
+            "{}",
+            "--supersedes-id",
+            "assessment_old",
+            "--supersession-reason",
+            "screening interpretation changed",
+        ]
+    )
+    assert args.supersedes_id == "assessment_old"
+    assert args.supersession_reason == "screening interpretation changed"
+
+
 def test_business_bootstrap_is_noninteractive_and_persists_charter(
     tmp_path, monkeypatch, capsys
 ):

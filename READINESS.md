@@ -428,6 +428,8 @@ python3 -m pytest tests/hermes_cli/test_compliance_db.py tests/hermes_cli/test_b
 Result: **13 passed, 0 failed**. Provider assessments now support immutable
 supersession, reject branch-from-old-record attempts, and stop authorization
 when the current replacement no longer satisfies screening controls.
+The supported `business provider-verify` command also accepts the exact
+superseded assessment ID and required replacement reason.
 
 ## Release gates that remain open
 

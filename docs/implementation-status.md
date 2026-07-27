@@ -73,6 +73,8 @@ acceptance evidence.
 - Payment-provider assessments use the same append-only supersession model;
   readiness excludes superseded records and provider authorization evaluates
   only the current screened assessment.
+- The operator CLI exposes provider-assessment supersession fields and routes
+  them through the same scope and lineage checks.
 - Security-readiness blocks now create deduplicated, organization-scoped
   advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.
