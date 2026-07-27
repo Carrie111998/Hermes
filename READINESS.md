@@ -387,10 +387,12 @@ The process-separated delegation acceptance gate was validated on the current
 tree with:
 
 ```sh
-python3 -m pytest -q tests/hermes_cli/test_agentic_business_e2e.py -k process_separated_delegation
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_agentic_business_e2e.py \
+  tests/hermes_cli/test_workforce_delegation.py
 ```
 
-Result: **1 passed, 6 deselected**. The test proves that the CEO-issued grant
+Result: **18 passed**. The process-separated test proves that the CEO-issued grant
 is bound to one subordinate profile, mandate, system, toolset, skill, budget,
 and expiry; a separate process performs the task and records evidence; and a
 fresh CEO runtime receives the completion event, performs authoritative

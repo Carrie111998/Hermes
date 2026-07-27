@@ -131,7 +131,9 @@ provider readiness, container-registry publication, or high availability.
 The process-separated delegation gate is also covered by:
 
 ```sh
-python3 -m pytest -q tests/hermes_cli/test_agentic_business_e2e.py -k process_separated_delegation
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_agentic_business_e2e.py \
+  tests/hermes_cli/test_workforce_delegation.py
 ```
 
 It launches the subordinate as a separate interpreter with only its exact
