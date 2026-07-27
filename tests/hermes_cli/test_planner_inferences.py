@@ -15,6 +15,15 @@ from hermes_cli import planner_inferences
 from hermes_cli import resource_budget
 
 
+def test_planner_inference_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    planner_inferences.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    planner_inferences.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def _response(text: str):
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
