@@ -771,6 +771,13 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
     (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
+    # A leading '+' on a refspec IS a force push — `git push origin +main` is
+    # exactly `git push --force origin main`, and `+src:dst` force-updates dst.
+    # The two flag patterns above match neither, so this form walked straight
+    # past the approval gate. Bounded with [^;|&\n]* like its neighbours so a
+    # later command in the same line cannot be swept in, and anchored on
+    # whitespace before the '+' because a refspec's '+' is always leading.
+    (r'\bgit\s+push\b[^;|&\n]*\s\+\S', "git force push via + refspec (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
     # `-D` is shorthand for `-d --force`; the long-flag spellings
