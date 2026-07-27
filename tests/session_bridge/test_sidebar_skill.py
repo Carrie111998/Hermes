@@ -251,9 +251,10 @@ def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missin
 
     assert "Authenticated Local Transport Fallback" in skill
     assert (
-        'uv run --project "C:\\\\Users\\\\diego\\\\.hermes\\\\worktrees\\\\'
-        'session-bridge-ship" --no-sync python -m session_bridge.broker_client'
+        'uv run --project "C:\\\\Users\\\\diego\\\\.hermes\\\\agent-src" '
+        "--no-sync python -m session_bridge.broker_client"
     ) in skill
+    assert "worktrees\\\\session-bridge-ship" not in skill
     assert "status|pending|reserve|bind|commit|fail" in skill
     assert "session_sidebar_reserve" in skill
     assert "reserve --lease-token=<exact token>" in skill

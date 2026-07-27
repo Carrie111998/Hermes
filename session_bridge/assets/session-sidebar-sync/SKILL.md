@@ -41,7 +41,7 @@ Never treat `notLoaded` as globally equivalent to `idle`. Missing turns, an inco
 Use the native `session_bridge` MCP tools when they are callable in the current task. If, and only if, those MCP tools are absent from the task's tool schema, use this authenticated loopback command prefix for the corresponding bridge operation:
 
 ```powershell
-uv run --project "C:\\Users\\diego\\.hermes\\worktrees\\session-bridge-ship" --no-sync python -m session_bridge.broker_client status|pending|reserve|bind|commit|fail
+uv run --project "C:\\Users\\diego\\.hermes\\agent-src" --no-sync python -m session_bridge.broker_client status|pending|reserve|bind|commit|fail
 ```
 
 The registration subcommands map one-for-one to `session_status`, `session_sidebar_pending`, `session_sidebar_reserve`, `session_sidebar_bind`, `session_sidebar_commit`, and `session_sidebar_fail`. Supply `pending --limit 1`, `reserve --lease-token=<exact token>`, `bind --lease-token=<exact token> --thread-id=<threadId>`, `commit --lease-token=<exact token> --thread-id=<threadId>`, or `fail --lease-token=<exact token> --error-code=<fixed code> --thread-id=<threadId>` when an exact returned native ID is known. Omit `--thread-id` from registration fail only when no exact native ID was returned.
