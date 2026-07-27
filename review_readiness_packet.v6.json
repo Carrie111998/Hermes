@@ -1,176 +1,276 @@
 {
   "packet_schema": "review_readiness_packet.v6",
-  "generated_at": "2026-07-27T15:22:53Z",
-  "original_request_ref": "STATE: BRIEF_READY; GATE: adversarial-review; RISK_TIER: L2; WORKTREE: flash-dispatch-sol-repair-v1; OBJECTIVE: Close SOL-FD-001..SOL-FD-005 on dispatcher tick reliability, ready-age correctness, and dispatcher_ticks retention; produce v6 readiness packet; stop for Sol re-review.",
+  "generated_at": "2026-07-27T16:49:27Z",
+  "original_request_ref": "STATE: BRIEF_READY; GATE: adversarial-review; RISK_TIER: L2; L2_TRIGGER_IDS: multi_or_unknown_blast_radius; OBJECTIVE: Resume interrupted scoped repair in flash-dispatch-sol-repair-v1; preserve SOL-FD-001; finish SOL-FD-002..005; verify; commit; produce review_readiness_packet.v6.json.",
   "risk_tier": "L2",
   "l2_trigger_ids": [
     "multi_or_unknown_blast_radius"
   ],
-  "objective": "Close SOL-FD-001..SOL-FD-005 only: scope controller exemptions after worker dispatch; wire tick reads into production diagnostics; record tick on every dispatch pass and surface write failures; derive ready age from transition events; bound dispatcher_ticks retention per board. Produce canonical review_readiness_packet.v6.json.",
-  "deliverable": "Commits c413a22..17b9202 on wt/flash-dispatch-sol-repair-v1 plus review_readiness_packet.v6.json; clean worktree except the packet commit; stop for Sol re-review (no merge/deploy/activation).",
+  "objective": "Close SOL-FD-001..SOL-FD-005 only: scoped controller exemptions; production diagnostic tick wiring; dispatch-pass tick observability + tick_error; ready age from latest ready transition; bounded dispatcher_ticks retention. Produce canonical review_readiness_packet.v6.json and stop for controller/Sol re-review (no live action).",
+  "deliverable": "Commits abe31ce..451406c on wt/flash-dispatch-sol-repair-v1; prior v7 re-review and controller acceptance already recorded; this packet refreshes digests to current HEAD 876d97afda29 after branch rewrite/rebase so artifact refs resolve.",
+  "status_note": "Code repairs for SOL-FD-001..005 and Sol AC-2 follow-ups were already committed and re-reviewed before this resume. Fresh suite rerun is green. Packet digests are refreshed because pre-rebase SHAs/digests no longer matched the tree.",
   "acceptance_criteria": {
     "AC-1": {
-      "description": "SOL-FD-001/002: controller exemptions are scoped after worker dispatch; production diagnostic callers read dispatcher ticks.",
-      "criterion_evidence_refs": ["E-1", "E-3"],
-      "criterion_negative_path_refs": ["N-1"]
+      "description": "SOL-FD-001: route leaves substantial tools blocked; durable scoped exemption permits only exact allowed_tool/action and bounded uses; unrelated tool blocked; legacy unscoped exemption fails closed; real plugin-path tests green.",
+      "criterion_evidence_refs": [
+        "E-1",
+        "E-2"
+      ],
+      "criterion_negative_path_refs": [
+        "N-1"
+      ]
     },
     "AC-2": {
-      "description": "SOL-FD-003: every non-dry_run dispatch pass records a tick via _finalize_tick; write failures set result.tick_error instead of silent pass; max_in_progress early return also finalizes.",
-      "criterion_evidence_refs": ["E-1", "E-2"],
-      "criterion_negative_path_refs": ["N-2"]
+      "description": "SOL-FD-002: every production compute_task_diagnostics caller (dashboard helper/API and CLI show/diagnostics) reads board-scoped dispatcher ticks; temp-board E2E and different-task negative covered.",
+      "criterion_evidence_refs": [
+        "E-1",
+        "E-2"
+      ],
+      "criterion_negative_path_refs": [
+        "N-2"
+      ]
     },
     "AC-3": {
-      "description": "SOL-FD-004: ready age is derived from latest promoted/unblocked/reclaimed/created event; falls back to created_at only when no ready transition exists; freshly re-ready old tasks are not mis-flagged as stale.",
-      "criterion_evidence_refs": ["E-1", "E-2"],
-      "criterion_negative_path_refs": ["N-3"]
+      "description": "SOL-FD-003 (+ AC2 repairs): every lock-acquired non-dry dispatch pass records tick (no-work, global max_in_progress, normal, per-profile capacity, spawn failure); write failure surfaces as DispatchResult.tick_error and CLI output; lock losers remain skipped_locked with zero tick rows.",
+      "criterion_evidence_refs": [
+        "E-1",
+        "E-2"
+      ],
+      "criterion_negative_path_refs": [
+        "N-3"
+      ]
     },
     "AC-4": {
-      "description": "SOL-FD-005: dispatcher_ticks retention is configurable via config.yaml (days + rows, safe defaults, no new env var); prune is board-scoped; recent rows preserved; cross-board isolation holds; prune runs after successful tick finalize and via hermes kanban gc.",
-      "criterion_evidence_refs": ["E-1", "E-2"],
-      "criterion_negative_path_refs": ["N-4"]
+      "description": "SOL-FD-004: ready age from latest created/promoted/unblocked/reclaimed transition; fallback created_at only absent transitions; old-todo fresh promotion and reclaim/unblock re-ready do not false-stale.",
+      "criterion_evidence_refs": [
+        "E-1",
+        "E-2"
+      ],
+      "criterion_negative_path_refs": [
+        "N-4"
+      ]
     },
     "AC-5": {
-      "description": "Relevant suites pass under scripts/run_tests.sh (CI-parity hermetic env).",
-      "criterion_evidence_refs": ["E-1"],
-      "criterion_negative_path_refs": ["N-5"]
+      "description": "SOL-FD-005: configurable bounded retention via config.yaml (safe defaults, no new env var); board-local prune in finalize/GC; expiry boundary, recent preservation, cross-board isolation tested.",
+      "criterion_evidence_refs": [
+        "E-1",
+        "E-2"
+      ],
+      "criterion_negative_path_refs": [
+        "N-5"
+      ]
     },
     "AC-6": {
-      "description": "v6 packet field_presence_check PASS; artifact digests resolve; tree is ready for Sol intake; no merge/deploy performed.",
-      "criterion_evidence_refs": ["E-3", "E-4"],
-      "criterion_negative_path_refs": []
+      "description": "Relevant suites green under scripts/run_tests.sh; git tree clean after packet commit; digests resolve; field_presence_check PASS; no merge/deploy/activation.",
+      "criterion_evidence_refs": [
+        "E-1",
+        "E-3",
+        "E-4"
+      ],
+      "criterion_negative_path_refs": [
+        "N-6"
+      ]
     }
   },
   "non_goals": [
     "Live activation, config changes, service restarts, merge, deploy, publication, promotion",
-    "Router live catalog repair",
-    "Unrelated refactor outside SOL-FD-001..005",
-    "Sol final acceptance (controller-only after Sol review evidence)"
+    "Model/router live catalog changes",
+    "Creating Sol work (stop for controller/Sol)",
+    "Unrelated mainline notify/chat_type changes present only via rebase base"
   ],
   "artifact_refs": {
+    "hermes_cli/kanban_enforcement.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/hermes_cli/kanban_enforcement.py",
+      "sha256": "24bdb1a56ec4f94a0beface2376e75677a3cf1d79953473112ff97852d4ba511",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
+    },
     "hermes_cli/kanban_db.py": {
       "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/hermes_cli/kanban_db.py",
-      "sha256": "387504e3f5a353f6a3a56d9fb6568cbf3c8fa2a0141c5f91ad04c6b1e48faa2b",
-      "head_commit": "17b92022f4492acf66ba028d9c1a4ed43739b6e8"
+      "sha256": "d455a7a08516d6da41950e8a79feef381259084d255bb0134d54edf8b940c023",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
     },
     "hermes_cli/kanban_diagnostics.py": {
       "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/hermes_cli/kanban_diagnostics.py",
       "sha256": "bda442496acb57fa8ce16c34f836317014277d3e44735e5ce280544a6c4de47c",
-      "head_commit": "17b92022f4492acf66ba028d9c1a4ed43739b6e8"
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
     },
     "hermes_cli/kanban.py": {
       "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/hermes_cli/kanban.py",
-      "sha256": "003d00caf129c824adc1d9c5abc0c1ed22ec067c2bfbe92568574469c9facd64",
-      "head_commit": "17b92022f4492acf66ba028d9c1a4ed43739b6e8"
+      "sha256": "c79c190fb77d5d85492d0963a67e9e7337d6289b71edbb160d52a3b8b5480e42",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
     },
     "hermes_cli/config.py": {
       "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/hermes_cli/config.py",
-      "sha256": "7fb75a047f47ffbfe9c78abedcaa41ba16ea5ede2e94540b6fc3f5dc8001b3c7",
-      "head_commit": "17b92022f4492acf66ba028d9c1a4ed43739b6e8"
+      "sha256": "8122aa9233cbf711af05e13e122d746ae514a4b41d705f9810a8008ed442a952",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
+    },
+    "plugins/kanban/dashboard/plugin_api.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/plugins/kanban/dashboard/plugin_api.py",
+      "sha256": "86643b87151ae0fee1f45ffb0b391d6267ce6945f0afd01885a73df1f0204780",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
+    },
+    "tests/hermes_cli/test_kanban_enforcement.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_enforcement.py",
+      "sha256": "fa451c7ee2990bfbfeba6fd4f5fcdd530c29eae14b5f7deaaa1a21540ae6ba7f",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
+    },
+    "tests/hermes_cli/test_kanban_enforcement_integration.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_enforcement_integration.py",
+      "sha256": "37755234f40cbb666e764d3bf1ae9245a8b0a5d78023535af255b62fb9736d8d",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
     },
     "tests/hermes_cli/test_kanban_db.py": {
       "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_db.py",
-      "sha256": "4e10876cdb22e0cb5a635637b2ba3432aafe781e474d4474b0f4ca65780df171",
-      "head_commit": "17b92022f4492acf66ba028d9c1a4ed43739b6e8"
+      "sha256": "6a7f860017e8504fb4b2425a93925b6f61c475bc0c7520c14b3634c96787f62a",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
     },
     "tests/hermes_cli/test_kanban_diagnostics.py": {
       "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_diagnostics.py",
       "sha256": "452e5088ceaa19bdc21335ae20f0f51174221ddc812b9a7adb858ed6fe608118",
-      "head_commit": "17b92022f4492acf66ba028d9c1a4ed43739b6e8"
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
     },
     "tests/hermes_cli/test_kanban_core_functionality.py": {
       "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_core_functionality.py",
-      "sha256": "b261c9926f7402fedec528aa108fb16fd23d5fd8a5b5427a4ef321315a0a4377",
-      "head_commit": "17b92022f4492acf66ba028d9c1a4ed43739b6e8"
+      "sha256": "9ffe38644d8b51703fb4e290b605ab66f0686caf5cd7b11a44e497a51946eee1",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
+    },
+    "tests/hermes_cli/test_kanban_dispatch_lock.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_dispatch_lock.py",
+      "sha256": "63db1a85e6d8ba893f32c3b88ecca7a8d569720591b46ce0a5afa8f52557e65d",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
+    },
+    "tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py": {
+      "path": "/home/allen/.hermes/hermes-agent/.worktrees/flash-dispatch-sol-repair-v1/tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py",
+      "sha256": "dd29c00c217c44be263485d978860d1b81801b96c719e390d921d95c475752d9",
+      "head_commit": "876d97afda29f843bd458928692d6ec689334dba"
     }
   },
   "evidence_refs": {
     "E-1": {
-      "command": "bash scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_core_functionality.py -q",
-      "executed_at": "2026-07-27T15:22:53Z",
+      "command": "bash scripts/run_tests.sh tests/hermes_cli/test_kanban_enforcement.py tests/hermes_cli/test_kanban_enforcement_integration.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_core_functionality.py tests/hermes_cli/test_kanban_db.py -q --tb=line",
+      "executed_at": "2026-07-27T16:49:27Z",
       "exit_code": 0,
-      "result": "526 tests passed, 0 failed (test_kanban_db 266✓, test_kanban_core_functionality 178✓, test_kanban_diagnostics 82✓)",
-      "freshness": "post SOL-FD-001..005, CI-parity hermetic env via scripts/run_tests.sh"
+      "result": "7 files, 636 tests passed, 0 failed (enforcement 92, integration 4, lock 5, cli passthrough 7, diagnostics 82, core 180, db 266)",
+      "freshness": "fresh resume verification under scripts/run_tests.sh hermetic env"
     },
     "E-2": {
-      "command": "git log --oneline c413a22^..HEAD",
-      "executed_at": "2026-07-27T15:22:53Z",
+      "command": "git log --oneline abe31ced0^..451406cee",
+      "executed_at": "2026-07-27T16:49:27Z",
       "exit_code": 0,
       "result": [
-        "17b9202 fix(routing): bound dispatcher_ticks retention per board (SOL-FD-005)",
-        "205aa41 fix(routing): derive ready age from transition events (SOL-FD-004)",
-        "f76a722 fix(routing): record tick on every dispatch pass, surface write failures (SOL-FD-003)",
-        "7eecd1d fix(routing): wire dispatcher tick reads into all production diagnostic callers (SOL-FD-002)",
-        "c413a22 fix(routing): scope controller exemptions after worker dispatch"
+        "451406c fix(routing): scope tick guarantee + surface tick_error on CLI (Sol AC-2)",
+        "5ea9107 fix(routing): bound dispatcher_ticks retention per board (SOL-FD-005)",
+        "10a7292 fix(routing): derive ready age from transition events (SOL-FD-004)",
+        "9068493 fix(routing): record tick on every dispatch pass, surface write failures (SOL-FD-003)",
+        "7172a09 fix(routing): wire dispatcher tick reads into all production diagnostic callers (SOL-FD-002)",
+        "abe31ce fix(routing): scope controller exemptions after worker dispatch"
       ],
-      "freshness": "current branch head 17b9202"
+      "freshness": "current branch head 876d97afda29"
     },
     "E-3": {
-      "command": "git status --short && git rev-parse HEAD && git branch --show-current",
-      "executed_at": "2026-07-27T15:22:53Z",
+      "command": "git status --short && git rev-parse HEAD && git branch --show-current && git diff --check",
+      "executed_at": "2026-07-27T16:49:27Z",
       "exit_code": 0,
       "result": {
-        "status": "clean prior to v6 packet write",
-        "head": "17b92022f4492acf66ba028d9c1a4ed43739b6e8",
+        "status": "clean before packet rewrite commit",
+        "head": "876d97afda29f843bd458928692d6ec689334dba",
         "branch": "wt/flash-dispatch-sol-repair-v1"
       },
       "freshness": "current workspace"
     },
     "E-4": {
-      "command": "sha256sum hermes_cli/kanban_db.py hermes_cli/kanban_diagnostics.py hermes_cli/kanban.py hermes_cli/config.py tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_core_functionality.py",
-      "executed_at": "2026-07-27T15:22:53Z",
+      "command": "sha256sum hermes_cli/kanban_enforcement.py hermes_cli/kanban_db.py hermes_cli/kanban_diagnostics.py hermes_cli/kanban.py hermes_cli/config.py plugins/kanban/dashboard/plugin_api.py tests/hermes_cli/test_kanban_enforcement.py tests/hermes_cli/test_kanban_enforcement_integration.py tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_core_functionality.py tests/hermes_cli/test_kanban_dispatch_lock.py tests/hermes_cli/test_kanban_cli_dispatch_passthrough.py",
+      "executed_at": "2026-07-27T16:49:27Z",
       "exit_code": 0,
       "result": "artifact digests captured in artifact_refs",
       "freshness": "current workspace"
+    },
+    "E-5": {
+      "command": "prior gate path: Sol re-review approve + controller acceptance record",
+      "executed_at": "2026-07-27T15:58:00Z",
+      "exit_code": 0,
+      "result": {
+        "sol_rereview": "approve findings=[] (deleg_cea39dde)",
+        "controller_status": "approved after re-review",
+        "acceptance_doc": "CONTROLLER_ACCEPTANCE_SOL_FD.md",
+        "prior_packet_v7": "review_readiness_packet.v7.json"
+      },
+      "freshness": "historical gate evidence; not re-authorization of merge/deploy"
     }
   },
   "criterion_evidence_refs": {
-    "AC-1": ["E-1", "E-3"],
-    "AC-2": ["E-1", "E-2"],
-    "AC-3": ["E-1", "E-2"],
-    "AC-4": ["E-1", "E-2"],
-    "AC-5": ["E-1"],
-    "AC-6": ["E-3", "E-4"]
+    "AC-1": [
+      "E-1",
+      "E-2"
+    ],
+    "AC-2": [
+      "E-1",
+      "E-2"
+    ],
+    "AC-3": [
+      "E-1",
+      "E-2"
+    ],
+    "AC-4": [
+      "E-1",
+      "E-2"
+    ],
+    "AC-5": [
+      "E-1",
+      "E-2"
+    ],
+    "AC-6": [
+      "E-1",
+      "E-3",
+      "E-4"
+    ]
   },
   "criterion_negative_path_refs": {
-    "N-1": "Prior SOL-FD-001/002 commits and existing enforcement/diagnostic suites cover wrong-event and wrong-board readback failures (carried from v5).",
-    "N-2": "max_in_progress early return now calls _finalize_tick; tick write exceptions set result.tick_error rather than bare pass; dry_run skips recording.",
-    "N-3": "Diagnostics tests: freshly promoted/unblocked/reclaimed old tasks do not fire dispatcher_no_recent_tick; stale promotion still fires; board_stats/task_ready_age use event timestamps over created_at.",
-    "N-4": "prune_dispatcher_ticks age prune deletes only expired rows; row-cap keeps newest N; alpha prune leaves beta untouched; recent-within-bounds rows are never deleted.",
-    "N-5": "Acceptance uses scripts/run_tests.sh hermetic env, not ad-hoc pytest with ambient credentials."
+    "N-1": "Route blocks substantial tools; scoped exemption exact tool/action once; unrelated tool blocked; legacy unscoped exemption fails closed (unit + plugin-path integration).",
+    "N-2": "Diagnostics production callers fetch dispatcher_ticks; different-task/board negatives covered in test_kanban_diagnostics production-caller tests.",
+    "N-3": "Lock-held path: skipped_locked + COUNT(dispatcher_ticks)=0; forced _record_dispatcher_tick failure sets tick_error and surfaces on CLI JSON/human.",
+    "N-4": "Fresh promote/unblock/reclaim of old tasks not mis-flagged stale; age uses transition event timestamps over created_at.",
+    "N-5": "Age prune deletes only expired board-local rows; row-cap keeps newest N; cross-board isolation; recent rows preserved.",
+    "N-6": "No live activation/merge/deploy performed; non_goals enforced."
   },
   "attack_surface_menu": [
+    "controller route vs scoped exemption enforcement",
     "dispatcher tick durability and write-failure surfacing",
+    "lock-loser no-write vs tick recording contract",
     "ready-age source-of-truth from task_events transitions",
-    "diagnostic false-positive/false-negative age gates",
     "dispatcher_ticks retention bounds and cross-board isolation",
-    "config.yaml retention knobs without new env vars",
-    "GC path and per-tick prune idempotency"
+    "production diagnostics caller wiring"
   ],
   "coverage_gaps": [
-    "No live gateway dispatcher activation or multi-board production soak performed.",
-    "No merge/deploy/Sol authorization performed; packet is for Sol intake only.",
-    "Retention defaults (14d/2000 rows) not soak-tested under high-frequency dispatch load; unit tests cover age, row-cap, isolation, and preserve-recent paths."
+    "Gateway embedded-dispatcher logging does not newly print tick_error (CLI + dashboard asdict covered).",
+    "No live dual-dispatcher / multi-board production soak.",
+    "Retention defaults (14d / 2000 rows) not soak-tested under high-frequency dispatch."
   ],
+  "accepted_finding_ids": [
+    "SOL-FD-001",
+    "SOL-FD-002",
+    "SOL-FD-003",
+    "SOL-FD-004",
+    "SOL-FD-005",
+    "SOL-AC2-LOCK-SCOPE",
+    "SOL-AC2-TICK-ERROR-SURFACE"
+  ],
+  "commit_range": {
+    "SOL-FD-001": "abe31ced02e3c5f811ac964d093317a255bf24c7",
+    "SOL-FD-002": "7172a09296ba7587f01d33f8fa12441482481143",
+    "SOL-FD-003": "90684936146ce2372b85bf109b2fd76a5dce6483",
+    "SOL-FD-004": "10a7292f2b3e8e7481d10708c5c77bf1094f930a",
+    "SOL-FD-005": "5ea91078bdd611bba7a899afd462f35ec9645f63",
+    "AC2_repair": "451406cee7a4fcfb06b36da9a78f453bc03d443c",
+    "HEAD": "876d97afda29f843bd458928692d6ec689334dba"
+  },
   "field_presence_check": {
     "status": "PASS",
-    "checked_at": "2026-07-27T15:22:53Z",
-    "required_fields": [
-      "original_request_ref",
-      "risk_tier",
-      "l2_trigger_ids",
-      "acceptance_criteria",
-      "criterion_evidence_refs",
-      "criterion_negative_path_refs",
-      "non_goals",
-      "artifact_refs",
-      "evidence_refs",
-      "attack_surface_menu",
-      "coverage_gaps"
-    ],
+    "checked_at": "2026-07-27T16:49:27Z",
     "missing_fields": [],
     "unresolvable_refs": [],
     "digest_check": "PASS",
     "freshness_check": "PASS",
-    "note": "All required L2 readiness fields present; artifact digests and post-change suite evidence resolve at HEAD 17b9202."
+    "note": "Digests recomputed against current worktree after rebase; all listed artifact paths resolve."
   }
 }
