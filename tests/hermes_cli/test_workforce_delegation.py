@@ -140,6 +140,56 @@ def _grant(conn, ids, **overrides):
     return workforce_delegation.create_grant(conn, **values)
 
 
+def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
+    company = _company(tmp_path, monkeypatch)
+    conn = company[0]
+    ids = company[1:]
+    plan_id = conn.execute(
+        "SELECT id FROM plans WHERE objective_id=? ORDER BY version DESC LIMIT 1",
+        (ids[4],),
+    ).fetchone()["id"]
+    action_id = objectives_db.propose_action(
+        conn,
+        objective_id=ids[4],
+        plan_id=plan_id,
+        action_type="kanban.create_task",
+        payload={
+            "system": "kanban",
+            "target_resource": "default",
+            "task_capabilities": ["web.read"],
+            "task_systems": ["web"],
+            "task_toolsets": ["web"],
+            "task_skills": ["research"],
+        },
+        expected_outcome="bounded worker task",
+        required_capability="work.delegate",
+        verification_method="kanban.task.created",
+        risk_class="low",
+        reversible=True,
+        proposed_by=f"employee:{ids[1]}",
+    )
+    with pytest.raises(
+        workforce_delegation.DelegationError,
+        match="skill does not match the immutable delegation contract",
+    ):
+        workforce_delegation.create_grant(
+            conn,
+            organization_id=ids[0],
+            objective_id=ids[4],
+            action_id=action_id,
+            manager_employee_id=ids[1],
+            assignee_profile="ada-research",
+            title="Interview synthesis",
+            body="Summarize independently sourced customer evidence.",
+            capabilities=["web.read"],
+            systems=["web"],
+            toolsets=["web"],
+            skills=[],
+            budget_minor=200,
+            expires_at=int(time.time()) + 1_800,
+        )
+
+
 def test_exact_employee_task_grant_is_mandate_bound_and_immutable(
     tmp_path, monkeypatch
 ):

@@ -54,6 +54,10 @@
   boundary: direct callers must present the exact worker task and execution
   contract, and the live grant/mandate projection is revalidated before the
   task can transition to `done`; rejected attempts are audited.
+- Delegation grants now bind any explicit subordinate contract embedded in the
+  action payload: capabilities, systems, toolsets, skills, budget, and expiry
+  must match exactly, so a manager cannot broaden or substitute the worker's
+  authorized surface while remaining within a broad mandate.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

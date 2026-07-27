@@ -46,6 +46,10 @@ acceptance evidence.
   grant, revocation, expiry, mandate, and task-contract projection at the
   write boundary. Unauthorized attempts remain auditable and cannot close the
   task.
+- When a delegation action declares a subordinate contract, the immutable
+  employee grant must match its capabilities, systems, toolsets, skills,
+  budget, and expiry exactly; the delegator cannot use a broader mandate to
+  issue a different worker authority.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

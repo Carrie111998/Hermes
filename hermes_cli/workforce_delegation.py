@@ -275,11 +275,47 @@ def create_grant(
     ):
         raise DelegationError("task skill exceeds delegator authority")
     action_row = conn.execute(
-        "SELECT action_type,payload_json FROM candidate_actions WHERE id=?", (action_id,)
+        "SELECT action_type,required_capability,payload_json "
+        "FROM candidate_actions WHERE id=?", (action_id,)
     ).fetchone()
     if action_row is None:
         raise DelegationError("employee task grant action is missing")
     action_payload = json.loads(action_row["payload_json"])
+    # A delegation action may carry an explicit subordinate contract. When
+    # present, it is authoritative: the grant cannot silently add a second
+    # capability/system/toolset, extend the budget, or outlive the requested
+    # window. Legacy actions without these fields retain their compatibility
+    # path and remain bounded by the employee and delegator mandates below.
+    contract_fields = (
+        ("task_capabilities", requested_capabilities, "capability"),
+        ("task_systems", requested_systems, "system"),
+        ("task_toolsets", requested_toolsets, "toolset"),
+    )
+    for field, requested, label in contract_fields:
+        if field in action_payload:
+            declared = sorted(set(str(item) for item in action_payload[field]))
+            if requested != declared:
+                raise DelegationError(
+                    f"task {label} does not match the immutable delegation contract"
+                )
+    if "task_skills" in action_payload:
+        declared_skills = sorted(
+            set(str(item) for item in action_payload["task_skills"])
+        )
+        if requested_skills != declared_skills:
+            raise DelegationError(
+                "task skill does not match the immutable delegation contract"
+            )
+    if "task_budget_minor" in action_payload:
+        if budget_minor != int(action_payload["task_budget_minor"]):
+            raise DelegationError(
+                "task budget does not match the immutable delegation contract"
+            )
+    if "task_expires_at" in action_payload:
+        if expires_at != int(action_payload["task_expires_at"]):
+            raise DelegationError(
+                "task expiry does not match the immutable delegation contract"
+            )
     resource_scope = {
         "system": str(action_payload.get("system") or "").strip(),
         "target_resource": str(action_payload.get("target_resource") or "").strip(),
