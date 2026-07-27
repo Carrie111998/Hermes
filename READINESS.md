@@ -1107,6 +1107,20 @@ This remains deterministic local-provider evidence and does not establish
 production provider credentials, corporate readiness, or legal/compliance
 certification.
 
+The exact local-file delegation example was rerun on current `main` commit
+`eb56235ba1` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_agentic_business_e2e.py
+```
+
+Result: **24 passed, 0 failed**. The worker is authorized for
+`file.read` on `localhost:/home/mike/ceofile.txt` only; the sibling path and
+`file.write` operation are rejected. This is deterministic authority-store
+evidence and does not establish host filesystem access for production workers.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
