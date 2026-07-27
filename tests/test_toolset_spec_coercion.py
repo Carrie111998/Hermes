@@ -94,3 +94,46 @@ class TestCronDisabledToolsetsStringCoercion:
         cfg = {"agent": {"disabled_toolsets": ["web"]}}
         disabled = _resolve_cron_disabled_toolsets(cfg)
         assert disabled == ["cronjob", "messaging", "clarify", "web"]
+
+
+class TestPlatformToolsDisabledToolsetsStringCoercion:
+    """The global denylist must hold for the shape `hermes config set` writes.
+
+    ``hermes config set agent.disabled_toolsets web`` stores the bare scalar
+    ``web``: the setter only auto-coerces bool/int/float, so a name stays a
+    string. ``_get_platform_tools`` then subtracted ``{'w','e','b'}``, which
+    matches no toolset, and the disabled toolset stayed enabled — the same
+    denylist bypass #25752 closed, reached through the CLI rather than a
+    per-job override. This resolver feeds gateway setup and prompt-size.
+    """
+
+    BASE = {"platform_toolsets": {"cli": ["web", "file"]}}
+
+    def _resolve(self, disabled):
+        from hermes_cli.tools_config import _get_platform_tools
+
+        cfg = dict(self.BASE, agent={"disabled_toolsets": disabled})
+        return _get_platform_tools(cfg, "cli")
+
+    def test_bare_string_disables_the_toolset(self):
+        """The `hermes config set` shape — regression for the bypass."""
+        assert "web" not in self._resolve("web")
+
+    def test_json_string_disables_the_toolset(self):
+        assert "web" not in self._resolve('["web"]')
+
+    def test_string_and_list_agree(self):
+        """String input must resolve identically to the equivalent list."""
+        assert self._resolve("web") == self._resolve(["web"])
+
+    def test_list_config_unchanged(self):
+        """The documented shape keeps working — no behaviour change for it."""
+        resolved = self._resolve(["web"])
+        assert "web" not in resolved
+        assert "file" in resolved
+
+    def test_absent_key_leaves_toolsets_enabled(self):
+        from hermes_cli.tools_config import _get_platform_tools
+
+        resolved = _get_platform_tools(dict(self.BASE), "cli")
+        assert {"web", "file"} <= resolved
