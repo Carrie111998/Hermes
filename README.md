@@ -125,6 +125,7 @@ pytest -q tests/hermes_cli/test_workforce_delegation.py \
 python -m compileall -q cli.py hermes_cli
 git diff --check
 uv run charterforge --help
+uv run charterforge --version
 ```
 
 The focused lint command did **not** run because `ruff` is not installed in

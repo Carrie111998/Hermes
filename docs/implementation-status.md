@@ -42,8 +42,9 @@
 
 ## Validation evidence
 
-The exact-grant increment passed 281 focused tests. The rebrand validation
-passed 315 focused Python tests, desktop/TUI/web TypeScript typechecks, and
-the implemented `charterforge` help commands. The independent documentation
-site prebuild completed, but its Docusaurus build was unavailable because the
-local `docusaurus` executable is not installed; no build pass is claimed.
+The exact-grant increment passed 281 focused tests. The rebrand and migration
+validation passed 361 focused Python tests, desktop/TUI/web TypeScript
+typechecks, Python compilation, and the implemented `charterforge` help and
+version commands. The independent documentation site prebuild completed, but
+its Docusaurus build was unavailable because the local `docusaurus` executable
+is not installed; no build pass is claimed.
