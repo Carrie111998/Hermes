@@ -1,11 +1,11 @@
-# RCA: Hermes Agent fails on corporate TLS-inspecting proxy networks (Aselsan / kurumsal ağ)
+# RCA: Hermes Agent fails on corporate TLS-inspecting proxy networks
 
 **Status:** fixed by `fix(agent): inject OS trust store via truststore on Windows/macOS for corporate CA support`
 **Severity:** P2 — Hermes Agent is unusable on any corporate network that deploys a TLS-inspecting proxy via Group Policy / MDM. No data loss, but a full availability outage for affected operators.
 
 ## Summary
 
-On corporate networks with TLS-inspecting proxies (reported at Aselsan; common across Turkish kurumsal ağ and enterprise deployments globally), IT deploys the proxy's root CA to the **operating system** trust store via Group Policy / MDM. Python's `ssl` module, however, defaults to the statically bundled `certifi` `cacert.pem`, which never sees the corporate root CA. Every outbound HTTPS call then fails with a certificate-verification error before Hermes can reach its provider.
+On corporate networks with TLS-inspecting proxies (common across enterprise deployments globally), IT deploys the proxy's root CA to the **operating system** trust store via Group Policy / MDM. Python's `ssl` module, however, defaults to the statically bundled `certifi` `cacert.pem`, which never sees the corporate root CA. Every outbound HTTPS call then fails with a certificate-verification error before Hermes can reach its provider.
 
 ## Symptoms
 
@@ -85,7 +85,7 @@ This does **not** weaken TLS verification or introduce a vulnerability (per `SEC
 
 ## Environment
 
-- Reported: Windows 10, Aselsan corporate network, TLS-inspecting proxy with MDM-deployed root CA.
+- Reported: Windows 10, enterprise corporate network, TLS-inspecting proxy with MDM-deployed root CA.
 - Generalizes to: any Windows / macOS deployment behind a TLS-inspecting proxy where the interception CA is in the OS trust store but not in certifi.
 - Linux is unaffected (distros bridge `/etc/ssl/certs/ca-certificates.crt` into certifi already); truststore injection is skipped there.
 

@@ -215,8 +215,8 @@ acp = ["agent-client-protocol==0.9.0"]
 # OS trust store integration for corporate / MDM-managed networks.
 # truststore makes Python's ssl module consult the OS trust store (Windows
 # cert store, macOS keychain) instead of only the bundled certifi cacert.pem.
-# On corporate networks with TLS-inspecting proxies (e.g. Aselsan, kurumsal
-# ağ), IT deploys the proxy's root CA via Group Policy / MDM to the OS trust
+# On corporate networks with TLS-inspecting proxies (e.g. enterprise networks),
+# IT deploys the proxy's root CA via Group Policy / MDM to the OS trust
 # store; certifi never sees it, so every outbound HTTPS call fails with a
 # certificate-verification error. truststore closes that gap by delegating
 # to the OS trust authority — the same trust decision the operator's admin
