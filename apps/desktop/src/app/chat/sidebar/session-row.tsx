@@ -175,7 +175,7 @@ function SidebarSessionRowImpl({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'tab')
+              openSession(session.id, () => undefined, 'tab', session.profile)
             }
           }}
           onClick={event => {
@@ -186,7 +186,7 @@ function SidebarSessionRowImpl({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'window')
+              openSession(session.id, () => undefined, 'window', session.profile)
 
               return
             }
@@ -196,7 +196,7 @@ function SidebarSessionRowImpl({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'tab')
+              openSession(session.id, () => undefined, 'tab', session.profile)
 
               return
             }

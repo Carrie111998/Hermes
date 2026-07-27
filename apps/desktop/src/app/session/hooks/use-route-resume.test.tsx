@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $resumeExhaustedSessionId, setResumeExhaustedSessionId } from '@/store/session'
 import { markSelectionRestore } from '@/store/session-states'
+import type * as WindowsModule from '@/store/windows'
+import { secondaryWindowProfile } from '@/store/windows'
 
 import { useRouteResume } from './use-route-resume'
 
@@ -11,6 +13,10 @@ import { useRouteResume } from './use-route-resume'
 // in the real store (covered by session-states.test.ts). Mock the module so the
 // store's side effects (persistence listeners) stay out of this harness.
 vi.mock('@/store/session-states', () => ({ markSelectionRestore: vi.fn() }))
+vi.mock('@/store/windows', async importActual => ({
+  ...(await importActual<typeof WindowsModule>()),
+  secondaryWindowProfile: vi.fn(() => undefined)
+}))
 
 interface HarnessProps {
   activeSessionId: null | string
@@ -20,7 +26,7 @@ interface HarnessProps {
   freshDraftReady: boolean
   gatewayState: string
   locationPathname: string
-  resumeSession: (sessionId: string, focus: boolean) => Promise<unknown>
+  resumeSession: (sessionId: string, focus: boolean, profile?: string) => Promise<unknown>
   resumeFailedSessionId?: null | string
   resumeExhaustedSessionId?: null | string
   routedSessionId: null | string
@@ -40,6 +46,7 @@ describe('useRouteResume', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    vi.mocked(secondaryWindowProfile).mockReturnValue(undefined)
   })
 
   it('does not re-resume the old session during a /:sid -> /new transition', () => {
@@ -198,6 +205,31 @@ describe('useRouteResume', () => {
     expect(resumeSession).toHaveBeenCalledWith('session-2', true)
   })
 
+  it('binds a secondary-window route to its explicit owner profile', () => {
+    vi.mocked(secondaryWindowProfile).mockReturnValue('profile-b')
+    const resumeSession = vi.fn(async () => undefined)
+
+    render(
+      <RouteResumeHarness
+        activeSessionId={null}
+        activeSessionIdRef={{ current: null }}
+        creatingSessionRef={{ current: false }}
+        currentView="chat"
+        freshDraftReady={false}
+        gatewayState="open"
+        locationPathname="/same-id"
+        resumeSession={resumeSession}
+        routedSessionId="same-id"
+        runtimeIdByStoredSessionIdRef={{ current: new Map() }}
+        selectedStoredSessionId={null}
+        selectedStoredSessionIdRef={{ current: null }}
+        startFreshSessionDraft={vi.fn()}
+      />
+    )
+
+    expect(resumeSession).toHaveBeenCalledWith('same-id', true, 'profile-b')
+  })
+
   it('arms the boot-restore one-shot for the FIRST resume only (⌘R tab persistence)', () => {
     // Factory mocks survive restoreAllMocks — drop calls earlier tests made.
     vi.mocked(markSelectionRestore).mockClear()
@@ -311,6 +343,7 @@ describe('useRouteResume bounded auto-retry after a failed resume', () => {
     cleanup()
     vi.useRealTimers()
     vi.restoreAllMocks()
+    vi.mocked(secondaryWindowProfile).mockReturnValue(undefined)
     setResumeExhaustedSessionId(null)
   })
 
@@ -353,6 +386,19 @@ describe('useRouteResume bounded auto-retry after a failed resume', () => {
     vi.advanceTimersByTime(1_000)
     expect(resumeSession).toHaveBeenCalledTimes(1)
     expect(resumeSession).toHaveBeenCalledWith('session-1', true)
+  })
+
+  it('keeps the secondary-window owner on bounded retry', () => {
+    vi.useFakeTimers()
+    vi.mocked(secondaryWindowProfile).mockReturnValue('profile-b')
+    const resumeSession = vi.fn(async () => undefined)
+
+    render(<RouteResumeHarness {...strandedProps(resumeSession)} resumeFailedSessionId="session-1" />)
+    resumeSession.mockClear()
+
+    vi.advanceTimersByTime(1_000)
+
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true, 'profile-b')
   })
 
   it('does NOT retry a failed session that is not the routed one', () => {

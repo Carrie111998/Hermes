@@ -8635,9 +8635,9 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
   })
 }
 
-// Secondary "session windows" — one extra OS window per chat so a user can
-// work with multiple chats side by side. The registry guarantees one window
-// per sessionId (re-opening focuses the existing window) and self-cleans on
+// Secondary "session windows" — one extra OS window per profile/chat identity
+// so a user can work with multiple chats side by side. The registry guarantees
+// one window per profile + sessionId (re-opening focuses it) and self-cleans on
 // close. The primary mainWindow is never tracked here. Pure logic + the URL
 // builder live in session-windows.ts so they stay unit-testable.
 const sessionWindows = createSessionWindowRegistry()
@@ -8658,7 +8658,11 @@ function focusWindow(win) {
   win.focus()
 }
 
-function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
+function spawnSecondaryWindow({
+  profile,
+  sessionId,
+  watch
+}: { profile?: string; sessionId?: string; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -8703,6 +8707,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     win,
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
+      profile,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
       watch
     }),
@@ -8713,8 +8718,8 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+function createSessionWindow(sessionId, { profile, watch = false }: { profile?: string; watch?: boolean } = {}) {
+  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ profile, sessionId, watch }), profile)
 }
 
 // Additional full "instance" windows — peers of the primary that render the
@@ -9440,7 +9445,13 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
     return { ok: false, error: 'invalid-session-id' }
   }
 
-  createSessionWindow(sessionId.trim(), { watch: opts?.watch === true })
+  const profile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+
+  if (profile && profile !== 'default' && !PROFILE_NAME_RE.test(profile)) {
+    return { ok: false, error: 'invalid-profile' }
+  }
+
+  createSessionWindow(sessionId.trim(), { profile: profile || undefined, watch: opts?.watch === true })
 
   return { ok: true }
 })

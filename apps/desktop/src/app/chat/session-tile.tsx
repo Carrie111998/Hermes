@@ -50,8 +50,10 @@ import {
   $sessionStates,
   $sessionTiles,
   closeSessionTile,
-  discardSessionTile,
+  discardSessionTileAt,
+  locateSessionTile,
   patchSessionTile,
+  patchSessionTileAt,
   type SessionTile,
   sessionTileDelegate
 } from '@/store/session-states'
@@ -117,6 +119,7 @@ function TileChat({
   const queryClient = useQueryClient()
   const { selectModel } = useModelControls({ queryClient, requestGateway })
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const tileProfile = useTileMenuRow(storedSessionId).profile
   const cwd = useStore(view.$cwd)
   const gatewayOpen = useStore($gatewayState) === 'open'
 
@@ -185,7 +188,9 @@ function TileChat({
           onSubmit={actions.submitText}
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={() => undefined}
-          onTranscribeAudio={async audio => (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript}
+          onTranscribeAudio={async audio =>
+            (await transcribeAudio(await blobToDataUrl(audio), audio.type, tileProfile)).transcript
+          }
         />
       </ComposerScopeProvider>
     </SessionViewProvider>
@@ -197,7 +202,8 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const tile = tiles.find(t => t.storedSessionId === storedSessionId)
   const runtimeId = tile?.runtimeId ?? null
   const gatewayOpen = useStore($gatewayState) === 'open'
-  const resumingRef = useRef(false)
+  const resumeAttemptsRef = useRef(new Map<string, Promise<{ profile?: string; runtimeId: string }>>())
+  const tileBucketProfile = locateSessionTile(storedSessionId)?.bucketProfile
   const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
 
   // A tab-strip "+"/⌘T tab is created UNLISTED — its session stays out of
@@ -251,39 +257,65 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   // session.resume before the gateway is OPEN. Persisted tiles mount at boot
   // while it's still connecting — an ungated resume rejected there and
   // latched every restored tile into the error card.
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (!gatewayOpen || runtimeId || tile?.error || resumingRef.current) {
+    if (!gatewayOpen || runtimeId || tile?.error) {
       return
     }
 
     const delegate = sessionTileDelegate()
+    const location = locateSessionTile(storedSessionId)
 
-    if (!delegate) {
+    if (!delegate || !location) {
       return
     }
 
-    resumingRef.current = true
+    const attemptKey = `${location.bucketProfile}\u0000${location.profile ?? ''}\u0000${storedSessionId}`
+    const existingAttempt = resumeAttemptsRef.current.get(attemptKey)
+    const attempt = existingAttempt ?? delegate.resumeTile(storedSessionId, tile?.profile)
 
-    delegate
-      .resumeTile(storedSessionId)
-      .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
+    if (!existingAttempt) {
+      resumeAttemptsRef.current.set(attemptKey, attempt)
+    }
+
+    // React may reuse this pane when two profile buckets contain the same
+    // stored id. Each effect subscribes to the bucket-stable attempt, while
+    // cleanup prevents a completion from an unmounted/switched incarnation
+    // from mutating a later tile with that id. Strict-mode effect replay
+    // reuses the same promise instead of issuing a duplicate resume.
+    let active = true
+
+    void attempt
+      .then(({ profile, runtimeId: id }) => {
+        if (active) {
+          patchSessionTileAt(location, { error: undefined, profile, runtimeId: id })
+        }
+      })
       .catch((err: unknown) => {
+        if (!active) {
+          return
+        }
+
         const message = err instanceof Error ? err.message : String(err)
 
         // A gone session (404 / "Session not found") is terminal — a stale or
         // cross-profile persisted tile. Discard it instead of latching an error
         // that re-retries on every reconnect (the "Session not found" spam).
         if (/session not found|\b404\b/i.test(message)) {
-          discardSessionTile(storedSessionId)
+          discardSessionTileAt(location)
         } else {
-          patchSessionTile(storedSessionId, { error: message })
+          patchSessionTileAt(location, { error: message })
         }
       })
       .finally(() => {
-        resumingRef.current = false
+        if (resumeAttemptsRef.current.get(attemptKey) === attempt) {
+          resumeAttemptsRef.current.delete(attemptKey)
+        }
       })
-  }, [gatewayOpen, runtimeId, storedSessionId, tile?.error])
+
+    return () => {
+      active = false
+    }
+  }, [gatewayOpen, runtimeId, storedSessionId, tile?.error, tile?.profile, tileBucketProfile])
 
   // The gateway (re)opening invalidates any latched error — it likely came
   // from a not-yet-open gateway or the previous connection. Clearing it
@@ -344,6 +376,15 @@ export function tileStoredRow(storedSessionId: string): SessionInfo | undefined 
   )
 }
 
+/** Durable profile owner for backend routing. Prefer the persisted tile field;
+ *  bounded session/project caches are presentation fallbacks only. */
+export function tileOwnerProfile(storedSessionId: string): string | undefined {
+  return (
+    $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.profile ??
+    tileStoredRow(storedSessionId)?.profile
+  )
+}
+
 function tileTitle(storedSessionId: string): string {
   const stored = tileStoredRow(storedSessionId)
 
@@ -356,7 +397,7 @@ function tileTitle(storedSessionId: string): string {
 function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = tileStoredRow(storedSessionId)
 
-  return { id: storedSessionId, profile: stored?.profile ?? '', title: tileTitle(storedSessionId) }
+  return { id: storedSessionId, profile: tileOwnerProfile(storedSessionId) ?? '', title: tileTitle(storedSessionId) }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,10 +475,12 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
   const subscribe = useCallback((onChange: () => void) => {
     const offSessions = $sessions.listen(onChange)
     const offTree = $projectTree.listen(onChange)
+    const offTiles = $sessionTiles.listen(onChange)
 
     return () => {
       offSessions()
       offTree()
+      offTiles()
     }
   }, [])
 
@@ -445,7 +488,7 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
     const stored = tileStoredRow(storedSessionId)
     const pinId = stored ? sessionPinId(stored) : storedSessionId
     const title = tileTitle(storedSessionId)
-    const profile = stored?.profile
+    const profile = tileOwnerProfile(storedSessionId)
     const key = `${pinId}\u0000${title}\u0000${profile ?? ''}`
 
     if (cache.current?.key !== key) {
@@ -484,10 +527,10 @@ export function SessionTabMenu({
   return (
     <span className="contents" onContextMenu={event => event.stopPropagation()}>
       <SessionContextMenu
-        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
-        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
+        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId, profile)}
+        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId, profile)}
         onClose={onClose}
-        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
+        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId, profile)}
         onHideTabBar={onHideTabBar}
         onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
         pinned={pinned}

@@ -67,7 +67,13 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionMessage,
+  SessionResumeResponse,
+  UsageStats
+} from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -131,6 +137,13 @@ function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?
   const output = stored.output_tokens || 0
 
   setCurrentUsage(current => ({ ...current, input, output, total: input + output }))
+}
+
+function sessionMatchesOwner(session: SessionInfo, storedSessionId: string, ownerProfile?: string): boolean {
+  return (
+    sessionMatchesStoredId(session, storedSessionId) &&
+    (!ownerProfile || normalizeProfileKey(session.profile) === normalizeProfileKey(ownerProfile))
+  )
 }
 
 function reconcileAuthoritativeMessages(
@@ -536,10 +549,15 @@ export function useSessionActions({
   }, [navigate, selectedStoredSessionId])
 
   const resumeSession = useCallback(
-    async (storedSessionId: string, replaceRoute = false) => {
+    async (storedSessionId: string, replaceRoute = false, ownerProfile?: string) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
-      const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
+      const explicitOwner = ownerProfile?.trim() ? normalizeProfileKey(ownerProfile) : null
+
+      const resumedSameSelectedSession =
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        (!explicitOwner || normalizeProfileKey($activeGatewayProfile.get()) === explicitOwner)
+
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
 
       const isCurrentResume = () =>
@@ -568,7 +586,15 @@ export function useSessionActions({
       // now-redundant tile so main owns it. Runs before the async awaits below (and
       // before the selection listener homes focus) so the tile is gone the same tick
       // the route takes over; the warm cache/runtime binding survives for main to reuse.
-      if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
+      if (
+        $sessionTiles
+          .get()
+          .some(
+            tile =>
+              tile.storedSessionId === storedSessionId &&
+              (!explicitOwner || normalizeProfileKey(tile.profile) === explicitOwner)
+          )
+      ) {
         closeSessionTile(storedSessionId)
       }
 
@@ -592,6 +618,14 @@ export function useSessionActions({
       // mismatch the mapping is cross-wired: purge both sides and report a miss
       // so the caller falls through to a full resume that rebinds a correct id.
       const takeWarmCache = (): { runtimeId: string; state: ClientSessionState } | null => {
+        // The legacy reverse map is keyed only by stored id. An explicit owner
+        // (secondary window / profile-qualified route) makes an equal id from
+        // another profile distinguishable, so fail closed to a scoped resume
+        // rather than rendering an unverifiable warm runtime.
+        if (explicitOwner) {
+          return null
+        }
+
         const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         const state = runtimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
 
@@ -623,8 +657,11 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const storedForProfile = await resolveStoredSession(storedSessionId)
-      const sessionProfile = storedForProfile?.profile
+      const storedForProfile = explicitOwner
+        ? $sessions.get().find(session => sessionMatchesOwner(session, storedSessionId, explicitOwner))
+        : await resolveStoredSession(storedSessionId)
+
+      const sessionProfile = explicitOwner ?? storedForProfile?.profile
 
       if (resumeRequestRef.current !== requestId) {
         return
@@ -642,7 +679,8 @@ export function useSessionActions({
         const cachedState = warmHit.state
 
         const stored =
-          $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
+          $sessions.get().find(session => sessionMatchesOwner(session, storedSessionId, sessionProfile)) ??
+          storedForProfile
 
         let cachedViewState =
           !cachedState.model && stored?.model != null
@@ -829,7 +867,8 @@ export function useSessionActions({
       setSessionStartedAt(Date.now())
 
       const stored =
-        $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
+        $sessions.get().find(session => sessionMatchesOwner(session, storedSessionId, sessionProfile)) ??
+        storedForProfile
 
       applyStoredSessionPreviewRuntimeInfo(stored)
 
@@ -1193,7 +1232,7 @@ export function useSessionActions({
         // chat exactly where it is. Prime the tile with the create runtime so it
         // skips a redundant resume. Do NOT select it as the primary session
         // first — openSessionTile no-ops when the id is already primary.
-        openSessionTile(routedSessionId, 'center')
+        openSessionTile(routedSessionId, 'center', undefined, undefined, profile ?? undefined)
         patchSessionTile(routedSessionId, { runtimeId: branched.session_id })
         revealTreePane(`session-tile:${routedSessionId}`)
         broadcastSessionsChanged()
@@ -1272,7 +1311,7 @@ export function useSessionActions({
       // miss: resolve it (cache → active backend → cross-profile) so the branch
       // is created on the parent's OWNING profile, not whichever is live (#67603).
       const stored =
-        $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ??
+        $sessions.get().find(session => sessionMatchesOwner(session, storedSessionId, sessionProfile ?? undefined)) ??
         (sessionProfile ? undefined : await resolveStoredSession(storedSessionId))
 
       const profile = sessionProfile ?? stored?.profile
@@ -1299,11 +1338,16 @@ export function useSessionActions({
   )
 
   const removeSession = useCallback(
-    async (storedSessionId: string) => {
+    async (storedSessionId: string, ownerProfile?: string) => {
       clearNotifications()
 
-      const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
-      const wasSelected = selectedStoredSessionId === storedSessionId
+      const removed = $sessions.get().find(session => sessionMatchesOwner(session, storedSessionId, ownerProfile))
+      const targetProfile = ownerProfile || removed?.profile
+
+      const selectedOwnerMatches =
+        !targetProfile || normalizeProfileKey($activeGatewayProfile.get()) === normalizeProfileKey(targetProfile)
+
+      const wasSelected = selectedStoredSessionId === storedSessionId && selectedOwnerMatches
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
       const previousPinned = $pinnedSessionIds.get()
@@ -1312,7 +1356,7 @@ export function useSessionActions({
       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
-      setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      setSessions(prev => prev.filter(session => !sessionMatchesOwner(session, storedSessionId, targetProfile)))
       // Evict from the project tree's optimistic layer too (the backend snapshot
       // still lists it until its next refresh), so grouped + flat views drop the
       // row in lockstep. Pin the tombstone against the projects.tree prune while
@@ -1332,8 +1376,11 @@ export function useSessionActions({
           await requestGateway('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
         }
 
-        await deleteSession(storedSessionId, removed?.profile)
-        clearQueuedPrompts(storedSessionId)
+        await deleteSession(storedSessionId, targetProfile)
+
+        if (!ownerProfile) {
+          clearQueuedPrompts(storedSessionId)
+        }
 
         if (closingRuntimeId) {
           clearQueuedPrompts(closingRuntimeId)
@@ -1342,17 +1389,35 @@ export function useSessionActions({
         // A tiled copy of this session must not outlive it: collapse the pane
         // and evict its mirrored runtime state so nothing submits to (or renders)
         // a deleted session.
-        const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
+        const targetTile = $sessionTiles
+          .get()
+          .find(
+            tile =>
+              tile.storedSessionId === storedSessionId &&
+              (!targetProfile || normalizeProfileKey(tile.profile) === normalizeProfileKey(targetProfile))
+          )
+
+        const tiledRuntimeId = targetTile?.runtimeId
+
+        if (targetTile) {
+          closeSessionTile(storedSessionId)
+        }
 
         if (tiledRuntimeId) {
-          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+          if (runtimeIdByStoredSessionIdRef.current.get(storedSessionId) === tiledRuntimeId) {
+            runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+          }
+
+          clearQueuedPrompts(tiledRuntimeId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
         }
       } catch (err) {
         if (removed) {
-          setSessions(prev => [removed, ...prev])
+          setSessions(prev => [
+            removed,
+            ...prev.filter(session => !sessionMatchesOwner(session, storedSessionId, targetProfile))
+          ])
         }
 
         untombstoneSessions(removedIds)
@@ -1400,11 +1465,16 @@ export function useSessionActions({
   )
 
   const archiveSession = useCallback(
-    async (storedSessionId: string) => {
+    async (storedSessionId: string, ownerProfile?: string) => {
       clearNotifications()
 
-      const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
-      const wasSelected = selectedStoredSessionId === storedSessionId
+      const archived = $sessions.get().find(session => sessionMatchesOwner(session, storedSessionId, ownerProfile))
+      const targetProfile = ownerProfile || archived?.profile
+
+      const selectedOwnerMatches =
+        !targetProfile || normalizeProfileKey($activeGatewayProfile.get()) === normalizeProfileKey(targetProfile)
+
+      const wasSelected = selectedStoredSessionId === storedSessionId && selectedOwnerMatches
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
@@ -1412,7 +1482,7 @@ export function useSessionActions({
       const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
-      setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      setSessions(prev => prev.filter(session => !sessionMatchesOwner(session, storedSessionId, targetProfile)))
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
@@ -1422,13 +1492,28 @@ export function useSessionActions({
       }
 
       try {
-        await setSessionArchived(storedSessionId, true, archived?.profile)
+        await setSessionArchived(storedSessionId, true, targetProfile)
+
         // An archived session is hidden from the sidebar; its tile must go too.
-        const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
+        const targetTile = $sessionTiles
+          .get()
+          .find(
+            tile =>
+              tile.storedSessionId === storedSessionId &&
+              (!targetProfile || normalizeProfileKey(tile.profile) === normalizeProfileKey(targetProfile))
+          )
+
+        const tiledRuntimeId = targetTile?.runtimeId
+
+        if (targetTile) {
+          closeSessionTile(storedSessionId)
+        }
 
         if (tiledRuntimeId) {
-          runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+          if (runtimeIdByStoredSessionIdRef.current.get(storedSessionId) === tiledRuntimeId) {
+            runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+          }
+
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
         }
@@ -1436,7 +1521,10 @@ export function useSessionActions({
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
         if (archived) {
-          setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
+          setSessions(prev => [
+            archived,
+            ...prev.filter(session => !sessionMatchesOwner(session, storedSessionId, targetProfile))
+          ])
         }
 
         untombstoneSessions(archivedIds)

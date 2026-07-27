@@ -454,6 +454,12 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     enabled: 'Speech To Text',
     echoTranscripts: 'Echo Transcripts',
     provider: 'Speech-To-Text Provider',
+    recovery: {
+      enabled: 'Preserve Failed Recordings',
+      retentionHours: 'Recovery Retention',
+      maxEntries: 'Recovery Recording Limit',
+      maxTotalMb: 'Recovery Storage Limit'
+    },
     local: {
       model: 'Local Transcription Model',
       language: 'Transcription Language'
@@ -624,6 +630,13 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   stt: {
     enabled: 'Enable local or provider-backed speech transcription.',
     echoTranscripts: 'Post the raw 🎙️ transcript of voice messages back to the chat.',
+    recovery: {
+      enabled: 'Keep a private, bounded copy of desktop recordings only when transcription fails.',
+      retentionHours:
+        'Hours failed recordings remain recoverable. Files are pruned on the next Hermes cache access. Zero disables recovery.',
+      maxEntries: 'Maximum number of failed recordings retained per profile.',
+      maxTotalMb: 'Maximum storage in MiB for failed recordings per profile.'
+    },
     elevenlabs: {
       languageCode: 'Optional ISO-639-3 language code. Blank lets ElevenLabs auto-detect.'
     }
@@ -711,6 +724,10 @@ export const SECTIONS: DesktopConfigSection[] = [
       'stt.enabled',
       'stt.echo_transcripts',
       'stt.provider',
+      'stt.recovery.enabled',
+      'stt.recovery.retention_hours',
+      'stt.recovery.max_entries',
+      'stt.recovery.max_total_mb',
       'voice.auto_tts',
       'tts.edge.voice',
       'tts.openai.model',

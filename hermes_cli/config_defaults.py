@@ -1411,6 +1411,16 @@ DEFAULT_CONFIG = {
         # the raw transcript is also echoed back to the user as a 🎙️ message.
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
+        # Desktop uploads are staged before transcription and retained only
+        # when STT fails. The cache is private, profile-scoped, excluded from
+        # backups/exports, and bounded by all three limits below. Set enabled
+        # false (or any numeric limit to 0) to restore ephemeral-only behavior.
+        "recovery": {
+            "enabled": True,
+            "retention_hours": 24,
+            "max_entries": 50,
+            "max_total_mb": 500,
+        },
         "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
         # Global language hint applied to EVERY provider unless a per-provider
         # language overrides it. Defaults to "en" — Whisper auto-detection

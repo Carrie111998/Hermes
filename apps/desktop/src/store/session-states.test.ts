@@ -3,15 +3,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $selectedStoredSessionId } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
+  $sessionStates,
+  $sessionTiles,
   blankDraftTile,
   focusedSessionNeedsRoute,
   markSelectionRestore,
+  openSessionTile,
   orderTilesByTree,
+  resetTileRuntimeBindings,
+  reuseBlankDraftTile,
   selectionHomesToWorkspace
 } from '@/store/session-states'
+
+afterEach(() => {
+  $activeGatewayProfile.set('default')
+  $selectedStoredSessionId.set(null)
+  $sessionTiles.set([])
+})
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
@@ -137,6 +149,19 @@ describe('blankDraftTile', () => {
     expect(blankDraftTile([bound('a', 'run-a')], { 'run-a': state(2) })).toBeNull()
     expect(blankDraftTile([], {})).toBeNull()
   })
+
+  it('preserves the target owner when a cross-profile session reuses a blank draft', () => {
+    $selectedStoredSessionId.set(null)
+    $sessionTiles.set([bound('draft', 'run-draft')])
+    $sessionStates.set({ 'run-draft': state(0) })
+
+    expect(reuseBlankDraftTile('remote-session', 'medical')).toBe(true)
+    expect($sessionTiles.get()).toEqual([
+      expect.objectContaining({ profile: 'medical', storedSessionId: 'remote-session' })
+    ])
+
+    $sessionStates.set({})
+  })
 })
 
 // ⌘⇧T used to only restore `$sessionTiles`. Adoption inserts silently
@@ -144,7 +169,7 @@ describe('blankDraftTile', () => {
 // Real path: register, adopt, focus — same as paneMirror + reopen.
 describe('reopenLastClosedTile focuses the restored tab', () => {
   beforeEach(() => {
-    window.localStorage.clear()
+    window.localStorage?.clear()
     vi.resetModules()
   })
 
@@ -225,5 +250,47 @@ describe('reopenLastClosedTile focuses the restored tab', () => {
     expect(states.$sessionTiles.get().some(t => t.storedSessionId === 'closed')).toBe(true)
     expect(findGroupOfPane(tree.$layoutTree.get()!, tilePane('closed'))?.active).toBe(tilePane('closed'))
     expect(tree.$activeTreeGroup.get()).toBe('grp-main')
+  })
+})
+
+describe('session tile profile persistence', () => {
+  it('retains the owning profile when runtime bindings reset for resume', () => {
+    $sessionTiles.set([{ profile: 'medical', runtimeId: 'runtime-1', storedSessionId: 'stored-1' }])
+
+    resetTileRuntimeBindings()
+
+    expect($sessionTiles.get()).toEqual([{ profile: 'medical', storedSessionId: 'stored-1' }])
+  })
+
+  it('clears a live runtime when an equal id is retargeted to another profile', () => {
+    $selectedStoredSessionId.set(null)
+    $layoutTree.set(group(['workspace', tilePane('same-id')], { active: 'workspace', id: 'main' }))
+    $sessionTiles.set([
+      {
+        anchor: 'workspace',
+        dir: 'center',
+        profile: 'profile-a',
+        runtimeId: 'runtime-a',
+        storedSessionId: 'same-id'
+      }
+    ])
+
+    openSessionTile('same-id', 'center', 'workspace', undefined, 'profile-b')
+
+    expect($sessionTiles.get()).toContainEqual(
+      expect.objectContaining({ profile: 'profile-b', runtimeId: undefined, storedSessionId: 'same-id' })
+    )
+  })
+
+  it('allows an equal selected id to open when its explicit owner is different', () => {
+    $activeGatewayProfile.set('profile-a')
+    $selectedStoredSessionId.set('same-id')
+    $sessionTiles.set([])
+
+    openSessionTile('same-id', 'center', 'workspace', undefined, 'profile-b')
+
+    expect($sessionTiles.get()).toContainEqual(
+      expect.objectContaining({ profile: 'profile-b', storedSessionId: 'same-id' })
+    )
   })
 })

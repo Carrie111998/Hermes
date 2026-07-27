@@ -48,7 +48,7 @@ import zipfile
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 import yaml
 
@@ -4223,60 +4223,220 @@ async def transcribe_audio_upload(
     if len(audio_bytes) > _MAX_TRANSCRIPTION_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Audio recording is too large")
 
+    from agent.redact import redact_sensitive_text
+    from hermes_cli.stt_recovery import SttRecoveryCache, recovery_expiry_iso
+    from tools.voice_mode import transcribe_recording
+
     temp_path = ""
+    recovery = None
+    cache = None
+    transcription_task = None
+    suffix = _audio_extension_for_mime(mime_type)
+    recovery_profile = _stt_recovery_cli_profile(profile)
+
+    def _failure_response(
+        status_code: int,
+        error_code: str,
+        *,
+        provider: Optional[str] = None,
+    ):
+        retained = recovery
+        if retained is not None and cache is not None:
+            retained = cache.mark_failed_attempt(
+                retained.recovery_id,
+                attempts=retained.attempts,
+                failure_code=error_code,
+                provider=provider,
+            )
+        if retained is not None and retained.status == "failed":
+            recovery_id = retained.recovery_id
+            recovery_command = "hermes "
+            if recovery_profile is not None:
+                recovery_command += f"-p {recovery_profile} "
+            recovery_command += f"stt recovery retry {recovery_id}"
+            detail = (
+                "Transcription failed. Audio is recoverable until "
+                f"{recovery_expiry_iso(retained)}. On the Hermes backend host, "
+                f"run `{recovery_command}`."
+            )
+            content = {
+                "detail": detail,
+                "error_code": error_code,
+                "recovery_available": True,
+                "recovery_id": recovery_id,
+                "expires_at": recovery_expiry_iso(retained),
+            }
+            if recovery_profile is not None:
+                content["recovery_profile"] = recovery_profile
+            return JSONResponse(status_code=status_code, content=content)
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "detail": (
+                    "Transcription failed, and Hermes could not preserve the "
+                    "recording for recovery."
+                ),
+                "error_code": error_code,
+                "recovery_available": False,
+            },
+        )
+
     try:
-        suffix = _audio_extension_for_mime(mime_type)
-        with tempfile.NamedTemporaryFile(
-            prefix="hermes-desktop-voice-",
-            suffix=suffix,
-            delete=False,
-        ) as tmp:
-            tmp.write(audio_bytes)
-            temp_path = tmp.name
+        # The profile scope selects both the STT provider configuration and
+        # the per-profile recovery root. asyncio.to_thread copies ContextVars;
+        # run_in_executor does not, which previously routed remote/profile STT
+        # through the dashboard process's default profile.
+        with _config_profile_scope(profile):
+            cache = SttRecoveryCache.from_config(load_config())
+            try:
+                recovery = cache.stage_audio(
+                    audio_bytes,
+                    suffix=suffix,
+                    mime_type=normalized_mime_type,
+                )
+            except Exception:
+                # Recovery is best-effort: a storage bug or unavailable cache
+                # must not break transcription that would otherwise succeed.
+                _log.warning("Desktop STT recovery staging failed", exc_info=True)
+                recovery = None
+            if recovery is not None:
+                audio_path = str(recovery.audio_path)
+            else:
+                with tempfile.NamedTemporaryFile(
+                    prefix="hermes-desktop-voice-",
+                    suffix=suffix,
+                    delete=False,
+                ) as tmp:
+                    # Publish the name before the first write so even a
+                    # partial disk-full failure is cleaned up in ``finally``.
+                    temp_path = tmp.name
+                    tmp.write(audio_bytes)
+                audio_path = temp_path
 
-        # transcribe_recording (not raw transcribe_audio): filters Whisper
-        # hallucinations and maps provider "empty transcript" errors to a
-        # successful empty result — the live voice loop treats "" as silence
-        # and re-listens instead of surfacing a 400 on every quiet turn.
-        from tools.voice_mode import transcribe_recording
+            # transcribe_recording (not raw transcribe_audio): filters Whisper
+            # hallucinations and maps provider "empty transcript" errors to a
+            # successful empty result — the live voice loop treats "" as silence
+            # and re-listens instead of surfacing a 400 on every quiet turn.
+            transcription_task = asyncio.create_task(
+                asyncio.to_thread(transcribe_recording, audio_path)
+            )
+            result = await asyncio.shield(transcription_task)
+            if not isinstance(result, Mapping):
+                raise TypeError("STT provider returned an invalid result")
+            result = dict(result)
+            raw_provider = result.get("provider")
+            if not (
+                isinstance(raw_provider, str)
+                and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", raw_provider)
+            ):
+                result["provider"] = None
+            raw_transcript = result.get("transcript")
+            if raw_transcript is not None and not isinstance(raw_transcript, str):
+                raise TypeError("STT provider returned an invalid transcript")
+            transcript = (raw_transcript or "").strip()
+    except asyncio.CancelledError:
+        if transcription_task is not None:
+            # shield() leaves the worker alive after the HTTP task is
+            # cancelled. Keep the record in its active state until the worker
+            # has finished reading it, then make it immediately retryable. If
+            # recovery is disabled/unavailable, defer temp cleanup for the same
+            # reason instead of unlinking a file the worker is still reading.
+            cancelled_temp_path = temp_path
+            temp_path = ""
 
-        def _transcribe_scoped():
-            # Home-only scope (contextvar), NOT _profile_scope: transcription
-            # blocks for the provider round-trip and _profile_scope holds a
-            # process-global skills lock for its entire body (see the MCP
-            # probe above). STT only needs config/.env resolution, which the
-            # contextvar override provides inside this worker thread.
-            with _config_profile_scope(profile):
-                return transcribe_recording(temp_path)
+            def _retain_cancelled_record(done_task):
+                provider = None
+                if not done_task.cancelled():
+                    try:
+                        completed = done_task.result()
+                        if isinstance(completed, Mapping):
+                            raw_provider = completed.get("provider")
+                            if (
+                                isinstance(raw_provider, str)
+                                and re.fullmatch(
+                                    r"[A-Za-z0-9._-]{1,64}", raw_provider
+                                )
+                            ):
+                                provider = raw_provider
+                    except Exception:
+                        pass
+                if recovery is not None and cache is not None:
+                    cache.mark_failed_attempt(
+                        recovery.recovery_id,
+                        attempts=recovery.attempts,
+                        failure_code="request_cancelled",
+                        provider=provider,
+                    )
+                if cancelled_temp_path:
+                    try:
+                        os.unlink(cancelled_temp_path)
+                    except OSError:
+                        pass
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _transcribe_scoped)
-    except HTTPException:
+            transcription_task.add_done_callback(_retain_cancelled_record)
         raise
+    except HTTPException as exc:
+        if transcription_task is None:
+            raise
+        # Provider/helper HTTPExceptions are implementation details once the
+        # worker has started. Return the same credential-safe structured error
+        # even when recovery was disabled or staging was unavailable.
+        _log.error(
+            "Desktop voice transcription raised HTTP %s",
+            exc.status_code,
+        )
+        return _failure_response(500, "unexpected_error")
     except Exception as exc:
-        _log.exception("Desktop voice transcription failed")
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}")
+        safe_error = redact_sensitive_text(str(exc), force=True)
+        _log.error("Desktop voice transcription failed: %s", safe_error)
+        return _failure_response(500, "unexpected_error")
     finally:
+        # Only the non-recoverable fallback uses a conventional temp file.
+        # A staged recovery file is discarded below on success and retained
+        # on every failure/cancellation path.
         if temp_path:
             try:
                 os.unlink(temp_path)
             except OSError:
                 pass
 
-    if not result.get("success"):
-        err = result.get("error") or "Transcription failed"
-        # An empty transcript means no speech was detected — a normal outcome
-        # for VAD/continuous voice loops (e.g. a wake-word conversation
-        # re-listening on silence), not an error. Return an empty transcript so
-        # the client quietly re-listens instead of surfacing a "transcription
-        # failed" toast on every silent gap.
-        if "empty transcript" in err.lower():
-            return {"ok": True, "transcript": "", "provider": result.get("provider")}
-        raise HTTPException(status_code=400, detail=err)
+    if result.get("success") is not True:
+        raw_error = result.get("error")
+        # Preserve the pre-recovery Desktop contract for providers (including
+        # command/custom providers) that signal silence only through their
+        # legacy error text and omit the newer ``no_speech`` flag. Treat only
+        # this narrow result as success: an empty/missing transcript can also
+        # accompany auth, network, or provider failures and must stay
+        # recoverable.
+        if isinstance(raw_error, str) and "empty transcript" in raw_error.lower():
+            transcript = ""
+        else:
+            provider = result.get("provider")
+            return _failure_response(
+                400,
+                "provider_error",
+                provider=str(provider) if provider else None,
+            )
+
+    if recovery is not None and cache is not None:
+        if not cache.complete_attempt(
+            recovery.recovery_id,
+            attempts=recovery.attempts,
+            expected_status="transcribing",
+        ):
+            # The transcript has not crossed the response boundary yet. If we
+            # cannot durably commit the non-retryable cleanup state, report a
+            # failure and retain the source instead of risking silent loss or
+            # a later duplicate retry of an already-accepted transcript.
+            return _failure_response(
+                500,
+                "cleanup_error",
+                provider=result.get("provider"),
+            )
 
     return {
         "ok": True,
-        "transcript": str(result.get("transcript") or "").strip(),
+        "transcript": transcript,
         "provider": result.get("provider"),
     }
 
@@ -12938,6 +13098,33 @@ def _profile_cli_args(profile: Optional[str]) -> List[str]:
     from hermes_cli import profiles as profiles_mod
     _resolve_profile_dir(requested)
     return ["-p", profiles_mod.normalize_profile_name(requested)]
+
+
+def _stt_recovery_cli_profile(profile: Optional[str]) -> Optional[str]:
+    """Return the named profile needed to address this request's cache.
+
+    Shared remote backends receive an explicit query profile, while Electron's
+    local profile pool routes to a process already launched with that profile's
+    HERMES_HOME and intentionally omits the query parameter. Cover both without
+    exposing arbitrary/custom filesystem paths in the recovery response.
+    """
+    requested = (profile or "").strip()
+    if requested and requested.lower() != "current":
+        args = _profile_cli_args(requested)
+        return args[1] if args else None
+
+    launch_home = get_process_hermes_home()
+    if launch_home.parent.name != "profiles":
+        return None
+
+    from hermes_cli import profiles as profiles_mod
+
+    try:
+        candidate = profiles_mod.normalize_profile_name(launch_home.name)
+        profiles_mod.validate_profile_name(candidate)
+    except ValueError:
+        return None
+    return None if candidate == "default" else candidate
 
 
 def _hub_action_name(verb: str, key: str) -> str:

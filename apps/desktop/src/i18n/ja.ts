@@ -131,6 +131,7 @@ export const ja = defineLocale({
     updateReadyMessage: count => `${count} 件の新しい変更が利用可能です。`,
     seeWhatsNew: '新機能を見る',
     errors: {
+      copySttRecoveryCommand: '復旧コマンドをコピー',
       elevenLabsNeedsKey: 'ElevenLabs STT には ELEVENLABS_API_KEY が必要です。',
       elevenLabsRejectedKey: 'ElevenLabs が API キーを拒否しました (401)。',
       gatewayAuthFailed: 'ゲートウェイ認証に失敗しました — API_SERVER_KEY を確認してください。',
@@ -139,7 +140,8 @@ export const ja = defineLocale({
       microphonePermission: 'マイクのアクセス許可が拒否されました。',
       openaiRejectedApiKey: 'OpenAI が API キーを拒否しました。',
       openaiRejectedApiKeyWithStatus: status => `OpenAI が API キーを拒否しました (${status} invalid_api_key)。`,
-      openaiTtsNeedsKey: 'OpenAI TTS には VOICE_TOOLS_OPENAI_KEY または OPENAI_API_KEY が必要です。'
+      openaiTtsNeedsKey: 'OpenAI TTS には VOICE_TOOLS_OPENAI_KEY または OPENAI_API_KEY が必要です。',
+      sttRecordingPreserved: recoveryId => `録音は復旧用に保持されました（ID: ${recoveryId}）。`
     },
     voice: {
       configureSpeechToText: '音声モードを使用するには音声認識を設定してください。',
@@ -454,6 +456,12 @@ export const ja = defineLocale({
       stt: {
         enabled: '音声認識',
         provider: '音声認識プロバイダー',
+        recovery: {
+          enabled: '失敗した録音を保持',
+          retentionHours: '復旧用の保持時間',
+          maxEntries: '復旧用録音の上限',
+          maxTotalMb: '復旧用ストレージの上限'
+        },
         local: {
           model: 'ローカル文字起こしモデル',
           language: '文字起こし言語'
@@ -601,6 +609,13 @@ export const ja = defineLocale({
       },
       stt: {
         enabled: 'ローカルまたはプロバイダーによる音声文字起こしを有効にします。',
+        recovery: {
+          enabled: 'デスクトップの文字起こしに失敗した録音を、非公開かつ上限付きで保持します。',
+          retentionHours:
+            '失敗した録音を復旧できる時間です。ファイルは次回の Hermes キャッシュアクセス時に削除されます。0 で無効になります。',
+          maxEntries: 'プロファイルごとに保持する失敗録音の最大件数です。',
+          maxTotalMb: 'プロファイルごとに失敗録音へ使用できる最大容量（MiB）です。'
+        },
         elevenlabs: {
           languageCode: '任意の ISO-639-3 言語コードです。空欄なら ElevenLabs が自動検出します。'
         }

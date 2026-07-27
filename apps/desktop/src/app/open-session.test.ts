@@ -120,6 +120,14 @@ describe('openSession', () => {
     expect(navigate).toHaveBeenCalledWith('/c/s1')
   })
 
+  it('keeps an explicit owner in a tile instead of losing it in an id-only route', () => {
+    focusOpenSession.mockReturnValue(null)
+    openSession('same-id', navigate, 'in-place', 'profile-b')
+
+    expect(openSessionTile).toHaveBeenCalledWith('same-id', 'center', undefined, undefined, 'profile-b')
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
   it('tab focuses an existing open session instead of stacking another', () => {
     focusOpenSession.mockReturnValue('tile')
     openSession('s1', navigate, 'tab')
@@ -133,6 +141,13 @@ describe('openSession', () => {
     openSession('s1', navigate, 'tab')
     expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
     expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('passes a known owner profile to a newly stacked tile', () => {
+    focusOpenSession.mockReturnValue(null)
+    openSession('s1', navigate, 'tab', 'work')
+    expect(focusOpenSession).toHaveBeenCalledWith('s1', 'work')
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, 'work')
   })
 
   it('stack focuses a session that is already on screen', () => {
@@ -159,6 +174,15 @@ describe('openSession', () => {
     expect(reuseBlankDraftTile).toHaveBeenCalledWith('s1')
     expect(openSessionTile).not.toHaveBeenCalled()
     expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('keeps a known owner profile when stack reuses a blank draft tab', () => {
+    $selectedStoredSessionId.set('s0')
+    focusOpenSession.mockReturnValue(null)
+    reuseBlankDraftTile.mockReturnValue(true)
+    openSession('s1', navigate, 'stack', 'work')
+    expect(reuseBlankDraftTile).toHaveBeenCalledWith('s1', 'work')
+    expect(openSessionTile).not.toHaveBeenCalled()
   })
 
   it('stack prefers the session already on screen over a blank draft tab', () => {
@@ -188,6 +212,11 @@ describe('openSession', () => {
     openSession('s1', navigate, 'window')
     expect(openSessionInNewWindow).toHaveBeenCalledWith('s1')
     expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
+  it('keeps a known owner profile when opening a native window', () => {
+    openSession('s1', navigate, 'window', 'work')
+    expect(openSessionInNewWindow).toHaveBeenCalledWith('s1', { profile: 'work' })
   })
 
   it('window falls back to a tab when pop-out is unavailable', () => {

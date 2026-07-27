@@ -88,6 +88,15 @@ test('buildSessionWindowUrl adds the watch flag for spectator windows, before th
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1#/abc')
 })
 
+test('buildSessionWindowUrl carries an encoded profile before the hash route', () => {
+  const url = buildSessionWindowUrl('abc', {
+    devServer: 'http://localhost:5173',
+    profile: 'profile with spaces'
+  })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&profile=profile+with+spaces#/abc')
+})
+
 test('instanceWindowBounds cascades a new window off its source bounds', () => {
   const bounds = instanceWindowBounds({ x: 100, y: 120, width: 1400, height: 900 }, { width: 1, height: 1 })
 
@@ -118,6 +127,63 @@ test('registry opens one window per session and focuses on re-open', () => {
   assert.equal(first, second)
   assert.equal(registry.size, 1)
   assert.equal(win.calls.focus, 1, 'second open focuses the existing window')
+})
+
+test('registry distinguishes the same session id in different profiles', () => {
+  const registry = createSessionWindowRegistry()
+  const first = makeFakeWindow()
+  const second = makeFakeWindow()
+  let built = 0
+
+  registry.openOrFocus(
+    's1',
+    () => {
+      built += 1
+
+      return first
+    },
+    'profile-a'
+  )
+  registry.openOrFocus(
+    's1',
+    () => {
+      built += 1
+
+      return second
+    },
+    'profile-b'
+  )
+
+  const reopened = registry.openOrFocus(
+    's1',
+    () => {
+      built += 1
+
+      return makeFakeWindow()
+    },
+    'profile-a'
+  )
+
+  assert.equal(built, 2)
+  assert.equal(registry.size, 2)
+  assert.equal(reopened, first)
+  assert.equal(first.calls.focus, 1)
+  assert.equal(second.calls.focus, 0)
+})
+
+test('registry identity cannot collide through an in-band session-id delimiter', () => {
+  const registry = createSessionWindowRegistry()
+  const unprofiled = makeFakeWindow()
+  const profiled = makeFakeWindow()
+
+  registry.openOrFocus('work\0same', () => unprofiled)
+  registry.openOrFocus('same', () => profiled, 'work')
+
+  assert.equal(registry.size, 2)
+  assert.equal(registry.get('work\0same'), unprofiled)
+  assert.equal(registry.get('same', 'work'), profiled)
+  assert.equal(unprofiled.calls.focus, 0)
+  assert.equal(profiled.calls.focus, 0)
 })
 
 test('registry restores + shows a minimized/hidden window on re-open', () => {

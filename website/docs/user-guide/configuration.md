@@ -1770,6 +1770,11 @@ stt:
   echo_transcripts: true       # Post raw transcripts back to the chat as 🎙️ "..." (default: true)
   provider: "local"            # "local" | "groq" | "openai" | "mistral" | "xai" | "elevenlabs" | "deepinfra" | ...
   language: "en"               # GLOBAL language hint for every provider (per-provider language wins); set "" for auto-detect
+  recovery:
+    enabled: true              # Preserve desktop recordings when STT fails
+    retention_hours: 24        # 0 disables recovery; maximum 168 (7 days)
+    max_entries: 50            # Per-profile recording cap; maximum 500
+    max_total_mb: 500          # Per-profile byte cap; maximum 2048 MiB
   local:
     model: "base"              # tiny, base, small, medium, large-v3
     language: ""               # per-provider override of stt.language
@@ -1789,6 +1794,21 @@ stt:
 Language resolution is the same for **every** STT provider (local, groq, openai, mistral, xai, elevenlabs, deepinfra, command providers, and plugins): `stt.<provider>.language` → `stt.language` → `HERMES_LOCAL_STT_LANGUAGE` env var → provider auto-detect. **The default is `stt.language: "en"`** — Whisper auto-detection frequently misidentifies short or accented clips, which shows up as voice notes transcribed in the wrong language. Non-English speakers should set `stt.language` to their language code once (e.g. `"es"`, `"zh"`, `"uk"`); set it to `""` to restore auto-detection for multilingual use.
 
 Set `stt.echo_transcripts: false` when the gateway should transcribe voice notes for the agent but must not post the raw transcript back to the chat (for example, customer-facing WhatsApp bots).
+
+### Failed recording recovery
+
+Desktop recordings are written to a private, profile-scoped cache before transcription starts. A successful transcription (including a successful empty/no-speech result) removes the cached audio immediately. Provider errors, unexpected failures, and interrupted HTTP requests retain the original bytes for the configured interval, counted from the latest failure. Expired entries become unavailable immediately on the next recovery lookup. Their files are physically pruned the next time Hermes accesses this cache (there is no background cleanup while Hermes is stopped), followed by the oldest failures until both the entry and storage limits are satisfied.
+
+```bash
+hermes stt recovery list
+hermes stt recovery retry <recovery-id>
+hermes stt recovery save <recovery-id> ./recording.webm
+hermes stt recovery discard <recovery-id>
+```
+
+Run recovery commands on the Hermes backend host and select the same profile that received the recording (for example, `hermes -p coder stt recovery list`). This matters when Desktop is connected to a remote backend. Recovery IDs are opaque; the API never exposes backend filesystem paths. The cache stores no transcript, provider exception, or credential material, and `.cache` is excluded from Hermes backups, profile exports, and `--clone-all` profile copies. On POSIX systems its directory is owner-only (`0700`) and its files are `0600`; on Windows Hermes relies on the account's inherited filesystem ACLs.
+
+This feature protects recordings when STT itself fails. It does not yet keep successful audio until the desktop acknowledges that the returned transcript was inserted into the composer; a connection loss after successful STT can therefore still lose that narrow delivery window.
 
 Provider behavior:
 

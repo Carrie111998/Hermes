@@ -79,7 +79,7 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
         if (delegate) {
           void delegate
             .resumeTile(target)
-            .then(runtimeId => delegate.submitToSession(runtimeId, text))
+            .then(({ runtimeId }) => delegate.submitToSession(runtimeId, text))
             // A dead/undeliverable target must not swallow the prompt.
             .catch(() => void submitTextRef.current(text))
 

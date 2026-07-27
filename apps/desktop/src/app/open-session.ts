@@ -68,11 +68,15 @@ export function openSessionIntentFromModifiers(
 /**
  * @param navigate Required for `in-place` (route into main when not on screen).
  *   `tab` / `window` ignore it — pass a no-op when you don't have a router handle.
+ * @param ownerProfile Authoritative profile for a newly-created session tile.
+ *   Optional so same-profile callers and older references keep their existing
+ *   behavior; cross-profile surfaces should pass the owner they already know.
  */
 export function openSession(
   storedSessionId: string,
   navigate: OpenSessionNavigate,
-  intent: OpenSessionIntent = 'in-place'
+  intent: OpenSessionIntent = 'in-place',
+  ownerProfile?: string
 ): void {
   if (!storedSessionId) {
     return
@@ -82,7 +86,9 @@ export function openSession(
 
   if (resolved === 'window') {
     if (canOpenSessionWindow()) {
-      void openSessionInNewWindow(storedSessionId)
+      void (ownerProfile
+        ? openSessionInNewWindow(storedSessionId, { profile: ownerProfile })
+        : openSessionInNewWindow(storedSessionId))
 
       return
     }
@@ -106,18 +112,26 @@ export function openSession(
     // Already on screen? Front it. openSessionTile would no-op on main without
     // focusing, or try to relocate an existing tile — neither is right for a
     // soft "open beside" link.
-    if (focusOpenSession(storedSessionId)) {
+    if (ownerProfile ? focusOpenSession(storedSessionId, ownerProfile) : focusOpenSession(storedSessionId)) {
       return
     }
 
     // Nothing to jump to, but an open tab may still be an empty "New session" —
     // that's the tab the user would have typed into, so spend it rather than
     // stacking a second blank one beside it.
-    if (spendBlankDraft && reuseBlankDraftTile(storedSessionId)) {
+    const reusedBlankDraft =
+      spendBlankDraft &&
+      (ownerProfile ? reuseBlankDraftTile(storedSessionId, ownerProfile) : reuseBlankDraftTile(storedSessionId))
+
+    if (reusedBlankDraft) {
       return
     }
 
-    openSessionTile(storedSessionId, 'center')
+    if (ownerProfile) {
+      openSessionTile(storedSessionId, 'center', undefined, undefined, ownerProfile)
+    } else {
+      openSessionTile(storedSessionId, 'center')
+    }
 
     return
   }
@@ -126,7 +140,19 @@ export function openSession(
   // otherwise load it into main. From a full page (artifacts, skills, …) a
   // `'main'` hit still has to route back: fronting the workspace tab alone
   // leaves the page showing.
-  if (focusedSessionNeedsRoute(focusOpenSession(storedSessionId), $workspaceIsPage.get())) {
+  const focused = ownerProfile ? focusOpenSession(storedSessionId, ownerProfile) : focusOpenSession(storedSessionId)
+
+  if (focusedSessionNeedsRoute(focused, $workspaceIsPage.get())) {
+    // A plain route contains only the stored id. When the caller knows an
+    // explicit owner, navigating would discard the only disambiguator (and a
+    // same pathname would not even retrigger resume). Keep the identity intact
+    // by opening the profile-bound tile instead.
+    if (ownerProfile) {
+      openSessionTile(storedSessionId, 'center', undefined, undefined, ownerProfile)
+
+      return
+    }
+
     navigate(sessionRoute(storedSessionId))
   }
 }

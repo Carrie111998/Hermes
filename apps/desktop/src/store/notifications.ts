@@ -122,14 +122,39 @@ function summarizeErrorMessage(message: string, fallback: string) {
   return message.length > 180 ? fallback : message || fallback
 }
 
-function readableError(error: unknown, fallback: string): { message: string; detail?: string } {
+function recoveryIdFromError(message: string): string | undefined {
+  if (!/"recovery_available"\s*:\s*true/i.test(message)) {
+    return undefined
+  }
+
+  return message.match(/"recovery_id"\s*:\s*"([0-9a-f]{32})"/i)?.[1]
+}
+
+function recoveryProfileFromError(message: string): string | undefined {
+  return message.match(/"recovery_profile"\s*:\s*"([a-z0-9][a-z0-9_-]{0,63})"/i)?.[1]
+}
+
+function readableError(
+  error: unknown,
+  fallback: string
+): { message: string; detail?: string; recoveryId?: string; recoveryProfile?: string } {
   const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : fallback
   const unwrapped = raw.match(/Error invoking remote method '[^']+': Error: (.+)$/)?.[1] ?? raw
   const cleaned = cleanErrorText(unwrapped)
   const detail = cleaned.match(/"detail"\s*:\s*"([^"]+)"/)?.[1] ?? cleaned
-  const summary = summarizeErrorMessage(detail, fallback)
+  const recoveryId = recoveryIdFromError(cleaned)
+  const recoveryProfile = recoveryId ? recoveryProfileFromError(cleaned) : undefined
 
-  return { message: summary, detail: detail === summary ? undefined : detail }
+  const summary = recoveryId
+    ? translateNow('notifications.errors.sttRecordingPreserved', recoveryId)
+    : summarizeErrorMessage(detail, fallback)
+
+  return {
+    message: summary,
+    detail: detail === summary ? undefined : detail,
+    recoveryId,
+    recoveryProfile
+  }
 }
 
 export function notify(input: NotificationInput): string {
@@ -170,11 +195,26 @@ export function notify(input: NotificationInput): string {
 export function notifyError(error: unknown, fallback: string): string {
   const readable = readableError(error, fallback)
 
+  const recoveryCommand = readable.recoveryId
+    ? `hermes ${readable.recoveryProfile ? `-p ${readable.recoveryProfile} ` : ''}stt recovery retry ${readable.recoveryId}`
+    : undefined
+
   return notify({
     kind: 'error',
     title: fallback,
     message: readable.message,
-    detail: readable.detail
+    detail: readable.detail,
+    action: recoveryCommand
+      ? {
+          label: translateNow('notifications.errors.copySttRecoveryCommand'),
+          onClick: () => {
+            const writeText =
+              window.hermesDesktop?.writeClipboard ?? navigator.clipboard?.writeText?.bind(navigator.clipboard)
+
+            void writeText?.(recoveryCommand)
+          }
+        }
+      : undefined
   })
 }
 

@@ -121,6 +121,14 @@ class TestShouldExclude:
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("backups/pre-update-2026-04-27-063400.zip"))
 
+    def test_excludes_stt_recovery_audio(self):
+        """Private failed recordings must never enter full Hermes backups."""
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(
+            Path(".cache/stt-recovery/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/audio.webm")
+        )
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state

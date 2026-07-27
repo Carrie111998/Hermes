@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { canOpenNewWindow, canOpenSessionWindow, openNewWindow, openSessionInNewWindow } from './windows'
+import {
+  canOpenNewWindow,
+  canOpenSessionWindow,
+  openNewWindow,
+  openSessionInNewWindow,
+  secondaryWindowProfile
+} from './windows'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 const initialHermesDesktop = desktopWindow.hermesDesktop
@@ -50,6 +56,17 @@ describe('canOpenSessionWindow', () => {
   })
 })
 
+describe('secondaryWindowProfile', () => {
+  it('reads the real pre-hash profile query used by secondary windows', () => {
+    const previous = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    window.history.replaceState(null, '', '/?win=secondary&profile=profile-b#/same-id')
+
+    expect(secondaryWindowProfile()).toBe('profile-b')
+
+    window.history.replaceState(null, '', previous)
+  })
+})
+
 describe('openSessionInNewWindow', () => {
   it('no-ops without a session id', async () => {
     const open = vi.fn().mockResolvedValue({ ok: true })
@@ -86,6 +103,16 @@ describe('openSessionInNewWindow', () => {
     await openSessionInNewWindow('s1', { watch: true })
 
     expect(open).toHaveBeenCalledWith('s1', { watch: true })
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('forwards the authoritative profile for profile-qualified windows', async () => {
+    const open = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(open)
+
+    await openSessionInNewWindow('s1', { profile: 'work', watch: true })
+
+    expect(open).toHaveBeenCalledWith('s1', { profile: 'work', watch: true })
     expect(notifyError).not.toHaveBeenCalled()
   })
 

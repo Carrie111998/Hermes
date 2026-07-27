@@ -127,6 +127,7 @@ export const zhHant = defineLocale({
     updateReadyMessage: count => `有 ${count} 項新變更可用。`,
     seeWhatsNew: '查看新增內容',
     errors: {
+      copySttRecoveryCommand: '複製復原指令',
       elevenLabsNeedsKey: 'ElevenLabs STT 需要 ELEVENLABS_API_KEY。',
       elevenLabsRejectedKey: 'ElevenLabs 拒絕了該 API 金鑰 (401)。',
       gatewayAuthFailed: '閘道認證失敗 — 請檢查你的 API_SERVER_KEY。',
@@ -134,7 +135,8 @@ export const zhHant = defineLocale({
       microphonePermission: '麥克風權限已被拒絕。',
       openaiRejectedApiKey: 'OpenAI 拒絕了該 API 金鑰。',
       openaiRejectedApiKeyWithStatus: status => `OpenAI 拒絕了該 API 金鑰 (${status} invalid_api_key)。`,
-      openaiTtsNeedsKey: 'OpenAI TTS 需要 VOICE_TOOLS_OPENAI_KEY 或 OPENAI_API_KEY。'
+      openaiTtsNeedsKey: 'OpenAI TTS 需要 VOICE_TOOLS_OPENAI_KEY 或 OPENAI_API_KEY。',
+      sttRecordingPreserved: recoveryId => `錄音已保留，可用於復原（ID：${recoveryId}）。`
     },
     voice: {
       configureSpeechToText: '設定語音轉文字後即可使用語音模式。',
@@ -442,6 +444,12 @@ export const zhHant = defineLocale({
       stt: {
         enabled: '語音轉文字',
         provider: '語音轉文字提供方',
+        recovery: {
+          enabled: '保留失敗的錄音',
+          retentionHours: '復原保留時間',
+          maxEntries: '復原錄音數量上限',
+          maxTotalMb: '復原儲存空間上限'
+        },
         local: {
           model: '本機轉寫模型',
           language: '轉寫語言'
@@ -588,6 +596,12 @@ export const zhHant = defineLocale({
       },
       stt: {
         enabled: '啟用本機或提供方支援的語音轉寫。',
+        recovery: {
+          enabled: '以私密且有界的方式保留桌面端轉寫失敗的錄音。',
+          retentionHours: '失敗錄音可復原的時數。檔案會在 Hermes 下次存取快取時清理。設為 0 可停用復原。',
+          maxEntries: '每個設定檔最多保留的失敗錄音數量。',
+          maxTotalMb: '每個設定檔用於失敗錄音的最大儲存空間（MiB）。'
+        },
         elevenlabs: {
           languageCode: '可選的 ISO-639-3 語言代碼。留空讓 ElevenLabs 自動偵測。'
         }

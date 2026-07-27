@@ -115,6 +115,8 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
 #   backups             — `hermes backup` archives
 #   state-snapshots     — quick-backup snapshot trees
 #   checkpoints         — session checkpoint data
+#   .cache              — private/regenerable runtime data, including retained
+#                         STT failure audio
 _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "state.db",
     "state.db-wal",
@@ -123,6 +125,7 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "backups",
     "state-snapshots",
     "checkpoints",
+    ".cache",
 })
 
 # Marker file written by `hermes profile create --no-skills`.  When present in
@@ -251,7 +254,7 @@ _RESERVED_NAMES = frozenset({
 # Hermes subcommands that cannot be used as profile names/aliases
 _HERMES_SUBCOMMANDS = frozenset({
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
-    "status", "cron", "doctor", "dump", "config", "pairing", "skills", "tools",
+    "status", "cron", "doctor", "dump", "config", "pairing", "skills", "tools", "stt",
     "mcp", "sessions", "insights", "version", "update", "uninstall",
     "profile", "plugins", "honcho", "acp",
 })
@@ -1930,15 +1933,23 @@ def export_profile(name: str, output_path: str) -> Path:
             result = shutil.make_archive(base, "gztar", tmpdir, "default")
             return Path(result)
 
-    # Named profiles — stage a filtered copy to exclude credentials
+    # Named profiles — stage a filtered copy to exclude credentials and
+    # private/regenerable runtime caches (including STT recovery audio).
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
         _CREDENTIAL_FILES = {"auth.json", ".env"}
+
+        def _named_export_ignore(directory: str, contents: List[str]) -> set[str]:
+            ignored = _CREDENTIAL_FILES & set(contents)
+            if Path(directory) == profile_dir:
+                ignored.update({".cache"} & set(contents))
+            return ignored
+
         shutil.copytree(
             profile_dir,
             staged,
             symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            ignore=_named_export_ignore,
         )
         result = shutil.make_archive(base, "gztar", tmpdir, canon)
         return Path(result)

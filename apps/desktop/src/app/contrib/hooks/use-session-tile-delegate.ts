@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 
 import { getSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
-import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
+import { locateSessionTile, publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -13,10 +13,10 @@ import type { GatewayRequester } from '../types'
 type SessionStateCache = ReturnType<typeof useSessionStateCache>
 
 interface SessionTileDelegateParams {
-  archiveSession: (storedSessionId: string) => Promise<unknown>
-  branchStoredSession: (storedSessionId: string) => Promise<unknown>
+  archiveSession: (storedSessionId: string, profile?: string) => Promise<unknown>
+  branchStoredSession: (storedSessionId: string, profile?: string) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
-  removeSession: (storedSessionId: string) => Promise<unknown>
+  removeSession: (storedSessionId: string, profile?: string) => Promise<unknown>
   requestGateway: GatewayRequester
   runtimeIdByStoredSessionIdRef: SessionStateCache['runtimeIdByStoredSessionIdRef']
   sessionStateByRuntimeIdRef: SessionStateCache['sessionStateByRuntimeIdRef']
@@ -42,14 +42,14 @@ export function useSessionTileDelegate({
 }: SessionTileDelegateParams): void {
   useEffect(() => {
     setSessionTileDelegate({
-      archiveSession: async storedSessionId => {
-        await archiveSession(storedSessionId)
+      archiveSession: async (storedSessionId, profile) => {
+        await archiveSession(storedSessionId, profile)
       },
-      branchSession: async storedSessionId => {
-        await branchStoredSession(storedSessionId)
+      branchSession: async (storedSessionId, profile) => {
+        await branchStoredSession(storedSessionId, profile)
       },
-      deleteSession: async storedSessionId => {
-        await removeSession(storedSessionId)
+      deleteSession: async (storedSessionId, profile) => {
+        await removeSession(storedSessionId, profile)
       },
       executeSlash: async (rawCommand, sessionId) => {
         await executeSlashCommand(rawCommand, { sessionId })
@@ -57,14 +57,27 @@ export function useSessionTileDelegate({
       interruptSession: async runtimeId => {
         await requestGateway('session.interrupt', { session_id: runtimeId })
       },
-      resumeTile: async storedSessionId => {
-        const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+      resumeTile: async (storedSessionId, ownerProfile) => {
+        // Capture the visible tile's persistence bucket before the first await.
+        // Profile switches replace `$sessionTiles`, and stored ids can collide
+        // across buckets, so delayed owner backfills must not use the bucket
+        // that happens to be active when resolution finishes.
+        const tileLocation = locateSessionTile(storedSessionId)
+        const explicitProfile = ownerProfile?.trim()
+
+        // A quick-entry target has no durable tile identity, so retain the
+        // existing warm shortcut there. A tile does: even a legacy ownerless
+        // tile must resolve its profile before trusting an id-only cache,
+        // because stored ids can collide across independent profile DBs.
+        const existing =
+          !tileLocation && !explicitProfile ? runtimeIdByStoredSessionIdRef.current.get(storedSessionId) : undefined
+
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
 
         if (existing && cached?.storedSessionId === storedSessionId) {
           publishSessionState(existing, cached)
 
-          return existing
+          return { runtimeId: existing }
         }
 
         // Resolve the owning profile before binding a runtime. A tile can open a
@@ -72,8 +85,12 @@ export function useSessionTileDelegate({
         // reading messages) without a profile lets the gateway fall back to the
         // launch-profile DB and fork the conversation into the wrong profile —
         // the same cross-profile bleed the recovery resumes had (#67603).
-        const profile = await resolveSessionProfile(storedSessionId)
+        const profile = explicitProfile || (await resolveSessionProfile(storedSessionId))
 
+        // Older v2 tile records predate durable ownership. Return the resolved
+        // owner with the runtime so SessionTilePane can publish both in one
+        // bucket/owner compare-and-set. That atomic handoff prevents a delayed
+        // resume from rebinding a same-id tile retargeted to another profile.
         const [prefetch, resumed] = await Promise.all([
           getSessionMessages(storedSessionId, profile).catch(() => null),
           requestGateway<SessionResumeResponse>('session.resume', {
@@ -100,7 +117,7 @@ export function useSessionTileDelegate({
           storedSessionId
         )
 
-        return runtimeId
+        return { profile: profile || undefined, runtimeId }
       },
       submitToSession: async (runtimeId, text) => {
         await requestGateway('prompt.submit', { session_id: runtimeId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
