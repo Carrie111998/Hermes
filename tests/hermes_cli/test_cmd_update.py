@@ -67,7 +67,8 @@ def _patch_managed_uv(request):
 
     with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
          patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
-         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
+         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv), \
+         patch("hermes_cli.main._repair_node_dependencies_if_needed", return_value=False):
         yield
 
 
@@ -118,6 +119,36 @@ class TestCmdUpdateNpmLockfileCache:
 
         assert hm._npm_lockfile_changed(tmp_path) is True
 
+    def test_npm_lockfile_changed_when_core_workspace_link_is_missing(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        (tmp_path / "package.json").write_text(
+            '{"workspaces": ["ui-tui", "ui-tui/packages/*", "web"]}'
+        )
+        for manifest in (
+            tmp_path / "ui-tui" / "package.json",
+            tmp_path / "ui-tui" / "packages" / "hermes-ink" / "package.json",
+            tmp_path / "web" / "package.json",
+        ):
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text("{}")
+        for installed in (
+            tmp_path / "node_modules" / "hermes-tui",
+            tmp_path / "node_modules" / "@hermes" / "ink",
+            tmp_path / "node_modules" / "web",
+        ):
+            installed.mkdir(parents=True)
+
+        hm._record_npm_lockfile_hash(tmp_path)
+        assert hm._npm_lockfile_changed(tmp_path) is False
+
+        (tmp_path / "node_modules" / "@hermes" / "ink").rmdir()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
     def test_record_npm_lockfile_hash(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
 
@@ -165,6 +196,7 @@ class TestCmdUpdateNpmLockfileCache:
         (tmp_path / "apps" / "desktop").mkdir(parents=True)
         (tmp_path / "apps" / "desktop" / "package.json").write_text("{}")
         (tmp_path / "node_modules").mkdir()
+        (tmp_path / "node_modules" / "hermes-tui").mkdir()
         hm._record_npm_lockfile_hash(tmp_path)
         assert hm._npm_lockfile_changed(tmp_path) is False
 
@@ -380,6 +412,24 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_update_already_current_repairs_node_workspaces(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+        with patch.object(
+            hm, "_repair_node_dependencies_if_needed", return_value=True
+        ) as repair:
+            cmd_update(mock_args)
+
+        repair.assert_called_once_with()
+        assert "Already up to date!" not in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_zero_commit_runtime_repair_requires_process_restart(
         self, mock_run, _mock_which, mock_args, capsys, tmp_path
     ):
@@ -475,7 +525,7 @@ class TestCmdUpdateBranchFallback:
 
         # cmd_update runs npm commands in these locations:
         #   1. repo root  — root-only install (--workspaces=false)
-        #   2. repo root  — workspace install (--workspace ui-tui --workspace web)
+        #   2. repo root  — scoped ui-tui, @hermes/ink, and web install
         #   3. web/       — npm ci --silent (if lockfile not at root)
         #                  via _build_web_ui (subprocess.run)
         #   4. web/       — npm run build (_run_with_idle_timeout)
@@ -507,6 +557,8 @@ class TestCmdUpdateBranchFallback:
             "--progress=false",
             "--workspace",
             "ui-tui",
+            "--workspace",
+            "ui-tui/packages/hermes-ink",
             "--workspace",
             "web",
         ]
