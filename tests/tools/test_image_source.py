@@ -212,6 +212,25 @@ class TestExecReadSafety:
         assert "'-i-etc-shadow.png'" in captured["cmd"] or "-i-etc-shadow.png" in captured["cmd"]
 
     @pytest.mark.asyncio
+    async def test_remote_image_requires_exact_url_permit(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        calls = []
+
+        def record(**kwargs):
+            calls.append(kwargs)
+
+        with patch("hermes_cli.workforce_delegation.authorize_worker_action", record), \
+             patch.object(isrc, "_http_block_reason", return_value=None), \
+             patch.object(isrc, "_download_to_bytes", return_value=PNG):
+            result = await isrc.resolve_image_source(
+                "https://cdn.example.test/photo.png", isrc.ResolveContext()
+            )
+        assert result.data == PNG
+        assert calls[0]["capability"] == "vision.read"
+        assert calls[0]["system"] == "web"
+        assert calls[0]["target_resource"].startswith("vision-url:")
+
+    @pytest.mark.asyncio
     async def test_exec_read_over_cap_rejected(self, tmp_path, monkeypatch):
         """A sandbox file larger than the ingest cap is rejected, not embedded."""
         home = tmp_path / "hermes"

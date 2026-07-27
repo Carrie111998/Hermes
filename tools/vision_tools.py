@@ -31,6 +31,7 @@ Usage:
 import base64
 import contextlib
 import asyncio
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -1686,6 +1687,15 @@ async def video_analyze_tool(
             blocked = check_website_access(video_url)
             if blocked:
                 raise PermissionError(blocked["message"])
+            from hermes_cli.workforce_delegation import authorize_worker_action
+            authorize_worker_action(
+                capability="video.read",
+                system="web",
+                target_resource=(
+                    "video-url:"
+                    + hashlib.sha256(video_url.encode("utf-8")).hexdigest()
+                ),
+            )
             temp_dir = get_hermes_dir("cache/video", "temp_video_files")
             temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
             await _download_video(video_url, temp_video_path)

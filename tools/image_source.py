@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -97,6 +98,15 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
         reason = _http_block_reason(s)
         if reason:
             raise SourceUnsafe(reason, src=s)
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        authorize_worker_action(
+            capability="vision.read",
+            system="web",
+            target_resource=(
+                "vision-url:"
+                + hashlib.sha256(s.encode("utf-8")).hexdigest()
+            ),
+        )
         return _finalize(await _download_to_bytes(s), "", "http", s)
 
     if _SCHEME_RE.match(s) and not s.lower().startswith("file://"):
