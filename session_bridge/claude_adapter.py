@@ -32,11 +32,14 @@ _PARSER_VERSION = 1
 _HEAD_SAMPLE_BYTES = 65_536
 _NATIVE_ID_PROBE_BYTES = 65_536
 _RECOGNIZED_RECORD_TYPES = {
+    "agent-name",
     "assistant",
     "attachment",
     "custom-title",
+    "file-history-snapshot",
     "last-prompt",
     "mode",
+    "permission-mode",
     "queue-operation",
     "system",
     "user",

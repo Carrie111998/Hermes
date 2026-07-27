@@ -233,6 +233,38 @@ def test_cold_increment_probes_entrypoint_beyond_cursor_head(tmp_path: Path) -> 
     assert result.entrypoint == "cli"
 
 
+def test_parse_accepts_claude_2_1_216_registration_metadata(tmp_path: Path) -> None:
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    records = [
+        {
+            "type": "agent-name",
+            "sessionId": BASIC_SESSION_ID,
+            "agentName": "session-bridge",
+        },
+        {
+            "type": "permission-mode",
+            "sessionId": BASIC_SESSION_ID,
+            "permissionMode": "dontAsk",
+        },
+        {
+            "type": "file-history-snapshot",
+            "messageId": "message-1",
+            "snapshot": {},
+            "isSnapshotUpdate": False,
+        },
+        _message_record("Registered prompt"),
+    ]
+    path.write_bytes(b"".join(_json_line(record) for record in records))
+
+    result = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert result.malformed_lines == 0
+    assert result.unknown_records == 0
+    assert [(message.role, message.content) for message in result.projection.messages] == [
+        ("user", "Registered prompt")
+    ]
+
+
 def test_parse_rejects_conflicting_head_entrypoints(tmp_path: Path) -> None:
     first = _message_record("first")
     first["entrypoint"] = "cli"
