@@ -1740,6 +1740,9 @@ class ObjectiveRuntime:
             verification_id = db.record_verification(
                 self.conn,
                 objective_id=objective_id,
+                organization_id=db.get_objective(
+                    self.conn, objective_id
+                ).organization_id,
                 plan_id=plan_id,
                 action_id=action_id,
                 execution_result_id=result_id,
