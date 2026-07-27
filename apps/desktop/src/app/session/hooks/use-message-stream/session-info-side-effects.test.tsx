@@ -6,6 +6,29 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+
+// Hoisted mocks — vi.mock factories run before static imports, so they must
+// reference module-level state through getters rather than capture it inline.
+const cwdFollowMock = vi.fn<(_: string) => Promise<void>>(async () => undefined)
+let currentCwdMock = ''
+
+vi.mock('@/store/projects', () => ({
+  followActiveSessionCwd: cwdFollowMock
+}))
+
+vi.mock('@/store/session', async () => {
+  const actual = await vi.importActual<typeof import('@/store/session')>('@/store/session')
+
+  return {
+    ...actual,
+    // $currentCwd is a nanostore atom — use a getter so tests can swap
+    // the value without re-importing the module.
+    get $currentCwd() {
+      return { get: () => currentCwdMock }
+    }
+  }
+})
+
 import { setCurrentModel, setCurrentProvider } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -158,55 +181,28 @@ describe('message.complete sidebar refresh coalescing', () => {
 })
 
 describe('session.info cwd-follow guard', () => {
+  beforeEach(() => {
+    cwdFollowMock.mockReset()
+    currentCwdMock = ''
+  })
+
   it('does not follow the cwd on the first session.info after reconnect (initial learn)', async () => {
-    const followActiveSessionCwd = vi.fn<(_: string) => Promise<void>>(async () => undefined)
-
-    vi.doMock('@/store/projects', () => ({
-      followActiveSessionCwd
-    }))
-
-    const currentCwd = { current: '' }
-
-    vi.doMock('@/store/session', async () => {
-      const actual = await vi.importActual<typeof import('@/store/session')>('@/store/session')
-
-      return {
-        ...actual,
-        $currentCwd: { get: () => currentCwd.current }
-      }
-    })
-
     await mountStream()
 
     // Initial payload — cwd goes from '' to a real path. Must NOT follow.
     await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/foo' })
 
-    expect(followActiveSessionCwd).not.toHaveBeenCalled()
+    expect(cwdFollowMock).not.toHaveBeenCalled()
   })
 
   it('follows the cwd on a genuine move (non-empty → different non-empty)', async () => {
-    const followActiveSessionCwd = vi.fn<(_: string) => Promise<void>>(async () => undefined)
-
-    vi.doMock('@/store/projects', () => ({
-      followActiveSessionCwd
-    }))
-
-    const currentCwd = { current: '/Users/test/projects/foo' }
-
-    vi.doMock('@/store/session', async () => {
-      const actual = await vi.importActual<typeof import('@/store/session')>('@/store/session')
-
-      return {
-        ...actual,
-        $currentCwd: { get: () => currentCwd.current }
-      }
-    })
+    currentCwdMock = '/Users/test/projects/foo'
 
     await mountStream()
 
     // Genuine move — cwd changes from one non-empty path to another. Must follow.
     await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/bar' })
 
-    expect(followActiveSessionCwd).toHaveBeenCalledWith('/Users/test/projects/bar')
+    expect(cwdFollowMock).toHaveBeenCalledWith('/Users/test/projects/bar')
   })
 })
