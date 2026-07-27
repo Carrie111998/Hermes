@@ -280,3 +280,5 @@ recorded.
   propagation across all governed verification paths.
 - `70ad7a0bbca351573c4b202e5ee80665866c1d3d` — bound external and scheduled
   objective wakeups to their organization at enqueue time.
+- `b8b9285e6573097a327daf1bdd30bb64e1e22cae` — scoped employee actors to their
+  organization for objective lifecycle mutations.
