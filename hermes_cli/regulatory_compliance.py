@@ -237,6 +237,8 @@ def record_control_evidence(
 
     if verdict not in {"pass", "fail"} or not evidence:
         raise ValueError("control evidence requires pass/fail and evidence")
+    if expires_at <= int(time.time()):
+        raise ComplianceGateError("control evidence expiry must be in the future")
     evidence_json = _json(evidence)
     evidence_id = f"controlevidence_{uuid.uuid4().hex}"
     with conn:

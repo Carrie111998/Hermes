@@ -42,6 +42,20 @@ def test_compliance_records_reject_unknown_or_inactive_regimes():
             assessed_by="advisor:legal",
             expires_at=future,
         )
+
+
+def test_control_evidence_rejects_stale_expiry():
+    conn = connection()
+    with pytest.raises(compliance.ComplianceGateError, match="expiry"):
+        compliance.record_control_evidence(
+            conn,
+            organization_id="org_1",
+            control_name="control.stale",
+            verifier="control:test",
+            verdict="pass",
+            evidence={"check": "old"},
+            expires_at=int(time.time()) - 1,
+        )
     conn.execute(
         "UPDATE compliance_regimes SET status='retired' WHERE id='casl'"
     )
