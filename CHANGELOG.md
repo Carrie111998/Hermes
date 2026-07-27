@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Kanban heartbeat lease extensions now require an exact permit bound to task,
+  board, note, claim lock, and expected worker run identity.
 - Kanban inline and URL attachment writes now require exact artifact permits
   bound to task, board, filename, content identity/source, and content type
   before durable storage or remote download.

@@ -1711,6 +1711,27 @@ This remains deterministic local-provider evidence and does not establish
 production artifact storage, remote-provider credentials, or external
 authorization.
 
+## Kanban heartbeat authority evidence (4caa839dce)
+
+`kanban.heartbeat` now requires a SHA-256 resource derived from the exact task,
+board, note, claim lock, and expected worker run identity before extending a
+claim or recording a heartbeat event. This prevents lease extension or run
+impersonation outside the delegated lifecycle scope.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **125 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:67783db32ac3ab37ab56c561ca0e53629683e868754a258a57f1c407a4ced640`.
+This remains deterministic local-provider evidence and does not establish
+production distributed lease infrastructure or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
