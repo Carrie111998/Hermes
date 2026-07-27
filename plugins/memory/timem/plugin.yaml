@@ -1,0 +1,5 @@
+name: timem
+version: 1.0.0
+description: "TiMEM — temporal-hierarchical layered memory (L1 raw interactions to L5 persona) with server-side memory generation, semantic recall, and computed user profiles."
+pip_dependencies:
+  - timem-ai==0.4.0

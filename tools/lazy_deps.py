@@ -152,6 +152,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # instance and the provider silently reports itself unavailable.
     "memory.supermemory": ("supermemory==3.50.0",),
     "memory.mem0": ("mem0ai==2.0.10",),
+    "memory.timem": ("timem-ai==0.4.0",),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
