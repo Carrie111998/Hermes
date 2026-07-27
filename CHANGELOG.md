@@ -257,3 +257,6 @@ recorded.
 - `4523d7c42844473497d12deae9679e3153230dec` — bound compute-cost
   reconciliation retries to provider, model, reference, amount, status, and
   exact evidence, rejecting changed settlement identity.
+- `cb0e8b7cdf43aa3aa2383821eb2a91794da8965c` — converged identical payment
+  provider readbacks to one immutable observation while preserving distinct
+  rows for actual provider-state changes.

@@ -116,6 +116,8 @@ acceptance evidence.
   objective, action, inbox, recipients, subject, and body hashes.
 - Compute-cost reconciliation retries are bound to the original provider,
   model, reference, amount, status, and exact evidence.
+- Identical payment-provider readbacks converge to one immutable observation;
+  changed provider states remain separately recorded.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -191,7 +193,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`4523d7c42844473497d12deae9679e3153230dec` passed 6 Founder/CEO E2E tests, 48
+`cb0e8b7cdf43aa3aa2383821eb2a91794da8965c` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -207,6 +209,7 @@ It also passed the intervention-control regression: 10 tests.
 It also passed the approval-artifact regression: 9 tests.
 It also passed the company-email regression: 4 tests.
 It also passed the compute-reconciliation regression: 9 tests.
+The finance suite also passed the payment readback convergence regression: 21 tests.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,
