@@ -130,6 +130,27 @@ def test_initial_capital_has_ten_dollar_floor_and_no_upper_cap(treasury):
     assert finance_db.account_balance(conn, account) == 10**15
 
 
+def test_provider_assessment_rejects_future_dated_evidence(tmp_path):
+    conn = objectives_db.connect(tmp_path / "business.db")
+    with pytest.raises(
+        compliance_db.ComplianceError, match="future-dated"
+    ):
+        compliance_db.verify_payment_provider(
+            conn,
+            organization_id="org_1",
+            provider="fake",
+            direction="inbound",
+            jurisdiction="GLOBAL",
+            registry_authority="test-registry",
+            registry_reference="future-assessment",
+            aml_screening_delegated=True,
+            sanctions_screening_delegated=True,
+            verified_at=int(time.time()) + 60,
+            expires_at=int(time.time()) + 3_600,
+            evidence={"test": True},
+        )
+
+
 def test_reservations_prevent_oversubscription_and_exact_settlement(treasury):
     conn, account = treasury
     finance_db.seed_initial_capital(
