@@ -329,8 +329,8 @@ class CodexAppServerClient:
         # subsumes hermes_cli._subprocess_compat.windows_hide_flags() and keeps
         # the console-flash fix (#56747). It additionally sets
         # STARTF_USESTDHANDLES and CREATE_SUSPENDED so the child can be assigned
-        # to a kill job before it runs — that is what stops orphaned codex
-        # processes, which plain hide-flags do not do.
+        # to a kill job before it runs — the orphan prevention that hide-flags
+        # alone does not provide.
         creationflags, startupinfo = _windows_startup()
         self._job = _create_kill_job()
         popen_kwargs: dict[str, Any] = {
@@ -637,7 +637,7 @@ def check_codex_binary(
         proc = subprocess.run(
             [codex_bin, "--version"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
