@@ -1395,6 +1395,13 @@ def register_kanban_adapters(
                 **COMMON_ACTION_FIELDS,
                 "priority": int,
                 "skills": list,
+                # When a delegated worker executes a privileged tool, the
+                # action contract may carry one exact system/resource pair
+                # distinct from the Kanban board used for coordination.
+                # Keep these fields typed at the action boundary so the
+                # grant's least-privilege scope survives admission unchanged.
+                "task_system": str,
+                "task_target_resource": str,
             },
         ),
         required_capability="work.delegate",

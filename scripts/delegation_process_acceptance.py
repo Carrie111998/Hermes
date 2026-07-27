@@ -39,13 +39,31 @@ def _worker_code() -> str:
 import json, os
 from pathlib import Path
 from hermes_cli import kanban_db, workforce_delegation
+from tools.file_tools import read_file_tool, write_file_tool
 
 grant = workforce_delegation.validate_worker_launch(
-    enabled_toolsets=["terminal"],
+    enabled_toolsets=["terminal", "files"],
     enabled_skills=["security.audit"],
-    enabled_capabilities=["security.audit"],
-    enabled_systems=["security"],
+    enabled_capabilities=["security.audit", "file.read"],
+    enabled_systems=["security", "localhost"],
 )
+input_path = os.environ["HERMES_WORKER_INPUT"]
+allowed_read = json.loads(read_file_tool(input_path, task_id=os.environ["HERMES_KANBAN_TASK"]))
+if not str(allowed_read.get("content") or "").startswith("1|delegated evidence"):
+    raise RuntimeError(f"governed file read failed: {allowed_read}")
+blocked_read = read_file_tool(
+    str(Path(input_path).with_name("not-authorized.txt")),
+    task_id=os.environ["HERMES_KANBAN_TASK"],
+)
+if "resource exceeds" not in blocked_read:
+    raise RuntimeError(f"retargeted file read was not rejected: {blocked_read}")
+blocked_write = write_file_tool(
+    input_path,
+    "must not write",
+    task_id=os.environ["HERMES_KANBAN_TASK"],
+)
+if "not granted" not in blocked_write:
+    raise RuntimeError(f"file write was not rejected: {blocked_write}")
 with kanban_db.connect_closing(board=os.environ["HERMES_DELEGATION_BOARD"]) as board:
     task_id = os.environ["HERMES_KANBAN_TASK"]
     if not kanban_db.complete_task(
@@ -56,7 +74,12 @@ with kanban_db.connect_closing(board=os.environ["HERMES_DELEGATION_BOARD"]) as b
     ):
         raise RuntimeError("worker could not close its assigned task")
 Path(os.environ["HERMES_WORKER_EVIDENCE"]).write_text(
-    json.dumps({"grant_id": grant["id"], "task_id": task_id, "evidence_recorded": True})
+    json.dumps({
+        "grant_id": grant["id"],
+        "task_id": task_id,
+        "evidence_recorded": True,
+        "file_tool_boundary": "pass",
+    })
 )
 '''
 
@@ -76,9 +99,9 @@ def main() -> int:
         "operating_mode": "autonomous",
         "operator_role": "advisor",
         "policy_version": "charter-v1",
-        "allowed_capabilities": ["work.delegate", "security.audit"],
+        "allowed_capabilities": ["work.delegate", "security.audit", "file.read"],
         "forbidden_capabilities": [],
-        "allowed_systems": ["kanban", "security"],
+        "allowed_systems": ["kanban", "security", "localhost"],
         "approval_required_capabilities": [],
         "max_autonomous_risk": "low",
         "allow_irreversible": False,
@@ -86,7 +109,7 @@ def main() -> int:
         "max_action_spend_minor": 100,
         "permit_ttl_seconds": 300,
         "operating_cadence": {"enabled": False},
-        "solo_founder": {"toolsets": ["terminal"], "skills": ["security.audit"]},
+        "solo_founder": {"toolsets": ["terminal", "files"], "skills": ["security.audit"]},
     }
     organization_id, ceo_id = organization_db.bootstrap_solo_founder(
         conn,
@@ -114,11 +137,11 @@ def main() -> int:
         responsibilities=["inspect the assigned record"],
         decision_rights=["report findings"],
         prohibited_actions=["work.delegate"],
-        capabilities=["security.audit"],
-        systems=["security"],
+        capabilities=["security.audit", "file.read"],
+        systems=["security", "localhost"],
         kpis=["evidence returned"],
         escalation={"to": ceo_id},
-        toolsets=["terminal"],
+        toolsets=["terminal", "files"],
         skills=["security.audit"],
         created_by=f"employee:{ceo_id}",
         budget_minor=100,
@@ -150,7 +173,7 @@ def main() -> int:
         organization_id=organization_id,
         desired_outcome="Complete the delegated evidence review",
         originator=f"employee:{ceo_id}",
-        permitted_systems=["kanban", "security"],
+        permitted_systems=["kanban", "security", "localhost"],
         success_criteria=[{"verifier": "kanban.task.done_with_evidence", "params": {}}],
     )
     objectives_db.transition_objective(conn, objective.id, "accepted", actor=f"employee:{ceo_id}")
@@ -179,9 +202,11 @@ def main() -> int:
         "body": "Inspect the assigned control and return read-back evidence.",
         "assignee": "security-auditor",
         "skills": ["security.audit"],
-        "task_capabilities": ["security.audit"],
-        "task_systems": ["security"],
-        "task_toolsets": ["terminal"],
+        "task_capabilities": ["security.audit", "file.read"],
+        "task_systems": ["security", "localhost"],
+        "task_toolsets": ["terminal", "files"],
+        "task_system": "localhost",
+        "task_target_resource": str(home / "delegation-worker-input.txt"),
         "task_budget_minor": 100,
         "task_expires_at": int(time.time()) + 1800,
     }
@@ -238,6 +263,7 @@ def main() -> int:
         external_reference=task_id,
     )
     conn.commit()
+    (home / "delegation-worker-input.txt").write_text("delegated evidence\n")
     print(json.dumps({"phase": "ceo", "grant": str(grant["id"]), "task": task_id}))
 
     child_env = {
@@ -250,6 +276,11 @@ def main() -> int:
         "HERMES_KANBAN_BOARD": board,
         "HERMES_KANBAN_DB": str(kanban_db.kanban_db_path(board=board)),
         "HERMES_WORKER_EVIDENCE": str(evidence_path),
+        "HERMES_WORKER_INPUT": str(home / "delegation-worker-input.txt"),
+        # The acceptance worker reads the mounted authority volume directly;
+        # do not let an inherited host-terminal Docker backend reinterpret the
+        # local path as a nested sandbox path.
+        "TERMINAL_ENV": "local",
     }
     child = subprocess.run(
         [sys.executable, "-c", _worker_code()],

@@ -527,7 +527,7 @@ def create_grant(
                 contract["body_sha256"],
                 _json(requested_capabilities),
                 _json(requested_systems),
-                _json(toolsets),
+                _json(requested_toolsets),
                 _json(requested_skills),
                 _json(resource_scope),
                 parent_grant_id,
