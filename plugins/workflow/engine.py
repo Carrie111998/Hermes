@@ -3327,8 +3327,8 @@ class WorkflowEngine:
                                         except Exception as e:
                                             print(f"   ⚠  Failed to enrich upstream card: {e}")
 
-                                    # Reviewer stays blocked — implement must re-block
-                                    # "pending review" before reviewer is unblocked.
+                                    # Update in-memory state to reflect actual kanban status
+                                    state.status = "blocked"
                                     # Remove both from pending so _monitor_layer exits
                                     # and the caller enters the review waiting loop.
                                     pending.discard(nid)
