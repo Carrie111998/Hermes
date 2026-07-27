@@ -1156,7 +1156,15 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # found, delegate fully; otherwise fall through to the legacy flag path.
     try:
         from providers import get_provider_profile
-        _profile = get_provider_profile(agent.provider)
+        # Normalize named custom provider keys (custom:<name>) to the generic
+        # "custom" profile key. Without this, a fallback model configured as
+        # custom:CPA keeps the qualified key after fallback activation, and
+        # get_provider_profile("custom:cpa") returns None — bypassing the
+        # CustomProfile that handles reasoning_effort and other extras (#72202).
+        _provider_key = str(agent.provider or "").strip().lower()
+        if _provider_key.startswith("custom:"):
+            _provider_key = "custom"
+        _profile = get_provider_profile(_provider_key)
     except Exception:
         _profile = None
 
