@@ -60,6 +60,12 @@ class TriggerError(ValueError):
 
 AUTHENTICATION_MAX_AGE_SECONDS = 300
 AUTHENTICATION_MAX_FUTURE_SKEW_SECONDS = 30
+FRESHNESS_REQUIRED_SCHEMES = frozenset(
+    {
+        "stripe_signature_v1",
+        "svix_hmac_sha256",
+    }
+)
 
 
 def _validate_authentication_freshness(
@@ -81,6 +87,11 @@ def _validate_authentication_freshness(
         None,
     )
     if raw_timestamp is None:
+        scheme = str(authentication_evidence.get("scheme") or "")
+        if scheme in FRESHNESS_REQUIRED_SCHEMES:
+            raise TriggerError(
+                "external event authentication evidence requires a signed timestamp"
+            )
         return
     if isinstance(raw_timestamp, bool):
         raise TriggerError("external event authentication timestamp is invalid")

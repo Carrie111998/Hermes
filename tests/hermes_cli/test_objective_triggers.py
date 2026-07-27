@@ -152,6 +152,24 @@ def test_external_event_rejects_invalid_authentication_freshness(
         )
 
 
+@pytest.mark.parametrize("scheme", ["stripe_signature_v1", "svix_hmac_sha256"])
+def test_provider_authentication_requires_freshness_evidence(company, scheme):
+    conn, organization_id, _ = company
+    with pytest.raises(objective_triggers.TriggerError, match="signed timestamp"):
+        objective_triggers.route_external_event(
+            conn,
+            organization_id=organization_id,
+            source_type="provider",
+            event_type="event.received",
+            source_reference=f"missing-timestamp-{scheme}",
+            payload={"provider": "event"},
+            authentication_evidence={
+                "scheme": scheme,
+                "signature_validated": True,
+            },
+        )
+
+
 def test_external_events_do_not_wake_terminal_objectives(company):
     conn, organization_id, objective_id = company
     objective_triggers.subscribe(
