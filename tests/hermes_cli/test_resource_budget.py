@@ -301,6 +301,19 @@ def test_compute_reconciliation_releases_reservation_and_records_real_cost(
         provider_reference=provider_reference,
         evidence={"provider_readback": status == "provider_confirmed"},
     )
+    with pytest.raises(
+        resource_budget.ResourceBudgetError, match="different reconciliation"
+    ):
+        resource_budget.reconcile_compute_reservation(
+            conn,
+            reservation_id=reservation_id,
+            status=status,
+            actual_minor=actual_minor,
+            model="planner-model",
+            billing_provider="different-provider",
+            provider_reference=provider_reference,
+            evidence={"provider_readback": status == "provider_confirmed"},
+        )
     assert finance_db.committed_compute_balance(conn, account_id) == 0
     assert finance_db.available_balance(conn, account_id) == expected_available
     assert (

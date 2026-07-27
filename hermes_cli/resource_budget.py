@@ -530,8 +530,13 @@ def reconcile_compute_reservation(
         raise ValueError(
             "paid compute reconciliation requires provider evidence"
         )
+    import json
+
+    evidence_json = json.dumps(
+        dict(evidence), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     existing = conn.execute(
-        """SELECT id,status,actual_minor FROM planner_compute_reconciliations
+        """SELECT * FROM planner_compute_reconciliations
             WHERE reservation_id=?""",
         (reservation_id,),
     ).fetchone()
@@ -539,9 +544,14 @@ def reconcile_compute_reservation(
         if (
             str(existing["status"]) != status
             or int(existing["actual_minor"]) != actual_minor
+            or (existing["model"] or None) != (model or None)
+            or (existing["billing_provider"] or None) != (billing_provider or None)
+            or (existing["provider_reference"] or None)
+            != (provider_reference or None)
+            or str(existing["evidence_json"]) != evidence_json
         ):
             raise ResourceBudgetError(
-                "compute reservation already has different reconciliation"
+                "compute reservation already has different reconciliation parameters"
             )
         return str(existing["id"])
     if actual_minor:
@@ -587,8 +597,6 @@ def reconcile_compute_reservation(
             },
         )
     reconciliation_id = f"compute_recon_{uuid.uuid4().hex}"
-    import json
-
     with conn:
         conn.execute(
             """INSERT INTO planner_compute_reconciliations
@@ -603,12 +611,7 @@ def reconcile_compute_reservation(
                 model,
                 billing_provider,
                 provider_reference,
-                json.dumps(
-                    dict(evidence),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
+                evidence_json,
                 int(time.time()),
             ),
         )
