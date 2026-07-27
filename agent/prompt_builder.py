@@ -2018,6 +2018,7 @@ def build_context_files_prompt(
     skip_soul: bool = False,
     context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False,
+    skip_project_context: bool = False,
 ) -> str:
     """Discover and load context files for the system prompt.
 
@@ -2036,6 +2037,9 @@ def build_context_files_prompt(
 
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).
+
+    When *skip_project_context* is True, project instructions are omitted but
+    SOUL.md handling is unchanged.
     """
     if cwd is None:
         cwd = os.getcwd()
@@ -2056,7 +2060,9 @@ def build_context_files_prompt(
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
     from agent.runtime_cwd import _is_install_tree
 
-    if (
+    if skip_project_context:
+        project_context = ""
+    elif (
         cwd_is_fallback
         and not allow_install_tree_fallback
         and _is_install_tree(cwd_path)

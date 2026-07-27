@@ -180,6 +180,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
+    # The coding/general posture governs every coding-specific prompt concern,
+    # including whether project instruction files belong in this session.
+    # Resolve it once so those decisions cannot disagree within a cached prompt.
+    _context_cwd = resolve_context_cwd()
+    _runtime_mode = None
+    try:
+        from agent.coding_context import resolve_runtime_mode
+
+        _runtime_mode = resolve_runtime_mode(
+            platform=agent.platform, cwd=_context_cwd, model=agent.model
+        )
+    except Exception:
+        # Coding-context probing must never block prompt build.
+        pass
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -307,14 +322,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # reach everything, and every name stays visible for recall). The
         # default coding posture leaves the index untouched.
         _compact_cats = frozenset()
-        try:
-            from agent.coding_context import coding_compact_skill_categories
-
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
-            )
-        except Exception:
-            _compact_cats = frozenset()
+        if _runtime_mode is not None:
+            try:
+                _compact_cats = _runtime_mode.compact_skill_categories()
+            except Exception:
+                pass
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
@@ -353,14 +365,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # stay in their historical position after the workspace snapshot.
     coding_workspace_parts: List[str] = []
     coding_trailing_parts: List[str] = []
-    if agent.valid_tool_names:
+    if agent.valid_tool_names and _runtime_mode is not None:
         try:
-            from agent.coding_context import coding_system_prompt_parts
-
-            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = coding_system_prompt_parts(
-                platform=agent.platform,
-                cwd=resolve_context_cwd(),
-                model=agent.model,
+            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = (
+                _runtime_mode.system_prompt_parts()
             )
             stable_parts.extend(coding_prefix_parts)
         except Exception:
@@ -488,9 +496,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
         context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+            cwd=_context_cwd, skip_soul=_soul_loaded,
             context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+            skip_project_context=(
+                _runtime_mode is not None and not _runtime_mode.is_coding
+            ),
+        )
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 

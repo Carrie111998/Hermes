@@ -3,7 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
@@ -29,15 +29,17 @@ def _make_agent(**overrides):
     return SimpleNamespace(**base)
 
 
-def _captured_context_cwd(agent):
-    """The cwd build_system_prompt_parts hands to build_context_files_prompt."""
+def _captured_context_file_options(agent):
+    """The options build_system_prompt_parts hands to context-file discovery."""
     captured = {}
 
     def fake_context_files(
         cwd=None, skip_soul=False, context_length=None,
         allow_install_tree_fallback=False,
+        skip_project_context=False,
     ):
         captured["cwd"] = cwd
+        captured["skip_project_context"] = skip_project_context
         return ""
 
     with (
@@ -47,7 +49,11 @@ def _captured_context_cwd(agent):
         patch("run_agent.build_context_files_prompt", side_effect=fake_context_files),
     ):
         build_system_prompt_parts(agent)
-    return captured["cwd"]
+    return captured
+
+
+def _captured_context_cwd(agent):
+    return _captured_context_file_options(agent)["cwd"]
 
 
 class TestContextFileCwd:
@@ -60,6 +66,42 @@ class TestContextFileCwd:
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         assert _captured_context_cwd(_make_agent()) == tmp_path
+
+    def test_skips_project_context_for_chat_platform(self, monkeypatch, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Project instructions.")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+        options = _captured_context_file_options(_make_agent(platform="telegram"))
+
+        assert options["skip_project_context"] is True
+
+    def test_skips_project_context_when_coding_context_is_off(self, monkeypatch, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Project instructions.")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+        with patch("agent.coding_context._coding_mode", return_value="off"):
+            options = _captured_context_file_options(_make_agent(platform="cli"))
+
+        assert options["skip_project_context"] is True
+
+    def test_explicit_coding_context_keeps_project_context_for_chat_platform(
+        self, monkeypatch, tmp_path
+    ):
+        (tmp_path / "AGENTS.md").write_text("Project instructions.")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+        with patch("agent.coding_context._coding_mode", return_value="on"):
+            options = _captured_context_file_options(_make_agent(platform="telegram"))
+
+        assert options["skip_project_context"] is False
+
+    def test_keeps_project_context_for_coding_cli(self, monkeypatch, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Project instructions.")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+        options = _captured_context_file_options(_make_agent(platform="cli"))
+
+        assert options["skip_project_context"] is False
 
 
 def _stable_prompt(agent):
@@ -163,18 +205,25 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "Conversation started: Friday, January 02, 2026",
     ))
 
+    runtime_mode = Mock(
+        is_coding=True,
+        system_prompt_parts=Mock(
+            return_value=(
+                ["CODING_STABLE"],
+                ["WORKSPACE"],
+                ["Operator instructions (from config):\nOPERATOR"],
+            )
+        ),
+        compact_skill_categories=Mock(return_value=frozenset()),
+    )
+
     with (
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
         patch(
-            "agent.coding_context.coding_system_prompt_parts",
-            return_value=(
-                ["CODING_STABLE"],
-                ["WORKSPACE"],
-                ["Operator instructions (from config):\nOPERATOR"],
-            ),
+            "agent.coding_context.resolve_runtime_mode", return_value=runtime_mode
         ),
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
         patch("hermes_time.now", return_value=datetime(2026, 1, 2)),

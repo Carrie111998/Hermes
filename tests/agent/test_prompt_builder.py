@@ -718,6 +718,20 @@ class TestBuildContextFilesPrompt:
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
+    def test_skips_project_context_but_keeps_soul(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        (tmp_path / "AGENTS.md").write_text("Project instructions.")
+        (hermes_home / "SOUL.md").write_text("Identity instructions.")
+
+        result = build_context_files_prompt(
+            cwd=str(tmp_path), skip_project_context=True
+        )
+
+        assert "Project instructions." not in result
+        assert "Identity instructions." in result
+
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
@@ -1723,5 +1737,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
