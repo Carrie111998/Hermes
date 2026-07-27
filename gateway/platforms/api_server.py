@@ -4858,7 +4858,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=None,
                 quiet_mode=True,
-                skip_tool_search_assembly=False,
+                # The catalog endpoint projects the concrete schemas that are
+                # currently callable.  Tool-search assembly intentionally
+                # replaces that catalog with a smaller model-facing surface,
+                # which would hide individually service-gated tools here.
+                skip_tool_search_assembly=True,
             )
             metadata = {
                 name: {"label": label, "description": desc}

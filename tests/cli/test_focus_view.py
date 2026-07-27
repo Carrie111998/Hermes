@@ -530,7 +530,13 @@ class TestModelFacingMessagesUnchanged:
         )
         # Sanity: the turn really did produce tool results to compare.
         assert [m["role"] for m in focus_on].count("tool") == 3
-        assert json.loads(focus_on[-1]["content"]) == {"ok": "gamma"}
+        from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
+
+        expected = json.dumps({"ok": "gamma"})
+        assert focus_on[-1]["content"] == _maybe_wrap_untrusted(
+            "web_search",
+            expected,
+        )
 
     def test_every_verbose_mode_produces_the_same_messages(self):
         # /focus composes with /verbose, so no tool-progress mode may change

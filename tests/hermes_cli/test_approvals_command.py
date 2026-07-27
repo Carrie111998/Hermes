@@ -31,12 +31,12 @@ def test_approvals_registry_drives_help_menu_and_autocomplete():
     command = resolve_command("approvals")
     assert command is not None
     assert command.category == "Configuration"
-    assert command.args_hint == "[manual|smart|off]"
-    assert SUBCOMMANDS["/approvals"] == ["manual", "smart", "off"]
+    assert command.args_hint == "[manual|off]"
+    assert SUBCOMMANDS["/approvals"] == ["manual", "off"]
     assert "approvals" in GATEWAY_KNOWN_COMMANDS
     assert any("/approvals" in line for line in gateway_help_lines())
     assert "approvals" in {name for name, _ in telegram_bot_commands()}
-    assert _completions("/approvals ") == {"manual", "smart", "off"}
+    assert _completions("/approvals ") == {"manual", "off"}
 
 
 def _isolate_config(monkeypatch, home):
@@ -91,9 +91,9 @@ def test_shared_approval_mode_command_rejects_unknown_mode_without_writing(tmp_p
     result = run_approval_mode_command("auto")
 
     assert result.ok is False
-    assert result.mode == "smart"
+    assert result.mode == "manual"
     assert path.read_bytes() == before
-    assert "manual|smart|off" in result.message
+    assert "manual|off" in result.message
 
 
 def test_shared_status_matches_runtime_normalization_for_all_stored_shapes():
@@ -148,16 +148,16 @@ def test_cli_handler_prints_shared_result_and_preserves_agent_cache():
     cli = HermesCLI.__new__(HermesCLI)
     cached_agent = object()
     cli.agent = cached_agent
-    result = SimpleNamespace(message="Approval mode: smart (persistent profile setting).")
+    result = SimpleNamespace(message="Approval mode: manual (persistent profile setting).")
 
     with (
         patch("hermes_cli.approval_mode.run_approval_mode_command", return_value=result) as run,
         patch("cli._cprint") as output,
     ):
-        cli._handle_approvals_command("/approvals smart")
+        cli._handle_approvals_command("/approvals manual")
 
-    run.assert_called_once_with("smart")
-    output.assert_called_once_with("  Approval mode: smart (persistent profile setting).")
+    run.assert_called_once_with("manual")
+    output.assert_called_once_with("  Approval mode: manual (persistent profile setting).")
     assert cli.agent is cached_agent
 
 

@@ -44,6 +44,14 @@ def _make_runner(adapter):
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
+    # This suite exercises notifier delivery, so opt this test gateway into
+    # dispatch ownership explicitly.  Production remains fail-closed by
+    # default and non-owner gateways still never open kanban state.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+
     async def fake_sleep(delay):
         if delay == 5:
             return None
