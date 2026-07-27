@@ -544,8 +544,16 @@ def direct_api_call(agent, api_kwargs: dict):
             raise InterruptedError("Agent interrupted during API call") from None
         raise
     else:
-        if getattr(agent, "_interrupt_requested", False):
-            raise InterruptedError("Agent interrupted during API call")
+        # Don't check _interrupt_requested here — the response is valid and
+        # was already received. The worker-based path (interruptible_api_call)
+        # only checks for interrupts in its polling loop before the thread
+        # completes; once a response is in hand it is returned unconditionally.
+        # The conversation loop's own redirect/finally handling (in
+        # conversation_loop.py) catches the redirect case before response
+        # processing begins, and the interrupt flag is checked at the top of
+        # the main while loop on the next iteration. Discarding a valid
+        # response here would waste the API call and leave the user waiting
+        # with no output — the exact symptom of #72940.
         _reset_stale_streak(agent)
         return response
     finally:
