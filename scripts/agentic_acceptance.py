@@ -301,9 +301,14 @@ def run_worker() -> None:
             (metadata["objective_id"],),
         ).fetchone()["n"]
         assert scheduled == 1, scheduled
+        plan_versions = conn.execute(
+            "SELECT COUNT(*) AS n FROM plans WHERE objective_id=?",
+            (metadata["objective_id"],),
+        ).fetchone()["n"]
+        assert plan_versions >= 2, plan_versions
         print(json.dumps({
             "phase": "run", "objective": "verified", "effects": 1,
-            "scheduled_events": scheduled,
+            "scheduled_events": scheduled, "plan_versions": plan_versions,
         }))
     finally:
         conn.close()
