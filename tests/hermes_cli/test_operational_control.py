@@ -6,6 +6,21 @@ import pytest
 from hermes_cli import objectives_db, operational_control
 
 
+def test_authority_schema_check_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    operational_control.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "UPDATE autonomy_control SET reason=? WHERE singleton=1",
+        ("uncommitted authority transition",),
+    )
+    assert operational_control.autonomy_state(conn)["reason"] == (
+        "uncommitted authority transition"
+    )
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def _conn(tmp_path):
     return objectives_db.connect(tmp_path / "authority.db")
 

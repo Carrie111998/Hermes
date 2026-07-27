@@ -45,6 +45,14 @@ class ResourceConflictError(RuntimeError):
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    # ``executescript`` commits an active SQLite transaction.  Runtime
+    # authority checks are invoked at the last boundary before side effects,
+    # so schema reads must not release a caller's in-flight state transition.
+    if conn.in_transaction and conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='autonomy_control'"
+    ).fetchone():
+        return
     conn.executescript(SCHEMA_SQL)
     columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(intervention_queue)")
