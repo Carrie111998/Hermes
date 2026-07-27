@@ -7,6 +7,7 @@ advancement through multiple providers.
 
 from unittest.mock import MagicMock, patch
 
+from agent.error_classifier import FailoverReason
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -371,3 +372,246 @@ class TestFallbackChainDedup:
         assert called == [("xai", "grok-4.5")]
         assert agent.provider == "xai"
         assert agent.model == "grok-4.5"
+
+
+class TestRichFallbackActivation:
+    def test_oauth_fallback_uses_constructed_client_endpoint_not_route_hint(self):
+        fallback = {
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex",
+            "base_url": "https://attacker.invalid/v1",
+        }
+        agent = _make_agent(fallback_model=[fallback])
+        runtime = {
+            "provider": "openai-codex",
+            "requested_provider": "openai-codex",
+            "model": "gpt-5.3-codex",
+            "base_url": "https://attacker.invalid/v1",
+            "api_key": "oauth-token",
+            "api_mode": "codex_responses",
+        }
+        client = _mock_client(
+            "https://chatgpt.com/backend-api/codex", "oauth-token"
+        )
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "hermes_cli.fallback_config.resolve_fallback_runtime",
+                return_value=runtime,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(client, "gpt-5.3-codex"),
+            ),
+        ):
+            assert (
+                agent._try_activate_fallback(reason=FailoverReason.format_error)
+                is True
+            )
+
+        canonical_url = "https://chatgpt.com/backend-api/codex"
+        client_kwargs = getattr(agent, "_client_kwargs")
+        assert agent.base_url == canonical_url
+        assert client_kwargs["base_url"] == canonical_url
+        assert "attacker.invalid" not in repr(client_kwargs)
+
+    def test_hard_400_fallback_applies_route_context_output_and_request_settings(self):
+        fallback = {
+            "provider": "lmstudio",
+            "model": "large-local",
+            "base_url": "http://localhost:1234/v1",
+            "context_length": 65_536,
+            "max_output_tokens": 16_384,
+            "extra_body": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+            "model_transition_policy": "sequential",
+        }
+        agent = _make_agent(fallback_model=[fallback])
+        agent.provider = "openai-codex"
+        agent.model = "primary-model"
+        agent.base_url = "https://primary.invalid/v1"
+        agent.max_tokens = 777
+        agent.request_overrides = {"extra_body": {"primary": True}}
+        agent._config_context_length = 200_000
+        agent.__dict__["lmstudio_load_mode"] = "jit"
+        agent._primary_runtime.update(
+            {
+                "provider": "openai-codex",
+                "model": "primary-model",
+                "base_url": "https://primary.invalid/v1",
+                "max_tokens": 777,
+                "request_overrides": {"extra_body": {"primary": True}},
+                "config_context_length": 200_000,
+            }
+        )
+        runtime = {
+            "provider": "lmstudio",
+            "requested_provider": "lmstudio",
+            "model": "large-local",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "local-key",
+            "api_mode": "chat_completions",
+            "context_length": 65_536,
+            "max_output_tokens": 16_384,
+            "request_overrides": {
+                "extra_body": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+            },
+            "model_transition_policy": "sequential",
+        }
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "hermes_cli.fallback_config.resolve_fallback_runtime",
+                return_value=runtime,
+            ) as resolve_runtime,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client("http://localhost:1234/v1", "local-key"), None),
+            ),
+            patch(
+                "hermes_cli.models.ensure_lmstudio_model_loaded",
+                return_value=65_536,
+            ) as ensure_loaded,
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.format_error) is True
+
+        resolve_runtime.assert_called_once_with(fallback)
+        ensure_loaded.assert_called_once_with(
+            "large-local",
+            "http://localhost:1234/v1",
+            "local-key",
+            65_536,
+            timeout=120.0,
+            transition_policy="sequential",
+            require_context_minimum=True,
+        )
+        assert agent.provider == "lmstudio"
+        assert agent.model == "large-local"
+        assert agent._config_context_length == 65_536
+        assert agent.max_tokens == 16_384
+        assert agent.request_overrides == runtime["request_overrides"]
+        # The primary snapshot remains available for rollback or a later route.
+        assert agent._primary_runtime["max_tokens"] == 777
+        assert agent._primary_runtime["request_overrides"] == {
+            "extra_body": {"primary": True}
+        }
+
+    def test_partial_first_activation_rolls_back_before_next_route(self):
+        fallbacks = [
+            {
+                "provider": "lmstudio",
+                "model": "large-local",
+                "base_url": "http://localhost:1234/v1",
+            },
+            {
+                "provider": "lmstudio",
+                "model": "small-local",
+                "base_url": "http://localhost:1234/v1",
+            },
+        ]
+        agent = _make_agent(fallback_model=fallbacks)
+        primary_client = agent.client
+        agent.provider = "openai-codex"
+        agent.model = "primary-model"
+        agent.base_url = "https://primary.invalid/v1"
+        agent.max_tokens = 777
+        agent.request_overrides = {"extra_body": {"primary": True}}
+        agent._config_context_length = 200_000
+        agent._cached_system_prompt = "primary prompt"
+        agent._primary_runtime.update(
+            {
+                "provider": "openai-codex",
+                "model": "primary-model",
+                "base_url": "https://primary.invalid/v1",
+                "max_tokens": 777,
+                "request_overrides": {"extra_body": {"primary": True}},
+                "config_context_length": 200_000,
+            }
+        )
+        first_runtime = {
+            "provider": "lmstudio",
+            "requested_provider": "lmstudio",
+            "model": "large-local",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "local-key",
+            "api_mode": "chat_completions",
+            "context_length": 65_536,
+            "max_output_tokens": 16_384,
+            "request_overrides": {"extra_body": {"route": "large"}},
+        }
+        second_runtime = {
+            "provider": "lmstudio",
+            "requested_provider": "lmstudio",
+            "model": "small-local",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "local-key",
+            "api_mode": "chat_completions",
+            "context_length": 32_768,
+            "max_output_tokens": 4_096,
+            "request_overrides": {"extra_body": {"route": "small"}},
+        }
+        resolution_count = 0
+
+        def resolve_runtime(entry):
+            nonlocal resolution_count
+            resolution_count += 1
+            if resolution_count == 1:
+                return first_runtime
+            # The first route failed after mutating runtime state. It must have
+            # been restored atomically before route two is even resolved.
+            assert agent.provider == "openai-codex"
+            assert agent.model == "primary-model"
+            assert agent.base_url == "https://primary.invalid/v1"
+            assert agent.client is primary_client
+            assert agent.max_tokens == 777
+            assert agent.request_overrides == {"extra_body": {"primary": True}}
+            assert agent._config_context_length == 200_000
+            assert agent._cached_system_prompt == "primary prompt"
+            return second_runtime
+
+        def rewrite_identity(target, model, provider):
+            target._cached_system_prompt = f"{provider}/{model}"
+
+        # Fail after the first route has applied settings and rewritten the
+        # prompt; the recursive route walk must see a fully restored primary.
+        agent._buffer_status = MagicMock(side_effect=[RuntimeError("late activation failure"), None])
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "hermes_cli.fallback_config.resolve_fallback_runtime",
+                side_effect=resolve_runtime,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=[
+                    (_mock_client("http://localhost:1234/v1"), None),
+                    (_mock_client("http://localhost:1234/v1"), None),
+                ],
+            ),
+            patch(
+                "hermes_cli.models.ensure_lmstudio_model_loaded",
+                side_effect=[65_536, 64_000],
+            ),
+            patch(
+                "agent.chat_completion_helpers.rewrite_prompt_model_identity",
+                side_effect=rewrite_identity,
+            ),
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.format_error) is True
+
+        assert resolution_count == 2
+        assert agent.model == "small-local"
+        assert agent._config_context_length == 32_768
+        assert agent.max_tokens == 4_096
+        assert agent.request_overrides == {"extra_body": {"route": "small"}}
+        assert agent._cached_system_prompt == "lmstudio/small-local"

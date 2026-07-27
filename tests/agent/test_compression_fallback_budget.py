@@ -21,7 +21,11 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.auxiliary_client import _fallback_entry_timeout, _call_fallback_candidate_sync
+from agent.auxiliary_client import (
+    _call_fallback_candidate_sync,
+    _fallback_entry_settings,
+    _fallback_entry_timeout,
+)
 from agent.context_compressor import ContextCompressor
 
 
@@ -92,6 +96,72 @@ def test_fallback_candidate_call_uses_entry_timeout():
         )
     assert resp is not None
     assert seen.get("timeout") == 240.0
+
+
+def test_fallback_candidate_call_uses_route_output_and_extra_body_settings():
+    """Auxiliary callers use the same rich route settings as the main agent."""
+    seen = {}
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            )
+
+    fb_client = SimpleNamespace(
+        base_url="http://localhost:1234/v1",
+        chat=SimpleNamespace(completions=_FakeCompletions()),
+    )
+    chain = [
+        {
+            "provider": "lmstudio",
+            "model": "large-local",
+            "max_output_tokens": 16_384,
+            "extra_body": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+        }
+    ]
+    with _patch_task_config(chain):
+        response = _call_fallback_candidate_sync(
+            fb_client,
+            "large-local",
+            "fallback_chain[0](lmstudio)",
+            task="compression",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=None,
+            max_tokens=777,
+            tools=None,
+            effective_timeout=30.0,
+            effective_extra_body={"primary_only": True},
+            reasoning_config=None,
+        )
+
+    assert response is not None
+    assert seen["max_tokens"] == 16_384
+    assert seen["extra_body"] == {
+        "primary_only": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }
+
+
+def test_profile_fallback_label_resolves_rich_route_settings():
+    chain = [
+        {
+            "provider": "lmstudio",
+            "model": "large-local",
+            "max_output_tokens": 16_384,
+            "extra_body": {"temperature": 1.0},
+        }
+    ]
+    with patch("hermes_cli.config.load_config", return_value={"fallback_providers": chain}):
+        settings = _fallback_entry_settings(
+            "compression", "fallback_providers[0](lmstudio)"
+        )
+
+    assert settings["max_output_tokens"] == 16_384
+    assert settings["extra_body"] == {"temperature": 1.0}
 
 
 def test_fallback_candidate_without_entry_timeout_keeps_task_timeout():

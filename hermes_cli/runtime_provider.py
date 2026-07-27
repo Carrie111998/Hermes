@@ -1095,6 +1095,8 @@ def _resolve_named_custom_runtime(
             pool_result["model"] = model_name
         if isinstance(custom_provider.get("max_output_tokens"), int):
             pool_result["max_output_tokens"] = custom_provider["max_output_tokens"]
+        if isinstance(custom_provider.get("context_length"), int):
+            pool_result["context_length"] = custom_provider["context_length"]
         request_overrides = _custom_provider_request_overrides(custom_provider)
         if request_overrides:
             pool_result["request_overrides"] = {
@@ -1139,6 +1141,8 @@ def _resolve_named_custom_runtime(
         result["model"] = custom_provider["model"]
     if isinstance(custom_provider.get("max_output_tokens"), int):
         result["max_output_tokens"] = custom_provider["max_output_tokens"]
+    if isinstance(custom_provider.get("context_length"), int):
+        result["context_length"] = custom_provider["context_length"]
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
     # Values may carry credentials — NEVER log them.
     if custom_provider.get("extra_headers"):
@@ -1652,13 +1656,17 @@ def resolve_runtime_provider(
     from hermes_cli.config import is_provider_enabled, load_config
     _full_cfg = load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
-    if isinstance(_provs_cfg, dict):
-        _block = _provs_cfg.get(requested_provider)
+    def _raise_if_provider_disabled(provider_key: str) -> None:
+        if not isinstance(_provs_cfg, dict):
+            return
+        _block = _provs_cfg.get(provider_key)
         if isinstance(_block, dict) and not is_provider_enabled(_block):
             raise ValueError(
-                f"provider {requested_provider!r} is disabled in config "
-                f"(providers.{requested_provider}.enabled: false)"
+                f"provider {provider_key!r} is disabled in config "
+                f"(providers.{provider_key}.enabled: false)"
             )
+
+    _raise_if_provider_disabled(requested_provider)
 
     if requested_provider == "moa":
         return {
@@ -1716,6 +1724,7 @@ def resolve_runtime_provider(
     # margin) by get_vertex_config(); mid-session expiry is additionally
     # recovered on 401 by run_agent._try_refresh_vertex_client_credentials().
     if requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
+        _raise_if_provider_disabled("vertex")
         from agent.vertex_adapter import get_vertex_config
 
         token, base_url = get_vertex_config()
@@ -1789,6 +1798,9 @@ def resolve_runtime_provider(
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
+    # Alias entries (for example ``kimi`` -> ``kimi-coding``) must not bypass
+    # an explicit disable on the canonical provider block.
+    _raise_if_provider_disabled(provider)
     model_cfg = _get_model_config()
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,

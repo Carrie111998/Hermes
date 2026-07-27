@@ -97,6 +97,64 @@ fallback_providers:
     key_env: MY_LOCAL_KEY            # env var name containing the API key
 ```
 
+### Route-Specific Runtime Settings
+
+Fallback entries can carry the same endpoint and request settings as a named
+custom provider. Explicit values on the fallback entry override the named
+provider's defaults:
+
+```yaml
+fallback_providers:
+  - provider: lmstudio
+    model: openai/gpt-oss-120b
+    base_url: http://localhost:1234/v1
+    context_length: 65536
+    max_output_tokens: 16384
+    request_timeout_seconds: 120
+    extra_body:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 20
+```
+
+Supported route fields are `base_url`, `api_key`, `key_env` (or
+`api_key_env`), `api_mode` (or `transport`), `context_length`,
+`max_output_tokens` (or `max_tokens`), `request_timeout_seconds` (or
+`timeout`), `extra_headers`, and `extra_body`. Invalid values and unsupported
+top-level keys are ignored rather than forwarded to the provider SDK.
+
+Hermes applies provider, model, client, API mode, timeout, context, output
+limit, and request overrides as one runtime transition. If activation fails,
+the prior runtime is restored before Hermes tries the next chain entry.
+
+#### Sequential LM Studio transitions
+
+On memory-constrained machines that can host only one large LLM at a time,
+opt in per route with `model_transition_policy: sequential`:
+
+```yaml
+fallback_providers:
+  - provider: lmstudio
+    model: openai/gpt-oss-120b
+    base_url: http://localhost:1234/v1
+    context_length: 65536
+    model_transition_policy: sequential
+  - provider: lmstudio
+    model: qwen/qwen3-coder-30b
+    base_url: http://localhost:1234/v1
+    context_length: 65536
+    model_transition_policy: sequential
+```
+
+For a sequential route, Hermes discovers loaded instances, unloads conflicting
+LLM instances through LM Studio's documented REST API, then loads the target
+with `parallel=1` to keep KV-cache concurrency memory-bounded. Embedding models
+are not unloaded. Unloads use a short bounded timeout; model loads use the
+route's longer bounded timeout. Hermes requests and verifies the configured
+context length exactly—if the model's maximum or LM Studio's actual load result
+is below that minimum, that fallback fails and the chain advances. Without this
+option, existing LM Studio loading behavior is unchanged.
+
 ### When Fallback Triggers
 
 The fallback activates automatically when the primary model fails with:
@@ -109,9 +167,9 @@ The fallback activates automatically when the primary model fails with:
 
 When triggered, Hermes:
 
-1. Resolves credentials for the fallback provider
-2. Builds a new API client
-3. Swaps the model, provider, and client in-place
+1. Resolves the complete fallback runtime and credentials
+2. Validates any required local-model transition and builds a new API client
+3. Atomically swaps the model, provider, client, and route-specific request settings
 4. Resets the retry counter and continues the conversation
 
 The switch is seamless — your conversation history, tool calls, and context are preserved. The agent continues from exactly where it left off, just using a different model.

@@ -27,10 +27,16 @@ def _make_pool(provider, n_entries=1):
     entry = MagicMock()
     entry.id = f"{provider}-entry-0"
     entry.runtime_api_key = f"key-{provider}"
-    entry.runtime_base_url = f"https://{provider}.example.com/v1"
+    runtime_base_url = (
+        "https://chatgpt.com/backend-api/codex"
+        if provider == "openai-codex"
+        else f"https://{provider}.example.com/v1"
+    )
+    entry.runtime_base_url = runtime_base_url
     entry.access_token = f"token-{provider}"
-    entry.base_url = f"https://{provider}.example.com/v1"
+    entry.base_url = runtime_base_url
     pool.current.return_value = entry
+    pool.select.return_value = entry
     pool.mark_exhausted_and_rotate.return_value = entry
     return pool
 
