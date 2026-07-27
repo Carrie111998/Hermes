@@ -146,6 +146,167 @@ class TestCliApprovalUi:
 
 
 
+<<<<<<< HEAD
+=======
+        import shutil as _shutil
+
+        with patch("cli.shutil.get_terminal_size",
+                   return_value=_shutil.os.terminal_size((30, 24))):
+            fragments = cli._get_approval_display_fragments()
+
+        rendered = "".join(text for _style, text in fragments)
+        lines = rendered.splitlines()
+        border_width = len(lines[0])
+
+        assert "Show full" in rendered
+        assert "command)" in rendered
+        assert all(len(line) == border_width for line in lines)
+
+    def test_approval_display_renders_heredoc_command_line_by_line(self):
+        cli = _make_cli_stub()
+        heredoc_cmd = (
+            "python3 << 'EOF'\n"
+            "import sqlite3\n"
+            "conn = sqlite3.connect('db')\n"
+            "cur.execute('SELECT * FROM sessions')\n"
+            "print(cur.fetchall())\n"
+            "conn.close()\n"
+            "EOF"
+        )
+        cli._approval_state = {
+            "command": heredoc_cmd,
+            "description": "run a script",
+            "choices": ["once", "session", "always", "deny", "view"],
+            "selected": 0,
+            "response_queue": queue.Queue(),
+            "show_full": True,
+        }
+
+        fragments = cli._get_approval_display_fragments()
+        rendered = "".join(text for _style, text in fragments)
+
+        # No literal backslash-n should leak into the rendered panel text.
+        assert "\\n" not in rendered
+        # Every source line of the heredoc should appear on the panel,
+        # each confined to its own rendered line.
+        for source_line in heredoc_cmd.split("\n"):
+            assert any(source_line in line for line in rendered.splitlines())
+
+    def test_approval_display_one_liner_unaffected_by_heredoc_fix(self):
+        cli = _make_cli_stub()
+        cli._approval_state = {
+            "command": "rm -rf /tmp/some/path",
+            "description": "delete a temp directory",
+            "choices": ["once", "session", "always", "deny", "view"],
+            "selected": 0,
+            "response_queue": queue.Queue(),
+        }
+
+        fragments = cli._get_approval_display_fragments()
+        rendered = "".join(text for _style, text in fragments)
+
+        assert "rm -rf /tmp/some/path" in rendered
+
+    def test_approval_display_shows_full_command_after_view(self):
+        cli = _make_cli_stub()
+        full_command = "sudo dd if=/tmp/in of=/usr/share/keyrings/githubcli-archive-keyring.gpg bs=4M status=progress"
+        cli._approval_state = {
+            "command": full_command,
+            "description": "disk copy",
+            "choices": ["once", "session", "always", "deny"],
+            "selected": 0,
+            "show_full": True,
+            "response_queue": queue.Queue(),
+        }
+
+        fragments = cli._get_approval_display_fragments()
+        rendered = "".join(text for _style, text in fragments)
+
+        assert "..." not in rendered
+        assert "githubcli-" in rendered
+        assert "archive-" in rendered
+        assert "keyring.gpg" in rendered
+        assert "status=progress" in rendered
+
+    def test_approval_display_preserves_command_and_choices_with_long_description(self):
+        """Regression: long tirith descriptions used to push approve/deny off-screen.
+
+        The panel must always render the command and every choice, even when
+        the description would otherwise wrap into 10+ lines. The description
+        gets truncated with a marker instead.
+        """
+        cli = _make_cli_stub()
+        long_desc = (
+            "Security scan — [CRITICAL] Destructive shell command with wildcard expansion: "
+            "The command performs a recursive deletion of log files which may contain "
+            "audit information relevant to active incident investigations, running services "
+            "that rely on log files for state, rotated archives, and other system artifacts. "
+            "Review whether this is intended before approving. Consider whether a targeted "
+            "deletion with more specific filters would better match the intent."
+        )
+        cli._approval_state = {
+            "command": "rm -rf /var/log/apache2/*.log",
+            "description": long_desc,
+            "choices": ["once", "session", "always", "deny"],
+            "selected": 0,
+            "response_queue": queue.Queue(),
+        }
+
+        # Simulate a compact terminal where the old unbounded panel would overflow.
+        import shutil as _shutil
+
+        with patch("cli.shutil.get_terminal_size",
+                   return_value=_shutil.os.terminal_size((100, 20))):
+            fragments = cli._get_approval_display_fragments()
+
+        rendered = "".join(text for _style, text in fragments)
+
+        # Command must be fully visible (rm -rf /var/log/apache2/*.log is short).
+        assert "rm -rf /var/log/apache2/*.log" in rendered
+
+        # Every choice must render — this is the core bug: approve/deny were
+        # getting clipped off the bottom of the panel.
+        assert "Allow once" in rendered
+        assert "Allow for this session" in rendered
+        assert "Add to permanent allowlist" in rendered
+        assert "Deny" in rendered
+
+        # The bottom border must render (i.e. the panel is self-contained).
+        assert rendered.rstrip().endswith("╯")
+
+        # The description gets truncated — marker should appear.
+        assert "(description truncated)" in rendered
+
+    def test_approval_display_skips_description_on_very_short_terminal(self):
+        """On a 12-row terminal, only the command and choices have room.
+
+        The description is dropped entirely rather than partially shown, so the
+        choices never get clipped.
+        """
+        cli = _make_cli_stub()
+        cli._approval_state = {
+            "command": "rm -rf /var/log/apache2/*.log",
+            "description": "recursive delete",
+            "choices": ["once", "session", "always", "deny"],
+            "selected": 0,
+            "response_queue": queue.Queue(),
+        }
+
+        import shutil as _shutil
+
+        with patch("cli.shutil.get_terminal_size",
+                   return_value=_shutil.os.terminal_size((100, 12))):
+            fragments = cli._get_approval_display_fragments()
+
+        rendered = "".join(text for _style, text in fragments)
+
+        # Command visible.
+        assert "rm -rf /var/log/apache2/*.log" in rendered
+        # All four choices visible.
+        for label in ("Allow once", "Allow for this session",
+                      "Add to permanent allowlist", "Deny"):
+            assert label in rendered, f"choice {label!r} missing"
+>>>>>>> c99821448 (fix(cli): split panel text on newline before wrapping (fixes #72580))
 
     def test_approval_display_truncates_giant_command_in_view_mode(self):
         """If the user hits /view on a massive command, choices still render.
