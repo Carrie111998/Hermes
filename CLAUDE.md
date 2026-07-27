@@ -246,6 +246,15 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   `providers.md:807` `Mistral、Hermes）`) — el lookahead del regex no cubre "Hermes X"
   con X≠3/4. 3 headings cambiaron (`faq.md` L15/L39/L745), sin anchors internos que
   las referenciaran. Build limpio: 98/98 warnings idénticos a la baseline.
+- Lote 4 (auto-aprobado, este commit): `user-guide/` sueltos (13) + `secrets/` (2) = 15
+  archivos. Cumplió las 7 condiciones del checklist de auto-aprobación → aplicado,
+  auditado, commiteado y pusheado sin pausa intermedia. Sin `Nous Research`, sin
+  falsos positivos de familia de modelos. 10 headings cambiaron (`configuring-models.md`,
+  `docker.md`, `git-worktrees.md`, `windows-native.md`×2, `windows-wsl-quickstart.md`×5),
+  ninguno con anchor interno real que coincidiera. Preservados: `HermesSweEnv`
+  (benchmark RL), `-HermesHome` (flag instalador), `HermesGateway` (tarea schtasks),
+  `window.__HERMES_SESSION_TOKEN__` (JS global), `Nous Portal`. Build limpio: 98/98
+  warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 
