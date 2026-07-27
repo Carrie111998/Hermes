@@ -51,3 +51,10 @@ action and was not performed by these code changes.
 
 Never push Charterforge-specific commits to the `upstream` remote.
 
+## Durable export identifiers
+
+Authority snapshots and business audit exports advertise canonical
+`charterforge-*-v1` format identifiers. Each also carries an explicit
+`compatibility_format` field containing the inherited Hermes identifier so
+existing tooling can recognize the schema without presenting this project as
+an official Hermes distribution.

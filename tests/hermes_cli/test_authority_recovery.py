@@ -49,6 +49,8 @@ def test_known_good_snapshot_is_consistent_and_tenant_bound(tmp_path):
 
     assert created["valid"] is True
     manifest = created["manifest"]
+    assert manifest["format"] == "charterforge-authority-snapshot-v1"
+    assert manifest["compatibility_format"] == "hermes-authority-snapshot-v1"
     assert manifest["organization_id"] == organization_id
     assert manifest["integrity_run_id"]
     assert manifest["database_sha256"]

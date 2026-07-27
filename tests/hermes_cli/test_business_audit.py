@@ -131,6 +131,8 @@ def test_audit_export_is_tenant_scoped_and_self_verifying(tmp_path):
     )
     package = business_audit.export_audit_package(conn, org_1)
     assert business_audit.verify_audit_package(package)
+    assert package["format"] == "charterforge-business-audit-v1"
+    assert package["compatibility_format"] == "hermes-business-audit-v1"
     assert [row["organization_id"] for row in package["objectives"]] == [org_1]
     assert [row["id"] for row in package["planner_inferences"]] == [inference_id]
     assert package["plans"][0]["id"] == plan_id

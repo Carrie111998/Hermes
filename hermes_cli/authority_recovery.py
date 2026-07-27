@@ -153,7 +153,10 @@ def create_known_good_snapshot(
         (organization_id,),
     ).fetchone()
     manifest: dict[str, Any] = {
-        "format": "hermes-authority-snapshot-v1",
+        "format": "charterforge-authority-snapshot-v1",
+        # Retained so recovery tooling can identify the inherited schema name
+        # without presenting Hermes as the current product identity.
+        "compatibility_format": "hermes-authority-snapshot-v1",
         "snapshot_id": snapshot_id,
         "organization_id": organization_id,
         "created_at": created_at,

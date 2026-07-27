@@ -178,7 +178,9 @@ def export_audit_package(
     if organization is None:
         raise KeyError("organization not found")
     package: dict[str, Any] = {
-        "format": "hermes-business-audit-v1",
+        "format": "charterforge-business-audit-v1",
+        # Existing consumers may key on the inherited export identifier.
+        "compatibility_format": "hermes-business-audit-v1",
         "organization": dict(organization),
         "audit_events": rows(
             """SELECT * FROM business_audit_events WHERE organization_id=?
