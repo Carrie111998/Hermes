@@ -13,7 +13,13 @@ import sys
 import time
 from pathlib import Path
 
-from hermes_cli import compliance_db, finance_db, objectives_db, payment_controls
+from hermes_cli import (
+    accounting_db,
+    compliance_db,
+    finance_db,
+    objectives_db,
+    payment_controls,
+)
 from hermes_cli.payments import (
     InboundPaymentRail,
     OutboundPaymentRail,
@@ -162,6 +168,24 @@ def interrupt() -> None:
             expires_at=int(time.time()) + 3600,
             evidence={"test_provider": True},
         )
+        tax_registration = accounting_db.configure_tax_registration(
+            conn,
+            organization_id=ORG,
+            jurisdiction="US-PA",
+            tax_type="sales",
+            filing_frequency="quarterly",
+            effective_from=int(time.time()) - 1,
+            evidence={"test_tax_registration": True},
+        )
+        tax_rule = accounting_db.configure_tax_rate(
+            conn,
+            registration_id=tax_registration,
+            tax_code="standard",
+            rate_basis_points=600,
+            effective_from=int(time.time()) - 1,
+            authority_source="https://authority.invalid/tax-rate",
+            verified_at=int(time.time()),
+        )
         compliance_db.verify_payment_provider(
             conn,
             organization_id=ORG,
@@ -215,6 +239,7 @@ def interrupt() -> None:
                     "intent_id": uncertain["id"],
                     "account_id": account_id,
                     "instrument_id": instrument_id,
+                    "tax_rule_id": tax_rule,
                 }
             )
             + "\n",
@@ -260,12 +285,14 @@ def recover() -> None:
             organization_id=ORG,
             account_id=str(marker["account_id"]),
             provider=PROVIDER,
-            amount_minor=500,
+            amount_minor=530,
             currency="USD",
             customer={"account": "customer-provider-recovery"},
-            customer_jurisdiction="US",
+            customer_jurisdiction="US-PA",
             purpose="Inbound provider recovery acceptance",
             idempotency_key="provider-recovery-receivable-0001",
+            tax_minor=30,
+            tax_rule_id=str(marker["tax_rule_id"]),
         )
         assert receivable["direction"] == "incoming", receivable
         settled_receivable = service.reconcile(receivable["id"])
@@ -274,16 +301,21 @@ def recover() -> None:
             organization_id=ORG,
             account_id=str(marker["account_id"]),
             provider=PROVIDER,
-            amount_minor=500,
+            amount_minor=530,
             currency="USD",
             customer={"account": "customer-provider-recovery"},
-            customer_jurisdiction="US",
+            customer_jurisdiction="US-PA",
             purpose="Inbound provider recovery acceptance",
             idempotency_key="provider-recovery-receivable-0001",
+            tax_minor=30,
+            tax_rule_id=str(marker["tax_rule_id"]),
         )
         assert retried_receivable["id"] == receivable["id"]
-        assert finance_db.account_balance(conn, str(marker["account_id"])) == 4_500
-        print(json.dumps({"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 500}))
+        assert finance_db.account_balance(conn, str(marker["account_id"])) == 4_530
+        statements = accounting_db.financial_statements(conn, ORG)
+        assert statements["profit_and_loss"]["revenue_minor"] == 500
+        assert statements["tax_liability_minor"] == 30
+        print(json.dumps({"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}))
     finally:
         conn.close()
 
