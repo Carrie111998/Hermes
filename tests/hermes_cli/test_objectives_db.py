@@ -176,6 +176,15 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
         policy_version="test-v1",
         expires_at=int(time.time()) + 60,
     )
+    with pytest.raises(odb.PermitError, match="organization"):
+        odb.consume_permit(
+            conn,
+            permit_id,
+            action_id=action_id,
+            organization_id="organization_other",
+            payload=payload,
+            executor="worker-1",
+        )
 
     with pytest.raises(odb.PermitError, match="payload"):
         odb.consume_permit(

@@ -656,6 +656,9 @@ class ObjectiveRuntime:
                             self.conn,
                             str(permit["id"]),
                             action_id=action_id,
+                            organization_id=db.get_objective(
+                                self.conn, objective_id
+                            ).organization_id,
                             payload=action.payload,
                             executor=self.executor.identity,
                             current_policy_version=self.policy_version,
@@ -1559,6 +1562,9 @@ class ObjectiveRuntime:
                         self.conn,
                         permit_id,
                         action_id=action_id,
+                        organization_id=db.get_objective(
+                            self.conn, objective_id
+                        ).organization_id,
                         payload=action.payload,
                         executor=self.executor.identity,
                         current_policy_version=self.policy_version,

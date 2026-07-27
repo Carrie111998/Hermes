@@ -1096,6 +1096,7 @@ def consume_permit(
     permit_id: str,
     *,
     action_id: str,
+    organization_id: Optional[str] = None,
     payload: Mapping[str, Any],
     executor: str,
     current_policy_version: Optional[str] = None,
@@ -1107,13 +1108,18 @@ def consume_permit(
         if permit["action_id"] != action_id:
             raise PermitError("permit is bound to a different action")
         objective = conn.execute(
-            """SELECT o.status FROM objectives o
-                 JOIN candidate_actions a ON a.objective_id=o.id
+            """SELECT o.status,o.organization_id FROM objectives o
+                JOIN candidate_actions a ON a.objective_id=o.id
                 WHERE a.id=?""",
             (action_id,),
         ).fetchone()
         if objective is None:
             raise PermitError("permit action objective was removed")
+        if (
+            organization_id is not None
+            and str(objective["organization_id"]) != organization_id
+        ):
+            raise PermitError("permit organization does not match objective")
         if objective["status"] not in {"planned", "authorized", "executing"}:
             raise PermitError(
                 f"objective status {objective['status']} no longer admits execution"

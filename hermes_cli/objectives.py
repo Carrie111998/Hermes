@@ -322,10 +322,19 @@ def objectives_command(args: argparse.Namespace) -> int:
                 as_json=True,
             )
         elif command == "consume-permit":
+            organization = conn.execute(
+                """SELECT o.organization_id FROM objectives o
+                   JOIN candidate_actions a ON a.objective_id=o.id
+                   WHERE a.id=?""",
+                (args.action_id,),
+            ).fetchone()
+            if organization is None:
+                raise KeyError("action objective not found")
             db.consume_permit(
                 conn,
                 args.permit_id,
                 action_id=args.action_id,
+                organization_id=str(organization["organization_id"]),
                 payload=_json_value(args.payload, label="payload"),
                 executor=args.executor,
             )
