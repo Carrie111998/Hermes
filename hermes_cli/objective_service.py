@@ -690,6 +690,13 @@ async def gateway_watcher(runner) -> None:
                         consecutive_failures = objective_worker.heartbeat(
                             health_conn, worker_id, cycle_status=outcome.status
                         )
+                        if outcome.status in objective_worker.FAIL_CLOSED_STATUSES:
+                            logger.warning(
+                                "objective runtime safety stop: status=%s reason=%s",
+                                outcome.status,
+                                outcome.reason,
+                            )
+                            return
                         if outcome.status not in {"idle", "disabled"}:
                             logger.info(
                                 "objective runtime: objective=%s status=%s reason=%s",

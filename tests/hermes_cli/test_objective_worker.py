@@ -6,6 +6,11 @@ import time
 from hermes_cli import objective_worker, objectives_db, operational_control
 
 
+def test_supervisor_fail_closed_status_contract_includes_recovery():
+    assert "recovery_blocked" in objective_worker.FAIL_CLOSED_STATUSES
+    assert "runtime_drift_blocked" in objective_worker.FAIL_CLOSED_STATUSES
+
+
 def test_worker_schema_read_preserves_active_transaction(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")
     objective_worker.ensure_schema(conn)

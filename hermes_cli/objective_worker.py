@@ -29,6 +29,21 @@ CREATE INDEX IF NOT EXISTS idx_objective_workers_health
     ON objective_workers(status, heartbeat_at);
 """
 
+# Results that indicate a global runtime safety boundary, rather than a
+# single-objective outcome.  Every supervisor host must stop on these states.
+FAIL_CLOSED_STATUSES = frozenset(
+    {
+        "paused",
+        "disabled",
+        "security_blocked",
+        "configuration_blocked",
+        "runtime_host_blocked",
+        "integrity_blocked",
+        "runtime_drift_blocked",
+        "recovery_blocked",
+    }
+)
+
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     if conn.in_transaction and conn.execute(
@@ -400,20 +415,6 @@ def run_forever(
             pass
     cycles = 0
     exit_code = 0
-    fail_closed_statuses = {
-        "paused",
-        "disabled",
-        "security_blocked",
-        "configuration_blocked",
-        "runtime_host_blocked",
-        "integrity_blocked",
-        "runtime_drift_blocked",
-        # Recovery storage/authority failures are a global safety stop.  Do
-        # not keep polling or attempting new work while recovery evidence is
-        # unavailable; an advisor must repair or explicitly keep the runtime
-        # stopped first.
-        "recovery_blocked",
-    }
     with objectives_db.connect_closing(db_path) as conn:
         from hermes_cli import operational_control
 
@@ -447,7 +448,7 @@ def run_forever(
                         consecutive_failures = heartbeat(
                             conn, worker_id, cycle_status=status
                         )
-                        if status in fail_closed_statuses:
+                        if status in FAIL_CLOSED_STATUSES:
                             shutdown_reason = (
                                 "autonomy_paused"
                                 if status == "paused"
