@@ -50,7 +50,7 @@ TERMINAL_OBJECTIVE_STATUSES = (
 
 _TRANSITIONS = {
     "proposed": {"accepted", "cancelled", "expired", "superseded"},
-    "accepted": {"planned", "cancelled", "expired", "superseded"},
+    "accepted": {"planned", "blocked", "cancelled", "expired", "superseded"},
     "planned": {
         "authorized",
         "blocked",
@@ -328,6 +328,7 @@ class Objective:
     originator: str
     owner: Optional[str]
     expires_at: Optional[int]
+    reaffirmed_at: int
     created_at: int
     updated_at: int
     version: int
@@ -752,10 +753,47 @@ def get_objective(conn: sqlite3.Connection, objective_id: str) -> Objective:
         originator=row["originator"],
         owner=row["owner"],
         expires_at=row["expires_at"],
+        reaffirmed_at=int(row["reaffirmed_at"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         version=row["version"],
     )
+
+
+def reaffirm_objective(
+    conn: sqlite3.Connection,
+    objective_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> Objective:
+    """Refresh standing intent without changing plan or execution authority."""
+    now = _now()
+    with conn:
+        row = conn.execute(
+            "SELECT status,expires_at FROM objectives WHERE id=?",
+            (objective_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"objective not found: {objective_id}")
+        if row["status"] in TERMINAL_OBJECTIVE_STATUSES:
+            raise ObjectiveStateError(
+                f"cannot reaffirm terminal objective {row['status']}"
+            )
+        if row["expires_at"] is not None and int(row["expires_at"]) <= now:
+            raise ObjectiveStateError("cannot reaffirm an expired objective")
+        conn.execute(
+            "UPDATE objectives SET reaffirmed_at=?,updated_at=? WHERE id=?",
+            (now, now, objective_id),
+        )
+        _append_event(
+            conn,
+            objective_id,
+            "reaffirmed",
+            actor,
+            {"reason": reason},
+        )
+    return get_objective(conn, objective_id)
 
 
 def transition_objective(

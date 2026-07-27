@@ -1053,6 +1053,53 @@ def test_proposed_objective_creates_acceptance_handoff(tmp_path):
     ).fetchone()
     assert tuple(wake) == ("objective.accepted", "pending")
 
+
+def test_stale_objective_intent_blocks_until_reaffirmed(tmp_path):
+    conn = db.connect(tmp_path / "authority.db")
+    objective = accepted_objective(conn)
+    conn.execute(
+        "UPDATE objectives SET reaffirmed_at=1 WHERE id=?", (objective.id,)
+    )
+    conn.commit()
+    event_id = db.enqueue_objective_event(
+        conn,
+        objective_id=objective.id,
+        event_type="objective.cadence",
+        payload={"source": "scheduler"},
+    )
+    governed = {**charter(), "reaffirmation_ttl_seconds": 10}
+    loop = runtime.ObjectiveRuntime(
+        conn,
+        planner=Planner([]),
+        executor=Executor(),
+        verifier=Verifier(),
+        charter=governed,
+        policy_version="charter-v1",
+        runtime_id="runtime-stale-intent",
+    )
+
+    outcome = loop.tick()
+
+    assert outcome.event_id == event_id
+    assert outcome.status == "escalated"
+    assert db.get_objective(conn, objective.id).status == "blocked"
+    handoff = operational_control.list_interventions(conn)[0]
+    assert handoff["category"] == "objective_reaffirmation_required"
+    operational_control.resolve_intervention(
+        conn,
+        handoff["id"],
+        option_id="reaffirm",
+        actor="human:advisor",
+        evidence={"reason": "quarterly strategy still applies"},
+    )
+    assert db.get_objective(conn, objective.id).status == "planned"
+    wake = conn.execute(
+        "SELECT status FROM objective_inbox "
+        "WHERE objective_id=? AND event_type='objective.reaffirmed'",
+        (objective.id,),
+    ).fetchone()
+    assert wake["status"] == "pending"
+
 def test_inconclusive_action_verification_creates_evidence_handoff(tmp_path):
     conn = db.connect(tmp_path / "authority.db")
     objective = accepted_objective(conn)

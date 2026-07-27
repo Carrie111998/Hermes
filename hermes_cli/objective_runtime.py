@@ -939,6 +939,39 @@ class ObjectiveRuntime:
             return CycleOutcome(
                 str(event["id"]), objective_id, "expired", "objective expired"
             )
+        reaffirmation_ttl = int(
+            self.charter.get("reaffirmation_ttl_seconds", 0) or 0
+        )
+        if (
+            reaffirmation_ttl > 0
+            and objective.status in {"accepted", "planned", "authorized", "executing"}
+            and int(objective.reaffirmed_at) + reaffirmation_ttl <= now
+        ):
+            reason = "objective intent reaffirmation is stale"
+            db.transition_objective(
+                self.conn,
+                objective_id,
+                "blocked",
+                actor=self.runtime_id,
+                reason=reason,
+            )
+            self._raise_advisor_handoff(
+                objective_id=objective_id,
+                category="objective_reaffirmation_required",
+                summary="Objective intent is stale and requires explicit reaffirmation",
+                context={
+                    "reaffirmed_at": objective.reaffirmed_at,
+                    "reaffirmation_ttl_seconds": reaffirmation_ttl,
+                    "stale_since": int(objective.reaffirmed_at) + reaffirmation_ttl,
+                },
+                options=[
+                    {"id": "reaffirm", "label": "Reaffirm the objective and resume planning"},
+                    {"id": "abandon", "label": "Abandon the stale objective"},
+                ],
+            )
+            return CycleOutcome(
+                str(event["id"]), objective_id, "escalated", reason
+            )
         if objective.status in {
             "closed",
             "cancelled",

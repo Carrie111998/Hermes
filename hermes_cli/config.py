@@ -2496,6 +2496,9 @@ DEFAULT_CONFIG = {
         "permit_ttl_seconds": 300,
         "runtime_interval_seconds": 15,
         "event_claim_ttl_seconds": 300,
+        # Standing objectives must be explicitly reaffirmed before this age;
+        # stale intent is blocked and escalated rather than acted on silently.
+        "reaffirmation_ttl_seconds": 2_592_000,
         # gateway | standalone | either
         "runtime_host": "gateway",
         "operating_cadence": {

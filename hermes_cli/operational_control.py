@@ -578,6 +578,42 @@ def resolve_intervention(
         )
         emitted_objective_event = True
     if (
+        row["category"] == "objective_reaffirmation_required"
+        and option_id == "reaffirm"
+    ):
+        from hermes_cli import objectives_db
+
+        objective_id = str(row["objective_id"] or "")
+        objective = objectives_db.reaffirm_objective(
+            conn,
+            objective_id,
+            actor=actor,
+            reason="; ".join(
+                str(value) for value in evidence.values()
+                if isinstance(value, (str, int, float))
+            ) or "advisor reaffirmed standing intent",
+        )
+        if objective.status == "blocked":
+            objectives_db.transition_objective(
+                conn,
+                objective_id,
+                "planned",
+                actor=actor,
+                reason=f"advisor reaffirmed objective via intervention {intervention_id}",
+            )
+        objectives_db.enqueue_objective_event(
+            conn,
+            objective_id=objective_id,
+            event_type="objective.reaffirmed",
+            payload={
+                "intervention_id": intervention_id,
+                "advisor": actor,
+                "evidence": dict(evidence),
+            },
+            dedupe_key=f"objective-reaffirmed:{objective_id}:{intervention_id}",
+        )
+        emitted_objective_event = True
+    if (
         row["category"] == "authority_insufficient"
         and option_id == "approve_exact_action"
     ):
