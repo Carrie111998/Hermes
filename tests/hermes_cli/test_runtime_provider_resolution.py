@@ -1573,3 +1573,54 @@ def test_named_custom_explicit_base_url_match_keeps_provider_key(monkeypatch):
 
     assert resolved["base_url"].rstrip("/") == "https://trusted.internal/v1"
     assert resolved["api_key"] == secret
+
+
+def test_named_custom_explicit_base_url_path_case_mismatch_drops_provider_key(
+    monkeypatch,
+):
+    """Path case is significant: /v1 and /V1 are different credential scopes."""
+    secret = "PRIVATE-PROVIDER-SECRET"
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "trusted-private",
+                    "base_url": "https://trusted.internal/v1",
+                    "api_key": secret,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("resolve_provider should not run for named custom providers")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom:trusted-private",
+        explicit_base_url="https://trusted.internal/V1",
+    )
+
+    assert resolved["base_url"] == "https://trusted.internal/V1"
+    assert resolved["api_key"] != secret
+    assert resolved["api_key"] == "no-key-required"
+    assert resolved["source"] == "direct-alias"
+
+
+def test_normalize_base_url_for_match_preserves_path_case():
+    """Scheme/host case and trailing slash collapse; path case does not."""
+    assert rp._normalize_base_url_for_match(
+        "HTTPS://Trusted.Internal/v1/"
+    ) == rp._normalize_base_url_for_match("https://trusted.internal/v1")
+    assert rp._normalize_base_url_for_match(
+        "https://trusted.internal/v1"
+    ) != rp._normalize_base_url_for_match("https://trusted.internal/V1")

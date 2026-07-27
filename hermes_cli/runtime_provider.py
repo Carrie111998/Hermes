@@ -991,7 +991,15 @@ def canonical_custom_identity(
 
 
 def _normalize_base_url_for_match(value) -> str:
-    return str(value or "").strip().rstrip("/").lower()
+    """Normalize endpoint identity for credential-scope comparisons.
+
+    Only proven-equivalent forms collapse (scheme/host case, default ports,
+    trailing slash). Path and query remain case-sensitive so ``/v1`` and
+    ``/V1`` stay distinct credential scopes.
+    """
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    return normalize_route_base_url(str(value or "").strip())
 
 
 def _custom_provider_request_overrides(custom_provider: Dict[str, Any]) -> Dict[str, Any]:
