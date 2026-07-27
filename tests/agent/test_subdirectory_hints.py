@@ -340,3 +340,40 @@ class TestExcludedDirectories:
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
         result = tracker.check_tool_call("read_file", {"path": str(normal / "f.py")})
         assert result is not None and "Backend rules" in result
+
+
+class TestTruncationIsAudible:
+    """Silent truncation is how AGENTS.md stopped being fully loaded for months.
+    Dropping content must always leave a trace in the log."""
+
+    def test_oversized_hint_warns(self, tmp_path, caplog):
+        import logging
+        from agent.subdirectory_hints import _MAX_HINT_CHARS
+
+        sub = tmp_path / "big"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("x" * (_MAX_HINT_CHARS + 5_000))
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        with caplog.at_level(logging.WARNING, logger="agent.subdirectory_hints"):
+            result = tracker.check_tool_call("read_file", {"path": str(sub / "f.py")})
+
+        assert result is not None
+        assert any(
+            "dropping" in r.message.lower() and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), caplog.text
+
+    def test_within_limit_stays_quiet(self, tmp_path, caplog):
+        import logging
+
+        sub = tmp_path / "small"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("short and fine")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        with caplog.at_level(logging.WARNING, logger="agent.subdirectory_hints"):
+            result = tracker.check_tool_call("read_file", {"path": str(sub / "f.py")})
+
+        assert result is not None
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

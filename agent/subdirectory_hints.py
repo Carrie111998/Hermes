@@ -255,6 +255,13 @@ class SubdirectoryHintTracker:
                 # Same security scan as startup context loading
                 content = _scan_context_content(content, filename)
                 if len(content) > _MAX_HINT_CHARS:
+                    logger.warning(
+                        "Subdirectory hint %s is %d chars (limit %d) — dropping "
+                        "%d chars from the end. Split the overflow into separate "
+                        "docs and reference them from the hint file.",
+                        hint_path, len(content), _MAX_HINT_CHARS,
+                        len(content) - _MAX_HINT_CHARS,
+                    )
                     content = (
                         content[:_MAX_HINT_CHARS]
                         + f"\n\n[...truncated {filename}: {len(content):,} chars total]"

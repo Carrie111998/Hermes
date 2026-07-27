@@ -1195,3 +1195,33 @@ class TestOpenAIModelExecutionGuidance:
 
 
 
+
+
+class TestContextFileTruncationIsAudible:
+    """A context file that outgrows the cap loses its middle. The in-band marker
+    only reaches the model, so the author needs a log line too (ref: AGENTS.md
+    silently shedding 66% of its content)."""
+
+    def test_oversized_context_file_warns(self, caplog):
+        import logging
+        from agent.prompt_builder import _truncate_content, CONTEXT_FILE_MAX_CHARS
+
+        oversized = "y" * (CONTEXT_FILE_MAX_CHARS * 2)
+        with caplog.at_level(logging.WARNING, logger="agent.prompt_builder"):
+            out = _truncate_content(oversized, "AGENTS.md")
+
+        assert len(out) < len(oversized)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, caplog.text
+        assert "AGENTS.md" in warnings[0].getMessage()
+
+    def test_within_limit_returns_unmodified_and_quiet(self, caplog):
+        import logging
+        from agent.prompt_builder import _truncate_content
+
+        content = "z" * 100
+        with caplog.at_level(logging.WARNING, logger="agent.prompt_builder"):
+            out = _truncate_content(content, "AGENTS.md")
+
+        assert out == content
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

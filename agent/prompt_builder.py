@@ -1299,11 +1299,24 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 # =========================================================================
 
 def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE_MAX_CHARS) -> str:
-    """Head/tail truncation with a marker in the middle."""
+    """Head/tail truncation with a marker in the middle.
+
+    Emits a warning when content is actually dropped.  The in-band marker only
+    reaches the model — an author who lets AGENTS.md grow past the cap gets no
+    signal that the middle of their file stopped being loaded, so the omission
+    has to surface in the log too.
+    """
     if len(content) <= max_chars:
         return content
     head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
     tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
+    dropped = len(content) - head_chars - tail_chars
+    logger.warning(
+        "Context file %s is %d chars (limit %d) — dropping %d chars (%.0f%%) "
+        "from the middle. Split the overflow into separate docs and reference "
+        "them, or the omitted sections will never reach the model.",
+        filename, len(content), max_chars, dropped, 100 * dropped / len(content),
+    )
     head = content[:head_chars]
     tail = content[-tail_chars:]
     marker = f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of {len(content)} chars. Use file tools to read the full file.]\n\n"
