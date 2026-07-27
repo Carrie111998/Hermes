@@ -96,6 +96,15 @@ def evaluate_procurement_from_state(
         (idempotency_key,),
     ).fetchone()
     if existing is not None:
+        if (
+            str(existing["organization_id"]) != organization_id
+            or str(existing["objective_id"]) != objective_id
+            or str(existing["case_json"]) != _json(dict(case))
+            or str(existing["source_evidence_json"]) != _json(dict(source_evidence))
+        ):
+            raise ValueError(
+                "procurement idempotency key was reused with different parameters"
+            )
         return str(existing["id"]), ProcurementDecision(
             str(existing["choice"]),
             str(existing["reason"]),

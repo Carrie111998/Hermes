@@ -171,6 +171,47 @@ def test_state_derived_buy_decision_binds_one_exact_payment(tmp_path):
         )
 
 
+def test_procurement_retry_rejects_case_and_evidence_drift(tmp_path):
+    conn, organization_id, objective = _state(tmp_path)
+    request = {
+        "foss_fit": 0.2,
+        "build_feasible": False,
+        "paid_cost_minor": 500,
+        "paid_required": True,
+        "paid_expected_roi": 2,
+        "persistent_need": True,
+    }
+    evaluate_procurement_from_state(
+        conn,
+        organization_id=organization_id,
+        objective_id=objective.id,
+        case=request,
+        source_evidence={"reference": "vendor-quote:v1"},
+        idempotency_key="procurement-replay-drift-0001",
+        evaluated_by="employee:ceo",
+    )
+    with pytest.raises(ValueError, match="different parameters"):
+        evaluate_procurement_from_state(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective.id,
+            case={**request, "paid_cost_minor": 600},
+            source_evidence={"reference": "vendor-quote:v1"},
+            idempotency_key="procurement-replay-drift-0001",
+            evaluated_by="employee:ceo",
+        )
+    with pytest.raises(ValueError, match="different parameters"):
+        evaluate_procurement_from_state(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective.id,
+            case=request,
+            source_evidence={"reference": "vendor-quote:v2"},
+            idempotency_key="procurement-replay-drift-0001",
+            evaluated_by="employee:ceo",
+        )
+
+
 def test_non_buy_decision_cannot_authorize_software_payment(tmp_path):
     conn, organization_id, objective = _state(tmp_path)
     decision_id, decision = evaluate_procurement_from_state(
