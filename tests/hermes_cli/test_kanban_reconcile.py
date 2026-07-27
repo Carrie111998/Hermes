@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
 import copy
 import hashlib
@@ -258,5 +259,15 @@ def test_cli_requires_canonical_json_and_emits_canonical_result(kanban_home, mon
     assert capsys.readouterr().out == '{"outcome":"invalid-input","schema_version":1}\n'
 
 
-def test_delegated_child_guard_includes_reconcile():
+def test_delegated_child_guard_emits_canonical_reconcile_result(monkeypatch, capsys):
     assert "reconcile" in kc._DELEGATED_CHILD_DENIED_ACTIONS
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    root = argparse.ArgumentParser()
+    subparsers = root.add_subparsers(dest="command")
+    kc.build_parser(subparsers)
+    args = root.parse_args(["kanban", "reconcile", "--input", "-"])
+
+    assert kc.kanban_command(args) == 1
+    captured = capsys.readouterr()
+    assert captured.out == '{"outcome":"permission-denied","schema_version":1}\n'
+    assert captured.err == ""

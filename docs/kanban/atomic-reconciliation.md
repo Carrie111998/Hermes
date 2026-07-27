@@ -6,7 +6,8 @@
 
 - Input is one UTF-8, canonical JSON object terminated by `\n` (sorted keys, no insignificant whitespace), maximum 1 MiB.
 - `--input -` reads stdin; a file path is also accepted.
-- Output is exactly one canonical JSON object.
+- Output is exactly one canonical JSON object, including delegated-child denial
+  (`permission-denied`).
 - Invalid input exits `2`; internal failure exits `1`. Error output is bounded and never reflects paths, bodies, credentials, or exception strings.
 
 ## Schema version 1
@@ -22,7 +23,9 @@ Every request contains:
 
 Create and replace include `task`; replace and cancel include `expected`. The strict field schema is enforced in `kanban_db.reconcile_task` rather than only at the CLI.
 
-`expected` carries the projected task id, its unclaimed status (`triage`, `todo`, or `ready`), previous source revision and lineage, plus null `claim_lock` and `run_id` expectations.
+`expected` carries the projected task id, its unclaimed status (`triage`, `todo`,
+or `ready`), previous source revision, lineage, and idempotency key, plus null
+`claim_lock` and `run_id` expectations.
 
 ## Atomic behavior
 

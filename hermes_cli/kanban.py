@@ -993,6 +993,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     # Fast-fail for clearer CLI UX only. The durable trust boundary is lower in
     # hermes_cli.kanban_db, because children can import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
+        if action == "reconcile":
+            print('{"outcome":"permission-denied","schema_version":1}')
+            return 1
         print(
             "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI",
             file=sys.stderr,
