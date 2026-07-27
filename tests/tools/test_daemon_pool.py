@@ -45,6 +45,22 @@ def test_results_and_initializer_work_like_stdlib():
         pool.shutdown(wait=True)
 
 
+def test_worker_args_match_stdlib_worker_signature():
+    """CPython changes _worker's signature between versions (3.14 moved
+    initializer/initargs into a worker context), so the mirrored spawn
+    path must adapt instead of passing a stale argument tuple."""
+    import inspect
+    import weakref
+    from concurrent.futures.thread import _worker
+
+    expected = len(inspect.signature(_worker).parameters)
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    try:
+        assert len(pool._worker_args(weakref.ref(pool))) == expected
+    finally:
+        pool.shutdown(wait=True)
+
+
 def test_idle_worker_reuse():
     pool = DaemonThreadPoolExecutor(max_workers=4)
     try:
