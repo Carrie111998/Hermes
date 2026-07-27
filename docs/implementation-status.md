@@ -240,6 +240,9 @@ state-directory smoke ran the non-interactive bootstrap twice, observed stable
 IDs, and confirmed configured business status after the second run.
 The built image also passed the complete Docker restart regression: 4 tests,
 including stale PID cleanup and live gateway auto-start after a real restart.
+The live Docker sandbox-provider integration also passed 3 tests, including
+the host-secret non-exfiltration invariant; other remote providers remain
+unvalidated in this environment.
 The broader current-main regression command across resource budgets, company
 email, approvals, operational control, hiring, portfolio, accounting,
 procurement, metered billing, and usage billing passed **76 tests, 0 failed**.

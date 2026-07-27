@@ -101,3 +101,18 @@ Result: **4 passed, 0 failed** in 72.18 seconds. The suite exercises named
 profile registration, intentional stopped-state preservation, stale PID cleanup,
 and live gateway auto-start after a real Docker restart. This is local restart
 evidence, not a disaster-recovery or high-availability drill.
+
+## Sandbox provider validation
+
+The Docker terminal provider was exercised against a live container with:
+
+```bash
+uv run pytest -q -m integration \
+  tests/integration/test_vision_docker_resolve.py
+```
+
+Result: **3 passed, 0 failed** in 6.13 seconds. The checks cover container-only
+workspace reads, root-owned mode-600 reads performed inside the container, and
+refusal to read a same-path host secret through the sandbox boundary. Modal,
+Daytona, SSH, and Singularity providers still require separate environment
+validation before they can be treated as production evidence.

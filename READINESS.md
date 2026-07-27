@@ -124,6 +124,9 @@ tag above.
   uv run pytest -q tests/docker/test_container_restart.py` — **4 passed, 0
   failed** in 72.18 seconds, covering stopped-state preservation, stale PID
   cleanup, profile reconciliation, and live gateway auto-start after restart.
+- Docker sandbox-provider integration: `uv run pytest -q -m integration
+  tests/integration/test_vision_docker_resolve.py` — **3 passed, 0 failed** in
+  6.13 seconds, covering container-only reads and host-secret non-exfiltration.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 
