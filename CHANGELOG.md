@@ -105,6 +105,11 @@
   sandbox dispatch; file and terminal grants do not imply arbitrary Python.
 - The process-separated acceptance now proves ungranted code execution is
   rejected before it can open a host file.
+- Local vision and video reads now require explicit `vision.read` or
+  `video.read` authority bound to the canonical media path; media tools cannot
+  bypass file authorization by opening a path directly.
+- The process-separated acceptance now proves an ordinary file grant cannot
+  invoke the vision resolver on a host path.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

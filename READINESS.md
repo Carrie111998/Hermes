@@ -1219,6 +1219,28 @@ This remains deterministic local-provider evidence and does not establish
 production code-execution isolation, provider credentials, or legal/compliance
 certification.
 
+The governed local-media boundary was validated on current `main` commit
+`de4a266a7aee21ac7d9d34db903fc99ccd0f9831` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/tools/test_image_source.py \
+  tests/tools/test_video_analyze.py \
+  tests/tools/test_vision_tools.py \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_agentic_business_e2e.py
+uv run --extra dev ruff check tools/image_source.py tools/vision_tools.py scripts/delegation_process_acceptance.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **159 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The subordinate's ordinary file grant rejected vision access before
+media bytes were opened. The acceptance image manifest digest was
+`sha256:24ec4d18e0ab5e8d4d63be32c76e60961df67b21e559a22176f6fc0ca6d5b571`.
+This remains deterministic local-provider evidence and does not establish
+production media isolation, provider credentials, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

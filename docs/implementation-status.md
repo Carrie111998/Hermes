@@ -83,6 +83,8 @@ acceptance evidence.
 - Arbitrary Python execution is separately governed by `code.execute` and an
   exact script digest; ordinary file or terminal authority cannot escalate
   into direct `open()` access.
+- Local image and video analysis are separately governed by exact media-read
+  capabilities and canonical targets before bytes are opened.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;
