@@ -448,6 +448,30 @@ def test_subordinate_cannot_subdelegate_without_parent_grant(tmp_path, monkeypat
             expires_at=int(time.time()) + 1_800,
         )
 
+    # A subordinate must not manufacture delegation authority by first
+    # self-dispatching from its standing mandate.  Self-assignment is still a
+    # delegation attempt and therefore requires an active grant from the
+    # manager above it.
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="active parent grant"
+    ):
+        workforce_delegation.create_grant(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective_id,
+            action_id=action_id,
+            manager_employee_id=manager2_id,
+            assignee_profile="morgan-manager",
+            title="Self-issued authority",
+            body="Attempt to create delegation authority from the standing mandate.",
+            capabilities=["web.read"],
+            systems=["web"],
+            toolsets=["web"],
+            skills=["research"],
+            budget_minor=50,
+            expires_at=int(time.time()) + 1_800,
+        )
+
     plan_id = conn.execute(
         "SELECT id FROM plans WHERE objective_id=? ORDER BY version DESC LIMIT 1",
         (objective_id,),

@@ -194,27 +194,30 @@ def create_grant(
     # authority actually issued for this task.  The root founder has no parent
     # grant and is the sole source of initial delegation authority.
     parent_grants: list[sqlite3.Row] = []
-    if manager_employee_id != str(employee["id"]):
-        manager_row = conn.execute(
-            "SELECT manager_id FROM employees WHERE id=?",
-            (manager_employee_id,),
-        ).fetchone()
-        if manager_row is None:
-            raise DelegationError("delegator employee is missing")
-        if manager_row["manager_id"] is not None:
-            parent_grants = conn.execute(
-                """SELECT * FROM employee_task_grants
-                    WHERE organization_id=? AND employee_id=? AND expires_at>?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM employee_task_grant_revocations r
-                           WHERE r.grant_id=employee_task_grants.id
-                      )""",
-                (organization_id, manager_employee_id, now),
-            ).fetchall()
-            if not parent_grants:
-                raise DelegationError(
-                    "subordinate may delegate only from an active parent grant"
-                )
+    manager_row = conn.execute(
+        "SELECT manager_id FROM employees WHERE id=?",
+        (manager_employee_id,),
+    ).fetchone()
+    if manager_row is None:
+        raise DelegationError("delegator employee is missing")
+    # A non-root employee may not turn its standing mandate into delegation
+    # authority by self-dispatching first.  Every grant issued by a
+    # subordinate—including a grant assigned to that same employee—must be
+    # descended from an active grant explicitly issued by its manager.
+    if manager_row["manager_id"] is not None:
+        parent_grants = conn.execute(
+            """SELECT * FROM employee_task_grants
+                WHERE organization_id=? AND employee_id=? AND expires_at>?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM employee_task_grant_revocations r
+                       WHERE r.grant_id=employee_task_grants.id
+                  )""",
+            (organization_id, manager_employee_id, now),
+        ).fetchall()
+        if not parent_grants:
+            raise DelegationError(
+                "subordinate may delegate only from an active parent grant"
+            )
     if int(mandate["starts_at"]) > now or (
         mandate["expires_at"] is not None and int(mandate["expires_at"]) <= now
     ):
