@@ -1,12 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
-  AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS,
-  AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MAX_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
-  audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -379,12 +377,6 @@ describe('Hermes REST helpers', () => {
     })
   })
 
-  it('bounds blocking TTS synthesis timeouts by text length', () => {
-    expect(audioSpeakRequestTimeoutMs('short message')).toBe(AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS)
-    expect(audioSpeakRequestTimeoutMs('x'.repeat(8_000))).toBe(280_000)
-    expect(audioSpeakRequestTimeoutMs('x'.repeat(100_000))).toBe(AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS)
-  })
-
   it('uses an extended timeout for blocking TTS synthesis', async () => {
     api.mockResolvedValueOnce({
       data_url: 'data:audio/mpeg;base64,AA==',
@@ -404,7 +396,7 @@ describe('Hermes REST helpers', () => {
       body: { text: 'Read this aloud' },
       method: 'POST',
       path: '/api/audio/speak',
-      timeoutMs: AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS
+      timeoutMs: DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS
     })
   })
 

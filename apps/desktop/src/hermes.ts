@@ -81,9 +81,10 @@ import type {
 export const STARTUP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
+export const DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS = 180_000
 const MIN_SPEECH_SYNTHESIS_TIMEOUT_SECONDS = 15
 const MAX_SPEECH_SYNTHESIS_TIMEOUT_SECONDS = 1_800
-let speechSynthesisRequestTimeoutMs: null | number = null
+let speechSynthesisRequestTimeoutMs = DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool
@@ -93,19 +94,6 @@ let speechSynthesisRequestTimeoutMs: null | number = null
 // agent-turn ceiling (agent.gateway_timeout = 1800s) so the ack timeout only
 // ever fires when the turn itself would have been abandoned server-side.
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
-export const AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS = 180_000
-export const AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS = 600_000
-const AUDIO_SPEAK_TIMEOUT_MS_PER_CHAR = 35
-
-export function audioSpeakRequestTimeoutMs(text: string): number {
-  const estimated = Math.max(
-    AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS,
-    Math.ceil(String(text || '').length * AUDIO_SPEAK_TIMEOUT_MS_PER_CHAR)
-  )
-
-  return Math.min(AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS, estimated)
-}
-
 export const AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS = 180_000
 export const AUDIO_TRANSCRIBE_MAX_REQUEST_TIMEOUT_MS = 600_000
 // The transcribe payload is the base64 audio data URL itself, so its string
@@ -236,7 +224,7 @@ export class HermesGateway extends JsonRpcGatewayClient {
 
 export function setSpeechSynthesisTimeoutSeconds(value: unknown): void {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    speechSynthesisRequestTimeoutMs = null
+    speechSynthesisRequestTimeoutMs = DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS
 
     return
   }
@@ -1547,7 +1535,7 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
     // TTS blocks until provider synthesis, file read, and base64 encoding
     // finish. Remote providers and large messages regularly exceed the
     // default 15s Electron backend timeout.
-    timeoutMs: speechSynthesisRequestTimeoutMs ?? audioSpeakRequestTimeoutMs(text)
+    timeoutMs: speechSynthesisRequestTimeoutMs
   })
 }
 
