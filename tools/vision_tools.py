@@ -1671,6 +1671,12 @@ async def video_analyze_tool(
         local_path = Path(os.path.expanduser(resolved_url))
 
         if local_path.is_file():
+            from hermes_cli.workforce_delegation import authorize_worker_action
+            authorize_worker_action(
+                capability="video.read",
+                system="localhost",
+                target_resource=os.path.realpath(str(local_path)),
+            )
             from agent.file_safety import raise_if_read_blocked
             raise_if_read_blocked(str(local_path))
             logger.info("Using local video file: %s", video_url)

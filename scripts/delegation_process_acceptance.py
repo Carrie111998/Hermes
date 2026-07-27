@@ -36,11 +36,12 @@ from hermes_cli import verification_evidence
 
 def _worker_code() -> str:
     return r'''
-import json, os
+import asyncio, json, os
 from pathlib import Path
 from hermes_cli import kanban_db, workforce_delegation
 from tools.code_execution_tool import execute_code
 from tools.file_tools import patch_tool, read_file_tool, search_tool, write_file_tool
+from tools.image_source import resolve_image_source, ResolveContext
 
 grant = workforce_delegation.validate_worker_launch(
     enabled_toolsets=["terminal", "files"],
@@ -88,6 +89,18 @@ blocked_code = execute_code(
 )
 if "not granted" not in blocked_code:
     raise RuntimeError(f"ungranted code execution was not rejected: {blocked_code}")
+try:
+    asyncio.run(
+        resolve_image_source(
+            input_path,
+            ResolveContext(task_id=os.environ["HERMES_KANBAN_TASK"]),
+        )
+    )
+except Exception as exc:
+    if "not granted" not in str(exc):
+        raise RuntimeError(f"ungranted vision read was not rejected: {exc}")
+else:
+    raise RuntimeError("ungranted vision read was not rejected")
 with kanban_db.connect_closing(board=os.environ["HERMES_DELEGATION_BOARD"]) as board:
     task_id = os.environ["HERMES_KANBAN_TASK"]
     if not kanban_db.complete_task(

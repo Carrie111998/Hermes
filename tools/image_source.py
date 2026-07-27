@@ -116,6 +116,25 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
     # every other path is read inside the sandbox via exec-read, so a host
     # path outside the caches never yields the host's bytes.
     host_target = _permitted_host_read_target(p, ctx)
+    # Local media reads are privileged file access even though they do not use
+    # the file tools. Governed workers need an explicit, exact vision grant
+    # before host or sandbox bytes are opened; ordinary file/terminal grants do
+    # not imply media inspection.
+    from hermes_cli.workforce_delegation import authorize_worker_action
+    target_resource = (
+        os.path.realpath(str(host_target))
+        if host_target is not None
+        else os.path.normpath(str(p))
+    )
+    authorize_worker_action(
+        capability="vision.read",
+        system=(
+            "localhost"
+            if _is_local_terminal_backend()
+            else str(os.getenv("TERMINAL_ENV") or "sandbox")
+        ),
+        target_resource=target_resource,
+    )
     if host_target is not None and host_target.is_file():
         # Shared credential-read guard (agent.file_safety, #57698): refuse
         # secret-bearing files (.env, auth.json, ...) with an intentional,
