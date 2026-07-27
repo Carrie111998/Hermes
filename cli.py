@@ -7824,6 +7824,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         short_uuid = uuid.uuid4().hex[:6]
         self.session_id = f"{timestamp_str}_{short_uuid}"
         self.conversation_history = []
+        if hasattr(self, "_ponytail_base_system_prompt"):
+            self.system_prompt = self._ponytail_base_system_prompt
+            if getattr(self, "agent", None) is not None:
+                self.agent.ephemeral_system_prompt = self.system_prompt or None
+            for _attr in ("_ponytail_base_system_prompt", "_ponytail_mode"):
+                if hasattr(self, _attr):
+                    delattr(self, _attr)
         self._pending_title = None
         self._resumed = False
         self.reasoning_config = _parse_reasoning_config(
@@ -9614,6 +9621,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
             self._handle_personality_command(cmd_original)
+        elif canonical == "ponytail":
+            self._handle_ponytail_command(cmd_original)
         elif canonical == "pet":
             self._handle_pet_command(cmd_original)
 

@@ -48,16 +48,21 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/compress')).toBe(true)
   })
 
-  it('surfaces /tools, /save, and /personality on the desktop', () => {
+  it('surfaces /tools, /save, /personality, and /ponytail on the desktop', () => {
     expect(isDesktopSlashSuggestion('/tools')).toBe(true)
     expect(isDesktopSlashSuggestion('/save')).toBe(true)
     expect(isDesktopSlashSuggestion('/personality')).toBe(true)
+    expect(isDesktopSlashSuggestion('/ponytail')).toBe(true)
     expect(isDesktopSlashCommand('/tools')).toBe(true)
     expect(isDesktopSlashCommand('/save')).toBe(true)
     expect(isDesktopSlashCommand('/personality')).toBe(true)
+    expect(isDesktopSlashCommand('/ponytail')).toBe(true)
     expect(desktopSlashUnavailableMessage('/tools')).toBeNull()
     expect(desktopSlashUnavailableMessage('/save')).toBeNull()
     expect(desktopSlashUnavailableMessage('/personality')).toBeNull()
+    expect(desktopSlashUnavailableMessage('/ponytail')).toBeNull()
+    expect(resolveDesktopCommand('/ponytail')?.surface).toEqual({ kind: 'exec' })
+    expect(resolveDesktopCommand('/ponytail')?.args).toBe(true)
   })
 
   it('routes /pet through the desktop action handler and drops /pets', () => {
@@ -128,6 +133,7 @@ describe('desktop slash command curation', () => {
       '/debug',
       '/goal',
       '/personality',
+      '/ponytail',
       '/queue',
       '/retry',
       '/rollback',

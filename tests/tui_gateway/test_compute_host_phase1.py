@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,49 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
     # Dead-RC tombstone: malformed env falls back to 8, not the old except-branch 4.
     monkeypatch.setenv("HERMES_TUI_RPC_POOL_WORKERS", "not-an-int")
     assert _default_workers() == 8
+
+
+def test_compute_host_seeds_ponytail_before_first_turn(monkeypatch):
+    from tui_gateway import server
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    sid = "ponytail-seed"
+    agent = types.SimpleNamespace(ephemeral_system_prompt="base")
+
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: agent)
+
+    def _init_session(session_id, key, built_agent, history, **_kwargs):
+        server._sessions[session_id] = {
+            "agent": built_agent,
+            "session_key": key,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "history_version": 0,
+            "personality": "friendly",
+        }
+
+    monkeypatch.setattr(server, "_init_session", _init_session)
+    try:
+        session = host._ensure_server_session(
+            server,
+            {
+                "sid": sid,
+                "session_key": sid,
+                "history": [],
+                "ponytail_mode": "full",
+            },
+        )
+
+        assert agent.ephemeral_system_prompt.startswith("base\n\n")
+        assert agent.ephemeral_system_prompt.count("PONYTAIL MODE ACTIVE") == 1
+        assert session["ponytail_mode"] == "full"
+        assert session[server._PONYTAIL_BASE_PROMPT_KEY] == "base"
+        assert session[server._PONYTAIL_BASE_PERSONALITY_KEY] == "friendly"
+        assert session["history"] == []
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
 
 
 def test_compute_host_frame_protocol_round_trip():

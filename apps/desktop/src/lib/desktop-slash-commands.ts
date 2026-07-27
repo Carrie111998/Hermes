@@ -211,6 +211,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   { name: '/debug', description: 'Create a debug report', surface: exec() },
   { name: '/goal', description: 'Manage the standing goal for this session', surface: exec(), args: true },
   { name: '/personality', description: 'Switch personality for this session', surface: exec(), args: true },
+  { name: '/ponytail', description: 'Switch Ponytail mode for this session', surface: exec(), args: true },
   {
     name: '/pet',
     description: 'Toggle or adopt a petdex mascot (/pet, /pet list, /pet boba)',

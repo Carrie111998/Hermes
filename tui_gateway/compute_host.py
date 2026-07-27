@@ -434,6 +434,8 @@ class ComputeHost:
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
         profile_home = str(frame.get("profile_home") or "")
+        ponytail_level = str(frame.get("ponytail_mode") or "")
+        ponytail_base_prompt = None
         session_db = None
         home_token = None
         secret_token = None
@@ -456,6 +458,20 @@ class ComputeHost:
                 platform_override=frame.get("source"),
                 session_db=session_db,
             )
+            if ponytail_level:
+                from hermes_cli.ponytail_mode import (
+                    PONYTAIL_LEVELS,
+                    compose_ponytail_overlay,
+                )
+
+                if ponytail_level in PONYTAIL_LEVELS:
+                    ponytail_base_prompt = getattr(agent, "ephemeral_system_prompt", None)
+                    agent.ephemeral_system_prompt = compose_ponytail_overlay(
+                        ponytail_base_prompt,
+                        ponytail_level,
+                    )
+                else:
+                    ponytail_level = ""
         finally:
             if home_token is not None:
                 try:
@@ -517,6 +533,10 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if ponytail_level:
+            session["ponytail_mode"] = ponytail_level
+            session[server._PONYTAIL_BASE_PROMPT_KEY] = ponytail_base_prompt
+            session[server._PONYTAIL_BASE_PERSONALITY_KEY] = session.get("personality", "")
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

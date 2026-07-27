@@ -1234,6 +1234,7 @@ class CLICommandsMixin:
                 else:
                     print("(^_^) Personality cleared (session only)")
                 print("  No personality overlay — using base agent behavior.")
+                self._reapply_ponytail_after_personality_change()
             elif personality_name in self.personalities:
                 self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
                 self.agent = None  # Force re-init
@@ -1242,6 +1243,7 @@ class CLICommandsMixin:
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
+                self._reapply_ponytail_after_personality_change()
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
                 print(f"  Available: none, {', '.join(self.personalities.keys())}")
@@ -1262,6 +1264,50 @@ class CLICommandsMixin:
             print()
             print("  Usage: /personality <name>")
             print()
+
+    def _reapply_ponytail_after_personality_change(self):
+        """Keep an active Ponytail overlay additive across personality changes."""
+        level = getattr(self, "_ponytail_mode", "")
+        if not level:
+            return
+        from hermes_cli.ponytail_mode import compose_ponytail_overlay
+
+        self._ponytail_base_system_prompt = getattr(self, "system_prompt", "") or ""
+        self.system_prompt = compose_ponytail_overlay(
+            self._ponytail_base_system_prompt,
+            level,
+        )
+
+    def _handle_ponytail_command(self, cmd: str):
+        """Handle session-scoped Ponytail mode without writing config."""
+        from hermes_cli.ponytail_mode import compose_ponytail_overlay, normalize_ponytail_level
+
+        parts = cmd.split(maxsplit=1)
+        try:
+            level = normalize_ponytail_level(parts[1] if len(parts) > 1 else "")
+        except ValueError as exc:
+            print(f"(._.) {exc}")
+            return
+
+        if level == "off":
+            if hasattr(self, "_ponytail_base_system_prompt"):
+                self.system_prompt = self._ponytail_base_system_prompt
+            for attr in ("_ponytail_base_system_prompt", "_ponytail_mode"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+        else:
+            if not hasattr(self, "_ponytail_base_system_prompt"):
+                self._ponytail_base_system_prompt = getattr(self, "system_prompt", "") or ""
+            self.system_prompt = compose_ponytail_overlay(
+                self._ponytail_base_system_prompt,
+                level,
+            )
+            self._ponytail_mode = level
+
+        agent = getattr(self, "agent", None)
+        if agent is not None:
+            agent.ephemeral_system_prompt = getattr(self, "system_prompt", "") or ""
+        print(f"Ponytail mode: {level}")
 
     def _handle_pet_command(self, cmd: str):
         """Toggle, browse, or adopt a petdex mascot.

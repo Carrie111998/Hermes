@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from utils import is_truthy_value
+from hermes_cli.ponytail_mode import PONYTAIL_ARGS_HINT, PONYTAIL_COMMAND_LEVELS
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
+    CommandDef("ponytail", "Toggle session-scoped Ponytail execution discipline", "Configuration",
+               cli_only=True, args_hint=PONYTAIL_ARGS_HINT,
+               subcommands=PONYTAIL_COMMAND_LEVELS),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
     CommandDef("battery", "Toggle a color-coded battery indicator in the status bar",

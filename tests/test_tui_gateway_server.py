@@ -6325,6 +6325,143 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     assert ("session.info", "sid", {"model": "?"}) in emits
 
 
+def test_live_ponytail_command_is_session_scoped_and_restores_prior_overlay(monkeypatch):
+    agent = types.SimpleNamespace(
+        ephemeral_system_prompt="You are concise.", _cached_system_prompt="cached"
+    )
+    session = _session(agent=agent, history=[], history_version=2)
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {"model": "test"})
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda *_args: pytest.fail("Ponytail mode must not write profile config"),
+    )
+
+    try:
+        enabled = server._live_slash_command_output("sid", session, "ponytail", "full")
+
+        assert enabled == "Ponytail mode: full"
+        assert session["ponytail_mode"] == "full"
+        assert agent.ephemeral_system_prompt.startswith("You are concise.\n\n")
+        assert "smallest correct solution" in agent.ephemeral_system_prompt
+        assert agent._cached_system_prompt == "cached"
+        assert session["history"] == []
+        assert session["history_version"] == 2
+
+        prompt_before_invalid = agent.ephemeral_system_prompt
+        invalid = server._live_slash_command_output("sid", session, "ponytail", "turbo")
+        assert invalid == "Usage: /ponytail [lite|full|ultra|off]"
+        assert session["ponytail_mode"] == "full"
+        assert agent.ephemeral_system_prompt == prompt_before_invalid
+        assert session["history"] == []
+        assert session["history_version"] == 2
+
+        session["running"] = True
+        busy = server._live_slash_command_output("sid", session, "ponytail", "ultra")
+        assert busy == "session busy — /interrupt the current turn before running /ponytail"
+        assert session["ponytail_mode"] == "full"
+
+        session["running"] = False
+        server._apply_base_personality_to_session(
+            "sid", session, "You are warm.", "friendly"
+        )
+        assert agent.ephemeral_system_prompt.startswith("You are warm.\n\n")
+        assert agent.ephemeral_system_prompt.count("PONYTAIL MODE ACTIVE") == 1
+        assert len(session["history"]) == 1
+        assert "PONYTAIL MODE ACTIVE" not in session["history"][0]["content"]
+        assert session["history_version"] == 3
+
+        disabled = server._live_slash_command_output("sid", session, "ponytail", "off")
+        assert disabled == "Ponytail mode: off"
+        assert "ponytail_mode" not in session
+        assert session["personality"] == "friendly"
+        assert agent.ephemeral_system_prompt == "You are warm."
+        assert agent._cached_system_prompt == "cached"
+        assert len(session["history"]) == 1
+        assert session["history_version"] == 3
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize("compute_host", [False, True])
+def test_deferred_ponytail_state_reaches_first_agent_without_host_control(
+    monkeypatch, compute_host
+):
+    session = _session(agent=None, history=[], history_version=4)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: compute_host)
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        lambda *_args, **_kwargs: pytest.fail("deferred sessions have no host to control"),
+    )
+
+    output = server._live_slash_command_output("sid", session, "ponytail", "full")
+
+    assert output == "Ponytail mode: full"
+    assert session["ponytail_mode"] == "full"
+    assert session["history"] == []
+    assert session["history_version"] == 4
+    if compute_host:
+        frame = server._compute_host_turn_frame("rid", "sid", session, "hello")
+        assert frame["ponytail_mode"] == "full"
+
+
+def test_compute_host_ponytail_invalid_and_missing_session_preserve_parent_state(
+    monkeypatch,
+):
+    session = _session(agent=None, history=[], history_version=4)
+    session.update(
+        {
+            "_compute_host_active": True,
+            "ponytail_mode": "full",
+            server._PONYTAIL_BASE_PROMPT_KEY: "base",
+            server._PONYTAIL_BASE_PERSONALITY_KEY: "friendly",
+        }
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        lambda *_args, **_kwargs: {
+            "type": "control.ack",
+            "output": "Usage: /ponytail [lite|full|ultra|off]",
+        },
+    )
+
+    invalid = server._live_slash_command_output("sid", session, "ponytail", "turbo")
+
+    assert invalid == "Usage: /ponytail [lite|full|ultra|off]"
+    assert session["ponytail_mode"] == "full"
+
+    session["running"] = True
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        lambda *_args, **_kwargs: {"type": "control.error", "message": "session not found"},
+    )
+
+    busy = server._live_slash_command_output("sid", session, "ponytail", "off")
+
+    assert busy == "session busy — /interrupt the current turn before running /ponytail"
+    assert session["ponytail_mode"] == "full"
+
+    session["running"] = False
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        lambda *_args, **_kwargs: {"type": "control.ack", "output": "Ponytail mode: off"},
+    )
+
+    disabled = server._live_slash_command_output("sid", session, "ponytail", "off")
+
+    assert disabled == "Ponytail mode: off"
+    assert "ponytail_mode" not in session
+    assert server._PONYTAIL_BASE_PROMPT_KEY not in session
+    assert server._PONYTAIL_BASE_PERSONALITY_KEY not in session
+
+
 def test_compress_session_history_passes_force():
     """_compress_session_history is manual-only (session.compress RPC, slash
     compress/compact, slash-worker mirror) — it must bypass the

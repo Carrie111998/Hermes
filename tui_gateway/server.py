@@ -1404,6 +1404,7 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        "ponytail_mode": session.get("ponytail_mode"),
         "source": _session_source(session),
         "attached_images": attached_images,
     }
@@ -5225,7 +5226,13 @@ def _prompt_text(value) -> str:
 
 
 def _apply_personality_to_session(
-    sid: str, session: dict, new_prompt: str, personality: str = ""
+    sid: str,
+    session: dict,
+    new_prompt: str,
+    personality: str = "",
+    *,
+    add_history_marker: bool = True,
+    history_prompt: str | None = None,
 ) -> tuple[bool, dict | None]:
     """Apply a personality change to an existing session without resetting history.
 
@@ -5234,9 +5241,9 @@ def _apply_personality_to_session(
     (ephemeral_system_prompt is appended at API-call time, not baked into the
     cache), which preserves prompt-cache hits.
 
-    Also injects a system-role marker into the conversation history so the model
-    knows to pivot its style from this point forward (without this, LLMs tend to
-    continue the tone established by earlier messages in the transcript).
+    Personality changes also inject a system-role marker into conversation
+    history so the model pivots its style. Callers applying orthogonal overlays
+    can disable that marker without changing the ephemeral prompt path.
 
     Returns (history_reset, info) — history_reset is always False since we
     preserve the conversation.
@@ -5248,26 +5255,105 @@ def _apply_personality_to_session(
     agent = session.get("agent")
     if agent:
         agent.ephemeral_system_prompt = new_prompt or None
-        # Inject a pivot marker into history so the model sees the change point.
-        # This prevents it from pattern-matching its prior style.
-        if new_prompt:
-            marker = (
-                "[System: The user has changed the assistant's personality. "
-                "From this point forward, adopt the following persona and respond "
-                f"accordingly: {new_prompt}]"
-            )
-        else:
-            marker = (
-                "[System: The user has cleared the personality overlay. "
-                "From this point forward, respond in your normal default style.]"
-            )
-        with session["history_lock"]:
-            session["history"].append({"role": "user", "content": marker})
-            session["history_version"] = int(session.get("history_version", 0)) + 1
+        if add_history_marker:
+            # Inject a pivot marker into history so the model sees the change point.
+            # This prevents it from pattern-matching its prior style.
+            marker_prompt = new_prompt if history_prompt is None else history_prompt
+            if marker_prompt:
+                marker = (
+                    "[System: The user has changed the assistant's personality. "
+                    "From this point forward, adopt the following persona and respond "
+                    f"accordingly: {marker_prompt}]"
+                )
+            else:
+                marker = (
+                    "[System: The user has cleared the personality overlay. "
+                    "From this point forward, respond in your normal default style.]"
+                )
+            with session["history_lock"]:
+                session["history"].append({"role": "user", "content": marker})
+                session["history_version"] = int(session.get("history_version", 0)) + 1
         info = _session_info(agent)
         _emit("session.info", sid, info)
         return False, info
     return False, None
+
+
+_PONYTAIL_BASE_PROMPT_KEY = "_ponytail_base_ephemeral_system_prompt"
+_PONYTAIL_BASE_PERSONALITY_KEY = "_ponytail_base_personality"
+
+
+def _apply_ponytail_to_session(sid: str, session: dict, raw_level: str = "") -> str:
+    """Apply a session-scoped Ponytail overlay without mutating history."""
+    if not session:
+        return "no active session for /ponytail"
+
+    from hermes_cli.ponytail_mode import compose_ponytail_overlay, normalize_ponytail_level
+
+    try:
+        level = normalize_ponytail_level(raw_level)
+    except ValueError as exc:
+        return str(exc)
+
+    agent = session.get("agent")
+    if level == "off":
+        had_base = _PONYTAIL_BASE_PROMPT_KEY in session
+        base_prompt = session.pop(_PONYTAIL_BASE_PROMPT_KEY, None)
+        base_personality = session.pop(
+            _PONYTAIL_BASE_PERSONALITY_KEY,
+            session.get("personality", ""),
+        )
+        session.pop("ponytail_mode", None)
+        if agent is not None and had_base:
+            _apply_personality_to_session(
+                sid,
+                session,
+                "" if base_prompt is None else str(base_prompt),
+                str(base_personality or ""),
+                add_history_marker=False,
+            )
+        return "Ponytail mode: off"
+
+    if agent is None:
+        session.setdefault(_PONYTAIL_BASE_PERSONALITY_KEY, session.get("personality", ""))
+        session["ponytail_mode"] = level
+        return f"Ponytail mode: {level}"
+
+    if _PONYTAIL_BASE_PROMPT_KEY not in session:
+        session[_PONYTAIL_BASE_PROMPT_KEY] = getattr(agent, "ephemeral_system_prompt", None)
+        session[_PONYTAIL_BASE_PERSONALITY_KEY] = session.get("personality", "")
+
+    new_prompt = compose_ponytail_overlay(session.get(_PONYTAIL_BASE_PROMPT_KEY), level)
+    session["ponytail_mode"] = level
+    _apply_personality_to_session(
+        sid,
+        session,
+        new_prompt,
+        str(session.get(_PONYTAIL_BASE_PERSONALITY_KEY) or ""),
+        add_history_marker=False,
+    )
+    return f"Ponytail mode: {level}"
+
+
+def _apply_base_personality_to_session(
+    sid: str, session: dict, new_prompt: str, personality: str = ""
+) -> tuple[bool, dict | None]:
+    """Apply a personality while preserving an active Ponytail overlay."""
+    base_prompt = new_prompt
+    level = str(session.get("ponytail_mode") or "")
+    if level:
+        from hermes_cli.ponytail_mode import compose_ponytail_overlay
+
+        session[_PONYTAIL_BASE_PROMPT_KEY] = new_prompt or None
+        session[_PONYTAIL_BASE_PERSONALITY_KEY] = personality
+        new_prompt = compose_ponytail_overlay(new_prompt, level)
+    return _apply_personality_to_session(
+        sid,
+        session,
+        new_prompt,
+        personality,
+        history_prompt=base_prompt,
+    )
 
 
 def _cfg_max_turns(cfg: dict, default: int) -> int:
@@ -5495,6 +5581,9 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        session.pop("ponytail_mode", None)
+        session.pop(_PONYTAIL_BASE_PROMPT_KEY, None)
+        session.pop(_PONYTAIL_BASE_PERSONALITY_KEY, None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
@@ -5728,6 +5817,16 @@ def _make_agent(
             system_prompt = "\n\n".join(
                 part for part in (system_prompt, skills_prompt) if part
             ).strip()
+    current_session = _sessions.get(sid) or {}
+    if current_session.get("ponytail_mode"):
+        from hermes_cli.ponytail_mode import compose_ponytail_overlay
+
+        if _PONYTAIL_BASE_PROMPT_KEY not in current_session:
+            current_session[_PONYTAIL_BASE_PROMPT_KEY] = system_prompt or None
+        system_prompt = compose_ponytail_overlay(
+            current_session.get(_PONYTAIL_BASE_PROMPT_KEY),
+            str(current_session.get("ponytail_mode") or "full"),
+        )
     # Prefer a per-session model override (set by a prior in-session /model
     # switch) over global config/env resolution. Resume-time stored sessions may
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
@@ -13817,7 +13916,7 @@ def _(rid, params: dict) -> dict:
                 _write_config_key("display.personality", pname)
                 _write_config_key("agent.system_prompt", new_prompt)
                 nv = str(value or "none")
-                history_reset, info = _apply_personality_to_session(
+                history_reset, info = _apply_base_personality_to_session(
                     sid_key, session, new_prompt, pname
                 )
             else:
@@ -16639,6 +16738,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "effort",
         "history",
         "models",
+        "ponytail",
         "prompt",
         "rename",
         "status",
@@ -16839,6 +16939,12 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         session is not None and _session_uses_compute_host(session)
     ):
         return None
+    if name == "ponytail":
+        if session is None:
+            return "no active session for /ponytail"
+        return _mirror_slash_side_effects(
+            sid, session, f"/ponytail {arg}".strip()
+        )
     if name == "compress":
         if session is None:
             return "no active session for /compress"
@@ -16905,9 +17011,21 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     # worker thread running agent.run_conversation is using.  Parity
     # with the session.compress / session.undo guards and the gateway
     # runner's running-agent /model guard.
-    _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress"}
-    if _session_uses_compute_host(session) and name in _MUTATES_WHILE_RUNNING:
-        route_name = f"slash.{name}"
+    _MUTATES_WHILE_RUNNING = {
+        "model",
+        "personality",
+        "ponytail",
+        "prompt",
+        "compress",
+    }
+    if (
+        _session_uses_compute_host(session)
+        and name in _MUTATES_WHILE_RUNNING
+        and not (name == "ponytail" and not session.get("_compute_host_active"))
+    ):
+        # Ponytail is another ephemeral/personality prompt mutation. Reuse the
+        # existing classified compute-host route instead of widening its API.
+        route_name = "slash.personality" if name == "ponytail" else f"slash.{name}"
         try:
             ack = _send_compute_host_control(
                 sid,
@@ -16918,8 +17036,25 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         except Exception as exc:
             return f"compute-host {route_name} failed: {exc}"
         if ack.get("type") in {"control.error", "error"}:
+            if name == "ponytail" and ack.get("message") == "session not found":
+                if session.get("running"):
+                    return "session busy — /interrupt the current turn before running /ponytail"
+                return _apply_ponytail_to_session(sid, session, arg)
             return str(ack.get("message") or f"compute-host {route_name} failed")
         _apply_compute_host_metadata_mirror(session, ack)
+        if name == "ponytail":
+            from hermes_cli.ponytail_mode import normalize_ponytail_level
+
+            try:
+                level = normalize_ponytail_level(arg)
+            except ValueError:
+                return str(ack.get("output") or "")
+            if level == "off":
+                session.pop("ponytail_mode", None)
+                session.pop(_PONYTAIL_BASE_PROMPT_KEY, None)
+                session.pop(_PONYTAIL_BASE_PERSONALITY_KEY, None)
+            else:
+                session["ponytail_mode"] = level
         return str(ack.get("output") or "")
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
@@ -16928,12 +17063,22 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
             return result.get("warning", "")
+        elif name == "ponytail":
+            return _apply_ponytail_to_session(sid, session, arg)
         elif name == "personality" and arg and agent:
             pname, new_prompt = _validate_personality(arg, _load_cfg())
-            _apply_personality_to_session(sid, session, new_prompt, pname)
+            _apply_base_personality_to_session(sid, session, new_prompt, pname)
         elif name == "prompt" and agent:
             cfg = _load_cfg()
             new_prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", ""))
+            if session.get("ponytail_mode"):
+                from hermes_cli.ponytail_mode import compose_ponytail_overlay
+
+                session[_PONYTAIL_BASE_PROMPT_KEY] = new_prompt or None
+                new_prompt = compose_ponytail_overlay(
+                    new_prompt,
+                    str(session.get("ponytail_mode") or "full"),
+                )
             agent.ephemeral_system_prompt = new_prompt or None
             agent._cached_system_prompt = None
         elif name == "compress" and agent:

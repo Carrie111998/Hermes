@@ -86,6 +86,12 @@ class TestCommandRegistry:
             "ultra",
         )
 
+    def test_ponytail_modes_are_registered_for_cli_surfaces(self):
+        ponytail = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "ponytail")
+        assert ponytail.cli_only is True
+        assert ponytail.subcommands == ("lite", "full", "ultra", "off")
+        assert SUBCOMMANDS["/ponytail"] == ["lite", "full", "ultra", "off"]
+
     def test_cli_only_and_gateway_only_are_mutually_exclusive(self):
         for cmd in COMMAND_REGISTRY:
             assert not (cmd.cli_only and cmd.gateway_only), \

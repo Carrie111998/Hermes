@@ -70,6 +70,35 @@ class TestCLIPersonalityNone:
         assert "none" in output.lower()
 
 
+class TestCLIPonytailMode:
+
+    def test_mode_is_additive_session_only_and_reversible(self):
+        from cli import HermesCLI
+
+        cli = HermesCLI.__new__(HermesCLI)
+        cli.system_prompt = "You are concise."
+        cli.agent = MagicMock()
+        cli.agent.ephemeral_system_prompt = "You are concise."
+        cli.console = MagicMock()
+
+        cli._handle_ponytail_command("/ponytail full")
+
+        assert cli.system_prompt.startswith("You are concise.\n\n")
+        assert "smallest correct solution" in cli.system_prompt
+        assert cli.agent.ephemeral_system_prompt == cli.system_prompt
+
+        cli.personalities = {"friendly": "You are warm."}
+        with patch("cli.save_config_value", return_value=True):
+            cli._handle_personality_command("/personality friendly")
+
+        assert cli.system_prompt.startswith("You are warm.\n\n")
+        assert cli._ponytail_base_system_prompt == "You are warm."
+
+        cli._handle_ponytail_command("/ponytail off")
+
+        assert cli.system_prompt == "You are warm."
+
+
 # ── Gateway tests ──────────────────────────────────────────────────────────
 
 class TestGatewayPersonalityNone:
