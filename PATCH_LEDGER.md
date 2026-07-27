@@ -87,6 +87,27 @@ resolution has already destroyed work in this repository once. That is why
 `scripts/verify_protected_behavior.py` simulates exactly that loss, and why the
 updater refuses `git checkout --ours/--theirs` on a protected file.
 
+## Rehearsal result — 2026-07-27, against 114 upstream commits
+
+`python scripts/safe_update.py` merged `origin/main` in a throwaway worktree:
+
+```
+[5] 1 conflict(s):  gateway/run.py
+[6] ok — 11 protected files retained local content
+RESULT: DO NOT APPLY — review above
+```
+
+So the update is **one hand-resolved conflict away** from applying, and it is
+in `gateway/run.py` — which carries local auto-dispatch and failure-successor
+work (`2484ec0a0`, `6cd47d16e`, `d4f3806a0`) and had uncommitted edits from the
+concurrent session at the time. Resolve it **by hunk**; taking either whole side
+is precisely `6ab037f1e`.
+
+Every other protected file merged without losing local content. Steps 7–9
+(contract suite, regression harness, targeted suites) were deliberately skipped
+because the tree was conflicted — re-run them in the rehearsal worktree once the
+conflict is resolved, before applying for real.
+
 ## Merge-sensitive regions
 
 Re-check by hand after any upstream merge:

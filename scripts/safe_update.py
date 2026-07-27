@@ -62,6 +62,10 @@ PROTECTED_FILES = [
     "tools/delegate_tool.py",
     "tools/daemon_pool.py",
     "gateway/worker_bridge_watchers.py",
+    # Carries local auto-dispatch and failure-successor work (2484ec0a0,
+    # 6cd47d16e, d4f3806a0) and is the ONE file that actually conflicted in the
+    # 2026-07-27 rehearsal against 114 upstream commits.
+    "gateway/run.py",
 ]
 
 REGRESSION_SUITES = [

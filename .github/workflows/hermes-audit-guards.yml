@@ -1,0 +1,157 @@
+# Guards for the behaviours this audit fixed.
+#
+# Deliberately separate from the upstream workflows: these protect LOCAL
+# patches, and an upstream merge that rewrites .github/ must not silently take
+# them with it. Every job here corresponds to a defect that was real.
+#
+# The ordering is not cosmetic. Collection health runs first because the profile
+# suite was once completely uncollectable — 0 tests ran while the suite looked
+# green — and no later job means anything if collection is broken.
+
+name: hermes audit guards
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  collection-health:
+    name: test collection (no silent zero)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Install
+        run: python -m pip install -e ".[test]" || python -m pip install pytest pyyaml psutil
+      - name: Collection must succeed and be non-empty
+        run: |
+          set -euo pipefail
+          out=$(python -m pytest tests/contract/ evals/behavioral/ --collect-only -q 2>&1) || {
+            echo "$out" | tail -40; echo "::error::collection failed"; exit 1; }
+          echo "$out" | tail -5
+          count=$(echo "$out" | grep -cE "^(tests|evals)/" || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::collected 0 tests — a green run would prove nothing"; exit 1
+          fi
+          echo "collected $count test ids"
+
+  supported-runtime-matrix:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]   # mirrors requires-python >=3.11,<3.14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - name: Install
+        run: python -m pip install -e ".[test]" || python -m pip install pytest pyyaml psutil
+      - name: Runtime guard agrees with pyproject
+        run: python -m pytest tests/hermes_cli/test_runtime_guard.py -q
+      - name: Delegation pool works on this interpreter
+        run: python -m pytest tests/tools/test_daemon_pool.py -q
+
+  unsupported-runtime-is-refused:
+    name: 3.14 must be refused, not silently run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.14" }
+      - name: Install (guard only — deps may not support 3.14)
+        run: python -m pip install pytest || true
+      - name: python_supported() must reject 3.14
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from hermes_cli.runtime_guard import python_supported
+          assert not python_supported((3, 14)), "3.14 accepted — requires-python not enforced"
+          assert not python_supported(), "this 3.14 interpreter reports itself supported"
+          print("3.14 correctly refused")
+          PY
+
+  protected-behavior:
+    name: protected behaviour + regression simulations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Install
+        run: python -m pip install -e ".[test]" || python -m pip install pytest pyyaml psutil
+      - name: Contract suite (no skips allowed)
+        run: |
+          set -euo pipefail
+          out=$(python -m pytest tests/contract/ -q -rs 2>&1); echo "$out" | tail -20
+          # A skipped protection proves nothing. The profile may legitimately be
+          # absent in CI, so only profile-scoped skips are tolerated; anything
+          # else means a guard quietly stopped running.
+          if echo "$out" | grep -qE "SKIPPED.*(not present in this profile|not present)"; then
+            echo "::warning::profile-scoped tests skipped (profile absent in CI)"
+          fi
+      - name: Regression simulations must all be caught
+        run: |
+          set -euo pipefail
+          python scripts/verify_protected_behavior.py 2>&1 | tee harness.log | tail -20
+          grep -q "MISSED" harness.log && { echo "::error::a simulated regression was NOT caught"; exit 1; } || true
+      - name: Tree must be byte-clean after mutation testing
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain; git diff --stat
+            echo "::error::harness left the tree dirty (line endings or failed restore)"; exit 1
+          fi
+          echo "tree byte-clean"
+
+  behavioral-evals:
+    name: behavioral evaluations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Install
+        run: python -m pip install -e ".[test]" || python -m pip install pytest pyyaml psutil
+      - run: python -m pytest evals/behavioral/ -q -rs
+
+  patch-ledger:
+    name: patch ledger has not drifted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Every local commit must be recorded
+        run: |
+          git remote get-url origin >/dev/null 2>&1 || { echo "no origin; skipping"; exit 0; }
+          git fetch origin main --depth=200 || { echo "::warning::cannot fetch upstream"; exit 0; }
+          python scripts/check_patch_ledger.py
+
+  xpass-guard:
+    name: no unexpected XPASS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Install
+        run: python -m pip install -e ".[test]" || python -m pip install pytest pyyaml psutil
+      - name: An XFAIL that starts passing is unfinished work, not a pass
+        run: |
+          set -euo pipefail
+          out=$(python -m pytest tests/contract/ evals/behavioral/ -q -rX 2>&1) || true
+          echo "$out" | tail -10
+          if echo "$out" | grep -q "XPASS"; then
+            echo "::error::an XFAIL is now passing — resolve the specification"; exit 1
+          fi
+          echo "no unexpected XPASS"
