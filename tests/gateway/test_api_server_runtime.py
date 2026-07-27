@@ -5,7 +5,9 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,7 @@ from gateway.api_server_runtime import (
     _pin_run_model,
     _resume_runtime_history,
     _runtime_attachment_parts,
+    _runtime_video_paths,
     _runtime_tool_middleware,
 )
 
@@ -197,7 +200,7 @@ def test_pin_run_model_uses_canonical_switch_and_disables_fallbacks():
     assert agent._fallback_activated is False
 
 
-def test_runtime_attachment_parts_preserve_image_pixels_and_require_video_frames():
+def test_runtime_attachment_parts_preserve_image_pixels():
     image = base64.b64encode(b"png-bytes").decode()
     parts = _runtime_attachment_parts([{
         "role": "product_photo",
@@ -215,7 +218,38 @@ def test_runtime_attachment_parts_preserve_image_pixels_and_require_video_frames
         "image_url": {"url": f"data:image/png;base64,{image}"},
     }]
 
-    with pytest.raises(ValueError, match="representative image frame"):
+
+
+def test_runtime_attachment_parts_materialize_video_for_native_analysis(tmp_path):
+    parts = _runtime_attachment_parts([{
+        "role": "user_upload",
+        "asset_id": "asset_video",
+        "filename": "../../clip.mp4",
+        "media_type": "video",
+        "mime_type": "video/mp4",
+        "data": base64.b64encode(b"video-bytes").decode(),
+    }], video_dir=tmp_path)
+
+    paths = _runtime_video_paths(parts)
+    assert len(paths) == 1
+    video_path = paths[0]
+    assert video_path.parent == tmp_path
+    assert video_path.name == hashlib.sha256(b"asset_video").hexdigest()[:24] + ".mp4"
+    assert video_path.read_bytes() == b"video-bytes"
+    assert parts == [{
+        "type": "text",
+        "text": (
+            f"[Attached video: ../../clip.mp4; role=user_upload; asset_id=asset_video. "
+            f"Analyze the complete source video with video_analyze using video_url={video_path} "
+            "and include_transcript=true. "
+            "Representative frames, when present, are supplementary rather than the source of truth.]"
+        ),
+        "_runtime_video_path": str(video_path),
+    }]
+
+
+def test_runtime_attachment_parts_require_private_video_directory():
+    with pytest.raises(ValueError, match="video materialization directory"):
         _runtime_attachment_parts([{
             "role": "user_upload",
             "asset_id": "asset_video",
@@ -224,6 +258,48 @@ def test_runtime_attachment_parts_preserve_image_pixels_and_require_video_frames
             "mime_type": "video/mp4",
             "data": base64.b64encode(b"video-bytes").decode(),
         }])
+
+
+def test_runtime_video_tool_is_scoped_to_materialized_attachment(tmp_path):
+    allowed = tmp_path / "asset_video.mp4"
+    allowed.write_bytes(b"video")
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_video",
+        asyncio.new_event_loop(),
+        queue,
+        [],
+        1_000,
+        "agent_video",
+        allowed_video_paths={str(allowed)},
+    )
+    runtime_module._SESSIONS["agent_video"] = session
+    try:
+        seen = []
+        accepted = _runtime_tool_middleware(
+            tool_name="video_analyze",
+            args={"video_url": str(allowed), "question": "Summarize it"},
+            session_id="agent_video",
+            tool_call_id="video_ok",
+            next_call=lambda args: seen.append(args) or '{"success":true}',
+        )
+        assert accepted == '{"success":true}'
+        assert seen == [{"video_url": str(allowed), "question": "Summarize it"}]
+
+        denied = _runtime_tool_middleware(
+            tool_name="video_analyze",
+            args={"video_url": os.devnull, "question": "Read another file"},
+            session_id="agent_video",
+            tool_call_id="video_denied",
+            next_call=lambda _args: pytest.fail("untrusted local path reached video tool"),
+        )
+        assert json.loads(denied) == {
+            "success": False,
+            "error": "video_analyze may only read video attachments owned by this run.",
+        }
+    finally:
+        runtime_module._SESSIONS.pop("agent_video", None)
+        session.loop.close()
 
 
 @pytest.mark.asyncio
@@ -278,6 +354,90 @@ async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_conte
         assert isinstance(content, list)
         assert content[0] == {"type": "text", "text": "describe it"}
         assert content[-1]["image_url"]["url"] == f"data:image/png;base64,{encoded}"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_bridge_exposes_scoped_video_analysis_and_cleans_source_file():
+    captured = {}
+
+    class VideoAttachmentAdapter(APIServerRuntimeMixin):
+        def _check_auth(self, _request):
+            return None
+
+        async def _run_agent_bridge(self, **kwargs):
+            agent = SimpleNamespace(
+                tools=[],
+                valid_tool_names=set(),
+                model="configured-model",
+                _primary_runtime={
+                    "model": "configured-model",
+                    "compressor_model": "configured-model",
+                },
+                _fallback_chain=[],
+                _fallback_model=None,
+                _fallback_index=0,
+                _fallback_activated=False,
+            )
+            kwargs["agent_configurator"](agent)
+            assert agent.valid_tool_names == {"video_analyze"}
+            content = kwargs["user_message"]
+            assert isinstance(content, list)
+            marker = next(
+                part["text"]
+                for part in content
+                if part.get("type") == "text" and "video_url=" in part.get("text", "")
+            )
+            video_path = marker.split("video_url=", 1)[1].split(".", 1)[0] + ".mp4"
+            captured["video_path"] = video_path
+            assert Path(video_path).read_bytes() == b"complete-video"
+            result = _runtime_tool_middleware(
+                tool_name="video_analyze",
+                args={"video_url": video_path, "question": "Summarize it"},
+                session_id=kwargs["session_id"],
+                tool_call_id="video_call",
+                next_call=lambda _args: '{"success":true,"analysis":"complete"}',
+            )
+            assert json.loads(result)["analysis"] == "complete"
+            return {"final_response": "analyzed"}, {"total_tokens": 1}
+
+    adapter = VideoAttachmentAdapter()
+    app = web.Application()
+    app.router.add_post("/v1/runtime/runs", adapter._handle_runtime_run)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        stable = "platform rules"
+        version = "video-attachments/v1"
+        turn = '{"attachment_asset_ids":{"user_upload":["asset_video"]}}'
+        digest = "sha256:" + hashlib.sha256(
+            f"{version}\nreplace\n{stable}\n{turn}".encode(),
+        ).hexdigest()
+        response = await client.post("/v1/runtime/runs", json={
+            "run_id": "run_video_attachment",
+            "model": "chat-test",
+            "messages": [{"role": "user", "content": "analyze the complete video"}],
+            "system_context": {
+                "version": version,
+                "mode": "replace",
+                "stable": stable,
+                "turn": turn,
+                "digest": digest,
+            },
+            "attachments": [{
+                "role": "user_upload",
+                "asset_id": "asset_video",
+                "filename": "source.mp4",
+                "media_type": "video",
+                "mime_type": "video/mp4",
+                "data": base64.b64encode(b"complete-video").decode(),
+            }],
+        })
+        assert response.status == 200
+        events = [json.loads(line) async for line in response.content]
+        assert events[-1]["type"] == "completed"
+        assert not Path(captured["video_path"]).exists()
     finally:
         await client.close()
 

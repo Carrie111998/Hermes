@@ -112,6 +112,7 @@ class TestVideoAnalyzeSchema:
         params = VIDEO_ANALYZE_SCHEMA["parameters"]
         assert "video_url" in params["properties"]
         assert "question" in params["properties"]
+        assert "include_transcript" in params["properties"]
         assert params["required"] == ["video_url", "question"]
 
     def test_schema_description_mentions_video(self):
@@ -163,6 +164,18 @@ class TestHandleVideoAnalyze:
             )
             args = mock_tool.call_args[0]
             assert args[2] == "google/gemini-flash"
+
+    def test_forwards_explicit_transcript_request(self):
+        with patch("tools.vision_tools.video_analyze_tool", new_callable=AsyncMock) as mock_tool:
+            mock_tool.return_value = json.dumps({"success": True, "analysis": "ok"})
+            asyncio.get_event_loop().run_until_complete(
+                _handle_video_analyze({
+                    "video_url": "/tmp/test.mp4",
+                    "question": "test",
+                    "include_transcript": True,
+                })
+            )
+            assert mock_tool.call_args[0][3] is True
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +314,69 @@ class TestVideoAnalyzeTool:
         assert content[1]["type"] == "video_url"
         assert "video_url" in content[1]
         assert content[1]["video_url"]["url"].startswith("data:video/mp4;base64,")
+
+    def test_optional_audio_transcription_is_returned_explicitly(self, tmp_path):
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Visual analysis."
+
+        with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response):
+            with patch("tools.vision_tools.extract_content_or_reasoning", return_value="Visual analysis."):
+                with patch(
+                    "tools.transcription_tools.transcribe_audio",
+                    return_value={
+                        "success": True,
+                        "transcript": "Exact spoken words.",
+                        "provider": "local",
+                    },
+                ):
+                    result = self._run(
+                        video_analyze_tool(
+                            str(video),
+                            "Describe this",
+                            include_transcript=True,
+                        )
+                    )
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert data["analysis"] == "Visual analysis."
+        assert data["transcription"] == {
+            "success": True,
+            "transcript": "Exact spoken words.",
+            "provider": "local",
+        }
+
+    def test_transcription_failure_is_not_silently_hidden(self, tmp_path):
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+
+        with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response):
+            with patch("tools.vision_tools.extract_content_or_reasoning", return_value="Visual analysis."):
+                with patch(
+                    "tools.transcription_tools.transcribe_audio",
+                    return_value={
+                        "success": False,
+                        "transcript": "",
+                        "error": "STT is disabled",
+                    },
+                ):
+                    result = self._run(
+                        video_analyze_tool(
+                            str(video),
+                            "Describe this",
+                            include_transcript=True,
+                        )
+                    )
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert data["transcription"]["success"] is False
+        assert data["transcription"]["error"] == "STT is disabled"
 
 
 # ---------------------------------------------------------------------------

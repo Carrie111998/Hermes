@@ -28,6 +28,7 @@ Usage:
     )
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -1339,6 +1340,7 @@ async def video_analyze_tool(
     video_url: str,
     user_prompt: str,
     model: str = None,
+    include_transcript: bool = False,
 ) -> str:
     """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
     if not isinstance(user_prompt, str):
@@ -1474,6 +1476,28 @@ async def video_analyze_tool(
             "success": True,
             "analysis": analysis or "There was a problem with the request and the video could not be analyzed.",
         }
+        if include_transcript:
+            try:
+                from tools.transcription_tools import transcribe_audio
+
+                transcription = await asyncio.to_thread(
+                    transcribe_audio,
+                    str(temp_video_path),
+                )
+                if not isinstance(transcription, dict):
+                    transcription = {
+                        "success": False,
+                        "transcript": "",
+                        "error": "Audio transcription returned an invalid result.",
+                    }
+            except Exception as transcription_error:
+                logger.exception("Video audio transcription failed")
+                transcription = {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"Audio transcription failed: {transcription_error}",
+                }
+            result["transcription"] = transcription
 
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
@@ -1562,6 +1586,14 @@ VIDEO_ANALYZE_SCHEMA = {
                 "type": "string",
                 "description": "Your specific question about the video. The AI will describe what happens in the video and answer your question.",
             },
+            "include_transcript": {
+                "type": "boolean",
+                "description": (
+                    "Also transcribe the video's audio track with the configured "
+                    "speech-to-text provider and return the result separately."
+                ),
+                "default": False,
+            },
         },
         "required": ["video_url", "question"],
     },
@@ -1571,13 +1603,14 @@ VIDEO_ANALYZE_SCHEMA = {
 def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     video_url = args.get("video_url", "")
     question = args.get("question", "")
+    include_transcript = args.get("include_transcript") is True
     full_prompt = (
         "Fully describe and explain everything happening in this video, "
         "including visual content, motion, audio cues, text overlays, and scene "
         f"transitions. Then answer the following question:\n\n{question}"
     )
     model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return video_analyze_tool(video_url, full_prompt, model)
+    return video_analyze_tool(video_url, full_prompt, model, include_transcript)
 
 
 registry.register(

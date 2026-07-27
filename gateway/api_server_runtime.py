@@ -9,10 +9,12 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from gateway.api_server_shared import AIOHTTP_AVAILABLE, web
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 _SESSIONS: dict[str, "RuntimeBridgeSession"] = {}
 _SESSIONS_LOCK = threading.RLock()
 _REGISTERED_MANAGERS: set[int] = set()
-_LOCAL_ACTIVITY_TOOLS = {"skill_view"}
+_LOCAL_ACTIVITY_TOOLS = {"skill_view", "video_analyze"}
 _MAX_ARGUMENT_CORRECTIONS = 1
 _TERMINAL_PLATFORM_ERROR_CODES = {
     "auth_rejected",
@@ -275,17 +277,24 @@ _RUNTIME_VIDEO_MIME_TYPES = {
 _MAX_RUNTIME_IMAGE_BYTES = 20 << 20
 _MAX_RUNTIME_VIDEO_BYTES = 50 << 20
 _MAX_RUNTIME_ATTACHMENT_BYTES = 64 << 20
+_RUNTIME_VIDEO_SUFFIXES = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+}
 
 
-def _runtime_attachment_parts(attachments: Any) -> list[dict[str, Any]]:
+def _runtime_attachment_parts(
+    attachments: Any,
+    *,
+    video_dir: str | os.PathLike[str] | None = None,
+) -> list[dict[str, Any]]:
     if attachments in (None, []):
         return []
     if not isinstance(attachments, list) or len(attachments) > 8:
         raise ValueError("attachments must be an array of at most 8 items")
     parts: list[dict[str, Any]] = []
     total_bytes = 0
-    image_count = 0
-    video_count = 0
     for item in attachments:
         if not isinstance(item, dict):
             raise ValueError("attachments must contain only objects")
@@ -307,7 +316,6 @@ def _runtime_attachment_parts(attachments: Any) -> list[dict[str, Any]]:
         if media_type == "image":
             if mime_type not in _RUNTIME_IMAGE_MIME_TYPES or not data or len(data) > _MAX_RUNTIME_IMAGE_BYTES:
                 raise ValueError("runtime image attachment is invalid or too large")
-            image_count += 1
             parts.append({
                 "type": "text",
                 "text": f"[Attached image: {filename}; role={role}; asset_id={asset_id}]",
@@ -320,19 +328,61 @@ def _runtime_attachment_parts(attachments: Any) -> list[dict[str, Any]]:
         if media_type == "video":
             if mime_type not in _RUNTIME_VIDEO_MIME_TYPES or not data or len(data) > _MAX_RUNTIME_VIDEO_BYTES:
                 raise ValueError("runtime video attachment is invalid or too large")
-            video_count += 1
+            if video_dir is None:
+                raise ValueError("runtime video materialization directory is required")
+            directory = Path(video_dir).resolve()
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            video_path = directory / (
+                hashlib.sha256(asset_id.encode("utf-8")).hexdigest()[:24]
+                + _RUNTIME_VIDEO_SUFFIXES[mime_type]
+            )
+            video_path.write_bytes(data)
+            video_path.chmod(0o600)
             parts.append({
                 "type": "text",
                 "text": (
                     f"[Attached video: {filename}; role={role}; asset_id={asset_id}. "
-                    "Representative frames from this video follow as image attachments.]"
+                    "Analyze the complete source video with video_analyze using "
+                    f"video_url={video_path} and include_transcript=true. "
+                    "Representative frames, when present, "
+                    "are supplementary rather than the source of truth.]"
                 ),
+                "_runtime_video_path": str(video_path),
             })
             continue
         raise ValueError("runtime attachment media_type must be image or video")
-    if video_count and not image_count:
-        raise ValueError("video attachments require at least one representative image frame")
     return parts
+
+
+def _runtime_video_paths(parts: list[dict[str, Any]]) -> list[Path]:
+    return [
+        Path(str(part["_runtime_video_path"])).resolve()
+        for part in parts
+        if isinstance(part, dict) and part.get("_runtime_video_path")
+    ]
+
+
+def _public_runtime_attachment_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in part.items() if not key.startswith("_runtime_")}
+        for part in parts
+    ]
+
+
+def _native_video_tool_definition() -> dict[str, Any]:
+    # Importing the module performs its normal registry registration. Runtime
+    # video input is an explicit per-run grant, so it must not depend on the
+    # process-wide default toolset containing the opt-in video tool.
+    from tools import vision_tools as _vision_tools  # noqa: F401
+    from tools.registry import registry
+
+    entry = registry.get_entry("video_analyze")
+    if entry is None:
+        raise RuntimeError("Hermes video_analyze tool is not registered")
+    return {
+        "type": "function",
+        "function": {**entry.schema, "name": entry.name},
+    }
 
 
 def _tool_schemas(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -458,6 +508,17 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
         requested = str(args.get("name") or args.get("skill") or "").strip()
         if not session.is_skill_allowed(requested):
             return _skill_scope_error(requested)
+    if tool_name == "video_analyze":
+        requested_path = str(args.get("video_url") or "").strip()
+        try:
+            resolved_path = str(Path(requested_path).resolve(strict=True))
+        except (OSError, RuntimeError):
+            resolved_path = ""
+        if resolved_path not in session.allowed_video_paths:
+            return json.dumps({
+                "success": False,
+                "error": "video_analyze may only read video attachments owned by this run.",
+            })
     result = next_call(args) if callable(next_call) else args
     if tool_name == "skill_view":
         session.record_loaded_skill(args, result)
@@ -495,6 +556,7 @@ class RuntimeBridgeSession:
         definitions: list[dict[str, Any]],
         deadline_ms: int,
         agent_session_id: str,
+        allowed_video_paths: set[str] | None = None,
     ) -> None:
         self.run_id = run_id
         self.agent_session_id = agent_session_id
@@ -503,6 +565,10 @@ class RuntimeBridgeSession:
         self.definitions = {str(item["name"]): dict(item) for item in definitions}
         self.tool_names = set(self.definitions)
         self.allowed_skill_names = _allowed_skill_names(definitions)
+        self.allowed_video_paths = {
+            str(Path(path).resolve())
+            for path in (allowed_video_paths or set())
+        }
         self.deadline_seconds = max(0.001, deadline_ms / 1000) if deadline_ms > 0 else None
         self.loaded_skills: dict[str, str] = {}
         self.local_activities: dict[str, str] = {}
@@ -848,6 +914,7 @@ class APIServerRuntimeMixin:
             _release_run_slot()
 
     async def _handle_runtime_run_gated(self, request: "web.Request") -> "web.StreamResponse":
+        video_temp_dir: tempfile.TemporaryDirectory[str] | None = None
         try:
             body = await request.json()
             run_id = str(body.get("run_id") or "").strip()
@@ -879,7 +946,18 @@ class APIServerRuntimeMixin:
             ]
             if len(normalized_messages) != len(messages):
                 raise ValueError("messages must contain only objects")
-            attachment_parts = _runtime_attachment_parts(body.get("attachments"))
+            attachments = body.get("attachments")
+            has_video_attachment = any(
+                isinstance(item, dict) and item.get("media_type") == "video"
+                for item in (attachments if isinstance(attachments, list) else [])
+            )
+            if has_video_attachment:
+                video_temp_dir = tempfile.TemporaryDirectory(prefix="hermes-runtime-video-")
+            attachment_parts = _runtime_attachment_parts(
+                attachments,
+                video_dir=video_temp_dir.name if video_temp_dir else None,
+            )
+            runtime_video_paths = _runtime_video_paths(attachment_parts)
             if attachment_parts:
                 last_user_index = next(
                     (
@@ -894,7 +972,7 @@ class APIServerRuntimeMixin:
                 text = _message_text(normalized_messages[last_user_index].get("content"))
                 normalized_messages[last_user_index]["content"] = [
                     {"type": "text", "text": text or "[Attached media]"},
-                    *attachment_parts,
+                    *_public_runtime_attachment_parts(attachment_parts),
                 ]
             if resuming:
                 history = _resume_runtime_history(normalized_messages, runtime_checkpoint, tool_results)
@@ -906,6 +984,8 @@ class APIServerRuntimeMixin:
                     raise ValueError("last message must be user")
                 user_message = last.get("content")
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            if video_temp_dir is not None:
+                video_temp_dir.cleanup()
             return web.json_response({"error": {"code": "invalid_param", "message": str(exc)}}, status=422)
         response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
         await response.prepare(request)
@@ -919,23 +999,33 @@ class APIServerRuntimeMixin:
             definitions,
             int(body.get("deadline_ms") or 0),
             agent_session_id,
+            allowed_video_paths={str(path) for path in runtime_video_paths},
         )
         _ensure_runtime_middleware()
         _ensure_session_sweeper()
         with _SESSIONS_LOCK:
             if run_id in _SESSIONS or agent_session_id in _SESSIONS:
                 await response.write(json.dumps({"run_id": run_id, "type": "error", "payload": {"code": "run_state_conflict", "message": "run already active"}}).encode() + b"\n")
+                if video_temp_dir is not None:
+                    video_temp_dir.cleanup()
                 return response
             _SESSIONS[run_id] = session
             _SESSIONS[agent_session_id] = session
 
         def configure_agent(agent: Any) -> None:
             native_runtime_tools = {"skill_view", "web_search", "web_extract"}
+            if runtime_video_paths:
+                native_runtime_tools.add("video_analyze")
             native = [
                 tool
                 for tool in (agent.tools or [])
                 if tool.get("function", {}).get("name") in native_runtime_tools
             ]
+            if runtime_video_paths and not any(
+                tool.get("function", {}).get("name") == "video_analyze"
+                for tool in native
+            ):
+                native.append(_native_video_tool_definition())
             agent.tools = native + schemas
             agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
             _pin_run_model(agent, body.get("model"))
@@ -1019,6 +1109,8 @@ class APIServerRuntimeMixin:
             session.mark_finished()
             queue.put_nowait(None)
             await pump_task
+            if video_temp_dir is not None:
+                video_temp_dir.cleanup()
         return response
 
     async def _handle_runtime_tool_result(self, request: "web.Request") -> "web.Response":
