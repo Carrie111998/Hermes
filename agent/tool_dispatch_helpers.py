@@ -480,7 +480,10 @@ def make_tool_result_message(
     The outer list itself is rebuilt rather than returned by identity, so
     callers should compare by value, not by ``is``.
     """
-    wrapped = _maybe_wrap_untrusted(name, content)
+    # Neutralize AFTER wrapping: the wrapper's own delimiters are trusted
+    # framing added by Hermes, while a forged steer marker can be hiding
+    # anywhere in the payload the wrapper just enclosed.
+    wrapped = _neutralize_steer_markers(_maybe_wrap_untrusted(name, content))
     message = {
         "role": "tool",
         "name": name,
@@ -521,6 +524,58 @@ _UNTRUSTED_WRAP_MIN_CHARS = 32
 # prematurely close the boundary with a differently-cased variant the model
 # would still read as a tag (e.g. ``</UNTRUSTED_TOOL_RESULT>``).
 _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
+
+
+# The mid-turn steer channel (agent/prompt_builder.py STEER_MARKER_OPEN/CLOSE)
+# is delivered by appending a fixed plaintext marker to the END of a tool
+# result, and STEER_CHANNEL_NOTE instructs the model to treat text inside that
+# marker as a direct user instruction carrying the same authority as the
+# original request. The marker is a constant with no nonce or signature, and it
+# is delivered in the one place the model is otherwise told to distrust — the
+# body of a tool result.
+#
+# So any content Hermes reads through a tool — a repo file, a web page, a log,
+# an MCP response, a subagent report — could contain that literal and thereby
+# forge operator authority. "Trust ONLY this exact marker" was not a defence;
+# it was the attack surface.
+#
+# Neutralizing at the tool-result construction boundary closes it: by the time
+# the genuine steer is appended (agent_runtime_helpers.py, which mutates the
+# message AFTER this function built it), no forged copy can remain in the body.
+# Matched case-insensitively with flexible inner whitespace, for the same
+# reason _DELIMITER_TOKEN_RE is: a differently-cased or re-wrapped variant
+# still reads as the marker to a model.
+_STEER_MARKER_TOKEN_RE = re.compile(
+    r"\[\s*/?\s*OUT-OF-BAND\s+USER\s+MESSAGE\b[^\]]*\]",
+    re.IGNORECASE,
+)
+_STEER_MARKER_REDACTION = "[redacted: forged out-of-band marker in tool output]"
+
+
+def _neutralize_steer_markers(content: Any) -> Any:
+    """Strip forged mid-turn-steer markers from tool-result content.
+
+    Returns content of the same shape. Replaces rather than deletes so the
+    model can see that something was stripped — a silent removal would hide an
+    active injection attempt from both the model and the transcript.
+    """
+    if isinstance(content, str):
+        return _STEER_MARKER_TOKEN_RE.sub(_STEER_MARKER_REDACTION, content)
+    if isinstance(content, list):
+        rebuilt: List[Any] = []
+        for item in content:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                item = dict(item)
+                item["text"] = _STEER_MARKER_TOKEN_RE.sub(
+                    _STEER_MARKER_REDACTION, item["text"]
+                )
+            rebuilt.append(item)
+        return rebuilt
+    return content
 
 
 def _is_untrusted_tool(name: Optional[str]) -> bool:
