@@ -2888,22 +2888,26 @@ class WorkflowEngine:
             for nid, state in states.items():
                 node = workflow.nodes.get(nid)
                 if node and node.reviews:
-                    for rev_entry in node.reviews:
-                        rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                        if rev_id and rev_id in states:
-                            rev_state = states[rev_id]
-                            if rev_state.status in ("running", "blocked"):
-                                any_active_review = True
-                                break
-                            if rev_state.kanban_card_id:
-                                try:
-                                    card = self.get_card_status(rev_state.kanban_card_id)
-                                    card_status = card.get("status", "").lower()
-                                    if card_status in ("running", "blocked", "ready"):
-                                        any_active_review = True
-                                        break
-                                except Exception:
-                                    pass
+                    # Check if implement was just enriched (status "ready"
+                    # but reviewer is still blocked) — means a review
+                    # iteration just completed.
+                    if state.status == "ready":
+                        for rev_entry in node.reviews:
+                            rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                            if rev_id and rev_id in states:
+                                rev_state = states[rev_id]
+                                if rev_state.status in ("running", "blocked"):
+                                    any_active_review = True
+                                    break
+                                if rev_state.kanban_card_id:
+                                    try:
+                                        card = self.get_card_status(rev_state.kanban_card_id)
+                                        card_status = card.get("status", "").lower()
+                                        if card_status in ("running", "blocked", "ready"):
+                                            any_active_review = True
+                                            break
+                                    except Exception:
+                                        pass
                     if any_active_review:
                         break
             if any_active_review:
