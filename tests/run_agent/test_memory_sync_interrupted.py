@@ -316,3 +316,79 @@ class TestSyncExternalMemoryForTurn:
         else:
             agent._memory_manager.sync_all.assert_not_called()
             agent._memory_manager.queue_prefetch_all.assert_not_called()
+
+
+class TestSessionTranscriptFallback:
+    """External memory providers need the session's turns, not just this one.
+
+    A provider reconciles capture gaps by re-examining a session's turns: a
+    turn recorded while the provider was unreachable is only recoverable if
+    it is presented again later. Callers that omitted ``messages`` silently
+    disabled that recovery, and the provider saw the current exchange alone.
+    """
+
+    def test_session_messages_are_used_when_the_caller_omits_them(self):
+        agent = _bare_agent()
+        agent._session_messages = [
+            {"role": "user", "content": "the reserve gemstone is jade"},
+            {"role": "assistant", "content": "noted"},
+            {"role": "user", "content": "are you back"},
+            {"role": "assistant", "content": "yes"},
+        ]
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="are you back",
+            final_response="yes",
+            interrupted=False,
+        )
+
+        _args, kwargs = agent._memory_manager.sync_all.call_args
+        assert kwargs["messages"] == agent._session_messages, (
+            "the provider must receive the session transcript so a turn it "
+            "missed can be reconciled"
+        )
+
+    def test_an_explicit_transcript_still_wins(self):
+        agent = _bare_agent()
+        agent._session_messages = [{"role": "user", "content": "stale"}]
+        explicit = [{"role": "user", "content": "current"}]
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="current",
+            final_response="ok",
+            interrupted=False,
+            messages=explicit,
+        )
+
+        _args, kwargs = agent._memory_manager.sync_all.call_args
+        assert kwargs["messages"] == explicit
+
+    def test_no_transcript_anywhere_is_not_an_error(self):
+        """An agent without a session transcript must still sync the turn."""
+        agent = _bare_agent()
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="hello",
+            final_response="hi",
+            interrupted=False,
+        )
+
+        _args, kwargs = agent._memory_manager.sync_all.call_args
+        assert "messages" not in kwargs
+        agent._memory_manager.sync_all.assert_called_once()
+
+    def test_an_empty_session_transcript_is_not_passed(self):
+        """Passing [] would claim 'this session has no turns', which is
+        different from 'no transcript available' and would make a provider
+        reconcile against nothing."""
+        agent = _bare_agent()
+        agent._session_messages = []
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="hello",
+            final_response="hi",
+            interrupted=False,
+        )
+
+        _args, kwargs = agent._memory_manager.sync_all.call_args
+        assert "messages" not in kwargs

@@ -3765,7 +3765,16 @@ class AIAgent:
             return
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
-            if messages is not None:
+            # Fall back to the agent's own session transcript when the caller
+            # did not supply one. External memory providers reconcile capture
+            # gaps by re-examining the session's turns: a provider that only
+            # ever sees the current exchange cannot recover a turn recorded
+            # while it was unreachable, because that turn is never presented
+            # to it again. Callers that omit `messages` silently disabled
+            # that recovery.
+            if messages is None:
+                messages = getattr(self, "_session_messages", None)
+            if messages:
                 sync_kwargs["messages"] = messages
             self._memory_manager.sync_all(
                 user_text,
