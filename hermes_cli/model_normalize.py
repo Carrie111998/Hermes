@@ -410,6 +410,18 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
 
     # --- Aggregators: need vendor/model format ---
     if provider in _AGGREGATOR_PROVIDERS:
+        # Strip matching provider prefix to avoid double-namespacing
+        # e.g. "openrouter/deepseek-v4-pro" → "deepseek-v4-pro" →
+        # "deepseek/deepseek-v4-pro" (issue #72418).
+        stripped = _strip_matching_provider_prefix(name, provider)
+        if stripped != name:
+            result = _prepend_vendor(stripped)
+            # Only accept if vendor detection succeeded; otherwise the
+            # original prefix was probably the correct vendor (e.g.
+            # "nous/hermes-3" on the nous provider).
+            if "/" in result:
+                return result
+            return name
         return _prepend_vendor(name)
 
     # --- OpenCode Zen / OpenCode Go: flat-namespace resellers.

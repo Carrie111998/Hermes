@@ -163,6 +163,16 @@ class TestAggregatorProviders:
         result = normalize_model_for_provider("anthropic/claude-sonnet-4.6", "openrouter")
         assert result == "anthropic/claude-sonnet-4.6"
 
+    def test_provider_prefix_stripped_before_vendor_prepend(self):
+        """openrouter/deepseek-v4-pro → deepseek/deepseek-v4-pro (#72418)."""
+        result = normalize_model_for_provider("openrouter/deepseek-v4-pro", "openrouter")
+        assert result == "deepseek/deepseek-v4-pro"
+
+    def test_provider_prefix_kept_when_vendor_unknown(self):
+        """nous/hermes-3 stays as-is since 'hermes' has no known vendor."""
+        result = normalize_model_for_provider("nous/hermes-3", "nous")
+        assert result == "nous/hermes-3"
+
 
 class TestIssue6211NativeProviderPrefixNormalization:
     @pytest.mark.parametrize("model,target_provider,expected", [
