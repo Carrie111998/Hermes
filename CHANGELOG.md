@@ -31,6 +31,8 @@
 - Worker supervision now persists expired heartbeat leases as `stale` workers
   with an explicit stop reason during supervisor startup and emits a
   deduplicated advisor intervention for each stale worker.
+- Gateway-hosted objective supervision now reconciles stale gateway workers
+  before registering a replacement worker.
 - Autonomous readiness stops now persist advisor handoffs for missing CEO
   authority, unavailable governed capabilities, and unreachable objectives;
   objectives without admissible verifiers are blocked before execution.

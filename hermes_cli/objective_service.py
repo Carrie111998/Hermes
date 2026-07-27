@@ -591,6 +591,14 @@ async def gateway_watcher(runner) -> None:
         except runtime_deployment.RuntimeDeploymentError as exc:
             logger.info("objective runtime: %s", exc)
             return
+        startup_interval = max(
+            1.0,
+            float(charter.get("runtime_interval_seconds", 15) or 15),
+        )
+        objective_worker.reconcile_stale_workers(
+            health_conn,
+            stale_after_seconds=max(60, int(startup_interval * 3)),
+        )
         worker_id = objective_worker.register_worker(
             health_conn, role="gateway-objective-runtime"
         )

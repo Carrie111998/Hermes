@@ -50,6 +50,8 @@
 - Supervisor startup reconciles expired worker heartbeats into durable `stale`
   stop states instead of leaving dead workers marked `running`, and emits a
   deduplicated advisor intervention with restart/diagnose/manual options.
+- Gateway-hosted objective supervision applies the same stale-worker
+  reconciliation before registering its replacement worker.
 - Readiness stops now persist deduplicated advisor handoffs for missing CEO
   authority, unavailable governed capabilities, and objectives without an
   admissible success verifier; unreachable objectives are blocked before any
