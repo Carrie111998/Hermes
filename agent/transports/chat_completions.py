@@ -125,7 +125,7 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     ``extra_content`` from earlier in a mixed-provider session.
     """
     m = str(model or "").lower()
-    return "gemini" in m or "gemma" in m
+    return "gemini" in m
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -173,10 +173,15 @@ class ChatCompletionsTransport(ProviderTransport):
           gateways (e.g. opencode-go, codex.nekos.me) reject with
           ``Extra inputs are not permitted, field: 'messages[N]._empty_recovery_synthetic'``,
           which then poisons every subsequent request in the session.
+        - Non-empty ``content`` on assistant messages with ``tool_calls`` —
+          Vertex AI (e.g., ``gemini-3.6-flash``, ``gemini-3.5-flash-lite``)
+          rejects replaying assistant messages in history that have both
+          ``tool_calls`` and non-empty ``content`` with HTTP 400 INVALID_ARGUMENT.
         """
-        strip_extra_content = not _model_consumes_thought_signature(
+        is_gemini_target = _model_consumes_thought_signature(
             kwargs.get("model")
         )
+        strip_extra_content = not is_gemini_target
         needs_sanitize = False
         for msg in messages:
             if not isinstance(msg, dict):
@@ -192,6 +197,14 @@ class ChatCompletionsTransport(ProviderTransport):
                 needs_sanitize = True
                 break
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
+                needs_sanitize = True
+                break
+            if (
+                is_gemini_target
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and msg.get("content")
+            ):
                 needs_sanitize = True
                 break
             tool_calls = msg.get("tool_calls")
@@ -249,6 +262,18 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg = mutable_msg()
                 for key in internal_keys:
                     out_msg.pop(key, None)
+
+            # Vertex AI (gemini-3.6-flash, gemini-3.5-flash-lite) rejects
+            # replaying assistant messages in history that have both tool_calls
+            # and a non-empty content string. Clear content to "".
+            if (
+                is_gemini_target
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and msg.get("content")
+            ):
+                out_msg = mutable_msg()
+                out_msg["content"] = ""
 
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):

@@ -107,12 +107,40 @@ class TestChatCompletionsBasic:
         every turn — stripping it would 400. Keep extra_content for Gemini
         targets (including aggregator slugs like google/gemini-3-pro).
         """
-        for model in ("gemini-3-pro", "google/gemini-3-pro-preview", "gemma-3-27b"):
+        for model in ("gemini-3-pro", "google/gemini-3-pro-preview"):
             msgs = self._msg_with_extra_content()
             result = transport.convert_messages(msgs, model=model)
             assert result[0]["tool_calls"][0]["extra_content"] == {
                 "google": {"thought_signature": "SIG_123"}
             }, model
+
+    def test_convert_messages_strips_extra_content_for_gemma(self, transport):
+        """Gemma models (e.g. gemma-4-31b-it) do NOT use Gemini thought_signatures.
+        When falling back or switching to Gemma, extra_content must be stripped.
+        Fixes #36907.
+        """
+        msgs = self._msg_with_extra_content()
+        result = transport.convert_messages(msgs, model="gemma-4-31b-it")
+        assert "extra_content" not in result[0]["tool_calls"][0]
+
+    def test_convert_messages_clears_assistant_content_for_gemini_with_tool_calls(self, transport):
+        """Vertex AI (gemini-3.6-flash, gemini-3.5-flash-lite) rejects replaying
+        assistant messages in history that have both tool_calls and a non-empty
+        content string with HTTP 400 INVALID_ARGUMENT. Clear content to "".
+        Fixes #69231.
+        """
+        msgs = [
+            {"role": "user", "content": "Fetch data"},
+            {
+                "role": "assistant",
+                "content": "Checking the database now...",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "query", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "res"},
+        ]
+        result = transport.convert_messages(msgs, model="google/gemini-3.6-flash")
+        assert result[1]["content"] == ""
+        assert msgs[1]["content"] == "Checking the database now..."
 
     def test_convert_messages_strips_tool_name(self, transport):
         """Internal `tool_name` (used for FTS indexing in the SQLite store) is

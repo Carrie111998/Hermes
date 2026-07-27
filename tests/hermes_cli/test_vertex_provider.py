@@ -88,9 +88,9 @@ def test_vertex_extra_body_thinking_config():
         model="google/gemini-3-pro-preview",
         reasoning_config={"effort": "high"},
     )
-    assert "extra_body" in body
-    assert "google" in body["extra_body"]
-    assert "thinking_config" in body["extra_body"]["google"]
+    assert "google" in body
+    assert "thinking_config" in body["google"]
+    assert "extra_body" not in body
 
 
 def test_vertex_extra_body_empty_without_reasoning():
@@ -126,3 +126,23 @@ def test_vertex_registered_in_hermes_overlays():
     resolved = get_provider("vertex")
     assert resolved is not None
     assert resolved.auth_type == "vertex"
+
+
+def test_vertex_prepare_messages_clears_assistant_content_with_tool_calls():
+    from providers import get_provider_profile
+
+    p = get_provider_profile("vertex")
+    msgs = [
+        {"role": "user", "content": "What is the weather?"},
+        {
+            "role": "assistant",
+            "content": "Let me check that for you.",
+            "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "tc1", "content": '{"temp": 20}'},
+    ]
+    out = p.prepare_messages(msgs)
+    assert out[1]["content"] == ""
+    assert out[1]["tool_calls"] == msgs[1]["tool_calls"]
+    # Ensure input array is not mutated in place
+    assert msgs[1]["content"] == "Let me check that for you."

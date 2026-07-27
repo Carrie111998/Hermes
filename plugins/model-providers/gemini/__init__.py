@@ -42,7 +42,7 @@ class GeminiProfile(ProviderProfile):
         if self.name == "gemini" and _is_gemini_openai_compat_base_url(base_url):
             thinking_config = _snake_case_gemini_thinking_config(raw_thinking_config)
             if thinking_config:
-                body["extra_body"] = {"google": {"thinking_config": thinking_config}}
+                body["google"] = {"thinking_config": thinking_config}
         else:
             body["thinking_config"] = raw_thinking_config
         return body
