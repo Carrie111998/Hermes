@@ -619,6 +619,15 @@ export const ar = defineLocale({
       imported: 'تم استيراد الإعدادات',
       invalidJson: 'JSON غير صالح'
     },
+    quickEntry: {
+      enabledTitle: 'الإدخال السريع',
+      enabledDesc: 'استدعِ محرّرا صغيرا من أي مكان باختصار عام وأرسل طلبا دون فتح Hermes.',
+      shortcutTitle: 'اختصار الإدخال السريع',
+      shortcutDesc: 'يحتاج إلى مفتاح تعديل واحد على الأقل، مثل CommandOrControl+Shift+Space.',
+      active: 'الاختصار مفعّل.',
+      takenBy: 'يستخدم تطبيق آخر هذا الاختصار — اختر اختصارا مختلفا.',
+      invalidShortcut: 'ليس اختصارا صالحا. أضف مفتاح تعديل واحدا على الأقل.'
+    },
     credentials: {
       pasteKey: 'لصق المفتاح',
       pasteLabelKey: label => `لصق مفتاح ${label}`,
@@ -2400,6 +2409,11 @@ export const ar = defineLocale({
           done: 'تم سرد الملفات',
           pending: 'جار سرد الملفات',
           pendingAction: 'جار السرد'
+        },
+        memory: {
+          done: 'تم الحفظ في الذاكرة',
+          pending: 'جار الحفظ في الذاكرة',
+          pendingAction: 'جار الحفظ'
         },
         patch: {
           done: 'تم تصحيح الملف',
