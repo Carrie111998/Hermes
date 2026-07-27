@@ -74,12 +74,22 @@ def route_webhook_event(conn, *, organization_id: str, raw_body: bytes,
     obj = data.get("object") if isinstance(data, Mapping) else None
     if not event_id or not isinstance(obj, Mapping) or not obj.get("id"):
         raise StripeWebhookError("Stripe webhook omitted event or object identity")
+    amount = obj.get("amount_total", obj.get("amount"))
+    currency = str(obj.get("currency") or "").strip().upper()
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+        raise StripeWebhookError(
+            "Stripe webhook omitted a positive integer payment amount"
+        )
+    if len(currency) != 3 or not currency.isalpha():
+        raise StripeWebhookError(
+            "Stripe webhook omitted a valid three-letter payment currency"
+        )
     payload = {
         "provider_event_id": event_id,
         "provider_object_id": str(obj["id"]),
         "status": str(obj.get("payment_status", obj.get("status", "unknown"))),
-        "amount_minor": obj.get("amount_total", obj.get("amount")),
-        "currency": obj.get("currency"),
+        "amount_minor": amount,
+        "currency": currency,
         "livemode": bool(obj.get("livemode", False)),
     }
     from hermes_cli import objective_triggers

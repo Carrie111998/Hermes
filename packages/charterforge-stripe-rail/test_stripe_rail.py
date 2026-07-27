@@ -97,3 +97,27 @@ def test_webhook_authenticates_and_routes_idempotently(tmp_path):
             conn, organization_id=organization_id, raw_body=body,
             signature_header=header.replace(digest, "0" * 64), signing_secret=secret,
         )
+
+
+def test_webhook_rejects_missing_financial_facts(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    organization_id, _ = organization_db.bootstrap_solo_founder(
+        conn, organization_name="Stripe Company", purpose="Receive payments",
+        profile_name="default", charter={},
+    )
+    body = json.dumps({
+        "id": "evt_missing_amount", "type": "payment_intent.succeeded",
+        "data": {"object": {"id": "pi_missing", "status": "succeeded"}},
+    }, separators=(",", ":")).encode()
+    secret = "whsec_test"
+    timestamp = int(time.time())
+    digest = hmac.new(secret.encode(), f"{timestamp}.".encode() + body,
+                      hashlib.sha256).hexdigest()
+    with pytest.raises(StripeWebhookError, match="amount"):
+        route_webhook_event(
+            conn, organization_id=organization_id, raw_body=body,
+            signature_header=f"t={timestamp},v1={digest}", signing_secret=secret,
+        )
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='external_event_receipts'"
+    ).fetchone() is None
