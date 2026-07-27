@@ -1436,18 +1436,17 @@ def _collect_auto_append_media_tags(
 
 
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
-    """Collect every media path already delivered in prior tool results.
+    """Collect every media path already delivered in prior assistant/tool output.
 
-    Used to dedup auto-appended MEDIA tags so the same file is not re-sent on
-    later turns. Must cover BOTH delivery shapes:
-      * ``MEDIA:<path>`` text tags in tool results, and
+    Used to dedup auto-appended and model-emitted MEDIA tags so the same file
+    is not re-sent on later turns. Covers three delivery shapes:
+      * ``MEDIA:<path>`` text tags in tool results,
+      * ``MEDIA:<path>`` text tags in assistant messages (model-generated tags),
       * ``image_generate`` JSON-payload paths (``host_image`` / ``image`` /
         ``agent_visible_image``), which carry no MEDIA: tag.
 
-    Missing the JSON-payload shape caused #46627: after a compression
-    boundary the auto-append fallback rescans full history, re-discovers an
-    earlier ``image_generate`` result whose path was never in the dedup set,
-    and re-emits the MEDIA tag every turn.
+    Missing the JSON-payload shape caused #46627; missing the assistant-message
+    shape caused repeated delivery when the model echoed a previous MEDIA tag.
     """
     paths: set = set()
     tool_name_by_call_id: Dict[str, str] = {}
@@ -1460,7 +1459,16 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
                 if cid and name:
                     tool_name_by_call_id[str(cid)] = name
     for msg in agent_history:
-        if msg.get("role") not in {"tool", "function"}:
+        role = msg.get("role")
+        if role == "assistant":
+            content = str(msg.get("content", "") or "")
+            if "MEDIA:" in content:
+                for match in _TOOL_MEDIA_RE.finditer(content):
+                    p = match.group(1).strip().rstrip('",}')
+                    if p:
+                        paths.add(p)
+            continue
+        if role not in {"tool", "function"}:
             continue
         content = str(msg.get("content", "") or "")
         if "MEDIA:" in content:
@@ -1667,9 +1675,9 @@ def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh."""
     _reload_runtime_env_preserving_config_authority()
     try:
-        return int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        return int(os.getenv("HERMES_MAX_ITERATIONS", "500"))
     except (TypeError, ValueError):
-        return 90
+        return 500
 
 
 from contextlib import contextmanager as _contextmanager
@@ -7815,10 +7823,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
-        # Enable faulthandler at gateway start so that SIGUSR2 (or an
-        # internal watchdog) can dump all thread and task stacks to stderr
-        # for post-mortem diagnosis of event-loop freezes (#70344).
-        faulthandler.enable()
+        # Enable faulthandler for stack dumps on freezes/crashes (#70344).
+        # Falls back to a log file when sys.stderr is None (Windows VBS /
+        # pythonw / detached service) — otherwise the gateway would die
+        # here and take every adapter offline. See #71671.
+        try:
+            faulthandler.enable()
+        except (RuntimeError, ValueError, OSError):
+            try:
+                _fh_log_dir = getattr(self.config, "log_dir", None) or os.path.join(
+                    os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")),
+                    "logs",
+                )
+                os.makedirs(_fh_log_dir, exist_ok=True)
+                _fh_enable_path = os.path.join(_fh_log_dir, "gateway_faulthandler.log")
+                _fh_enable_file = open(_fh_enable_path, "a", encoding="utf-8")
+                faulthandler.enable(file=_fh_enable_file, all_threads=True)
+            except Exception:
+                logger.debug("faulthandler.enable() unavailable", exc_info=True)
         # Also dump stacks to a rotating file for off-line analysis when
         # the gateway is running under a service manager that doesn't
         # capture stderr.
@@ -7877,10 +7899,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # config.yaml → env bridge did the right thing at a glance (instead
         # of silently running at a stale .env value for weeks).
         try:
-            _effective_max_iter = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            _effective_max_iter = int(os.getenv("HERMES_MAX_ITERATIONS", "500"))
             logger.info(
                 "Agent budget: max_iterations=%d (agent.max_turns from config.yaml, "
-                "or HERMES_MAX_ITERATIONS from .env, or default 90)",
+                "or HERMES_MAX_ITERATIONS from .env, or default 500)",
                 _effective_max_iter,
             )
         except Exception:
@@ -11146,6 +11168,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 
+            if event.get_command() in {"context", "ctx"}:
+                return await self._handle_context_command(event)
+
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
                 ACTIVE_SESSION_BYPASS_COMMANDS as _DEDICATED_HANDLERS,
@@ -11721,6 +11746,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             return format_status_text()
 
+        if canonical == "context":
+            return await self._handle_context_command(event)
+
         if canonical == "agents":
             return await self._handle_agents_command(event)
 
@@ -11769,6 +11797,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # fall through to agent processing
             except Exception:
                 return "Could not start /learn — please try again."
+
+        if canonical == "init":
+            # /init: rewrite the turn to a guidance-laden prompt and fall
+            # through to normal agent processing (same fall-through as /learn
+            # so role alternation is preserved). The live agent scans the
+            # project with its own read-only tools and writes/updates
+            # AGENTS.md via write_file. No engine, works on any backend.
+            from hermes_cli.init_command import build_init_prompt_for_cwd
+
+            _init_notes = event.get_command_args().strip()
+            try:
+                _init_prompt = build_init_prompt_for_cwd(extra=_init_notes)
+            except Exception:
+                return "Could not start /init — please try again."
+            _ack = (
+                "Updating AGENTS.md from a project scan…"
+                if "UPDATE the existing AGENTS.md" in _init_prompt
+                else "Generating AGENTS.md from a project scan…"
+            )
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    _ack_meta = self._thread_metadata_for_source(source)
+                    await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+            except Exception:
+                logger.debug("init ack send failed", exc_info=True)
+            event.text = _init_prompt
+            # fall through to agent processing
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
@@ -11904,6 +11960,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
+
+        if canonical == "diff":
+            return await self._handle_diff_command(event)
 
         if canonical == "background":
             return await self._handle_background_command(event)
@@ -12209,7 +12268,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+        if not is_internal and await asyncio.to_thread(
+            self._is_telegram_topic_root_lobby, source
+        ):
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.
             if self._should_send_telegram_lobby_reminder(source):
@@ -14548,6 +14609,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
+                            history_media_paths=_history_media_paths,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -15616,6 +15678,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
+        history_media_paths: Optional[set] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
 
@@ -15647,6 +15710,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            # Deduplicate against media already delivered in prior turns —
+            # the model may echo a previous turn's MEDIA: tag in a later
+            # response; without this guard the same file is re-sent.
+            if history_media_paths:
+                media_files = [
+                    (path, is_voice)
+                    for path, is_voice in media_files
+                    if path not in history_media_paths
+                ]
             # Strip image URLs from the cleaned text for parity with the
             # non-streaming chain, but do NOT run extract_local_files here:
             # post-stream delivery is explicit-only (#20834). Bare local paths
@@ -17427,6 +17499,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
+            chat_type=(
+                str(context.source.chat_type) if context.source.chat_type else ""
+            ),
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
@@ -21811,7 +21886,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # explaining that no response arrived (so the agent can adapt
             # rather than hang forever).
             # ------------------------------------------------------------------
-            def _clarify_callback_sync(question: str, choices) -> str:
+            def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
                 from tools import clarify_gateway as _clarify_mod
                 import uuid as _uuid
 
@@ -21824,6 +21899,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key or "",
                     question=question,
                     choices=list(choices) if choices else None,
+                    multi_select=bool(multi_select),
                 )
 
                 # Pause typing — like approval, we don't want a "thinking..."
