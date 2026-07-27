@@ -943,23 +943,39 @@ class TestActiveContextLengthResolution:
         assert _resolve_active_context_length() == 65536
         assert calls and calls[0]["config_context_length"] == 65536
 
-    def test_no_override_falls_back_without_probing_endpoint(self, monkeypatch):
-        """Without an override we fall back — but never pass base_url.
+    def test_no_custom_provider_match_falls_through_to_provider_aware_resolution(
+        self, monkeypatch
+    ):
+        """A provider with no ``custom_providers`` entry isn't short-circuited
+        by the per-model override lookup — it falls through to the
+        provider-aware resolution main added in #68589 (runtime pass-through,
+        offline degradation, and the no-provider-configured skip are all
+        covered there, in test_tool_search_context_provider.py).
 
-        Passing base_url would enable get_model_context_length's endpoint
-        probes; against an unreachable local server those cost ~25s on every
-        CLI startup, the regression #46620 guards against.
+        This gate's own guarantee is narrower and covers only the earlier
+        custom_providers short-circuit — see
+        test_honors_custom_provider_per_model_override and
+        test_does_not_resolve_runtime_credentials above. Once that's ruled
+        out (no matching entry here), reaching resolve_runtime_provider() is
+        the intended path, not a regression — this used to assert the
+        opposite, back before #68589 added that call to the shared fallback.
         """
+        import hermes_cli.runtime_provider as rp_mod
         from model_tools import _resolve_active_context_length
 
         config = {"model": {"default": "some-model", "provider": "openrouter"}}
         calls = self._patch(monkeypatch, config)
+        # _patch()'s class-wide tripwire guards the custom_providers path;
+        # override it here since falling through to runtime resolution is
+        # exactly what should happen once no override matches.
+        monkeypatch.setattr(
+            rp_mod, "resolve_runtime_provider",
+            lambda **k: {"base_url": "https://openrouter.ai/api/v1", "api_key": "sk-x"},
+        )
 
         assert _resolve_active_context_length() == 131072
         assert len(calls) == 1
-        assert not calls[0].get("base_url"), (
-            "tool-search gate must not trigger endpoint probes at startup (#46620)"
-        )
+        assert calls[0]["base_url"] == "https://openrouter.ai/api/v1"
 
     def test_unresolvable_model_returns_zero(self, monkeypatch):
         """No configured model → 0, so should_activate uses its fixed cutoff."""
