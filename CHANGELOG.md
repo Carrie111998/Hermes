@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Readiness now blocks a charter that grants `email.send` until its declared
+  AgentMail inbox and API key are actually configured; unavailable company
+  email is reported as a deterministic blocker instead of failing later at
+  execution time.
 - Compliance supersession now rejects branching from an already superseded
   assessment or control record, and current-authority projections fail closed
   on ambiguous legacy branches instead of silently selecting one interpretation.

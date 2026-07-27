@@ -75,6 +75,8 @@ acceptance evidence.
   only the current screened assessment.
 - The operator CLI exposes provider-assessment supersession fields and routes
   them through the same scope and lineage checks.
+- Readiness gates declared `email.send` authority on a configured AgentMail
+  inbox and API key, with deterministic blocking before execution can start.
 - Security-readiness blocks now create deduplicated, organization-scoped
   advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.

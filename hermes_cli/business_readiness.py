@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from hermes_cli import business_security, compliance_db, payments
+from hermes_cli import business_security, company_email, compliance_db, payments
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,40 @@ def payment_findings(
     return findings
 
 
+def email_findings(
+    config: Mapping[str, Any], *, charter: Mapping[str, Any]
+) -> list[ReadinessFinding]:
+    """Gate declared company-email authority on the configured provider edge."""
+    capabilities = {
+        str(value) for value in (charter.get("allowed_capabilities") or [])
+    }
+    if "email.send" not in capabilities:
+        return []
+    email = ((charter.get("communications") or {}).get("email") or {})
+    provider = str(email.get("provider") or "").strip().lower()
+    if provider != "agentmail":
+        return [
+            ReadinessFinding(
+                "company_email_provider_unconfigured",
+                "Declared email.send authority has no supported AgentMail provider",
+                {"configured_provider": provider or None},
+            )
+        ]
+    if company_email.configured_agentmail(config) is None:
+        return [
+            ReadinessFinding(
+                "company_email_unavailable",
+                "AgentMail inbox and API key are required for email.send authority",
+                {
+                    "provider": "agentmail",
+                    "inbox_configured": bool(str(email.get("inbox_id") or "").strip()),
+                    "api_key_configured": bool(os.getenv("AGENTMAIL_API_KEY", "").strip()),
+                },
+            )
+        ]
+    return []
+
+
 def project(
     conn: sqlite3.Connection,
     *,
@@ -189,6 +224,7 @@ def project(
         *payment_findings(
             conn, organization_id=organization_id, charter=charter
         ),
+        *email_findings(config, charter=charter),
     ]
     deployment = snapshot.get("runtime_deployment") or {}
     autonomy = snapshot.get("autonomy") or {}

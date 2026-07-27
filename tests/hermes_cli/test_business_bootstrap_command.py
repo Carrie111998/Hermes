@@ -228,6 +228,49 @@ def test_business_readiness_blocks_declared_payments_without_ready_rail(monkeypa
     ]
 
 
+def test_business_readiness_blocks_declared_email_without_agentmail(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "agentic": {
+                "allowed_capabilities": ["email.send"],
+                "communications": {
+                    "email": {
+                        "provider": "agentmail",
+                        "inbox_id": "ceo@agentmail.to",
+                    }
+                },
+            }
+        },
+    )
+    monkeypatch.delenv("AGENTMAIL_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.business_security.evaluate_security_readiness",
+        lambda _config: type("Readiness", (), {"ready": True, "violations": ()})(),
+    )
+    monkeypatch.setattr(
+        business,
+        "build_business_snapshot",
+        lambda _conn: {
+            "configured": True,
+            "organization": {"id": "org-email"},
+            "autonomy": {"mode": "autonomous"},
+            "runtime_deployment": {"ready": True},
+            "runtime_drift": {"blocked": False},
+            "interventions": [],
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    readiness = business.build_business_readiness(conn)
+    blocker = next(
+        item for item in readiness["blockers"]
+        if item["code"] == "company_email_unavailable"
+    )
+    assert blocker["inbox_configured"] is True
+    assert blocker["api_key_configured"] is False
+
+
 def test_business_readiness_rejects_assessment_for_different_ready_rail(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.payments.payment_rail_status",

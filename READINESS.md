@@ -431,6 +431,16 @@ when the current replacement no longer satisfies screening controls.
 The supported `business provider-verify` command also accepts the exact
 superseded assessment ID and required replacement reason.
 
+Company-email readiness was validated with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_business_bootstrap_command.py tests/hermes_cli/test_company_email.py tests/hermes_cli/test_agentmail_events.py -q
+```
+
+Result: **20 passed, 0 failed**. A charter granting `email.send` now remains
+blocked until AgentMail configuration is present, while outbound read-back and
+authenticated inbound routing remain covered at the provider boundary.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
