@@ -605,7 +605,7 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   },
   voice: {
     autoTts: 'Automatically speak assistant responses.',
-    synthesisTimeoutSeconds: 'Optional fixed timeout in seconds. Leave blank to use adaptive speech timing.'
+    synthesisTimeoutSeconds: 'Seconds Desktop waits for speech generation before reporting a timeout.'
   },
   tts: {
     xai: {
