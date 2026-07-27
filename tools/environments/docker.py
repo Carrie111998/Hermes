@@ -314,19 +314,76 @@ def find_docker() -> Optional[str]:
     return None
 
 
-def _is_podman_runtime(executable: str) -> bool:
-    """Return whether *executable* resolves to a Podman CLI.
+def _runtime_names(executable: str) -> set[str]:
+    """Return the basename of *executable* plus its symlink target basename.
 
-    Rootless Podman needs ``--userns keep-id`` in addition to ``--user`` to
-    preserve bind-mount ownership. Follow compatibility symlinks (commonly
-    ``docker -> podman``) without executing another runtime probe.
+    Compatibility symlinks (commonly ``docker -> podman``) must resolve to the
+    real runtime; a stat failure degrades to the literal name rather than
+    raising.
     """
     names = {Path(executable).name.lower()}
     try:
         names.add(Path(executable).resolve().name.lower())
     except (OSError, RuntimeError):
         pass
-    return any(name == "podman" or name.startswith("podman.") for name in names)
+    return names
+
+
+def _is_podman_remote_runtime(executable: str) -> bool:
+    """Return whether *executable* is a Podman *remote* client.
+
+    ``podman-remote`` (and ``podman --remote``) forwards every container
+    operation to a service that may run on another host, under another user,
+    with another subuid map.  Two assumptions this module makes then stop
+    holding:
+
+    * bind-mount sources are resolved on the SERVER's filesystem, so a local
+      path in ``docker_volumes`` may not exist there or may point elsewhere;
+    * ``--userns keep-id`` maps to the SERVICE user, not to the caller, so
+      ``docker_run_as_host_user`` cannot promise host-visible ownership.
+
+    Deciding rootless-vs-rootful from the local process is therefore wrong for
+    this flavour.  Rather than guess — or silently fall through to the Docker
+    branch and hand back files owned by somebody else — the caller refuses the
+    combination outright.  See ``DockerEnvironment.__init__``.
+    """
+    return any(name.startswith("podman-remote") for name in _runtime_names(executable))
+
+
+def _is_podman_runtime(executable: str) -> bool:
+    """Return whether *executable* resolves to a LOCAL Podman CLI.
+
+    Excludes ``podman-remote`` (see :func:`_is_podman_remote_runtime`) because
+    the identity policy below is only sound for a runtime sharing this
+    process's user namespace.
+    """
+    if _is_podman_remote_runtime(executable):
+        return False
+    return any(
+        name == "podman" or name.startswith("podman.")
+        for name in _runtime_names(executable)
+    )
+
+
+def _podman_is_rootless() -> bool:
+    """Return whether local Podman would run in rootless mode.
+
+    Podman selects rootless purely from the effective UID of the invoking
+    process: non-root means a user namespace with a subuid map, root means
+    plain rootful containers.  ``podman info --format {{.Host.Security.Rootless}}``
+    reports exactly this, so the euid check is equivalent and avoids spawning a
+    probe on every container creation.
+
+    This matters because ``--userns keep-id`` is a ROOTLESS-ONLY option: under
+    rootful Podman it is rejected, so applying it there would turn a working
+    setup into a container that refuses to start.  Rootful Podman already maps
+    UIDs identically to Docker, so ``--user UID:GID`` alone is both necessary
+    and sufficient.
+    """
+    try:
+        return os.geteuid() != 0
+    except AttributeError:  # pragma: no cover - non-POSIX
+        return False
 
 
 # Security flags applied to every container.
@@ -1263,12 +1320,27 @@ class DockerEnvironment(BaseEnvironment):
         # platforms without POSIX uid/gid (e.g. native Windows Docker).
         user_args: list[str] = []
         if run_as_host_user:
+            # podman-remote cannot honour this flag: the container runs under a
+            # service that may live on another host with another subuid map, so
+            # neither keep-id nor a bare --user can promise the CALLER sees the
+            # files as their own. Refuse loudly instead of silently taking the
+            # Docker branch and handing back files owned by somebody else.
+            if _is_podman_remote_runtime(self._docker_exe):
+                raise ValueError(
+                    "docker_run_as_host_user is not supported with podman-remote "
+                    f"({self._docker_exe}): bind mounts and the keep-id user "
+                    "namespace resolve on the remote service, not on this host, "
+                    "so host-visible file ownership cannot be guaranteed. Use a "
+                    "local container runtime or set docker_run_as_host_user: false."
+                )
             user_spec = _resolve_host_user_spec()
             if user_spec is not None:
-                if _is_podman_runtime(self._docker_exe):
+                # keep-id is rootless-only. Rootful Podman rejects it, and maps
+                # UIDs exactly like Docker, so it takes the Docker branch.
+                if _is_podman_runtime(self._docker_exe) and _podman_is_rootless():
                     user_args = ["--userns", "keep-id", "--user", user_spec]
                     logger.info(
-                        "Podman: keeping host user namespace and running as %s",
+                        "Podman (rootless): keeping host user namespace and running as %s",
                         user_spec,
                     )
                 else:

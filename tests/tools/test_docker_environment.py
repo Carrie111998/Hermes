@@ -559,6 +559,9 @@ def test_rootless_podman_keeps_host_uid_gid(monkeypatch, tmp_path):
     translated to a different host owner.
     """
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman")
+    # Pinned rather than inherited from the test runner's euid, so the case
+    # under test is the rootless one on every machine and in CI as root.
+    monkeypatch.setattr(docker_env, "_podman_is_rootless", lambda: True)
     monkeypatch.setattr(
         docker_env,
         "_resolve_host_user_spec",
@@ -585,6 +588,123 @@ def test_rootless_podman_keeps_host_uid_gid(monkeypatch, tmp_path):
         for index in range(len(run_args) - len(identity_args) + 1)
     ), f"Podman identity arguments missing from real run argv: {run_args}"
 
+
+def test_rootful_podman_omits_keep_id(monkeypatch, tmp_path):
+    """Rootful Podman must take the Docker branch: --user only, no keep-id.
+
+    ``--userns keep-id`` is rootless-only; rootful Podman rejects it, so
+    emitting it there converts a working setup into a container that refuses to
+    start. Rootful Podman already maps UIDs like Docker, so the bare --user is
+    both necessary and sufficient.
+
+    This is a decision-logic test: rootful Podman cannot be exercised for real
+    in this environment (see the module docstring of
+    tests/tools/test_rootless_podman_owner.py), so live rootful coverage is
+    explicitly NOT claimed.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman")
+    monkeypatch.setattr(docker_env, "_podman_is_rootless", lambda: False)
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(tmp_path),
+        auto_mount_cwd=True,
+        run_as_host_user=True,
+    )
+
+    run_args = _run_args_from_calls(calls)
+    assert "--userns" not in run_args, (
+        f"rootful Podman must not receive keep-id: {run_args}"
+    )
+    assert not any(arg.startswith("--userns=") for arg in run_args), run_args
+    index = run_args.index("--user")
+    assert run_args[index + 1] == "1234:5678"
+
+
+def test_podman_is_rootless_follows_effective_uid(monkeypatch):
+    """Rootless mode is exactly 'the invoking process is not root'.
+
+    Same rule ``podman info --format {{.Host.Security.Rootless}}`` reports, so
+    the euid check is equivalent without spawning a probe per container.
+    """
+    monkeypatch.setattr(docker_env.os, "geteuid", lambda: 1000)
+    assert docker_env._podman_is_rootless() is True
+    monkeypatch.setattr(docker_env.os, "geteuid", lambda: 0)
+    assert docker_env._podman_is_rootless() is False
+
+
+def test_podman_remote_is_not_classified_as_local_podman(tmp_path):
+    """podman-remote must not be swept into the local-Podman policy."""
+    assert docker_env._is_podman_remote_runtime("/usr/bin/podman-remote")
+    assert not docker_env._is_podman_runtime("/usr/bin/podman-remote")
+    # Also via a compatibility symlink, the same way `docker -> podman` is
+    # followed.
+    remote = tmp_path / "podman-remote"
+    remote.touch()
+    wrapper = tmp_path / "docker"
+    wrapper.symlink_to(remote)
+    assert docker_env._is_podman_remote_runtime(str(wrapper))
+    assert not docker_env._is_podman_runtime(str(wrapper))
+
+
+def test_podman_remote_rejects_run_as_host_user(monkeypatch, tmp_path):
+    """podman-remote + docker_run_as_host_user must fail loudly, not silently.
+
+    Bind mounts and the keep-id namespace resolve on the remote service, which
+    may run on another host under another subuid map, so host-visible ownership
+    cannot be promised. Falling through to the Docker branch would hand back
+    files owned by somebody else with no warning.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman-remote")
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="podman-remote"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(tmp_path),
+            auto_mount_cwd=True,
+            run_as_host_user=True,
+        )
+
+    # Checked against `calls` directly: _run_args_from_calls() asserts that a
+    # run happened, so it cannot express "no run happened".
+    run_calls = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
+    ]
+    assert not run_calls, (
+        f"no container may be created once the runtime is refused: {run_calls}"
+    )
+
+
+def test_podman_remote_allowed_without_host_user_mode(monkeypatch, tmp_path):
+    """Without run_as_host_user there is no ownership promise to break."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman-remote")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(tmp_path),
+        auto_mount_cwd=True,
+        run_as_host_user=False,
+    )
+
+    run_args = _run_args_from_calls(calls)
+    assert run_args, "container should still be created"
+    assert "--userns" not in run_args
+    assert "--user" not in run_args
+
     mount = f"{tmp_path}:/workspace"
     assert mount in run_args
     assert f"{mount}:U" not in run_args
@@ -604,11 +724,27 @@ def test_podman_runtime_detection_follows_docker_compat_symlink(tmp_path):
 @pytest.mark.parametrize(
     "extra_args",
     [
+        # Separated flag + value.
         ["--user", "0:0"],
         ["-u", "0:0"],
         ["--userns", "host"],
+        # Attached with '=' — including the empty-value forms, which are still
+        # an attempt to seize the control Hermes owns.
+        ["--user="],
         ["--user=0:0"],
+        ["--user=1234:1234"],
+        ["--userns="],
         ["--userns=host"],
+        # keep-id in particular: correct for rootless Podman, but the backend
+        # decides that now. A profile still carrying it from the config-level
+        # workaround must fail loudly rather than emit --userns twice.
+        ["--userns=keep-id"],
+        # Concatenated short form. Handled by the length>2 branch of
+        # _extra_args_identity_collisions; previously implemented but untested.
+        ["-u1234:1234"],
+        ["-u0:0"],
+        # Buried among legitimate flags, not just alone at position 0.
+        ["--shm-size=1g", "-u1234:1234", "--label", "x=y"],
     ],
 )
 def test_run_as_host_user_rejects_conflicting_extra_args(

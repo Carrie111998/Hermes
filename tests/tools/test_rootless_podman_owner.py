@@ -9,6 +9,7 @@ Podman service and may pull an image. Run it only in an isolated arena with:
 """
 
 import os
+import pwd
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +20,39 @@ from tools.environments import docker as docker_env
 
 
 pytestmark = pytest.mark.integration
+
+
+def _subordinate_ranges(path: str) -> list[tuple[int, int]]:
+    """Return this user's ``(start, count)`` ranges from /etc/subuid|subgid.
+
+    These are the IDs a rootless container maps into. A probe file owned by one
+    of them is the exact symptom of the missing keep-id mapping, so the test
+    refuses them by construction instead of hard-coding an observed number like
+    100999 — which is specific to one machine's subuid base.
+
+    An unreadable or malformed file yields no ranges: the caller still has the
+    ``== os.getuid()`` assertion, so a missing file weakens the check rather
+    than breaking the run on systems without subordinate IDs at all.
+    """
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):  # pragma: no cover - unusual passwd setups
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.strip().split(":")
+                if len(fields) != 3 or fields[0] != user:
+                    continue
+                try:
+                    ranges.append((int(fields[1]), int(fields[2])))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return ranges
 
 
 def _rootless_podman_or_skip() -> str:
@@ -84,10 +118,34 @@ def test_rootless_podman_backend_writes_as_current_owner(monkeypatch, tmp_path):
 
         probe_files = list(tmp_path.glob("uid-probe.*"))
         assert len(probe_files) == 1, result["output"]
+
+        # THE GATE. This stat() runs in the pytest process — on the host,
+        # outside the container's user namespace — which is the only vantage
+        # point from which the bug is visible at all. The identical file
+        # reports uid=1000 from inside the container even when unpatched.
         owner = probe_files[0].stat()
         assert owner.st_uid == os.getuid(), result["output"]
         assert owner.st_gid == os.getgid(), result["output"]
-        assert "owner_matches_process=yes" in result["output"]
+
+        # Reject the subordinate ID explicitly instead of trusting the equality
+        # above to have compared the right thing. Without keep-id the owner
+        # lands inside this range (measured: subuid base 100000 + 999 = 100999
+        # for uid 1000); a refactor that accidentally compared a mapped ID
+        # would slip past `==` but not past this.
+        for value, ranges in (
+            (owner.st_uid, _subordinate_ranges("/etc/subuid")),
+            (owner.st_gid, _subordinate_ranges("/etc/subgid")),
+        ):
+            for start, count in ranges:
+                assert not (start <= value < start + count), (
+                    f"owner id {value} falls in the subordinate range "
+                    f"{start}..{start + count - 1}: the file is owned by a "
+                    f"mapped id, not by the caller.\n{result['output']}"
+                )
+
+        # In-namespace consistency is reported, never used as the verdict: it
+        # reads "yes" both with and without the fix.
+        assert "host_verification=required" in result["output"]
     finally:
         if environment is not None:
             environment.cleanup(force_remove=True)
