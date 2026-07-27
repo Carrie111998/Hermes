@@ -2880,5 +2880,49 @@
     "headline": "Recursively built a Supabase-backed CRM dashboard where each build reuses prior components",
     "quote": "Used the Hermes Desktop App to recursively generate a CRM dashboard where each build reuses components from prior generations; it can also build full videos using official HyperFrame skills — HTML-native, full control over scenes, animations, and rendering.",
     "size": "sm"
+  },
+  {
+    "id": "gulag-soviet-messenger",
+    "source": "x",
+    "author": "@gromykoss",
+    "url": "https://github.com/Gromykoss/gooolag",
+    "date": "2026-07-27",
+    "category": "messaging",
+    "headline": "GULAG.online — self-hosted messenger, invisible to censorship: Matrix/Synapse + custom clients + prison aesthetics",
+    "quote": "Self-hosted Matrix messenger on a Yandex Cloud VPS with a 'white' IP — invisible to ISP-level blocking in Russia. Custom web client (Vanilla JS + Matrix API) and Expo mobile app. Soviet prison-camp aesthetic: custom emoji picker 'СИМВОЛЫ ЗОНЫ' (28 symbols), onboarding through a 'prison gate' Flask bot, cells instead of rooms. 11 users, closed circle. Hermes Agent manages the full stack via Diamond-pattern orchestration: parallel agents for deploy, audit, and monitoring.",
+    "size": "md"
+  },
+  {
+    "id": "alikhan-whatsapp-construction",
+    "source": "x",
+    "author": "@gromykoss",
+    "url": "https://github.com/Gromykoss/Alikhan",
+    "date": "2026-07-27",
+    "category": "business-ops",
+    "headline": "WhatsApp bot replaces paper journals at a 2,700m gold mine — GOST-compliant reporting from chat messages",
+    "quote": "WhatsApp bot for a gold mine construction site at 2,700m altitude. Workers communicate through WhatsApp — the bot listens to everything: photos, voice messages, foreman chat — and auto-generates GOST-compliant construction reports (daily journal, work completion certificates, daily snapshot). 14 PostgreSQL tables following Russian standard РД-11-05-2007. Grok vision analyzes construction photos. 11.5× cost savings: all code changes delegated to Codex/Grok Build instead of running on the orchestrator model.",
+    "size": "md"
+  },
+  {
+    "id": "rab9-crypto-signals",
+    "source": "x",
+    "author": "@gromykoss",
+    "url": "https://github.com/Gromykoss/rab9-crypto-bot",
+    "date": "2026-07-27",
+    "category": "trading-markets",
+    "headline": "AI crypto signal pipeline from Telegram memes — 24/7 monitoring, MoA verification, REJECT by default",
+    "quote": "AI pipeline that turns Telegram meme channels into trading signals. @msf_rab_bot monitors 24/7 → DexScreener enrichment → Grok analysis → MoA verification (two AIs must agree, REJECT by default). Cabal Detector filters out KOL pumps and scams. Wallet Intelligence cross-references maker wallets (P≥80%). Loop brakes: max 3 enrichment modules, 2 FLAGs in a row → REJECT. Sandbox-only deployment — no production without approval.",
+    "size": "md"
+  },
+  {
+    "id": "robot-man-x-accounts",
+    "source": "x",
+    "author": "@gromykoss",
+    "url": "https://github.com/Gromykoss/Robot-man",
+    "date": "2026-07-27",
+    "category": "content-creation",
+    "headline": "Two AI-managed X accounts: one autonomous agent, one human brand — war stories from real production AI projects",
+    "quote": "AI-managed X/Twitter accounts: @RobotsTJ500 (autonomous AI agent) and @gromykoss (personal brand). Niche: 'production AI agents' — real war stories from managing a messenger, a construction bot, and a crypto pipeline. Content pipeline: Hermes (strategist) writes BRIEF → robot-man (executor) drafts post → MoA verification → human approval gate → publish. 117-node Knowledge Graph for structured memory. Human Gate on every post — safety over speed.",
+    "size": "md"
   }
 ]
