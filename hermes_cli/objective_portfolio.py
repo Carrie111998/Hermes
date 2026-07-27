@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import time
 import uuid
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS objective_relationships (
     child_objective_id TEXT NOT NULL UNIQUE,
     relationship TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,
+    request_sha256 TEXT NOT NULL DEFAULT '',
     allocated_budget_minor INTEGER NOT NULL,
     currency TEXT,
     created_by TEXT NOT NULL,
@@ -72,7 +74,29 @@ def _serialized_portfolio_mutation(function):
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA_SQL)
+    if not (
+        conn.in_transaction
+        and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='objective_relationships'"
+        ).fetchone()
+    ):
+        conn.executescript(SCHEMA_SQL)
+    columns = {
+        row["name"] for row in conn.execute(
+            "PRAGMA table_info(objective_relationships)"
+        )
+    }
+    if "request_sha256" not in columns:
+        conn.execute(
+            "ALTER TABLE objective_relationships ADD COLUMN "
+            "request_sha256 TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def _request_sha256(payload: Mapping[str, Any]) -> str:
+    material = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(material.encode()).hexdigest()
 
 
 @_serialized_portfolio_mutation
@@ -98,8 +122,23 @@ def create_child_objective(
         raise ValueError("child objective requires a high-entropy idempotency key")
     if max_active_objectives <= 0:
         raise ValueError("max_active_objectives must be positive")
+    request_sha256 = _request_sha256(
+        {
+            "desired_outcome": desired_outcome,
+            "success_criteria": success_criteria,
+            "termination_conditions": termination_conditions,
+            "permitted_systems": permitted_systems,
+            "prohibited_actions": prohibited_actions,
+            "constraints": constraints,
+            "allocated_budget_minor": allocated_budget_minor,
+            "currency": currency,
+            "expires_at": expires_at,
+            "created_by": created_by,
+        }
+    )
     existing = conn.execute(
-        """SELECT parent_objective_id,child_objective_id,relationship
+        """SELECT parent_objective_id,child_objective_id,relationship,
+                      request_sha256
              FROM objective_relationships WHERE idempotency_key=?""",
         (idempotency_key,),
     ).fetchone()
@@ -107,6 +146,8 @@ def create_child_objective(
         if (
             str(existing["parent_objective_id"]) != parent_objective_id
             or str(existing["relationship"]) != "decomposes_to"
+            or not str(existing["request_sha256"])
+            or str(existing["request_sha256"]) != request_sha256
         ):
             raise PermissionError(
                 "objective idempotency key belongs to a different operation"
@@ -193,9 +234,9 @@ def create_child_objective(
         conn.execute(
             """INSERT INTO objective_relationships (
                  id,organization_id,parent_objective_id,child_objective_id,
-                 relationship,idempotency_key,allocated_budget_minor,currency,
-                 created_by,created_at
-               ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                 relationship,idempotency_key,request_sha256,
+                 allocated_budget_minor,currency,created_by,created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 relationship_id,
                 parent["organization_id"],
@@ -203,6 +244,7 @@ def create_child_objective(
                 child.id,
                 "decomposes_to",
                 idempotency_key,
+                request_sha256,
                 allocated_budget_minor,
                 resolved_currency,
                 created_by,
@@ -243,8 +285,23 @@ def create_successor_objective(
     """Create one peer root that continues the organization's objective chain."""
     if len(idempotency_key.strip()) < 16:
         raise ValueError("successor objective requires a high-entropy idempotency key")
+    request_sha256 = _request_sha256(
+        {
+            "desired_outcome": desired_outcome,
+            "success_criteria": success_criteria,
+            "termination_conditions": termination_conditions,
+            "permitted_systems": permitted_systems,
+            "prohibited_actions": prohibited_actions,
+            "constraints": constraints,
+            "allocated_budget_minor": allocated_budget_minor,
+            "currency": currency,
+            "expires_at": expires_at,
+            "created_by": created_by,
+        }
+    )
     existing = conn.execute(
-        """SELECT parent_objective_id,child_objective_id,relationship
+        """SELECT parent_objective_id,child_objective_id,relationship,
+                      request_sha256
              FROM objective_relationships
             WHERE idempotency_key=?""",
         (idempotency_key,),
@@ -253,6 +310,8 @@ def create_successor_objective(
         if (
             str(existing["parent_objective_id"]) != predecessor_objective_id
             or str(existing["relationship"]) != "succeeds"
+            or not str(existing["request_sha256"])
+            or str(existing["request_sha256"]) != request_sha256
         ):
             raise PermissionError(
                 "objective idempotency key belongs to a different operation"
@@ -351,9 +410,9 @@ def create_successor_objective(
         conn.execute(
             """INSERT INTO objective_relationships (
                  id,organization_id,parent_objective_id,child_objective_id,
-                 relationship,idempotency_key,allocated_budget_minor,currency,
-                 created_by,created_at
-               ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                 relationship,idempotency_key,request_sha256,
+                 allocated_budget_minor,currency,created_by,created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 relationship_id,
                 predecessor["organization_id"],
@@ -361,6 +420,7 @@ def create_successor_objective(
                 successor.id,
                 "succeeds",
                 idempotency_key,
+                request_sha256,
                 allocated_budget_minor,
                 resolved_currency,
                 created_by,

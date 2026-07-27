@@ -42,6 +42,7 @@ def _parent(tmp_path):
 
 def test_child_objective_inherits_scope_budget_and_wake_event(tmp_path):
     conn, organization_id, parent = _parent(tmp_path)
+    expires_at = int(time.time()) + 3_600
     child_id, created = objective_portfolio.create_child_objective(
         conn,
         parent_objective_id=parent.id,
@@ -58,7 +59,7 @@ def test_child_objective_inherits_scope_budget_and_wake_event(tmp_path):
         constraints=["use public sources"],
         allocated_budget_minor=400,
         currency="USD",
-        expires_at=int(time.time()) + 3_600,
+        expires_at=expires_at,
         idempotency_key="child-objective-research-0001",
         created_by="employee:ceo",
         max_active_objectives=10,
@@ -66,15 +67,17 @@ def test_child_objective_inherits_scope_budget_and_wake_event(tmp_path):
     repeated_id, repeated_created = objective_portfolio.create_child_objective(
         conn,
         parent_objective_id=parent.id,
-        desired_outcome="ignored idempotent retry",
-        success_criteria=[],
-        termination_conditions=[],
-        permitted_systems=[],
-        prohibited_actions=[],
-        constraints=[],
-        allocated_budget_minor=0,
-        currency=None,
-        expires_at=int(time.time()) + 1,
+        desired_outcome="Complete launch research",
+        success_criteria=[
+            {"verifier": "kanban.all_delegated_tasks_completed", "params": {}}
+        ],
+        termination_conditions=["research invalidates launch"],
+        permitted_systems=["kanban"],
+        prohibited_actions=["data.delete", "external.publish"],
+        constraints=["use public sources"],
+        allocated_budget_minor=400,
+        currency="USD",
+        expires_at=expires_at,
         idempotency_key="child-objective-research-0001",
         created_by="employee:ceo",
         max_active_objectives=1,
@@ -123,7 +126,6 @@ def test_children_cannot_expand_scope_or_oversubscribe_parent_budget(tmp_path):
             idempotency_key="child-objective-invalid-system-0001",
             **common,
         )
-
     objective_portfolio.create_child_objective(
         conn,
         desired_outcome="First funded workstream",
@@ -142,6 +144,30 @@ def test_children_cannot_expand_scope_or_oversubscribe_parent_budget(tmp_path):
             **common,
         )
 
+
+def test_relationship_retry_rejects_request_drift(tmp_path):
+    conn, _, parent = _parent(tmp_path)
+    expires_at = int(time.time()) + 3_600
+    kwargs = {
+        "parent_objective_id": parent.id,
+        "desired_outcome": "Bounded workstream",
+        "success_criteria": [{"verifier": "test.pass", "params": {}}],
+        "termination_conditions": [],
+        "permitted_systems": ["kanban"],
+        "prohibited_actions": ["data.delete"],
+        "constraints": [],
+        "allocated_budget_minor": 100,
+        "currency": "USD",
+        "expires_at": expires_at,
+        "idempotency_key": "relationship-replay-drift-0001",
+        "created_by": "employee:ceo",
+        "max_active_objectives": 10,
+    }
+    objective_portfolio.create_child_objective(conn, **kwargs)
+    with pytest.raises(PermissionError, match="different operation"):
+        objective_portfolio.create_child_objective(
+            conn, **{**kwargs, "allocated_budget_minor": 200}
+        )
 
 def test_concurrent_child_admission_serializes_active_ceiling(tmp_path):
     conn, _, parent = _parent(tmp_path)
@@ -217,6 +243,7 @@ def test_exact_creation_key_cancels_only_its_child(tmp_path):
 
 def test_successor_is_peer_root_and_inherits_cadence_and_authority(tmp_path):
     conn, organization_id, predecessor = _parent(tmp_path)
+    expires_at = int(time.time()) + 30 * 86_400
     schedule_id = objective_triggers.create_schedule(
         conn,
         organization_id=organization_id,
@@ -240,7 +267,7 @@ def test_successor_is_peer_root_and_inherits_cadence_and_authority(tmp_path):
         constraints=["preserve runway"],
         allocated_budget_minor=800,
         currency="USD",
-        expires_at=int(time.time()) + 30 * 86_400,
+        expires_at=expires_at,
         idempotency_key="successor-objective-growth-0001",
         created_by="employee:ceo",
         max_active_objectives=10,
@@ -248,15 +275,17 @@ def test_successor_is_peer_root_and_inherits_cadence_and_authority(tmp_path):
     repeated_id, repeated_created = objective_portfolio.create_successor_objective(
         conn,
         predecessor_objective_id=predecessor.id,
-        desired_outcome="ignored",
-        success_criteria=[],
-        termination_conditions=[],
-        permitted_systems=[],
-        prohibited_actions=[],
-        constraints=[],
-        allocated_budget_minor=0,
-        currency=None,
-        expires_at=int(time.time()) + 1,
+        desired_outcome="Reach ten verified paying customers",
+        success_criteria=[
+            {"verifier": "accounting.revenue_at_least", "params": {"amount_minor": 1}}
+        ],
+        termination_conditions=["runway exhausted"],
+        permitted_systems=["kanban"],
+        prohibited_actions=["data.delete", "external.publish"],
+        constraints=["preserve runway"],
+        allocated_budget_minor=800,
+        currency="USD",
+        expires_at=expires_at,
         idempotency_key="successor-objective-growth-0001",
         created_by="employee:ceo",
         max_active_objectives=1,
