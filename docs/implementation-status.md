@@ -12,6 +12,8 @@
 - Compliance inventory, obligations, deadlines, evidence, and audit export.
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
+- Optional fail-closed runtime drift detection with immutable human-accepted
+  baselines for the charter, authority schema, and Python runtime.
 - Canonical Charterforge Python distribution/namespace/CLI plus migration
   aliases.
 
@@ -42,6 +44,9 @@
   image, production deployment, or repository rename.
 - Trademark clearance for Charterforge.
 - High-availability database replication or disaster-recovery drill evidence.
+- Runtime drift enforcement remains opt-in for migrated installations; fresh
+  setup records a baseline, but operators must enable the strict gate in the
+  charter after reviewing deployment policy.
 
 ## Validation evidence
 

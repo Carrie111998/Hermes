@@ -31,6 +31,11 @@ The `agentic` section controls business operation. Important fields include:
 Non-secret behavior belongs in `config.yaml`. Credentials, API keys, payment
 provider secrets, and tokens belong in `.env` or an external secret source.
 
+For long-running business operation, `agentic.security.require_runtime_baseline`
+can require a human-accepted runtime baseline before cycles execute. Inspect it
+with `charterforge business runtime-drift` and accept a reviewed change with
+`charterforge business runtime-rebaseline --reason "..."`. Rebaselining does
+not resume autonomy; the operator must separately resume it.
+
 Use `charterforge config`, `charterforge setup`, and
 `charterforge business --help` to inspect the implemented command surfaces.
-

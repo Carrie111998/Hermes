@@ -70,6 +70,10 @@ these artifacts.
 - **Repeated task failure:** circuit breaker and advisor intervention.
 - **State drift:** compare configuration, package lock, schema, profiles, and
   provider state to the recorded baseline.
+- **Runtime baseline drift:** when enabled, `charterforge business runtime-drift`
+  reports the exact baseline mismatch and autonomy pauses. Inspect the host and
+  provider state, then use `charterforge business runtime-rebaseline` with a
+  human reason only after accepting the change; resume autonomy separately.
 - **Conflicting workers:** claims and resource leases select one writer.
 - **Accounting interruption:** reconcile provider records before posting or
   reversing journal entries.

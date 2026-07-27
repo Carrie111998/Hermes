@@ -40,6 +40,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "recovery-list", help="List and verify known-good authority snapshots"
     )
     sub.add_parser(
+        "runtime-drift", help="Inspect the accepted runtime baseline and drift posture"
+    )
+    runtime_rebaseline = sub.add_parser(
+        "runtime-rebaseline",
+        help="Accept a human-reviewed runtime baseline after drift inspection",
+    )
+    runtime_rebaseline.add_argument("--actor", default="human:operator")
+    runtime_rebaseline.add_argument("--reason", required=True)
+    sub.add_parser(
         "recovery-create", help="Create a verified known-good authority snapshot"
     )
     recovery_verify = sub.add_parser(
@@ -213,6 +222,7 @@ def build_business_snapshot(conn) -> dict:
     from hermes_cli.approval_artifacts import approval_posture
     from hermes_cli.outcome_attribution import planning_snapshot as outcome_snapshot
     from hermes_cli.runtime_deployment import posture as runtime_posture
+    from hermes_cli.runtime_drift import check as runtime_drift_check
     from hermes_cli.workforce_delegation import planning_snapshot as delegation_snapshot
     organization = conn.execute(
         "SELECT * FROM organizations WHERE id = ?", (organization_id,)
@@ -348,6 +358,16 @@ def build_business_snapshot(conn) -> dict:
                 * 3,
             ),
         ),
+        "runtime_drift": runtime_drift_check(
+            conn,
+            organization_id=organization_id,
+            charter=loaded_charter,
+            require_baseline=bool(
+                (loaded_charter.get("security") or {}).get(
+                    "require_runtime_baseline", False
+                )
+            ),
+        ).__dict__,
         "employee_delegation": delegation_snapshot(conn, organization_id),
         "execution_recovery": {
             "in_doubt": db.in_doubt_executions(conn, organization_id),
@@ -445,6 +465,61 @@ def business_command(args: argparse.Namespace) -> int:
             value = authority_recovery.verify_snapshot(args.snapshot)
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0 if value["valid"] else 1
+        if command in {"runtime-drift", "runtime-rebaseline"}:
+            from hermes_cli import runtime_drift
+            from hermes_cli.config import load_config
+
+            ceo = organization_db.active_ceo(conn)
+            if ceo is None:
+                raise RuntimeError("solo-founder organization has not been initialized")
+            charter = load_config().get("agentic") or {}
+            organization_id = str(ceo["organization_id"])
+            if command == "runtime-rebaseline":
+                autonomy = operational_control.autonomy_state(conn)
+                if autonomy["mode"] == "autonomous":
+                    raise RuntimeError(
+                        "pause autonomy before accepting a runtime rebaseline"
+                    )
+                from hermes_cli import objective_worker
+
+                objective_worker.ensure_schema(conn)
+                active_workers = conn.execute(
+                    """SELECT COUNT(*) FROM objective_workers
+                       WHERE status='running' AND heartbeat_at>?""",
+                    (int(time.time()) - 60,),
+                ).fetchone()[0]
+                if int(active_workers) > 0:
+                    raise RuntimeError(
+                        "stop active objective workers before accepting a runtime rebaseline"
+                    )
+                baseline_id = runtime_drift.accept_baseline(
+                    conn,
+                    organization_id=organization_id,
+                    charter=charter,
+                    actor=args.actor,
+                    reason=args.reason,
+                )
+                print(json.dumps({"baseline_id": baseline_id}, sort_keys=True))
+                return 0
+            posture = runtime_drift.check(
+                conn,
+                organization_id=organization_id,
+                charter=charter,
+                require_baseline=bool(
+                    (charter.get("security") or {}).get(
+                        "require_runtime_baseline", False
+                    )
+                ),
+            )
+            print(json.dumps({
+                "status": posture.status,
+                "ready": posture.ready,
+                "baseline_id": posture.baseline_id,
+                "expected_sha256": posture.expected_sha256,
+                "observed_sha256": posture.observed_sha256,
+                "differences": list(posture.differences),
+            }, indent=2, sort_keys=True))
+            return 0 if posture.ready else 1
         if command == "autonomy":
             if args.mode is not None:
                 if not args.reason:

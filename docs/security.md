@@ -14,6 +14,10 @@ funds; Charterforge stores opaque references and verified state.
 Durable business-audit payloads and planner lineage redact credential-like
 fields before hashing and persistence; ordinary non-sensitive planner response
 text remains byte-for-byte evidence.
+When `agentic.security.require_runtime_baseline` is enabled, each unattended
+cycle also compares the non-secret charter, authority-store schema, and Python
+runtime version with a human-accepted baseline. Drift pauses autonomy and opens
+an intervention; the planner cannot silently repair or rebaseline the host.
 
 The optional Stripe package follows this boundary: it uses an in-memory HTTP
 client, sends the secret only to Stripe, and records no raw card or bank data.

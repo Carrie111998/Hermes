@@ -244,6 +244,20 @@ def tick_once(
                 "authority integrity preflight failed: "
                 + ", ".join(integrity.checks["failed_checks"]),
             )
+        from hermes_cli import runtime_drift
+
+        drift = runtime_drift.enforce(
+            conn,
+            organization_id=str(ceo["organization_id"]),
+            charter=charter,
+        )
+        if not drift.ready:
+            return CycleOutcome(
+                None,
+                None,
+                "runtime_drift_blocked",
+                "runtime baseline " + drift.status,
+            )
         from hermes_cli import authority_recovery
 
         recovery_config = charter.get("recovery") or {}

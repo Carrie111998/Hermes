@@ -2562,6 +2562,9 @@ DEFAULT_CONFIG = {
             "require_idempotency_key_for_external_actions": True,
             "require_fresh_state_for_external_actions": True,
             "require_compensation_for_reversible_actions": True,
+            # When enabled, unattended cycles require an explicitly accepted
+            # runtime baseline for the charter and authority-store schema.
+            "require_runtime_baseline": False,
             "quarantine_untrusted_instructions": True,
             "circuit_breaker_failure_threshold": 3,
             "circuit_breaker_cooldown_seconds": 900,

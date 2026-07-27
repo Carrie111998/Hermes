@@ -1998,6 +1998,7 @@ def _bootstrap_agentic_business(charter: dict) -> tuple[str, str]:
         compliance_db,
         finance_db,
         organization_db,
+        runtime_drift,
     )
     from hermes_cli import objective_triggers, objectives_db
     from hermes_cli.objectives_db import connect_closing
@@ -2146,6 +2147,13 @@ def _bootstrap_agentic_business(charter: dict) -> tuple[str, str]:
                     1, int(recovery.get("retention_count", 7))
                 ),
             )
+        runtime_drift.accept_baseline(
+            conn,
+            organization_id=organization_id,
+            charter=charter,
+            actor="human:setup",
+            reason="initial runtime baseline accepted during agentic setup",
+        )
         return organization_id, objective_id
 
 

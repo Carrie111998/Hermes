@@ -16,6 +16,8 @@
   loops.
 - Durable audit and planner-lineage records now redact credential-like fields
   before persistence while preserving ordinary response evidence unchanged.
+- Added an optional immutable runtime baseline that pauses autonomous cycles on
+  charter, schema, or Python-runtime drift until a human rebaselines explicitly.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.
