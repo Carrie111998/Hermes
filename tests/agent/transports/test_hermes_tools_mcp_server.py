@@ -243,6 +243,21 @@ class TestCapabilitySets:
         )
         assert "kanban_list" not in selected
 
+    def test_product_owner_intake_capability_is_intake_only(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        selected = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner-intake"}
+        )
+        assert selected == (
+            "work_inbox_show",
+            "work_inbox_decide",
+            "work_inbox_heartbeat",
+            "work_inbox_agent_memory_recall",
+            "work_inbox_agent_memory_write",
+        )
+        assert not any(name.startswith("kanban_") for name in selected)
+
     def test_reviewer_capabilities_are_read_and_lifecycle_only(self):
         from agent.transports import hermes_tools_mcp_server as m
 

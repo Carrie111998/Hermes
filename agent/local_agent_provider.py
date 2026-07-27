@@ -87,6 +87,17 @@ _CLAUDE_TASK_REQUIRED_ENV = (
     "HERMES_KANBAN_WORKSPACES_ROOT",
     "HERMES_PROFILE",
 )
+_CLAUDE_INTAKE_REQUIRED_ENV = (
+    "HERMES_HOME",
+    "HERMES_AGENT_MEMORY_OUTBOX",
+    "HERMES_WORK_INBOX_INTAKE",
+    "HERMES_WORK_INBOX_RUN_ID",
+    "HERMES_WORK_INBOX_CLAIM_LOCK",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_PROFILE",
+)
 _CLAUDE_READONLY_BUILTINS = ("Read", "Grep", "Glob", "ToolSearch")
 
 
@@ -140,13 +151,18 @@ def _task_scoped_claude_options(
     effort: str | None,
 ) -> tuple[str, str] | None:
     """Return inline MCP config and allowed tools for a task-scoped Claude run."""
-    if not os.environ.get("HERMES_KANBAN_TASK"):
+    task_scoped = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    intake_scoped = bool(os.environ.get("HERMES_WORK_INBOX_INTAKE"))
+    if not task_scoped and not intake_scoped:
         return None
     profile = (os.environ.get("HERMES_PROFILE") or "").strip()
-    missing = [key for key in _CLAUDE_TASK_REQUIRED_ENV if not os.environ.get(key)]
+    required_env = (
+        _CLAUDE_INTAKE_REQUIRED_ENV if intake_scoped else _CLAUDE_TASK_REQUIRED_ENV
+    )
+    missing = [key for key in required_env if not os.environ.get(key)]
     if missing:
         raise CliConfigurationError(
-            "task-scoped claude-cli is missing dispatcher identity: "
+            "governed claude-cli is missing dispatcher identity: "
             + ", ".join(missing)
         )
 
@@ -155,7 +171,11 @@ def _task_scoped_claude_options(
         CLAUDE_TASK_CAPABILITY_BY_PROFILE,
     )
 
-    capability_set = CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+    capability_set = (
+        "product-owner-intake"
+        if intake_scoped and profile == "productowner"
+        else CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+    )
     if capability_set is None:
         raise CliConfigurationError(
             f"task-scoped claude-cli profile is not approved: {profile or '(missing)'}"
@@ -165,9 +185,6 @@ def _task_scoped_claude_options(
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
         "HERMES_QUIET": "1",
         "HERMES_REDACT_SECRETS": "true",
-        "HERMES_KANBAN_TASK": os.environ["HERMES_KANBAN_TASK"],
-        "HERMES_KANBAN_RUN_ID": os.environ["HERMES_KANBAN_RUN_ID"],
-        "HERMES_KANBAN_CLAIM_LOCK": os.environ["HERMES_KANBAN_CLAIM_LOCK"],
         "HERMES_KANBAN_DB": os.environ["HERMES_KANBAN_DB"],
         "HERMES_KANBAN_BOARD": os.environ["HERMES_KANBAN_BOARD"],
         "HERMES_KANBAN_WORKSPACES_ROOT": os.environ[
@@ -180,6 +197,30 @@ def _task_scoped_claude_options(
         "HERMES_INFERENCE_MODEL": model,
         "HERMES_INFERENCE_EFFORT": effort or "default",
     }
+    if intake_scoped:
+        child_env.update(
+            {
+                "HERMES_WORK_INBOX_INTAKE": os.environ[
+                    "HERMES_WORK_INBOX_INTAKE"
+                ],
+                "HERMES_WORK_INBOX_RUN_ID": os.environ[
+                    "HERMES_WORK_INBOX_RUN_ID"
+                ],
+                "HERMES_WORK_INBOX_CLAIM_LOCK": os.environ[
+                    "HERMES_WORK_INBOX_CLAIM_LOCK"
+                ],
+            }
+        )
+    else:
+        child_env.update(
+            {
+                "HERMES_KANBAN_TASK": os.environ["HERMES_KANBAN_TASK"],
+                "HERMES_KANBAN_RUN_ID": os.environ["HERMES_KANBAN_RUN_ID"],
+                "HERMES_KANBAN_CLAIM_LOCK": os.environ[
+                    "HERMES_KANBAN_CLAIM_LOCK"
+                ],
+            }
+        )
     memory_vault = os.environ.get("HERMES_AGENT_MEMORY_VAULT")
     if memory_vault:
         child_env["HERMES_AGENT_MEMORY_VAULT"] = memory_vault
@@ -372,13 +413,21 @@ def run_cli_acting(
     if not Path(project_cwd).is_dir():
         raise CliConfigurationError(f"Active project directory does not exist: {project_cwd}")
     capability_set = None
-    if provider == "claude-cli" and os.environ.get("HERMES_KANBAN_TASK"):
+    if provider == "claude-cli" and (
+        os.environ.get("HERMES_KANBAN_TASK")
+        or os.environ.get("HERMES_WORK_INBOX_INTAKE")
+    ):
         profile = (os.environ.get("HERMES_PROFILE") or "").strip()
         from agent.transports.hermes_tools_mcp_server import (
             CLAUDE_TASK_CAPABILITY_BY_PROFILE,
         )
 
-        capability_set = CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+        capability_set = (
+            "product-owner-intake"
+            if os.environ.get("HERMES_WORK_INBOX_INTAKE")
+            and profile == "productowner"
+            else CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+        )
     effective_timeout = float(timeout) if timeout is not None else provider_timeout(provider)
     deadline = time.monotonic() + max(0.01, effective_timeout)
     executable = _executable_for(selected)

@@ -40,6 +40,15 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
 
 
 class TestFallbackChainInit:
+    def test_direct_primary_scope_suppresses_configured_fallback(self):
+        fb = {"provider": "openai", "model": "gpt-4o"}
+        with patch.dict(
+            "os.environ", {"HERMES_DISABLE_PROVIDER_FALLBACK": "1"}
+        ):
+            agent = _make_agent(fallback_model=fb)
+            assert agent._fallback_chain == []
+            assert agent._try_activate_fallback() is False
+
     def test_no_fallback(self):
         agent = _make_agent(fallback_model=None)
         assert agent._fallback_chain == []

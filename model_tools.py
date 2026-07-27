@@ -331,6 +331,7 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(os.environ.get("HERMES_WORK_INBOX_INTAKE")),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),
         )
@@ -377,7 +378,10 @@ def _compute_tool_definitions(
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
         if (
-            os.environ.get("HERMES_KANBAN_TASK")
+            (
+                os.environ.get("HERMES_KANBAN_TASK")
+                or os.environ.get("HERMES_WORK_INBOX_INTAKE")
+            )
             and not _is_delegated_child_context()
             and "kanban" not in effective_enabled_toolsets
         ):

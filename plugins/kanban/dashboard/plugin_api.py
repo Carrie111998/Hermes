@@ -561,8 +561,21 @@ class WorkInboxAssignedDeliveryBody(BaseModel):
         return self
 
 
+class WorkInboxClarificationResponseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[2]
+    kind: Literal["clarification_response"]
+    intake_id: str
+    response: str
+    session_id: Optional[str] = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
 WorkInboxBody = Annotated[
-    WorkInboxNewWorkBody | WorkInboxAssignedDeliveryBody,
+    WorkInboxNewWorkBody
+    | WorkInboxAssignedDeliveryBody
+    | WorkInboxClarificationResponseBody,
     Field(discriminator="kind"),
 ]
 
@@ -679,6 +692,34 @@ def submit_work_inbox(
             )
             return JSONResponse(status_code=202, content=receipt)
 
+        if isinstance(payload, WorkInboxClarificationResponseBody):
+            expected_source = (
+                f"work-inbox:{principal.provider}:{principal.principal}"
+            )
+            try:
+                ok = kanban_db.respond_to_qualification_clarification(
+                    conn,
+                    payload.intake_id,
+                    source=expected_source,
+                    response=payload.response,
+                    session_id=payload.session_id,
+                    attachments=tuple(payload.attachments),
+                )
+            except PermissionError:
+                raise HTTPException(status_code=404, detail="intake not found") from None
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            if not ok:
+                raise HTTPException(status_code=409, detail="clarification was not applied")
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "intake_id": payload.intake_id,
+                    "status": "qualification_required",
+                    "intake_status": "pending",
+                },
+            )
+
         _require_work_inbox_assignment(conn, payload)
         metadata = _work_inbox_metadata(payload.metadata)
         summary = redact_sensitive_text(payload.summary, force=True)
@@ -760,12 +801,30 @@ def get_work_inbox_status(
             raise HTTPException(status_code=404, detail="intake not found")
         decisions = kanban_db.list_qualification_decisions(conn, intake_id)
         decision = decisions[-1] if decisions else None
-        return {
+        events = kanban_db.list_qualification_intake_events(conn, intake_id)
+        question = None
+        if record["status"] == "needs_clarification":
+            for event in reversed(events):
+                if event["kind"] == "clarification_requested":
+                    payload = event.get("payload") or {}
+                    question = payload.get("question")
+                    break
+        latest_run = conn.execute(
+            "SELECT id FROM qualification_intake_runs "
+            "WHERE intake_id = ? ORDER BY id DESC LIMIT 1",
+            (intake_id,),
+        ).fetchone()
+        response = {
             "intake_id": intake_id,
             "status": record["status"],
             "reason": decision.get("reason") if decision else None,
             "items": _materialized_intake_items(conn, intake_id),
         }
+        if question is not None:
+            response["question"] = question
+        if latest_run is not None:
+            response["run_id"] = latest_run["id"]
+        return response
     finally:
         conn.close()
 
@@ -804,6 +863,9 @@ def list_intake(
 
     if status is not None and status not in {
         "pending",
+        "running",
+        "needs_clarification",
+        "attention_required",
         "qualified",
         "rejected",
         "overridden",

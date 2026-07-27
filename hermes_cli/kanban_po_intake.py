@@ -191,3 +191,278 @@ def _spawn_product_owner_intake(
     finally:
         log_f.close()
     return int(proc.pid)
+
+
+def active_intake_scope(conn) -> tuple[str, dict[str, Any], str]:
+    """Validate the exact env-bound intake attempt and return its identity."""
+
+    intake_id = str(os.environ.get("HERMES_WORK_INBOX_INTAKE") or "")
+    run_text = str(os.environ.get("HERMES_WORK_INBOX_RUN_ID") or "")
+    claim_lock = str(os.environ.get("HERMES_WORK_INBOX_CLAIM_LOCK") or "")
+    if not intake_id or not run_text or not claim_lock:
+        raise ValueError("missing Work Inbox intake authority")
+    try:
+        run_id = int(run_text)
+    except ValueError as exc:
+        raise ValueError("invalid Work Inbox run identity") from exc
+    run = kanban_db.get_qualification_intake_run(conn, run_id)
+    if (
+        run is None
+        or run["intake_id"] != intake_id
+        or run["claim_lock"] != claim_lock
+        or run["status"] != "running"
+    ):
+        raise ValueError("Work Inbox intake authority is stale or does not match")
+    current = conn.execute(
+        "SELECT current_run_id, claim_lock, status "
+        "FROM qualification_intake WHERE id = ?",
+        (intake_id,),
+    ).fetchone()
+    if (
+        current is None
+        or current["current_run_id"] != run_id
+        or current["claim_lock"] != claim_lock
+        or current["status"] != "running"
+    ):
+        raise ValueError("Work Inbox intake claim is no longer active")
+    return intake_id, run, claim_lock
+
+
+def show_product_owner_intake(conn, *, board: str) -> dict[str, Any]:
+    from hermes_cli import kanban_qualifier
+
+    intake_id, run, _claim_lock = active_intake_scope(conn)
+    intake = kanban_db.get_qualification_intake(conn, intake_id)
+    if intake is None:
+        raise ValueError(f"unknown qualification intake: {intake_id}")
+    metadata = kanban_db.read_board_metadata(board)
+    return {
+        "intake": intake,
+        "run": {
+            key: run.get(key)
+            for key in ("id", "profile", "provider", "model", "effort", "started_at")
+        },
+        "board_policy": metadata,
+        "repository_instructions": kanban_qualifier._repository_instructions(metadata),
+        "current_task_graph": kanban_qualifier._task_graph(conn),
+        "events": kanban_db.list_qualification_intake_events(conn, intake_id),
+    }
+
+
+def heartbeat_product_owner_intake(
+    conn, *, note: Optional[str] = None
+) -> dict[str, Any]:
+    intake_id, run, claim_lock = active_intake_scope(conn)
+    ok = kanban_db.heartbeat_qualification_intake(
+        conn,
+        intake_id=intake_id,
+        run_id=int(run["id"]),
+        claim_lock=claim_lock,
+    )
+    if not ok:
+        raise ValueError("Work Inbox intake heartbeat lost its claim")
+    if note:
+        kanban_db.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            run_id=int(run["id"]),
+            kind="heartbeat",
+            payload={"note": str(note)},
+        )
+    return {"status": "running", "intake_id": intake_id, "run_id": run["id"]}
+
+
+def decide_product_owner_intake(
+    conn,
+    *,
+    board: str,
+    disposition: str,
+    reason: str,
+    proposal: Optional[dict[str, Any]] = None,
+    question: Optional[str] = None,
+) -> dict[str, Any]:
+    """Validate and atomically apply one semantic PO disposition."""
+
+    import copy
+    import time
+
+    from hermes_cli import kanban_intake, kanban_qualifier
+
+    intake_id, run, claim_lock = active_intake_scope(conn)
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("decision reason is required")
+    if disposition == "needs_clarification":
+        exact_question = str(question or "").strip()
+        if not exact_question:
+            raise ValueError("clarification question is required")
+        with kanban_db.write_txn(conn):
+            kanban_db.append_qualification_intake_event(
+                conn,
+                intake_id=intake_id,
+                run_id=int(run["id"]),
+                kind="clarification_requested",
+                payload={"question": exact_question, "reason": reason},
+            )
+            kanban_db.finish_qualification_intake_run(
+                conn,
+                intake_id=intake_id,
+                run_id=int(run["id"]),
+                claim_lock=claim_lock,
+                intake_status="needs_clarification",
+                outcome="needs_clarification",
+            )
+        return {"status": "needs_clarification", "intake_id": intake_id}
+    if disposition == "rejected":
+        with kanban_db.write_txn(conn):
+            kanban_db.finish_qualification_intake_run(
+                conn,
+                intake_id=intake_id,
+                run_id=int(run["id"]),
+                claim_lock=claim_lock,
+                intake_status="pending",
+                outcome="rejected",
+            )
+            kanban_db.record_qualification_decision(
+                conn,
+                intake_id=intake_id,
+                decision="rejected",
+                actor_profile=str(run["profile"]),
+                reason=reason,
+            )
+        return {"status": "rejected", "intake_id": intake_id}
+    if disposition != "accepted":
+        raise ValueError("disposition must be accepted, needs_clarification, or rejected")
+    if not isinstance(proposal, dict):
+        raise ValueError("accepted decision requires a proposal object")
+
+    intake = kanban_db.get_qualification_intake(conn, intake_id)
+    metadata = kanban_db.read_board_metadata(board)
+    decision = copy.deepcopy(proposal)
+    decision["qualification_path"] = "po"
+    decision["po_evidence"] = {
+        "surface": "work_inbox_intake",
+        "run_id": int(run["id"]),
+    }
+    work = decision.get("work") if isinstance(decision.get("work"), dict) else {}
+    if work.get("item_kind") != "epic":
+        phase_assignees = metadata["qualification"]["phase_assignees"]
+        decision["routing"] = {
+            **(
+                decision.get("routing")
+                if isinstance(decision.get("routing"), dict)
+                else {}
+            ),
+            "entry_phase": "architecture",
+            "assignee": phase_assignees["architecture"],
+        }
+        marker = f"work_inbox_intake_run:{run['id']}"
+        decision["entry_assessment"] = {
+            "reason": "Product Owner intake assessment completed",
+            "skipped_phases": [
+                {
+                    "phase": "backlog",
+                    "reason": "The configured Product Owner assessed the intake",
+                    "evidence": [marker],
+                }
+            ],
+            "evidence": [marker],
+        }
+        handover = (
+            decision.get("handover")
+            if isinstance(decision.get("handover"), dict)
+            else {}
+        )
+        decision["handover"] = {
+            **handover,
+            "next_phase": "development",
+            "next_role": phase_assignees["development"],
+        }
+    try:
+        validated = kanban_qualifier.validate_decision(
+            conn,
+            board_metadata=metadata,
+            intake=intake,
+            decision=decision,
+        )
+    except kanban_qualifier.QualificationValidationError as exc:
+        with kanban_db.write_txn(conn):
+            updated = conn.execute(
+                "UPDATE qualification_intake_runs "
+                "SET validation_attempts = validation_attempts + 1 "
+                "WHERE id = ? AND status = 'running'",
+                (int(run["id"]),),
+            )
+            attempts = conn.execute(
+                "SELECT validation_attempts FROM qualification_intake_runs WHERE id = ?",
+                (int(run["id"]),),
+            ).fetchone()["validation_attempts"]
+            if updated.rowcount == 1 and attempts >= 2:
+                kanban_db.finish_qualification_intake_run(
+                    conn,
+                    intake_id=intake_id,
+                    run_id=int(run["id"]),
+                    claim_lock=claim_lock,
+                    intake_status="attention_required",
+                    outcome="invalid_decision",
+                    error="; ".join(exc.errors),
+                )
+        return {
+            "status": "attention_required" if attempts >= 2 else "invalid",
+            "errors": list(exc.errors),
+            "attempt": attempts,
+        }
+
+    contract = {
+        "version": int(metadata["qualification"].get("contract_version", 1)),
+        "policy_version": str(
+            metadata["qualification"].get(
+                "policy_version", kanban_intake.DEFAULT_POLICY_VERSION
+            )
+        ),
+        "qualification_path": "po",
+        "request_id": intake_id,
+        **{
+            key: copy.deepcopy(validated[key])
+            for key in (
+                "work",
+                "routing",
+                "entry_assessment",
+                "handover",
+                "rules",
+                "classification",
+            )
+        },
+        "po_evidence": copy.deepcopy(validated["po_evidence"]),
+        "issuer": {
+            "surface": "work_inbox_intake",
+            "profile": run["profile"],
+            "provider": run["provider"],
+            "model": run["model"],
+            "effort": run["effort"],
+            "run_id": int(run["id"]),
+            "issued_at": int(time.time()),
+        },
+    }
+    if validated["work"]["item_kind"] == "epic":
+        contract["stories"] = copy.deepcopy(validated["stories"])
+    signed = kanban_intake.sign_work_contract(contract)
+    with kanban_db.write_txn(conn):
+        task_id = kanban_intake.materialize_contract(
+            conn, board=board, signed_contract=signed
+        )
+        if not kanban_db.finish_qualification_intake_run(
+            conn,
+            intake_id=intake_id,
+            run_id=int(run["id"]),
+            claim_lock=claim_lock,
+            intake_status="qualified",
+            outcome="qualified",
+        ):
+            raise RuntimeError("Product Owner intake claim changed during materialization")
+    return {
+        "status": "qualified",
+        "intake_id": intake_id,
+        "task_id": task_id,
+        "contract_digest": signed["digest"],
+    }

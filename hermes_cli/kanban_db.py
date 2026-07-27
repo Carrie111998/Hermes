@@ -6766,6 +6766,18 @@ def finish_qualification_intake_run(
         raise ValueError("invalid intake completion status")
     ended = int(time.time()) if now is None else int(now)
     with write_txn(conn):
+        intake_row = conn.execute(
+            "SELECT status, current_run_id, claim_lock "
+            "FROM qualification_intake WHERE id = ?",
+            (intake_id,),
+        ).fetchone()
+        if (
+            intake_row is None
+            or intake_row["current_run_id"] != int(run_id)
+            or intake_row["claim_lock"] != claim_lock
+            or intake_row["status"] not in {"running", intake_status}
+        ):
+            return False
         updated = conn.execute(
             """
             UPDATE qualification_intake_runs
@@ -6783,8 +6795,7 @@ def finish_qualification_intake_run(
             UPDATE qualification_intake
                SET status = ?, current_run_id = NULL, claim_lock = NULL,
                    claim_expires = NULL, updated_at = ?
-             WHERE id = ? AND status = 'running'
-               AND current_run_id = ? AND claim_lock = ?
+             WHERE id = ? AND current_run_id = ? AND claim_lock = ?
             """,
             (intake_status, ended, intake_id, int(run_id), claim_lock),
         )
@@ -6811,6 +6822,52 @@ def retry_qualification_intake(
         updated = conn.execute(
             "UPDATE qualification_intake SET status = 'pending', updated_at = ? "
             "WHERE id = ? AND status = 'attention_required'",
+            (timestamp, intake_id),
+        )
+    return updated.rowcount == 1
+
+
+def respond_to_qualification_clarification(
+    conn: sqlite3.Connection,
+    intake_id: str,
+    *,
+    source: str,
+    response: str,
+    session_id: Optional[str] = None,
+    attachments: Iterable[dict[str, Any]] = (),
+    now: Optional[int] = None,
+) -> bool:
+    """Append a same-source clarification response and reopen the inert intake."""
+
+    exact_response = str(response or "").strip()
+    if not exact_response:
+        raise ValueError("clarification response is required")
+    timestamp = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT source, status FROM qualification_intake WHERE id = ?",
+            (intake_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown qualification intake: {intake_id}")
+        if row["source"] != source:
+            raise PermissionError("clarification source does not match intake")
+        if row["status"] != "needs_clarification":
+            raise ValueError("intake is not waiting for clarification")
+        append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="clarification_response",
+            payload={
+                "response": exact_response,
+                "session_id": session_id,
+                "attachments": list(attachments),
+            },
+            created_at=timestamp,
+        )
+        updated = conn.execute(
+            "UPDATE qualification_intake SET status = 'pending', updated_at = ? "
+            "WHERE id = ? AND status = 'needs_clarification'",
             (timestamp, intake_id),
         )
     return updated.rowcount == 1
@@ -8529,7 +8586,11 @@ def claim_task(
     release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
         candidate = conn.execute(
-            "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+            "SELECT t.work_item_kind, t.workflow_template_id, t.current_step_key, "
+            "       json_extract(w.canonical_json, '$.po_evidence.surface') "
+            "           AS qualification_surface "
+            "FROM tasks t LEFT JOIN work_contracts w ON w.id = t.work_contract_id "
+            "WHERE t.id = ?", (task_id,)
         ).fetchone()
         if candidate is not None and candidate["work_item_kind"] == "epic":
             return None
@@ -8553,7 +8614,21 @@ def claim_task(
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
-        if any(not _dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks) for p in parents):
+        architecture_assessment = (
+            candidate is not None
+            and candidate["workflow_template_id"] == "product"
+            and candidate["current_step_key"] == "architecture"
+            and candidate["qualification_surface"] == "work_inbox_intake"
+        )
+        if (
+            not architecture_assessment
+            and any(
+                not _dependency_parent_satisfied(
+                    p, release_measure_unblocks=release_measure_unblocks
+                )
+                for p in parents
+            )
+        ):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -13571,6 +13646,27 @@ def handoff(
             if cur.rowcount != 1:
                 raise RuntimeError("handoff run ownership changed")
             _sync_legacy_status(conn, task_id, meta)
+            if next_step == "development":
+                release_measure_unblocks = (
+                    _product_release_measure_unblocks_dependents(meta)
+                )
+                parents = conn.execute(
+                    "SELECT p.status, p.workflow_template_id, p.current_step_key "
+                    "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                    "WHERE l.child_id = ?",
+                    (task_id,),
+                ).fetchall()
+                if any(
+                    not _dependency_parent_satisfied(
+                        parent,
+                        release_measure_unblocks=release_measure_unblocks,
+                    )
+                    for parent in parents
+                ):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'todo' WHERE id = ?",
+                        (task_id,),
+                    )
             run_id = _end_run(
                 conn,
                 task_id,

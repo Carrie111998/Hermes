@@ -845,6 +845,17 @@ def _create_materialized_task(
         kanban_db.add_epic_membership(
             conn, epic_id=str(epic_id), task_id=task_id
         )
+    if (
+        fields["work_item_kind"] == "card"
+        and fields["current_step_key"] == "architecture"
+        and contract.get("qualification_path") == "po"
+        and contract.get("po_evidence", {}).get("surface")
+        == "work_inbox_intake"
+    ):
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+            (task_id,),
+        )
     kanban_db._append_event(
         conn,
         task_id,
@@ -903,7 +914,15 @@ def materialize_contract(
         allowed_intake_statuses = (
             {"pending", "rejected"}
             if contract["qualification_path"] == "override"
-            else {"pending"}
+            else (
+                {"running"}
+                if (
+                    contract["qualification_path"] == "po"
+                    and contract.get("po_evidence", {}).get("surface")
+                    == "work_inbox_intake"
+                )
+                else {"pending"}
+            )
         )
         if intake_record["status"] not in allowed_intake_statuses:
             raise WorkContractError(

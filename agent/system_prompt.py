@@ -173,7 +173,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _task_scoped_claude_capability = None
     if (
         str(getattr(agent, "provider", "") or "") == "claude-cli"
-        and os.environ.get("HERMES_KANBAN_TASK")
+        and (
+            os.environ.get("HERMES_KANBAN_TASK")
+            or os.environ.get("HERMES_WORK_INBOX_INTAKE")
+        )
     ):
         from agent.transports.hermes_tools_mcp_server import (
             CAPABILITY_SETS,
@@ -181,7 +184,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         )
 
         _task_scoped_claude_capability = (
-            CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(
+            "product-owner-intake"
+            if os.environ.get("HERMES_WORK_INBOX_INTAKE")
+            and os.environ.get("HERMES_PROFILE") == "productowner"
+            else CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(
                 (os.environ.get("HERMES_PROFILE") or "").strip()
             )
         )
@@ -220,6 +226,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+
+    if (
+        os.environ.get("HERMES_WORK_INBOX_INTAKE")
+        and not _task_scoped_claude_capability
+    ):
+        from agent.transports.hermes_tools_mcp_server import (
+            CAPABILITY_INSTRUCTIONS,
+        )
+
+        stable_parts.append(
+            CAPABILITY_INSTRUCTIONS["product-owner-intake"]
+        )
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes

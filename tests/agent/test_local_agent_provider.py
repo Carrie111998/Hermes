@@ -721,3 +721,35 @@ def test_task_scoped_claude_rejects_unapproved_profile(
             cwd=str(tmp_path),
             timeout=5,
         )
+
+
+def test_work_inbox_claude_selects_intake_only_mcp_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.local_agent_provider import _task_scoped_claude_options
+
+    values = {
+        "HERMES_HOME": str(tmp_path / "profile"),
+        "HERMES_AGENT_MEMORY_OUTBOX": str(tmp_path / "outbox"),
+        "HERMES_WORK_INBOX_INTAKE": "qi_one",
+        "HERMES_WORK_INBOX_RUN_ID": "7",
+        "HERMES_WORK_INBOX_CLAIM_LOCK": "claim",
+        "HERMES_KANBAN_DB": str(tmp_path / "kanban.db"),
+        "HERMES_KANBAN_BOARD": "product",
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_PROFILE": "productowner",
+    }
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    inline, allowed = _task_scoped_claude_options(
+        provider="claude-cli", model="opus", effort="high"
+    )
+    server = json.loads(inline)["mcpServers"]["hermes-tools"]
+
+    assert server["env"]["HERMES_MCP_CAPABILITY_SET"] == "product-owner-intake"
+    assert server["env"]["HERMES_WORK_INBOX_INTAKE"] == "qi_one"
+    assert "mcp__hermes-tools__work_inbox_decide" in allowed
+    assert "mcp__hermes-tools__kanban_create" not in allowed

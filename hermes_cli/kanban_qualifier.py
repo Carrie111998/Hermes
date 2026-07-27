@@ -244,6 +244,29 @@ def _validate_po_evidence(
         errors.append("Product Owner path requires po_evidence")
         return
     run_id = evidence.get("run_id")
+    if evidence.get("surface") == "work_inbox_intake":
+        if type(run_id) is not int:
+            errors.append("Product Owner intake evidence requires run_id")
+            return
+        row = conn.execute(
+            """
+            SELECT r.id, r.intake_id, r.profile, r.status, q.current_run_id
+            FROM qualification_intake_runs r
+            JOIN qualification_intake q ON q.id = r.intake_id
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            errors.append(f"Product Owner intake run {run_id} does not exist")
+            return
+        if row["intake_id"] != intake.get("id"):
+            errors.append("Product Owner intake run does not match the request")
+        if not product_owner_profile or row["profile"] != product_owner_profile:
+            errors.append("Product Owner run profile does not match board policy")
+        if row["status"] != "running" or row["current_run_id"] != run_id:
+            errors.append("Product Owner intake run is not the active claim")
+        return
     artifact = evidence.get("artifact")
     if type(run_id) is not int or not isinstance(artifact, str) or not artifact.strip():
         errors.append("Product Owner evidence requires run_id and artifact")
@@ -313,6 +336,15 @@ def _validate_late_entry(
         )
         return
     evidence_corpus = _evidence_corpus(intake)
+    po_evidence = decision.get("po_evidence")
+    if (
+        isinstance(po_evidence, Mapping)
+        and po_evidence.get("surface") == "work_inbox_intake"
+        and type(po_evidence.get("run_id")) is int
+    ):
+        evidence_corpus += (
+            f"\nwork_inbox_intake_run:{po_evidence['run_id']}"
+        )
     for item in skipped:
         reason = item.get("reason")
         evidence = item.get("evidence")

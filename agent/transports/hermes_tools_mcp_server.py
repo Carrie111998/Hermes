@@ -158,6 +158,14 @@ PRODUCT_OWNER_TOOLS: tuple[str, ...] = (
     "kanban_block",
 )
 
+PRODUCT_OWNER_INTAKE_TOOLS: tuple[str, ...] = (
+    "work_inbox_show",
+    "work_inbox_decide",
+    "work_inbox_heartbeat",
+    "work_inbox_agent_memory_recall",
+    "work_inbox_agent_memory_write",
+)
+
 REVIEWER_TOOLS: tuple[str, ...] = (
     "kanban_show",
     "kanban_comment",
@@ -172,6 +180,7 @@ REVIEWER_TOOLS: tuple[str, ...] = (
 CAPABILITY_SETS: dict[str, tuple[str, ...]] = {
     "codex-app": CODEX_APP_TOOLS,
     "product-owner": PRODUCT_OWNER_TOOLS,
+    "product-owner-intake": PRODUCT_OWNER_INTAKE_TOOLS,
     "reviewer": REVIEWER_TOOLS,
 }
 
@@ -197,6 +206,14 @@ CAPABILITY_INSTRUCTIONS = {
         "requires unavailable attachment content or file/attachment creation, "
         "comment on the task and call kanban_block with that missing-capability "
         "reason; do not infer the missing content or broaden access."
+    ),
+    "product-owner-intake": (
+        "You are the first semantic owner of one claimed Work Inbox intake. "
+        "Call work_inbox_show before deciding, then finish with exactly one "
+        "work_inbox_decide call. You cannot create, edit, claim, or move cards "
+        "directly and cannot write repository files. Request clarification "
+        "when essential information is missing. This run has no provider "
+        "fallback; failure must leave the intake inert."
     ),
     "reviewer": (
         "You are the task-scoped Reviewer. Your filesystem access is read-only. "

@@ -1372,7 +1372,9 @@ def init_agent(
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
     # new list ``fallback_providers`` format.
-    if isinstance(fallback_model, list):
+    if os.environ.get("HERMES_DISABLE_PROVIDER_FALLBACK") == "1":
+        agent._fallback_chain = []
+    elif isinstance(fallback_model, list):
         agent._fallback_chain = [
             f for f in fallback_model
             if isinstance(f, dict) and f.get("provider") and f.get("model")

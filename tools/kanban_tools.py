@@ -112,6 +112,8 @@ def _check_kanban_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
+    if os.environ.get("HERMES_WORK_INBOX_INTAKE"):
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
@@ -127,6 +129,8 @@ def _check_kanban_orchestrator_mode() -> bool:
     and are NOT scoped to a single task are the orchestrator surface.
     """
     if _is_delegated_child_context():
+        return False
+    if os.environ.get("HERMES_WORK_INBOX_INTAKE"):
         return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
@@ -169,6 +173,21 @@ def _check_reviewer_mode() -> bool:
 def _check_ordinary_worker_mode() -> bool:
     """Normal lifecycle exits are unavailable to the privileged Resolver."""
     return _check_kanban_mode() and not _check_resolver_mode()
+
+
+def _check_work_inbox_mode() -> bool:
+    """Expose only intake authority to an exact Product Owner intake run."""
+    if _is_delegated_child_context():
+        return False
+    if not (
+        os.environ.get("HERMES_WORK_INBOX_INTAKE")
+        and os.environ.get("HERMES_WORK_INBOX_RUN_ID")
+        and os.environ.get("HERMES_WORK_INBOX_CLAIM_LOCK")
+        and os.environ.get("HERMES_PROFILE") == "productowner"
+    ):
+        return False
+    capability = os.environ.get("HERMES_MCP_CAPABILITY_SET")
+    return capability in {None, "", "product-owner-intake"}
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +1789,190 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return tool_error(f"kanban_heartbeat: {e}")
 
 
+def _handle_work_inbox_show(args: dict, **kw) -> str:
+    try:
+        from hermes_cli import kanban_po_intake
+
+        kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+        try:
+            return json.dumps(
+                kanban_po_intake.show_product_owner_intake(
+                    conn, board=os.environ["HERMES_KANBAN_BOARD"]
+                ),
+                ensure_ascii=False,
+                default=str,
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        return tool_error(f"work_inbox_show: {exc}")
+
+
+def _handle_work_inbox_heartbeat(args: dict, **kw) -> str:
+    try:
+        from hermes_cli import kanban_po_intake
+
+        kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+        try:
+            return json.dumps(
+                kanban_po_intake.heartbeat_product_owner_intake(
+                    conn, note=args.get("note")
+                )
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        return tool_error(f"work_inbox_heartbeat: {exc}")
+
+
+def _handle_work_inbox_decide(args: dict, **kw) -> str:
+    try:
+        from hermes_cli import kanban_po_intake
+
+        kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+        try:
+            return json.dumps(
+                kanban_po_intake.decide_product_owner_intake(
+                    conn,
+                    board=os.environ["HERMES_KANBAN_BOARD"],
+                    disposition=args.get("disposition"),
+                    reason=args.get("reason"),
+                    proposal=args.get("proposal"),
+                    question=args.get("question"),
+                ),
+                ensure_ascii=False,
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        return tool_error(f"work_inbox_decide: {exc}")
+
+
+def _work_inbox_memory_identity():
+    from hermes_cli import kanban_po_intake
+    from hermes_cli.agent_memory_vault import ExecutorIdentity
+
+    kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
+    try:
+        intake_id, run, _claim = kanban_po_intake.active_intake_scope(conn)
+        intake = kb.get_qualification_intake(conn, intake_id)
+        board = os.environ["HERMES_KANBAN_BOARD"]
+        delegation_id = f"{board}:{intake_id}:{run['id']}"
+        executor = ExecutorIdentity(
+            agent_id=str(run.get("provider") or "hermes"),
+            model=str(run.get("model") or "unknown"),
+            surface="work_inbox_intake",
+            hermes_role="productowner",
+            execution_id=f"work-inbox-{run['id']}",
+            responsibility="writer",
+        )
+        return (
+            kb,
+            conn,
+            intake_id,
+            int(run["id"]),
+            delegation_id,
+            "product-owner-intake",
+            "Product Owner Work Inbox assessment",
+            str(intake["raw_request"]),
+            executor,
+        )
+    except Exception:
+        conn.close()
+        raise
+
+
+def _handle_work_inbox_memory_recall(args: dict, **kw) -> str:
+    try:
+        from hermes_cli.agent_memory_protocol import (
+            WorkerRecallRequest,
+            recall_for_worker,
+        )
+
+        (kb, conn, intake_id, run_id, delegation_id, function_id,
+         title, query, executor) = _work_inbox_memory_identity()
+        try:
+            matches, receipt = recall_for_worker(
+                WorkerRecallRequest(
+                    operation_id=kb._agent_memory_operation_id(
+                        "recall", delegation_id, function_id
+                    ),
+                    task_id=intake_id,
+                    run_id=run_id,
+                    delegation_id=delegation_id,
+                    function_id=function_id,
+                    title=title,
+                    query=query,
+                    executor=executor,
+                )
+            )
+            return _ok(
+                matches=[
+                    {
+                        "function_id": item.function_id,
+                        "title": item.title,
+                        "evidence": item.evidence,
+                        "note": item.snippet,
+                    }
+                    for item in matches
+                ],
+                receipt=receipt.to_mapping(),
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        return tool_error(f"work_inbox_agent_memory_recall: {exc}")
+
+
+def _handle_work_inbox_memory_write(args: dict, **kw) -> str:
+    content = str(args.get("content") or "").strip()
+    if not content:
+        return tool_error("work_inbox_agent_memory_write: content is required")
+    try:
+        import hashlib
+        from datetime import datetime, timezone
+        from hermes_cli.agent_memory_protocol import (
+            WorkerWriteRequest,
+            write_worker_gist,
+        )
+
+        (kb, conn, intake_id, run_id, delegation_id, function_id,
+         title, _query, executor) = _work_inbox_memory_identity()
+        try:
+            gist_id = "work-inbox-" + hashlib.sha256(
+                delegation_id.encode("utf-8")
+            ).hexdigest()[:32]
+            receipt = write_worker_gist(
+                WorkerWriteRequest(
+                    operation_id=kb._agent_memory_operation_id(
+                        "write", delegation_id, function_id
+                    ),
+                    task_id=intake_id,
+                    run_id=run_id,
+                    delegation_id=delegation_id,
+                    gist_id=gist_id,
+                    occurred_at=datetime.now(timezone.utc),
+                    function_id=function_id,
+                    title=title,
+                    context=f"board={os.environ['HERMES_KANBAN_BOARD']}; intake={intake_id}",
+                    summary=content,
+                    reused="none",
+                    result="Product Owner intake continuity recorded",
+                    maturity="planned",
+                    evidence=f"intake_run={run_id}",
+                    behavior="none",
+                    decisions=content,
+                    open_loops="none",
+                    executor=executor,
+                )
+            )
+            return _ok(receipt=receipt.to_mapping())
+        finally:
+            conn.close()
+    except Exception as exc:
+        return tool_error(f"work_inbox_agent_memory_write: {exc}")
+
+
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     delegated_err = _reject_delegated_child_mutation("kanban_comment")
@@ -3357,10 +3560,107 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+WORK_INBOX_SHOW_SCHEMA = {
+    "name": "work_inbox_show",
+    "description": "Read the exact claimed Work Inbox intake and authoritative context.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+WORK_INBOX_HEARTBEAT_SCHEMA = {
+    "name": "work_inbox_heartbeat",
+    "description": "Renew the exact Product Owner intake claim.",
+    "parameters": {
+        "type": "object",
+        "properties": {"note": {"type": "string"}},
+    },
+}
+
+WORK_INBOX_DECIDE_SCHEMA = {
+    "name": "work_inbox_decide",
+    "description": (
+        "Finish the Product Owner assessment. Accepted proposals are validated, "
+        "signed, and materialized by Hermes; this tool does not grant direct card authority."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "disposition": {
+                "type": "string",
+                "enum": ["accepted", "needs_clarification", "rejected"],
+            },
+            "reason": {"type": "string"},
+            "question": {"type": "string"},
+            "proposal": {"type": "object"},
+        },
+        "required": ["disposition", "reason"],
+    },
+}
+
+WORK_INBOX_MEMORY_RECALL_SCHEMA = {
+    "name": "work_inbox_agent_memory_recall",
+    "description": "Recall advisory history for this intake when available.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+WORK_INBOX_MEMORY_WRITE_SCHEMA = {
+    "name": "work_inbox_agent_memory_write",
+    "description": "Record advisory continuity for this intake when available.",
+    "parameters": {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+        "required": ["content"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+registry.register(
+    name="work_inbox_show",
+    toolset="kanban",
+    schema=WORK_INBOX_SHOW_SCHEMA,
+    handler=_handle_work_inbox_show,
+    check_fn=_check_work_inbox_mode,
+    emoji="📥",
+)
+
+registry.register(
+    name="work_inbox_decide",
+    toolset="kanban",
+    schema=WORK_INBOX_DECIDE_SCHEMA,
+    handler=_handle_work_inbox_decide,
+    check_fn=_check_work_inbox_mode,
+    emoji="✅",
+)
+
+registry.register(
+    name="work_inbox_heartbeat",
+    toolset="kanban",
+    schema=WORK_INBOX_HEARTBEAT_SCHEMA,
+    handler=_handle_work_inbox_heartbeat,
+    check_fn=_check_work_inbox_mode,
+    emoji="💓",
+)
+
+registry.register(
+    name="work_inbox_agent_memory_recall",
+    toolset="kanban",
+    schema=WORK_INBOX_MEMORY_RECALL_SCHEMA,
+    handler=_handle_work_inbox_memory_recall,
+    check_fn=_check_work_inbox_mode,
+    emoji="🧠",
+)
+
+registry.register(
+    name="work_inbox_agent_memory_write",
+    toolset="kanban",
+    schema=WORK_INBOX_MEMORY_WRITE_SCHEMA,
+    handler=_handle_work_inbox_memory_write,
+    check_fn=_check_work_inbox_mode,
+    emoji="🧠",
+)
 
 registry.register(
     name="kanban_show",
