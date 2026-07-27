@@ -8038,12 +8038,12 @@ class SessionBridgeStore:
                 next_attempt_at = failure_time
             else:
                 state = SidebarHydrationState.RETRY
-                delay = (
-                    0.0
-                    if error_code
-                    in {"hydration_send_ambiguous", "broker_time_budget"}
-                    else min(300.0, 5.0 * (2 ** (attempts - 1)))
-                )
+                if error_code == "hydration_send_ambiguous":
+                    delay = 15.0
+                elif error_code == "broker_time_budget":
+                    delay = 0.0
+                else:
+                    delay = min(300.0, 5.0 * (2 ** (attempts - 1)))
                 next_attempt_at = failure_time + delay
             cursor = conn.execute(
                 """UPDATE session_sidebar_hydration_jobs

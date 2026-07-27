@@ -7182,7 +7182,8 @@ def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) 
     assert failed["state"] == SidebarHydrationState.RETRY.value
     assert failed["send_reserved_at"] == 126.0
 
-    reclaimed = store.claim_sidebar_hydration_jobs(now=129.0, limit=1)[0]
+    assert store.claim_sidebar_hydration_jobs(now=129.0, limit=1) == []
+    reclaimed = store.claim_sidebar_hydration_jobs(now=143.0, limit=1)[0]
     assert reclaimed["send_reserved"] is True
     assert reclaimed["source_cursor"] == "cursor-1"
     assert reclaimed["source_hash"] == "hash-1"
@@ -7239,8 +7240,9 @@ def test_sidebar_hydration_operator_recovers_exact_proven_absent_send(db) -> Non
     seeded = _seed_hydration(store, candidate)
 
     for attempt in range(5):
+        attempt_at = 125.0 + attempt * 20.0
         claim = store.claim_sidebar_hydration_jobs(
-            now=125.0 + attempt,
+            now=attempt_at,
             limit=1,
         )[0]
         if attempt == 0:
@@ -7252,7 +7254,7 @@ def test_sidebar_hydration_operator_recovers_exact_proven_absent_send(db) -> Non
             lease_token=claim["lease_token"],
             error_code="hydration_send_ambiguous",
             codex_thread_id=str(seeded["codex_thread_id"]),
-            now=125.75 + attempt,
+            now=attempt_at + 0.75,
         )
 
     assert failed["state"] == SidebarHydrationState.FAILED.value
