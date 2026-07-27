@@ -14740,6 +14740,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = ""
 
             # Auto voice reply: send TTS audio before the text response
+            # A realtime Discord VC turn owns one spoken-output route. If the
+            # model nevertheless called the generic text_to_speech tool, drop
+            # that tool's audio MEDIA tag before both VC synthesis and normal
+            # platform delivery. Otherwise the generic dedup path below skips
+            # the VC reply and Discord receives a clickable voice attachment
+            # in the linked text channel instead of live channel audio.
+            response = self._strip_realtime_voice_audio_media(
+                event,
+                response,
+                self._adapter_for_source(source),
+                agent_messages=agent_messages,
+            )
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
@@ -15879,8 +15891,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # adapter's classic auto-TTS path. Preserve the otherwise-lost
             # modality and language context for the normal Hermes turn.
             agent_input = (
-                "[This was spoken live in the connected Discord voice channel."
-                f"{language_context}]\n{transcript}"
+                "[This was spoken live in the connected Discord voice channel. "
+                "Reply naturally as part of that live spoken conversation. "
+                f"{language_context.strip()} "
+                "Return only your final response text. Do not call text_to_speech "
+                "or attach a voice memo for your reply; the gateway will speak "
+                "your final text directly in the connected voice channel. Media "
+                "artifacts explicitly requested by the user remain allowed.]\n"
+                f"{transcript}"
             )
         event = MessageEvent(
             source=source,
@@ -15942,7 +15960,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             for msg in agent_messages
         )
-        if has_agent_tts:
+        if has_agent_tts and not is_realtime_voice_input:
             return False
 
         # Dedup: base adapter auto-TTS already handles voice input
@@ -15954,6 +15972,207 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         return True
+
+    def _strip_realtime_voice_audio_media(
+        self,
+        event: MessageEvent,
+        response: str,
+        adapter,
+        agent_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Prevent live Discord VC replies from becoming chat audio files.
+
+        The generic gateway media collector auto-appends ``MEDIA:`` tags from
+        text_to_speech tool results. That is correct for ordinary messaging,
+        but a Codex realtime VC turn has a single owner for spoken output:
+        ``_send_voice_reply``. Keep non-audio artifacts available while
+        dropping audio attachments from this specific synthetic turn.
+        """
+        if not bool(getattr(event.raw_message, "codex_realtime_voice", False)):
+            return response
+
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio,
+        )
+        extract_media_candidate = getattr(adapter, "extract_media", None)
+        extract_media: Callable[[str], Any] = cast(
+            Callable[[str], Any],
+            extract_media_candidate
+            if callable(extract_media_candidate)
+            else BasePlatformAdapter.extract_media,
+        )
+        extract_local_files_candidate = getattr(adapter, "extract_local_files", None)
+        extract_local_files: Callable[[str], Any] = cast(
+            Callable[[str], Any],
+            extract_local_files_candidate
+            if callable(extract_local_files_candidate)
+            else BasePlatformAdapter.extract_local_files,
+        )
+
+        try:
+            force_document_attachments = "[[as_document]]" in response
+            media_files, cleaned = extract_media(response)
+            suppressed_audio = 0
+            preserved_media = []
+            current_turn_called_tts = self._current_turn_has_tts_tool(
+                agent_messages or []
+            )
+            for media_path, is_voice in media_files:
+                ext = Path(media_path).suffix.lower()
+                is_audio = should_send_media_as_audio(
+                    event.source.platform,
+                    ext,
+                    is_voice=is_voice,
+                )
+                # Automatic reply speech may be OGG voice media or an unmarked
+                # MP3. During a current TTS turn both are owned by the live VC;
+                # audio from unrelated artifact flows remains deliverable.
+                if is_audio and (is_voice or current_turn_called_tts):
+                    suppressed_audio += 1
+                else:
+                    preserved_media.append(media_path)
+
+            changed = bool(suppressed_audio)
+            rebuilt = cleaned.rstrip() if suppressed_audio else response
+            if suppressed_audio:
+                logger.warning(
+                    "Suppressed %d model-generated audio attachment(s) for a live Discord VC reply",
+                    suppressed_audio,
+                )
+            if (suppressed_audio or current_turn_called_tts) and not rebuilt:
+                changed = True
+                recovered = self._latest_tts_tool_text(agent_messages or [])
+                if recovered:
+                    # TTS arguments are speech content, never a second channel
+                    # through which attachment directives may re-enter delivery.
+                    _recovered_media, recovered = extract_media(recovered)
+                    # Bare paths in recovered speech are also tool payload, not
+                    # a fresh attachment request. Strip all of them here.
+                    _recovered_files, recovered = extract_local_files(recovered)
+                    rebuilt = recovered.rstrip()
+                else:
+                    rebuilt = self._realtime_voice_failure_text(adapter)
+            if suppressed_audio and preserved_media:
+                preserved = "\n".join(f"MEDIA:{path}" for path in preserved_media)
+                if force_document_attachments:
+                    preserved = f"[[as_document]]\n{preserved}"
+                rebuilt = f"{rebuilt}\n{preserved}" if rebuilt else preserved
+
+            if current_turn_called_tts:
+                local_files, local_cleaned = extract_local_files(rebuilt)
+                suppressed_local_audio = []
+                preserved_local_files = []
+                for local_path in local_files:
+                    ext = Path(local_path).suffix.lower()
+                    if should_send_media_as_audio(
+                        event.source.platform,
+                        ext,
+                        is_voice=False,
+                    ):
+                        suppressed_local_audio.append(local_path)
+                    else:
+                        preserved_local_files.append(local_path)
+                if suppressed_local_audio:
+                    changed = True
+                    rebuilt = local_cleaned.rstrip()
+                    if preserved_local_files:
+                        preserved = "\n".join(
+                            f"MEDIA:{path}" for path in preserved_local_files
+                        )
+                        if force_document_attachments:
+                            preserved = f"[[as_document]]\n{preserved}"
+                        rebuilt = f"{rebuilt}\n{preserved}" if rebuilt else preserved
+                    logger.warning(
+                        "Suppressed %d model-generated bare audio path(s) for a live Discord VC reply",
+                        len(suppressed_local_audio),
+                    )
+            if changed and not rebuilt:
+                rebuilt = self._realtime_voice_failure_text(adapter)
+            return rebuilt if changed else response
+        except Exception:
+            # Fail closed for the live-voice contract: if media parsing itself
+            # breaks, retain visible text but never leak an explicit MEDIA tag
+            # into the linked text channel as a faux voice fallback.
+            logger.warning(
+                "Failed to classify live Discord VC media; suppressing explicit media directives",
+                exc_info=True,
+            )
+            cleaned = BasePlatformAdapter.strip_media_directives_for_display(response)
+            current_turn_called_tts = self._current_turn_has_tts_tool(
+                agent_messages or []
+            )
+            if current_turn_called_tts:
+                local_files, local_cleaned = BasePlatformAdapter.extract_local_files(
+                    cleaned
+                )
+                preserved_local_files = [
+                    path
+                    for path in local_files
+                    if not should_send_media_as_audio(
+                        event.source.platform,
+                        Path(path).suffix.lower(),
+                        is_voice=False,
+                    )
+                ]
+                if len(preserved_local_files) != len(local_files):
+                    cleaned = local_cleaned.rstrip()
+                    if preserved_local_files:
+                        preserved = "\n".join(
+                            f"MEDIA:{path}" for path in preserved_local_files
+                        )
+                        cleaned = f"{cleaned}\n{preserved}" if cleaned else preserved
+            return cleaned.rstrip() or self._realtime_voice_failure_text(adapter)
+
+    @staticmethod
+    def _realtime_voice_failure_text(adapter) -> str:
+        """Return a visible/spoken failure sentence in the configured language."""
+        config = getattr(adapter, "config", None)
+        extra = getattr(config, "extra", None)
+        realtime = extra.get("codex_realtime_voice") if isinstance(extra, dict) else None
+        language = realtime.get("spoken_language", "") if isinstance(realtime, dict) else ""
+        if str(language).lower().startswith("nl"):
+            return "Sorry, ik kon het gesproken antwoord niet afmaken."
+        return "Sorry, I couldn't prepare the spoken reply."
+
+    @staticmethod
+    def _current_turn_has_tts_tool(agent_messages: List[Dict[str, Any]]) -> bool:
+        """Return whether the current turn, not history, invoked TTS."""
+        for message in reversed(agent_messages):
+            role = message.get("role")
+            if role == "user":
+                break
+            if role != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                if (call.get("function") or {}).get("name") == "text_to_speech":
+                    return True
+        return False
+
+    @staticmethod
+    def _latest_tts_tool_text(agent_messages: List[Dict[str, Any]]) -> str:
+        """Recover intended speech text when a TTS-only reply has no final text."""
+        for message in reversed(agent_messages):
+            role = message.get("role")
+            if role == "user":
+                break
+            if role != "assistant":
+                continue
+            for call in reversed(message.get("tool_calls") or []):
+                function = call.get("function") or {}
+                if function.get("name") != "text_to_speech":
+                    continue
+                arguments = function.get("arguments") or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except (TypeError, ValueError):
+                        continue
+                if isinstance(arguments, dict):
+                    text = arguments.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+        return ""
 
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
@@ -15975,6 +16194,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             is_realtime_voice_input = bool(
                 getattr(event.raw_message, "codex_realtime_voice", False)
             )
+            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
+            if is_realtime_voice_input and (
+                not guild_id
+                or not callable(is_in_voice_channel)
+                or not is_in_voice_channel(guild_id)
+            ):
+                logger.warning(
+                    "Suppressing live Discord VC speech because the voice channel is disconnected"
+                )
+                return
             linked_voice_session = (
                 guild_id
                 and adapter is not None
@@ -16079,6 +16308,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
                 await adapter.play_in_voice_channel(guild_id, actual_path)
+            elif (
+                event.source.platform == Platform.DISCORD
+                and bool(getattr(event.raw_message, "codex_realtime_voice", False))
+            ):
+                logger.warning(
+                    "Suppressing Discord chat voice attachment fallback for a live VC reply"
+                )
+                return
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
