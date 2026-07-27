@@ -998,12 +998,11 @@ class ObjectiveRuntime:
                 # authority tables; they must retain the external acceptance
                 # handoff rather than turning a missing table into a retry.
                 ceo = None
-            ceo_ids = {
-                "employee:ceo",
-                f"employee:{ceo['id']}" if ceo is not None else "",
-            }
+            ceo_identity = (
+                f"employee:{ceo['id']}" if ceo is not None else ""
+            )
             if (
-                objective.originator in ceo_ids
+                objective.originator == ceo_identity
                 and ceo is not None
                 and objective.organization_id == str(ceo["organization_id"])
             ):

@@ -1056,7 +1056,7 @@ def test_proposed_objective_creates_acceptance_handoff(tmp_path):
 
 def test_ceo_originated_objective_is_accepted_without_advisor_dispatch(tmp_path):
     conn = db.connect(tmp_path / "authority.db")
-    organization_id, _ = organization_db.bootstrap_solo_founder(
+    organization_id, ceo_id = organization_db.bootstrap_solo_founder(
         conn,
         organization_name="Autonomous Company",
         purpose="Operate without routine human dispatch",
@@ -1067,7 +1067,7 @@ def test_ceo_originated_objective_is_accepted_without_advisor_dispatch(tmp_path)
         conn,
         organization_id=organization_id,
         desired_outcome="Advance the next CEO-owned operating milestone",
-        originator="employee:ceo",
+        originator=f"employee:{ceo_id}",
         permitted_systems=["crm"],
         success_criteria=["CRM read-back matches expected stage"],
     )
