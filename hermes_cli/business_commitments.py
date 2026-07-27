@@ -364,6 +364,7 @@ def fulfill_commitment(
     conn: sqlite3.Connection,
     *,
     commitment_id: str,
+    organization_id: str,
     verification_id: str,
     actor: str,
     now: Optional[int] = None,
@@ -371,7 +372,8 @@ def fulfill_commitment(
     """Fulfil only from a pre-existing passing independent verification record."""
     ensure_schema(conn)
     commitment = conn.execute(
-        "SELECT * FROM business_commitments WHERE id=?", (commitment_id,)
+        "SELECT * FROM business_commitments WHERE id=? AND organization_id=?",
+        (commitment_id, organization_id),
     ).fetchone()
     if commitment is None:
         raise KeyError("business commitment not found")

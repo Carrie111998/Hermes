@@ -3306,6 +3306,7 @@ def register_commitment_adapters(
             commitment_id = business_commitments.fulfill_commitment(
                 authority_conn,
                 commitment_id=str(payload["commitment_id"]),
+                organization_id=organization_id,
                 verification_id=str(payload["verification_id"]),
                 actor=executor.identity,
             )

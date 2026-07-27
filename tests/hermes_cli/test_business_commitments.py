@@ -131,6 +131,7 @@ def test_fulfillment_requires_matching_passing_independent_verification(tmp_path
         business_commitments.fulfill_commitment(
             conn,
             commitment_id=commitment_id,
+            organization_id=organization_id,
             verification_id=failed,
             actor="employee:ceo",
             now=1900,
@@ -139,6 +140,7 @@ def test_fulfillment_requires_matching_passing_independent_verification(tmp_path
         business_commitments.fulfill_commitment(
             conn,
             commitment_id=commitment_id,
+            organization_id=organization_id,
             verification_id=wrong_method,
             actor="employee:ceo",
             now=1900,
@@ -153,6 +155,7 @@ def test_fulfillment_requires_matching_passing_independent_verification(tmp_path
     business_commitments.fulfill_commitment(
         conn,
         commitment_id=commitment_id,
+        organization_id=organization_id,
         verification_id=passed,
         actor="employee:ceo",
         now=1900,
@@ -178,11 +181,30 @@ def test_fulfillment_requires_matching_passing_independent_verification(tmp_path
         business_commitments.fulfill_commitment(
             conn,
             commitment_id=second,
+            organization_id=organization_id,
             verification_id=passed,
             actor="employee:ceo",
             now=2000,
         )
     conn.close()
+
+
+def test_fulfillment_is_bound_to_organization(tmp_path):
+    conn, organization_id, objective_id = _context(tmp_path)
+    commitment_id, _ = _create(conn, organization_id, objective_id)
+    passed = _verification(conn, objective_id, method="delivery.provider_readback")
+    with pytest.raises(KeyError, match="business commitment not found"):
+        business_commitments.fulfill_commitment(
+            conn,
+            commitment_id=commitment_id,
+            organization_id="organization_other",
+            verification_id=passed,
+            actor="employee:ceo",
+            now=1900,
+        )
+    assert conn.execute(
+        "SELECT status FROM business_commitments WHERE id=?", (commitment_id,)
+    ).fetchone()[0] == "active"
 
 
 def test_deadline_scan_wakes_owner_then_marks_breach_once(tmp_path):
