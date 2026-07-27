@@ -4224,6 +4224,91 @@ def fetch_api_models(
     ).get("models")
 
 
+def _custom_endpoint_cache_key(base_url: str) -> str:
+    """Return a deterministic cache key for a custom endpoint by its base_url.
+
+    Uses ``__custom__`` prefix to avoid collisions with registered-provider
+    slugs in ``provider_models_cache.json``.
+    """
+    import hashlib
+    norm = str(base_url).strip().rstrip("/").lower()
+    return f"__custom__:{hashlib.sha256(norm.encode()).hexdigest()[:16]}"
+
+
+def _custom_endpoint_fingerprint(api_key: str, base_url: str, headers: dict | None = None) -> str:
+    """Return a short hash that changes when api_key or base_url rotates."""
+    import hashlib
+    norm_url = str(base_url).strip().rstrip("/").lower()
+    h = hashlib.sha256(norm_url.encode())
+    h.update(str(api_key or "").encode())
+    if headers:
+        import json
+        h.update(json.dumps(headers, sort_keys=True).encode())
+    return h.hexdigest()[:16]
+
+
+def cached_fetch_api_models(
+    api_key: str | None,
+    base_url: str | None,
+    *,
+    timeout: float = 5.0,
+    api_mode: str | None = None,
+    headers: dict[str, str] | None = None,
+    force_refresh: bool = False,
+    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
+) -> list[str] | None:
+    """Disk-cached wrapper around :func:`fetch_api_models`.
+
+    Custom endpoints (``base_url``-keyed) get the same TTL disk cache that
+    first-class providers get via :func:`cached_provider_model_ids`.  Cache
+    entries are indexed by a deterministic key derived from ``base_url`` and
+    invalidated when ``api_key`` or ``base_url`` changes.
+
+    Does NOT cache an empty/None result — transient network errors never pin.
+    """
+    if not base_url:
+        return fetch_api_models(api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers)
+
+    cache_key = _custom_endpoint_cache_key(base_url)
+    fp = _custom_endpoint_fingerprint(api_key or "", base_url, headers)
+    cache = _load_provider_models_cache()
+    entry = cache.get(cache_key)
+    now = time.time()
+
+    if (
+        not force_refresh
+        and isinstance(entry, dict)
+        and entry.get("fp") == fp
+        and isinstance(entry.get("models"), list)
+        and entry["models"]
+        and (now - float(entry.get("at", 0))) < ttl_seconds
+    ):
+        return list(entry["models"])
+
+    # Cache miss / stale — call the live endpoint.
+    live = fetch_api_models(api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers)
+    if live:
+        cache[cache_key] = {
+            "fp": fp,
+            "at": now,
+            "models": list(live),
+        }
+        _save_provider_models_cache(cache)
+        return list(live)
+
+    # Live fetch returned nothing.  Stale fallback with matching fingerprint
+    # is better than an empty list when the endpoint is flaky.
+    if (
+        isinstance(entry, dict)
+        and entry.get("fp") == fp
+        and isinstance(entry.get("models"), list)
+        and entry["models"]
+    ):
+        return list(entry["models"])
+
+    return live
+
+
 # ---------------------------------------------------------------------------
 # Ollama Cloud — merged model discovery with disk cache
 # ---------------------------------------------------------------------------
