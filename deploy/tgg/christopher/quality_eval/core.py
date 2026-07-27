@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1075,6 +1076,13 @@ def finalize_external(
         return {"ok": True, "ran": False, "reason": "already-finalized", "cursor": state["cursor"]}
     if int(state.get("cursor", 0)) != cursor_start:
         raise EvalError("local cursor does not match the external batch start")
+    run_id = f"external-{cursor_start + 1}-{cursor_end}"
+    evidence_dir = store.root / "runs" / run_id
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    durable_batch = evidence_dir / "source-batch.json"
+    durable_judgment = evidence_dir / "judge-result.json"
+    shutil.copy2(batch_path, durable_batch)
+    shutil.copy2(judgment_path, durable_judgment)
     if state.get("registry_hash") != registry.digest:
         Evaluator(store, judge=golden_judge or Judge())._golden(registry, maker_session_id)
     filer = filer or DefectFiler(store)
@@ -1137,6 +1145,8 @@ def finalize_external(
         screenshot = next((path for path in screenshot_candidates if path.exists()), None)
         if screenshot is None:
             raise EvalError(f"no screenshot found for {job_no}")
+        durable_screenshot = evidence_dir / screenshot.name
+        shutil.copy2(screenshot, durable_screenshot)
         all_message_ids = [str(message["message_id"]) for message in bundle["messages"]]
         for check in [*normalized, *axes]:
             if check["result"] == "pass":
@@ -1145,9 +1155,9 @@ def finalize_external(
             wb_id, created = filer.file(
                 job_no=job_no,
                 check=check,
-                screenshot=str(screenshot),
+                screenshot=str(durable_screenshot),
                 message_ids=evidence_ids,
-                judgment_path=str(judgment_path),
+                judgment_path=str(durable_judgment),
             )
             defects.append({"wb_id": wb_id, "created": created, "job_no": job_no, **check})
     preferred_portal = artifacts_dir / "portal-cases.png"
@@ -1158,15 +1168,17 @@ def finalize_external(
     )
     if portal_screenshot is None:
         raise EvalError("external batch has no screenshot evidence")
+    durable_portal_screenshot = evidence_dir / portal_screenshot.name
+    shutil.copy2(portal_screenshot, durable_portal_screenshot)
     for check in portal_normalized:
         if check["result"] == "pass":
             continue
         wb_id, created = filer.file(
             job_no="TGG portal",
             check=check,
-            screenshot=str(portal_screenshot),
+            screenshot=str(durable_portal_screenshot),
             message_ids=check["message_ids"],
-            judgment_path=str(judgment_path),
+            judgment_path=str(durable_judgment),
         )
         defects.append({"wb_id": wb_id, "created": created, "job_no": "TGG portal", **check})
     occurrence_key = f"{cursor_start + 1}:{cursor_end}"
@@ -1184,7 +1196,6 @@ def finalize_external(
     state["last_completed_rows"] = len(batch["events"])
     state["last_unmapped_count"] = len(unmapped)
     trend = list(state.get("defect_trend", []))
-    run_id = f"external-{cursor_start + 1}-{cursor_end}"
     trend.append({"run_id": run_id, "at": iso(now), "defects": len(defects), "new_defects": created_count})
     state["defect_trend"] = trend[-30:]
     store.save(state)

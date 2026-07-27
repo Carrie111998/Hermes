@@ -715,6 +715,12 @@ def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
     assert len(filer.calls) == 2
     assert filer.calls[0]["message_ids"] == ["wa-10"]
     assert filer.calls[1]["screenshot"].endswith("portal-cases.png")
+    evidence_dir = tmp_path / "state" / "runs" / "external-10-11"
+    assert Path(filer.calls[0]["screenshot"]).parent == evidence_dir
+    assert Path(filer.calls[0]["judgment_path"]) == evidence_dir / "judge-result.json"
+    assert (evidence_dir / "source-batch.json").exists()
+    assert (evidence_dir / "case-7.png").exists()
+    assert (evidence_dir / "portal-cases.png").exists()
     assert core.finalize_external(
         store,
         batch_path=batch_path,
