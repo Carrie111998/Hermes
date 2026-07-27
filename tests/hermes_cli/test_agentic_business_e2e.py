@@ -5,10 +5,13 @@ import time
 from hermes_cli import (
     compliance_db,
     finance_db,
+    kanban_db,
     objective_adapters,
+    objective_service,
     objectives_db,
     organization_db,
     payment_controls,
+    workforce_delegation,
     verification_evidence,
 )
 from hermes_cli.payments import PaymentRail, ProviderPayment
@@ -562,6 +565,58 @@ def test_ceo_evaluates_then_hires_worker_across_verified_cycles(
     )
     assert delegated.status == "succeeded"
     assert verifier.verify(delegation_action, delegated).verdict == "pass"
+
+    grant = conn.execute(
+        "SELECT id FROM employee_task_grants WHERE action_id=?",
+        (delegation_action_id,),
+    ).fetchone()
+    assert grant is not None
+    task_id = str(delegated.external_reference)
+    monkeypatch.setenv("HERMES_EXECUTION_CONTRACT_ID", str(grant["id"]))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_BUSINESS_AUTHORITY_DB", str(tmp_path / "workforce.db"))
+    monkeypatch.setenv("HERMES_PROFILE", "security-auditor")
+    monkeypatch.setenv(
+        "HERMES_KANBAN_DB",
+        str(kanban_db.kanban_db_path(board="workforce-e2e")),
+    )
+    assert workforce_delegation.validate_worker_launch(
+        enabled_toolsets=["terminal"], enabled_skills=["security.audit"]
+    )["id"] == grant["id"]
+    with kanban_db.connect_closing(board="workforce-e2e") as board_conn:
+        kanban_db.complete_task(
+            board_conn,
+            task_id,
+            summary="Security audit evidence returned to the Founder/CEO",
+        )
+    conn.execute(
+        """INSERT INTO permits (
+             id,action_id,capability,payload_sha256,policy_version,
+             constraints_json,issued_to,issued_at,expires_at,consumed_at
+           ) VALUES (
+             'permit_workforce_result',?,'work.delegate','','charter-v1',
+             '{}','employee:ceo',1,9999999999,1
+           )""",
+        (delegation_action_id,),
+    )
+    conn.execute(
+        """INSERT INTO execution_results (
+             id,action_id,permit_id,executor,status,external_reference,
+             result_json,started_at,finished_at
+           ) VALUES (
+             'result_workforce_task',?,'permit_workforce_result','employee:ceo',
+             'succeeded',?,'{}',1,1
+           )""",
+        (delegation_action_id, task_id),
+    )
+    conn.commit()
+    assert objective_service.sync_kanban_events(
+        conn, board="workforce-e2e"
+    ) == 1
+    assert conn.execute(
+        """SELECT event_type FROM objective_inbox
+           WHERE event_type='kanban.task.done'"""
+    ).fetchone()["event_type"] == "kanban.task.done"
 
 
 def test_ceo_evaluates_procurement_before_autonomous_software_payment(
