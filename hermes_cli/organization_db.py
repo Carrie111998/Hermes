@@ -13,6 +13,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Mapping, Optional
 
 
@@ -223,6 +224,29 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _serialized_organization_mutation(function):
+    """Preserve one authority transaction across nested org mutations."""
+
+    @wraps(function)
+    def wrapped(conn, *args, **kwargs):
+        ensure_schema(conn)
+        owns_transaction = not conn.in_transaction
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = function(conn, *args, **kwargs)
+        except Exception:
+            if owns_transaction:
+                conn.rollback()
+            raise
+        else:
+            if owns_transaction:
+                conn.commit()
+            return result
+
+    return wrapped
+
+
 def _event(
     conn: sqlite3.Connection,
     employee_id: str,
@@ -373,6 +397,7 @@ def _active_headcount_and_payroll(
     return int(row["headcount"]), int(row["payroll"])
 
 
+@_serialized_organization_mutation
 def propose_employee(
     conn: sqlite3.Connection,
     *,
@@ -434,8 +459,7 @@ def propose_employee(
 
     employee_id = _id("emp")
     ts = _now()
-    with conn:
-        conn.execute(
+    conn.execute(
             """
             INSERT INTO employees (
                 id, organization_id, display_name, title, level, department_id,
@@ -459,17 +483,18 @@ def propose_employee(
                 ts,
                 ts,
             ),
-        )
-        _event(
-            conn,
-            employee_id,
-            "employee_proposed",
-            proposed_by,
-            {"level": level, "manager_id": manager_id, "title": title},
-        )
+    )
+    _event(
+        conn,
+        employee_id,
+        "employee_proposed",
+        proposed_by,
+        {"level": level, "manager_id": manager_id, "title": title},
+    )
     return employee_id
 
 
+@_serialized_organization_mutation
 def create_mandate(
     conn: sqlite3.Connection,
     employee_id: str,
@@ -502,8 +527,7 @@ def create_mandate(
     version = int(previous["version"]) + 1 if previous else 1
     mandate_id = _id("mandate")
     ts = _now()
-    with conn:
-        conn.execute(
+    conn.execute(
             """
             INSERT INTO employee_mandates (
                 id, employee_id, version, purpose, responsibilities_json,
@@ -534,14 +558,14 @@ def create_mandate(
                 ts,
                 previous["id"] if previous else None,
             ),
-        )
-        _event(
-            conn,
-            employee_id,
-            "mandate_created",
-            created_by,
-            {"mandate_id": mandate_id, "version": version},
-        )
+    )
+    _event(
+        conn,
+        employee_id,
+        "mandate_created",
+        created_by,
+        {"mandate_id": mandate_id, "version": version},
+    )
     return mandate_id
 
 
@@ -822,6 +846,7 @@ def may_delegate_to(
     return False
 
 
+@_serialized_organization_mutation
 def transition_employee(
     conn: sqlite3.Connection,
     employee_id: str,
@@ -833,62 +858,61 @@ def transition_employee(
     ensure_schema(conn)
     if next_status not in EMPLOYEE_STATUSES:
         raise OrganizationError(f"unknown employee status: {next_status}")
-    with conn:
-        row = _employee(conn, employee_id)
-        current = row["status"]
-        if next_status not in _EMPLOYEE_TRANSITIONS[current]:
-            raise OrganizationError(f"cannot transition employee {current} -> {next_status}")
-        if next_status == "approved":
-            org = conn.execute(
-                "SELECT * FROM organizations WHERE id = ?", (row["organization_id"],)
-            ).fetchone()
-            headcount, payroll = _active_headcount_and_payroll(
-                conn, row["organization_id"]
-            )
-            if org["headcount_limit"] is not None and headcount + 1 > org["headcount_limit"]:
-                raise OrganizationError("hire exceeds organization headcount limit")
-            if (
-                org["payroll_budget_minor"] is not None
-                and payroll + row["annual_cost_minor"] > org["payroll_budget_minor"]
-            ):
-                raise OrganizationError("hire exceeds organization payroll budget")
-        if next_status == "active":
-            mandate = conn.execute(
-                """
-                SELECT id, expires_at FROM employee_mandates
-                 WHERE employee_id = ? ORDER BY version DESC LIMIT 1
-                """,
-                (employee_id,),
-            ).fetchone()
-            if mandate is None:
-                raise OrganizationError("employee cannot activate without a mandate")
-            if mandate["expires_at"] is not None and mandate["expires_at"] <= _now():
-                raise OrganizationError("employee mandate has expired")
-            if not (profile_name or row["profile_name"]):
-                raise OrganizationError("agent employee cannot activate without a profile")
+    row = _employee(conn, employee_id)
+    current = row["status"]
+    if next_status not in _EMPLOYEE_TRANSITIONS[current]:
+        raise OrganizationError(f"cannot transition employee {current} -> {next_status}")
+    if next_status == "approved":
+        org = conn.execute(
+            "SELECT * FROM organizations WHERE id = ?", (row["organization_id"],)
+        ).fetchone()
+        headcount, payroll = _active_headcount_and_payroll(
+            conn, row["organization_id"]
+        )
+        if org["headcount_limit"] is not None and headcount + 1 > org["headcount_limit"]:
+            raise OrganizationError("hire exceeds organization headcount limit")
+        if (
+            org["payroll_budget_minor"] is not None
+            and payroll + row["annual_cost_minor"] > org["payroll_budget_minor"]
+        ):
+            raise OrganizationError("hire exceeds organization payroll budget")
+    if next_status == "active":
+        mandate = conn.execute(
+            """
+            SELECT id, expires_at FROM employee_mandates
+             WHERE employee_id = ? ORDER BY version DESC LIMIT 1
+            """,
+            (employee_id,),
+        ).fetchone()
+        if mandate is None:
+            raise OrganizationError("employee cannot activate without a mandate")
+        if mandate["expires_at"] is not None and mandate["expires_at"] <= _now():
+            raise OrganizationError("employee mandate has expired")
+        if not (profile_name or row["profile_name"]):
+            raise OrganizationError("agent employee cannot activate without a profile")
 
-        ts = _now()
-        values: dict[str, Any] = {"status": next_status, "updated_at": ts}
-        if profile_name:
-            values["profile_name"] = profile_name
-        if next_status == "approved":
-            values["approved_by"] = actor
-        if next_status == "active" and row["started_at"] is None:
-            values["started_at"] = ts
-        if next_status == "terminated":
-            values["ended_at"] = ts
-        assignments = ", ".join(f"{key} = ?" for key in values)
-        conn.execute(
-            f"UPDATE employees SET {assignments} WHERE id = ?",
-            (*values.values(), employee_id),
-        )
-        _event(
-            conn,
-            employee_id,
-            "employee_transitioned",
-            actor,
-            {"previous_status": current, "next_status": next_status},
-        )
+    ts = _now()
+    values: dict[str, Any] = {"status": next_status, "updated_at": ts}
+    if profile_name:
+        values["profile_name"] = profile_name
+    if next_status == "approved":
+        values["approved_by"] = actor
+    if next_status == "active" and row["started_at"] is None:
+        values["started_at"] = ts
+    if next_status == "terminated":
+        values["ended_at"] = ts
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    conn.execute(
+        f"UPDATE employees SET {assignments} WHERE id = ?",
+        (*values.values(), employee_id),
+    )
+    _event(
+        conn,
+        employee_id,
+        "employee_transitioned",
+        actor,
+        {"previous_status": current, "next_status": next_status},
+    )
     row = _employee(conn, employee_id)
     return Employee(
         id=row["id"],

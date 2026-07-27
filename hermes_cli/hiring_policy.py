@@ -15,6 +15,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any, Mapping
 
 
@@ -72,7 +73,34 @@ def _json(value: Any) -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hiring_decisions'"
+    ).fetchone():
+        return
     conn.executescript(SCHEMA_SQL)
+
+
+def _serialized_hiring_mutation(function):
+    """Serialize decision materialization against current organization limits."""
+
+    @wraps(function)
+    def wrapped(conn, *args, **kwargs):
+        ensure_schema(conn)
+        owns_transaction = not conn.in_transaction
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = function(conn, *args, **kwargs)
+        except Exception:
+            if owns_transaction:
+                conn.rollback()
+            raise
+        else:
+            if owns_transaction:
+                conn.commit()
+            return result
+
+    return wrapped
 
 
 def evaluate_hiring_case_from_state(
@@ -211,6 +239,7 @@ def evaluate_hiring_case_from_state(
     return decision_id, recorded
 
 
+@_serialized_hiring_mutation
 def materialize_hiring_decision(
     conn: sqlite3.Connection,
     decision_id: str,
@@ -329,8 +358,7 @@ def materialize_hiring_decision(
         organization_db.transition_employee(
             conn, employee_id, "approved", actor=actor
         )
-    with conn:
-        conn.execute(
+    conn.execute(
             """INSERT OR IGNORE INTO hiring_engagements (
                  decision_id,employee_id,organization_id,employment_class,
                  materialized_by,created_at
@@ -343,7 +371,7 @@ def materialize_hiring_decision(
                 actor,
                 int(time.time()),
             ),
-        )
+    )
     return employee_id
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import yaml
@@ -417,3 +418,77 @@ def test_planner_cannot_invent_sustained_hiring_evidence(tmp_path):
             mandate={},
             actor="control:hiring",
         )
+
+
+def test_concurrent_hiring_materialization_serializes_headcount(tmp_path):
+    conn, organization_id, objective = _governed_hiring_state(tmp_path)
+    conn.execute(
+        "UPDATE organizations SET headcount_limit=2, payroll_budget_minor=1000 "
+        "WHERE id=?",
+        (organization_id,),
+    )
+    conn.commit()
+    decisions = []
+    for index in (1, 2):
+        decision_id, decision = evaluate_hiring_case_from_state(
+            conn,
+            organization_id=organization_id,
+            case={
+                "objective_id": objective.id,
+                "missing_capability": "security.audit",
+                "blocked_objectives": 999,
+                "capability_gap_cycles": 999,
+                "annual_cost_minor": 100,
+                "expected_duration_cycles": 4,
+                "scoped_deliverable": f"audit {index}",
+            },
+            policy=default_hiring_policy(),
+            idempotency_key=f"concurrent-hire-decision-{index:04d}",
+            evaluated_by="control:hiring",
+        )
+        assert decision.verdict == "hire"
+        decisions.append(decision_id)
+    ceo_id = organization_db.active_ceo(conn)["id"]
+    database = tmp_path / "authority.db"
+
+    def materialize(decision_id):
+        worker_conn = objectives_db.connect(database)
+        try:
+            try:
+                return materialize_hiring_decision(
+                    worker_conn,
+                    decision_id,
+                    display_name=f"Auditor {decision_id[-4:]}",
+                    title="Contract Security Auditor",
+                    level="individual_contributor",
+                    manager_id=ceo_id,
+                    mandate={
+                        "purpose": "Complete an independent audit",
+                        "responsibilities": ["audit"],
+                        "decision_rights": ["report findings"],
+                        "prohibited_actions": ["security.deploy"],
+                        "capabilities": ["security.audit"],
+                        "systems": ["security"],
+                        "kpis": ["verified report"],
+                        "escalation": {"to": ceo_id},
+                        "toolsets": ["terminal"],
+                        "expires_at": int(time.time()) + 3_600,
+                    },
+                    actor="control:hiring",
+                )
+            except PermissionError:
+                return None
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        employees = list(pool.map(materialize, decisions))
+    assert sum(employee is not None for employee in employees) == 1
+    refreshed = objectives_db.connect(database)
+    try:
+        assert refreshed.execute(
+            "SELECT COUNT(*) FROM employees WHERE organization_id=? AND status!='rejected'",
+            (organization_id,),
+        ).fetchone()[0] == 2
+    finally:
+        refreshed.close()
