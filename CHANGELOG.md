@@ -248,3 +248,6 @@ recorded.
 - `f1ec869d5280f9ba33d5822d4f23e1d655432237` — scoped advisor-intervention
   action and dedupe replays to their organization, rejecting cross-tenant
   escalation collisions.
+- `a1e6e1630229e429c43dabdc3ed2bd890cc7c1de` — required approval-artifact
+  issuance to name the expected organization, preventing direct callers from
+  issuing authority against another tenant's intervention.

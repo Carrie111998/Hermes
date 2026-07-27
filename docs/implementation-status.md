@@ -110,6 +110,8 @@ acceptance evidence.
   action, amount, and currency before an existing spend authorization is reused.
 - Advisor-intervention action and dedupe replays are organization-scoped;
   cross-tenant intervention collisions fail closed.
+- Approval-artifact issuance requires an explicit expected organization and
+  filters the intervention lookup by that organization.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -185,7 +187,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`f1ec869d5280f9ba33d5822d4f23e1d655432237` passed 6 Founder/CEO E2E tests, 48
+`a1e6e1630229e429c43dabdc3ed2bd890cc7c1de` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -198,6 +200,7 @@ It also passed the objective portfolio relationship regression: 7 tests.
 It also passed the hiring policy regression: 13 tests.
 It also passed the finance reservation regression: 21 tests.
 It also passed the intervention-control regression: 10 tests.
+It also passed the approval-artifact regression: 9 tests.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,
