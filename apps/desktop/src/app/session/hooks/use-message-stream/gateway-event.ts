@@ -324,7 +324,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             lastCwdInfoSessionRef.current = sessionId
             setCurrentCwd(payload.cwd)
 
-            if (cwdMoved && sameSession && previousCwd) {
+            if (cwdMoved && sameSession && previousCwd && payload.cwd) {
               void followActiveSessionCwd(payload.cwd)
             }
           }
