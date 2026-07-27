@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -158,3 +159,108 @@ def test_selected_release_rejects_non_root_symlink_owner(
         match="trusted_signer_current_release_invalid",
     ):
         provisioning._selected_release_evidence(layout)
+
+
+def test_release_projection_accepts_signed_zero_byte_runtime_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "a" * 40
+    release = tmp_path / revision
+    public_raw = bytes(range(32))
+    public_key_id = hashlib.sha256(public_raw).hexdigest()
+    payloads = {
+        "bin/provision": (b"entrypoint", 0o555),
+        "scripts/canary/trusted_signer_provisioning.py": (
+            b"signer provisioning source",
+            0o444,
+        ),
+        "scripts/canary/storage_growth_trusted_collector.py": (
+            b"storage collector source",
+            0o444,
+        ),
+    }
+    interpreter = b"exact offline interpreter"
+    files = {
+        **payloads,
+        "venv/bin/python": (interpreter, 0o555),
+        "venv/lib/python3.11/site-packages/example/py.typed": (b"", 0o444),
+        "trust/cloud-observation-attestation.pub": (public_raw, 0o444),
+    }
+    for relative, (raw, mode) in files.items():
+        path = release / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        path.chmod(mode)
+    manifest = {
+        "release_revision": revision,
+        "package_sha256": "b" * 64,
+        "collector_public_key_ids": {
+            role: public_key_id for role in ("network", "cloud", "host")
+        },
+        "runtime_source_closure": [
+            "scripts/canary/trusted_signer_provisioning.py",
+            "scripts/canary/storage_growth_trusted_collector.py",
+        ],
+        "wheels": [{"project": "cryptography", "version": "49.0.0"}],
+        "interpreter_sha256": hashlib.sha256(interpreter).hexdigest(),
+        "payloads": [
+            {
+                "release_relative": relative,
+                "mode": f"{mode:04o}",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+            for relative, (raw, mode) in payloads.items()
+        ],
+    }
+    authority_manifest = release / "package-manifest.json"
+    authority_manifest.write_bytes(
+        provisioning.foundation.canonical_json_bytes(manifest)
+    )
+    authority_manifest.chmod(0o444)
+    for directory in sorted(
+        (path for path in release.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        directory.chmod(0o555)
+    release.chmod(0o555)
+    uid = os.getuid()
+    gid = os.getgid()
+    layout = provisioning.SignerLayout(
+        role="cloud",
+        release_base=release.parent,
+        release=release,
+        authority_manifest=authority_manifest,
+        pinned_public_key=release / "trust/cloud-observation-attestation.pub",
+        private_key=tmp_path / "private.key",
+        installed_public_key=tmp_path / "installed.pub",
+        config=tmp_path / "config.json",
+        replay_directory=tmp_path / "replay",
+        receipt=tmp_path / "receipt.json",
+        lock=tmp_path / "lock",
+        activation_seal=tmp_path / "activation-seal",
+        current_link=tmp_path / "current",
+        private_uid=uid,
+        private_gid=gid,
+        config_uid=uid,
+        config_gid=gid,
+        replay_uid=uid,
+        replay_gid=gid,
+        receipt_uid=uid,
+        receipt_gid=gid,
+        release_uid=uid,
+        release_gid=gid,
+        runtime_entrypoint_name="provision",
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_layout_directories",
+        lambda _layout: None,
+    )
+
+    evidence = provisioning._validate_release_and_authority(layout)
+
+    assert evidence["runtime"]["immutable_release_projection_count"] > len(files)
+    assert len(evidence["runtime"]["immutable_release_projection_sha256"]) == 64

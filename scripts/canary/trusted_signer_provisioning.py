@@ -935,6 +935,7 @@ def _validate_release_and_authority(layout: SignerLayout) -> Mapping[str, Any]:
                 uid=layout.release_uid,
                 gid=layout.release_gid,
                 mode=mode,
+                allow_empty=True,
             )
             projection.append({
                 "path": relative,
