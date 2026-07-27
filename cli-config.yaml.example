@@ -890,7 +890,8 @@ agent:
   #   full        - every category keeps full descriptions (default for
   #                 interactive coding surfaces; today's behaviour)
   #   compact     - non-coding categories demoted to names-only (default for
-  #                 messaging/chat surfaces; ~55-70% catalog reduction)
+  #                 messaging/chat surfaces; catalog reduction varies with the
+  #                 category mix, ~17.5% measured on the default profile)
   #   names-only  - every category demoted to names-only (max compaction;
   #                 opt-in for token-critical high-volume profiles)
   # Omit (or '') to accept the per-surface default (compact on chat, full on

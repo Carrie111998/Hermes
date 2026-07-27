@@ -357,10 +357,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _compact_cats = frozenset()
             _catalog_cats = frozenset()
         _resolved_cats = _union_compact_categories(_compact_cats, _catalog_cats)
+        # Pass the resolved set through WITHOUT boolean coercion. The
+        # ALL_SKILL_CATEGORIES sentinel (names-only) is an empty-but-meaningful
+        # frozenset, so `_resolved_cats or None` would silently coerce it to
+        # None and disable names-only mode. build_skills_system_prompt already
+        # identity-checks the sentinel and treats an empty plain frozenset the
+        # same as None, so forwarding the set verbatim is correct for all of
+        # full / compact / names-only.
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
-            compact_categories=_resolved_cats or None,
+            compact_categories=_resolved_cats,
         )
     else:
         skills_prompt = ""

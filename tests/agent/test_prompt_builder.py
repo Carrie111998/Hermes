@@ -1044,13 +1044,36 @@ class TestSkillsCatalogModeRendering:
         reduction = 1.0 - (len(compact_block) / len(full_block))
         assert reduction >= 0.50, f"only {reduction:.1%} reduction"
 
-    def test_t7_no_env_var_for_mode(self):
-        """The mode is config-only — no HERMES_* env read for it."""
-        import inspect
+    def test_t7_no_env_var_for_mode(self, monkeypatch):
+        """The mode is config-only — no HERMES_* env var can steer it.
+
+        Behavioral, not source-text: populate the environment with every
+        plausible HERMES_* mode override and assert resolution still follows
+        only (config, platform). If the resolver ever read an env var, one of
+        these would flip the outcome away from the config/surface default.
+        """
         from agent import coding_context as cc
 
-        src = inspect.getsource(cc._skills_catalog_mode)
-        src += inspect.getsource(cc.resolve_skills_catalog_compaction)
-        assert "os.environ" not in src
-        assert "getenv" not in src
-        assert "HERMES_" not in src
+        for name in (
+            "HERMES_SKILLS_CATALOG_MODE",
+            "HERMES_SKILL_CATALOG_MODE",
+            "HERMES_CATALOG_MODE",
+            "HERMES_SKILLS_MODE",
+        ):
+            monkeypatch.setenv(name, "names-only")
+
+        # Chat surface, empty config → still the compact surface default
+        # (would be the names-only ALL sentinel if any env var were honored).
+        got_chat = cc.resolve_skills_catalog_compaction(platform="mattermost", config={})
+        assert got_chat == frozenset(cc._NON_CODING_SKILL_CATEGORIES)
+
+        # Coding surface, empty config → still full (no demotion).
+        got_cli = cc.resolve_skills_catalog_compaction(platform="cli", config={})
+        assert got_cli == frozenset()
+
+        # Explicit config still wins over the (ignored) environment.
+        cfg_full = {"agent": {"skills_catalog_mode": "full"}}
+        assert (
+            cc.resolve_skills_catalog_compaction(platform="mattermost", config=cfg_full)
+            == frozenset()
+        )
