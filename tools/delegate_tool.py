@@ -2137,6 +2137,14 @@ def _run_single_child(
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        # H-01: a crashed child still produces a non-empty ``final_response`` —
+        # the outer loop writes "I apologize, but I encountered an error ..."
+        # into it — so summary-presence alone reported the delegated work as
+        # done and the parent proceeded on an apology. Shared predicate so this
+        # cannot drift from the finalizer's own definition.
+        from agent.turn_finalizer import turn_crashed
+
+        child_crashed = turn_crashed(result.get("turn_exit_reason"))
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -2148,6 +2156,9 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif child_crashed:
+            # Checked before the summary branch: the crash apology IS a summary.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -2195,6 +2206,11 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif child_crashed:
+            # Without this the crash falls through to "max_iterations", which is
+            # a specific and wrong diagnosis — the parent would retry a budget
+            # problem that never happened.
+            exit_reason = "crashed"
         elif completed:
             exit_reason = "completed"
         else:
