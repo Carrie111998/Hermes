@@ -1223,6 +1223,37 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            _authorize_kanban_mutation(
+                "create",
+                {
+                    "operation": "create",
+                    "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+                    "title": str(title).strip(),
+                    "body": body,
+                    "assignee": str(assignee),
+                    "parents": [str(parent) for parent in parents],
+                    "tenant": tenant,
+                    "priority": int(priority) if priority is not None else 0,
+                    "workspace_kind": str(workspace_kind),
+                    "workspace_path": workspace_path,
+                    "project_id": project_id,
+                    "triage": triage,
+                    "idempotency_key": idempotency_key,
+                    "max_runtime_seconds": (
+                        int(max_runtime_seconds)
+                        if max_runtime_seconds is not None else None
+                    ),
+                    "skills": list(skills) if skills is not None else None,
+                    "model": model_override,
+                    "provider": provider_override,
+                    "goal_mode": goal_mode,
+                    "goal_max_turns": (
+                        int(goal_max_turns) if goal_max_turns is not None else None
+                    ),
+                    "initial_status": str(initial_status),
+                    "session_id": session_id,
+                },
+            )
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),

@@ -1546,6 +1546,32 @@ def test_create_rejects_non_list_skills(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_create_authorization_binds_task_contract(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    calls = []
+
+    def record(operation, scope):
+        calls.append((operation, scope))
+
+    monkeypatch.setattr(kt, "_authorize_kanban_mutation", record)
+    out = kt._handle_create({
+        "title": "bounded child",
+        "assignee": "researcher",
+        "body": "acceptance",
+        "priority": 3,
+        "skills": ["research"],
+    })
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "create"
+    assert scope["board"] == "default"
+    assert scope["title"] == "bounded child"
+    assert scope["assignee"] == "researcher"
+    assert scope["parents"] == []
+    assert scope["priority"] == 3
+    assert scope["skills"] == ["research"]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
