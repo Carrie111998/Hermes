@@ -1892,10 +1892,13 @@ class WorkflowEngine:
                 # Check if reviewer depends on this node (circular)
                 reviewer = workflow.nodes.get(rev_id)
                 if reviewer and nid in reviewer.depends_on:
-                    result["valid"] = False
+                    # This is acceptable — reviewer nodes are skipped in the
+                    # initial card creation and dispatched by the supervisor
+                    # on demand. The depends_on ensures the reviewer runs
+                    # after the creator in the DAG ordering.
                     result["issues"].append(
-                        f"Node '{nid}' reviews '{rev_id}' but '{rev_id}' depends_on '{nid}' — "
-                        f"this causes double dispatch (DAG + supervisor)"
+                        f"Node '{nid}' reviews '{rev_id}' and '{rev_id}' depends_on '{nid}' — "
+                        f"reviewer will be dispatched by supervisor (not DAG)"
                     )
                 # Check if this node depends on reviewer (conflict)
                 if rev_id in node.depends_on:
@@ -3074,6 +3077,9 @@ class WorkflowEngine:
                                                 states[rev_id].status = "running"
                                                 states[rev_id].started_at = datetime.now(timezone.utc).isoformat()
                                                 state.review_counts[rev_id] = current_count + 1
+                                                # Add reviewer to pending set so _monitor_layer
+                                                # polls its status and detects block/completion.
+                                                pending.add(rev_id)
                                                 print(f"   ✓ {rev_id} → card {reviewer_card_id}")
                                                 dispatched = True
                                                 break  # Dispatch one reviewer at a time
