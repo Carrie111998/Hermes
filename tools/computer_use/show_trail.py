@@ -45,7 +45,7 @@ def update_canvas(canvas, root, points, state):
         root.after(30, update_canvas, canvas, root, points, state)
     else:
         # Start persistence stage: keep it for 2 seconds
-        root.after(2000, start_retraction, canvas, root, points)
+        root.after(100, start_retraction, canvas, root, points)
 
 def start_retraction(canvas, root, points):
     # Spring retract animation: shrink from tail to head
