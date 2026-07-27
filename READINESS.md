@@ -84,7 +84,7 @@ determination until a newer evidence commit is recorded.
 ## Post-boundary evidence on current main
 
 The exact acceptance command set was rerun against current `main` at baseline
-commit `a1e6e1630229e429c43dabdc3ed2bd890cc7c1de`. This is a separate,
+commit `3f91ce6344150885a0e74ec961565c7190fa56c2`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
@@ -101,6 +101,7 @@ tag above.
 - Finance reservation regression: **21 passed, 0 failed**.
 - Intervention-control regression: **10 passed, 0 failed**.
 - Approval-artifact regression: **9 passed, 0 failed**.
+- Company-email regression: **4 passed, 0 failed**.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 

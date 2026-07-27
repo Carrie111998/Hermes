@@ -251,3 +251,6 @@ recorded.
 - `a1e6e1630229e429c43dabdc3ed2bd890cc7c1de` — required approval-artifact
   issuance to name the expected organization, preventing direct callers from
   issuing authority against another tenant's intervention.
+- `3f91ce6344150885a0e74ec961565c7190fa56c2` — made company-email send
+  recording explicitly idempotent and payload-bound, returning the original
+  operation for true retries and rejecting changed recipients or content.
