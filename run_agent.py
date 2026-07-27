@@ -3506,6 +3506,32 @@ class AIAgent:
             # Never let durable heartbeat I/O break the agent loop.
             pass
 
+    def _reset_activity_labels_after_turn(self) -> None:
+        """Drop mid-turn activity labels once the turn is no longer running.
+
+        Keeps ``_last_activity_ts`` so idle/watchdog clocks stay continuous
+        across interrupt-recursive turns (#15654) and between turns. Clears
+        description + provenance so idle cached agents / SessionDB listings
+        do not keep advertising the last mid-turn stamp (e.g. compression
+        or tool execution) after the turn ended (#72039).
+        """
+        from agent.session_activity import ActivityProvenance
+
+        self._last_activity_desc = ""
+        self._last_activity_provenance = ActivityProvenance.UNKNOWN
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        if not session_id or session_db is None:
+            return
+        clear = getattr(session_db, "clear_session_activity_labels", None)
+        if not callable(clear):
+            return
+        try:
+            clear(session_id)
+        except Exception:
+            # Never let durable cleanup I/O break turn teardown.
+            pass
+
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
 
@@ -6822,6 +6848,12 @@ class AIAgent:
                     moa_config=moa_config,
                 )
             finally:
+                # Always clear mid-turn labels when the turn exits — including
+                # interrupted early returns that skip finalize_turn. Keep ts.
+                try:
+                    self._reset_activity_labels_after_turn()
+                except Exception:
+                    pass
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
 

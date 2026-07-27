@@ -4688,6 +4688,31 @@ class TestListSessionsRich:
         assert db.get_session("s1")["last_activity_at"] == heartbeat
         assert db.get_session("s1")["last_activity_description"] == "starting API call #1"
 
+    def test_clear_session_activity_labels_keeps_timestamp(self, db):
+        """Turn-end label clear must wipe desc/provenance without moving ts."""
+        db.create_session("s1", "cli")
+        heartbeat = 1_700_000_500.0
+        db.touch_session_activity(
+            "s1",
+            heartbeat,
+            description="compressing context",
+            provenance=ActivityProvenance.AGENT_COMPRESSION,
+        )
+        row = db.get_session("s1")
+        assert row["last_activity_at"] == heartbeat
+        assert row["last_activity_description"] == "compressing context"
+        assert row["last_activity_provenance"] == "agent.compression"
+
+        db.clear_session_activity_labels("s1")
+        row = db.get_session("s1")
+        assert row["last_activity_at"] == heartbeat
+        assert row["last_activity_description"] == ""
+        assert row["last_activity_provenance"] == "unknown"
+        activity = db.get_session_activity("s1")
+        assert activity["last_activity_at"] == heartbeat
+        assert activity["last_activity_description"] == ""
+        assert activity["last_activity_provenance"] == "unknown"
+
     def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
         """Rate-limited heartbeats can lag message writes; last_active must take max."""
         db.create_session("s1", "cli")

@@ -24,6 +24,9 @@ def _agent_with_db(session_id: str = "sess-1"):
     agent._persist_session_activity_if_due = (
         run_agent.AIAgent._persist_session_activity_if_due.__get__(agent, SimpleNamespace)
     )
+    agent._reset_activity_labels_after_turn = (
+        run_agent.AIAgent._reset_activity_labels_after_turn.__get__(agent, SimpleNamespace)
+    )
     agent.get_activity_summary = run_agent.AIAgent.get_activity_summary.__get__(
         agent, SimpleNamespace
     )
@@ -130,3 +133,53 @@ def test_get_activity_summary_exposes_shared_activity_contract(monkeypatch):
     assert summary["last_activity_desc"] == "executing tool: terminal"
     assert "phase" not in summary
     assert "last_progress_at" not in summary
+
+
+def test_reset_activity_labels_after_turn_keeps_ts_and_clears_labels():
+    """Turn-end cleanup must not bump ts (watchdog continuity) but must
+    clear mid-turn description/provenance and force a durable label clear.
+    """
+    agent = _agent_with_db()
+    agent._last_activity_ts = 1_700_000_000.0
+    agent._last_activity_desc = "compressing context"
+    agent._last_activity_provenance = ActivityProvenance.AGENT_COMPRESSION
+    # Still inside the 60s persist window from a prior heartbeat — label
+    # clear must bypass that rate limit via clear_session_activity_labels.
+    agent._session_activity_last_persist_mono = 1_000.0
+
+    agent._reset_activity_labels_after_turn()
+
+    assert agent._last_activity_ts == 1_700_000_000.0
+    assert agent._last_activity_desc == ""
+    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+    agent._session_db.clear_session_activity_labels.assert_called_once_with("sess-1")
+    agent._session_db.touch_session_activity.assert_not_called()
+
+
+def test_reset_activity_labels_after_turn_skips_db_without_session():
+    agent = _agent_with_db()
+    agent.session_id = None
+    agent._last_activity_ts = 42.0
+    agent._last_activity_desc = "executing tool: terminal"
+    agent._last_activity_provenance = ActivityProvenance.AGENT_COMPRESSION
+
+    agent._reset_activity_labels_after_turn()
+
+    assert agent._last_activity_ts == 42.0
+    assert agent._last_activity_desc == ""
+    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+    agent._session_db.clear_session_activity_labels.assert_not_called()
+
+
+def test_reset_activity_labels_after_turn_swallows_db_errors():
+    agent = _agent_with_db()
+    agent._last_activity_ts = 99.0
+    agent._last_activity_desc = "starting API call #1"
+    agent._last_activity_provenance = ActivityProvenance.UNKNOWN
+    agent._session_db.clear_session_activity_labels.side_effect = RuntimeError("db locked")
+
+    agent._reset_activity_labels_after_turn()
+
+    assert agent._last_activity_ts == 99.0
+    assert agent._last_activity_desc == ""
+    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
