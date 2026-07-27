@@ -2868,7 +2868,9 @@ class WorkflowEngine:
                                                 rev_state.completed_at = None
                                                 rev_state.result = None
                                                 print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
-                                    # Re-enter monitoring loop for this layer
+                                    # Advance to next layer so the reviewer
+                                    # gets dispatched and monitored.
+                                    layer_idx += 1
                                     break
                         except Exception:
                             pass
