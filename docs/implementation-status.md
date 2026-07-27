@@ -96,6 +96,8 @@ acceptance evidence.
   direction, provider, party, amount, currency, purpose, and action fields.
 - Treasury ledger retries are bound to the original entry parameters before a
   duplicate idempotency key is accepted.
+- Accounting journal retries are bound to the original description, currency,
+  and complete line set before a duplicate source key is accepted.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -171,11 +173,13 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`9c2bdd63a3360c222046f5bf490dc7cca620f103` passed 6 Founder/CEO E2E tests, 48
+`15dd8224cadf9c46e2b16ea7d6bef2175420cd0b` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
 boundary or broaden the inventory coverage claim.
+
+The same baseline passed the accounting replay/idempotency regression: 7 tests.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,

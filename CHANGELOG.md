@@ -227,3 +227,6 @@ recorded.
 - `9c2bdd63a3360c222046f5bf490dc7cca620f103` — bound treasury ledger
   idempotency retries to exact entry parameters, rejecting duplicate-key
   amount, account, action, or external-reference drift.
+- `15dd8224cadf9c46e2b16ea7d6bef2175420cd0b` — bound accounting journal replays to exact description,
+  currency, and line parameters, rejecting source-key drift while permitting
+  evidence-only retries.
