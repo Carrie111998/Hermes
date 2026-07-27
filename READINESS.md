@@ -437,6 +437,25 @@ The committed container acceptance was rerun from `9a5370b45c4c3378d97415a76d480
 
 Image manifest: `sha256:92e65135599ec03c747539b51bc4b5ca9bf1f406c50a97faf758366e46cf33dc`. The provider boundaries remain deterministic local adapters.
 
+The current-tree acceptance was rerun after exact-resource grant enforcement at
+commit `fc69220e5c78f7c892f049749c37319283c4a18c` on 2026-07-27. The run used
+`scripts/run_agentic_acceptance.sh` and passed installation/bootstrap,
+readiness gating, bounded CEO execution, process-separated delegation,
+uncertain-provider read-back, durable recovery, and master stop without
+duplicate effects:
+
+```text
+{"phase": "ceo", "event": "kanban.task.done", "objective": "verified"}
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}
+{"phase": "stop", "autonomy": "paused", "generation": 2, "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+Image manifest: `sha256:b081b0a9de63aadbcbb4392d6453616dfa8870c3cdc1402b20e06dffa9d40d3f`.
+This is still deterministic local-provider evidence, not production deployment
+or live payment-provider evidence.
+
 Compliance lineage was separately validated with:
 
 ```sh

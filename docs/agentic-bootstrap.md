@@ -263,3 +263,15 @@ current-tree agentic acceptance: PASS
 Image manifest: `sha256:92e65135599ec03c747539b51bc4b5ca9bf1f406c50a97faf758366e46cf33dc`.
 This remains deterministic local-provider evidence, not production deployment
 or live payment evidence.
+
+The same acceptance was rerun from commit
+`fc69220e5c78f7c892f049749c37319283c4a18c` after exact-resource delegation
+enforcement. Command:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+It passed the process-separated delegation, interrupted-provider read-back,
+durable restart recovery, and stop phases with zero duplicate provider calls.
+Image manifest: `sha256:b081b0a9de63aadbcbb4392d6453616dfa8870c3cdc1402b20e06dffa9d40d3f`.
