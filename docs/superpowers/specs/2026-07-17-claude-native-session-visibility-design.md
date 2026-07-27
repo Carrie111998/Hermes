@@ -304,3 +304,10 @@ Final acceptance requires:
 - Never broaden cwd or Git identity silently.
 - Never exceed the daily count or emergency cost threshold.
 - Never allow native Claude mirrors to re-enter eligibility as new sources.
+
+## Completion record
+
+The implementation was recovered from the retired
+`session-bridge-ship` worktree and audited again on 2026-07-27. The final
+evidence and acceptance disposition are recorded in
+`docs/superpowers/audits/2026-07-27-session-bridge-acceptance-audit.md`.

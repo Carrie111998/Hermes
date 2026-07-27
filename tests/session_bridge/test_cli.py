@@ -44,6 +44,7 @@ from session_bridge.cli import (
     main,
 )
 from session_bridge.codex_adapter import SidebarThreadVerifier
+from session_bridge.codex_client import RecoveringCodexAppServerClient
 from session_bridge.config import (
     BridgeConfig,
     CatalogConfig,
@@ -5498,6 +5499,45 @@ def test_claude_only_runtime_never_spawns_codex(
             providers=(Provider.CLAUDE,),
         )
         assert set(coordinator._adapters) == {Provider.CLAUDE}
+    finally:
+        backend.close()
+
+
+def test_production_codex_runtime_owns_a_recovering_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+
+    class Client:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: Client(),
+    )
+    try:
+        backend._provider_runtime(
+            targets=False,
+            catalog_only=True,
+            providers=(Provider.CODEX,),
+        )
+
+        assert isinstance(
+            backend._codex_client,
+            RecoveringCodexAppServerClient,
+        )
     finally:
         backend.close()
 

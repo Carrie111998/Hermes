@@ -52,6 +52,7 @@ from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_RETRY_CODES,
 )
 from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter, SidebarThreadVerifier
+from .codex_client import RecoveringCodexAppServerClient
 from .config import BridgeConfig
 from .context_pack import ContextPackBuilder
 from .coordinator import (
@@ -688,7 +689,7 @@ class ProductionBackend:
         self._claude_visibility_startup_identity: tuple[tuple[str, ...], str] | None = (
             None
         )
-        self._codex_client: CodexAppServerClient | None = None
+        self._codex_client: RecoveringCodexAppServerClient | None = None
         self._sidebar_codex_client: CodexAppServerClient | None = None
         self._sidebar_executor: SidebarExecutor | None = None
         self._sidebar_hydration_executor: SidebarHydrationExecutor | None = None
@@ -2482,7 +2483,9 @@ class ProductionBackend:
             codex_command = resolve_cli_executable("codex")
             if len(codex_command) != 1:
                 raise RuntimeError("codex_direct_runtime_required")
-            self._codex_client = CodexAppServerClient(codex_bin=codex_command[0])
+            self._codex_client = RecoveringCodexAppServerClient(
+                lambda: CodexAppServerClient(codex_bin=codex_command[0])
+            )
         codex = CodexSourceAdapter(
             self._codex_client,
             marker_secret=marker_secret,
@@ -2797,8 +2800,8 @@ class ProductionBackend:
                 if len(codex_command) != 1:
                     raise RuntimeError("codex_direct_runtime_required")
                 if self._codex_client is None:
-                    self._codex_client = CodexAppServerClient(
-                        codex_bin=codex_command[0]
+                    self._codex_client = RecoveringCodexAppServerClient(
+                        lambda: CodexAppServerClient(codex_bin=codex_command[0])
                     )
                 codex_source = CodexSourceAdapter(
                     self._codex_client,

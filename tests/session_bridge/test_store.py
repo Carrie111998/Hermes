@@ -11605,7 +11605,7 @@ def test_exact_operator_recovery_preserves_exhausted_identity_and_attempt_histor
     assert repaired["error_detail"] == "operator authorized exact UUID reconciliation"
 
     same_id_launch = store.claim_claude_visibility_job(
-        86_500.0, 60, 25, "1.00", "0.02", 2
+        86_500.0, 60, 25, "1.00", "0.02", 1
     )
     assert same_id_launch.status == "claimed"
     assert same_id_launch.lease_kind == "launch"

@@ -1481,7 +1481,13 @@ class SessionBridgeStore:
                     claim_time=operation_time,
                     lease_duration=lease_duration,
                 )
-            if int(due["attempts"]) >= max_attempts:
+            operator_recovery = (
+                absence is not None
+                and due["error_code"] == "creation_ambiguous"
+                and due["error_detail"]
+                == "operator authorized exact UUID reconciliation"
+            )
+            if int(due["attempts"]) >= max_attempts and not operator_recovery:
                 cursor = conn.execute(
                     """UPDATE session_claude_visibility_jobs
                        SET state = 'claude_failed', lease_digest = NULL,
