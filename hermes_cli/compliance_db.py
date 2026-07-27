@@ -42,6 +42,16 @@ class ComplianceError(PermissionError):
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(kya_events)")
+        }
+        index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_kya_sequence'"
+        ).fetchone()
+        if "sequence" in columns and index is not None:
+            return
     conn.executescript(SCHEMA_SQL)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(kya_events)")}
     if "sequence" not in columns:

@@ -13,6 +13,14 @@ def connection():
     return conn
 
 
+def test_compliance_schema_read_preserves_active_transaction():
+    conn = connection()
+    conn.execute("BEGIN IMMEDIATE")
+    compliance_db.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_payment_provider_authority_is_jurisdictional_and_expires():
     conn = connection()
     compliance_db.configure_profile(
