@@ -19,6 +19,14 @@ import sys
 from rich.markup import escape as _escape
 
 
+def _normalize_memory_notifications(value) -> str:
+    """Normalize classic-CLI memory-review notification configuration."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    mode = str(value or "on").strip().lower()
+    return mode if mode in {"off", "on", "verbose"} else "on"
+
+
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 
@@ -235,7 +243,17 @@ class CLIAgentSetupMixin:
         Returns:
             bool: True if successful, False otherwise
         """
-        from cli import AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
+        from cli import (
+            AIAgent,
+            CLI_CONFIG,
+            ChatConsole,
+            _DIM,
+            _RST,
+            _accent_hex,
+            _cprint,
+            _prepare_deferred_agent_startup,
+            logger,
+        )
         if self.agent is not None:
             return True
 
@@ -421,6 +439,14 @@ class CLIAgentSetupMixin:
             # forever — so memory shutdown never ran on /exit (#49287).
             import cli as _cli
             _cli._active_agent_ref = self.agent
+            # The TUI and messaging gateway already honor this display option,
+            # but the classic CLI previously left AIAgent's hard-coded "on"
+            # default untouched. That made ``memory_notifications: off`` a
+            # no-op and injected "💾 Self-improvement review" bookkeeping into
+            # the transcript despite the user's explicit preference.
+            self.agent.memory_notifications = _normalize_memory_notifications(
+                (CLI_CONFIG.get("display") or {}).get("memory_notifications")
+            )
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
