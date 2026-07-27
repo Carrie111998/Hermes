@@ -306,3 +306,5 @@ recorded.
   compliance supersession lineage and current-record selection.
 - `24204f0149eb48036c11ffa2504bae1d99a130c8` — enabled independently
   installable Charterforge wheel and source-distribution artifacts.
+- `21c6e85282fe57fb957732b55141fa4f70f40f68` — added the non-interactive
+  agentic bootstrap contract, example charter, and operator runbook.

@@ -1,0 +1,48 @@
+{
+  "enabled": true,
+  "operating_mode": "autonomous",
+  "operator_role": "advisor",
+  "policy_version": "charterforge-bootstrap-v1",
+  "allowed_capabilities": ["market.publish"],
+  "allowed_systems": ["market"],
+  "forbidden_capabilities": ["company.delete"],
+  "max_autonomous_risk": "low",
+  "allow_irreversible": false,
+  "max_action_spend_minor": 1000,
+  "permit_ttl_seconds": 300,
+  "operating_cadence": {
+    "enabled": true,
+    "interval_hours": 24
+  },
+  "finance": {
+    "base_currency": "USD",
+    "initial_capital_minor": 1000,
+    "tax_profile": {
+      "legal_entity_type": "unconfigured",
+      "jurisdictions": []
+    }
+  },
+  "initial_mandate": {
+    "organization_name": "Charterforge Bootstrap Company",
+    "purpose": "Build a sustainable software business",
+    "desired_outcome": "Earn the first verified customer revenue",
+    "success_criteria": [
+      {
+        "verifier": "accounting.revenue_at_least",
+        "params": {
+          "amount_minor": 1000,
+          "currency": "USD"
+        }
+      },
+      {
+        "verifier": "accounting.books_balanced",
+        "params": {}
+      }
+    ],
+    "termination_conditions": [
+      "capital exhausted",
+      "objective expires"
+    ],
+    "duration_days": 90
+  }
+}

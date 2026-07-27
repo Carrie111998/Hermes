@@ -147,6 +147,7 @@ recorded as a limitation, not a passing check.
 
 - [Readiness determination and release evidence](READINESS.md)
 - [Agentic Business OS guide](website/docs/guides/agentic-business-os.md)
+- [Non-interactive agentic bootstrap](docs/agentic-bootstrap.md)
 - [Architecture](docs/architecture.md)
 - [Company operating model](docs/company-operating-model.md)
 - [Security and threat model](docs/security.md)
