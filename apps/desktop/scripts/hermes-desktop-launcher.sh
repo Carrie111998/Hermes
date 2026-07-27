@@ -41,6 +41,17 @@ if [ "electron/main.ts" -nt "dist/electron-main.mjs" ] 2>/dev/null; then
   echo "[hermes-launcher] Rebuild complete."
 fi
 
+# NVIDIA driver mismatch guard — detect loaded vs on-disk version mismatch
+if [ -f /proc/driver/nvidia/version ] && command -v modinfo >/dev/null 2>&1; then
+  LOADED=$(sed -n 's/.*Kernel Module  *\([0-9.]*\) .*/\1/p' /proc/driver/nvidia/version 2>/dev/null | head -1)
+  ONDISK=$(modinfo -F version nvidia 2>/dev/null | head -1)
+  if [ -n "$LOADED" ] && [ -n "$ONDISK" ] && [ "$LOADED" != "$ONDISK" ]; then
+    echo "[hermes-launcher] ERROR: NVIDIA driver mismatch — loaded: $LOADED, on-disk: $ONDISK."
+    echo "[hermes-launcher] Reboot required. GPU-dependent apps cannot start."
+    exit 1
+  fi
+fi
+
 # Cleanup before launch — kill any previous hermes electron/processes
 kill -9 $(ps aux | grep 'hermes-agent.*electron' | grep -v grep | awk '{print $2}') 2>/dev/null
 kill -9 $(ps aux | grep 'electron.*desktop' | grep -v grep | awk '{print $2}') 2>/dev/null
