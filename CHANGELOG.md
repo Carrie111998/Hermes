@@ -268,3 +268,5 @@ recorded.
   mutations to the organization executing the governed accounting action.
 - `2853b1e45660d00be27c50b4f22c0caf7eabd49b` — bound fiscal-period closure to
   the organization executing the governed accounting action.
+- `42fd303f13d617759ab48fc0ffef97dada7aad4e` — bound approval-artifact
+  validation to the organization executing the governed action.
