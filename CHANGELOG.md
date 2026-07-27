@@ -208,3 +208,7 @@ recorded.
 - `c4662689660f1e2447a2479f1844fae28bd2a57c` — provider-authenticated ingress
   now requires signed freshness evidence for Stripe and Svix schemes; the
   focused ingress regression passed 23 tests.
+- `247617ca47102af87c968d303897fff45dcaa2ee` — Founder/CEO-originated
+  objectives now enter the operating portfolio under standing authority
+  without requiring a routine advisor dispatch; externally originated
+  proposals still require evidence-bearing acceptance.
