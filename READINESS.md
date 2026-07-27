@@ -85,7 +85,8 @@ determination until a newer evidence commit is recorded.
 
 The exact acceptance command set plus the installer contract was rerun against
 current `main` at baseline commit
-`dbb9fd52da932f29bb4782884d6ee5f590f76152`. This is a separate,
+`9e93cc1edfcc7cb7ec3ac45e3527e0f91a362cf7` (the payment-rail discovery fix).
+This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
@@ -112,9 +113,9 @@ tag above.
 - Packaging artifact regression: **2 passed, 0 failed**.
 - Combined governed-runtime and packaging command: **84 passed, 0 failed**.
 - Bootstrap/operator regression additions: **6 passed, 0 failed**.
-- Expanded current-main validation command: **94 passed, 0 failed** across 10
-  files, including the independent installer contract and security-readiness
-  escalation regression.
+- Expanded current-main validation command: **95 passed, 0 failed** across 10
+  files, including the independent installer contract, security-readiness
+  escalation, and credential-safe payment-rail discovery regression.
 - Non-interactive bootstrap smoke: two consecutive bootstrap invocations
   returned identical organization/objective IDs, and `business status` reported
   configured state from the persistent directory.
