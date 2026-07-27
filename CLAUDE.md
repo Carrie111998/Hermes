@@ -222,4 +222,17 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   este lote → cero riesgo de ancla. Preservados `HERMES_HOME`, `HERMES_GIT_BASH_PATH`,
   `HERMES_DISABLE_WINDOWS_UTF8`, `HERMES_DEV`, `HERMES_MANAGED`, `HERMES_BUNDLED_SKILLS`,
   `Nous` como nombre de provider (Nous Portal). Repo `NousResearch/hermes-agent` →
-  `digital-services-llc/iyari` en comandos `nix run`/`git clone`/flake inputs.
+  `digital-services-llc/iyari` en comandos `nix run`/`git clone`/flake inputs. Build
+  limpio (`.docusaurus`+cache borrados) confirmó 98/98 warnings idénticos a la
+  baseline → cero anclas rotas (evidencia concluyente, no como el de lote 1 en vivo
+  que salió cacheado).
+- Lote 2 `68243263c`: `guides/` (28 archivos). 21 headings con Hermes/Nous cambiaron
+  texto (auditados contra todo `zh-Hans`, filtrando falsos positivos de comentarios
+  `#` dentro de bloques ```bash```; ninguno tenía un anchor interno que coincidiera
+  realmente → cero riesgo). Preservados `HERMES_STREAM_READ_TIMEOUT`,
+  `HERMES_API_TIMEOUT`, `HERMES_STREAM_STALE_TIMEOUT`, `HERMES_GATEWAY_TOKEN`,
+  `HERMES_CRON_TIMEOUT`, `Hermes-4`/`Hermes-4-70B`/`Hermes-4-405B` (modelo, en
+  `run-hermes-with-nous-portal.md`), `Nous Portal`/`Subscription`/`Chat`/provider
+  (incl. cita literal `"using Nous as inference provider"`). `User-Agent:
+  "Hermes-Monitor/1.0"` → `"IYARI-Monitor/1.0"`. Build limpio: 98/98 warnings
+  idénticos a la baseline.
