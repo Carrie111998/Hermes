@@ -236,3 +236,6 @@ recorded.
 - `614a74b5714a37146a01b95fc50abe60bf5b2a7b` — bound metered usage-event
   retries to the original meter, customer, quantity, supplied timestamp, and evidence,
   rejecting duplicate-key event drift.
+- `4bd0ccefb7be7c87c6c57479ce323be382c25e0f` — bound child and successor
+  objective relationship retries to immutable request fingerprints, failing
+  closed for unbound legacy rows or changed decomposition inputs.

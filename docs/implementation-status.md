@@ -102,6 +102,8 @@ acceptance evidence.
   sourcing case, and source evidence before a duplicate key is accepted.
 - Metered usage-event retries are bound to the original meter, customer,
   quantity, supplied timestamp, and evidence before a duplicate key is accepted.
+- Child and successor objective relationship retries carry immutable request
+  fingerprints; unbound legacy relationships fail closed on replay.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -177,7 +179,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`614a74b5714a37146a01b95fc50abe60bf5b2a7b` passed 6 Founder/CEO E2E tests, 48
+`4bd0ccefb7be7c87c6c57479ce323be382c25e0f` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -186,6 +188,7 @@ boundary or broaden the inventory coverage claim.
 The same baseline passed the accounting replay/idempotency regression: 7 tests.
 It also passed the procurement decision replay regression: 8 tests.
 It also passed the metered usage and billing regression: 8 tests.
+It also passed the objective portfolio relationship regression: 7 tests.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,
