@@ -130,7 +130,7 @@ def _session_search_exclude_patterns() -> Dict[str, tuple[str, ...]]:
             for value in values
             if isinstance(value, str) and value.strip()
         )
-        for key, values in patterns
+        for key, values in patterns.items()
     }
 
 

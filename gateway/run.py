@@ -8133,9 +8133,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         else:
             try:
-                suspended = await self.async_session_store.suspend_recently_active()
+                # Crash-recovery bookkeeping must never prevent messaging
+                # platforms from coming online.  Session storage can be held
+                # by a stale SQLite/file lock after an unclean exit; bound the
+                # recovery attempt and continue startup if it does not return.
+                try:
+                    _session_recovery_timeout = float(
+                        os.getenv("HERMES_GATEWAY_SESSION_RECOVERY_TIMEOUT", "15")
+                    )
+                except (TypeError, ValueError):
+                    _session_recovery_timeout = 15.0
+                _session_recovery_timeout = max(0.1, _session_recovery_timeout)
+                suspended = await asyncio.wait_for(
+                    self.async_session_store.suspend_recently_active(),
+                    timeout=_session_recovery_timeout,
+                )
                 if suspended:
                     logger.info("Marked %d in-flight session(s) as resumable from previous run", suspended)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Session suspension on startup timed out after %.1fs; "
+                    "continuing platform startup",
+                    _session_recovery_timeout,
+                )
             except Exception as e:
                 logger.warning("Session suspension on startup failed: %s", e)
 
@@ -24157,18 +24177,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _ensure_windows_gateway_venv_imports()
 
-    # MCP tool discovery — run in an executor so the asyncio event loop
-    # stays responsive even when a configured MCP server is slow or
-    # unreachable.  discover_mcp_tools() uses a blocking 120s wait
-    # internally; calling it from the loop thread would freeze platform
-    # heartbeats (Discord shard, Telegram polling) until it returned.
-    # See #16856.
+    # MCP discovery can take up to 120s for a slow or unreachable server.
+    # It must not gate platform startup: a gateway with Telegram configured
+    # still needs to receive messages while optional MCP servers connect.
+    # Reuse the shared daemon-thread launcher used by the CLI/dashboard; the
+    # first tool snapshot takes a separately bounded wait where needed.
     try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(
+            logger=logger,
+            thread_name="gateway-mcp-discovery",
+        )
+    except Exception:
+        logger.debug("Background MCP tool discovery failed at gateway startup", exc_info=True)
 
     # Start the gateway
     success = await runner.start()

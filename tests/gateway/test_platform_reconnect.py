@@ -138,6 +138,59 @@ class TestStartupPlatformIsolation:
         assert Platform.TELEGRAM not in runner.adapters
         assert runner._create_adapter.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_start_continues_after_session_recovery_timeout(self, tmp_path, monkeypatch):
+        """A wedged crash-recovery pass must not block Telegram startup."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="test")},
+            sessions_dir=tmp_path,
+        )
+        runner.hooks = MagicMock()
+        runner.hooks.loaded_hooks = []
+        runner.hooks.emit = AsyncMock()
+        runner._suspend_stuck_loop_sessions = MagicMock(return_value=0)
+        runner._update_runtime_status = MagicMock()
+        runner._update_platform_runtime_status = MagicMock()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._send_update_notification = AsyncMock(return_value=True)
+        runner._send_restart_notification = AsyncMock()
+
+        async def hang_recovery():
+            await asyncio.Event().wait()
+
+        runner._async_session_store = MagicMock()
+        runner._async_session_store._store = runner.session_store
+        runner._async_session_store.suspend_recently_active = hang_recovery
+        adapter = StubAdapter(platform=Platform.TELEGRAM)
+        runner._create_adapter = MagicMock(return_value=adapter)
+        runner._connect_adapter_with_timeout = AsyncMock(return_value=True)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION_RECOVERY_TIMEOUT", "0.001")
+
+        def fake_create_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("gateway.status.write_runtime_status"):
+            with patch("hermes_cli.plugins.discover_plugins"):
+                with patch("hermes_cli.config.load_config", return_value={}):
+                    with patch("agent.shell_hooks.register_from_config"):
+                        with patch(
+                            "tools.process_registry.process_registry.recover_from_checkpoint",
+                            return_value=0,
+                        ):
+                            with patch(
+                                "gateway.channel_directory.build_channel_directory",
+                                new=AsyncMock(return_value={"platforms": {}}),
+                            ):
+                                with patch("gateway.run.asyncio.create_task", side_effect=fake_create_task):
+                                    assert await runner.start() is True
+
+        assert Platform.TELEGRAM in runner.adapters
+        runner._connect_adapter_with_timeout.assert_awaited_once_with(
+            adapter, Platform.TELEGRAM
+        )
+
     def test_default_connect_timeout_allows_telegram_polling_readiness(
         self, monkeypatch
     ):
