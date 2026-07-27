@@ -892,6 +892,19 @@ def _handle_comment(args: dict, **kw) -> str:
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
     try:
+        _authorize_kanban_mutation(
+            "comment",
+            {
+                "operation": "comment",
+                "task_id": str(tid),
+                "body": str(body),
+                "author": author,
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_comment authorization denied: {exc}")
+    try:
         kb, conn = _connect(board=board)
         try:
             cid = kb.add_comment(conn, tid, author=author, body=str(body))

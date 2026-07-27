@@ -2248,6 +2248,28 @@ def test_board_param_routes_comment_to_alt_board(multi_board_env):
         assert kb.get_task(conn, alt_seed) is None
 
 
+def test_comment_authorization_binds_exact_task_body_and_board(multi_board_env, monkeypatch):
+    from tools import kanban_tools as kt
+    calls = []
+
+    def record(operation, scope):
+        calls.append((operation, scope))
+
+    monkeypatch.setattr(kt, "_authorize_kanban_mutation", record)
+    alt_seed = multi_board_env["alt_seed"]
+    out = kt._handle_comment({
+        "task_id": alt_seed,
+        "body": "exact handoff",
+        "board": "alt",
+    })
+    assert json.loads(out)["ok"] is True
+    operation, scope = calls[0]
+    assert operation == "comment"
+    assert scope["task_id"] == alt_seed
+    assert scope["body"] == "exact handoff"
+    assert scope["board"] == "alt"
+
+
 def test_board_param_routes_complete_to_alt_board(multi_board_env):
     """kanban_complete on the alt board closes the alt task, leaving
     the default seed untouched."""
