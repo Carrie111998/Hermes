@@ -116,6 +116,12 @@ tag above.
 - Expanded current-main validation command: **95 passed, 0 failed** across 10
   files, including the independent installer contract, security-readiness
   escalation, and credential-safe payment-rail discovery regression.
+- Current-tree container worker smoke passed with image ID
+  `sha256:83bb9a85e36ecc948c67a1051445566a7e6a6f3d00f63e7c5756b962da346db4`:
+  separate bootstrap, `objectives worker --once`, and `worker-status`
+  containers shared one temporary state directory. The read-back worker record
+  contained `security_blocked`, `runtime_blocked:security_blocked`, and the
+  exact isolation/secret readiness reason; no external action was attempted.
 - Non-interactive bootstrap smoke: two consecutive bootstrap invocations
   returned identical organization/objective IDs, and `business status` reported
   configured state from the persistent directory.

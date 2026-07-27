@@ -62,6 +62,15 @@ not run the profile with a charter that selects `runtime_host: "gateway"`.
 This is a deployment contract, not proof of provider credentials, isolation
 readiness, or production availability.
 
+The current-tree container smoke also exercised the worker boundary with image
+`charterforge:agentic-current` (local image ID
+`sha256:83bb9a85e36ecc948c67a1051445566a7e6a6f3d00f63e7c5756b962da346db4`).
+Bootstrap, `objectives worker --once`, and `objectives worker-status` ran in
+separate containers against one temporary mounted directory. The worker
+persisted `last_cycle_status: security_blocked`,
+`stop_reason: runtime_blocked:security_blocked`, and the exact isolation/secret
+readiness reason; it performed no external action.
+
 ## Container smoke contract
 
 The image build and supervised entrypoint were exercised locally on 2026-07-27

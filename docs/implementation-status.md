@@ -189,6 +189,11 @@ acceptance evidence.
   standalone Founder/CEO worker. Compose configuration is validated locally;
   this does not constitute a production deployment, registry publication, or
   live-provider readiness proof.
+- A current-tree container smoke also proves cross-container bootstrap and
+  worker-status persistence against one temporary volume. With no approved
+  isolation backend or external secret manager, the worker stopped
+  `security_blocked` and recorded the exact reason without attempting an
+  external action.
 
 ## Not implemented or not proven
 
