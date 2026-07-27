@@ -5235,6 +5235,17 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     }
 
 
+def _mcp_tool_returns_terminal_result(mcp_tool) -> bool:
+    """Detect the generic terminal-result opt-in from the advertised schema."""
+    from agent.terminal_tool_result import (
+        output_schema_declares_terminal_verbatim,
+    )
+
+    return output_schema_declares_terminal_verbatim(
+        getattr(mcp_tool, "outputSchema", None)
+    )
+
+
 def _build_utility_schemas(server_name: str) -> List[dict]:
     """Build schemas for the MCP utility tools (resources & prompts).
 
@@ -5552,6 +5563,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            terminal_result=_mcp_tool_returns_terminal_result(mcp_tool),
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)

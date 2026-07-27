@@ -1084,6 +1084,48 @@ class TestDiscoverAndRegister:
 
         _servers.pop("srv", None)
 
+    def test_terminal_output_schema_marks_registered_tool(self):
+        """An explicit terminal output contract survives MCP registration."""
+        from tools.registry import ToolRegistry
+        from tools.mcp_tool import _discover_and_register_server, _servers, MCPServerTask
+
+        mock_registry = ToolRegistry()
+        terminal_tool = _make_mcp_tool("final_answer", "Return a final answer")
+        terminal_tool.outputSchema = {
+            "type": "object",
+            "properties": {
+                "delivery_semantics": {
+                    "type": "string",
+                    "const": "terminal_verbatim",
+                },
+                "answer": {"type": "string"},
+                "answer_sha256": {"type": "string"},
+            },
+            "required": [
+                "delivery_semantics",
+                "answer",
+                "answer_sha256",
+            ],
+        }
+
+        async def fake_connect(name, config):
+            server = MCPServerTask(name)
+            server.session = MagicMock()
+            server._tools = [terminal_tool]
+            return server
+
+        with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.registry.registry", mock_registry):
+            asyncio.run(
+                _discover_and_register_server("answers", {"command": "test"})
+            )
+
+        assert mock_registry.is_terminal_result_tool(
+            "mcp__answers__final_answer"
+        ) is True
+
+        _servers.pop("answers", None)
+
 
 # ---------------------------------------------------------------------------
 # MCPServerTask (run / start / shutdown)

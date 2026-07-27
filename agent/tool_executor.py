@@ -32,6 +32,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.terminal_tool_result import capture_terminal_tool_result
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -920,6 +921,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 effect_disposition = "none"
 
             if not blocked:
+                capture_terminal_tool_result(
+                    agent,
+                    tool_name=function_name,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                    raw_result=function_result,
+                )
                 function_result = agent._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -1621,6 +1628,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        if not _execution_blocked:
+            capture_terminal_tool_result(
+                agent,
+                tool_name=function_name,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                raw_result=function_result,
+            )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the

@@ -1093,6 +1093,10 @@ def run_conversation(
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
     _pending_verification_response_previewed = False
+    # A terminal-capable tool may supply the participant-facing answer itself.
+    # Reset this per turn so no result can leak across conversations.
+    agent._terminal_tool_result = None
+    agent._terminal_tool_result_error = None
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -5835,6 +5839,27 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if agent._terminal_tool_result_error is not None:
+                    failed = True
+                    _turn_exit_reason = "invalid_terminal_tool_result"
+                    final_response = agent._terminal_tool_result_error
+                    messages.append({"role": "assistant", "content": final_response})
+                    agent._emit_status(f"⚠️ {final_response}")
+                    break
+
+                if agent._terminal_tool_result is not None:
+                    _turn_exit_reason = "terminal_tool_result"
+                    final_response = agent._terminal_tool_result.answer
+                    messages.append({"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                            except Exception:
+                                pass
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

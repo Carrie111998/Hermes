@@ -6,6 +6,7 @@ are made.
 """
 
 import ast
+import hashlib
 import inspect
 import io
 import json
@@ -4342,6 +4343,105 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+
+    def test_terminal_tool_result_ends_turn_without_second_model_call(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        self._setup_agent(agent)
+        answer = "Exact participant-facing answer."
+        terminal_result = json.dumps(
+            {
+                "result": {
+                    "delivery_semantics": "terminal_verbatim",
+                    "answer": answer,
+                    "answer_sha256": hashlib.sha256(answer.encode("utf-8")).hexdigest(),
+                }
+            }
+        )
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+        )
+
+        from tools.registry import registry
+
+        monkeypatch.setattr(
+            registry,
+            "is_terminal_result_tool",
+            lambda name: name == "web_search",
+        )
+        streamed: list[str | None] = []
+        agent.stream_delta_callback = streamed.append
+        with (
+            patch("run_agent.handle_function_call", return_value=terminal_result),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == answer
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "terminal_tool_result"
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        # Existing tool-boundary break first; the terminal answer must not add
+        # a trailing break because the gateway's normal finish finalizes it.
+        assert streamed == [None, answer]
+
+    def test_invalid_terminal_tool_result_fails_without_model_rewrite(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+        )
+
+        from tools.registry import registry
+
+        monkeypatch.setattr(
+            registry,
+            "is_terminal_result_tool",
+            lambda name: name == "web_search",
+        )
+        streamed: list[str | None] = []
+        agent.stream_delta_callback = streamed.append
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps(
+                    {
+                        "result": {
+                            "delivery_semantics": "terminal_verbatim",
+                            "answer": "Do not deliver this.",
+                            "answer_sha256": "0" * 64,
+                        }
+                    }
+                ),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["turn_exit_reason"] == "invalid_terminal_tool_result"
+        assert "does not match answer" in result["final_response"]
+        assert agent.client.chat.completions.create.call_count == 1
+        # The ordinary pre-tool segment break remains, but invalid terminal
+        # content is never streamed to the participant.
+        assert streamed == [None]
 
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
