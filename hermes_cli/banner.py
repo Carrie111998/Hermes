@@ -200,12 +200,29 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     """Count commits behind origin/main in a local checkout."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
+    is_official_origin = _canonical_github_remote(origin_url) == _OFFICIAL_REPO_CANONICAL
+
+    # Official repo over SSH — avoid SSH auth hangs on headless systems.
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         checked = _check_via_rev(head_rev) if head_rev else None
         if checked == UPDATE_AVAILABLE_NO_COUNT:
             return 1
         return checked
+
+    # Fork-based origin: ``origin/main`` never reflects upstream changes
+    # and the ref may not exist at all if the fork uses a different default
+    # branch name (#72789).  Compare HEAD against the canonical upstream via
+    # ``git ls-remote`` (the same path the SSH origin uses) instead of
+    # fetching from (and counting against) the fork.
+    if not is_official_origin:
+        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+        if head_rev:
+            checked = _check_via_rev(head_rev)
+            if checked == UPDATE_AVAILABLE_NO_COUNT:
+                return 1
+            return checked
+        return None
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
@@ -376,6 +393,10 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     definition pinned to one commit, so "ahead" is always zero and the
     banner correctly shows ``· upstream <sha>`` with no carried-commits
     annotation.
+
+    For fork-based origins (issue #72789), ``origin/main`` points at the
+    fork's default branch, not upstream.  The upstream hash is fetched via
+    ``git ls-remote`` against the canonical upstream URL instead.
     """
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
@@ -389,8 +410,31 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
     local = _git_short_hash(repo_dir, "HEAD")
+
+    # Determine the upstream hash.  For the official repo use
+    # ``origin/main`` (fast, local).  For forks use ``git ls-remote``
+    # against the canonical upstream URL (#72789).
+    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
+    is_official_origin = _canonical_github_remote(origin_url) == _OFFICIAL_REPO_CANONICAL
+
+    if is_official_origin:
+        upstream = _git_short_hash(repo_dir, "origin/main")
+    else:
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout:
+                full_hash = result.stdout.split()[0]
+                upstream = full_hash[:8] if len(full_hash) >= 8 else None
+            else:
+                upstream = None
+        except Exception:
+            upstream = None
+
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
         # Fall back to the baked build SHA if available.
