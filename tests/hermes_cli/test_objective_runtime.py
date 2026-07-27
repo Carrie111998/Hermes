@@ -1240,6 +1240,71 @@ def test_unhandled_planner_failure_is_backed_off_instead_of_lost(tmp_path):
     conn.close()
 
 
+def test_rate_limited_planner_recovers_after_durable_backoff_without_duplicate_action(
+    tmp_path,
+):
+    conn = db.connect(tmp_path / "authority.db")
+    objective = accepted_objective(conn)
+    event_id = db.enqueue_objective_event(
+        conn, objective_id=objective.id, event_type="provider.throttled", payload={}
+    )
+
+    class RateLimited(RuntimeError):
+        retry_after = 0
+
+    class RetryOncePlanner(Planner):
+        def __init__(self):
+            super().__init__([recovery_action()])
+            self.calls = 0
+
+        def propose(self, snapshot, event):
+            self.calls += 1
+            if self.calls == 1:
+                raise RateLimited("LLM HTTP 429 rate limit")
+            return super().propose(snapshot, event)
+
+    planner = RetryOncePlanner()
+    executor = Executor()
+    configured = {
+        **charter(),
+        "retry_policy": {
+            "max_attempts": 3,
+            "base_backoff_seconds": 0,
+            "max_backoff_seconds": 60,
+        },
+    }
+    loop = runtime.ObjectiveRuntime(
+        conn,
+        planner=planner,
+        executor=executor,
+        verifier=Verifier(),
+        charter=configured,
+        policy_version="charter-v1",
+        runtime_id="runtime-rate-limit-recovery",
+    )
+
+    first = loop.tick()
+    row = conn.execute(
+        "SELECT * FROM objective_inbox WHERE id=?", (event_id,)
+    ).fetchone()
+    assert first.status == "retry_scheduled"
+    assert row["status"] == "pending"
+    assert row["last_error"].startswith("rate_limited:")
+    assert row["attempts"] == 1
+
+    second = loop.tick()
+    assert second.status == "verified"
+    assert planner.calls == 2
+    assert len(executor.calls) == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM execution_results"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT status FROM objective_inbox WHERE id=?", (event_id,)
+    ).fetchone()["status"] == "completed"
+    conn.close()
+
+
 def test_multiple_effects_from_one_observation_are_preserved_but_not_executed(
     tmp_path,
 ):

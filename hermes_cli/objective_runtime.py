@@ -27,6 +27,36 @@ from hermes_cli import (
 from hermes_cli import objectives_db as db
 
 
+def _rate_limit_retry_after(exc: BaseException) -> int | None:
+    """Extract a bounded provider retry hint without coupling to one SDK."""
+    candidates: list[Any] = []
+    for source in (exc, getattr(exc, "response", None)):
+        if source is None:
+            continue
+        value = getattr(source, "retry_after", None)
+        if value is not None:
+            candidates.append(value)
+        headers = getattr(source, "headers", None)
+        if headers:
+            try:
+                value = headers.get("retry-after") or headers.get("Retry-After")
+            except AttributeError:
+                value = None
+            if value is not None:
+                candidates.append(value)
+    for value in candidates:
+        try:
+            seconds = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if seconds >= 0:
+            return seconds
+    message = str(exc).lower()
+    if "429" in message or "rate limit" in message or "rate_limit" in message:
+        return 0
+    return None
+
+
 @dataclass(frozen=True)
 class ActionProposal:
     action_type: str
@@ -200,21 +230,36 @@ class ObjectiveRuntime:
             attempts = int(event.get("attempts") or 1)
             if attempts < max_attempts:
                 delay = min(max_seconds, base_seconds * (2 ** (attempts - 1)))
+                retry_after = _rate_limit_retry_after(exc)
+                if retry_after is not None:
+                    delay = min(max_seconds, max(delay, retry_after))
+                    error = f"rate_limited: {exc}"
+                else:
+                    error = str(exc)
                 db.finish_objective_event(
                     self.conn,
                     event["id"],
                     runtime_id=self.runtime_id,
                     status="pending",
-                    error=str(exc),
+                    error=error,
                     retry_at=int(time.time()) + delay,
                 )
                 self._finish_cycle(
                     cycle_id, "retry_scheduled",
-                    {"error": str(exc), "delay_seconds": delay, "attempt": attempts},
+                    {
+                        "error": error,
+                        "delay_seconds": delay,
+                        "attempt": attempts,
+                        "rate_limited": retry_after is not None,
+                    },
                 )
                 return CycleOutcome(
                     str(event["id"]), objective_id, "retry_scheduled",
-                    f"transient failure; retry in {delay}s",
+                    (
+                        f"rate-limited provider; retry in {delay}s"
+                        if retry_after is not None
+                        else f"transient failure; retry in {delay}s"
+                    ),
                 )
             db.finish_objective_event(
                 self.conn, event["id"], runtime_id=self.runtime_id,
