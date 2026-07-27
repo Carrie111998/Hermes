@@ -2347,7 +2347,8 @@ DEFAULT_CONFIG = {
     "voice": {
         "record_key": "ctrl+b",
         "max_recording_seconds": 120,
-        "synthesis_timeout_seconds": 180,  # Desktop read-aloud request timeout (15-1800s)
+        "synthesis_timeout_adaptive": False,  # Shorten by text length without exceeding the configured maximum
+        "synthesis_timeout_seconds": 180,  # Fixed timeout or adaptive maximum (15-1800s)
         "auto_tts": False,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
         "silence_threshold": 200,     # RMS below this = silence (0-32767)

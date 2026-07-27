@@ -85,6 +85,18 @@ export const DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS = 180_000
 const MIN_SPEECH_SYNTHESIS_TIMEOUT_SECONDS = 15
 const MAX_SPEECH_SYNTHESIS_TIMEOUT_SECONDS = 1_800
 let speechSynthesisRequestTimeoutMs = DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS
+let speechSynthesisAdaptiveTimeout = false
+export const AUDIO_SPEAK_ADAPTIVE_MIN_REQUEST_TIMEOUT_MS = 15_000
+const AUDIO_SPEAK_TIMEOUT_MS_PER_CHAR = 35
+
+export function audioSpeakRequestTimeoutMs(text: string, maximumMs = speechSynthesisRequestTimeoutMs): number {
+  const estimated = Math.max(
+    AUDIO_SPEAK_ADAPTIVE_MIN_REQUEST_TIMEOUT_MS,
+    Math.ceil(String(text || '').length * AUDIO_SPEAK_TIMEOUT_MS_PER_CHAR)
+  )
+
+  return Math.min(maximumMs, estimated)
+}
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
 // presets running references + aggregator in series, deep reasoning, large tool
@@ -231,6 +243,10 @@ export function setSpeechSynthesisTimeoutSeconds(value: unknown): void {
 
   const bounded = Math.min(MAX_SPEECH_SYNTHESIS_TIMEOUT_SECONDS, Math.max(MIN_SPEECH_SYNTHESIS_TIMEOUT_SECONDS, value))
   speechSynthesisRequestTimeoutMs = Math.round(bounded * 1_000)
+}
+
+export function setSpeechSynthesisAdaptiveTimeout(value: unknown): void {
+  speechSynthesisAdaptiveTimeout = value === true
 }
 
 // Profile that profile-scoped REST settings (config/env/skills/tools/model/…)
@@ -1535,7 +1551,9 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
     // TTS blocks until provider synthesis, file read, and base64 encoding
     // finish. Remote providers and large messages regularly exceed the
     // default 15s Electron backend timeout.
-    timeoutMs: speechSynthesisRequestTimeoutMs
+    timeoutMs: speechSynthesisAdaptiveTimeout
+      ? audioSpeakRequestTimeoutMs(text, speechSynthesisRequestTimeoutMs)
+      : speechSynthesisRequestTimeoutMs
   })
 }
 

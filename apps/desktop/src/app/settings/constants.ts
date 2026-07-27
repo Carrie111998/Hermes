@@ -446,6 +446,7 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
   voice: {
     recordKey: 'Voice Shortcut',
     maxRecordingSeconds: 'Max Recording Length',
+    synthesisTimeoutAdaptive: 'Adaptive Speech Timeout',
     synthesisTimeoutSeconds: 'Speech Synthesis Timeout',
     autoTts: 'Read Responses Aloud'
   },
@@ -605,7 +606,8 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   },
   voice: {
     autoTts: 'Automatically speak assistant responses.',
-    synthesisTimeoutSeconds: 'Seconds Desktop waits for speech generation before reporting a timeout.'
+    synthesisTimeoutAdaptive: 'Choose a shorter timeout from text length without exceeding the configured maximum.',
+    synthesisTimeoutSeconds: 'Fixed timeout, or maximum timeout when adaptive timing is enabled.'
   },
   tts: {
     xai: {
@@ -748,6 +750,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'stt.elevenlabs.diarize',
       'voice.record_key',
       'voice.max_recording_seconds',
+      'voice.synthesis_timeout_adaptive',
       'voice.synthesis_timeout_seconds'
     ]
   },

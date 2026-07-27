@@ -5302,9 +5302,13 @@ class TestBuildSchemaFromConfig:
         from hermes_cli.web_server import CONFIG_SCHEMA
 
         assert DEFAULT_CONFIG["voice"]["synthesis_timeout_seconds"] == 180
+        assert DEFAULT_CONFIG["voice"]["synthesis_timeout_adaptive"] is False
         entry = CONFIG_SCHEMA["voice.synthesis_timeout_seconds"]
         assert entry["type"] == "number"
         assert entry["category"] == "voice"
+        adaptive = CONFIG_SCHEMA["voice.synthesis_timeout_adaptive"]
+        assert adaptive["type"] == "boolean"
+        assert adaptive["category"] == "voice"
 
     def test_memory_provider_field_present_as_select(self):
         """memory.provider must stay in the config schema.

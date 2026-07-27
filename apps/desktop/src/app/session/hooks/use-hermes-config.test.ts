@@ -2,7 +2,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { getHermesConfig } from '@/hermes'
+import { getHermesConfig, setSpeechSynthesisAdaptiveTimeout, setSpeechSynthesisTimeoutSeconds } from '@/hermes'
 import { persistString } from '@/lib/storage'
 import {
   $currentCwd,
@@ -21,7 +21,9 @@ import { useHermesConfig } from './use-hermes-config'
 
 vi.mock('@/hermes', () => ({
   getHermesConfig: vi.fn(),
-  getHermesConfigDefaults: vi.fn().mockResolvedValue({})
+  getHermesConfigDefaults: vi.fn().mockResolvedValue({}),
+  setSpeechSynthesisAdaptiveTimeout: vi.fn(),
+  setSpeechSynthesisTimeoutSeconds: vi.fn()
 }))
 
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
@@ -47,7 +49,21 @@ describe('useHermesConfig refreshHermesConfig', () => {
     setCurrentModelSource('')
     setCurrentReasoningEffort('')
     setDefaultReasoningEffort('')
+    vi.mocked(setSpeechSynthesisAdaptiveTimeout).mockClear()
+    vi.mocked(setSpeechSynthesisTimeoutSeconds).mockClear()
     persistString(WORKSPACE_CWD_KEY, null)
+  })
+
+  it('applies speech timeout policy from voice config', async () => {
+    mockConfig({ voice: { synthesis_timeout_adaptive: true, synthesis_timeout_seconds: 240 } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+
+    expect(setSpeechSynthesisTimeoutSeconds).toHaveBeenCalledWith(240)
+    expect(setSpeechSynthesisAdaptiveTimeout).toHaveBeenCalledWith(true)
   })
 
   // Regression: the composer keeps a manual model pick sticky, which skips the

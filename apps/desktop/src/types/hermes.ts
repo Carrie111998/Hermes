@@ -324,6 +324,7 @@ export interface HermesConfig {
   }
   voice?: {
     max_recording_seconds?: number
+    synthesis_timeout_adaptive?: boolean
     synthesis_timeout_seconds?: null | number
     auto_tts?: boolean
   }

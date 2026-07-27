@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  AUDIO_SPEAK_ADAPTIVE_MIN_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MAX_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioTranscribeRequestTimeoutMs,
@@ -18,6 +19,7 @@ import {
   listSidebarSessions,
   resetSidebarBatchCapability,
   setApiRequestProfile,
+  setSpeechSynthesisAdaptiveTimeout,
   setSpeechSynthesisTimeoutSeconds,
   speakText,
   transcribeAudio
@@ -45,6 +47,7 @@ describe('Hermes REST helpers', () => {
 
   afterEach(() => {
     setApiRequestProfile(null)
+    setSpeechSynthesisAdaptiveTimeout(false)
     setSpeechSynthesisTimeoutSeconds(undefined)
     vi.restoreAllMocks()
     Reflect.deleteProperty(window, 'hermesDesktop')
@@ -341,6 +344,25 @@ describe('Hermes REST helpers', () => {
     await speakText('Read this aloud')
 
     expect(api).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 300_000 }))
+  })
+
+  it('scales the configured speech timeout only when adaptive mode is enabled', async () => {
+    setSpeechSynthesisAdaptiveTimeout(true)
+
+    await speakText('short')
+    expect(api).toHaveBeenLastCalledWith(
+      expect.objectContaining({ timeoutMs: AUDIO_SPEAK_ADAPTIVE_MIN_REQUEST_TIMEOUT_MS })
+    )
+
+    await speakText('x'.repeat(100_000))
+    expect(api).toHaveBeenLastCalledWith(expect.objectContaining({ timeoutMs: DEFAULT_SPEECH_SYNTHESIS_TIMEOUT_MS }))
+
+    setSpeechSynthesisTimeoutSeconds(600)
+    await speakText('x'.repeat(8_000))
+    expect(api).toHaveBeenLastCalledWith(expect.objectContaining({ timeoutMs: 280_000 }))
+
+    await speakText('x'.repeat(100_000))
+    expect(api).toHaveBeenLastCalledWith(expect.objectContaining({ timeoutMs: 600_000 }))
   })
 
   it('routes speech synthesis through the active profile', async () => {

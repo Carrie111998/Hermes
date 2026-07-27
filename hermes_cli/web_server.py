@@ -851,7 +851,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     },
     "voice.synthesis_timeout_seconds": {
         "type": "number",
-        "description": "Seconds Desktop waits for speech synthesis (15-1800)",
+        "description": "Fixed speech timeout, or adaptive maximum, in seconds (15-1800)",
     },
     "stt.provider": {
         "type": "select",

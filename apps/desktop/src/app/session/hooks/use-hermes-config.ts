@@ -1,6 +1,11 @@
 import { type MutableRefObject, useCallback, useRef, useState } from 'react'
 
-import { getHermesConfig, getHermesConfigDefaults, setSpeechSynthesisTimeoutSeconds } from '@/hermes'
+import {
+  getHermesConfig,
+  getHermesConfigDefaults,
+  setSpeechSynthesisAdaptiveTimeout,
+  setSpeechSynthesisTimeoutSeconds
+} from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
 import {
@@ -104,6 +109,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
         setVoiceMaxRecordingSeconds(recordingLimit(config.voice?.max_recording_seconds))
         setSpeechSynthesisTimeoutSeconds(config.voice?.synthesis_timeout_seconds)
+        setSpeechSynthesisAdaptiveTimeout(config.voice?.synthesis_timeout_adaptive)
         setSttEnabled(config.stt?.enabled !== false)
         applyAutoSpeakFromConfig(config)
       } catch {
