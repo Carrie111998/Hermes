@@ -530,6 +530,8 @@ class TestDispatchMessage(unittest.TestCase):
         import asyncio
         with patch.dict(os.environ, {
             "EMAIL_ALLOWED_USERS": "hermes@test.com,admin@test.com",
+            "EMAIL_ALLOW_ALL_USERS": "",
+            "GATEWAY_ALLOW_ALL_USERS": "",
         }):
             adapter = self._make_adapter()
             adapter._message_handler = MagicMock()
@@ -771,6 +773,99 @@ class TestDispatchMessage(unittest.TestCase):
 
             asyncio.run(adapter._dispatch_message(msg_data))
             self.assertEqual(len(captured), 1)
+
+    def test_allow_all_wins_over_stale_allowlist(self):
+        """EMAIL_ALLOW_ALL_USERS=true must win even when EMAIL_ALLOWED_USERS is set.
+
+        Regression: the dispatch gate previously checked the allowlist first
+        and only consulted allow-all when the allowlist was empty, so a stale
+        allowlist silently dropped every sender not exactly listed.
+        """
+        import asyncio
+        with patch.dict(os.environ, {
+            "EMAIL_ALLOW_ALL_USERS": "true",
+            "EMAIL_ALLOWED_USERS": "someone-else@other.com",
+        }):
+            adapter = self._make_adapter()
+            captured = []
+
+            async def capture_handle(event):
+                captured.append(event)
+
+            adapter.handle_message = capture_handle
+
+            asyncio.run(adapter._dispatch_message({
+                "uid": b"204",
+                "sender_addr": "andrew@known.ltd",
+                "sender_name": "Andrew",
+                "subject": "Hi",
+                "message_id": "<m@test.com>",
+                "in_reply_to": "",
+                "body": "Hello",
+                "attachments": [],
+                "date": "",
+                "sender_authenticated": True,
+                "auth_reason": "dmarc=pass",
+            }))
+            self.assertEqual(len(captured), 1)
+
+    def test_allowlist_domain_token_matches(self):
+        """@domain tokens in EMAIL_ALLOWED_USERS match any address on that domain."""
+        import asyncio
+        with patch.dict(os.environ, {
+            "EMAIL_ALLOWED_USERS": "@known.ltd,a2childs@gmail.com",
+        }):
+            for k in ("EMAIL_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS"):
+                os.environ.pop(k, None)
+            adapter = self._make_adapter()
+            captured = []
+
+            async def capture_handle(event):
+                captured.append(event)
+
+            adapter.handle_message = capture_handle
+
+            for i, sender in enumerate(["andrew@known.ltd", "siya@known.ltd", "a2childs@gmail.com"]):
+                asyncio.run(adapter._dispatch_message({
+                    "uid": str(300 + i).encode(),
+                    "sender_addr": sender,
+                    "sender_name": sender,
+                    "subject": "Hi",
+                    "message_id": f"<m{i}@test.com>",
+                    "in_reply_to": "",
+                    "body": "Hello",
+                    "attachments": [],
+                    "date": "",
+                    "sender_authenticated": True,
+                    "auth_reason": "dmarc=pass",
+                }))
+            self.assertEqual(len(captured), 3)
+
+    def test_allowlist_domain_token_rejects_other_domains(self):
+        """@domain tokens must NOT match addresses on other domains."""
+        import asyncio
+        with patch.dict(os.environ, {
+            "EMAIL_ALLOWED_USERS": "@known.ltd",
+        }):
+            for k in ("EMAIL_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS"):
+                os.environ.pop(k, None)
+            adapter = self._make_adapter()
+            adapter._message_handler = MagicMock()
+
+            asyncio.run(adapter._dispatch_message({
+                "uid": b"310",
+                "sender_addr": "mallory@evil.com",
+                "sender_name": "Mallory",
+                "subject": "Hi",
+                "message_id": "<m@evil.com>",
+                "in_reply_to": "",
+                "body": "Hello",
+                "attachments": [],
+                "date": "",
+                "sender_authenticated": True,
+                "auth_reason": "dmarc=pass",
+            }))
+            adapter._message_handler.assert_not_called()
 
 
 class TestThreadContext(unittest.TestCase):

@@ -862,20 +862,25 @@ class EmailAdapter(BasePlatformAdapter):
         # that the gateway will never authorize.  Without this early guard,
         # a race between dispatch and authorization can result in the adapter
         # sending a reply even though the handler returned None.
-        allowed_raw = _get_secret("EMAIL_ALLOWED_USERS", "").strip()
-        if not allowed_raw:
-            if _get_secret("EMAIL_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"} and (
-                os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"}
-            ):
+        #
+        # Precedence matches the gateway authz layer: allow-all wins FIRST;
+        # only when it is off does the allowlist gate. Allowlist tokens may be
+        # exact addresses or @domain wildcards (e.g. "@known.ltd").
+        if not self._allow_all_senders():
+            allowed_raw = os.getenv("EMAIL_ALLOWED_USERS", "").strip()
+            if not allowed_raw:
                 logger.debug(
                     "[Email] Dropping sender at dispatch — EMAIL_ALLOWED_USERS is unset "
                     "and open access is not opted in: %s",
                     sender_addr,
                 )
                 return
-        else:
-            allowed = {addr.strip().lower() for addr in allowed_raw.split(",") if addr.strip()}
-            if sender_addr.lower() not in allowed:
+            tokens = {t.strip().lower() for t in allowed_raw.split(",") if t.strip()}
+            sender_l = sender_addr.lower()
+            if not any(
+                (t.startswith("@") and sender_l.endswith(t)) or sender_l == t
+                for t in tokens
+            ):
                 logger.debug("[Email] Dropping non-allowlisted sender at dispatch: %s", sender_addr)
                 return
 
