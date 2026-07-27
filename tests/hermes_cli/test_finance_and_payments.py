@@ -52,6 +52,20 @@ def test_payment_and_metering_schema_reads_preserve_active_transaction(tmp_path)
     conn.rollback()
 
 
+@pytest.mark.parametrize(
+    "payment",
+    [
+        ProviderPayment("", "succeeded", 100, "USD"),
+        ProviderPayment("provider-1", "", 100, "USD"),
+        ProviderPayment("provider-1", "succeeded", True, "USD"),
+        ProviderPayment("provider-1", "succeeded", 100, "US"),
+    ],
+)
+def test_payment_provider_readback_rejects_malformed_identity_and_money(payment):
+    with pytest.raises(ValueError):
+        PaymentService._validate_remote(payment, 100, "USD")
+
+
 class FakeRail(PaymentRail):
     name = "fake"
 

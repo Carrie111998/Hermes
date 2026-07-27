@@ -550,7 +550,20 @@ class PaymentService:
     def _validate_remote(
         payment: ProviderPayment, expected_amount: int, expected_currency: str
     ) -> None:
+        if not str(payment.reference or "").strip():
+            raise ValueError("payment provider omitted a reference")
+        if not str(payment.status or "").strip():
+            raise ValueError("payment provider omitted a status")
+        if (
+            isinstance(payment.amount_minor, bool)
+            or not isinstance(payment.amount_minor, int)
+            or payment.amount_minor <= 0
+        ):
+            raise ValueError("payment provider returned an invalid amount")
+        provider_currency = str(payment.currency or "").strip().upper()
+        if len(provider_currency) != 3 or not provider_currency.isalpha():
+            raise ValueError("payment provider returned an invalid currency")
         if payment.amount_minor != expected_amount:
             raise ValueError("payment provider amount does not match intent")
-        if payment.currency.upper() != expected_currency.upper():
+        if provider_currency != expected_currency.upper():
             raise ValueError("payment provider currency does not match intent")
