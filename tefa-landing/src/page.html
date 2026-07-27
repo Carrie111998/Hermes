@@ -1,0 +1,895 @@
+<title>MMM Investment — TEFA Programs for Families</title>
+
+<!--
+  ============================================================
+  EDITOR CHECKLIST — replace every [bracketed] field before publishing.
+  They render with a dotted underline so they are easy to spot.
+
+  1.  Phone number ....................... hero, contact, footer
+  2.  Hours of operation ................. contact
+  3.  Response time ...................... contact, enroll step 02
+  4.  Service area / state ............... hero eyebrow, contact
+  5.  Delivery format (online/in person) . programs note, FAQ
+  6.  Time to first kit .................. hero spec, enroll step 04
+  7.  Tuition figures ($) ................ tuition tiers
+  8.  Carbon percentages (%) ............. carbon ledger  <-- must be real
+  9.  Carbon partner organisation ........ carbon ledger
+  10. Reporting cadence .................. carbon ledger
+  11. Refund / swap policy ............... FAQ
+  12. Legal business name ................ footer
+
+  Two claims to confirm before this goes live:
+   - "TEFA vendor" status: only publish once your approval is on file.
+   - The carbon percentages: publish a number you will actually honour.
+  ============================================================
+-->
+
+<style>
+/* ---------- Faces ---------- */
+@font-face{font-family:'Bricolage';src:url(data:font/woff2;base64,__BRIC__) format('woff2');font-weight:200 800;font-style:normal;font-display:swap}
+@font-face{font-family:'Newsreader';src:url(data:font/woff2;base64,__NEWS__) format('woff2');font-weight:200 800;font-style:normal;font-display:swap}
+@font-face{font-family:'DMMono';src:url(data:font/woff2;base64,__MONO4__) format('woff2');font-weight:400;font-style:normal;font-display:swap}
+@font-face{font-family:'DMMono';src:url(data:font/woff2;base64,__MONO5__) format('woff2');font-weight:500;font-style:normal;font-display:swap}
+
+/* ---------- Tokens ---------- */
+:root{
+  --paper:#F2F4EF; --paper-2:#EAEEE6; --card:#FBFCF9;
+  --ink:#15201B; --ink-soft:#33453C; --muted:#63736B;
+  --pine:#1C4B3C; --pine-deep:#123227; --on-pine:#EAF2ED; --pine-muted:#9DBFB0;
+  /* --accent carries text and button fills (contrast-safe on paper);
+     --accent-lit is decorative only; --pine-accent is the band-inverted pair. */
+  --accent:#8F5606; --accent-lit:#D08D22; --on-accent:#FFF9F0; --accent-hover:#7A4905;
+  --pine-accent:#EDB25E; --on-pine-accent:#12261E;
+  --clay:#A44E36;
+  --rule:#15201B26; --rule-soft:#15201B14;
+  --focus:var(--accent);
+  --shadow:0 1px 2px #15201B0d, 0 12px 28px -18px #15201B40;
+  --display:'Bricolage',ui-sans-serif,system-ui,sans-serif;
+  --body:'Newsreader',Georgia,'Times New Roman',serif;
+  --mono:'DMMono',ui-monospace,'SFMono-Regular',Menlo,monospace;
+  --measure:1120px;
+  --grid-line:#15201B0a;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --paper:#0E1613; --paper-2:#121D19; --card:#16211D;
+    --ink:#E7ECE5; --ink-soft:#C2CDC5; --muted:#93A39A;
+    --pine:#0C1F19; --pine-deep:#081511; --on-pine:#E7EFE9; --pine-muted:#8FB3A3;
+    --accent:#E9A340; --accent-lit:#F0B257; --on-accent:#15201B; --accent-hover:#F3BE72;
+    --pine-accent:#EDB25E; --on-pine-accent:#12261E;
+    --clay:#D08064;
+    --rule:#E7ECE526; --rule-soft:#E7ECE514;
+    --shadow:0 1px 2px #0006, 0 16px 34px -20px #000a;
+    --grid-line:#E7ECE508;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0E1613; --paper-2:#121D19; --card:#16211D;
+  --ink:#E7ECE5; --ink-soft:#C2CDC5; --muted:#93A39A;
+  --pine:#0C1F19; --pine-deep:#081511; --on-pine:#E7EFE9; --pine-muted:#8FB3A3;
+  --accent:#E9A340; --accent-lit:#F0B257; --on-accent:#15201B; --accent-hover:#F3BE72;
+  --pine-accent:#EDB25E; --on-pine-accent:#12261E;
+  --clay:#D08064;
+  --rule:#E7ECE526; --rule-soft:#E7ECE514;
+  --shadow:0 1px 2px #0006, 0 16px 34px -20px #000a;
+  --grid-line:#E7ECE508;
+}
+:root[data-theme="light"]{
+  --paper:#F2F4EF; --paper-2:#EAEEE6; --card:#FBFCF9;
+  --ink:#15201B; --ink-soft:#33453C; --muted:#63736B;
+  --pine:#1C4B3C; --pine-deep:#123227; --on-pine:#EAF2ED; --pine-muted:#9DBFB0;
+  --accent:#8F5606; --accent-lit:#D08D22; --on-accent:#FFF9F0; --accent-hover:#7A4905;
+  --pine-accent:#EDB25E; --on-pine-accent:#12261E;
+  --clay:#A44E36;
+  --rule:#15201B26; --rule-soft:#15201B14;
+  --shadow:0 1px 2px #15201B0d, 0 12px 28px -18px #15201B40;
+  --grid-line:#15201B0a;
+}
+/* Inverted bands re-point the accent so focus rings and fills stay legible. */
+.carbon,.foot{--accent:var(--pine-accent); --accent-lit:var(--pine-accent); --focus:var(--pine-accent); --clay:#EDA487}
+
+/* ---------- Base ---------- */
+*,*::before,*::after{box-sizing:border-box}
+.page{
+  font-family:var(--body); font-size:1.0625rem; line-height:1.72;
+  color:var(--ink); background:var(--paper);
+  -webkit-font-smoothing:antialiased; position:relative; overflow-x:hidden;
+}
+.page::before{
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
+  background-size:28px 28px;
+}
+.page > *{position:relative; z-index:1}
+.page p{margin:0; text-wrap:pretty}
+.page h1,.page h2,.page h3,.page h4{margin:0; font-family:var(--display); font-weight:750; letter-spacing:-.02em; line-height:1.06; text-wrap:balance}
+.page ul,.page ol{margin:0; padding:0; list-style:none}
+.page a{color:inherit}
+.page :focus-visible{outline:2.5px solid var(--focus); outline-offset:3px; border-radius:2px}
+
+.wrap{width:100%; max-width:var(--measure); margin-inline:auto; padding-inline:clamp(1.15rem,4vw,2.5rem)}
+.band{padding-block:clamp(3.75rem,8vw,7rem)}
+.band-tint{background:var(--paper-2)}
+.stack{display:flex; flex-direction:column}
+.g-8{gap:.5rem} .g-12{gap:.75rem} .g-16{gap:1rem} .g-20{gap:1.25rem}
+.g-24{gap:1.5rem} .g-32{gap:2rem} .g-40{gap:2.5rem} .g-56{gap:3.5rem}
+
+/* ---------- Repeating type roles ---------- */
+.mono{font-family:var(--mono); font-size:.7rem; letter-spacing:.14em; text-transform:uppercase; font-weight:500}
+.lede{font-size:clamp(1.1rem,1.9vw,1.3rem); line-height:1.62; color:var(--ink-soft); max-width:38ch}
+.prose{max-width:62ch; color:var(--ink-soft)}
+.h-xl{font-size:clamp(2.5rem,6.2vw,4.5rem); font-weight:800; letter-spacing:-.035em}
+.h-lg{font-size:clamp(1.85rem,3.7vw,2.85rem); font-weight:750; letter-spacing:-.028em}
+.h-md{font-size:clamp(1.25rem,2vw,1.5rem); font-weight:700; letter-spacing:-.02em; line-height:1.2}
+.h-sm{font-size:1.0625rem; font-weight:700; letter-spacing:-.01em; line-height:1.28; font-family:var(--display)}
+
+/* section opener: mono label + hairline rule */
+.opener{display:flex; align-items:center; gap:1rem; padding-bottom:1.5rem}
+.opener .mono{color:var(--accent); white-space:nowrap}
+.opener::after{content:""; flex:1; height:1px; background:var(--rule)}
+.opener-inv .mono{color:var(--accent)}
+.opener-inv::after{background:#EAF2ED2e}
+
+/* editable placeholder */
+.fill{font-family:var(--mono); font-size:.9em; font-weight:500; color:var(--clay);
+  border-bottom:1.5px dotted currentColor; padding-bottom:1px; white-space:nowrap}
+
+/* ---------- Nav ---------- */
+.topbar{position:sticky; top:0; z-index:40; background:color-mix(in oklab,var(--paper) 88%,transparent);
+  backdrop-filter:blur(12px) saturate(1.3); border-bottom:1px solid var(--rule)}
+.topbar-in{display:flex; align-items:center; gap:1.5rem; height:60px}
+.brand{display:flex; align-items:baseline; gap:.55rem; text-decoration:none; margin-right:auto}
+.brand-mark{font-family:var(--display); font-weight:800; font-size:1.02rem; letter-spacing:-.045em}
+.brand-sub{color:var(--muted); font-size:.62rem}
+.nav{display:flex; gap:1.6rem; align-items:center}
+.nav a{font-family:var(--mono); font-size:.7rem; letter-spacing:.1em; text-transform:uppercase;
+  text-decoration:none; color:var(--muted); transition:color .18s ease}
+.nav a:hover{color:var(--ink)}
+@media (max-width:880px){.nav{display:none}}
+
+.btn{display:inline-flex; align-items:center; justify-content:center; gap:.5rem;
+  font-family:var(--mono); font-size:.72rem; letter-spacing:.1em; text-transform:uppercase; font-weight:500;
+  padding:.72rem 1.15rem; border-radius:2px; text-decoration:none; border:1.5px solid transparent;
+  transition:transform .16s ease, background .16s ease, border-color .16s ease, color .16s ease; cursor:pointer}
+.btn-solid{background:var(--accent); color:var(--on-accent); border-color:var(--accent)}
+.btn-solid:hover{background:var(--accent-hover); border-color:var(--accent-hover); transform:translateY(-2px)}
+.btn-ghost{border-color:var(--rule); color:var(--ink)}
+.btn-ghost:hover{border-color:var(--ink); transform:translateY(-2px)}
+.btn-sm{padding:.55rem .85rem; font-size:.66rem}
+.btn-inv{background:var(--pine-accent); color:var(--on-pine-accent); border-color:var(--pine-accent)}
+.btn-inv:hover{transform:translateY(-2px); background:#F2BC6A; border-color:#F2BC6A}
+.btn-inv-ghost{border-color:#EAF2ED4d; color:var(--on-pine)}
+.btn-inv-ghost:hover{border-color:var(--on-pine); transform:translateY(-2px)}
+@media (max-width:600px){.topbar .btn{display:none}}
+
+/* ---------- Hero ---------- */
+.hero{padding-block:clamp(3.25rem,7.5vw,6rem) clamp(3rem,6vw,5rem)}
+.hero-grid{display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr); gap:clamp(2rem,5vw,4rem); align-items:start}
+@media (max-width:920px){.hero-grid{grid-template-columns:1fr; gap:2.75rem}}
+.hero-eyebrow{display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; color:var(--muted)}
+.hero-eyebrow .dot{width:4px; height:4px; border-radius:50%; background:var(--accent-lit)}
+.hero h1 .mark{color:var(--accent); font-style:italic; font-family:var(--body); font-weight:600; letter-spacing:-.01em}
+.hero-cta{display:flex; flex-wrap:wrap; gap:.75rem; padding-top:.4rem}
+.hero-foot{display:flex; align-items:center; gap:.6rem; color:var(--muted); font-size:.9rem; padding-top:.6rem}
+.hero-foot a{color:var(--accent); text-decoration-thickness:1px; text-underline-offset:3px}
+
+/* spec card + stamp */
+.spec{position:relative; background:var(--card); border:1px solid var(--rule); border-radius:3px;
+  padding:1.6rem 1.5rem 1.4rem; box-shadow:var(--shadow)}
+.spec::before{content:""; position:absolute; left:0; right:0; top:0; height:3px; background:var(--accent-lit)}
+.spec-title{color:var(--muted); padding-bottom:1.1rem; border-bottom:1px solid var(--rule-soft); margin-bottom:.35rem}
+.spec-row{display:grid; grid-template-columns:8.5rem 1fr; gap:.75rem; padding:.7rem 0; border-bottom:1px solid var(--rule-soft); align-items:baseline}
+.spec-row:last-child{border-bottom:0}
+.spec-row dt{font-family:var(--mono); font-size:.66rem; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); font-weight:500}
+.spec-row dd{margin:0; font-size:.97rem; line-height:1.45; color:var(--ink)}
+@media (max-width:420px){.spec-row{grid-template-columns:1fr; gap:.15rem}}
+.stamp{position:absolute; right:-14px; top:-22px; width:96px; height:96px; border-radius:50%;
+  border:1.5px solid var(--accent-lit); color:var(--accent-lit); background:var(--paper);
+  display:grid; place-items:center; text-align:center; transform:rotate(-8deg); opacity:.92}
+.stamp::before{content:""; position:absolute; inset:5px; border:1px solid currentColor; border-radius:50%; opacity:.5}
+.stamp span{font-family:var(--mono); font-size:.53rem; letter-spacing:.1em; line-height:1.35; text-transform:uppercase; font-weight:500; padding:0 .6rem}
+.stamp b{display:block; font-size:.86rem; letter-spacing:.06em; font-weight:500}
+@media (max-width:920px){.stamp{right:-6px; top:-18px; width:84px; height:84px}}
+
+/* ---------- Trust strip ---------- */
+.strip{border-block:1px solid var(--rule); background:var(--paper-2)}
+.strip-grid{display:grid; grid-template-columns:repeat(4,1fr)}
+.strip-item{padding:1.6rem 1.4rem; border-right:1px solid var(--rule)}
+.strip-item:last-child{border-right:0}
+.strip-item .mono{color:var(--accent); display:block; padding-bottom:.45rem}
+.strip-item p{font-size:.94rem; line-height:1.45; color:var(--ink-soft)}
+@media (max-width:860px){
+  .strip-grid{grid-template-columns:repeat(2,1fr)}
+  .strip-item:nth-child(2n){border-right:0}
+  .strip-item:nth-child(-n+2){border-bottom:1px solid var(--rule)}
+}
+@media (max-width:460px){
+  .strip-grid{grid-template-columns:1fr}
+  .strip-item{border-right:0; border-bottom:1px solid var(--rule)}
+  .strip-item:last-child{border-bottom:0}
+}
+
+/* ---------- Two-column section head ---------- */
+.split{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:clamp(2rem,5vw,4.5rem); align-items:start}
+@media (max-width:900px){.split{grid-template-columns:1fr; gap:2rem}}
+
+/* ---------- Pillars ---------- */
+.pillars{display:grid; gap:0; border-top:1px solid var(--rule)}
+.pillar{display:grid; grid-template-columns:9rem 1fr; gap:1.5rem; padding:1.5rem 0; border-bottom:1px solid var(--rule); align-items:start}
+.pillar .mono{color:var(--accent); padding-top:.35rem}
+.pillar h3{padding-bottom:.4rem}
+.pillar p{color:var(--ink-soft); font-size:1rem; max-width:56ch}
+@media (max-width:640px){.pillar{grid-template-columns:1fr; gap:.5rem}}
+
+/* ---------- Programs ---------- */
+.cards{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1.25rem}
+@media (max-width:860px){.cards{grid-template-columns:1fr}}
+.card{display:flex; flex-direction:column; gap:1rem; background:var(--card); border:1px solid var(--rule);
+  border-radius:3px; padding:1.6rem 1.5rem; transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease}
+.card:hover{transform:translateY(-3px); box-shadow:var(--shadow); border-color:color-mix(in oklab,var(--accent-lit) 45%,var(--rule))}
+.card-head{display:flex; align-items:flex-start; justify-content:space-between; gap:1rem}
+.card-tag{font-family:var(--mono); font-size:.6rem; letter-spacing:.12em; text-transform:uppercase; font-weight:500;
+  color:var(--accent); border:1px solid currentColor; border-radius:2px; padding:.28rem .45rem; white-space:nowrap}
+.card > p{color:var(--ink-soft); font-size:1rem}
+.card-list{display:flex; flex-direction:column; gap:.5rem; border-top:1px solid var(--rule-soft); padding-top:1rem}
+.card-list li{display:grid; grid-template-columns:1rem 1fr; gap:.6rem; font-size:.95rem; line-height:1.5; color:var(--ink-soft)}
+.card-list li::before{content:"\2713"; font-family:var(--mono); font-size:.72rem; color:var(--accent); line-height:1.75}
+.card-spec{display:flex; flex-wrap:wrap; gap:.35rem 1.15rem; border-top:1px solid var(--rule-soft); padding-top:.9rem; margin-top:auto}
+.card-spec span{font-family:var(--mono); font-size:.64rem; letter-spacing:.08em; text-transform:uppercase; color:var(--muted)}
+.card-spec b{color:var(--ink); font-weight:500}
+.note{display:flex; gap:.75rem; align-items:flex-start; border-left:2px solid var(--accent-lit); padding-left:1rem; color:var(--ink-soft); font-size:.97rem; max-width:70ch}
+
+/* ---------- Parents / safety ---------- */
+.safety{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.9rem 2rem}
+@media (max-width:760px){.safety{grid-template-columns:1fr}}
+.safety li{display:grid; grid-template-columns:1.4rem 1fr; gap:.65rem; align-items:start; font-size:1rem; line-height:1.55; color:var(--ink-soft); padding:.55rem 0; border-bottom:1px solid var(--rule-soft)}
+.safety li::before{content:"\2713"; font-family:var(--mono); font-size:.75rem; color:var(--accent); line-height:1.9}
+
+/* ---------- Carbon band ---------- */
+.carbon{background:var(--pine); color:var(--on-pine); border-block:1px solid var(--pine-deep); position:relative; overflow:hidden}
+.carbon::before{content:""; position:absolute; inset:0;
+  background:radial-gradient(120% 80% at 88% 0%, #EDB05e1f, transparent 62%); pointer-events:none}
+.carbon .prose{color:var(--pine-muted)}
+.carbon-grid{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:clamp(2rem,5vw,4rem); align-items:start}
+@media (max-width:900px){.carbon-grid{grid-template-columns:1fr; gap:2.5rem}}
+.big-figure{font-family:var(--display); font-weight:800; font-size:clamp(4.5rem,13vw,8.5rem); line-height:.86;
+  letter-spacing:-.05em; color:var(--accent); font-variant-numeric:tabular-nums}
+/* At display size the bracket glyphs already read as a blank to fill,
+   and the dotted rule would collide with the caption below. */
+.big-figure .fill{font-size:.9em; color:inherit; border-bottom:0; padding-bottom:0}
+.big-cap{font-family:var(--mono); font-size:.7rem; letter-spacing:.14em; text-transform:uppercase; color:var(--pine-muted); max-width:26ch; line-height:1.7}
+.ledger{border-top:1px solid #EAF2ED2e; font-variant-numeric:tabular-nums}
+.ledger-row{display:grid; grid-template-columns:1fr auto; gap:1rem; align-items:baseline; padding:.72rem 0; border-bottom:1px solid #EAF2ED1a}
+.ledger-row span{font-size:.95rem; line-height:1.45}
+.ledger-row b{font-family:var(--mono); font-size:.9rem; font-weight:500; color:var(--accent)}
+.ledger-total{border-bottom:0; border-top:1.5px solid #EAF2ED3d; margin-top:.35rem; padding-top:.9rem}
+.ledger-total span{font-family:var(--display); font-weight:700; font-size:1.02rem}
+.ledger-total b{font-size:1.05rem}
+.honest{border-left:2px solid var(--accent); padding-left:1rem; color:var(--pine-muted); font-size:.97rem; max-width:62ch}
+.carbon-kicker{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1.25rem}
+@media (max-width:760px){.carbon-kicker{grid-template-columns:1fr}}
+.kick{border:1px solid #EAF2ED26; border-radius:3px; padding:1.25rem 1.2rem; background:#EAF2ED0a}
+.kick .mono{color:var(--accent); display:block; padding-bottom:.5rem}
+.kick p{color:var(--pine-muted); font-size:.95rem; line-height:1.55}
+
+/* ---------- Tuition ---------- */
+.tiers{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1.25rem}
+@media (max-width:860px){.tiers{grid-template-columns:1fr}}
+.tier{display:flex; flex-direction:column; gap:1rem; border:1px solid var(--rule); border-radius:3px;
+  padding:1.5rem 1.4rem; background:var(--card)}
+.tier-flag{border-color:var(--accent-lit); box-shadow:var(--shadow)}
+.tier-flag .tier-name{color:var(--accent)}
+.tier-name{font-family:var(--mono); font-size:.68rem; letter-spacing:.12em; text-transform:uppercase; font-weight:500; color:var(--muted)}
+.tier-price{font-family:var(--display); font-weight:750; font-size:2rem; letter-spacing:-.03em; line-height:1}
+.tier-price small{font-family:var(--mono); font-size:.62rem; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); font-weight:500; display:block; padding-top:.5rem}
+.tier ul{display:flex; flex-direction:column; gap:.5rem; border-top:1px solid var(--rule-soft); padding-top:1rem; margin-top:auto}
+.tier li{display:grid; grid-template-columns:1rem 1fr; gap:.55rem; font-size:.93rem; line-height:1.5; color:var(--ink-soft)}
+.tier li::before{content:"\2713"; font-family:var(--mono); font-size:.7rem; color:var(--accent); line-height:1.8}
+
+/* ---------- Steps ---------- */
+.steps{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:0; border-top:1px solid var(--rule)}
+@media (max-width:900px){.steps{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:520px){.steps{grid-template-columns:1fr}}
+.step{display:flex; flex-direction:column; gap:.55rem; padding:1.6rem 1.4rem 1.6rem 0; border-bottom:1px solid var(--rule)}
+.step-n{font-family:var(--mono); font-size:.68rem; letter-spacing:.14em; color:var(--accent); font-weight:500}
+.step p{font-size:.95rem; line-height:1.55; color:var(--ink-soft)}
+
+/* ---------- FAQ ---------- */
+.faq{border-top:1px solid var(--rule); max-width:78ch}
+.faq details{border-bottom:1px solid var(--rule)}
+.faq summary{display:flex; align-items:flex-start; justify-content:space-between; gap:1.5rem; cursor:pointer;
+  padding:1.15rem 0; font-family:var(--display); font-weight:650; font-size:1.05rem; letter-spacing:-.012em; line-height:1.35; list-style:none}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"+"; font-family:var(--mono); font-size:1.1rem; color:var(--accent); flex:none; line-height:1.25; transition:transform .2s ease}
+.faq details[open] summary::after{transform:rotate(45deg)}
+.faq-body{padding:0 0 1.25rem; color:var(--ink-soft); font-size:1rem; max-width:66ch}
+
+/* ---------- Contact ---------- */
+.contact-grid{display:grid; grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr); gap:clamp(2rem,5vw,4rem); align-items:start}
+@media (max-width:900px){.contact-grid{grid-template-columns:1fr; gap:2.5rem}}
+.lines{border-top:1px solid var(--rule)}
+.line{display:grid; grid-template-columns:7.5rem 1fr; gap:1rem; padding:.95rem 0; border-bottom:1px solid var(--rule); align-items:baseline}
+.line dt{font-family:var(--mono); font-size:.66rem; letter-spacing:.11em; text-transform:uppercase; color:var(--muted); font-weight:500}
+.line dd{margin:0; font-size:1.02rem; line-height:1.45}
+.line a{color:var(--accent); text-decoration-thickness:1px; text-underline-offset:3px; word-break:break-word}
+@media (max-width:460px){.line{grid-template-columns:1fr; gap:.2rem}}
+.checklist{background:var(--card); border:1px solid var(--rule); border-radius:3px; padding:1.5rem 1.4rem}
+.checklist .mono{color:var(--accent); display:block; padding-bottom:.9rem}
+.checklist li{display:grid; grid-template-columns:1.1rem 1fr; gap:.6rem; padding:.5rem 0; border-bottom:1px solid var(--rule-soft);
+  font-size:.96rem; line-height:1.5; color:var(--ink-soft)}
+.checklist li:last-child{border-bottom:0}
+.checklist li::before{content:"\25A2"; font-family:var(--mono); font-size:.85rem; color:var(--accent); line-height:1.55}
+
+/* ---------- Footer ---------- */
+.foot{background:var(--pine-deep); color:var(--on-pine); padding-block:3rem 2.5rem}
+.foot-top{display:flex; flex-wrap:wrap; gap:1.5rem 2.5rem; align-items:baseline; justify-content:space-between;
+  padding-bottom:1.5rem; border-bottom:1px solid #EAF2ED1f}
+.foot-brand{font-family:var(--display); font-weight:800; font-size:1.1rem; letter-spacing:-.045em}
+.foot-nav{display:flex; flex-wrap:wrap; gap:1.25rem}
+.foot-nav a{font-family:var(--mono); font-size:.66rem; letter-spacing:.1em; text-transform:uppercase; color:var(--pine-muted); text-decoration:none; transition:color .18s ease}
+.foot-nav a:hover{color:var(--on-pine)}
+.disclaim{color:var(--pine-muted); font-size:.86rem; line-height:1.65; max-width:74ch; padding-top:1.5rem}
+.foot-meta{display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; padding-top:1.25rem; color:#8AAB9B; font-family:var(--mono); font-size:.63rem; letter-spacing:.1em; text-transform:uppercase}
+
+.skip{position:absolute; left:-9999px; top:0}
+.skip:focus{left:.75rem; top:.75rem; z-index:99; background:var(--accent); color:var(--on-accent); padding:.6rem .9rem; border-radius:2px; font-family:var(--mono); font-size:.7rem}
+
+/* ---------- Motion ---------- */
+.rise{opacity:0; transform:translateY(14px); transition:opacity .7s cubic-bezier(.22,.61,.36,1), transform .7s cubic-bezier(.22,.61,.36,1)}
+.rise.in{opacity:1; transform:none}
+.hero .rise{transition-delay:var(--d,0ms)}
+@media (prefers-reduced-motion:reduce){
+  .rise{opacity:1; transform:none; transition:none}
+  .card:hover,.btn:hover{transform:none}
+  *{animation:none !important}
+}
+
+/* ---------- Print (families print this for their TEFA file) ---------- */
+@media print{
+  .page{background:#fff; color:#000; font-size:10.5pt}
+  .page::before,.topbar,.hero-cta,.stamp{display:none !important}
+  .carbon,.foot{background:#fff !important; color:#000 !important; border:1px solid #999}
+  .carbon .prose,.honest,.kick p,.disclaim,.big-cap{color:#333 !important}
+  .big-figure,.ledger-row b,.card-tag,.step-n,.opener .mono{color:#000 !important}
+  .band{padding-block:1.25rem}
+  .card,.tier,.checklist,.spec{break-inside:avoid; box-shadow:none}
+  .faq details{break-inside:avoid}
+  .faq .faq-body{display:block}
+}
+</style>
+
+<div class="page">
+<a class="skip" href="#main">Skip to content</a>
+
+<!-- ============ NAV ============ -->
+<header class="topbar">
+  <div class="wrap topbar-in">
+    <a class="brand" href="#top">
+      <span class="brand-mark">MMM Investment</span>
+      <span class="brand-sub mono">Est. for families</span>
+    </a>
+    <nav class="nav" aria-label="Primary">
+      <a href="#mission">Mission</a>
+      <a href="#programs">Programs</a>
+      <a href="#parents">For parents</a>
+      <a href="#carbon">Carbon pledge</a>
+      <a href="#tuition">Tuition</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <a class="btn btn-solid btn-sm" href="#enroll">Start enrollment</a>
+  </div>
+</header>
+
+<main id="main">
+<!-- ============ HERO ============ -->
+<section class="wrap hero" id="top">
+  <div class="hero-grid">
+    <div class="stack g-24">
+      <p class="hero-eyebrow mono rise" style="--d:0ms">
+        <span>TEFA vendor</span><span class="dot" aria-hidden="true"></span>
+        <span>Serving <span class="fill">[your city / region]</span> families</span>
+      </p>
+      <h1 class="h-xl rise" style="--d:70ms">The skills school<br>runs out of <span class="mark">time</span> to teach.</h1>
+      <p class="lede rise" style="--d:140ms">
+        Money sense. Real tools in real hands. A working understanding of AI — what it does,
+        what it can't, and how not to be fooled by it. Built for students aged 8&ndash;18 and
+        funded straight from your family's TEFA account.
+      </p>
+      <div class="hero-cta rise" style="--d:210ms">
+        <a class="btn btn-solid" href="#enroll">Start enrollment</a>
+        <a class="btn btn-ghost" href="#programs">See the four tracks</a>
+      </div>
+      <p class="hero-foot rise" style="--d:280ms">
+        <span class="fill">[__]%</span> of every dollar goes to cutting CO&#8322;.
+        <a href="#carbon">Read the ledger &#8594;</a>
+      </p>
+    </div>
+
+    <aside class="spec rise" style="--d:340ms" aria-label="Program summary">
+      <div class="stamp" aria-hidden="true"><span>Approved<b>TEFA</b>Vendor</span></div>
+      <p class="spec-title mono">Program spec</p>
+      <dl class="stack">
+        <div class="spec-row"><dt>Ages</dt><dd>8&ndash;18, grouped by readiness rather than grade</dd></div>
+        <div class="spec-row"><dt>Format</dt><dd>A physical kit plus guided sessions &mdash; <span class="fill">[online / in person]</span></dd></div>
+        <div class="spec-row"><dt>Funding</dt><dd>TEFA-eligible, invoiced directly to your account</dd></div>
+        <div class="spec-row"><dt>Start</dt><dd>Rolling enrollment; first kit ships in <span class="fill">[__]</span> weeks</dd></div>
+        <div class="spec-row"><dt>Screen time</dt><dd>Structured and supervised. Never open-ended.</dd></div>
+        <div class="spec-row"><dt>Parent access</dt><dd>Full visibility into every module and assignment</dd></div>
+      </dl>
+    </aside>
+  </div>
+</section>
+
+<!-- ============ TRUST STRIP ============ -->
+<section class="strip" aria-label="At a glance">
+  <div class="wrap">
+    <div class="strip-grid">
+      <div class="strip-item"><span class="mono">Funding</span><p>TEFA funds accepted, with itemized invoices that map to eligible categories.</p></div>
+      <div class="strip-item"><span class="mono">Kit first</span><p>Every track ships physical materials. Nothing lives only on a screen.</p></div>
+      <div class="strip-item"><span class="mono">Ages 8&ndash;18</span><p>Placed by readiness, so siblings can work side by side at their own level.</p></div>
+      <div class="strip-item"><span class="mono">Reinvested</span><p>A fixed share of proceeds is committed to carbon reduction before profit.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MISSION ============ -->
+<section class="band wrap" id="mission">
+  <div class="opener"><span class="mono">About us &mdash; our mission</span></div>
+  <div class="split">
+    <div class="stack g-20">
+      <h2 class="h-lg">Competence is the best protection a kid can carry.</h2>
+    </div>
+    <div class="stack g-16 prose">
+      <p>
+        Most young people aren't short on energy or intelligence. They're short on places to
+        put it. A student who can fix the thing, budget the money, hold the plan, and read the
+        room is far harder to knock off course than one who has only been told to behave.
+      </p>
+      <p>
+        So we don't lead with lectures. Every module ends with something the student can
+        demonstrate &mdash; a repaired object, a working budget, a project they built, a claim they
+        checked and disproved. Confidence follows capability. It rarely works the other way around.
+      </p>
+      <p>
+        We're a supplement, not a replacement. School covers the academics. We cover the
+        practical ground it doesn't have hours for, and we do it in a way that gives your
+        family something concrete to show for the funds you spent.
+      </p>
+    </div>
+  </div>
+
+  <div class="pillars" style="margin-top:clamp(2.5rem,5vw,3.75rem)">
+    <div class="pillar rise">
+      <span class="mono">Skill</span>
+      <div class="stack">
+        <h3 class="h-md">Something they can actually do</h3>
+        <p>Hands-on work with a finished result. Tools, money, food, time, repairs, and the
+           small competencies that quietly make an adult useful.</p>
+      </div>
+    </div>
+    <div class="pillar rise">
+      <span class="mono">Self-command</span>
+      <div class="stack">
+        <h3 class="h-md">Energy pointed somewhere</h3>
+        <p>Goal-setting that survives a bad week, habits that hold when nobody is watching,
+           and a plan for the hours that would otherwise go looking for trouble.</p>
+      </div>
+    </div>
+    <div class="pillar rise">
+      <span class="mono">Judgment</span>
+      <div class="stack">
+        <h3 class="h-md">The habit of asking who benefits</h3>
+        <p>Students practise spotting manipulation &mdash; in a feed, an ad, a generated image, or a
+           friend's bad idea. Scepticism they can aim, so pressure loses its grip.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PROGRAMS ============ -->
+<section class="band band-tint" id="programs">
+  <div class="wrap stack g-32">
+    <div>
+      <div class="opener"><span class="mono">Programs &amp; educational offerings</span></div>
+      <div class="split">
+        <h2 class="h-lg">Four tracks. One kit each.<br>Nothing that only lives on a screen.</h2>
+        <p class="prose">Run a single track, combine two, or take the full year. Kits ship to your
+          door and sessions are scheduled around your family. Every track is written to be
+          purchased with TEFA funds and invoiced with materials and instruction listed separately.</p>
+      </div>
+    </div>
+
+    <div class="cards">
+      <article class="card rise">
+        <div class="card-head">
+          <h3 class="h-md">Life Skills Lab</h3>
+          <span class="card-tag">Ages 8&ndash;18</span>
+        </div>
+        <p>Money, meals, time, and talking to people &mdash; the four things every young adult is
+           expected to have figured out and almost never gets taught.</p>
+        <ul class="card-list">
+          <li>Budgeting, banking, and a first-paycheck simulation</li>
+          <li>Meal planning cards and a real grocery-run challenge</li>
+          <li>A weekly planning board students keep using after the track ends</li>
+          <li>Scripts for hard conversations, conflict, and asking for help</li>
+          <li>Personal safety, documents, and what to do when something goes wrong</li>
+        </ul>
+        <div class="card-spec">
+          <span>Sessions <b><span class="fill">[__]</span></b></span>
+          <span>Kit <b>Included</b></span>
+          <span>TEFA <b>Eligible</b></span>
+        </div>
+      </article>
+
+      <article class="card rise">
+        <div class="card-head">
+          <h3 class="h-md">AI &amp; Modern Tech Literacy</h3>
+          <span class="card-tag">Ages 10&ndash;18</span>
+        </div>
+        <p>What AI actually is, where it breaks, and how to use it as a tool instead of being
+           used by it. Most of this track starts on paper.</p>
+        <ul class="card-list">
+          <li>How models really work, explained without jargon</li>
+          <li>A prompt-practice deck: asking well, checking the answer</li>
+          <li>Spot-the-fake drills for generated images, audio, and text</li>
+          <li>A digital-footprint audit of the student's own accounts</li>
+          <li>Capstone: build one small, genuinely useful tool</li>
+        </ul>
+        <div class="card-spec">
+          <span>Sessions <b><span class="fill">[__]</span></b></span>
+          <span>Kit <b>Included</b></span>
+          <span>TEFA <b>Eligible</b></span>
+        </div>
+      </article>
+
+      <article class="card rise">
+        <div class="card-head">
+          <h3 class="h-md">Build It: Hands-On Projects</h3>
+          <span class="card-tag">Ages 9&ndash;18</span>
+        </div>
+        <p>Real tools, supervised, with a finished object at the end of every project &mdash;
+           something the student can hand you when it's done.</p>
+        <ul class="card-list">
+          <li>A starter tool roll the student keeps</li>
+          <li>Safety card and a supervised competency checklist</li>
+          <li>Six builds, from simple joinery to a small powered project</li>
+          <li>Basic home and bike repair that saves the family money</li>
+          <li>Measuring, estimating, and the maths that shows up in the work</li>
+        </ul>
+        <div class="card-spec">
+          <span>Sessions <b><span class="fill">[__]</span></b></span>
+          <span>Kit <b>Included</b></span>
+          <span>TEFA <b>Eligible</b></span>
+        </div>
+      </article>
+
+      <article class="card rise">
+        <div class="card-head">
+          <h3 class="h-md">Focus &amp; Resilience Coaching</h3>
+          <span class="card-tag">Ages 11&ndash;18</span>
+        </div>
+        <p>Habits that hold up when nobody is watching, and a straight answer for the pressure
+           coming at them from outside the house.</p>
+        <ul class="card-list">
+          <li>A goal ladder broken into weeks the student can actually finish</li>
+          <li>Habit tracking with a review that isn't a lecture</li>
+          <li>Scenario work on peer pressure, influence, and walking away</li>
+          <li>A recurring check-in with the same coach each time</li>
+          <li>A short parent debrief so you're never guessing</li>
+        </ul>
+        <div class="card-spec">
+          <span>Sessions <b><span class="fill">[__]</span></b></span>
+          <span>Format <b><span class="fill">[1:1 / small group]</span></b></span>
+          <span>TEFA <b>Eligible</b></span>
+        </div>
+      </article>
+    </div>
+
+    <p class="note">Not sure which track fits? Tell us the student's age and what they do with a free
+      afternoon &mdash; we'll tell you honestly which track we'd start with, even if it's the cheapest one.</p>
+  </div>
+</section>
+
+<!-- ============ FOR PARENTS ============ -->
+<section class="band wrap" id="parents">
+  <div class="opener"><span class="mono">For parents</span></div>
+  <div class="split" style="padding-bottom:clamp(1.75rem,3.5vw,2.5rem)">
+    <h2 class="h-lg">You should know exactly what your child is doing with AI.</h2>
+    <p class="prose">Handing a young person an open chatbot and hoping for the best isn't
+      education, and it isn't safe. Our AI track is supervised, bounded, and built to make the
+      student the one asking the hard questions.</p>
+  </div>
+  <ul class="safety">
+    <li>Accounts are set up with you, not around you &mdash; you hold the credentials.</li>
+    <li>No open-ended, unsupervised chatbot time. Every session has a task and an end.</li>
+    <li>Work is logged and shareable, so you can read exactly what was asked and answered.</li>
+    <li>Assignments start offline. Students think first, then check their thinking against a model.</li>
+    <li>We teach where AI is confidently wrong, and how to catch it, before we teach convenience.</li>
+    <li>Nothing personal about your child goes into a public tool. That rule is taught and enforced.</li>
+  </ul>
+  <p class="note" style="margin-top:1.75rem">AI literacy is not screen time. Roughly
+    <span class="fill">[__]%</span> of the AI track happens on paper, in conversation, or out in
+    the world checking whether a claim survives contact with reality.</p>
+</section>
+
+<!-- ============ CARBON PLEDGE ============ -->
+<section class="carbon band" id="carbon">
+  <div class="wrap stack g-40">
+    <div>
+      <div class="opener opener-inv"><span class="mono">The carbon ledger &mdash; our pledge</span></div>
+      <div class="carbon-grid">
+        <div class="stack g-20">
+          <h2 class="h-lg">We teach kids about the world they're inheriting. Then we pay to clean some of it.</h2>
+          <p class="prose">A fixed share of what your family spends with us is committed to cutting
+            carbon emissions &mdash; not what's left over at the end of a good year, a fixed share taken
+            off the top, before we count profit. It is written into how we price every track.</p>
+          <p class="prose">We'd rather earn your enrollment twice: once because the programs are
+            good, and once because the money does something after it leaves your account.</p>
+        </div>
+        <div class="stack g-24">
+          <div class="stack g-16">
+            <p class="big-figure"><span class="fill">[__]</span>%</p>
+            <p class="big-cap">of every dollar, committed to carbon reduction and clean-air work</p>
+          </div>
+          <dl class="ledger">
+            <div class="ledger-row"><span>Verified carbon removal &amp; offset purchase</span><b><span class="fill">[__]</span>%</b></div>
+            <div class="ledger-row"><span>Tree planting and urban canopy projects</span><b><span class="fill">[__]</span>%</b></div>
+            <div class="ledger-row"><span>Low-carbon kit materials and recycled packaging</span><b><span class="fill">[__]</span>%</b></div>
+            <div class="ledger-row"><span>Carbon-neutral shipping on every kit</span><b><span class="fill">[__]</span>%</b></div>
+            <div class="ledger-row ledger-total"><span>Total committed per enrollment</span><b><span class="fill">[__]</span>%</b></div>
+          </dl>
+        </div>
+      </div>
+    </div>
+
+    <div class="carbon-kicker">
+      <div class="kick">
+        <span class="mono">Students see it too</span>
+        <p>Every kit includes a one-page impact card showing what your family's enrollment funded
+          &mdash; tonnes, trees, and where. The AI track then uses real emissions data as its practice
+          dataset, so the pledge doubles as a lesson in reading numbers honestly.</p>
+      </div>
+      <div class="kick">
+        <span class="mono">Why we do it</span>
+        <p>Teaching a child to think long-term while acting short-term is a contradiction they will
+          notice. Kids are unusually good at spotting adults who don't mean it. This is the part of
+          the business where we have to mean it.</p>
+      </div>
+    </div>
+
+    <p class="honest">We publish the numbers. <span class="fill">[Quarterly / annually]</span> we post
+      what we spent, and with whom &mdash; currently <span class="fill">[partner organisation]</span> &mdash;
+      so you can check the claim instead of taking our word for it. If we fall short of the pledge in
+      a given period, we'll say so plainly and carry the shortfall forward.</p>
+  </div>
+</section>
+
+<!-- ============ TUITION ============ -->
+<section class="band wrap" id="tuition">
+  <div class="opener"><span class="mono">Tuition &amp; TEFA funding</span></div>
+  <div class="split" style="padding-bottom:clamp(1.75rem,3.5vw,2.5rem)">
+    <h2 class="h-lg">Priced to fit an account. Invoiced the way TEFA expects.</h2>
+    <p class="prose">Every invoice lists materials and instruction separately so it maps cleanly onto
+      eligible expense categories, and includes the vendor details your account portal asks for.
+      Confirm the figures below with us before you submit &mdash; they're set per family.</p>
+  </div>
+  <div class="tiers">
+    <div class="tier">
+      <span class="tier-name">Single track</span>
+      <p class="tier-price">$<span class="fill">[___]</span><small>per student &middot; one track</small></p>
+      <ul>
+        <li>One track of your choice</li>
+        <li>Full physical kit, shipped</li>
+        <li>All guided sessions for the track</li>
+        <li>Itemized TEFA-ready invoice</li>
+      </ul>
+    </div>
+    <div class="tier tier-flag">
+      <span class="tier-name">Two tracks &mdash; most chosen</span>
+      <p class="tier-price">$<span class="fill">[___]</span><small>per student &middot; two tracks</small></p>
+      <ul>
+        <li>Any two tracks, run together or in sequence</li>
+        <li>Both kits, shipped</li>
+        <li>A combined progress review with a parent debrief</li>
+        <li>Itemized TEFA-ready invoice</li>
+      </ul>
+    </div>
+    <div class="tier">
+      <span class="tier-name">Full year</span>
+      <p class="tier-price">$<span class="fill">[___]</span><small>per student &middot; all four tracks</small></p>
+      <ul>
+        <li>All four tracks across the school year</li>
+        <li>Every kit, plus resupply on consumables</li>
+        <li>Ongoing Focus &amp; Resilience coaching throughout</li>
+        <li>End-of-year portfolio of completed work</li>
+      </ul>
+    </div>
+  </div>
+  <p class="note" style="margin-top:1.75rem">Sibling and multi-student families: ask about combined
+    scheduling. If your TEFA balance doesn't cover the option you want, tell us the number you're
+    working with and we'll build something that fits it.</p>
+</section>
+
+<!-- ============ ENROLL ============ -->
+<section class="band band-tint" id="enroll">
+  <div class="wrap stack g-24">
+    <div class="opener"><span class="mono">How to enroll &mdash; four steps</span></div>
+    <div class="split" style="padding-bottom:.5rem">
+      <h2 class="h-lg">From first email to first kit.</h2>
+      <p class="prose">TEFA families follow the same four steps. We handle the paperwork side; you
+        approve it in your account portal.</p>
+    </div>
+    <ol class="steps">
+      <li class="step">
+        <span class="step-n">Step 01</span>
+        <h3 class="h-sm">Reach out</h3>
+        <p>Email or call with your student's age and the tracks you're considering. No form to fill in first.</p>
+      </li>
+      <li class="step">
+        <span class="step-n">Step 02</span>
+        <h3 class="h-sm">Get your quote</h3>
+        <p>We send an itemized, TEFA-ready invoice within <span class="fill">[__]</span> business days, with materials and instruction listed separately.</p>
+      </li>
+      <li class="step">
+        <span class="step-n">Step 03</span>
+        <h3 class="h-sm">Submit through TEFA</h3>
+        <p>Upload our invoice and vendor details to your account portal. We'll send anything else it asks for.</p>
+      </li>
+      <li class="step">
+        <span class="step-n">Step 04</span>
+        <h3 class="h-sm">Kit ships, sessions start</h3>
+        <p>Your first kit arrives within <span class="fill">[__]</span> weeks of approval, and we confirm the schedule by email.</p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<!-- ============ FAQ ============ -->
+<section class="band wrap" id="faq">
+  <div class="opener"><span class="mono">Questions families ask</span></div>
+  <div class="faq">
+    <details>
+      <summary>Is MMM Investment an approved TEFA vendor?</summary>
+      <p class="faq-body">Yes &mdash; our vendor details and approval status are listed under
+        <span class="fill">[legal business name]</span>. Ask us and we'll send the exact vendor
+        identifier your account portal needs so nothing gets held up in review.</p>
+    </details>
+    <details>
+      <summary>Which TEFA expense categories do your programs fall under?</summary>
+      <p class="faq-body">Our invoices separate curriculum and instructional materials from
+        instruction and tutoring, which is how most accounts expect to see them. Category names and
+        rules change between program years, so confirm the current list in your portal before you
+        submit &mdash; and tell us if you need the invoice broken out differently.</p>
+    </details>
+    <details>
+      <summary>What ages do you serve, and how are students placed?</summary>
+      <p class="faq-body">Ages 8&ndash;18. Placement is by readiness rather than grade, which means
+        siblings can often work through the same track together at different depths. We'll ask a few
+        questions before recommending a starting point.</p>
+    </details>
+    <details>
+      <summary>Are sessions online or in person?</summary>
+      <p class="faq-body"><span class="fill">[Describe your delivery: e.g. sessions run live online,
+        in person in the [region] area, or a mix.]</span> Kits ship to your address either way.</p>
+    </details>
+    <details>
+      <summary>My child has never used AI tools. Is that a problem?</summary>
+      <p class="faq-body">No &mdash; it's the ideal starting point. The AI track assumes zero prior
+        experience and spends its first sessions entirely offline, on how these systems work and
+        where they go wrong, before a student touches one.</p>
+    </details>
+    <details>
+      <summary>Can I split my TEFA funds across more than one track or student?</summary>
+      <p class="faq-body">Yes. We'll quote each student and track as its own line item so you can
+        allocate exactly what you want, and adjust before you submit.</p>
+    </details>
+    <details>
+      <summary>What if a track isn't the right fit once we start?</summary>
+      <p class="faq-body"><span class="fill">[State your swap and refund policy here &mdash; e.g. swap
+        tracks within the first two sessions at no charge; unopened kits refundable within 30 days.]</span>
+        Whatever you set, keep it in writing: TEFA families are spending restricted funds and
+        reasonably want the terms up front.</p>
+    </details>
+    <details>
+      <summary>How can I verify the carbon spending you advertise?</summary>
+      <p class="faq-body">We publish a <span class="fill">[quarterly / annual]</span> summary of what
+        was committed and where it went, including the partner we purchased through. Ask for the most
+        recent one before you enroll &mdash; we'd rather you check.</p>
+    </details>
+  </div>
+</section>
+
+<!-- ============ CONTACT ============ -->
+<section class="band band-tint" id="contact">
+  <div class="wrap stack g-32">
+    <div>
+      <div class="opener"><span class="mono">Contact &amp; getting started</span></div>
+      <div class="contact-grid">
+        <div class="stack g-24">
+          <h2 class="h-lg">Tell us about your student.</h2>
+          <p class="prose">One email is enough to start. We'll reply with a straight recommendation
+            and an itemized quote &mdash; no pressure, and no call required unless you want one.</p>
+          <dl class="lines">
+            <div class="line"><dt>Email</dt><dd><a href="mailto:Mmminvestment25@gmail.com">Mmminvestment25@gmail.com</a></dd></div>
+            <div class="line"><dt>Phone</dt><dd><span class="fill">[(000) 000-0000]</span></dd></div>
+            <div class="line"><dt>Hours</dt><dd><span class="fill">[Mon&ndash;Fri, 9:00 AM &ndash; 5:00 PM]</span></dd></div>
+            <div class="line"><dt>Reply time</dt><dd>Within <span class="fill">[__]</span> business days</dd></div>
+            <div class="line"><dt>Serving</dt><dd><span class="fill">[service area / statewide]</span></dd></div>
+          </dl>
+          <div class="hero-cta">
+            <a class="btn btn-solid" href="mailto:Mmminvestment25@gmail.com?subject=TEFA%20enrollment%20enquiry">Email us to start</a>
+            <a class="btn btn-ghost" href="#programs">Review the tracks again</a>
+          </div>
+        </div>
+
+        <div class="checklist">
+          <span class="mono">What to include in your first message</span>
+          <ul>
+            <li>Your student's age and current grade</li>
+            <li>Which track or tracks caught your eye</li>
+            <li>Whether your TEFA account is already approved and funded</li>
+            <li>Roughly what balance you're working with</li>
+            <li>Anything we should know &mdash; interests, challenges, what hasn't worked before</li>
+            <li>The best time and way to reach you</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- ============ FOOTER ============ -->
+<footer class="foot">
+  <div class="wrap">
+    <div class="foot-top">
+      <div class="stack g-8">
+        <span class="foot-brand">MMM Investment</span>
+        <span class="mono" style="color:var(--pine-muted)">Practical skills &middot; AI literacy &middot; carbon reinvested</span>
+      </div>
+      <nav class="foot-nav" aria-label="Footer">
+        <a href="#mission">Mission</a><a href="#programs">Programs</a><a href="#parents">For parents</a>
+        <a href="#carbon">Carbon pledge</a><a href="#tuition">Tuition</a><a href="#enroll">Enroll</a>
+        <a href="mailto:Mmminvestment25@gmail.com">Email</a>
+      </nav>
+    </div>
+    <p class="disclaim">
+      MMM Investment is an independent education vendor. We are not affiliated with, employed by, or
+      endorsed by the agency that administers TEFA, and nothing on this page should be read as
+      official guidance. Eligible expense categories, balances, and submission rules change between
+      program years &mdash; always confirm current requirements in your official TEFA account portal
+      before purchasing. Program details, tuition, and the carbon commitment described above are set
+      per family and confirmed in writing on your invoice.
+    </p>
+    <p class="foot-meta">
+      <span>&copy; 2026 <span class="fill">[legal business name]</span></span>
+      <span>Mmminvestment25@gmail.com</span>
+      <span><span class="fill">[(000) 000-0000]</span></span>
+      <span>Updated <span class="fill">[month year]</span></span>
+    </p>
+  </div>
+</footer>
+</div>
+
+<script>
+(function () {
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var risers = document.querySelectorAll('.rise');
+  if (reduce || !('IntersectionObserver' in window)) {
+    risers.forEach(function (el) { el.classList.add('in'); });
+    return;
+  }
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+    });
+  }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+  risers.forEach(function (el) { io.observe(el); });
+
+  // Hero staggers on load rather than on scroll.
+  requestAnimationFrame(function () {
+    document.querySelectorAll('.hero .rise').forEach(function (el) { el.classList.add('in'); });
+  });
+})();
+</script>
