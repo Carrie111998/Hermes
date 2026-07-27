@@ -744,12 +744,12 @@ Manage the active profile's owner-readable contact and outbound-route registry a
 |------------|-------------|
 | `init` | Create an empty v1 registry with deny-by-default policy (`0600` on POSIX). Never overwrites an existing registry. |
 | `path` | Print the active registry path. |
-| `validate` | Validate schema, contact/name uniqueness, route keys, and route states. |
+| `validate` | Validate schema, contact/name uniqueness, route keys, route states, and boolean sendability flags. |
 | `list` (alias `ls`) | List contacts and route metadata without endpoint values. Add `--show-destinations` to reveal them. |
 | `show <contact>` | Show one exact ID, display-name, or alias match. Endpoint values remain hidden unless requested. |
 | `resolve <contact>` | Resolve one `--purpose` or explicit `--route` without sending. Add `--show-destination` only when preparing an authorized action. |
 
-The resolver reports explicit failure states for unknown or ambiguous contacts, missing or ambiguous routes, stale/unverified endpoints, and live-directory mismatches. Every result records `send_performed: false`; successful resolution still records `authorization_check: required`.
+The resolver reports explicit failure states for unknown or ambiguous contacts, missing or ambiguous routes, stale/unverified endpoints, stale channel-directory caches, and directory mismatches. Any gateway or plugin platform present in the generated directory is supported dynamically; email requires a separate account-specific check. Every result records `send_performed: false`; successful resolution still records `authorization_check: required`.
 
 See [Contact Route Registry](../user-guide/messaging/contact-route-registry.md) for the schema and safety model.
 

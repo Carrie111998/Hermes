@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -50,7 +51,10 @@ def _contact(*, status="verified", preferred_for=None, destination="123"):
 
 
 def _directory(destination="123"):
-    return {"platforms": {"discord": [{"id": destination, "name": "alice"}]}}
+    return {
+        "updated_at": datetime.now().astimezone().isoformat(),
+        "platforms": {"discord": [{"id": destination, "name": "alice"}]},
+    }
 
 
 def test_init_creates_empty_profile_registry_with_owner_only_mode(tmp_path):
@@ -105,6 +109,15 @@ def test_registry_rejects_duplicate_route_keys():
         _registry(contact)
 
 
+@pytest.mark.parametrize("value", [0, "false", None])
+def test_registry_rejects_non_boolean_sendable(value):
+    contact = _contact()
+    contact["routes"][0]["sendable"] = value
+
+    with pytest.raises(ContactRegistryError, match="sendable must be a boolean"):
+        _registry(contact)
+
+
 def test_find_contact_matches_id_display_name_or_alias_exactly():
     data = _registry(_contact())
 
@@ -133,7 +146,7 @@ def test_valid_resolution_is_non_sending_and_redacts_destination_by_default():
 
     assert code == 0
     assert result["status"] == "ok"
-    assert result["live_check"] == "directory_match"
+    assert result["live_check"] == "fresh_directory_match"
     assert result["send_performed"] is False
     assert result["authorization_check"] == "required"
     assert "destination" not in result
@@ -204,6 +217,44 @@ def test_live_directory_mismatch_fails_closed():
     assert code == 4
     assert result["status"] == "destination_not_in_live_directory"
     assert result["live_check"] == "failed"
+
+
+def test_stale_channel_directory_fails_closed_even_when_destination_matches():
+    directory = _directory()
+    directory["updated_at"] = (
+        datetime.now().astimezone() - timedelta(minutes=11)
+    ).isoformat()
+
+    code, result = resolve_contact(
+        _registry(_contact()),
+        "Alice",
+        purpose="internal",
+        directory=directory,
+    )
+
+    assert code == 4
+    assert result["status"] == "stale_channel_directory"
+    assert result["live_check"] == "directory_missing_or_stale"
+
+
+def test_plugin_platform_can_use_fresh_directory_membership():
+    contact = _contact()
+    contact["routes"][0]["platform"] = "matrix"
+    directory = {
+        "updated_at": datetime.now().astimezone().isoformat(),
+        "platforms": {"matrix": [{"id": "123", "name": "alice"}]},
+    }
+
+    code, result = resolve_contact(
+        _registry(contact),
+        "Alice",
+        purpose="internal",
+        directory=directory,
+    )
+
+    assert code == 0
+    assert result["status"] == "ok"
+    assert result["live_check"] == "fresh_directory_match"
 
 
 def test_email_resolution_fails_until_external_live_check_and_never_sends():

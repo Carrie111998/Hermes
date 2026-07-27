@@ -60,6 +60,7 @@ contacts:
         destination: "123456789012345678"
         preferred_for: [internal]
         status: verified
+        sendable: true
         last_verified: 2026-01-02
         constraints:
           - Verify messaging authority before sending.
@@ -72,7 +73,7 @@ Hermes rejects:
 - duplicate contact IDs;
 - an alias/name that maps to multiple contacts;
 - duplicate route keys within one contact;
-- malformed route fields;
+- malformed route fields, including a non-boolean `sendable` value;
 - unsupported route states.
 
 Supported route states are `verified`, `unverified`, and `stale`.
@@ -117,10 +118,13 @@ The resolver fails closed for cases such as:
 - `stale_destination`
 - `unverified_destination`
 - `not_sendable`
+- `stale_channel_directory`
 - `destination_not_in_live_directory`
 - `live_check_unavailable`
 
-For gateway-backed platforms such as Discord and Telegram, the selected destination must also appear in the active profile's generated channel directory. Platforms such as email require their own account/mailbox verification. Until a caller performs that check, the resolver returns `live_check_unavailable` rather than silently reporting a send-ready result.
+For any gateway or plugin platform represented in `channel_directory.json`, the selected destination must appear in a directory refreshed within the last ten minutes. The gateway normally refreshes it every five minutes; an older or malformed cache returns `stale_channel_directory` even if the destination still appears in the file. This cache check is reachability evidence, not proof that a gateway remains active, so the actual send path must still revalidate its adapter.
+
+Platforms such as email require their own account/mailbox verification and are excluded from directory checks. Until a caller performs that check, the resolver returns `live_check_unavailable` rather than silently reporting a send-ready result.
 
 ## Before sending
 

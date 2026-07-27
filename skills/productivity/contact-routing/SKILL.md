@@ -43,7 +43,7 @@ Never infer one from another. A generated channel-directory entry or platform al
    ```
 
    Use `--route route-key` only when the user or durable workflow selected that exact route.
-3. Stop on any status other than `ok`, including unknown/ambiguous contacts, missing routes, stale endpoints, or live-directory mismatches.
+3. Stop on any status other than `ok`, including unknown/ambiguous contacts, missing routes, stale endpoints, stale directory caches, or directory mismatches.
 4. A successful resolution still reports `authorization_check: required`. Confirm the user authorized the communication and that no platform-specific identity check remains.
 5. Re-run with `--show-destination` only when preparing the authorized delivery.
 6. Send through the existing messaging or mailbox tool; the resolver never sends.
@@ -69,6 +69,6 @@ Do not automatically merge contacts based on similar names or endpoints. Do not 
 ## Verification
 
 - `hermes contacts validate` reports `status: ok`.
-- Resolution reports the expected contact ID, route key, and live-check state.
+- Resolution reports the expected contact ID, route key, and live-check state. A directory match is accepted only when the generated cache is at most ten minutes old.
 - Resolution output always reports `send_performed: false` and `authorization_check: required`.
 - After an authorized send, the platform readback matches the resolved destination and expected sender identity.

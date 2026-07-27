@@ -13,6 +13,7 @@ import os
 import stat
 import tempfile
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,7 +23,8 @@ from hermes_constants import get_hermes_home
 
 SCHEMA_VERSION = 1
 _ROUTE_STATES = {"verified", "unverified", "stale"}
-_LIVE_DIRECTORY_PLATFORMS = {"discord", "telegram", "slack", "whatsapp", "signal"}
+_DIRECTORY_MAX_AGE_SECONDS = 10 * 60
+_NON_DIRECTORY_PLATFORMS = {"email"}
 
 
 class ContactRegistryError(ValueError):
@@ -127,6 +129,8 @@ def validate_registry(data: Any) -> dict[str, Any]:
                 raise ContactRegistryError(
                     f"{route_prefix}.status must be one of {sorted(_ROUTE_STATES)}"
                 )
+            if "sendable" in route and not isinstance(route["sendable"], bool):
+                raise ContactRegistryError(f"{route_prefix}.sendable must be a boolean")
             _string_list(route.get("preferred_for"), f"{route_prefix}.preferred_for")
             _string_list(route.get("constraints"), f"{route_prefix}.constraints")
 
@@ -253,6 +257,26 @@ def directory_has(directory: dict[str, Any], platform: str, destination: str) ->
     return False
 
 
+def directory_is_fresh(directory: dict[str, Any]) -> bool:
+    """Return whether the generated directory is recent enough to use.
+
+    The gateway refreshes this cache every five minutes. A ten-minute ceiling
+    tolerates one missed refresh while preventing a stopped or reconfigured
+    gateway from leaving indefinitely trusted reachability evidence.
+    """
+    updated_at = directory.get("updated_at")
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        return False
+    try:
+        timestamp = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.astimezone()
+        age_seconds = (datetime.now(timestamp.tzinfo) - timestamp).total_seconds()
+    except (TypeError, ValueError, OSError):
+        return False
+    return -60 <= age_seconds <= _DIRECTORY_MAX_AGE_SECONDS
+
+
 def resolve_contact(
     data: dict[str, Any],
     query: str,
@@ -303,22 +327,27 @@ def resolve_contact(
 
     platform = str(route.get("platform", "")).casefold()
     destination = str(route.get("destination", ""))
-    if platform in _LIVE_DIRECTORY_PLATFORMS:
-        if directory is None or not directory_has(directory, platform, destination):
-            return 4, {
-                **result,
-                "status": "destination_not_in_live_directory",
-                "live_check": "failed",
-            }
-        result["live_check"] = "directory_match"
-    else:
-        # Email and other providers require an adapter/account-specific check.
+    if platform in _NON_DIRECTORY_PLATFORMS:
+        # Email requires an account-specific check outside the gateway directory.
         # Return the selected route but do not report a send-ready resolution.
         return 4, {
             **result,
             "status": "live_check_unavailable",
             "live_check": "unsupported_for_platform",
         }
+    if directory is None or not directory_is_fresh(directory):
+        return 4, {
+            **result,
+            "status": "stale_channel_directory",
+            "live_check": "directory_missing_or_stale",
+        }
+    if not directory_has(directory, platform, destination):
+        return 4, {
+            **result,
+            "status": "destination_not_in_live_directory",
+            "live_check": "failed",
+        }
+    result["live_check"] = "fresh_directory_match"
 
     return 0, {**result, "status": "ok"}
 
