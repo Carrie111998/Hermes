@@ -440,6 +440,37 @@ def _find_installed_skill_dir_by_name(skill_dir_name: str) -> Optional[Path]:
     return matches[0]
 
 
+def _index_active_skill_dirs_by_folder_name() -> Dict[str, List[Path]]:
+    """Index installed skill directories by folder name for optional backfill."""
+    index: Dict[str, List[Path]] = {}
+    if not SKILLS_DIR.exists():
+        return index
+
+    skills_root = SKILLS_DIR.resolve()
+    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        candidate = skill_md.parent
+        try:
+            candidate.resolve().relative_to(skills_root)
+        except (OSError, ValueError):
+            continue
+        index.setdefault(candidate.name, []).append(candidate)
+    return index
+
+
+def _unique_active_skill_dir_by_folder_name(
+    index: Dict[str, List[Path]], skill_dir_name: str
+) -> Optional[Path]:
+    """Return a unique installed skill directory from a precomputed index."""
+    if not skill_dir_name:
+        return None
+    matches = index.get(skill_dir_name, [])
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
     """Mark already-present official optional skills as hub-installed.
 
@@ -467,6 +498,7 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
 
     backfilled: List[str] = []
     changed = False
+    active_dirs_by_name: Optional[Dict[str, List[Path]]] = None
     for skill_md in sorted(optional_dir.rglob("SKILL.md")):
         if is_excluded_skill_path(skill_md):
             continue
@@ -486,7 +518,9 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
             # silently skips them forever. Fall back to a unique
             # same-directory-name match anywhere in the tree, then still
             # require a byte-identical hash below before claiming provenance.
-            dest = _find_installed_skill_dir_by_name(src.name)
+            if active_dirs_by_name is None:
+                active_dirs_by_name = _index_active_skill_dirs_by_folder_name()
+            dest = _unique_active_skill_dir_by_folder_name(active_dirs_by_name, src.name)
             if dest is None:
                 continue
             try:

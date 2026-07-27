@@ -997,6 +997,37 @@ class TestSyncSkills:
 
         assert result["optional_provenance_backfilled"] == []
 
+    def test_relocated_backfill_indexes_active_tree_once(self, tmp_path):
+        """Relocated optional backfill should not rescan active skills per candidate."""
+        bundled = self._setup_bundled(tmp_path)
+        optional = tmp_path / "optional-skills"
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        for name in ("alpha", "beta", "gamma"):
+            optional_skill = optional / "new" / name
+            optional_skill.mkdir(parents=True)
+            skill_text = f"---\nname: {name}\n---\n# {name}\n"
+            (optional_skill / "SKILL.md").write_text(skill_text)
+
+            active = skills_dir / "old" / name
+            active.mkdir(parents=True)
+            (active / "SKILL.md").write_text(skill_text)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("tools.skills_sync._get_optional_dir", return_value=optional):
+                from tools import skills_sync as sync_module
+
+                original = sync_module._index_active_skill_dirs_by_folder_name
+                with patch(
+                    "tools.skills_sync._index_active_skill_dirs_by_folder_name",
+                    wraps=original,
+                ) as indexed:
+                    result = sync_skills(quiet=True)
+
+        assert result["optional_provenance_backfilled"] == ["alpha", "beta", "gamma"]
+        assert indexed.call_count == 1
+
     def test_repair_official_optional_restores_reorganized_skill_with_backup(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
         optional = tmp_path / "optional-skills"
