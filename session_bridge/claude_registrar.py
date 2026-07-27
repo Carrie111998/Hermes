@@ -56,6 +56,7 @@ _CLAUDE_STARTUP_THEMES = frozenset({
 })
 _RESPONSE_SETTLE_SECONDS = 0.5
 _READINESS_SETTLE_SECONDS = 0.5
+_PROMPT_SUBMIT_DELAY_SECONDS = 0.01
 _CLAUDE_FORCED_ONBOARDING = frozenset({"banner", "step"})
 _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
     "CLAUDE_CODE_POWERUP_ONBOARDING",
@@ -988,6 +989,8 @@ class ClaudeNativeRegistrar:
                 pending = ("creation_ambiguous", "Claude TUI readiness unavailable")
             else:
                 process.write(_interactive_prompt_frame(prompt))
+                self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
+                process.write("\r")
                 output = process.read_until(
                     self._remaining_process_time(deadline), prompt=prompt
                 )
@@ -1239,6 +1242,8 @@ class ClaudeNativeRegistrar:
                 )
             else:
                 process.write(_interactive_prompt_frame(prompt))
+                self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
+                process.write("\r")
                 output = process.read_until(
                     self._remaining_process_time(deadline), prompt=prompt
                 )
@@ -1766,9 +1771,9 @@ def _normalized_terminal_output(output: str, prompt: str | None) -> str:
 
 
 def _interactive_prompt_frame(prompt: str) -> str:
-    """Send one multiline prompt as a terminal bracketed-paste frame."""
+    """Build one multiline bracketed-paste frame; submit it separately."""
 
-    return f"\x1b[200~{prompt}\x1b[201~\r"
+    return f"\x1b[200~{prompt}\x1b[201~"
 
 
 def _has_exact_registered_response(output: str, prompt: str) -> bool:

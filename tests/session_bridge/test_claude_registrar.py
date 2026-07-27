@@ -372,7 +372,11 @@ def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
     assert "--print" not in argv and "-p" not in argv
     assert expected not in argv
     assert "--no-session-persistence" not in argv
-    assert process.writes == [f"\x1b[200~{expected}\x1b[201~\r", "/exit\r"]
+    assert process.writes == [
+        f"\x1b[200~{expected}\x1b[201~",
+        "\r",
+        "/exit\r",
+    ]
     assert "tool_calls" not in expected
     assert process.ready_waits == [2.0]
     assert process.ready_trust_acceptances == [True]
@@ -384,7 +388,7 @@ def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
     [
         (FakePty(write_error_at=0), []),
         (FakePty(write_error_at=1), ["prompt"]),
-        (FakePty(wait_error=TimeoutError()), ["prompt", "/exit\r"]),
+        (FakePty(wait_error=TimeoutError()), ["prompt", "\r", "/exit\r"]),
     ],
 )
 def test_interactive_write_or_exit_uncertainty_is_creation_ambiguous(
@@ -401,7 +405,7 @@ def test_interactive_write_or_exit_uncertainty_is_creation_ambiguous(
     assert result.status == "retry"
     assert result.error_code == "creation_ambiguous"
     normalized = [
-        "prompt" if value == f"\x1b[200~{expected}\x1b[201~\r" else value
+        "prompt" if value == f"\x1b[200~{expected}\x1b[201~" else value
         for value in process.writes
     ]
     assert normalized == expected_writes
@@ -415,8 +419,9 @@ def test_malformed_interactive_response_never_sends_exit_command() -> None:
 
     assert result.status == "failed"
     assert result.error_code == "bridge_conflict"
-    assert len(process.writes) == 1
+    assert len(process.writes) == 2
     assert process.writes[0].startswith("\x1b[200~")
+    assert process.writes[1] == "\r"
     assert "/exit\r" not in process.writes
     assert process.terminated and process.closed
 
@@ -573,7 +578,11 @@ def test_auth_recovery_resumes_exact_uuid_interactively_without_create() -> None
     assert "--print" not in factory.spawns[0][0]
     assert prompt not in factory.spawns[0][0]
     assert "--no-session-persistence" not in factory.spawns[0][0]
-    assert process.writes == [f"\x1b[200~{prompt}\x1b[201~\r", "/exit\r"]
+    assert process.writes == [
+        f"\x1b[200~{prompt}\x1b[201~",
+        "\r",
+        "/exit\r",
+    ]
     assert process.ready_trust_acceptances == [True]
 
 
