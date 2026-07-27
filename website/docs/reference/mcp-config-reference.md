@@ -247,19 +247,19 @@ After changing MCP config, reload servers with:
 Server-native MCP tools become:
 
 ```text
-mcp_<server>_<tool>
+mcp__<server>__<tool>
 ```
 
 Examples:
-- `mcp_github_create_issue`
-- `mcp_filesystem_read_file`
-- `mcp_my_api_query_data`
+- `mcp__github__create_issue`
+- `mcp__filesystem__read_file`
+- `mcp__my_api__query_data`
 
 Utility tools follow the same prefixing pattern:
-- `mcp_<server>_list_resources`
-- `mcp_<server>_read_resource`
-- `mcp_<server>_list_prompts`
-- `mcp_<server>_get_prompt`
+- `mcp__<server>__list_resources`
+- `mcp__<server>__read_resource`
+- `mcp__<server>__list_prompts`
+- `mcp__<server>__get_prompt`
 
 ### Name sanitization
 
@@ -268,7 +268,7 @@ Hyphens (`-`) and dots (`.`) in both server names and tool names are replaced wi
 For example, a server named `my-api` exposing a tool called `list-items.v2` becomes:
 
 ```text
-mcp_my_api_list_items_v2
+mcp__my_api__list_items_v2
 ```
 
 Keep this in mind when writing `include` / `exclude` filters — use the **original** MCP tool name (with hyphens/dots), not the sanitized version.
