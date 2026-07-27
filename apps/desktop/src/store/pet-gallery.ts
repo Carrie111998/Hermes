@@ -1,15 +1,7 @@
 import { atom } from 'nanostores'
 
 import { normalize } from '@/lib/text'
-import {
-  $petInfo,
-  hasPetSpriteForMeta,
-  mergePetInfoMeta,
-  type PetInfo,
-  type PetInfoMeta,
-  petProfile,
-  setPetInfo
-} from '@/store/pet'
+import { $petInfo, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
 
 /**
  * Feature store for the petdex gallery picker (Cmd+K "Pets…" + Settings).
@@ -136,9 +128,9 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
     try {
       // Phase 1: local pets only — instant, never blocks on the remote petdex
       // manifest. The user's own/generated pets render right away.
-      const [local] = await Promise.all([
+      const [local, info] = await Promise.all([
         petRpc<PetGallery>(request, 'pet.gallery', { localOnly: true }),
-        syncInfo(request)
+        petRpc<PetInfo>(request, 'pet.info')
       ])
 
       if (local) {
@@ -146,6 +138,10 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
         $petGalleryStatus.set('ready')
         $petGalleryError.set(null)
         localOk = true
+      }
+
+      if (info) {
+        setPetInfo(info)
       }
     } catch (e) {
       if (isMissingMethod(e)) {
@@ -183,46 +179,6 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
 // network gallery — the floating pet repaints, the picker keeps its cache.
 async function syncInfo(request: GatewayRequest): Promise<void> {
   try {
-    let meta: PetInfoMeta | null = null
-
-    try {
-      meta = await petRpc<PetInfoMeta>(request, 'pet.info.meta')
-    } catch (e) {
-      if (!isMissingMethod(e)) {
-        throw e
-      }
-
-      const info = await petRpc<PetInfo>(request, 'pet.info')
-
-      if (info) {
-        setPetInfo(info)
-      }
-
-      return
-    }
-
-    if (!meta) {
-      return
-    }
-
-    if (!meta.enabled) {
-      setPetInfo({ enabled: false })
-
-      return
-    }
-
-    const current = $petInfo.get()
-
-    if (hasPetSpriteForMeta(current, meta)) {
-      const merged = mergePetInfoMeta(current, meta)
-
-      if (merged !== current) {
-        setPetInfo(merged)
-      }
-
-      return
-    }
-
     const info = await petRpc<PetInfo>(request, 'pet.info')
 
     if (info) {

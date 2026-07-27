@@ -117,7 +117,6 @@ export const ar = defineLocale({
     errors: {
       elevenLabsNeedsKey: 'يتطلب ElevenLabs STT المفتاح ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'رفض ElevenLabs مفتاح API (401).',
-      diskFull: 'القرص ممتلئ — حرّر مساحة ثم أعد المحاولة.',
       methodNotAllowed: 'رفضت خلفية سطح المكتب هذا الطلب (405 Method Not Allowed). جرب إعادة تشغيل Hermes Desktop.',
       microphonePermission: 'تم رفض إذن الميكروفون.',
       openaiRejectedApiKey: 'رفض OpenAI مفتاح API.',
@@ -138,7 +137,6 @@ export const ar = defineLocale({
       noSpeechDetected: 'لم يتم اكتشاف كلام',
       playbackFailed: 'فشل تشغيل الصوت',
       recordingFailed: 'فشل التسجيل',
-      sayStopToEnd: phrase => `قل "${phrase}" لإنهاء المحادثة الصوتية.`,
       transcriptionFailed: 'فشل التفريغ النصي',
       transcriptionUnavailable: 'التفريغ النصي غير متاح.',
       tryRecordingAgain: 'حاول التسجيل مرة أخرى.',
@@ -151,7 +149,7 @@ export const ar = defineLocale({
       inputTitle: 'مطلوب إدخال',
       inputBody: 'ينتظر Hermes ردّك.',
       turnDoneTitle: 'أنهى Hermes',
-      turnDoneBody: '',
+      turnDoneBody: 'الرد جاهز.',
       turnErrorTitle: 'فشلت الجولة',
       backgroundDoneTitle: 'انتهت المهمة في الخلفية',
       backgroundFailedTitle: 'فشلت المهمة في الخلفية'
@@ -166,6 +164,7 @@ export const ar = defineLocale({
     search: 'بحث',
     searchTitle: 'البحث في الجلسات والعروض والإجراءات',
     swapSidebarSides: 'تبديل جانبي الأشرطة',
+    swapSidebarSidesTitle: 'تبديل موضعي شريط الجلسات ومستكشف الملفات',
     hideRightSidebar: 'إخفاء الشريط الأيمن',
     showRightSidebar: 'إظهار الشريط الأيمن',
     muteHaptics: 'كتم الاهتزازات',
@@ -221,7 +220,6 @@ export const ar = defineLocale({
       'session.focusSearch': 'البحث في الجلسات',
       'session.togglePin': 'تثبيت / إلغاء تثبيت الجلسة الحالية',
       'workspace.newWorktree': 'worktree جديد',
-      'workspace.openFolder': 'فتح مجلد كمشروع',
       'composer.focus': 'التركيز على المحرّر',
       'composer.modelPicker': 'فتح منتقي النموذج',
       'composer.voice': 'بدء / إيقاف المحادثة الصوتية',
@@ -233,8 +231,6 @@ export const ar = defineLocale({
       'view.closeTab': 'إغلاق علامة التبويب',
       'view.reopenTab': 'إعادة فتح علامة التبويب المغلقة',
       'view.terminalSelection': 'إرسال تحديد الطرفية إلى المحرّر',
-      'view.terminalCopy': 'نسخ تحديد الطرفية',
-      'view.terminalPaste': 'لصق في الطرفية',
       'view.closePreviewTab': 'إغلاق علامة تبويب المعاينة',
       'view.flipPanes': 'تبديل جانبي الشريط الجانبي',
       'appearance.toggleMode': 'تبديل الفاتح / الداكن',
@@ -323,7 +319,7 @@ export const ar = defineLocale({
       intro:
         'إشعارات سطح المكتب الأصلية، منفصلة عن التنبيهات داخل التطبيق. هذه محلية على الجهاز — كل حاسوب يحتفظ بإعداداته الخاصة.',
       enableAll: 'تفعيل الإشعارات',
-      enableAllDesc: 'إيقافه يصمت كل الإشعارات أدناه.',
+      enableAllDesc: 'مفتاح رئيسي. أوقفه لإسكات كل الإشعارات أدناه.',
       focusedHint: 'تنبيهات الاكتمال تظهر فقط عندما يكون Hermes في الخلفية.',
       kinds: {
         approval: {
@@ -340,7 +336,7 @@ export const ar = defineLocale({
         },
         turnError: {
           label: 'فشل الدور',
-          description: 'أخطاء الأدوار في الخلفية.'
+          description: 'انتهى دور بخطأ.'
         },
         backgroundDone: {
           label: 'اكتملت مهمة الخلفية',
@@ -399,8 +395,6 @@ export const ar = defineLocale({
       translucencyDesc: 'إظهار سطح المكتب من خلال النافذة بالكامل. متاح على macOS وWindows فقط.',
       backdropTitle: 'خلفية النافذة',
       backdropDesc: 'اختيار مقدار مزج خلفية سطح المكتب مع سطح Hermes.',
-      reactionsTitle: 'تفاعلات الرسائل',
-      reactionsDesc: 'تفاعلات إيموجي بأسلوب iMessage — تفاعل مع الرسائل، ويمكن لـ Hermes التفاعل مع رسائلك.',
       embedsTitle: 'التضمينات المضمّنة',
       embedsDesc:
         'تُحمّل المعاينات الغنية من مواقع طرف ثالث (YouTube، X، …). "اسأل" يعرض عنصرا نائبا حتى تسمح لكل واحد؛ "دائما" يحمّلها تلقائيا؛ "إيقاف" يبقي الروابط عادية.',
@@ -617,9 +611,6 @@ export const ar = defineLocale({
       noneParen: '(لا شيء)',
       notSet: 'غير مضبوط',
       commaSeparated: 'قيم مفصولة بفواصل',
-      searchPlaceholder: 'بحث…',
-      noResults: 'لا توجد نتائج',
-      systemDefault: 'إعداد النظام الافتراضي',
       loading: 'جار تحميل إعدادات Hermes...',
       emptyTitle: 'لا توجد إعدادات',
       emptyDesc: 'لا يحتوي هذا القسم على إعدادات قابلة للتعديل.',
@@ -648,7 +639,8 @@ export const ar = defineLocale({
       saving: 'جار الحفظ'
     },
     envActions: {
-      actions: 'إجراءات',
+      actionsFor: label => `إجراءات ${label}`,
+      credentialActions: 'إجراءات بيانات الاعتماد',
       docs: 'الوثائق',
       hideValue: 'إخفاء القيمة',
       revealValue: 'إظهار القيمة',
@@ -913,7 +905,7 @@ export const ar = defineLocale({
     needsKeys: 'يحتاج مفاتيح',
     toolsetsEnabled: (enabled, total) => `${enabled} من ${total} مفعلة`,
     configureToolset: label => `ضبط ${label}`,
-    toggleToolset: (label, enabled) => `${enabled ? 'تشغيل' : 'إيقاف'} ${label}`,
+    toggleToolset: label => `تبديل ${label}`,
     skillsLoadFailed: 'فشل تحميل المهارات',
     toolsetsRefreshFailed: 'فشل تحديث مجموعات الأدوات',
     skillEnabled: 'تم تفعيل المهارة',
@@ -978,7 +970,7 @@ export const ar = defineLocale({
       installed: 'مثبّت',
       generatedTag: 'مُولّد',
       adoptFailed: 'تعذّر تبنّي ذلك الحيوان الأليف.',
-      toggleFailed: enabled => `تعذّر ${enabled ? 'تشغيل' : 'إيقاف'} الحيوان الأليف.`,
+      toggleFailed: 'تعذّر تبديل الحيوان الأليف.',
       noneAvailable: 'لا توجد حيوانات أليفة متاحة — اختر واحدا أدناه لتثبيته.'
     },
     generatePet: {
@@ -1297,9 +1289,9 @@ export const ar = defineLocale({
     showAllProfiles: 'إظهار كل الملفات الشخصية',
     switchToProfile: name => `التبديل إلى ${name}`,
     manageProfiles: 'إدارة الملفات الشخصية',
-    actions: 'إجراءات',
+    actionsFor: name => `إجراءات ${name}`,
     color: 'اللون',
-    colorFor: 'اللون',
+    colorFor: name => `لون ${name}`,
     setColor: color => `ضبط اللون ${color}`,
     autoColor: 'لون تلقائي',
     noProfiles: 'لا توجد ملفات شخصية',
@@ -1428,7 +1420,7 @@ export const ar = defineLocale({
     showRuns: 'إظهار التشغيلات',
     hideRuns: 'إخفاء التشغيلات',
     runHistory: 'سجل التشغيل',
-
+    actionsFor: title => `إجراءات ${title}`,
     actionsTitle: 'الإجراءات',
     resume: 'استئناف',
     pause: 'إيقاف مؤقت',
@@ -1511,7 +1503,10 @@ export const ar = defineLocale({
     open: 'فتح'
   },
 
-  artifactPreview: {
+  artifactPane: {
+    tabFallback: 'ناتج',
+    modePreview: 'معاينة',
+    modeSource: 'المصدر',
     versionOf: (current, total) => `الإصدار ${current} من ${total}`,
     olderVersion: 'إصدار أقدم',
     newerVersion: 'إصدار أحدث',
@@ -1551,11 +1546,11 @@ export const ar = defineLocale({
     allPinned: 'كل الجلسات مثبتة',
     shiftClickHint: 'استخدم Shift للتحديد المتعدد',
     noWorkspace: 'بدون مساحة عمل',
+    noProject: 'لا يوجد مشروع',
     projectEmpty: 'لا توجد جلسات بعد',
     noSessions: 'لا توجد جلسات بعد',
     projects: {
       sectionLabel: 'المشاريع',
-      home: 'الرئيسية',
       newButton: 'مشروع جديد',
       createTitle: 'مشروع جديد',
       createDesc: 'سمِّ مساحة العمل وأضف مجلدا أو أكثر.',
@@ -1573,7 +1568,7 @@ export const ar = defineLocale({
       primaryBadge: 'أساسي',
       removeFolder: 'إزالة',
       create: 'إنشاء',
-      menu: 'إجراءات',
+      menu: 'إجراءات المشروع',
       menuRename: 'إعادة تسمية',
       menuAppearance: 'المظهر',
       noColor: 'بلا لون',
@@ -1609,7 +1604,7 @@ export const ar = defineLocale({
       forceRemove: 'إزالة بالقوة',
       enter: label => `فتح ${label}`,
       reorder: label => `إعادة ترتيب ${label}`,
-      toggle: (label, open) => `${open ? 'إظهار' : 'إخفاء'} جلسات ${label}`,
+      toggle: label => `تبديل جلسات ${label}`,
       back: 'كل المشاريع'
     },
     newSessionIn: label => `جلسة جديدة في ${label}`,
@@ -1627,7 +1622,7 @@ export const ar = defineLocale({
       archive: 'أرشفة',
       newWindow: 'فتح في نافذة جديدة',
       copyIdFailed: 'فشل نسخ المعرف',
-
+      actionsFor: title => `إجراءات ${title}`,
       sessionActions: 'إجراءات الجلسة',
       sessionRunning: 'الجلسة تعمل',
       needsInput: 'تحتاج إدخالا',
@@ -1643,7 +1638,7 @@ export const ar = defineLocale({
       renamed: 'تمت إعادة التسمية',
       renameFailed: 'فشلت إعادة التسمية',
       renameTitle: 'إعادة تسمية الجلسة',
-      renameDesc: '',
+      renameDesc: 'اختر اسما جديدا لهذه الجلسة.',
       untitledPlaceholder: 'جلسة بلا عنوان',
       ageNow: 'الآن',
       ageDay: 'يوم',
@@ -1660,7 +1655,6 @@ export const ar = defineLocale({
     newSessionPlaceholders: ['اسأل Hermes عن شيء...', 'اطلب من Hermes تنفيذ مهمة...', 'ابدأ محادثة جديدة...'],
     followUpPlaceholders: ['اكتب متابعة...', 'أضف توجيها...', 'اسأل سؤالا آخر...'],
     startVoice: 'بدء الصوت',
-    openDirective: 'فتح',
     queueMessage: 'إضافة الرسالة للطابور',
     steer: 'توجيه',
     stop: 'إيقاف',
@@ -2080,7 +2074,7 @@ export const ar = defineLocale({
       gatewayConnecting: 'جار اتصال البوابة',
       gatewayOffline: 'البوابة غير متصلة',
       gatewayRestarting: 'جار إعادة التشغيل...',
-      gatewayTitle: 'البوابة',
+      gatewayTitle: 'حالة البوابة',
       agents: 'الوكلاء',
       closeAgents: 'إغلاق الوكلاء',
       openAgents: 'فتح الوكلاء',
@@ -2090,8 +2084,10 @@ export const ar = defineLocale({
       cron: 'المهام',
       openCron: 'فتح المهام المجدولة',
       turnRunning: 'الدور يعمل',
+      currentTurnElapsed: 'وقت الدور الحالي',
       contextUsage: 'استخدام السياق',
       session: 'الجلسة',
+      runtimeSessionElapsed: 'وقت الجلسة',
       yoloOn: 'YOLO مفعل',
       yoloOff: 'YOLO معطل',
       modelNone: 'لا نموذج',
@@ -2113,7 +2109,7 @@ export const ar = defineLocale({
     remotePickerTitle: 'اختر مجلدا بعيدا',
     remotePickerDescription: 'استعرض المجلدات على الخادم الخلفي المتصل.',
     remotePickerSelect: 'تحديد المجلد',
-    folderTip: cwd => cwd,
+    folderTip: cwd => `المجلد الحالي: ${cwd}`,
     openFolder: 'فتح مجلد',
     refreshTree: 'تحديث الشجرة',
     collapseAll: 'طي الكل',
@@ -2236,15 +2232,20 @@ export const ar = defineLocale({
     closeRunningBody:
       'هذه المحادثة ما زالت تعمل (أو تنتظر إدخالك). إغلاق التبويب يخفيها فقط — ستحتفظ الجلسة بتقدمها ويمكن إعادة فتحها من الشريط الجانبي.',
     closeRunningConfirm: 'إغلاق التبويب',
-    reload: 'إعادة التحميل',
     closeOthers: 'إغلاق الأخرى',
     closeToRight: 'إغلاق ما على اليمين',
     closeAll: 'إغلاق الكل',
+    split: dir => `تقسيم ${dir}`,
+    move: dir => `نقل ${dir}`,
+    dirUp: 'للأعلى',
+    dirDown: 'للأسفل',
+    dirLeft: 'لليسار',
+    dirRight: 'لليمين',
     pluginDisabled: pluginId => `الإضافة "${pluginId}" معطلة`,
     pluginDisabledBody: 'أعد تفعيلها من الإعدادات ← الإضافات لإرجاع اللوحة.',
     missingPane: paneId => `لوحة مفقودة: ${paneId}`,
     editTitle: 'التخطيطات',
-    editHint: 'اختر تخطيطا، أو اسحب اللوحات بين المناطق.',
+    editHint: 'اختر تخطيطا، أو اسحب اللوحات بين المناطق. انقر بزر الفأرة الأيمن على منطقة لتقسيمها.',
     reset: 'إعادة ضبط',
     templates: 'القوالب',
     custom: 'مخصص',
@@ -2275,19 +2276,13 @@ export const ar = defineLocale({
       resumeWhenBackgroundDone: count =>
         count === 1 ? 'سيُستأنف عند انتهاء المهمة الخلفية' : `سيُستأنف عند انتهاء ${count} مهام خلفية`,
       thinking: 'يفكر...',
-      thought: 'فكّر',
-      thoughtBriefly: 'فكّر قليلاً',
-      thoughtFor: duration => `فكّر لمدة ${duration}`,
       today: time => `اليوم ${time}`,
       yesterday: time => `أمس ${time}`,
       copy: 'نسخ',
       refresh: 'تحديث',
       moreActions: 'إجراءات إضافية',
       branchNewChat: 'تفريع إلى محادثة جديدة',
-      react: 'تفاعل',
       dismissError: 'تجاهل الخطأ',
-      filesChanged: count => `${count} ملفات تم تغييرها`,
-      reviewChanges: 'مراجعة',
       readAloudFailed: 'فشلت القراءة بصوت عال',
       preparingAudio: 'جار تجهيز الصوت',
       stopReading: 'إيقاف القراءة',
@@ -2331,6 +2326,7 @@ export const ar = defineLocale({
       continueLabel: 'متابعة'
     },
     tool: {
+      code: 'الكود',
       copyCode: 'نسخ الكود',
       renderingImage: 'جار عرض الصورة...',
       copyOutput: 'نسخ الإخراج',
@@ -2352,7 +2348,6 @@ export const ar = defineLocale({
       statusError: 'خطأ',
       statusRecovered: 'تم الاسترداد',
       statusDone: 'تم',
-      memoryWriteNoted: 'تم تسجيل كتابة الذاكرة',
       actions: {
         read: 'قراءة',
         reading: 'جار القراءة',
@@ -2598,7 +2593,7 @@ export const ar = defineLocale({
     sidebar: {
       title: 'الشريط الجانبي',
       description: 'تنقل التطبيق',
-      toggle: open => `${open ? 'إظهار' : 'إخفاء'} الشريط الجانبي`
+      toggle: 'تبديل الشريط الجانبي'
     }
   }
 })

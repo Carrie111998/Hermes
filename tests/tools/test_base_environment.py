@@ -39,6 +39,12 @@ class TestBoundedOutputCollector:
         assert rendered.endswith("TAIL-SENTINEL")
         assert "[OUTPUT TRUNCATED" in rendered
 
+    def test_small_stream_is_unchanged(self):
+        collector = _BoundedOutputCollector(100)
+        collector.append("hello ")
+        collector.append("world")
+
+        assert collector.render() == "hello world"
 
     def test_required_status_suffix_stays_inside_limit(self):
         collector = _BoundedOutputCollector(120)
@@ -81,6 +87,36 @@ class TestWrapCommand:
 
         assert "eval 'echo '\\''hello world'\\'''" in wrapped
 
+    def test_tilde_not_quoted(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("ls", "~")
+
+        assert "cd -- ~" in wrapped
+        assert "cd -- '~'" not in wrapped
+
+    def test_tilde_subpath_with_spaces_uses_home_and_quotes_suffix(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("ls", "~/my repo")
+
+        assert "cd -- $HOME/'my repo'" in wrapped
+        assert "cd -- ~/my repo" not in wrapped
+
+    def test_tilde_slash_maps_to_home(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("ls", "~/")
+
+        assert "cd -- $HOME" in wrapped
+        assert "cd -- ~/" not in wrapped
+
+    def test_hyphen_prefixed_workdir_is_passed_after_double_dash(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("pwd", "-demo")
+
+        assert "builtin cd -- -demo || exit 126" in wrapped
 
     def test_cd_failure_exit_126(self):
         env = _TestableEnv()
@@ -115,27 +151,49 @@ class TestAtomicSnapshotWrite:
         assert f"> '{snap}'" not in wrapped
         assert f"> {snap}\n" not in wrapped
 
-    def test_temp_path_uses_mktemp_not_pid_variables(self):
-        """The temp name MUST be allocated by ``mktemp`` — never ``$$`` (in
-        ``&``-launched concurrent subshells it stays the parent shell's PID, so
-        two writers would pick the same temp name and publish a torn file) and
-        never ``$BASHPID`` (macOS ships bash 3.2, which lacks it — the name
-        expands empty, collapsing every writer onto one temp path and
-        reopening the #38249 race).  Regression for PR #54314."""
+    def test_temp_path_uses_bashpid_not_dollardollar(self):
+        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
+        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
+        shell's PID, so two writers would pick the same temp name, clobber each
+        other mid-write, and mv would publish a torn file — the corruption is
+        only narrowed, not closed.  This is the bug shared by every prior PR in
+        the #38249 cluster."""
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "mktemp " in wrapped
-        assert ".tmp.XXXXXXXXXX" in wrapped
-        assert "$BASHPID" not in wrapped
+        assert "$BASHPID" in wrapped
         # The bare $$ temp form must be gone.
         assert ".tmp.$$" not in wrapped
 
+    def test_temp_path_static_part_is_quoted_bashpid_outside(self):
+        """The static path portion must be shlex-quoted (Windows/Git-Bash
+        ``C:/Users/...`` or spaces) while ``$BASHPID`` stays OUTSIDE the quotes
+        so it still expands."""
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        env._snapshot_path = "/tmp/has space/hermes-snap-x.sh"
+        wrapped = env._wrap_command("echo hi", "/tmp")
+        # The static path (with its space) is shlex-quoted as a single word, with
+        # $BASHPID appended OUTSIDE the quotes so it still expands at runtime.
+        assert "'/tmp/has space/hermes-snap-x.sh.tmp.'$BASHPID" in wrapped
+        # The space must never appear bare/unquoted in the temp token (that would
+        # word-split into two args and break the redirect/mv).
+        assert " space/hermes-snap-x.sh.tmp.$BASHPID" not in wrapped
 
-    def test_init_session_bootstrap_also_atomic_and_mktemp(self):
+    def test_wrap_command_mv_chained_on_export_success(self):
+        """A failed/partial ``export -p`` must NOT mv a torn temp over a good
+        snapshot.  The mv is chained with ``&&`` on the export, and the temp is
+        removed on failure."""
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hi", "/tmp")
+        assert "export -p" in wrapped and "> " in wrapped and "&& mv -f " in wrapped
+        assert "rm -f " in wrapped  # temp cleanup on failure
+
+    def test_init_session_bootstrap_also_atomic_and_bashpid(self):
         """The init_session bootstrap (first snapshot write) is the same shared
         file a concurrent command could source — it must be atomic and use
-        ``mktemp`` too (no ``$BASHPID``: absent on macOS bash 3.2)."""
+        ``$BASHPID`` too."""
         env = _TestableEnv()
         captured = {}
 
@@ -150,10 +208,17 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "mktemp " in boot
-        assert "$BASHPID" not in boot
+        assert "$BASHPID" in boot
         assert ".tmp.$$" not in boot
 
+    def test_snapshot_writes_use_private_umask_after_user_command(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hi", "/tmp")
+
+        assert "umask 077" in wrapped
+        assert wrapped.index("eval 'echo hi'") < wrapped.index("umask 077")
+        assert wrapped.index("umask 077") < wrapped.index("export -p")
 
     def test_init_session_bootstrap_uses_private_umask(self):
         env = _TestableEnv()
@@ -181,9 +246,8 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     the emitted script's guarantee holds under real concurrency: N concurrent
     writers + readers, and the snapshot is ALWAYS a complete, parseable env
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it allocates the temp with ``mktemp``
-    (per-writer unique, works on macOS bash 3.2 which lacks ``$BASHPID``),
-    which is what closes the race; ``$$`` would still tear here.
+    that would corrupt PATH.  Crucially it uses ``$BASHPID`` (per-subshell
+    unique), which is what closes the race; ``$$`` would still tear here.
     """
 
     def _run(self, script):
@@ -198,14 +262,13 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _tmpl = _q(snap + ".tmp.XXXXXXXXXX")
+        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"__hermes_snap_tmp=$(mktemp {_tmpl}) && "
-            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
-            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true; "
+            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
+            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
             "done"
         )
         # Reader: repeatedly source the snapshot and check PATH never absorbs
@@ -240,11 +303,10 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
         # Redirect export into an unwritable dir so the export side fails; mv
         # must then NOT run (&&) and not clobber snap.
-        bad_tmp = _q("/nonexistent-dir/snap.tmp.XXXXXXXXXX")
+        bad_tmp = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID"
         script = (
-            f"__hermes_snap_tmp=$(mktemp {bad_tmp}) && "
-            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
-            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true"
+            f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
+            f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"
         )
         self._run(script)
         out = self._run(f"cat {_q(snap)}")
@@ -316,6 +378,24 @@ class TestExtractCwdFromOutput:
         assert env.cwd == "/home/user"
         assert marker not in result["output"]
 
+    def test_missing_marker(self):
+        env = _TestableEnv()
+        result = {"output": "hello world\n"}
+        env._extract_cwd_from_output(result)
+
+        assert env.cwd == "/tmp"  # unchanged
+
+    def test_marker_in_command_output(self):
+        """If the marker appears in command output AND as the real marker,
+        rfind grabs the last (real) one."""
+        env = _TestableEnv()
+        marker = env._cwd_marker
+        result = {
+            "output": f"user typed {marker} in their output\nreal output\n{marker}/correct/path{marker}\n",
+        }
+        env._extract_cwd_from_output(result)
+
+        assert env.cwd == "/correct/path"
 
     def test_output_cleaned(self):
         env = _TestableEnv()
@@ -359,6 +439,42 @@ class TestInitSessionFailure:
 
         assert env._snapshot_ready is False
 
+    def test_snapshot_ready_false_on_nonzero_bootstrap_exit(self):
+        """A non-zero bootstrap result should trigger fallback mode."""
+        env = _TestableEnv()
+
+        def mock_run_bash(*args, **kwargs):
+            mock = MagicMock()
+            mock.poll.return_value = 0
+            mock.returncode = 127
+            mock.stdout = iter([])
+            return mock
+
+        env._run_bash = mock_run_bash
+        env.init_session()
+
+        assert env._snapshot_ready is False
+
+    def test_login_flag_when_snapshot_not_ready(self):
+        """When _snapshot_ready=False, execute() should pass login=True to _run_bash."""
+        env = _TestableEnv()
+        env._snapshot_ready = False
+
+        calls = []
+        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+            calls.append({"login": login})
+            # Return a mock process handle
+            mock = MagicMock()
+            mock.poll.return_value = 0
+            mock.returncode = 0
+            mock.stdout = iter([])
+            return mock
+
+        env._run_bash = mock_run_bash
+        env.execute("echo test")
+
+        assert len(calls) == 1
+        assert calls[0]["login"] is True
 
     def test_prefer_nonlogin_when_login_bash_is_dead(self):
         """Login snapshot failure + working non-login probe → don't use bash -l."""

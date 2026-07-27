@@ -19,7 +19,6 @@ import {
   listSessions,
   listSidebarSessions,
   resetSidebarBatchCapability,
-  setApiRequestProfile,
   speakText,
   transcribeAudio
 } from './hermes'
@@ -45,7 +44,6 @@ describe('Hermes REST helpers', () => {
   })
 
   afterEach(() => {
-    setApiRequestProfile(null)
     vi.restoreAllMocks()
     Reflect.deleteProperty(window, 'hermesDesktop')
   })
@@ -339,8 +337,7 @@ describe('Hermes REST helpers', () => {
     expect(audioSpeakRequestTimeoutMs('x'.repeat(100_000))).toBe(AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS)
   })
 
-  it('routes blocking TTS synthesis through the active profile backend', async () => {
-    setApiRequestProfile('rhaegal')
+  it('uses an extended timeout for blocking TTS synthesis', async () => {
     api.mockResolvedValueOnce({
       data_url: 'data:audio/mpeg;base64,AA==',
       mime_type: 'audio/mpeg',
@@ -359,7 +356,6 @@ describe('Hermes REST helpers', () => {
       body: { text: 'Read this aloud' },
       method: 'POST',
       path: '/api/audio/speak',
-      profile: 'rhaegal',
       timeoutMs: AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS
     })
   })

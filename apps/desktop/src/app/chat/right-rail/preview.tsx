@@ -10,15 +10,23 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
-import { PaneTab, PaneTabLabel } from '@/components/ui/pane-tab'
+import { PANE_TAB_STRIP_LINE, PaneTab, PaneTabLabel } from '@/components/ui/pane-tab'
 import { Tip } from '@/components/ui/tooltip'
 import { translateNow, useI18n } from '@/i18n'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
-import { $panesFlipped, $rightRailActiveTabId, selectRightRailTab } from '@/store/layout'
+import { $openArtifacts, artifactIdFromTabId } from '@/store/artifacts'
 import {
+  $panesFlipped,
+  $rightRailActiveTabId,
+  RIGHT_RAIL_PREVIEW_TAB_ID,
+  type RightRailTabId,
+  selectRightRailTab
+} from '@/store/layout'
+import {
+  $filePreviewTabs,
   $previewReloadRequest,
-  $previewTabs,
+  $previewTarget,
   closeOtherRightRailTabs,
   closeRightRail,
   closeRightRailTab,
@@ -27,6 +35,7 @@ import {
 } from '@/store/preview'
 import { $dirtyPreviewUrls } from '@/store/preview-edit'
 
+import { ArtifactPane } from './artifact-pane'
 import { PreviewPane } from './preview-pane'
 
 export const PREVIEW_RAIL_MIN_WIDTH = '18rem'
@@ -37,12 +46,11 @@ interface ChatPreviewRailProps {
   setTitlebarToolGroup?: SetTitlebarToolGroup
 }
 
-function tabLabelFor(target: PreviewTarget): string {
-  // Artifacts are titled, not located — their label is the whole name.
-  if (target.kind === 'artifact') {
-    return target.label || translateNow('preview.tab')
-  }
+type RailTab =
+  | { id: RightRailTabId; kind: 'preview'; label: string; target: PreviewTarget; tooltip: string }
+  | { artifactId: string; id: RightRailTabId; kind: 'artifact'; label: string; tooltip: string }
 
+function tabLabelFor(target: PreviewTarget): string {
   const value = target.label || target.path || target.source || target.url
   const tail = value.split(/[\\/]/).filter(Boolean).at(-1)
 
@@ -54,17 +62,46 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
   const previewReloadRequest = useStore($previewReloadRequest)
   const activeTabId = useStore($rightRailActiveTabId)
   const panesFlipped = useStore($panesFlipped)
-  const previewTabs = useStore($previewTabs)
+  const filePreviewTabs = useStore($filePreviewTabs)
+  const previewTarget = useStore($previewTarget)
   const dirtyPreviewUrls = useStore($dirtyPreviewUrls)
+  const openArtifacts = useStore($openArtifacts)
 
-  const tabs = useMemo(
-    () =>
-      previewTabs.map(({ id, target }) => {
-        const label = tabLabelFor(target)
-
-        return { id, label, target, tooltip: target.kind === 'artifact' ? label : target.path || target.url || label }
-      }),
-    [previewTabs]
+  const tabs = useMemo<readonly RailTab[]>(
+    () => [
+      ...(previewTarget
+        ? [
+            {
+              id: RIGHT_RAIL_PREVIEW_TAB_ID,
+              kind: 'preview',
+              label: t.preview.tab,
+              target: previewTarget,
+              tooltip: previewTarget.path || previewTarget.url || t.preview.tab
+            } as RailTab
+          ]
+        : []),
+      ...filePreviewTabs.map(
+        ({ id, target }) =>
+          ({
+            id,
+            kind: 'preview',
+            label: tabLabelFor(target),
+            target,
+            tooltip: target.path || target.url || tabLabelFor(target)
+          }) as RailTab
+      ),
+      ...openArtifacts.map(
+        ({ record, tabId }) =>
+          ({
+            artifactId: record.id,
+            id: tabId,
+            kind: 'artifact',
+            label: record.title || t.artifactPane.tabFallback,
+            tooltip: record.title || t.artifactPane.tabFallback
+          }) as RailTab
+      )
+    ],
+    [filePreviewTabs, openArtifacts, previewTarget, t.artifactPane.tabFallback, t.preview.tab]
   )
 
   const activeTab = tabs.find(tab => tab.id === activeTabId) ?? tabs[0]
@@ -79,7 +116,7 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
     return null
   }
 
-  const isPreview = activeTab.target.kind === 'url'
+  const isPreview = activeTab.id === RIGHT_RAIL_PREVIEW_TAB_ID
 
   return (
     <aside
@@ -94,7 +131,12 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
       // titlebar-height so it opens below the band. 0px elsewhere → unchanged.
       style={{ paddingTop: 'var(--right-rail-top-inset, 0px)' }}
     >
-      <div className="group/rail-tabs flex h-(--titlebar-height) shrink-0 bg-(--ui-sidebar-surface-background)">
+      <div
+        className={cn(
+          'group/rail-tabs flex h-(--titlebar-height) shrink-0 bg-(--ui-sidebar-surface-background)',
+          PANE_TAB_STRIP_LINE
+        )}
+      >
         <div
           className="flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           role="tablist"
@@ -103,7 +145,7 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
             const active = tab.id === activeTab.id
             const hasOthers = tabs.length > 1
             const hasTabsToRight = index < tabs.length - 1
-            const dirty = Boolean(dirtyPreviewUrls[tab.target.url])
+            const dirty = tab.kind === 'preview' && Boolean(dirtyPreviewUrls[tab.target.url])
 
             return (
               <ContextMenu key={tab.id}>
@@ -118,7 +160,7 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
                         role="tab"
                         type="button"
                       >
-                        {tab.target.kind === 'artifact' && (
+                        {tab.kind === 'artifact' && (
                           <Codicon className="mr-1 shrink-0 text-[0.6875rem] opacity-70" name="sparkle" />
                         )}
                         {tab.label}
@@ -155,13 +197,17 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
-        <PreviewPane
-          embedded
-          onRestartServer={isPreview ? onRestartServer : undefined}
-          reloadRequest={previewReloadRequest}
-          setTitlebarToolGroup={setTitlebarToolGroup}
-          target={activeTab.target}
-        />
+        {activeTab.kind === 'artifact' ? (
+          <ArtifactPane artifactId={artifactIdFromTabId(activeTab.id) ?? activeTab.artifactId} />
+        ) : (
+          <PreviewPane
+            embedded
+            onRestartServer={isPreview ? onRestartServer : undefined}
+            reloadRequest={previewReloadRequest}
+            setTitlebarToolGroup={setTitlebarToolGroup}
+            target={activeTab.target}
+          />
+        )}
       </div>
     </aside>
   )

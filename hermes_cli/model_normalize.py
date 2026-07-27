@@ -69,7 +69,6 @@ _VENDOR_PREFIXES: dict[str, str] = {
 _AGGREGATOR_PROVIDERS: frozenset[str] = frozenset({
     "openrouter",
     "nous",
-    "ai-gateway",
     "kilocode",
 })
 

@@ -11,11 +11,10 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { Field, FieldHint } from '@/components/ui/field'
-import { SanitizedInput } from '@/components/ui/sanitized-input'
+import { Input } from '@/components/ui/input'
 import { renameProfile } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
-import { slug } from '@/lib/sanitize'
 
 import { isValidProfileName } from './create-profile-dialog'
 
@@ -96,12 +95,11 @@ export function RenameProfileDialog({
 
         <form className="grid gap-4" onSubmit={handleSubmit}>
           <Field htmlFor="rename-profile-name" label={p.newNameLabel}>
-            <SanitizedInput
+            <Input
               aria-invalid={invalid}
               autoFocus
               id="rename-profile-name"
-              onValueChange={setName}
-              sanitize={slug}
+              onChange={event => setName(event.target.value)}
               value={name}
             />
             <FieldHint error={invalid}>{p.nameHint}</FieldHint>

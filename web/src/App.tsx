@@ -19,7 +19,7 @@ import {
   Navigate,
   useLocation,
   useNavigate,
-} from "react-router";
+} from "react-router-dom";
 import {
   Activity,
   BarChart3,

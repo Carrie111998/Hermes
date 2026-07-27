@@ -1,7 +1,7 @@
 ---
-title: "Node Inspect Debugger — Debug Node.js via --inspect + Chrome DevTools Protocol CLI"
+title: "Node Inspect Debugger — Debug Node"
 sidebar_label: "Node Inspect Debugger"
-description: "Debug Node.js via --inspect + Chrome DevTools Protocol CLI"
+description: "Debug Node"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}

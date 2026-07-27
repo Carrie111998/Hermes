@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.profiles import get_active_profile_name
 
 
 # ---------------------------------------------------------------------------

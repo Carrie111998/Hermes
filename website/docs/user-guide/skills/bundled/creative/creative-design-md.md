@@ -1,7 +1,7 @@
 ---
-title: "Design Md — Author/validate/export Google's DESIGN.md token spec files"
+title: "Design Md — Author/validate/export Google's DESIGN"
 sidebar_label: "Design Md"
-description: "Author/validate/export Google's DESIGN.md token spec files"
+description: "Author/validate/export Google's DESIGN"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
