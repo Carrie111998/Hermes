@@ -188,7 +188,7 @@ class Win32NativeBackend(ComputerUseBackend):
         return ActionResult(ok=True, action="drag",
             message=f"drag ({fx},{fy})->({tx},{ty})", path="win32_ljqCtrl")
 
-    def _smooth_move(self, x1, y1, x2, y2, duration=0.5):
+    def _smooth_move(self, x1, y1, x2, y2, duration=0.2):
         """Smooth cursor movement with comet trail overlay."""
         import subprocess
         _ensure_ljq()
