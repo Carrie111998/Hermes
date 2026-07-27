@@ -15,6 +15,15 @@ metadata:
 
 Use [CommandCode](https://commandcode.ai) as an autonomous coding worker orchestrated by Hermes terminal/process tools. CommandCode is a "coding agent that continuously learns your taste of writing code" — provider-hosted, with a TUI and CLI.
 
+## Prerequisites
+
+- **Install:** `npm install -g commandcode` (or check `~/.npm-global/bin/commandcode`)
+- **Auth:** run `commandcode auth login` or set `COMMANDCODE_API_KEY` env var
+- **Verify:** `commandcode status` should show `Authenticated`
+- **Git repo required** for coding tasks (read, edit, commit, push)
+- **Default model:** `deepseek/deepseek-v4-pro` via `~/.commandcode/config.json`
+- **PTY mode:** Always pair `background=true, notify_on_complete=true, pty=true` for TUI sessions
+
 ## When to Use
 
 - User explicitly asks to use CommandCode
