@@ -34,6 +34,46 @@ def noop_backend():
     return _get_backend()
 
 
+def test_governed_computer_action_is_exactly_session_scoped(monkeypatch, noop_backend):
+    from tools.computer_use.tool import handle_computer_use
+
+    calls = []
+
+    def record(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", record
+    )
+    monkeypatch.setenv("HERMES_EXECUTION_CONTRACT_ID", "grant-1")
+
+    handle_computer_use(
+        {"action": "click", "element": 7},
+        session_id="worker-session",
+    )
+
+    assert calls == [
+        ("computer.click", "desktop", "desktop-session:worker-session")
+    ]
+
+
+def test_governed_computer_action_denial_happens_before_backend(monkeypatch, noop_backend):
+    from tools.computer_use.tool import handle_computer_use
+
+    def reject(*_args, **_kwargs):
+        raise RuntimeError("desktop authority denied")
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", reject
+    )
+    monkeypatch.setenv("HERMES_EXECUTION_CONTRACT_ID", "grant-1")
+
+    out = json.loads(handle_computer_use({"action": "click", "element": 7}))
+
+    assert "authorization denied" in out["error"]
+    assert noop_backend.calls == []
+
+
 # ---------------------------------------------------------------------------
 # Schema & registration
 # ---------------------------------------------------------------------------

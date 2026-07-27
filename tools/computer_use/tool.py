@@ -86,6 +86,24 @@ _DESTRUCTIVE_ACTIONS = frozenset({
     "drag", "scroll", "type", "key", "set_value", "focus_app",
 })
 
+
+def _authorize_computer_action(
+    action: str, args: Dict[str, Any], session_id: str,
+) -> None:
+    """Authorize one exact computer-use operation against one desktop session."""
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    scope_id = (
+        str(session_id or "").strip()
+        or str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        or "default"
+    )
+    authorize_worker_action(
+        capability=f"computer.{action}",
+        system="desktop",
+        target_resource=f"desktop-session:{scope_id}",
+    )
+
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
 # regardless of approval level (e.g. logout kills the session Hermes runs in).
 _BLOCKED_KEY_COMBOS = {
@@ -315,8 +333,23 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
                     "hint": "Destructive system shortcuts are hard-blocked.",
                 })
 
+    try:
+        _authorize_computer_action(action, args, session_id)
+        if bool(args.get("capture_after")) and action != "capture":
+            _authorize_computer_action("capture", args, session_id)
+        governed_worker = bool(
+            str(os.environ.get("HERMES_EXECUTION_CONTRACT_ID") or "").strip()
+        )
+    except Exception as e:
+        return json.dumps({
+            "error": f"computer_use authorization denied: {e}",
+        })
+
     # Approval gate (destructive actions only).
-    if action in _DESTRUCTIVE_ACTIONS:
+    # A governed worker's exact permit is the control-plane authorization. It
+    # must not depend on an interactive callback that is unavailable in a
+    # detached subordinate process.
+    if action in _DESTRUCTIVE_ACTIONS and not governed_worker:
         err = _request_approval(action, args, session_id)
         if err is not None:
             return err
