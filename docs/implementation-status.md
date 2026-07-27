@@ -100,6 +100,8 @@ acceptance evidence.
   and complete line set before a duplicate source key is accepted.
 - Procurement decision retries are bound to the original tenant, objective,
   sourcing case, and source evidence before a duplicate key is accepted.
+- Metered usage-event retries are bound to the original meter, customer,
+  quantity, supplied timestamp, and evidence before a duplicate key is accepted.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -175,7 +177,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`a54de88bd08749bf7e1542805aba16f78ee2f179` passed 6 Founder/CEO E2E tests, 48
+`614a74b5714a37146a01b95fc50abe60bf5b2a7b` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -183,6 +185,7 @@ boundary or broaden the inventory coverage claim.
 
 The same baseline passed the accounting replay/idempotency regression: 7 tests.
 It also passed the procurement decision replay regression: 8 tests.
+It also passed the metered usage and billing regression: 8 tests.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,

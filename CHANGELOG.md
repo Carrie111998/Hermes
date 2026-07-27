@@ -233,3 +233,6 @@ recorded.
 - `a54de88bd08749bf7e1542805aba16f78ee2f179` — bound procurement decision
   retries to the original tenant, objective, sourcing case, and evidence,
   rejecting idempotency-key input drift.
+- `614a74b5714a37146a01b95fc50abe60bf5b2a7b` — bound metered usage-event
+  retries to the original meter, customer, quantity, supplied timestamp, and evidence,
+  rejecting duplicate-key event drift.
