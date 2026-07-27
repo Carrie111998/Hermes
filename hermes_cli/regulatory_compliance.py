@@ -34,6 +34,24 @@ CREATE TABLE IF NOT EXISTS compliance_control_evidence (
     verifier TEXT NOT NULL, verdict TEXT NOT NULL, evidence_json TEXT NOT NULL,
     evidence_sha256 TEXT NOT NULL, verified_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS compliance_applicability_immutable_update
+BEFORE UPDATE ON compliance_applicability
+BEGIN SELECT RAISE(ABORT, 'compliance applicability is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS compliance_applicability_immutable_delete
+BEFORE DELETE ON compliance_applicability
+BEGIN SELECT RAISE(ABORT, 'compliance applicability is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS compliance_obligations_immutable_update
+BEFORE UPDATE ON compliance_obligations
+BEGIN SELECT RAISE(ABORT, 'compliance obligations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS compliance_obligations_immutable_delete
+BEFORE DELETE ON compliance_obligations
+BEGIN SELECT RAISE(ABORT, 'compliance obligations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS compliance_control_evidence_immutable_update
+BEFORE UPDATE ON compliance_control_evidence
+BEGIN SELECT RAISE(ABORT, 'compliance control evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS compliance_control_evidence_immutable_delete
+BEFORE DELETE ON compliance_control_evidence
+BEGIN SELECT RAISE(ABORT, 'compliance control evidence is immutable'); END;
 """
 
 STARTER_REGIMES = (

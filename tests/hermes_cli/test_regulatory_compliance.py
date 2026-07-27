@@ -56,6 +56,39 @@ def test_control_evidence_rejects_stale_expiry():
             evidence={"check": "old"},
             expires_at=int(time.time()) - 1,
         )
+
+
+def test_compliance_evidence_records_are_append_only():
+    conn = connection()
+    future = int(time.time()) + 3600
+    assessment_id = compliance.assess_applicability(
+        conn,
+        organization_id="org_1",
+        regime_id="casl",
+        verdict="not_applicable",
+        rationale="No Canadian recipients",
+        evidence={"review": "r1"},
+        assessed_by="advisor:legal",
+        expires_at=future,
+    )
+    evidence_id = compliance.record_control_evidence(
+        conn,
+        organization_id="org_1",
+        control_name="control.append_only",
+        verifier="control:test",
+        verdict="pass",
+        evidence={"check": "current"},
+        expires_at=future,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute(
+            "UPDATE compliance_applicability SET rationale='changed' WHERE id=?",
+            (assessment_id,),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute(
+            "DELETE FROM compliance_control_evidence WHERE id=?", (evidence_id,)
+        )
     conn.execute(
         "UPDATE compliance_regimes SET status='retired' WHERE id='casl'"
     )
