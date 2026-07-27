@@ -38,6 +38,18 @@ The build is validated by `tests/test_packaging_build_guard.py`. A successful
 artifact build does not imply that the package has been published to an index,
 that a container image exists, or that provider credentials are configured.
 
+Local evidence from current `main` (`3b1023e37167b2b19738b084eb4552abe303c9e1`)
+on 2026-07-27:
+
+```text
+uv build --wheel --sdist --out-dir /tmp/charterforge-dist-current
+uv venv /tmp/charterforge-artifact-venv-current --python 3.13
+uv pip install --python /tmp/charterforge-artifact-venv-current/bin/python \
+  /tmp/charterforge-dist-current/charterforge-0.19.0-py3-none-any.whl
+/tmp/charterforge-artifact-venv-current/bin/charterforge --version
+Charterforge v0.19.0 (2026.7.20)
+```
+
 `.github/workflows/charterforge-artifacts.yml` repeats the wheel/sdist build and
 isolated `charterforge --version` install smoke on pull requests, `main`, and
 version-tag pushes, then retains the artifacts in GitHub Actions. It is an

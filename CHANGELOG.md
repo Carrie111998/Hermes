@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added an independent GitHub Actions artifact workflow that builds and
+  isolated-installs the Charterforge wheel/sdist on pull requests, `main`, and
+  version-tag pushes without publishing to an index automatically.
 - Added `business readiness --check`, a non-mutating exit-status contract for
   supervisors and container healthchecks; blocked or unconfigured readiness
   returns status 1 while preserving the diagnostic JSON projection.
