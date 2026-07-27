@@ -331,6 +331,38 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 
 ---
 
+## Secret Scanning
+
+`.github/workflows/secret-scan.yml` runs gitleaks on every push and PR. It
+scans the **diff**, not history — pre-existing placeholder credentials in test
+fixtures therefore never fire on unrelated changes, which is what keeps the
+check worth reading.
+
+Tuning lives in `.gitleaks.toml`:
+
+- **Custom rules** for `sk-ant-api*` / `sk-ant-admin*` (Anthropic) and
+  `sk-or-v1-*` (OpenRouter). The stock gitleaks ruleset has **no** Anthropic
+  rule and routes OpenRouter through the entropy-based `generic-api-key`, which
+  misses a key that appears without a nearby keyword. Those are the two
+  credentials this repo is most likely to leak.
+- **Allowlists** for vendored upstream docs, published OAuth client IDs
+  (`*_OAUTH_CLIENT_ID`, gemini-cli's public desktop client secret), and
+  placeholders carrying an explicit marker word.
+
+**If the scan fires on your PR:**
+
+1. Real credential → rotate it first, then remove it from history.
+2. Placeholder → give it an obvious marker (`fake`, `dummy`, `example`,
+   `placeholder`, `sk-test-…`) so the existing allowlist covers it, or add a
+   narrow, commented entry to `.gitleaks.toml`.
+
+Do **not** add a blanket `tests/` or `**/*.md` exemption. Test fixtures are
+exactly where a real key gets pasted by accident. Same principle as
+`supply-chain-audit.yml`: a scanner that fires on every PR trains reviewers to
+ignore it, so keep the allowlist narrow and give every entry a reason.
+
+---
+
 ## Adding Configuration
 
 ### config.yaml options:

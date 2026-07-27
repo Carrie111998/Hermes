@@ -1,0 +1,79 @@
+# gitleaks configuration for hermes-agent.
+#
+# The CI workflow (.github/workflows/secret-scan.yml) scans *diffs*, not
+# history, so the allowlist below exists to stop recurring false positives on
+# new commits — not to paper over anything already committed.
+#
+# Design note, same principle as supply-chain-audit.yml: a scanner that fires
+# on every PR trains reviewers to ignore it. Every entry here is narrow and
+# carries a reason. Do not add a blanket `tests/` or `**/*.md` exemption —
+# test fixtures are exactly where a real key gets pasted by accident.
+
+title = "hermes-agent"
+
+[extend]
+useDefault = true
+
+# --- Rules the stock ruleset is missing -------------------------------------
+# gitleaks 8.24 ships no Anthropic rule, and routes OpenRouter/OpenAI keys
+# through `generic-api-key`, whose entropy+keyword heuristic misses a key that
+# appears without a nearby keyword. For a repo whose primary job is calling
+# these providers, those are the two credentials most likely to leak, so they
+# get explicit rules instead of relying on the generic fallback.
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-api\d{2}-[A-Za-z0-9_\-]{80,120}'''
+keywords = ["sk-ant-api"]
+
+[[rules]]
+id = "anthropic-admin-key"
+description = "Anthropic admin API key"
+regex = '''sk-ant-admin\d{2}-[A-Za-z0-9_\-]{80,120}'''
+keywords = ["sk-ant-admin"]
+
+[[rules]]
+id = "openrouter-api-key"
+description = "OpenRouter API key"
+regex = '''sk-or-v1-[a-f0-9]{64}'''
+keywords = ["sk-or-v1-"]
+
+[allowlist]
+description = "Vendored docs, published OAuth identifiers, and marked placeholders"
+
+# Matched against the whole matching line. For the identifier rules that is the
+# point: what makes those values safe is the constant's *name*, not the value.
+regexTarget = "line"
+
+paths = [
+  # Upstream documentation dumps vendored verbatim for the unsloth skill.
+  # ~534 generic-api-key hits, all inside third-party prose and code samples.
+  '''optional-skills/mlops/training/unsloth/references/llms-full\.md''',
+  '''optional-skills/mlops/training/unsloth/references/llms-txt\.md''',
+]
+
+regexes = [
+  # --- Published, non-confidential identifiers ---
+  # Device-code / installed-app OAuth client IDs. Published identifiers, not
+  # credentials; each is a named constant with an in-source comment saying so.
+  '''_?OAUTH_CLIENT_ID\s*=''',
+  # gemini-cli's public desktop client secret, shipped in Google's MIT repo
+  # (agent/google_oauth.py carries the upstream link).
+  '''_PUBLIC_CLIENT_SECRET_SUFFIX\s*=''',
+  # The redaction patterns in agent/redact.py — the module whose job is to
+  # recognise secrets necessarily contains their shapes.
+  '''^\s*#.*PRIVATE KEY''',
+  # Docs examples: Discord/Mattermost user and channel IDs look like tokens to
+  # the generic rules. These are allowlist config values, not auth material.
+  '''(DISCORD|MATTERMOST|MATRIX|TELEGRAM|SLACK)_(ALLOWED_USERS|HOME_CHANNEL)\s*=''',
+  # Docs examples: `Authorization: Bearer <placeholder>` in curl snippets.
+  '''Bearer (ADMIN_TOKEN|YOUR_|\$|change-me)''',
+
+  # --- Marked placeholders in tests and docs ---
+  # Deliberately requires an explicit marker word on the line. A high-entropy
+  # string with no marker still fires, including inside tests/.
+  '''(?i)(fake|dummy|placeholder|example|changeme|change-me|not-?a-?real|your[-_](api[-_])?key)''',
+  '''(?i)\b(sk|pk|key|token|secret)[-_](test|fake|dummy|example|dotenv|local|stub)[-_]''',
+  '''(?i)=\s*["']?<[a-z_]+>["']?\s*$''',
+]
