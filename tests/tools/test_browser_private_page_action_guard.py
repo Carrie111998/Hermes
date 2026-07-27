@@ -7,6 +7,33 @@ import pytest
 from tools import browser_tool
 
 
+def test_browser_interaction_authorization_is_operation_and_session_scoped(monkeypatch):
+    calls = []
+
+    def record(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", record
+    )
+
+    browser_tool._authorize_browser_action("browser.type", "worker-1")
+
+    assert calls == [
+        ("browser.type", "browser", "browser-session:worker-1")
+    ]
+
+
+def test_browser_click_checks_authority_before_backend(monkeypatch):
+    def reject(*_args, **_kwargs):
+        raise RuntimeError("authority denied")
+
+    monkeypatch.setattr(browser_tool, "_authorize_browser_action", reject)
+
+    with pytest.raises(RuntimeError, match="authority denied"):
+        browser_tool.browser_click("@e1", task_id="worker-1")
+
+
 PRIVATE_URL = "http://169.254.169.254/latest/meta-data/"
 
 

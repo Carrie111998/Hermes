@@ -2802,6 +2802,18 @@ def _redact_browser_output(value: Any) -> Any:
 # Browser Tool Functions
 # ============================================================================
 
+def _authorize_browser_action(capability: str, task_id: Optional[str]) -> str:
+    """Authorize one browser operation against one exact session resource."""
+    effective_task_id = _last_session_key(task_id or "default")
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    authorize_worker_action(
+        capability=capability,
+        system="browser",
+        target_resource=f"browser-session:{effective_task_id}",
+    )
+    return effective_task_id
+
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -3053,11 +3065,10 @@ def browser_snapshot(
     Returns:
         JSON string with page snapshot
     """
+    effective_task_id = _authorize_browser_action("browser.snapshot", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
-
-    effective_task_id = _last_session_key(task_id or "default")
 
     # Build command args based on full flag
     args = []
@@ -3148,11 +3159,11 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with click result
     """
+    effective_task_id = _authorize_browser_action("browser.click", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_action(effective_task_id, "click")
     if blocked is not None:
         return blocked
@@ -3189,11 +3200,11 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with type result
     """
+    effective_task_id = _authorize_browser_action("browser.type", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_action(effective_task_id, "type")
     if blocked is not None:
         return blocked
@@ -3258,6 +3269,7 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
     # ~500px is roughly half a viewport of travel.
     _SCROLL_PIXELS = 500
 
+    effective_task_id = _authorize_browser_action("browser.scroll", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_scroll
         # Camofox REST API doesn't support pixel args; use repeated calls
@@ -3266,8 +3278,6 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
         for _ in range(_SCROLL_REPEATS):
             result = camofox_scroll(direction, task_id)
         return result
-
-    effective_task_id = _last_session_key(task_id or "default")
 
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
     if not result.get("success"):
@@ -3294,11 +3304,11 @@ def browser_back(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result
     """
+    effective_task_id = _authorize_browser_action("browser.back", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     result = _run_browser_command(effective_task_id, "back", [])
 
     if result.get("success"):
@@ -3346,11 +3356,11 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with key press result
     """
+    effective_task_id = _authorize_browser_action("browser.press", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_action(effective_task_id, "press")
     if blocked is not None:
         return blocked
@@ -3402,19 +3412,22 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     Returns:
         JSON string with console messages/errors, or eval result
     """
+    effective_task_id = _authorize_browser_action(
+        "browser.evaluate" if expression is not None else "browser.console",
+        task_id,
+    )
+
     # --- JS evaluation mode ---
     if expression is not None:
         policy_error = _enforce_browser_eval_policy(expression)
         if policy_error:
             return json.dumps({"success": False, "error": policy_error}, ensure_ascii=False)
-        return _browser_eval(expression, task_id)
+        return _browser_eval(expression, effective_task_id)
 
     # --- Console output mode (original behaviour) ---
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_console
         return camofox_console(clear, task_id)
-
-    effective_task_id = _last_session_key(task_id or "default")
 
     if _eval_ssrf_guard_active(effective_task_id):
         _blocked_url = _current_page_private_url(effective_task_id)
@@ -3972,11 +3985,10 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with list of images (src and alt)
     """
+    effective_task_id = _authorize_browser_action("browser.get_images", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
-
-    effective_task_id = _last_session_key(task_id or "default")
 
     # Use eval to run JavaScript that extracts images
     js_code = """JSON.stringify(
@@ -4059,6 +4071,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         A JSON string with vision analysis results and screenshot_path, or a
         multimodal tool-result envelope carrying the screenshot and metadata.
     """
+    effective_task_id = _authorize_browser_action("browser.vision", task_id)
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
         return camofox_vision(question, annotate, task_id)
