@@ -26,7 +26,7 @@ description: "通过 curl 使用 Shopify Admin 与 Storefront GraphQL API"
 ## 参考：完整 SKILL.md
 
 :::info
-以下是 Hermes 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
+以下是 IYARI 在触发此 skill 时加载的完整 skill 定义。这是 skill 激活时 agent 所看到的指令内容。
 :::
 
 # Shopify — Admin 与 Storefront GraphQL API
@@ -142,7 +142,7 @@ mutation($input: ProductCreateInput!) {
     product { id handle }
     userErrors { field message }
   }
-}' '{"input":{"title":"Test Hoodie","status":"DRAFT","vendor":"Hermes","productType":"Apparel","tags":["test"]}}'
+}' '{"input":{"title":"Test Hoodie","status":"DRAFT","vendor":"IYARI","productType":"Apparel","tags":["test"]}}'
 ```
 
 新版本中变体有独立的 mutation：

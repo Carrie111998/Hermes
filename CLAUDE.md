@@ -311,6 +311,13 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   LLC)` ya commiteado) — transformación normal. 2 headings cambiaron, sin anchors
   internos. Residual post-transform: cero (ni siquiera `HERMES_HOME`). Build limpio:
   98/98 warnings idénticos a la baseline.
+- Lote 11 (este commit): `skills/optional/{productivity,research,security,
+  software-development,web-development}` = 23 (parte 3 y cierre de `optional/`).
+  **`skills/optional/` y `skills/` COMPLETOS.** 1 `Nous Research` en
+  `productivity-telephony.md` (fila de autor, verificado contra inglés
+  `Digital Services LLC` ya commiteado). 5 headings cambiaron, sin anchors internos.
+  Build limpio: 98/98 warnings idénticos a la baseline.
+- **`skills/bundled/` y `skills/optional/` (todo `skills/`) COMPLETOS en GRUPO 6.**
 
 ## Auto-aprobación delegada (GRUPO 6)
 
