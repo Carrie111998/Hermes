@@ -50,6 +50,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
 
+
+def _code_execution_resource(code: str, task_id: Optional[str], enabled_tools, environment: str) -> str:
+    """Return the immutable identity of one code-execution request."""
+    scope = {
+        "code": code or "",
+        "task_id": task_id,
+        "enabled_tools": sorted(str(tool) for tool in (enabled_tools or SANDBOX_ALLOWED_TOOLS)),
+        "environment": environment,
+    }
+    return "code-action:" + hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
 # ``_use_tcp_rpc`` in ``_execute_local`` below.  That makes execute_code
@@ -1207,19 +1220,24 @@ def execute_code(
     Returns:
         JSON string with execution results.
     """
-    # Governed workers must authorize the exact script before any sandbox
-    # availability check or child process is started. The digest is part of
-    # the resource contract, so changing even one byte requires a new permit;
-    # code execution is never inferred from terminal or file capabilities.
+    # Resolve the backend before authorization so a grant cannot be replayed
+    # against a different execution environment.
+    from tools.terminal_tool import _get_env_config
+    _env_config = _get_env_config()
+    env_type = _env_config["env_type"]
+
+    # Governed workers must authorize the exact script and execution context
+    # before any sandbox availability check or child process is started. The
+    # contract includes task identity and the effective tool allow-list, so a
+    # script grant cannot be replayed with broader RPC capabilities.
     try:
         from hermes_cli.workforce_delegation import authorize_worker_action
 
         authorize_worker_action(
             capability="code.execute",
-            system="localhost",
-            target_resource=(
-                "code:"
-                + hashlib.sha256((code or "").encode("utf-8")).hexdigest()
+            system="localhost" if env_type == "local" else env_type,
+            target_resource=_code_execution_resource(
+                code, task_id, enabled_tools, env_type
             ),
         )
     except Exception as exc:
@@ -1243,9 +1261,7 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
-    env_type = _env_config["env_type"]
+    from tools.terminal_tool import _docker_has_host_access
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script

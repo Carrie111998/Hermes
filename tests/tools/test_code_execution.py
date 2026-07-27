@@ -1184,3 +1184,21 @@ class TestRpcTokenAuthorization(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_code_execution_resource_binds_context():
+    from tools.code_execution_tool import _code_execution_resource
+
+    base = _code_execution_resource(
+        "print('ok')", "worker-1", ["read_file", "terminal"], "local"
+    )
+    assert base.startswith("code-action:")
+    assert base != _code_execution_resource(
+        "print('ok')", "worker-1", ["read_file", "write_file"], "local"
+    )
+    assert base != _code_execution_resource(
+        "print('ok')", "worker-2", ["read_file", "terminal"], "local"
+    )
+    assert base != _code_execution_resource(
+        "print('ok')", "worker-1", ["read_file", "terminal"], "docker"
+    )
