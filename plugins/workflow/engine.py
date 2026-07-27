@@ -2878,7 +2878,9 @@ class WorkflowEngine:
                     # While loop exited without break — reviewers done
                     pass
                 # Stay in this layer — don't advance
-                continue
+                # Fall through to post-monitor review check below
+                # instead of continuing, so the check can detect
+                # active reviews and go back to layer 0.
 
             # ── Post-monitor review check ──
             # After _monitor_layer returns, check if any node in the
