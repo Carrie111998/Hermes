@@ -164,7 +164,7 @@ Hermesには2つのエントリポイントがあります: `hermes`でターミ
 
 ## ドキュメント
 
-すべてのドキュメントは**[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**にあります:
+すべてのドキュメントは **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)** にあります:
 
 | セクション | 内容 |
 |---------|---------------|
