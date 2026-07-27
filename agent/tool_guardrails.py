@@ -13,8 +13,12 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from utils import safe_json_loads
+from agent.delegation_validation import (
+    build_delegate_task_list,
+    recover_tasks_from_json_string,
+)
 from agent.tool_result_classification import file_mutation_result_landed
+from utils import safe_json_loads
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -287,6 +291,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._subagent_reservations: dict[ToolCallSignature, list[int]] = {}
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -299,8 +304,8 @@ class ToolCallGuardrailController:
         # These are hard ceilings on how many times a runaway-prone tool may
         # be called within a single agent loop (turn). They apply regardless
         # of hard_stop_enabled (which only governs the per-turn loop detector).
-        # We block BEFORE the call runs once the count is already at the cap,
-        # then increment for an allowed call so the (cap+1)-th is refused.
+        # We reserve each allowed call before execution and block when its
+        # projected total would cross the configured ceiling.
         cap_block = self._check_loop_cap(tool_name, _coerce_args(args), signature)
         if cap_block is not None:
             return cap_block
@@ -357,6 +362,8 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
+        if tool_name == "delegate_task":
+            self._settle_subagent_reservation(signature, result)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 
@@ -485,13 +492,15 @@ class ToolCallGuardrailController:
             if not cap:
                 return None
             spawn_count = _subagent_spawn_count(args)
-            if self._turn_subagent_count >= cap:
+            projected_count = self._turn_subagent_count + spawn_count
+            if projected_count > cap:
                 decision = ToolGuardrailDecision(
                     action="block",
                     code="loop_subagent_cap",
                     message=(
-                        f"Blocked delegate_task: this turn has already spawned "
-                        f"{self._turn_subagent_count} subagents (limit {cap}). "
+                        f"Blocked delegate_task: this turn has already spawned or "
+                        f"reserved {self._turn_subagent_count} subagents, and this "
+                        f"call would add {spawn_count} (limit {cap}). "
                         "This looks like a runaway delegation loop. Finish the "
                         "work with the results you have and answer the user."
                     ),
@@ -502,9 +511,38 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
             self._turn_subagent_count += spawn_count
+            if spawn_count:
+                self._subagent_reservations.setdefault(signature, []).append(spawn_count)
             return None
 
         return None
+
+    def _settle_subagent_reservation(
+        self,
+        signature: ToolCallSignature,
+        result: str | None,
+    ) -> None:
+        """Replace a delegate call's reservation with its actual spawn count.
+
+        ``before_call`` must reserve the whole request so multiple calls cannot
+        race past the cap. The delegate result then tells us whether children
+        were actually created: synchronous results contain one entry per child,
+        while accepted background batches return a structured ``count``. Normal
+        preflight rejections return ``{"error": ...}`` and therefore release the
+        reservation. Unknown result shapes keep the reservation conservatively.
+        """
+        reservations = self._subagent_reservations.get(signature)
+        if not reservations:
+            return
+        reserved = reservations.pop(0)
+        if not reservations:
+            self._subagent_reservations.pop(signature, None)
+
+        actual = _subagent_result_spawn_count(result, fallback=reserved)
+        self._turn_subagent_count = max(
+            0,
+            self._turn_subagent_count - reserved + actual,
+        )
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
@@ -611,17 +649,48 @@ def _non_negative_int(value: Any, default: int) -> int:
 
 
 def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
-    """How many subagents a single delegate_task call spawns.
+    """How many subagents a structurally valid delegate_task call requests.
 
     delegate_task runs in one of two modes: a batch (``tasks`` is a non-empty
-    list, one child per item) or a single task (``goal``). Count the batch size
-    when present, otherwise 1, so the session subagent cap reflects real spawns
-    rather than delegate_task invocations.
+    list, one child per item) or a single task (``goal``). Models may encode the
+    tasks array as a JSON string, which the delegate tool recovers before
+    spawning. Mirror that normalization here and return zero for malformed task
+    requests that the tool will reject before constructing a child.
     """
     tasks = args.get("tasks") if isinstance(args, Mapping) else None
-    if isinstance(tasks, list) and tasks:
-        return len(tasks)
-    return 1
+    recovered_tasks, tasks_error = recover_tasks_from_json_string(tasks)
+    if tasks_error:
+        return 0
+    if recovered_tasks is not None:
+        tasks = recovered_tasks
+
+    task_list, task_error = build_delegate_task_list(
+        goal=args.get("goal"),
+        context=args.get("context"),
+        role=args.get("role"),
+        tasks=tasks,
+    )
+    return len(task_list) if task_error is None and task_list is not None else 0
+
+
+def _subagent_result_spawn_count(result: str | None, *, fallback: int) -> int:
+    """Extract actual child construction count from a delegate_task result."""
+    parsed = safe_json_loads(result or "")
+    if not isinstance(parsed, Mapping):
+        return fallback
+
+    results = parsed.get("results")
+    if isinstance(results, list):
+        return len(results)
+
+    if parsed.get("status") == "dispatched":
+        count = parsed.get("count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            return count
+
+    if parsed.get("error"):
+        return 0
+    return fallback
 
 
 def _sha256(value: str) -> str:

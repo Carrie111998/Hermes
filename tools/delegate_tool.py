@@ -32,6 +32,10 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from agent.delegation_validation import (
+    build_delegate_task_list,
+    recover_tasks_from_json_string as _recover_tasks_from_json_string,
+)
 from toolsets import TOOLSETS
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -2720,29 +2724,6 @@ def _run_child_lifecycle(
     return result
 
 
-def _recover_tasks_from_json_string(
-    tasks: Any,
-) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-    if not isinstance(tasks, str):
-        return None, None
-    raw = tasks.strip()
-    if not raw:
-        return None, "Provide either 'goal' (single task) or 'tasks' (batch)."
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, (
-            "tasks must be a JSON array of task objects; received a string "
-            f"that could not be parsed as JSON ({exc.msg})."
-        )
-    if not isinstance(parsed, list):
-        return None, (
-            f"tasks must be a JSON array of task objects; parsed "
-            f"{type(parsed).__name__} instead."
-        )
-    return parsed, None
-
-
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2841,32 +2822,23 @@ def delegate_task(
     if recovered_tasks is not None:
         tasks = recovered_tasks
 
-    if tasks and isinstance(tasks, list):
-        if len(tasks) > max_children:
-            return tool_error(
-                f"Too many tasks: {len(tasks)} provided, but "
-                f"max_concurrent_children is {max_children}. "
-                f"Either reduce the task count, split into multiple "
-                f"delegate_task calls, or increase "
-                f"delegation.max_concurrent_children in config.yaml."
-            )
-        task_list = tasks
-    elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
-    else:
-        return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
+    if tasks and isinstance(tasks, list) and len(tasks) > max_children:
+        return tool_error(
+            f"Too many tasks: {len(tasks)} provided, but "
+            f"max_concurrent_children is {max_children}. "
+            f"Either reduce the task count, split into multiple "
+            f"delegate_task calls, or increase "
+            f"delegation.max_concurrent_children in config.yaml."
+        )
 
-    if not task_list:
-        return tool_error("No tasks provided.")
-
-    # Validate each task has a goal
-    for i, task in enumerate(task_list):
-        if not isinstance(task, dict):
-            return tool_error(
-                f"Task {i} must be an object, got {type(task).__name__}."
-            )
-        if not task.get("goal", "").strip():
-            return tool_error(f"Task {i} is missing a 'goal'.")
+    task_list, task_error = build_delegate_task_list(
+        goal=goal,
+        context=context,
+        role=top_role,
+        tasks=tasks,
+    )
+    if task_error:
+        return tool_error(task_error)
 
     overall_start = time.monotonic()
     results = []
