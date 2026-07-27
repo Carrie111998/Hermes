@@ -311,17 +311,20 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             // moves, follow it — refresh the project tree + scope so the sidebar
             // tracks the live thread. A fresh selection (different session id)
             // is a switch, not a move, so it refreshes data without yanking scope.
-            const cwdMoved = payload.cwd !== $currentCwd.get()
+            //
+            // Capture before setCurrentCwd mutates the atom; on restart
+            // $currentCwd is empty, so the first session.info payload looks like
+            // a "move" from '' to the real path. Guard with previousCwd (the
+            // pre-mutation value) so we only follow genuine moves — not the
+            // initial cwd learn after reconnect (hermes-agent#72491).
+            const previousCwd = $currentCwd.get()
+            const cwdMoved = payload.cwd !== previousCwd
             const sameSession = !!sessionId && sessionId === lastCwdInfoSessionRef.current
 
             lastCwdInfoSessionRef.current = sessionId
             setCurrentCwd(payload.cwd)
 
-            // Only follow genuine cwd moves, not the initial learn on reconnect.
-            // On restart $currentCwd is empty, so the first session.info payload
-            // looks like a "move" from '' to the real path — skip that, or the
-            // sidebar flips into Projects view (hermes-agent#72491).
-            if (cwdMoved && sameSession && $currentCwd.get()) {
+            if (cwdMoved && sameSession && previousCwd) {
               void followActiveSessionCwd(payload.cwd)
             }
           }
