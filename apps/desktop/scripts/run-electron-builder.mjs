@@ -5,6 +5,7 @@
 // electron-builder fetch via @electron/get (electronVersion + ELECTRON_MIRROR).
 
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
@@ -48,9 +49,34 @@ if (dist && fs.existsSync(distBinary(dist))) {
 }
 args.push(...process.argv.slice(2))
 
+const builderEnv = { ...process.env }
+let builderTemp = null
+
+if (process.platform === "win32") {
+  // NSIS creates short-lived `nst*.tmp` include files while compiling the
+  // installer. A machine-wide TEMP (for example C:\Windows\Temp) is vulnerable
+  // to concurrent cleanup and security tooling deleting those files between
+  // creation and !include. Give each build an isolated user-scoped directory.
+  const userTempBase = process.env.LOCALAPPDATA
+    ? path.join(process.env.LOCALAPPDATA, "Temp")
+    : os.tmpdir()
+  fs.mkdirSync(userTempBase, { recursive: true })
+  builderTemp = fs.mkdtempSync(path.join(userTempBase, "hermes-electron-builder-"))
+  builderEnv.TEMP = builderTemp
+  builderEnv.TMP = builderTemp
+  builderEnv.TMPDIR = builderTemp
+  console.log(`[run-electron-builder] isolated Windows temp: ${builderTemp}`)
+}
+
 const result = spawnSync(process.execPath, [electronBuilderCli(), ...args], {
+  env: builderEnv,
   stdio: "inherit",
 })
+
+if (builderTemp) {
+  fs.rmSync(builderTemp, { recursive: true, force: true })
+}
+
 if (result.error) {
   console.error(`[run-electron-builder] spawn failed: ${result.error.message}`)
   process.exit(1)

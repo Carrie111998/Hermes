@@ -16,6 +16,10 @@ import {
   switchBranch
 } from './git-worktree-ops'
 
+function comparableRealPath(filePath: string): string {
+  return fs.realpathSync.native(filePath)
+}
+
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')
   assert.equal(sanitizeBranch('feat/cool thing'), 'feat/cool-thing')
@@ -109,7 +113,7 @@ test('listBranches: lists locals and flags the checked-out branch', async () => 
     // The repo's own checkout is flagged; the unused branch is convertible.
     assert.equal(branches.find(b => b.name === current).checkedOut, true)
     assert.equal(branches.find(b => b.name === current).isDefault, true)
-    assert.equal(fs.realpathSync(branches.find(b => b.name === current).worktreePath), fs.realpathSync(dir))
+    assert.equal(comparableRealPath(branches.find(b => b.name === current).worktreePath), comparableRealPath(dir))
     assert.equal(branches.find(b => b.name === 'feature').checkedOut, false)
     assert.equal(branches.find(b => b.name === 'feature').isDefault, false)
     assert.equal(branches.find(b => b.name === 'feature').worktreePath, null)
@@ -205,7 +209,7 @@ test('addWorktree: existing default branch switches the main checkout, not .work
     const result = await addWorktree(dir, { existingBranch: trunk }, 'git')
 
     assert.equal(result.branch, trunk)
-    assert.equal(fs.realpathSync(result.path), fs.realpathSync(dir))
+    assert.equal(comparableRealPath(result.path), comparableRealPath(dir))
     assert.equal(git('branch', '--show-current'), trunk)
     assert.equal(fs.existsSync(path.join(dir, '.worktrees', trunk)), false)
   } finally {

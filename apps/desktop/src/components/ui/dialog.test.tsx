@@ -105,15 +105,7 @@ describe('DialogContent close button', () => {
     expect(event.defaultPrevented).toBe(true)
   })
 
-  // Skipped: pre-existing test, unrelated to the onOpenAutoFocus scoping this
-  // file is actually about (that's fully covered by the three tests above).
-  // The tooltip's open transition is driven by a real, un-act()-wrapped timer
-  // inside Radix/Tip, and on the Linux CI runner it consistently never fires
-  // within any timeout tried (1000ms/3000ms), while passing reliably in a full
-  // local run on Windows — an environment-specific flake, not a regression
-  // from this change. Needs its own investigation (e.g. Radix/jsdom version
-  // pinning, timer/act handling) rather than a timeout bump.
-  it.skip('shows the tooltip on focus (Radix opens on focus as well as hover; jsdom cannot reliably simulate real pointer hover)', async () => {
+  it('shows the tooltip on focus (Radix opens on focus as well as hover; jsdom cannot reliably simulate real pointer hover)', async () => {
     render(
       <Dialog open>
         {/* No input here, so without this opt-out Radix's real autofocus would
@@ -126,7 +118,12 @@ describe('DialogContent close button', () => {
     )
 
     const closeButton = screen.getByRole('button', { name: /close/i })
-    closeButton.focus()
+    const nativeMatches = closeButton.matches.bind(closeButton)
+
+    vi.spyOn(closeButton, 'matches').mockImplementation(selector =>
+      selector === ':focus-visible' ? true : nativeMatches(selector)
+    )
+    fireEvent.focus(closeButton)
 
     await waitFor(
       () => {

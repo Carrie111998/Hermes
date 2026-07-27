@@ -5,8 +5,8 @@ import { test } from 'vitest'
 import { pickLocalPort, SshConnection } from './ssh-connection'
 import { connectWindowsRemote } from './windows-remote-lifecycle'
 
-// Live test against a real Windows host over SSH. Opt-in: set the env trio to
-// your test rig; skipped everywhere else (CI, other machines).
+// Live test against a real Windows host over SSH. Run explicitly with
+// `npm run test:desktop:live:windows-remote` after configuring the test rig:
 //   HERMES_WIN_SSH_HOST   ssh alias/host of the Windows box
 //   HERMES_WIN_SSH_USER   remote user
 //   HERMES_WIN_SSH_HERMES absolute path to the remote hermes.exe under test
@@ -25,9 +25,13 @@ function fetchJson(url, token, path) {
   })
 }
 
-test.skipIf(!liveHost || !liveUser || !configuredHermes)(
+test(
   'live Windows remote lifecycle spawns, authenticates, reuses, and cleans exact ownership',
   async () => {
+    assert.ok(liveHost, 'HERMES_WIN_SSH_HOST is required for the live Windows remote test')
+    assert.ok(liveUser, 'HERMES_WIN_SSH_USER is required for the live Windows remote test')
+    assert.ok(configuredHermes, 'HERMES_WIN_SSH_HERMES is required for the live Windows remote test')
+
     const ssh = new SshConnection({ host: liveHost, user: liveUser, port: 22, keyPath: '' }, { mux: true })
     await ssh.open()
 
@@ -70,6 +74,7 @@ test.skipIf(!liveHost || !liveUser || !configuredHermes)(
       assert.equal(first.platform.os, 'Windows')
       assert.equal(first.reused, false)
       const status: any = await fetchJson(first.baseUrl, first.token, '/api/status')
+
       assert.ok(status)
       await ssh.cancelForward(first.localPort, first.remotePort)
       second = await connectWindowsRemote({ ...common, reuseToken: first.token })
@@ -90,6 +95,7 @@ test.skipIf(!liveHost || !liveUser || !configuredHermes)(
       if (lock) {
         const python = configuredHermes.replace('hermes.exe', 'python.exe')
         const terminate = `& '${python}' -m hermes_cli.windows_ssh_runtime terminate '${lock.pid}' '${lock.creationTimeNs}' '${lock.hermesPath}' '${lock.spawnNonce}'`
+
         await ssh.exec(`powershell.exe -NoProfile -NonInteractive -Command "${terminate}"`)
         await ssh.exec(
           `powershell.exe -NoProfile -NonInteractive -Command "& '${python}' -m hermes_cli.windows_ssh_runtime remove-lock '${ownershipId}'"`
