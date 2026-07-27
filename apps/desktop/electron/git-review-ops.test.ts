@@ -6,7 +6,7 @@ import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { gitFor, repoStatus, resolveRenamePath } from './git-review-ops'
+import { gitFor, repoStatus, resolveRenamePath, reviewRevert } from './git-review-ops'
 
 const tempDirs: string[] = []
 
@@ -28,6 +28,29 @@ function makeRepo() {
   execFileSync('git', ['commit', '-qm', 'initial'], { cwd: dir })
 
   return dir
+}
+
+// A repo with the two shapes the review pane always has to handle at once: a
+// tracked edit and a brand-new file.
+function makeDirtyRepo() {
+  const dir = makeRepo()
+
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'tracked\nedited\n')
+  fs.writeFileSync(path.join(dir, 'new.txt'), 'brand new\n')
+
+  return dir
+}
+
+function makeTempDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-desktop-git-plain-'))
+
+  tempDirs.push(dir)
+
+  return dir
+}
+
+async function changedPaths(dir: string) {
+  return (await repoStatus(dir, 'git'))?.files.map(file => file.path)
 }
 
 test('resolveRenamePath: plain path is unchanged', () => {
@@ -86,4 +109,84 @@ test('repoStatus reports an untracked directory without recursively listing its 
     status.files.map(file => file.path),
     ['generated/']
   )
+})
+
+test('reviewRevert removes a staged new file', async () => {
+  // Staging is one click away from reverting in the review pane, and a staged
+  // new file is what `checkout HEAD` (not in HEAD) and `clean` (tracked in the
+  // index) both refuse to touch.
+  const dir = makeDirtyRepo()
+
+  execFileSync('git', ['add', 'new.txt'], { cwd: dir })
+
+  assert.deepEqual(await reviewRevert(dir, 'new.txt', 'git'), { ok: true })
+  assert.equal(fs.existsSync(path.join(dir, 'new.txt')), false)
+  // Scoped: the unrelated tracked edit is left alone.
+  assert.deepEqual(await changedPaths(dir), ['tracked.txt'])
+})
+
+test('reviewRevert removes a plain untracked file', async () => {
+  // `checkout HEAD` legitimately fails here (the path is not in HEAD); `clean`
+  // is the whole job, so that failure must not abort the revert.
+  const dir = makeDirtyRepo()
+
+  assert.deepEqual(await reviewRevert(dir, 'new.txt', 'git'), { ok: true })
+  assert.equal(fs.existsSync(path.join(dir, 'new.txt')), false)
+  assert.deepEqual(await changedPaths(dir), ['tracked.txt'])
+})
+
+test('reviewRevert restores a staged modification', async () => {
+  const dir = makeDirtyRepo()
+
+  execFileSync('git', ['add', 'tracked.txt'], { cwd: dir })
+
+  assert.deepEqual(await reviewRevert(dir, 'tracked.txt', 'git'), { ok: true })
+  assert.equal(fs.readFileSync(path.join(dir, 'tracked.txt'), 'utf8'), 'tracked\n')
+  assert.deepEqual(await changedPaths(dir), ['new.txt'])
+})
+
+test('reviewRevert restores a staged deletion', async () => {
+  const dir = makeDirtyRepo()
+
+  execFileSync('git', ['rm', '-q', '-f', 'tracked.txt'], { cwd: dir })
+
+  assert.deepEqual(await reviewRevert(dir, 'tracked.txt', 'git'), { ok: true })
+  assert.equal(fs.readFileSync(path.join(dir, 'tracked.txt'), 'utf8'), 'tracked\n')
+  assert.deepEqual(await changedPaths(dir), ['new.txt'])
+})
+
+test('reviewRevert with no path clears staged, unstaged and untracked changes', async () => {
+  const dir = makeDirtyRepo()
+
+  fs.writeFileSync(path.join(dir, 'staged-new.txt'), 'staged\n')
+  execFileSync('git', ['add', 'staged-new.txt'], { cwd: dir })
+
+  assert.deepEqual(await reviewRevert(dir, null, 'git'), { ok: true })
+  assert.equal(fs.readFileSync(path.join(dir, 'tracked.txt'), 'utf8'), 'tracked\n')
+  assert.equal(fs.existsSync(path.join(dir, 'new.txt')), false)
+  assert.equal(fs.existsSync(path.join(dir, 'staged-new.txt')), false)
+  assert.deepEqual(await changedPaths(dir), [])
+})
+
+test('reviewRevert removes new files before the first commit', async () => {
+  // An unborn HEAD has nothing to restore, but the new files still have to go.
+  const dir = makeTempDir()
+
+  execFileSync('git', ['init', '-q'], { cwd: dir })
+  fs.writeFileSync(path.join(dir, 'staged.txt'), 'staged\n')
+  fs.writeFileSync(path.join(dir, 'loose.txt'), 'loose\n')
+  execFileSync('git', ['add', 'staged.txt'], { cwd: dir })
+
+  assert.deepEqual(await reviewRevert(dir, null, 'git'), { ok: true })
+  assert.equal(fs.existsSync(path.join(dir, 'staged.txt')), false)
+  assert.equal(fs.existsSync(path.join(dir, 'loose.txt')), false)
+})
+
+test('reviewRevert rejects on a git failure instead of reporting success', async () => {
+  const dir = makeTempDir()
+
+  fs.writeFileSync(path.join(dir, 'note.txt'), 'keep me\n')
+
+  await assert.rejects(() => reviewRevert(dir, 'note.txt', 'git'))
+  assert.equal(fs.readFileSync(path.join(dir, 'note.txt'), 'utf8'), 'keep me\n')
 })

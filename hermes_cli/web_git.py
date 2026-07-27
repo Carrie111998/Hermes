@@ -358,11 +358,26 @@ def review_unstage(cwd: str, file_path: str | None) -> dict:
     return {"ok": True}
 
 
+def _head_has(cwd: str, target: list[str]) -> bool:
+    """Does HEAD carry anything matching this pathspec? False on an unborn HEAD,
+    where ``ls-tree`` has no commit to read and there is nothing to restore."""
+    code, out, _ = _git(cwd, ["ls-tree", "--name-only", "HEAD", *target])
+    return code == 0 and bool(out.strip())
+
+
 def review_revert(cwd: str, file_path: str | None) -> dict:
     """Discard changes back to the committed state (restore tracked, remove untracked)."""
     target = ["--", file_path] if file_path else ["--", "."]
-    _git(cwd, ["checkout", "HEAD", *target])
-    _git(cwd, ["clean", "-fd", *target])
+    # Unstage first: a *staged* new file is invisible to both commands below —
+    # `checkout HEAD` can't restore what HEAD never had, and `clean` skips it as
+    # tracked — so without this it survived the revert untouched.
+    _git_ok(cwd, ["reset", "-q", "HEAD", *target])
+    # Restore only what HEAD actually carries; for anything else `clean` is the
+    # whole job. Both commands can now fail loudly, since neither is expected to
+    # fail on a path the review pane listed.
+    if _head_has(cwd, target):
+        _git_ok(cwd, ["checkout", "HEAD", *target])
+    _git_ok(cwd, ["clean", "-fd", *target])
     return {"ok": True}
 
 
