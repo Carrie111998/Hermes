@@ -3,7 +3,18 @@ import os
 import signal
 import time
 
+import pytest
+
 from hermes_cli import objective_worker, objectives_db, operational_control
+
+
+@pytest.fixture(autouse=True)
+def standalone_worker_charter(monkeypatch):
+    """Run direct worker tests under the host they actually exercise."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agentic": {"runtime_host": "standalone"}},
+    )
 
 
 def test_supervisor_fail_closed_status_contract_includes_recovery():
@@ -146,6 +157,25 @@ def test_worker_checks_autonomy_before_injected_callback(tmp_path):
     assert calls == []
     assert worker["status"] == "stopped"
     assert worker["stop_reason"] == "autonomy_paused"
+
+
+def test_injected_callback_cannot_bypass_selected_runtime_host(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agentic": {"runtime_host": "gateway"}},
+    )
+
+    with pytest.raises(
+        RuntimeError, match="does not admit worker role"
+    ):
+        objective_worker.run_forever(
+            db_path=tmp_path / "authority.db",
+            interval_seconds=0.01,
+            tick=lambda: SimpleNamespace(status="idle"),
+            max_cycles=1,
+        )
 
 
 def test_worker_exits_when_autonomy_is_revoked_during_failure(tmp_path):

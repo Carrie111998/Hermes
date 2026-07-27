@@ -381,8 +381,10 @@ def run_forever(
     agentic = config.get("agentic") or {}
     from hermes_cli import runtime_deployment
 
-    if tick is None:
-        runtime_deployment.validate_worker_role(agentic, "objective-runtime")
+    # Callback injection is an embedding/testing seam, not an authority
+    # bypass. The configured deployment role is validated before either the
+    # default tick or an injected callback can run.
+    runtime_deployment.validate_worker_role(agentic, "objective-runtime")
     security = agentic.get("security") or {}
     retry = agentic.get("retry_policy") or {}
     failure_threshold = max(
@@ -442,6 +444,7 @@ def run_forever(
                         # same check, but alternate/injected callbacks must not
                         # be able to begin work after an operator pause.
                         operational_control.assert_autonomous(conn)
+                        runtime_deployment.assert_current_runtime(conn, agentic)
                         outcome = tick()
                         heartbeat_keeper.assert_healthy()
                         status = str(getattr(outcome, "status", "unknown"))
