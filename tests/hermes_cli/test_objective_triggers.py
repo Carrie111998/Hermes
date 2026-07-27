@@ -11,6 +11,15 @@ from hermes_cli import (
 )
 
 
+def test_trigger_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    objective_triggers.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    objective_triggers.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 @pytest.fixture
 def company(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")

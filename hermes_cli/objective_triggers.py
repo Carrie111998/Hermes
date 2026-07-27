@@ -59,6 +59,17 @@ class TriggerError(ValueError):
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(objective_schedules)")
+        }
+        index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_objective_schedules_idempotency'"
+        ).fetchone()
+        if "idempotency_key" in columns and index is not None:
+            return
     conn.executescript(SCHEMA_SQL)
     columns = {
         str(row["name"])
