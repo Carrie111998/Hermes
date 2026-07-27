@@ -93,6 +93,12 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+# Credential-owning gateway profile for the live inbound adapter. This may
+# differ from _SESSION_PROFILE when profile_routes sends one shared bot into a
+# secondary runtime namespace.
+_SESSION_TRANSPORT_PROFILE: ContextVar = ContextVar(
+    "HERMES_SESSION_TRANSPORT_PROFILE", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -134,6 +140,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_SESSION_TRANSPORT_PROFILE": _SESSION_TRANSPORT_PROFILE,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -168,6 +175,7 @@ def set_session_vars(
     session_id: str = "",
     message_id: str = "",
     profile: str = "",
+    transport_profile: str = "",
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
@@ -206,6 +214,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _SESSION_TRANSPORT_PROFILE.set(transport_profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -242,6 +251,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_TRANSPORT_PROFILE,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

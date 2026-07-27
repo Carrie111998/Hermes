@@ -146,7 +146,11 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert adapter.sent[0]["metadata"] == {
+    metadata = dict(adapter.sent[0]["metadata"])
+    delivery_key = metadata.pop("delivery_key")
+    assert metadata.pop("idempotency_key") == delivery_key
+    assert len(delivery_key) == 32
+    assert metadata == {
         "chat_type": "dm",
         "direct_messages_topic_id": "20197",
         "telegram_dm_topic_reply_fallback": True,
@@ -576,7 +580,9 @@ def test_auto_subscribe_persists_session_chat_type(tmp_path, monkeypatch):
         clear_session_vars(tokens)
 
 
-def test_notify_sub_migration_adds_chat_type_to_legacy_table(tmp_path, monkeypatch):
+def test_notify_sub_migration_adds_routing_columns_to_legacy_table(
+    tmp_path, monkeypatch,
+):
     db_path = tmp_path / "legacy-notify-sub.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
 
@@ -597,6 +603,11 @@ def test_notify_sub_migration_adds_chat_type_to_legacy_table(tmp_path, monkeypat
             )
             """
         )
+        legacy.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, notifier_profile, created_at) "
+            "VALUES ('legacy-task', 'telegram', 'legacy-chat', '', 'writer', 1)"
+        )
         legacy.commit()
     finally:
         legacy.close()
@@ -608,6 +619,9 @@ def test_notify_sub_migration_adds_chat_type_to_legacy_table(tmp_path, monkeypat
             row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
         }
         assert "chat_type" in cols
+        assert "source_profile" in cols
+        [legacy_sub] = kb.list_notify_subs(conn, task_id="legacy-task")
+        assert legacy_sub["source_profile"] == "writer"
 
         tid = kb.create_task(conn, title="legacy sub", assignee="worker")
         kb.add_notify_sub(
@@ -616,9 +630,11 @@ def test_notify_sub_migration_adds_chat_type_to_legacy_table(tmp_path, monkeypat
             platform="telegram",
             chat_id="chat-dm",
             chat_type="dm",
+            notifier_profile="default",
         )
         [sub] = kb.list_notify_subs(conn, task_id=tid)
         assert sub["chat_type"] == "dm"
+        assert sub["source_profile"] == "default"
     finally:
         conn.close()
 
@@ -668,14 +684,16 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     finally:
         conn.close()
 
-    original_claim = kb.claim_unseen_events_for_sub
+    original_claim = kb.claim_notify_delivery_event_guarded
 
     def selective_claim(conn, task_id, **kwargs):
         if task_id == tid_bad:
             raise RuntimeError("simulated DB corruption for bad task")
         return original_claim(conn, task_id=task_id, **kwargs)
 
-    monkeypatch.setattr(kb, "claim_unseen_events_for_sub", selective_claim)
+    monkeypatch.setattr(
+        kb, "claim_notify_delivery_event_guarded", selective_claim,
+    )
 
     # Force the failing subscription to be iterated FIRST regardless of the
     # unordered SELECT's scan order.
@@ -695,6 +713,94 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     # The good task must still be delivered despite the bad task failing.
     assert len(adapter.sent) == 1
     assert tid_good in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_normalizes_malformed_timeout_without_blocking_later_subs(
+    tmp_path, monkeypatch,
+):
+    """Malformed timeout values degrade safely and do not abort later subs."""
+    db_path = tmp_path / "post-claim-isolation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid_bad = kb.create_task(conn, title="bad payload", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid_bad, platform="telegram", chat_id="chat-bad",
+        )
+        kb._append_event(
+            conn,
+            tid_bad,
+            kind="timed_out",
+            payload={"limit_seconds": "not-an-integer"},
+        )
+
+        tid_good = kb.create_task(conn, title="good payload", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid_good, platform="telegram", chat_id="chat-good",
+        )
+        kb.complete_task(conn, tid_good, summary="done")
+    finally:
+        conn.close()
+
+    original_list = kb.list_notify_subs
+
+    def bad_first(conn, task_id=None):
+        subs = original_list(conn, task_id)
+        return sorted(subs, key=lambda sub: 0 if sub["task_id"] == tid_bad else 1)
+
+    monkeypatch.setattr(kb, "list_notify_subs", bad_first)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert {item["chat_id"] for item in adapter.sent} == {
+        "chat-bad", "chat-good",
+    }
+    bad = next(item for item in adapter.sent if item["chat_id"] == "chat-bad")
+    assert "max_runtime=0s" in bad["text"]
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid_bad,
+            platform="telegram",
+            chat_id="chat-bad",
+            kinds=["timed_out"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_terminal_event_does_not_unsubscribe_requeued_task(tmp_path, monkeypatch):
+    """A stale completion notification cannot drop a now-active subscription."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "requeued-terminal.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="requeued", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1",
+        )
+        kb.complete_task(conn, task_id, summary="first run")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                (task_id,),
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, task_id=task_id)) == 1
+    finally:
+        conn.close()
 
 
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    profile: Optional[str] = None,
+    delivery_key: Optional[str] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -91,11 +94,24 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    wake_kwargs: dict[str, Any] = {
+        "text": text,
+        "session_id": session_id,
+    }
+    if profile:
+        wake_kwargs["profile"] = profile
+    if delivery_key:
+        wake_kwargs["delivery_key"] = delivery_key
+    await _self_post_chat_completion(adapter, **wake_kwargs)
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any,
+    *,
+    text: str,
+    session_id: str,
+    profile: Optional[str] = None,
+    delivery_key: Optional[str] = None,
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -122,11 +138,18 @@ async def _self_post_chat_completion(
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    profile_prefix = (
+        f"/p/{quote(str(profile), safe='')}"
+        if profile and str(profile).strip() not in {"", "default"}
+        else ""
+    )
+    url = f"http://{host}:{port}{profile_prefix}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    if delivery_key:
+        headers["Idempotency-Key"] = str(delivery_key)
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
         "messages": [{"role": "user", "content": text}],

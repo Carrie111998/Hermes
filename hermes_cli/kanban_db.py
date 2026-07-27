@@ -1304,10 +1304,39 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     notifier_profile TEXT,
+    source_profile TEXT,
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    inflight_profile TEXT,
+    inflight_old_cursor INTEGER,
+    notify_inflight_event_id INTEGER,
+    notify_inflight_owner TEXT,
+    notify_lease_expires_at INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+-- Durable, item-level outbox for notifier messages.  Chunk rows are created
+-- before the first send and acknowledged independently, so a process crash or
+-- later-chunk failure resumes at the first unacknowledged item instead of
+-- replaying an already delivered prefix.
+CREATE TABLE IF NOT EXISTS kanban_notify_deliveries (
+    task_id       TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    event_id      INTEGER NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    delivery_key  TEXT NOT NULL UNIQUE,
+    content       TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT 'pending',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER,
+    acked_at      INTEGER,
+    last_error    TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id, chunk_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -1320,6 +1349,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_delivery_event
+    ON kanban_notify_deliveries(task_id, platform, chat_id, thread_id, event_id, state);
 """
 
 
@@ -2447,6 +2478,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "source_profile" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "source_profile", "source_profile TEXT"
+            )
+            # Legacy rows used notifier_profile for both the runtime namespace
+            # and the credential-owning transport. Preserve that meaning until
+            # a live source re-registers with an explicit split identity.
+            conn.execute(
+                "UPDATE kanban_notify_subs SET source_profile = "
+                "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') "
+                "WHERE source_profile IS NULL OR TRIM(source_profile) = ''"
+            )
         if "chat_type" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "chat_type", "chat_type TEXT"
@@ -2454,6 +2497,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "delivery_metadata" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
+            )
+        if "inflight_profile" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "inflight_profile", "inflight_profile TEXT"
+            )
+        if "inflight_old_cursor" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "inflight_old_cursor",
+                "inflight_old_cursor INTEGER",
+            )
+        if "notify_inflight_event_id" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "notify_inflight_event_id",
+                "notify_inflight_event_id INTEGER",
+            )
+        if "notify_inflight_owner" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "notify_inflight_owner",
+                "notify_inflight_owner TEXT",
+            )
+        if "notify_lease_expires_at" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "notify_lease_expires_at",
+                "notify_lease_expires_at INTEGER",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -2578,8 +2653,11 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " notifier_profile TEXT, source_profile TEXT, delivery_metadata TEXT,"
+        " created_at INTEGER NOT NULL,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, inflight_profile TEXT,"
+        " inflight_old_cursor INTEGER, notify_inflight_event_id INTEGER,"
+        " notify_inflight_owner TEXT, notify_lease_expires_at INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -3232,8 +3310,9 @@ def _inherit_notify_subs(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
+             notifier_profile, source_profile, created_at, last_event_id)
+        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile,
+               source_profile, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
@@ -9424,6 +9503,106 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+def _normalize_notify_profile(value: Any) -> str:
+    """Canonicalize explicit and legacy notification transport owners."""
+    return str(value or "default").strip() or "default"
+
+
+_NOTIFY_DELIVERY_LOCK_TIMEOUT_SECONDS = 60.0
+_NOTIFY_DELIVERY_LOCK_POLL_SECONDS = 0.02
+
+
+def _notify_delivery_lock_path(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Path:
+    """Return a board-local advisory-lock path for one subscription row."""
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    main = next((row for row in rows if str(row[1]) == "main"), None)
+    raw_path = str(main[2] or "") if main is not None else ""
+    db_path = Path(raw_path) if raw_path else kanban_db_path()
+    identity = "\0".join(
+        (str(task_id), str(platform), str(chat_id), str(thread_id or ""))
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return db_path.with_name(db_path.name + ".notify-locks") / f"{digest}.lock"
+
+
+def _acquire_notify_delivery_lock(
+    lock_path: Path,
+    *,
+    timeout_seconds: float = _NOTIFY_DELIVERY_LOCK_TIMEOUT_SECONDS,
+):
+    """Acquire a bounded cross-process subscription-delivery lock."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    if _IS_WINDOWS:
+        import msvcrt
+
+        locking = getattr(msvcrt, "locking")
+        mode = getattr(msvcrt, "LK_NBLCK")
+        while True:
+            try:
+                handle.seek(0)
+                locking(handle.fileno(), mode, 1)
+                return handle
+            except OSError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise TimeoutError(
+                        f"notification delivery lock timed out: {lock_path}"
+                    )
+                time.sleep(_NOTIFY_DELIVERY_LOCK_POLL_SECONDS)
+    else:
+        import fcntl
+
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise TimeoutError(
+                        f"notification delivery lock timed out: {lock_path}"
+                    )
+                time.sleep(_NOTIFY_DELIVERY_LOCK_POLL_SECONDS)
+
+
+def _release_notify_delivery_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            locking = getattr(msvcrt, "locking")
+            locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        handle.close()
+
+
+@contextlib.contextmanager
+def _notify_delivery_lock(lock_path: Path):
+    handle = _acquire_notify_delivery_lock(lock_path)
+    try:
+        yield
+    finally:
+        _release_notify_delivery_lock(handle)
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -9433,6 +9612,7 @@ def add_notify_sub(
     chat_type: Optional[str] = None,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    source_profile: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
@@ -9449,14 +9629,36 @@ def add_notify_sub(
     task creation, where the snapshot is 0 anyway.
     """
     now = int(time.time())
+    if notifier_profile is not None:
+        notifier_profile = _normalize_notify_profile(notifier_profile)
+    if source_profile is None and notifier_profile is not None:
+        # Backward-compatible callers historically supplied one profile for
+        # both the runtime namespace and credential-owning transport.
+        source_profile = notifier_profile
+    if source_profile is not None:
+        source_profile = _normalize_notify_profile(source_profile)
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    delivery_guard = contextlib.nullcontext()
+    if notifier_profile is not None:
+        delivery_guard = _notify_delivery_lock(
+            _notify_delivery_lock_path(
+                conn,
+                task_id=task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        )
+    # Lock ordering is subscription lock → SQLite write transaction in both
+    # notifier delivery and ownership transfer, avoiding transfer/send races.
+    with delivery_guard, write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
-                 notifier_profile, delivery_metadata, created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 notifier_profile, source_profile, delivery_metadata, created_at,
+                 last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
@@ -9467,6 +9669,7 @@ def add_notify_sub(
                 thread_id or "",
                 user_id,
                 notifier_profile,
+                source_profile,
                 metadata_json,
                 now,
                 task_id,
@@ -9483,17 +9686,94 @@ def add_notify_sub(
                 """,
                 (chat_type, task_id, platform, chat_id, thread_id or ""),
             )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership by
-            # backfilling only when the existing value is unset.
+        if notifier_profile is not None:
+            # A subscription has one transport owner. Re-registering the same
+            # target from another profile is an explicit ownership transfer;
+            # leaving the stale owner would make the row permanently
+            # undeliverable when only the new profile's adapter is connected.
+            # When the old owner has an in-flight claim, restore its exact old
+            # cursor before handing the row over. The subscription delivery
+            # lock makes this transfer atomic with pre-send revalidation and
+            # successful cursor acknowledgement.
+            transferring = conn.execute(
+                "SELECT notify_inflight_event_id FROM kanban_notify_subs "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND COALESCE(NULLIF(TRIM(notifier_profile), ''), "
+                "'default') <> ?",
+                (
+                    task_id, platform, chat_id, thread_id or "",
+                    notifier_profile,
+                ),
+            ).fetchone()
+            if transferring and transferring["notify_inflight_event_id"] is not None:
+                # A profile handoff changes the transport identity. Chunks
+                # acknowledged through the old profile cannot count for the
+                # new recipient, so replay the complete event with fresh,
+                # profile-scoped delivery keys.
+                conn.execute(
+                    "DELETE FROM kanban_notify_deliveries WHERE task_id = ? "
+                    "AND platform = ? AND chat_id = ? AND thread_id = ? "
+                    "AND event_id = ?",
+                    (
+                        task_id,
+                        platform,
+                        chat_id,
+                        thread_id or "",
+                        int(transferring["notify_inflight_event_id"]),
+                    ),
+                )
             conn.execute(
                 """
                 UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
+                   SET last_event_id = COALESCE(
+                           inflight_old_cursor,
+                           last_event_id
+                       ),
+                       inflight_profile = NULL,
+                       inflight_old_cursor = NULL,
+                       notify_inflight_event_id = NULL,
+                       notify_inflight_owner = NULL,
+                       notify_lease_expires_at = NULL,
+                       notifier_profile = ?
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
+                   AND COALESCE(
+                           NULLIF(TRIM(notifier_profile), ''),
+                           'default'
+                       ) <> ?
                 """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+                (
+                    notifier_profile,
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread_id or "",
+                    notifier_profile,
+                ),
+            )
+            conn.execute(
+                "UPDATE kanban_notify_subs SET notifier_profile = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (
+                    notifier_profile,
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread_id or "",
+                ),
+            )
+        if source_profile is not None:
+            # Runtime routing is independent of transport ownership. A shared
+            # primary bot may own delivery for a secondary routed profile.
+            conn.execute(
+                "UPDATE kanban_notify_subs SET source_profile = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (
+                    source_profile,
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread_id or "",
+                ),
             )
         if metadata_json:
             # A duplicate subscribe from the same chat/thread should refresh
@@ -9529,10 +9809,57 @@ def list_notify_subs(
     return out
 
 
+def list_notify_subs_for_profiles(
+    conn: sqlite3.Connection,
+    notifier_profiles: Iterable[str],
+) -> list[dict]:
+    """Return subscriptions owned by exactly the supplied transport profiles."""
+    profiles = sorted({_normalize_notify_profile(p) for p in notifier_profiles})
+    if not profiles:
+        return []
+    placeholders = ",".join("?" for _ in profiles)
+    rows = conn.execute(
+        "SELECT * FROM kanban_notify_subs WHERE "
+        "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') "
+        f"IN ({placeholders})",
+        profiles,
+    ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        if "delivery_metadata" in item:
+            item["delivery_metadata"] = _decode_notify_delivery_metadata(
+                item.get("delivery_metadata")
+            )
+        out.append(item)
+    return out
+
+
+def notify_sub_owned_by(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: str,
+) -> bool:
+    """Return whether the subscription still belongs to ``notifier_profile``."""
+    owner = _normalize_notify_profile(notifier_profile)
+    row = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? "
+        "AND platform = ? AND chat_id = ? AND thread_id = ? "
+        "AND COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?",
+        (task_id, platform, chat_id, thread_id or "", owner),
+    ).fetchone()
+    return row is not None
+
+
 def count_notify_subs(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    notifier_profiles: Optional[Iterable[str]] = None,
 ) -> int:
     """Count ``kanban_notify_subs`` rows via a read-only connection.
 
@@ -9555,9 +9882,25 @@ def count_notify_subs(
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM kanban_notify_subs"
-            ).fetchone()
+            profiles = (
+                sorted({_normalize_notify_profile(p) for p in notifier_profiles})
+                if notifier_profiles is not None
+                else []
+            )
+            if notifier_profiles is not None and not profiles:
+                return 0
+            if profiles:
+                placeholders = ",".join("?" for _ in profiles)
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM kanban_notify_subs WHERE "
+                    "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') "
+                    f"IN ({placeholders})",
+                    profiles,
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM kanban_notify_subs"
+                ).fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return 0
@@ -9574,12 +9917,20 @@ def remove_notify_sub(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
 ) -> bool:
+    owner = (
+        _normalize_notify_profile(notifier_profile)
+        if notifier_profile is not None
+        else None
+    )
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
-            "AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND (? IS NULL OR "
+            "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
+            (task_id, platform, chat_id, thread_id or "", owner, owner),
         )
     return cur.rowcount > 0
 
@@ -9591,7 +9942,9 @@ def unseen_events_for_sub(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    limit: Optional[int] = None,
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
@@ -9599,10 +9952,17 @@ def unseen_events_for_sub(
     cursor is NOT advanced here; call :func:`advance_notify_cursor` after
     the gateway has successfully delivered the notifications.
     """
+    owner = (
+        _normalize_notify_profile(notifier_profile)
+        if notifier_profile is not None
+        else None
+    )
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
-        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-        (task_id, platform, chat_id, thread_id or ""),
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+        "AND (? IS NULL OR "
+        "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
+        (task_id, platform, chat_id, thread_id or "", owner, owner),
     ).fetchone()
     if row is None:
         return 0, []
@@ -9616,6 +9976,9 @@ def unseen_events_for_sub(
     params: list[Any] = [task_id, cursor]
     if kind_list:
         params.extend(kind_list)
+    if limit is not None:
+        q += " LIMIT ?"
+        params.append(max(1, int(limit)))
     rows = conn.execute(q, params).fetchall()
     out: list[Event] = []
     max_id = cursor
@@ -9640,7 +10003,9 @@ def claim_unseen_events_for_sub(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    limit: Optional[int] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -9656,11 +10021,18 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
+    owner = (
+        _normalize_notify_profile(notifier_profile)
+        if notifier_profile is not None
+        else None
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND (? IS NULL OR "
+            "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
+            (task_id, platform, chat_id, thread_id or "", owner, owner),
         ).fetchone()
         if row is None:
             return 0, 0, []
@@ -9671,15 +10043,26 @@ def claim_unseen_events_for_sub(
             platform=platform,
             chat_id=chat_id,
             thread_id=thread_id,
+            notifier_profile=notifier_profile,
             kinds=kinds,
+            limit=limit,
         )
         if not events:
             return old_cursor, old_cursor, []
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs "
+            "SET last_event_id = ?, "
+            "inflight_profile = COALESCE("
+            "NULLIF(TRIM(notifier_profile), ''), 'default'), "
+            "inflight_old_cursor = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            "AND last_event_id = ? AND (? IS NULL OR "
+            "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
+            (
+                int(new_cursor), int(old_cursor), task_id, platform, chat_id,
+                thread_id or "",
+                int(old_cursor), owner, owner,
+            ),
         )
         return old_cursor, new_cursor, events
 
@@ -9691,13 +10074,25 @@ def advance_notify_cursor(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
     new_cursor: int,
 ) -> None:
+    owner = (
+        _normalize_notify_profile(notifier_profile)
+        if notifier_profile is not None
+        else None
+    )
     with write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "inflight_profile = NULL, inflight_old_cursor = NULL "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND (? IS NULL OR "
+            "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
+            (
+                int(new_cursor), task_id, platform, chat_id, thread_id or "",
+                owner, owner,
+            ),
         )
 
 
@@ -9708,6 +10103,7 @@ def rewind_notify_cursor(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
 ) -> bool:
@@ -9717,17 +10113,483 @@ def rewind_notify_cursor(
     claim. This keeps retry behavior for transient send failures without
     clobbering newer progress.
     """
+    owner = (
+        _normalize_notify_profile(notifier_profile)
+        if notifier_profile is not None
+        else None
+    )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "inflight_profile = NULL, inflight_old_cursor = NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
+            "AND last_event_id = ? AND (? IS NULL OR "
+            "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
             (
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
-                int(claimed_cursor),
+                int(claimed_cursor), owner, owner,
             ),
         )
     return cur.rowcount > 0
+
+
+def _notify_delivery_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["chunk_index"] = int(item["chunk_index"])
+    item["event_id"] = int(item["event_id"])
+    item["attempts"] = int(item["attempts"])
+    return item
+
+
+def claim_notify_delivery_event(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_owner: str,
+    lease_seconds: int = 30,
+    kinds: Optional[Iterable[str]] = None,
+    now: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Lease one event without acknowledging its subscription cursor."""
+    timestamp = int(time.time()) if now is None else int(now)
+    expires_at = timestamp + max(1, int(lease_seconds))
+    profile = _normalize_notify_profile(notifier_profile)
+    owner = str(delivery_owner).strip()
+    if not owner:
+        raise ValueError("delivery_owner is required")
+    thread = thread_id or ""
+    kind_list = list(kinds) if kinds else []
+
+    with write_txn(conn):
+        sub = conn.execute(
+            "SELECT last_event_id, notify_inflight_event_id, "
+            "notify_inflight_owner, notify_lease_expires_at "
+            "FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND "
+            "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?",
+            (task_id, platform, chat_id, thread, profile),
+        ).fetchone()
+        if sub is None:
+            return None
+
+        cursor = int(sub["last_event_id"])
+        event_id = sub["notify_inflight_event_id"]
+        lease_owner = str(sub["notify_inflight_owner"] or "")
+        lease_expires = int(sub["notify_lease_expires_at"] or 0)
+        event_row = None
+        if event_id is not None and int(event_id) > cursor:
+            if lease_owner != owner and lease_expires > timestamp:
+                return None
+            event_row = conn.execute(
+                "SELECT * FROM task_events WHERE id = ? AND task_id = ?",
+                (int(event_id), task_id),
+            ).fetchone()
+
+        if event_row is None:
+            q = "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+            params: list[Any] = [task_id, cursor]
+            if kind_list:
+                q += "AND kind IN (" + ",".join("?" * len(kind_list)) + ") "
+                params.extend(kind_list)
+            q += "ORDER BY id ASC LIMIT 1"
+            event_row = conn.execute(q, params).fetchone()
+            if event_row is None:
+                conn.execute(
+                    "UPDATE kanban_notify_subs SET notify_inflight_event_id = NULL, "
+                    "notify_inflight_owner = NULL, notify_lease_expires_at = NULL "
+                    "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+                    "AND COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?",
+                    (task_id, platform, chat_id, thread, profile),
+                )
+                return None
+            event_id = int(event_row["id"])
+
+        updated = conn.execute(
+            "UPDATE kanban_notify_subs SET notify_inflight_event_id = ?, "
+            "notify_inflight_owner = ?, notify_lease_expires_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ? AND "
+            "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?",
+            (
+                int(event_id), owner, expires_at, task_id, platform, chat_id,
+                thread, cursor, profile,
+            ),
+        )
+        if not updated.rowcount:
+            return None
+
+        try:
+            payload = json.loads(event_row["payload"]) if event_row["payload"] else None
+        except Exception:
+            payload = None
+        event = Event(
+            id=int(event_row["id"]),
+            task_id=event_row["task_id"],
+            kind=event_row["kind"],
+            payload=payload,
+            created_at=event_row["created_at"],
+            run_id=(
+                int(event_row["run_id"])
+                if "run_id" in event_row.keys() and event_row["run_id"] is not None
+                else None
+            ),
+        )
+        return {
+            "task_id": task_id,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread,
+            "notifier_profile": profile,
+            "old_cursor": cursor,
+            "event": event,
+            "delivery_owner": owner,
+            "lease_expires_at": expires_at,
+        }
+
+
+def claim_notify_delivery_event_guarded(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    delivery_owner: str,
+    lease_seconds: int = 30,
+    kinds: Optional[Iterable[str]] = None,
+    now: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Claim only while the recipient's cross-process send lock is free.
+
+    The zero-timeout lock probe prevents an expiring DB lease from being stolen
+    while another process is still inside the external send. Lock contention is
+    not an error; the current sender owns this recipient for the tick.
+    """
+    lock_path = _notify_delivery_lock_path(
+        conn,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+    try:
+        handle = _acquire_notify_delivery_lock(
+            lock_path,
+            timeout_seconds=0.0,
+        )
+    except TimeoutError:
+        return None
+    try:
+        return claim_notify_delivery_event(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            notifier_profile=notifier_profile,
+            delivery_owner=delivery_owner,
+            lease_seconds=lease_seconds,
+            kinds=kinds,
+            now=now,
+        )
+    finally:
+        _release_notify_delivery_lock(handle)
+
+
+def prepare_notify_delivery_chunks(
+    conn: sqlite3.Connection,
+    *,
+    claim: Mapping[str, Any],
+    chunks: Iterable[str],
+    now: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Persist immutable chunk boundaries for a claimed event."""
+    timestamp = int(time.time()) if now is None else int(now)
+    event = claim["event"]
+    identity = (
+        str(claim["task_id"]), str(claim["platform"]), str(claim["chat_id"]),
+        str(claim.get("thread_id") or ""), int(event.id),
+    )
+    owner = str(claim["delivery_owner"])
+    with write_txn(conn):
+        sub = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND notify_inflight_event_id = ? "
+            "AND notify_inflight_owner = ?",
+            (*identity, owner),
+        ).fetchone()
+        if sub is None:
+            return []
+        existing = conn.execute(
+            "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+            "ORDER BY chunk_index ASC",
+            identity,
+        ).fetchall()
+        if existing:
+            return [_notify_delivery_row_to_dict(row) for row in existing]
+
+        for index, content in enumerate(chunks):
+            text = str(content)
+            key_input = "\0".join(
+                (
+                    *map(str, identity),
+                    str(claim.get("notifier_profile") or "default"),
+                    str(index),
+                    text,
+                )
+            )
+            delivery_key = hashlib.sha256(
+                key_input.encode("utf-8", "replace")
+            ).hexdigest()[:32]
+            conn.execute(
+                "INSERT INTO kanban_notify_deliveries "
+                "(task_id, platform, chat_id, thread_id, event_id, chunk_index, "
+                "delivery_key, content, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (*identity, index, delivery_key, text, timestamp, timestamp),
+            )
+        rows = conn.execute(
+            "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+            "ORDER BY chunk_index ASC",
+            identity,
+        ).fetchall()
+        return [_notify_delivery_row_to_dict(row) for row in rows]
+
+
+def pending_notify_delivery_chunks(
+    conn: sqlite3.Connection,
+    *,
+    claim: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    event = claim["event"]
+    owned = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+        "AND chat_id = ? AND thread_id = ? AND notify_inflight_event_id = ? "
+        "AND notify_inflight_owner = ?",
+        (
+            claim["task_id"], claim["platform"], claim["chat_id"],
+            claim.get("thread_id") or "", int(event.id), claim["delivery_owner"],
+        ),
+    ).fetchone()
+    if owned is None:
+        return []
+    rows = conn.execute(
+        "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
+        "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+        "AND state != 'acked' ORDER BY chunk_index ASC",
+        (
+            claim["task_id"], claim["platform"], claim["chat_id"],
+            claim.get("thread_id") or "", int(event.id),
+        ),
+    ).fetchall()
+    return [_notify_delivery_row_to_dict(row) for row in rows]
+
+
+def _update_notify_chunk_state(
+    conn: sqlite3.Connection,
+    *,
+    delivery_key: str,
+    delivery_owner: str,
+    state: str,
+    now: Optional[int] = None,
+    error: Optional[str] = None,
+) -> bool:
+    timestamp = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM kanban_notify_deliveries WHERE delivery_key = ?",
+            (delivery_key,),
+        ).fetchone()
+        if row is None:
+            return False
+        owned = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND notify_inflight_event_id = ? "
+            "AND notify_inflight_owner = ?",
+            (
+                row["task_id"], row["platform"], row["chat_id"], row["thread_id"],
+                int(row["event_id"]), delivery_owner,
+            ),
+        ).fetchone()
+        if owned is None:
+            return False
+        if state == "attempting":
+            cur = conn.execute(
+                "UPDATE kanban_notify_deliveries SET state = 'attempting', "
+                "attempts = attempts + 1, last_attempt_at = ?, updated_at = ?, "
+                "last_error = NULL WHERE delivery_key = ? AND state != 'acked'",
+                (timestamp, timestamp, delivery_key),
+            )
+        elif state == "acked":
+            cur = conn.execute(
+                "UPDATE kanban_notify_deliveries SET state = 'acked', acked_at = ?, "
+                "updated_at = ?, last_error = NULL WHERE delivery_key = ? "
+                "AND state != 'acked'",
+                (timestamp, timestamp, delivery_key),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE kanban_notify_deliveries SET state = 'pending', "
+                "updated_at = ?, last_error = ? WHERE delivery_key = ? "
+                "AND state != 'acked'",
+                (timestamp, str(error or "")[:500] or None, delivery_key),
+            )
+        return bool(cur.rowcount)
+
+
+def mark_notify_delivery_chunk_attempting(
+    conn: sqlite3.Connection,
+    *,
+    delivery_key: str,
+    delivery_owner: str,
+    now: Optional[int] = None,
+) -> bool:
+    return _update_notify_chunk_state(
+        conn, delivery_key=delivery_key, delivery_owner=delivery_owner,
+        state="attempting", now=now,
+    )
+
+
+def ack_notify_delivery_chunk(
+    conn: sqlite3.Connection,
+    *,
+    delivery_key: str,
+    delivery_owner: str,
+    now: Optional[int] = None,
+) -> bool:
+    return _update_notify_chunk_state(
+        conn, delivery_key=delivery_key, delivery_owner=delivery_owner,
+        state="acked", now=now,
+    )
+
+
+def fail_notify_delivery_chunk(
+    conn: sqlite3.Connection,
+    *,
+    delivery_key: str,
+    delivery_owner: str,
+    error: str,
+    now: Optional[int] = None,
+) -> bool:
+    return _update_notify_chunk_state(
+        conn, delivery_key=delivery_key, delivery_owner=delivery_owner,
+        state="pending", now=now, error=error,
+    )
+
+
+def renew_notify_delivery_claim(
+    conn: sqlite3.Connection,
+    *,
+    claim: Mapping[str, Any],
+    lease_seconds: int = 30,
+    now: Optional[int] = None,
+) -> bool:
+    timestamp = int(time.time()) if now is None else int(now)
+    event = claim["event"]
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET notify_lease_expires_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND notify_inflight_event_id = ? AND notify_inflight_owner = ?",
+            (
+                timestamp + max(1, int(lease_seconds)), claim["task_id"],
+                claim["platform"], claim["chat_id"], claim.get("thread_id") or "",
+                int(event.id), claim["delivery_owner"],
+            ),
+        )
+        return bool(cur.rowcount)
+
+
+def release_notify_delivery_claim(
+    conn: sqlite3.Connection,
+    *,
+    claim: Mapping[str, Any],
+    now: Optional[int] = None,
+) -> bool:
+    """Expire a failed claim immediately while retaining its pending tail."""
+    timestamp = int(time.time()) if now is None else int(now)
+    event = claim["event"]
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET notify_lease_expires_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND notify_inflight_event_id = ? AND notify_inflight_owner = ?",
+            (
+                timestamp, claim["task_id"], claim["platform"], claim["chat_id"],
+                claim.get("thread_id") or "", int(event.id), claim["delivery_owner"],
+            ),
+        )
+        return bool(cur.rowcount)
+
+
+def release_notify_delivery_claim_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    event_id: int,
+    delivery_owner: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Identity-based release used by legacy notifier error call sites."""
+    timestamp = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET notify_lease_expires_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND notify_inflight_event_id = ? AND notify_inflight_owner = ?",
+            (
+                timestamp, task_id, platform, chat_id, thread_id or "",
+                int(event_id), delivery_owner,
+            ),
+        )
+        return bool(cur.rowcount)
+
+
+def ack_notify_delivery_event(
+    conn: sqlite3.Connection,
+    *,
+    claim: Mapping[str, Any],
+    delivery_owner: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Advance the cursor only after every persisted item is acknowledged."""
+    _ = int(time.time()) if now is None else int(now)
+    event = claim["event"]
+    thread = claim.get("thread_id") or ""
+    with write_txn(conn):
+        pending = conn.execute(
+            "SELECT 1 FROM kanban_notify_deliveries WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+            "AND state != 'acked' LIMIT 1",
+            (
+                claim["task_id"], claim["platform"], claim["chat_id"], thread,
+                int(event.id),
+            ),
+        ).fetchone()
+        if pending is not None:
+            return False
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "notify_inflight_event_id = NULL, notify_inflight_owner = NULL, "
+            "notify_lease_expires_at = NULL WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND notify_inflight_event_id = ? "
+            "AND notify_inflight_owner = ? AND last_event_id = ?",
+            (
+                int(event.id), claim["task_id"], claim["platform"], claim["chat_id"],
+                thread, int(event.id), delivery_owner, int(claim["old_cursor"]),
+            ),
+        )
+        return bool(cur.rowcount)
 
 
 # ---------------------------------------------------------------------------

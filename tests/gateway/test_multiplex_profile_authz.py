@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.session import SessionSource
+from gateway.session import SessionContext, SessionSource
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -109,6 +109,15 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
 
 
+def test_active_profile_resolution_ignores_notifier_profile_cache(monkeypatch):
+    """General auth routing must use the live active profile, not notifier state."""
+    runner, default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "dev"
+    runner._kanban_notifier_profile = "stale-notifier-profile"
+
+    assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
+
+
 def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
     """Ingress adapter lookup must use the stamped profile's adapter map."""
     runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
@@ -159,6 +168,35 @@ def test_chat_routed_source_keeps_receiving_shared_adapter(monkeypatch):
     source._transport_adapter_ref = lambda: default_adapter
     assert runner._adapter_for_source(source) is default_adapter
     assert runner._is_user_authorized(source) is True
+
+
+def test_routed_session_context_splits_runtime_from_transport_owner(monkeypatch):
+    """Auto-subscribe receives both identities for one shared-bot inbound turn."""
+    from gateway.session_context import clear_session_vars, get_session_env
+
+    runner, default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "default"
+    source = SessionSource(
+        platform=Platform.WECOM,
+        chat_id="shared-chat",
+        chat_type="dm",
+        profile="writer",
+    )
+    source._transport_adapter_ref = lambda: default_adapter
+
+    tokens = runner._set_session_env(
+        SessionContext(
+            session_key="writer-session",
+            source=source,
+            connected_platforms=[],
+            home_channels=[],
+        )
+    )
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "writer"
+        assert get_session_env("HERMES_SESSION_TRANSPORT_PROFILE") == "default"
+    finally:
+        clear_session_vars(tokens)
 
 
 def test_adapter_for_relay_delivered_source_uses_relay_transport(monkeypatch):

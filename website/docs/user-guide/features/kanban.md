@@ -549,7 +549,68 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
-| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's scheduled/terminal events. The gateway notifier drives delivery independently of task dispatch. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+
+### Task notifications in multi-profile gateways
+
+The Kanban notifier is independent of the embedded dispatcher. Setting
+`kanban.dispatch_in_gateway: false` creates a **notifier-only gateway**: it does
+not claim or spawn tasks, but it still delivers subscriptions for its connected
+profile adapters.
+
+Notification ownership is coordinated **per credential-owning transport
+profile**. Standalone `default` and `writer` gateways can notify simultaneously,
+while two `writer` gateways use one profile-scoped advisory lock so exactly one
+polls. A lock loser does not open or poll board DBs. Multiplex gateways can own
+several transport-profile locks and route each subscription through the adapter
+registry for its stamped `notifier_profile`. Blank subscriptions created by
+older Hermes versions belong to `default`.
+
+Tasks and auto-subscriptions created from messaging persist that transport owner
+separately from `source_profile`, the inbound logical runtime/session namespace.
+An unstamped source falls back to the gateway's startup profile. A secondary
+runtime selected by `profile_routes` can therefore remain the wake target while
+the default profile's shared bot owns delivery.
+
+If a profile loses all connected adapters, the gateway releases that profile's
+notifier lock. Another eligible gateway retries within one second. Persistent
+DB leases expire after a bounded interval, and per-chunk acknowledgements let
+the replacement gateway resume at the unfinished tail.
+
+Notifications use durable stable delivery identities: claiming records an owner
+and lease without advancing the cursor, `pending` versus `attempting` state,
+chunk boundaries, and stable delivery keys are persisted, and the exact event is
+acknowledged only after every chunk succeeds. A process dying before send replays
+the unsent chunk; dying after send but before acknowledgement replays the same
+key so idempotent transports deduplicate it. Upstream APIs without an
+idempotency primitive retain an unavoidable at-least-once ambiguity at that one
+boundary, but cannot silently lose the event. Blocked and scheduled reviews
+include:
+
+- `ASK`
+- `WHY GATED` (the complete reason, not a 160-character preview)
+- `SCOPE`
+- `ROLLBACK`
+- `REPLY`
+- `WINDOW` for scheduled work
+- explicit `APPROVE <task-id>` and `VETO <task-id>` targets
+
+Existing optional `DEADLINE` and `SAFE DEFAULT` fields are preserved too.
+
+Hermes chunks the brief for adapters that do not split long messages natively,
+without omitting fields, and acknowledges each successful chunk so retries keep
+the delivered prefix. For the API server there is no push channel, so the wake
+self-post targets `source_profile`'s `/p/<profile>/v1/chat/completions` route,
+uses the stable delivery key as `Idempotency-Key`, and must succeed before event
+acknowledgement. Failure counts are diagnostic only: Hermes retains the unsent
+tail until delivery succeeds or an operator explicitly unsubscribes it. Push,
+wake, and artifact attempts are time-bounded below the ownership lease so one
+hung recipient cannot block unrelated subscriptions or takeover.
+
+If a notification does not arrive, check both `source_profile` (logical wake
+route) and `notifier_profile` (credential-owning adapter), then the gateway log's
+notifier-lock acquire/release lines. Do not enable task dispatch merely to fix
+notifications; the two ownership paths are intentionally separate.
 
 And the two auxiliary LLM slots:
 

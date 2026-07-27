@@ -81,12 +81,12 @@ def test_deliver_wake_non_push_requires_api_key():
         asyncio.run(deliver_wake(adapter, text="x", session_id="raw-sid"))
 
 
-async def _serve(handler):
+async def _serve(handler, path="/v1/chat/completions"):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
 
     app = web.Application()
-    app.router.add_post("/v1/chat/completions", handler)
+    app.router.add_post(path, handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -124,6 +124,40 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
     ]
+
+
+def test_deliver_wake_routes_profile_and_uses_stable_idempotency_key():
+    from aiohttp import web
+
+    seen = {}
+
+    async def handler(request):
+        seen["profile"] = request.match_info["profile"]
+        seen["delivery_key"] = request.headers.get("Idempotency-Key")
+        return web.json_response({"choices": []})
+
+    async def run():
+        runner, port = await _serve(
+            handler,
+            path="/p/{profile}/v1/chat/completions",
+        )
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            await deliver_wake(
+                adapter,
+                text="review required",
+                session_id="raw-profile-session",
+                profile="reviewer",
+                delivery_key="kanban-event-42-chunk-0",
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen == {
+        "profile": "reviewer",
+        "delivery_key": "kanban-event-42-chunk-0",
+    }
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):

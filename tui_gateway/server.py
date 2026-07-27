@@ -11139,8 +11139,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # the cursor advances past them and they can't wedge a later completed/blocked
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "completed", "blocked", "scheduled", "gave_up", "crashed", "timed_out",
+    "status", "block_loop_detected", "archived", "unblocked",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -11156,40 +11156,78 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     kind = getattr(ev, "kind", "")
     if not kind or kind in _KANBAN_SILENT_KINDS:
         return None
+    from gateway.kanban_watchers import _format_kanban_event_message
+
     task_id = sub.get("task_id", "")
     title = (getattr(task, "title", None) or task_id)[:120]
-    board_tag = f"[{board_slug}] " if board_slug else ""
     who = getattr(task, "assignee", None) or ""
-    tag = f"@{who} " if who else ""
-    payload = getattr(ev, "payload", None) or {}
-    if kind == "completed":
-        handoff = ""
-        summary = payload.get("summary")
-        if summary:
-            lines = str(summary).strip().splitlines()
-            handoff = f"\n{lines[0][:200]}" if lines else ""
-        elif getattr(task, "result", None):
-            lines = str(task.result).strip().splitlines()
-            handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
-    if kind == "blocked":
-        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
-    if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
-    if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
-    if kind == "timed_out":
-        limit = 0
-        try:
-            limit = int(payload.get("limit_seconds") or 0)
-        except (TypeError, ValueError):
-            pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
-    if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
-    return None
+    return _format_kanban_event_message(
+        event=ev,
+        task=task,
+        sub=sub,
+        board_tag=f"[{board_slug}] " if board_slug else "",
+        tag=f"@{who} " if who else "",
+        title=title,
+    )
+
+
+def _ack_kanban_notification(record: dict) -> bool:
+    """Acknowledge one TUI record only after its agent turn succeeds."""
+    from hermes_cli import kanban_db as _kb
+
+    claim = record["claim"]
+    owner = claim["delivery_owner"]
+    conn = _kb.connect(board=record.get("board"))
+    try:
+        for item in _kb.pending_notify_delivery_chunks(conn, claim=claim):
+            if not _kb.mark_notify_delivery_chunk_attempting(
+                conn,
+                delivery_key=item["delivery_key"],
+                delivery_owner=owner,
+            ):
+                return False
+            if not _kb.ack_notify_delivery_chunk(
+                conn,
+                delivery_key=item["delivery_key"],
+                delivery_owner=owner,
+            ):
+                return False
+        if not _kb.ack_notify_delivery_event(
+            conn,
+            claim=claim,
+            delivery_owner=owner,
+        ):
+            return False
+        if record.get("terminal"):
+            sub = record["sub"]
+            try:
+                _kb.remove_notify_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _release_kanban_notification(record: dict) -> None:
+    """Make a failed TUI dispatch immediately reclaimable."""
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect(board=record.get("board"))
+    try:
+        _kb.release_notify_delivery_claim(conn, claim=record["claim"])
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
 
 def _collect_kanban_notifications(session: dict) -> list:
@@ -11200,9 +11238,8 @@ def _collect_kanban_notifications(session: dict) -> list:
     tools/kanban_tools.py ``_maybe_auto_subscribe``). The gateway notifier
     can't deliver those — there is no "tui" messaging adapter — so this
     poller is the delivery path for them (issue #59890). Uses the same
-    atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
+    durable lease + exact-event acknowledgement path as the gateway notifier,
+    so a crash retains the event for at-least-once retry.
 
     Returns the list of formatted notification texts (may be empty).
     """
@@ -11213,7 +11250,8 @@ def _collect_kanban_notifications(session: dict) -> list:
         from hermes_cli import kanban_db as _kb
     except Exception:
         return []
-    texts: list = []
+    records: list[dict] = []
+    pending_records = list(session.get("_kanban_pending") or [])
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
@@ -11252,39 +11290,91 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
+                delivery_owner = session.setdefault(
+                    "_kanban_delivery_owner",
+                    f"tui:{os.getpid()}:{session_key}",
                 )
-                if not events:
+                sub_key = (
+                    slug,
+                    sub["task_id"],
+                    sub["platform"],
+                    sub["chat_id"],
+                    sub.get("thread_id") or "",
+                )
+                matching_pending = next(
+                    (
+                        item for item in pending_records
+                        if item.get("sub_key") == sub_key
+                    ),
+                    None,
+                )
+                if matching_pending is not None:
+                    _kb.renew_notify_delivery_claim(
+                        conn,
+                        claim=matching_pending["claim"],
+                        lease_seconds=30,
+                    )
                     continue
-                task = _kb.get_task(conn, sub["task_id"])
-                for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
-                    if text:
-                        texts.append(text)
-                # Unsubscribe only at a truly final status (done/archived);
-                # blocked/crashed subs stay live so a respawned task's next
-                # terminal event still reaches the user (same rule as the
-                # gateway notifier).
-                if task and getattr(task, "status", "") in {"done", "archived"}:
+                for _ in range(100):
+                    claim = None
                     try:
-                        _kb.remove_notify_sub(
+                        claim = _kb.claim_notify_delivery_event(
                             conn,
                             task_id=sub["task_id"],
                             platform=sub["platform"],
                             chat_id=sub["chat_id"],
                             thread_id=sub.get("thread_id") or "",
+                            notifier_profile=(
+                                sub.get("notifier_profile") or "default"
+                            ),
+                            kinds=_KANBAN_NOTIFY_KINDS,
+                            delivery_owner=delivery_owner,
+                            lease_seconds=30,
                         )
+                        if claim is None:
+                            break
+                        task = _kb.get_task(conn, sub["task_id"])
+                        text = _format_kanban_event_text(
+                            sub, task, claim["event"], slug
+                        )
+                        chunks = [text] if text else []
+                        _kb.prepare_notify_delivery_chunks(
+                            conn,
+                            claim=claim,
+                            chunks=chunks,
+                        )
+                        record = {
+                            "text": text,
+                            "claim": claim,
+                            "board": slug,
+                            "sub": sub,
+                            "sub_key": sub_key,
+                            "terminal": bool(
+                                task and getattr(task, "status", "")
+                                in {"done", "archived"}
+                            ),
+                        }
+                        if text:
+                            records.append(record)
+                            break
+                        # Intentionally silent transitions have no external
+                        # delivery obligation, so acknowledge them immediately
+                        # and keep scanning for the next visible event.
+                        if not _ack_kanban_notification(record):
+                            _release_kanban_notification(record)
+                            break
                     except Exception:
-                        pass
+                        if claim is not None:
+                            try:
+                                _kb.release_notify_delivery_claim(
+                                    conn, claim=claim
+                                )
+                            except Exception:
+                                pass
+                        break
         finally:
             conn.close()
-    return texts
+    return records
 
 
 def _notification_poller_loop(
@@ -11314,20 +11404,27 @@ def _notification_poller_loop(
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
             try:
-                _kanban_texts = _collect_kanban_notifications(session)
+                _kanban_records = _collect_kanban_notifications(session)
             except Exception as _kb_exc:
                 print(
                     f"[tui_gateway] kanban notification poll failed: "
                     f"{type(_kb_exc).__name__}: {_kb_exc}",
                     file=sys.stderr,
                 )
-                _kanban_texts = []
-            if _kanban_texts:
-                for _kb_text in _kanban_texts:
-                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+                _kanban_records = []
+            if _kanban_records:
+                for _kb_record in _kanban_records:
+                    _emit(
+                        "status.update",
+                        sid,
+                        {"kind": "process", "text": _kb_record["text"]},
+                    )
+                # Keep the durable claims leased while the session is busy;
+                # exact event acknowledgement happens only after the agent
+                # turn below returns successfully.
+                session.setdefault("_kanban_pending", []).extend(
+                    _kanban_records
+                )
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
@@ -11340,8 +11437,18 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            "\n".join(item["text"] for item in _batch),
+                        )
+                        for _kb_record in _batch:
+                            if not _ack_kanban_notification(_kb_record):
+                                _release_kanban_notification(_kb_record)
                     except Exception as exc:
+                        for _kb_record in _batch:
+                            _release_kanban_notification(_kb_record)
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
                             f"{type(exc).__name__}: {exc}",
