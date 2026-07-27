@@ -230,3 +230,6 @@ recorded.
 - `15dd8224cadf9c46e2b16ea7d6bef2175420cd0b` — bound accounting journal replays to exact description,
   currency, and line parameters, rejecting source-key drift while permitting
   evidence-only retries.
+- `a54de88bd08749bf7e1542805aba16f78ee2f179` — bound procurement decision
+  retries to the original tenant, objective, sourcing case, and evidence,
+  rejecting idempotency-key input drift.
