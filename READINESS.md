@@ -1626,6 +1626,27 @@ was `sha256:3660e2b4ba99b2cc0b6c19711543c97f187ca70503154739612524b7b1e68b43`.
 This remains deterministic local-provider evidence and does not establish
 production sandbox deployment or external authorization.
 
+## Kanban linking authority evidence (7552bb0573)
+
+`kanban.link` now requires a SHA-256 resource derived from the exact parent
+task, child task, board, and operation before the dependency edge is written.
+This prevents governed workers from creating arbitrary cross-task durable
+relationships outside their delegated authority.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **120 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:14f5617350049b5a54123776f136f8c0255dde3d0323e4cc01ad2caebbf99a67`.
+This remains deterministic local-provider evidence and does not establish
+production multi-tenant board deployment or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

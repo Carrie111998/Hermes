@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Kanban task linking now requires a `kanban.link` permit bound to the exact
+  parent task, child task, board, and operation before durable state changes.
 - `execute_code` permits now bind the script, task identity, effective sandbox
   tool allow-list, and backend environment; a script grant cannot be replayed
   with broader RPC capabilities or a different execution target.
