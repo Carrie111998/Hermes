@@ -866,6 +866,19 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _stamp_hygiene_compression_provenance(
+    agent: Any,
+    desc: str,
+    provenance: "ActivityProvenance",
+    debug_label: str,
+) -> None:
+    """Best-effort activity provenance stamp for hygiene compression transitions."""
+    try:
+        agent._touch_activity(desc, provenance=provenance)
+    except Exception:
+        logger.debug(debug_label, exc_info=True)
+
+
 def _is_fresh_gateway_interruption(
     value: Any,
     *,
@@ -16439,22 +16452,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 self._hygiene_compression_failure_cooldowns[
                                                     session_entry.session_id
                                                 ] = time.time() + _hyg_failure_cooldown_seconds
-                                            try:
                                                 from agent.session_activity import (
                                                     ActivityProvenance,
                                                 )
 
-                                                _hyg_agent._touch_activity(
+                                            _stamp_hygiene_compression_provenance(
+                                                _hyg_agent,
                                                     "session hygiene compression timed out",
-                                                    provenance=(
-                                                        ActivityProvenance.AGENT_COMPRESSION_TIMEOUT
-                                                    ),
-                                                )
-                                            except Exception:
-                                                logger.debug(
+                                                ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
                                                     "hygiene compression timeout "
                                                     "activity stamp failed",
-                                                    exc_info=True,
                                                 )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
@@ -16622,22 +16629,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             self._hygiene_compression_failure_cooldowns[
                                                 session_entry.session_id
                                             ] = time.time() + _hyg_failure_cooldown_seconds
-                                        try:
                                             from agent.session_activity import (
                                                 ActivityProvenance,
                                             )
 
-                                            _hyg_agent._touch_activity(
+                                        _stamp_hygiene_compression_provenance(
+                                            _hyg_agent,
                                                 "session hygiene compression aborted",
-                                                provenance=(
-                                                    ActivityProvenance.AGENT_COMPRESSION_COOLDOWN
-                                                ),
-                                            )
-                                        except Exception:
-                                            logger.debug(
+                                            ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
                                                 "hygiene compression abort "
                                                 "activity stamp failed",
-                                                exc_info=True,
                                             )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
