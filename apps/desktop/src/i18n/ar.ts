@@ -2111,6 +2111,7 @@ export const ar = defineLocale({
     remotePickerSelect: 'تحديد المجلد',
     folderTip: cwd => `المجلد الحالي: ${cwd}`,
     openFolder: 'فتح مجلد',
+    navigateUp: 'الانتقال إلى المجلد الأب',
     refreshTree: 'تحديث الشجرة',
     collapseAll: 'طي الكل',
     previewUnavailable: 'المعاينة غير متاحة',

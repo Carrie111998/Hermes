@@ -1,5 +1,6 @@
 import { useStore } from '@nanostores/react'
 import type { ComponentProps } from 'react'
+import { useEffect, useState } from 'react'
 
 import { TreeSkeleton } from '@/components/chat/skeletons'
 import { ErrorBoundary } from '@/components/error-boundary'
@@ -13,12 +14,37 @@ import { cn } from '@/lib/utils'
 import { $panesFlipped } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { setCurrentSessionPreviewTarget } from '@/store/preview'
-import { $currentCwd } from '@/store/session'
+import { $activeSessionId, $currentCwd } from '@/store/session'
 
 import { SidebarPanelLabel } from '../shell/sidebar-label'
 
 import { ProjectTree } from './files/tree'
 import { useProjectTree } from './files/use-project-tree'
+
+function parentDirectory(path: string): null | string {
+  const trimmed = path.trim()
+  const normalized = trimmed.replace(/[\\/]+$/, '') || (trimmed.startsWith('/') ? '/' : trimmed)
+  const driveRootChild = normalized.match(/^([A-Za-z]:)([\\/])[^\\/]+$/)
+  const uncShareRoot = /^[\\/]{2}[^\\/]+[\\/][^\\/]+$/.test(normalized)
+
+  if (uncShareRoot) {
+    return null
+  }
+
+  if (driveRootChild) {
+    return `${driveRootChild[1]}${driveRootChild[2]}`
+  }
+
+  const separator = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'))
+
+  if (separator < 0 || (separator === 0 && !normalized.startsWith('/'))) {
+    return null
+  }
+
+  const parent = normalized.slice(0, separator) || (normalized.startsWith('/') ? '/' : null)
+
+  return parent && parent !== normalized ? parent : null
+}
 
 interface RightSidebarPaneProps {
   onActivateFile: (path: string) => void
@@ -29,13 +55,22 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
   const { t } = useI18n()
   const r = t.rightSidebar
   const panesFlipped = useStore($panesFlipped)
+  const activeSessionId = useStore($activeSessionId)
   const currentCwd = useStore($currentCwd).trim()
+  const [browserCwd, setBrowserCwd] = useState(currentCwd)
+
+  // A session switch resets the browser to that session's workspace. Within a
+  // session, navigation stays local to this pane so viewing a parent folder
+  // cannot silently change where the agent runs.
+  useEffect(() => {
+    setBrowserCwd(currentCwd)
+  }, [activeSessionId, currentCwd])
 
   // The file tree is simply "browse the session's working directory". If the
   // session has a cwd — a repo, a sibling worktree, or any folder — show it. A
   // bare/detached chat (resolveNewSessionCwd → '') has none, so it shows the
   // empty hint instead of whatever dir Hermes happens to run from.
-  const hasWorkspace = Boolean(currentCwd)
+  const hasWorkspace = Boolean(browserCwd)
 
   const {
     collapseAll,
@@ -48,7 +83,7 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
     rootError,
     rootLoading,
     setNodeOpen
-  } = useProjectTree(hasWorkspace ? currentCwd : '')
+  } = useProjectTree(hasWorkspace ? browserCwd : '')
 
   const cwdName =
     effectiveCwd
@@ -69,6 +104,14 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
       setCurrentSessionPreviewTarget(preview, 'file-browser', path)
     } catch (error) {
       notifyError(error, r.previewUnavailable)
+    }
+  }
+
+  const navigateUp = () => {
+    const parent = parentDirectory(effectiveCwd)
+
+    if (parent) {
+      setBrowserCwd(parent)
     }
   }
 
@@ -95,6 +138,7 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
         onActivateFolder={onActivateFolder}
         onCollapseAll={collapseAll}
         onLoadChildren={loadChildren}
+        onNavigateUp={navigateUp}
         onNodeOpenChange={setNodeOpen}
         onPreviewFile={previewFile}
         onRefresh={() => void refreshRoot()}
@@ -109,6 +153,7 @@ interface FilesystemTabProps extends FileTreeBodyProps {
   cwdName: string
   hasWorkspace: boolean
   onCollapseAll: () => void
+  onNavigateUp: () => void
   onRefresh: () => void
 }
 
@@ -132,6 +177,7 @@ function FilesystemTab({
   onActivateFolder,
   onCollapseAll,
   onLoadChildren,
+  onNavigateUp,
   onNodeOpenChange,
   onPreviewFile,
   onRefresh,
@@ -139,6 +185,7 @@ function FilesystemTab({
 }: FilesystemTabProps) {
   const { t } = useI18n()
   const r = t.rightSidebar
+  const canNavigateUp = Boolean(parentDirectory(cwd))
 
   // No working directory (a bare/detached chat) → no tree, just a terse hint.
   // Switching workspace is a project/worktree action, never a raw folder picker.
@@ -152,6 +199,18 @@ function FilesystemTab({
         <div className="flex min-w-0 flex-1">
           <SidebarPanelLabel>{cwdName}</SidebarPanelLabel>
         </div>
+        <Tip label={r.navigateUp}>
+          <Button
+            aria-label={r.navigateUp}
+            className={cn(HEADER_ACTION_LABEL_REVEAL, !canNavigateUp && 'pointer-events-none opacity-0')}
+            disabled={!canNavigateUp}
+            onClick={onNavigateUp}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name="arrow-up" size="0.8125rem" />
+          </Button>
+        </Tip>
         <Tip label={r.refreshTree}>
           <Button
             aria-label={r.refreshTree}

@@ -2101,6 +2101,7 @@ export interface Translations {
     remotePickerSelect: string
     folderTip: (cwd: string) => string
     openFolder: string
+    navigateUp: string
     refreshTree: string
     collapseAll: string
     previewUnavailable: string

@@ -2495,6 +2495,7 @@ export const en: Translations = {
     remotePickerSelect: 'Select folder',
     folderTip: cwd => `${cwd} — click to change folder`,
     openFolder: 'Open folder',
+    navigateUp: 'Go to parent folder',
     refreshTree: 'Refresh tree',
     collapseAll: 'Collapse all folders',
     previewUnavailable: 'Preview unavailable',
