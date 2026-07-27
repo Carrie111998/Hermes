@@ -31,6 +31,9 @@ acceptance evidence.
   and cumulative child budgets cannot exceed the parent grant ceiling; a
   subordinate cannot reuse authority on another objective or subdivide the
   same parent budget repeatedly.
+- Delegated worker launch and result handoff independently re-run the full
+  immutable grant-chain integrity projection, rather than relying only on the
+  live mandate and revocation checks.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

@@ -730,6 +730,8 @@ def validate_worker_launch(
             raise DelegationError("worker task does not match its execution contract")
         if is_revoked(conn, grant_id):
             raise DelegationError("employee task grant was revoked")
+        if not verify_grants(conn, str(grant["organization_id"])):
+            raise DelegationError("employee task grant integrity verification failed")
         if int(grant["expires_at"]) <= int(time.time()):
             raise DelegationError("employee task grant has expired")
         employee = organization_db.get_employee_record(
@@ -803,6 +805,8 @@ def validate_task_result_authority(
         raise DelegationError("delegated task has no authoritative employee grant")
     if is_revoked(conn, str(grant["id"])):
         raise DelegationError("employee task grant was revoked")
+    if not verify_grants(conn, str(grant["organization_id"])):
+        raise DelegationError("employee task grant integrity verification failed")
     if int(grant["expires_at"]) <= int(time.time()):
         raise DelegationError("employee task grant expired before result handoff")
     employee = organization_db.get_employee_record(conn, str(grant["employee_id"]))

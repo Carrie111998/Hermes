@@ -41,6 +41,8 @@
 - Parent-grant delegation is now bounded to the same objective and action
   type, with cumulative child-budget accounting so repeated sub-delegation
   cannot exceed the parent grant ceiling.
+- Delegated worker launch and result handoff now require an independent full
+  grant-chain integrity verification in addition to live mandate checks.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy
