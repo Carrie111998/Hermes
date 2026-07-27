@@ -42,6 +42,10 @@ Organization-bound interventions also require the caller to provide the
 matching organization scope; omitted scope is accepted only for explicitly
 unscoped control records.
 
+Legacy objective-only stores without an employee identity table retain a
+non-crashing compatibility path; freshly bootstrapped agentic stores always
+initialize the employee authority boundary before autonomous execution.
+
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
 records. Payment integration is non-custodial: providers hold instruments and

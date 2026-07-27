@@ -55,6 +55,9 @@
 - Organization-scoped intervention resolution now fails closed when the caller
   omits organization scope; only explicitly unscoped control records may use
   the legacy scope-free path.
+- Permit actor-scope checks now tolerate legacy objective-only databases without
+  crashing during migration; fully bootstrapped stores continue to enforce the
+  employee organization/status boundary.
 - Delegation grants now persist the exact action resource scope and reject a
   Kanban binding to a different board; legacy grants without a scope fail closed
   until reissued under a current action contract.

@@ -330,6 +330,7 @@ def test_stale_outbound_spend_hold_escalates_without_automatic_release(tmp_path)
         intervention["id"],
         option_id="release",
         actor="human:advisor",
+        organization_id="org_spend",
         evidence={
             "provider_status": "failed",
             "settlement_reference": "provider-failure-1",

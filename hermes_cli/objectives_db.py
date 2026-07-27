@@ -1446,6 +1446,14 @@ def _assert_employee_actor_scope(
     objective = conn.execute(
         "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)
     ).fetchone()
+    employee_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='employees'"
+    ).fetchone()
+    if employee_table is None:
+        # Legacy objective-only stores may not yet have the organization
+        # schema. Preserve their existing non-crashing behavior; fully
+        # bootstrapped stores always have the employee identity boundary.
+        return
     employee = conn.execute(
         "SELECT organization_id,status FROM employees WHERE id=?", (employee_id,)
     ).fetchone()
