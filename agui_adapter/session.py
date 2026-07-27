@@ -482,6 +482,7 @@ def build_run_agent(
         kwargs["args"] = list(settings.get("args") or [])
 
     agent = AIAgent(**kwargs)
+    _expose_tools_eagerly(agent)
     if cwd:
         agent.session_cwd = cwd
     if default_headers:
@@ -500,6 +501,50 @@ def build_run_agent(
         _merge_frontend_tools(agent, state_writer_schemas or [], set(specs))
 
     return agent
+
+
+def _expose_tools_eagerly(agent) -> None:
+    """Re-assemble the agent's model-facing tools WITHOUT the tool_search bridge.
+
+    Newer Hermes core defers non-core (MCP/plugin) tools behind a
+    ``tool_search`` / ``tool_describe`` / ``tool_call`` bridge (config
+    ``tools.tool_search``, default ``"auto"``) to save context on large tool
+    catalogs. That indirection is wrong for the AG-UI surface: the client
+    renders one card per tool call and the adapter streams ``TOOL_CALL_*`` keyed
+    on the *real* tool name (see :class:`events.AGUIEventBridge`) and detects
+    frontend-tool handoffs by name. A bridged ``tool_call`` dispatch would
+    surface ``tool_call`` instead of the real tool and break both. It also
+    matches the adapter's pre-existing contract — it always advertised its
+    (curated) toolset directly.
+
+    So we force the eager, pre-assembly tool list. Scoped to this adapter's
+    agent instance via the public ``skip_tool_search_assembly`` flag — no core
+    change and no global-config mutation. Runs BEFORE the frontend/state-writer
+    merge so those schemas still append on top.
+    """
+    try:
+        import model_tools
+        eager = model_tools.get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+    except Exception:  # noqa: BLE001 - fall back to whatever agent_init assembled
+        logger.debug("eager tool re-assembly failed; leaving agent.tools as built", exc_info=True)
+        return
+    agent.tools = eager
+    agent.valid_tool_names = {
+        t["function"]["name"]
+        for t in eager
+        if isinstance(t, dict) and isinstance(t.get("function"), dict) and t["function"].get("name")
+    }
+    invalidate = getattr(agent, "_invalidate_system_prompt", None)
+    if callable(invalidate):
+        try:
+            invalidate()
+        except Exception:
+            logger.debug("system-prompt invalidation failed", exc_info=True)
 
 
 def _merge_frontend_tools(agent, schemas: List[dict], names: set[str]) -> None:
