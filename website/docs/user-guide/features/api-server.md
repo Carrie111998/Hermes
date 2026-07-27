@@ -202,6 +202,12 @@ Lists the agent as an available model. The advertised model name defaults to the
 enumerate every authenticated provider/model combination Hermes can route to,
 and it does not do pricing or capability enrichment.
 
+When [text-to-speech](/user-guide/features/tts) is configured, each usable
+provider is also advertised as a `tts/<provider>` model (e.g. `tts/edge`,
+`tts/openai`) so OpenAI-compatible clients can target a specific voice backend
+on `/v1/audio/speech`. Only providers whose dependencies and credentials are
+actually satisfied are listed.
+
 ### GET /api/model/options
 
 Hermes-aware clients can request the same curated provider/model inventory used
@@ -233,6 +239,30 @@ curl \
 Use `/v1/models` when an OpenAI-compatible client only needs a model name to
 send back in chat/responses requests. Use `/api/model/options` when an
 authenticated UI needs the richer Hermes-specific picker metadata.
+
+### POST /v1/audio/speech
+
+OpenAI-compatible text-to-speech. Synthesizes `input` with the configured [TTS provider](/user-guide/features/tts) and returns the raw audio bytes.
+
+```bash
+curl http://localhost:8642/v1/audio/speech \
+  -H "Authorization: Bearer $API_SERVER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "tts/openai", "input": "Hello from Hermes.", "voice": "nova"}' \
+  --output speech.mp3
+```
+
+Request fields:
+
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `input` | yes | — | Text to synthesize. |
+| `model` | no | `tts.provider` from config | `tts/<provider>` (or a bare provider name). Defaults to the configured provider. Requesting a provider that isn't available returns `400`. |
+| `voice` | no | provider's configured voice | Overrides the voice/voice ID for this request. |
+| `response_format` | no | `mp3` | `mp3` or `opus`. Opus is produced natively by OpenAI/ElevenLabs/Mistral/Gemini and via ffmpeg otherwise. Unsupported values return `400`. |
+| `speed` | no | provider default | Clamped to OpenAI's `0.25`–`4.0` range. |
+
+The response `Content-Type` reflects the audio actually produced (e.g. `audio/mpeg`, `audio/ogg`), which may differ from `response_format` when a provider can't emit the requested codec (for example, Opus without ffmpeg installed). Advertised in `/v1/capabilities` via the `audio_api` feature flag and the `audio_speech` endpoint entry.
 
 ### GET /v1/capabilities
 
