@@ -11362,6 +11362,13 @@ def main():
     project_parser.set_defaults(func=cmd_project)
 
     # =========================================================================
+    # contacts command — profile-scoped identity and route registry
+    # =========================================================================
+    from hermes_cli.contacts_cmd import build_parser as _build_contacts_parser
+
+    _build_contacts_parser(subparsers)
+
+    # =========================================================================
     # hooks command — shell-hook inspection and management
     # =========================================================================
     # hooks command  (parser built in hermes_cli/subcommands/hooks.py)
