@@ -200,6 +200,39 @@ def test_sidebar_skill_encodes_the_single_lease_sequential_delivery_protocol() -
     assert "the unfinished lease" in skill
 
 
+def test_sidebar_skill_prioritizes_exact_task_hydration_without_creation() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "session_sidebar_hydration_pending(limit=1)" in skill
+    assert "hydration-pending --limit 1" in skill
+    assert "Prefer one actionable hydration pending or retry job" in skill
+    assert "Do not call both pending tools in one wake" in skill
+
+    hydration = skill.split("\n## In-place Hydration Procedure\n", 1)[1].split(
+        "\n## Registration Procedure\n", 1
+    )[0]
+    assert (
+        '`read_thread({"threadId":"<exact codex_thread_id>",'
+        '"turnLimit":10,"includeOutputs":false})`' in hydration
+    )
+    assert "exact linked task ID" in hydration
+    assert "exact hydration marker" in hydration
+    assert "session_sidebar_hydration_reserve" in hydration
+    assert "send_message_to_thread" in hydration
+    assert "hydration_message" in hydration
+    assert "session_sidebar_hydration_commit" in hydration
+    assert "session_sidebar_hydration_fail" in hydration
+    assert "`hydration_send_ambiguous`" in hydration
+    assert "`native_task_not_indexed`" in hydration
+    assert "`marker_conflict`" in hydration
+    assert "`codex_thread_conflict`" in hydration
+    assert "`source_identity_mismatch`" in hydration
+    assert "Never create, rename, archive, or replace a task in hydration mode" in hydration
+    assert "create_thread" not in hydration
+    assert "set_thread_title" not in hydration
+    assert "set_thread_archived" not in hydration
+
+
 def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
@@ -612,6 +645,10 @@ def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
         "session_sidebar_bind",
         "session_sidebar_commit",
         "session_sidebar_fail",
+        "session_sidebar_hydration_pending",
+        "session_sidebar_hydration_reserve",
+        "session_sidebar_hydration_commit",
+        "session_sidebar_hydration_fail",
         "session_continue",
     }
 
