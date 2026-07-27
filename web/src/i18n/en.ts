@@ -399,6 +399,8 @@ export const en: Translations = {
     authRequired: "Auth required",
     authRequiredHint: "Run this command to authenticate:",
     updateGit: "Git pull",
+    updateManaged: "Update",
+    managedUpdated: "Product updated",
     versionBadge: "Version",
     showInSidebar: "Show in sidebar",
     hideFromSidebar: "Hide from sidebar",

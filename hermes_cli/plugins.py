@@ -288,6 +288,9 @@ class PluginManifest:
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
+    update_mode: str = ""
+    update_contract: str = ""
+    update_entrypoint: str = ""
     source: str = ""        # "user", "project", or "entrypoint"
     path: Optional[str] = None
     # Plugin kind — see plugins.py module docstring for semantics.
@@ -1651,6 +1654,9 @@ class PluginManager:
                 "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s",
                 key, name, kind, source, plugin_dir,
             )
+            update = data.get("update")
+            if not isinstance(update, dict):
+                update = {}
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -1659,6 +1665,9 @@ class PluginManager:
                 requires_env=data.get("requires_env", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
+                update_mode=str(update.get("mode", "")),
+                update_contract=str(update.get("contract", "")),
+                update_entrypoint=str(update.get("entrypoint", "")),
                 source=source,
                 path=str(plugin_dir),
                 kind=kind,
@@ -2008,6 +2017,8 @@ class PluginManager:
                     "version": loaded.manifest.version,
                     "description": loaded.manifest.description,
                     "source": loaded.manifest.source,
+                    "update_mode": loaded.manifest.update_mode,
+                    "update_contract": loaded.manifest.update_contract,
                     "enabled": loaded.enabled,
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),

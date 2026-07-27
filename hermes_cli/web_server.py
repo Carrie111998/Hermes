@@ -102,7 +102,7 @@ from utils import env_var_enabled
 
 try:
     from fastapi import (
-        FastAPI, File, Form, HTTPException, Request, UploadFile,
+        APIRouter, FastAPI, File, Form, HTTPException, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -118,7 +118,7 @@ except ImportError:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import (
-            FastAPI, File, Form, HTTPException, Request, UploadFile,
+            APIRouter, FastAPI, File, Form, HTTPException, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
@@ -19524,11 +19524,19 @@ def _merged_plugins_hub() -> Dict[str, Any]:
         can_remove_update = (
             source in {"user", "git"} and under_user_tree and Path(dir_str).is_dir()
         )
+        manifest_data = _read_plugin_manifest_at(dir_path)
+        update_data = manifest_data.get("update")
+        update_mode = (
+            str(update_data.get("mode", ""))
+            if isinstance(update_data, dict)
+            else ""
+        )
+        is_managed_update = update_mode == "managed"
+        is_git_checkout = (Path(dir_str) / ".git").exists()
 
         # Check if this plugin provides tools that require auth
         auth_required = False
         auth_command = ""
-        manifest_data = _read_plugin_manifest_at(dir_path)
         provides_tools = manifest_data.get("provides_tools") or []
         if provides_tools:
             try:
@@ -19552,7 +19560,13 @@ def _merged_plugins_hub() -> Dict[str, Any]:
             "dashboard_manifest": _strip_dashboard_manifest(dm) if dm else None,
             "path": dir_str,
             "can_remove": can_remove_update,
-            "can_update_git": can_remove_update and (Path(dir_str) / ".git").exists(),
+            "can_update": can_remove_update and (
+                is_managed_update or is_git_checkout
+            ),
+            "can_update_git": (
+                can_remove_update and is_git_checkout and not is_managed_update
+            ),
+            "update_mode": update_mode or ("git" if is_git_checkout else ""),
             "auth_required": auth_required,
             "auth_command": auth_command,
             "user_hidden": name in hidden_plugins,
@@ -19656,7 +19670,7 @@ async def post_agent_plugin_update(request: Request, name: str):
     name = _validate_plugin_name(name)
     from hermes_cli.plugins_cmd import dashboard_update_user_plugin
 
-    result = dashboard_update_user_plugin(name)
+    result = await run_in_threadpool(dashboard_update_user_plugin, name)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Update failed.")
     _get_dashboard_plugins(force_rescan=True)
@@ -19814,30 +19828,78 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
-def _mount_plugin_api_routes():
-    """Import and mount backend API routes from plugins that declare them.
+_plugin_api_routes: Dict[str, tuple] = {}
+_plugin_api_modules: Dict[str, Any] = {}
+_plugin_api_mount_lock = threading.RLock()
 
-    Each plugin's ``api`` field points to a Python file that must expose
-    a ``router`` (FastAPI APIRouter).  Routes are mounted under
-    ``/api/plugins/<name>/``.
 
-    Backend import is restricted to ``bundled`` and ``user`` sources.
-    Project plugins (``./.hermes/plugins/``) ship with the CWD and are
-    therefore attacker-controlled in any threat model where the user
-    opens a malicious repo; they can extend the dashboard UI via
-    static JS/CSS but their Python ``api`` file is never auto-imported
-    by the web server.  See GHSA-5qr3-c538-wm9j (#29156).
+def _plugin_api_allowed(
+    plugin: Dict[str, Any],
+    enabled_set: set,
+    disabled_set: set,
+) -> bool:
+    name = str(plugin.get("name", ""))
+    source = plugin.get("source")
+    if source == "project":
+        _log.warning(
+            "Plugin %s: ignoring backend api=%s (project plugins may not "
+            "auto-import Python code; move the plugin to ~/.hermes/plugins/ "
+            "if you trust it)",
+            name,
+            plugin.get("_api_file"),
+        )
+        return False
+    if name in disabled_set:
+        _log.debug("Plugin %s: skipping API mount (explicitly disabled)", name)
+        return False
+    if source == "user" and name not in enabled_set:
+        _log.debug("Plugin %s: skipping API mount (not in plugins.enabled)", name)
+        return False
+    return source in {"user", "bundled"}
 
-    Additionally, user plugins must be explicitly enabled via the
-    ``plugins.enabled`` allow-list in config.yaml before their backend
-    code is imported. Without this gate, an installed-but-not-enabled
-    plugin's Python code would execute at dashboard startup — a code
-    execution vector that bypasses the user's intent. (#46435,
-    GHSA-mcfc-hp25-cjv7)
-    """
-    # Load the enabled/disabled sets once for the loop.
+
+def _load_plugin_api(plugin: Dict[str, Any]) -> tuple[Any, Any, tuple]:
+    """Import one plugin backend and build its prefixed routes off-app."""
+    name = str(plugin["name"])
+    dashboard_dir = Path(plugin["_dir"])
+    api_path = dashboard_dir / str(plugin["_api_file"])
     try:
-        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+        api_path.resolve().relative_to(dashboard_dir.resolve())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Plugin {name} API file is outside its dashboard directory."
+        ) from exc
+    if not api_path.is_file():
+        raise RuntimeError(
+            f"Plugin {name} declares api={plugin['_api_file']} but it was not found."
+        )
+
+    module_name = f"hermes_dashboard_plugin_{name}"
+    spec = importlib.util.spec_from_file_location(module_name, api_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load plugin {name} API module.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    router = getattr(module, "router", None)
+    if router is None:
+        sys.modules.pop(module_name, None)
+        raise RuntimeError(f"Plugin {name} API file has no 'router' attribute.")
+
+    staged = APIRouter()
+    staged.include_router(router, prefix=f"/api/plugins/{name}")
+    return module, router, tuple(staged.routes)
+
+
+def _mount_plugin_api_routes():
+    """Import enabled trusted/user plugin backends under isolated prefixes."""
+    try:
+        from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
+
         enabled_set = _get_enabled_set()
         disabled_set = _get_disabled_set()
     except Exception:
@@ -19845,87 +19907,216 @@ def _mount_plugin_api_routes():
         disabled_set = set()
 
     for plugin in _get_dashboard_plugins():
-        api_file_name = plugin.get("_api_file")
-        if not api_file_name:
-            continue
-        plugin_name = plugin.get("name", "")
-        # Gate: user plugins must be in plugins.enabled and not in
-        # plugins.disabled before we import their Python code.
-        # Bundled plugins are trusted (they ship with the release) but
-        # still respect an explicit disable.
-        if plugin.get("source") == "user":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-            if plugin_name not in enabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (not in plugins.enabled)",
-                    plugin_name,
-                )
-                continue
-        elif plugin.get("source") == "bundled":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-        if plugin.get("source") == "project":
-            _log.warning(
-                "Plugin %s: ignoring backend api=%s (project plugins may "
-                "not auto-import Python code; move the plugin to "
-                "~/.hermes/plugins/ if you trust it)",
-                plugin["name"], api_file_name,
-            )
-            continue
-        dashboard_dir = Path(plugin["_dir"])
-        api_path = dashboard_dir / api_file_name
-        try:
-            resolved_api = api_path.resolve()
-            resolved_base = dashboard_dir.resolve()
-            resolved_api.relative_to(resolved_base)
-        except (OSError, RuntimeError, ValueError):
-            # Discovery already filters this, but re-check here in case
-            # ``_dir`` was tampered with after caching or a future caller
-            # bypasses the validator.  Defence in depth keeps the import
-            # primitive contained even if the upstream check regresses.
-            _log.warning(
-                "Plugin %s: refusing to import api file outside its "
-                "dashboard directory (%s)", plugin["name"], api_path,
-            )
-            continue
-        if not api_path.exists():
-            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
+        name = str(plugin.get("name", ""))
+        if not plugin.get("_api_file") or not _plugin_api_allowed(
+            plugin, enabled_set, disabled_set
+        ):
             continue
         try:
-            module_name = f"hermes_dashboard_plugin_{plugin['name']}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            if spec is None or spec.loader is None:
-                continue
-            mod = importlib.util.module_from_spec(spec)
-            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
-            # can resolve forward references (e.g. models defined in a file
-            # that uses `from __future__ import annotations`). Without this,
-            # TypeAdapter lazy-build fails at first request with
-            # "is not fully defined" because the module namespace isn't
-            # reachable by name for string-annotation resolution.
-            sys.modules[module_name] = mod
-            try:
-                spec.loader.exec_module(mod)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
-            router = getattr(mod, "router", None)
-            if router is None:
-                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
-                continue
-            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
-            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
+            module, router, _staged_routes = _load_plugin_api(plugin)
+            first_route = len(app.router.routes)
+            app.include_router(router, prefix=f"/api/plugins/{name}")
+            routes = tuple(app.router.routes[first_route:])
+            _plugin_api_routes[name] = routes
+            _plugin_api_modules[name] = module
+            _log.info("Mounted plugin API routes: /api/plugins/%s/", name)
         except Exception as exc:
-            _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+            _log.warning("Failed to load plugin %s API routes: %s", name, exc)
+
+
+def _module_is_under(module: Any, root: Path) -> bool:
+    candidates: List[Path] = []
+    module_file = getattr(module, "__file__", None)
+    if module_file:
+        candidates.append(Path(module_file))
+    module_path = getattr(module, "__path__", None)
+    if module_path:
+        candidates.extend(Path(value) for value in module_path)
+    for candidate in candidates:
+        try:
+            candidate.resolve().relative_to(root)
+            return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
+
+
+def _managed_plugin_entry(name: str, plugin_root: Path) -> Dict[str, Any]:
+    from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
+
+    enabled_set = _get_enabled_set()
+    disabled_set = _get_disabled_set()
+    for plugin in _get_dashboard_plugins(force_rescan=True):
+        if (
+            plugin.get("name") == name
+            and Path(plugin["_dir"]).resolve().parent == plugin_root
+            and plugin.get("_api_file")
+            and _plugin_api_allowed(plugin, enabled_set, disabled_set)
+        ):
+            return plugin
+    raise RuntimeError(
+        f"Managed plugin '{name}' is not enabled with a mounted dashboard backend."
+    )
+
+
+def _preflight_managed_plugin_reload(name: str, plugin_root: Path) -> None:
+    _managed_plugin_entry(name, plugin_root)
+    if name not in _plugin_api_routes:
+        raise RuntimeError(
+            f"Managed plugin '{name}' backend is not mounted. Enable it and "
+            "restart the dashboard before Update."
+        )
+
+
+def _has_mounted_managed_plugin() -> bool:
+    from hermes_cli.managed_plugin_update import get_managed_update_spec
+
+    plugins_root = get_process_hermes_home() / "plugins"
+    for name in _plugin_api_routes:
+        try:
+            if get_managed_update_spec(plugins_root / name) is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _managed_product_identity(name: str, plugin_root: Path) -> tuple[str, str | None]:
+    git = shutil.which("git")
+    if not git:
+        raise RuntimeError("git is required to attest managed plugin source.")
+    head = subprocess.run(
+        [git, "rev-parse", "HEAD"],
+        cwd=str(plugin_root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+    dirty = subprocess.run(
+        [git, "status", "--porcelain", "--untracked-files=all"],
+        cwd=str(plugin_root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+    source_commit = head.stdout.strip()
+    if (
+        head.returncode != 0
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or dirty.returncode != 0
+        or dirty.stdout.strip()
+    ):
+        raise RuntimeError(
+            "Managed plugin checkout is not a clean, attestable Git commit."
+        )
+
+    state_path = get_process_hermes_home() / name / "service-state.json"
+    if not state_path.is_file():
+        return source_commit, None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Managed product state is not valid JSON.") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("Managed product state is invalid.")
+    desired_state = state.get("desired_state")
+    if desired_state == "uninstalled":
+        if (
+            state.get("product_source_commit") is not None
+            or state.get("product_version") is not None
+        ):
+            raise RuntimeError(
+                "Uninstalled managed product state contains a stale product identity."
+            )
+        return source_commit, None
+    if desired_state != "installed":
+        raise RuntimeError("Managed product desired state is invalid.")
+    state_commit = state.get("product_source_commit")
+    product_version = state.get("product_version")
+    if state_commit != source_commit or not isinstance(product_version, str):
+        raise RuntimeError(
+            "Managed product state does not match the checked-out source."
+        )
+    return source_commit, product_version
+
+
+def _reload_managed_plugin_backend(
+    name: str,
+    plugin_root: Path,
+    source_commit: str,
+    product_version: str | None,
+) -> Dict[str, Any]:
+    """Load fresh code, atomically replace routes, and attest host-derived state."""
+    plugin = _managed_plugin_entry(name, plugin_root)
+    importlib.invalidate_caches()
+    for cache_dir in plugin_root.rglob("__pycache__"):
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    before = _managed_product_identity(name, plugin_root)
+    if before != (source_commit, product_version):
+        raise RuntimeError(
+            "Managed product state does not match the requested reload target."
+        )
+
+    previous_modules = {
+        module_name: module
+        for module_name, module in tuple(sys.modules.items())
+        if module is not None and _module_is_under(module, plugin_root)
+    }
+    for module_name in previous_modules:
+        sys.modules.pop(module_name, None)
+
+    try:
+        module, _router, new_routes = _load_plugin_api(plugin)
+        for cache_dir in plugin_root.rglob("__pycache__"):
+            if cache_dir.is_dir():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+        after = _managed_product_identity(name, plugin_root)
+        if after != (source_commit, product_version):
+            raise RuntimeError(
+                "Managed product changed while its backend was being loaded."
+            )
+    except Exception:
+        for module_name, candidate in tuple(sys.modules.items()):
+            if candidate is not None and _module_is_under(candidate, plugin_root):
+                sys.modules.pop(module_name, None)
+        sys.modules.update(previous_modules)
+        raise
+
+    with _plugin_api_mount_lock:
+        old_route_ids = {id(route) for route in _plugin_api_routes.get(name, ())}
+        current_routes = app.router.routes
+        insertion_index = next(
+            (
+                index
+                for index, route in enumerate(current_routes)
+                if id(route) in old_route_ids
+            ),
+            len(current_routes),
+        )
+        retained_routes = [
+            route for route in current_routes if id(route) not in old_route_ids
+        ]
+        app.router.routes = (
+            retained_routes[:insertion_index]
+            + list(new_routes)
+            + retained_routes[insertion_index:]
+        )
+        _plugin_api_routes[name] = new_routes
+        _plugin_api_modules[name] = module
+
+    return {
+        "reloaded": True,
+        "loaded_source_commit": after[0],
+        "loaded_product_version": after[1],
+    }
 
 
 # Mount plugin API routes before the SPA catch-all.
@@ -20240,6 +20431,19 @@ def start_server(
             if server.should_exit:
                 return
 
+            managed_update_coordinator = None
+            if _has_mounted_managed_plugin():
+                from hermes_cli.managed_plugin_update import ManagedUpdateCoordinator
+
+                try:
+                    managed_update_coordinator = ManagedUpdateCoordinator(
+                        preflight=_preflight_managed_plugin_reload,
+                        reload_backend=_reload_managed_plugin_backend,
+                    )
+                except Exception:
+                    if server.started:
+                        await server.shutdown()
+                    raise
             actual_port = _read_bound_port(server, fallback=port)
             app.state.bound_port = actual_port
 
@@ -20299,9 +20503,13 @@ def start_server(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
 
-            await server.main_loop()
-            if server.started:
-                await server.shutdown()
+            try:
+                await server.main_loop()
+            finally:
+                if server.started:
+                    await server.shutdown()
+                if managed_update_coordinator is not None:
+                    managed_update_coordinator.close()
 
     # On POSIX, keep the long-standing ``asyncio.run(_serve())`` behavior
     # unchanged — Python's default loop there is already a SelectorEventLoop

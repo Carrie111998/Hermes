@@ -268,11 +268,24 @@ hermes plugins list                          # table: enabled / disabled / not e
 hermes plugins install user/repo             # install from Git, then prompt Enable? [y/N]
 hermes plugins install user/repo --enable    # install AND enable (no prompt)
 hermes plugins install user/repo --no-enable # install but leave disabled (no prompt)
-hermes plugins update my-plugin              # pull latest
+hermes plugins update my-plugin              # update (Git pull unless managed)
 hermes plugins remove my-plugin              # uninstall
 hermes plugins enable my-plugin              # add to allow-list
 hermes plugins disable my-plugin             # remove from allow-list + add to disabled
 ```
+
+For ordinary Git plugins, **Update** remains `git pull --ff-only`. A plugin
+that declares a managed product update has one Update operation instead: its
+plugin source, native runtime, service activation, health proof, and mounted
+dashboard backend advance or roll back together. Hermes does not offer a
+separate source-only Git update for that plugin.
+
+Managed Update requires a matching profile's dashboard or desktop backend host
+to be running with the plugin enabled and mounted. If it is unavailable, the
+CLI and dashboard fail before fetching or changing files and tell you to start
+or restart a backend host. A successful response means requests after the
+update are reaching the newly loaded backend implementation, not merely
+rescanned metadata.
 
 ### Interactive UI
 

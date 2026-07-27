@@ -85,6 +85,73 @@ requires_env:          # gate loading on env vars; prompted during install
     secret: true
 ```
 
+### Managed product updates
+
+Most Git-installed plugins are updated with `git pull --ff-only`. A plugin
+whose source and native runtime form one versioned product can instead declare
+the host-coordinated managed update contract:
+
+```yaml
+update:
+  mode: managed
+  contract: t3code-hermes-v1
+  entrypoint: integrations/hermes_plugin/update_process.py
+```
+
+For such a plugin, Hermes exposes one **Update** operation. Both
+`hermes plugins update <name>` and the dashboard update endpoint run the
+declared entrypoint as an isolated Python worker:
+
+```text
+python -I <entrypoint> <absolute-plugin-root> update
+```
+
+Hermes never falls back to `git pull` when `update.mode` is `managed`; a
+malformed or unreadable manifest also fails closed instead of guessing that
+the plugin is unmanaged. The entrypoint owns the complete
+source/runtime/service transaction and must print one JSON object with
+`{"ok": true, ...}` only after coherent success.
+
+The `t3code-hermes-v1` worker imports
+`hermes_cli.managed_plugin_update.get_managed_update_contract("t3code")`.
+The returned synchronous object has `version == 1` and these methods:
+
+```python
+contract.preflight(plugin_name=..., plugin_root=...)
+contract.complete(
+    plugin_name=...,
+    plugin_root=...,
+    source_commit=...,
+    product_version=...,
+)
+contract.rollback(
+    plugin_name=...,
+    plugin_root=...,
+    source_commit=...,
+    product_version=...,  # may be None when restoring an uninstalled product
+)
+```
+
+`preflight` is mutation-free and fails unless a matching profile's dashboard
+or desktop backend host is running, the plugin is enabled, and its backend is mounted. Call it
+before fetch, checkout, runtime replacement, or service changes. `complete`
+and `rollback` return only after Hermes has imported fresh backend code,
+atomically replaced the plugin's prefixed routes, and independently attested
+the requested Git commit and product version. The product identity is read
+from `<HERMES_HOME>/t3code/service-state.json` (`product_source_commit` and
+`product_version` for installed state); caller-provided values are comparison
+targets, not attestation.
+
+The host handoff uses an authenticated, profile-local loopback coordinator.
+When multiple same-profile dashboard/backend hosts have the managed plugin
+mounted, the contract preflights and remounts every live host and rejects
+inconsistent attestations.
+Plugins must not read dashboard session tokens, implement remote reload
+endpoints, or attempt to restart the dashboard from an in-flight handler.
+The product transaction must serialize its own lifecycle work and must call
+`rollback` after restoring prior source/runtime/state whenever activation
+fails after source cutover.
+
 ## Step 3: Write the tool schemas
 
 Create `schemas.py` — this is what the LLM reads to decide when to call your tools:

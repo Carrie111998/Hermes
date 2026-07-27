@@ -1008,8 +1008,7 @@ function PluginRowCard(props: PluginRowCardProps) {
               </Link>
             ) : null}
 
-            {row.can_update_git ? (
-
+            {row.can_update ? (
               <Button
                 disabled={busy}
                 ghost
@@ -1017,12 +1016,19 @@ function PluginRowCard(props: PluginRowCardProps) {
                 onClick={() => {
                   void setRuntimeLoading(row.name, async () => {
                     await api.updateAgentPlugin(row.name);
-                    showToast(t.pluginsPage.updateGit, "success");
+                    showToast(
+                      row.update_mode === "managed"
+                        ? (t.pluginsPage.managedUpdated ?? "Product updated")
+                        : t.pluginsPage.updateGit,
+                      "success",
+                    );
                   });
                 }}
               >
                 {busy ? <Spinner /> : null}
-                {t.pluginsPage.updateGit}
+                {row.update_mode === "managed"
+                  ? (t.pluginsPage.updateManaged ?? "Update")
+                  : t.pluginsPage.updateGit}
               </Button>
             ) : null}
 
