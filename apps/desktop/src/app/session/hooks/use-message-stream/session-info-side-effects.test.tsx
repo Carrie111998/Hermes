@@ -13,9 +13,14 @@ const mocks = vi.hoisted(() => ({
   cwdFollowMock: vi.fn<(_: string) => Promise<void>>(async () => undefined)
 }))
 
-vi.mock('@/store/projects', () => ({
-  followActiveSessionCwd: mocks.cwdFollowMock
-}))
+vi.mock('@/store/projects', async () => {
+  const actual = await vi.importActual('@/store/projects')
+
+  return {
+    ...actual,
+    followActiveSessionCwd: mocks.cwdFollowMock
+  }
+})
 
 import { $currentCwd, setCurrentModel, setCurrentProvider } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
