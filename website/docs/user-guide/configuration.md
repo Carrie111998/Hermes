@@ -117,14 +117,14 @@ terminal:
   timeout: 180      # Per-command timeout in seconds
   home_mode: auto   # auto | real | profile — subprocess HOME policy
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
-  shell_init_files: []      # Shell init files to source before the env snapshot (e.g. ~/.zshrc, ~/.nvm/nvm.sh); ~ and ${VAR} expand, missing files are skipped. Setting a list disables the default ~/.bashrc auto-source
-  auto_source_bashrc: true  # Auto-source ~/.bashrc / ~/.profile when shell_init_files is unset, so tools registered there (nvm, asdf, pyenv) stay visible (default: true)
+  shell_init_files: []      # Shell init files to source before the env snapshot (e.g. ~/.zshrc, ~/.nvm/nvm.sh); ~ and ${VAR} expand, missing files are skipped. Setting a list replaces the whole default list below, not just ~/.bashrc
+  auto_source_bashrc: true  # Non-Windows only: with shell_init_files unset, source ~/.profile, ~/.bash_profile, then ~/.bashrc so tools registered there (nvm, asdf, pyenv) stay visible (default: true)
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"                 # Container image for Modal backend
   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Container image for Daytona backend
 ```
 
-If terminal commands report `command not found` for tools like `nvm` or `pyenv`, see the FAQ entry on shell init files.
+If terminal commands report `command not found` for tools like `nvm` or `pyenv`, see the [FAQ](/reference/faq) entry on `node: command not found`.
 
 For cloud sandboxes such as Modal and Daytona, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
 
