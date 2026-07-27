@@ -72,6 +72,7 @@ None submitted yet — pushing requires authorization.
 | `7f9e41aaf` | this ledger, its drift check, and `scripts/safe_update.py` |
 | `d9f3996d8` | behavioral evaluation harness + `.github/workflows/hermes-audit-guards.yml` |
 | `6fab15b17` | FakeRunner composes the ultra mixin; XFAIL disposition recorded |
+| `7efb1104e` | drift check exempts ledger-only commits (it could not converge) |
 
 ## test-only
 
