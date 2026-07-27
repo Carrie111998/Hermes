@@ -281,11 +281,50 @@ def post_journal(
     if not materialized or debit <= 0 or debit != credit:
         raise AccountingError("journal entry must contain balanced, non-zero debits and credits")
     existing = conn.execute(
-        """SELECT id FROM journal_entries
+        """SELECT * FROM journal_entries
            WHERE organization_id = ? AND source_type = ? AND source_id = ?""",
         (organization_id, source_type, source_id),
     ).fetchone()
     if existing:
+        requested_currency = str(currency).upper()
+        persisted_lines = [
+            {
+                "account_code": str(row["code"]),
+                "debit_minor": int(row["debit_minor"]),
+                "credit_minor": int(row["credit_minor"]),
+                "tax_code": row["tax_code"],
+                "party": json.loads(row["party_json"] or "{}"),
+                "memo": row["memo"],
+            }
+            for row in conn.execute(
+                """SELECT a.code, l.debit_minor, l.credit_minor, l.tax_code,
+                          l.party_json, l.memo
+                     FROM journal_lines l
+                     JOIN ledger_accounts a ON a.id = l.account_id
+                    WHERE l.journal_entry_id = ?""",
+                (existing["id"],),
+            )
+        ]
+        requested_lines = [
+            {
+                "account_code": str(line["account_code"]),
+                "debit_minor": int(line.get("debit_minor", 0)),
+                "credit_minor": int(line.get("credit_minor", 0)),
+                "tax_code": line.get("tax_code"),
+                "party": line.get("party", {}),
+                "memo": line.get("memo"),
+            }
+            for line in materialized
+        ]
+        canonical = lambda values: sorted(
+            (_json(value) for value in values), key=str
+        )
+        if (
+            str(existing["description"]) != str(description)
+            or str(existing["currency"]).upper() != requested_currency
+            or canonical(persisted_lines) != canonical(requested_lines)
+        ):
+            raise AccountingError("journal source was reused with different parameters")
         return str(existing["id"])
     occurred = occurred_at or int(time.time())
     period = conn.execute(

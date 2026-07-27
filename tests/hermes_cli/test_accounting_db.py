@@ -76,6 +76,50 @@ def test_journal_is_balanced_idempotent_and_immutable(conn):
     assert statements["balance_sheet"]["assets_minor"] == 1000
 
 
+def test_journal_retry_rejects_source_parameter_drift(conn):
+    accounting_db.post_journal(
+        conn,
+        organization_id="org_1",
+        description="Founder capital",
+        source_type="payment",
+        source_id="payment-1",
+        currency="USD",
+        lines=(
+            {"account_code": "1000", "debit_minor": 1000},
+            {"account_code": "3000", "credit_minor": 1000},
+        ),
+        evidence={"provider": "test"},
+    )
+    with pytest.raises(accounting_db.AccountingError, match="different parameters"):
+        accounting_db.post_journal(
+            conn,
+            organization_id="org_1",
+            description="Founder capital",
+            source_type="payment",
+            source_id="payment-1",
+            currency="USD",
+            lines=(
+                {"account_code": "1000", "debit_minor": 1100},
+                {"account_code": "3000", "credit_minor": 1100},
+            ),
+            evidence={"provider": "test"},
+        )
+    with pytest.raises(accounting_db.AccountingError, match="different parameters"):
+        accounting_db.post_journal(
+            conn,
+            organization_id="org_1",
+            description="Changed description",
+            source_type="payment",
+            source_id="payment-1",
+            currency="USD",
+            lines=(
+                {"account_code": "1000", "debit_minor": 1000},
+                {"account_code": "3000", "credit_minor": 1000},
+            ),
+            evidence={"provider": "test"},
+        )
+
+
 def test_tax_calculation_requires_verified_effective_rule(conn):
     now = int(time.time())
     with pytest.raises(accounting_db.AccountingError, match="no verified tax rule"):
