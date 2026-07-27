@@ -107,11 +107,22 @@ def test_enforce_can_report_without_exiting(monkeypatch):
     assert rg.enforce(exit_on_failure=False, stream=io.StringIO()) is False
 
 
-def test_vulnerable_sqlite_warns_but_never_blocks_startup(monkeypatch):
-    """SQLite is advisory: it must warn, and must NOT gate startup."""
+def test_vulnerable_sqlite_blocks_startup(monkeypatch):
+    """Vulnerable SQLite must GATE startup, not merely warn.
+
+    This reverses the original advisory design deliberately. Warning-only left a
+    live corruption path: hermes-agent/venv is Python 3.11.15 -- inside
+    requires-python, so the Python half of the guard passes it -- linking SQLite
+    3.50.4, and ~10 of the profile's 11 databases are already in WAL. Upstream's
+    "refuse WAL on new databases" does not retroactively protect those. A guard
+    that observes the exact precondition for database corruption and returns
+    control to the caller is documentation, not a guard.
+    """
     monkeypatch.setattr(rg, "check_python", lambda **k: True)
     monkeypatch.setattr(rg, "check_sqlite", lambda **k: False)
-    assert rg.enforce(exit_on_failure=True, stream=io.StringIO()) is True
+    with pytest.raises(SystemExit) as exc:
+        rg.enforce(exit_on_failure=True, stream=io.StringIO())
+    assert exc.value.code == 1
 
 
 def test_sqlite_check_matches_upstream_predicate():
@@ -122,11 +133,48 @@ def test_sqlite_check_matches_upstream_predicate():
     assert rg.check_sqlite(stream=out) is (not is_sqlite_wal_reset_vulnerable())
 
 
-def test_sqlite_warning_can_be_suppressed(monkeypatch):
+def test_suppress_env_cannot_bypass_a_real_corruption_risk(monkeypatch):
+    """The cosmetic suppressor must not double as a safety override.
+
+    HERMES_SUPPRESS_SQLITE_WARNING used to return True before the vulnerability
+    was even probed, so one env var silently converted a corruption risk into a
+    clean start. In this system an emergency-bypass file already became the
+    routine path (2109 BYPASS vs 58 ALLOW in a gate audit log); a silent env
+    bypass is the same failure with less friction.
+    """
+    monkeypatch.setattr(rg, "_sqlite_vulnerable", lambda: (True, "3.50.4"))
     monkeypatch.setenv(rg.SUPPRESS_SQLITE_WARNING_ENV, "1")
+    monkeypatch.delenv(rg.ALLOW_VULNERABLE_SQLITE_ENV, raising=False)
+    out = io.StringIO()
+    assert rg.check_sqlite(stream=out) is False, "suppressor bypassed the risk"
+
+
+def test_explicit_override_allows_vulnerable_sqlite_but_is_loud(monkeypatch):
+    """Rollback to the 3.11 venv stays possible -- deliberately and audibly."""
+    monkeypatch.setattr(rg, "_sqlite_vulnerable", lambda: (True, "3.50.4"))
+    monkeypatch.setenv(rg.ALLOW_VULNERABLE_SQLITE_ENV, "1")
+    monkeypatch.setenv(rg.SUPPRESS_SQLITE_WARNING_ENV, "1")  # must not silence this
+    out = io.StringIO()
+    assert rg.check_sqlite(stream=out) is True
+    text = out.getvalue()
+    assert "3.50.4" in text and "OVERRIDE" in text.upper(), (
+        "an accepted corruption risk must still be announced"
+    )
+
+
+def test_safe_sqlite_is_silent(monkeypatch):
+    monkeypatch.setattr(rg, "_sqlite_vulnerable", lambda: (False, "3.53.1"))
     out = io.StringIO()
     assert rg.check_sqlite(stream=out) is True
     assert out.getvalue() == ""
+
+
+def test_unprobeable_sqlite_does_not_pass_silently(monkeypatch):
+    """If the version cannot be determined, say so rather than assuming safe."""
+    monkeypatch.setattr(rg, "_sqlite_vulnerable", lambda: (None, ""))
+    out = io.StringIO()
+    assert rg.check_sqlite(stream=out) is True  # unknown must not brick startup
+    assert out.getvalue().strip(), "an unverifiable runtime must not be silent"
 
 
 # ── the guard is actually wired into the CLI ─────────────────────────────────

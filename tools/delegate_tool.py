@@ -2306,6 +2306,14 @@ def _run_single_child(
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        # H-01: a crashed child still produces a non-empty ``final_response`` —
+        # the outer loop writes "I apologize, but I encountered an error ..."
+        # into it — so summary-presence alone reported the delegated work as
+        # done and the parent proceeded on an apology. Shared predicate so this
+        # cannot drift from the finalizer's own definition.
+        from agent.turn_finalizer import turn_crashed
+
+        child_crashed = turn_crashed(result.get("turn_exit_reason"))
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -2327,25 +2335,15 @@ def _run_single_child(
             or str(result.get("turn_exit_reason") or "") == EMPTY_TERMINAL_EXIT_REASON
         )
 
-        # A crashed child is not a completed one. conversation_loop writes an
-        # apology into final_response on a crash exit, which is a non-empty
-        # summary and is not the "(empty)" sentinel — so deriving success from
-        # "there is output" reported the crash to the parent as
-        # status="completed", and the parent proceeded as though the delegated
-        # work was done. `completed` was already read above and then ignored.
-        #
         # Keyed on the crash exit reasons specifically, NOT on `completed`:
         # a child that hits max_iterations but produces usable output is
         # deliberately still "completed", with exit_reason telling the parent
-        # how it ended. Gating on `completed` wholesale would silently reclassify
-        # those as failures.
-        from agent.turn_finalizer import CRASH_EXIT_PREFIXES
-
-        _crashed = str(result.get("turn_exit_reason") or "").startswith(CRASH_EXIT_PREFIXES)
-
+        # how it ended. Gating on `completed` wholesale would silently
+        # reclassify those as failures.
         if interrupted:
             status = "interrupted"
-        elif _crashed:
+        elif child_crashed:
+            # Checked before the summary branch: the crash apology IS a summary.
             status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
@@ -2396,6 +2394,11 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif child_crashed:
+            # Without this the crash falls through to "max_iterations", which is
+            # a specific and wrong diagnosis — the parent would retry a budget
+            # problem that never happened.
+            exit_reason = "crashed"
         elif completed:
             exit_reason = "completed"
         else:

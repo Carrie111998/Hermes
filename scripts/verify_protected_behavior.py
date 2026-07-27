@@ -119,9 +119,13 @@ def _reintroduce_phantom_path(src: str) -> str:
 
 
 def _drop_steer_neutralization(src: str) -> str:
-    return _sub(src,
-                "wrapped = _neutralize_forged_trust_markers(_maybe_wrap_untrusted(name, content))",
-                "wrapped = _maybe_wrap_untrusted(name, content)")
+    """Anchored dynamically: the neutralizer was renamed once already
+    (_neutralize_steer_markers -> _neutralize_forged_trust_markers) and the
+    hard-coded anchor went stale silently. Find the call site by shape."""
+    target = next(l for l in src.split(chr(10))
+                  if "wrapped = " in l and "_maybe_wrap_untrusted(name, content)" in l)
+    return _sub(src, target,
+                "    wrapped = _maybe_wrap_untrusted(name, content)")
 
 
 def _restore_blocking_with(src: str) -> str:
@@ -160,6 +164,13 @@ def _restore_silent_overwrite(src: str) -> str:
 
 def _drop_memory_threat_scan(src: str) -> str:
     return _sub(src, '"[System note: recalled memory context', '"[System note: authoritative reference data')
+
+
+def _downgrade_sqlite_to_advisory(src: str) -> str:
+    """Upstream restores advisory SQLite. hermes-agent/venv is 3.11.15 —
+    INSIDE requires-python, so the Python half waves it through — linking
+    SQLite 3.50.4 against ~10 already-WAL databases."""
+    return _sub(src, "    ok = python_ok and sqlite_ok", "    ok = python_ok")
 
 
 SCENARIOS: List[Scenario] = [
@@ -212,6 +223,9 @@ SCENARIOS: List[Scenario] = [
     Scenario("reframe-memory-as-authoritative",
              "untrusted provider memory is laundered back into an obey-this framing",
              REPO / "agent" / "memory_manager.py", _drop_memory_threat_scan),
+    Scenario("downgrade-sqlite-to-advisory",
+             "merge restores advisory SQLite; a supported runtime reopens WAL corruption",
+             REPO / "hermes_cli" / "runtime_guard.py", _downgrade_sqlite_to_advisory),
 ]
 
 

@@ -304,6 +304,116 @@ def test_plugin_hook_dispatch_still_exists():
     assert callable(plugin_mod.invoke_hook)
 
 
+# ── 8. vulnerable SQLite must GATE, not merely warn ──────────────────────────
+# Added after the guard shipped advisory-only. hermes-agent/venv is Python
+# 3.11.15 -- inside requires-python, so the Python half passes it -- linking
+# SQLite 3.50.4 against ~10 already-WAL databases. An upstream merge that
+# restores "advisory" reopens a live corruption path on a runtime the guard
+# itself calls supported, and nothing else would notice.
+
+def test_vulnerable_sqlite_gates_startup():
+    from hermes_cli import runtime_guard as rg
+
+    calls = {}
+    rg_enforce_src = _read(REPO / "hermes_cli" / "runtime_guard.py")
+    assert "check_sqlite" in rg_enforce_src
+
+    # enforce() must fail when the SQLite half fails, independent of Python.
+    import io as _io
+    orig_py, orig_sq = rg.check_python, rg.check_sqlite
+    try:
+        rg.check_python = lambda **k: True
+        rg.check_sqlite = lambda **k: False
+        try:
+            rg.enforce(exit_on_failure=True, stream=_io.StringIO())
+        except SystemExit as exc:
+            calls["exit"] = exc.code
+    finally:
+        rg.check_python, rg.check_sqlite = orig_py, orig_sq
+
+    assert calls.get("exit") == 1, (
+        "vulnerable SQLite no longer gates startup -- it is advisory again"
+    )
+
+
+def test_sqlite_suppressor_cannot_clear_a_real_vulnerability():
+    """The cosmetic silencer must never double as a safety override."""
+    from hermes_cli import runtime_guard as rg
+    import io as _io
+
+    assert hasattr(rg, "ALLOW_VULNERABLE_SQLITE_ENV"), (
+        "the explicit accept-the-risk override was removed"
+    )
+    orig = rg._sqlite_vulnerable
+    old_suppress = os.environ.get(rg.SUPPRESS_SQLITE_WARNING_ENV)
+    old_allow = os.environ.get(rg.ALLOW_VULNERABLE_SQLITE_ENV)
+    try:
+        rg._sqlite_vulnerable = lambda: (True, "3.50.4")
+        os.environ[rg.SUPPRESS_SQLITE_WARNING_ENV] = "1"
+        os.environ.pop(rg.ALLOW_VULNERABLE_SQLITE_ENV, None)
+        assert rg.check_sqlite(stream=_io.StringIO()) is False, (
+            "SUPPRESS_SQLITE_WARNING bypasses the vulnerability check again"
+        )
+    finally:
+        rg._sqlite_vulnerable = orig
+        for k, v in ((rg.SUPPRESS_SQLITE_WARNING_ENV, old_suppress),
+                     (rg.ALLOW_VULNERABLE_SQLITE_ENV, old_allow)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ── 9. a crashed turn must not report completed (H-01) ───────────────────────
+
+def test_delegate_tool_does_not_report_a_crashed_child_completed():
+    src = _read(REPO / "tools" / "delegate_tool.py")
+    assert "turn_crashed" in src, "delegate_tool stopped consulting the predicate"
+    assert src.index("elif child_crashed:") < src.index(
+        "elif summary and not _empty_sentinel:"
+    ), "the crash check no longer precedes the summary-presence branch"
+
+
+# ── 10. the steer marker must stay unforgeable from tool output (H-05) ───────
+
+def test_force_push_gated_including_plus_refspec():
+    """`git push origin +main` IS --force for that ref. It matched neither
+    existing pattern and was auto-approved, so a rebase-and-sync could destroy
+    collaborator commits on the remote with no prompt."""
+    from tools.approval import detect_dangerous_command
+
+    def flagged(cmd):
+        r = detect_dangerous_command(cmd)
+        return bool(r[0]) if isinstance(r, tuple) else bool(r)
+
+    assert flagged("git push --force origin main")
+    assert flagged("git push -f origin main")
+    assert flagged("git push origin +main"), "the +refspec spelling is ungated again"
+    assert not flagged("git push origin main"), "ordinary push must not be gated"
+
+
+# ── 12. .env must be write-protected, not only read-protected (H-25) ─────────
+
+def test_project_env_is_write_denied_not_only_read_denied():
+    """The asymmetry was the bug: the agent could not READ your .env but could
+    silently REPLACE it, destroying live credentials with no prompt."""
+    import tempfile
+    from agent.file_safety import _classify_write_denial, get_read_block_error
+
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, ".env")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("DATABASE_URL=postgres://real\n")
+
+    assert bool(get_read_block_error(p)), "read protection regressed"
+    assert bool(_classify_write_denial(p)), "write protection regressed — .env is clobberable"
+    # templates must stay writable or the agent routes around the gate
+    tmpl = os.path.join(d, ".env.example")
+    with open(tmpl, "w", encoding="utf-8") as fh:
+        fh.write("X=1\n")
+    assert _classify_write_denial(tmpl) is None
+
+
 # ── 11. steer markers cannot be forged from tool output ──────────────────────
 
 def test_tool_results_neutralize_forged_steer_markers():
@@ -345,7 +455,13 @@ def test_crash_exits_are_excluded_from_completion():
     from agent.turn_finalizer import finalize_turn
 
     src = inspect.getsource(finalize_turn)
-    assert "CRASH_EXIT_PREFIXES" in src, "crash exits are completions again"
+    # Either spelling is fine — the constant inline, or the shared
+    # turn_crashed() predicate built on it. What must not happen is
+    # finalize_turn deciding "crashed" by some private rule of its own,
+    # because delegate_tool has to reach the identical verdict.
+    assert ("CRASH_EXIT_PREFIXES" in src or "turn_crashed(" in src), (
+        "crash exits are completions again"
+    )
     assert "and not crashed" in src, "crash exclusion dropped from the completion rule"
 
     # The parent must classify a crashed child the same way. Fixing only the
@@ -353,7 +469,8 @@ def test_crash_exits_are_excluded_from_completion():
     # because it derived success from "is there a summary?" and a crash
     # produces a non-empty apology.
     delegate_src = _read(REPO / "tools" / "delegate_tool.py")
-    assert "CRASH_EXIT_PREFIXES" in delegate_src, (
+    assert ("CRASH_EXIT_PREFIXES" in delegate_src
+            or "turn_crashed" in delegate_src), (
         "delegate_tool reports a crashed child as completed again"
     )
 

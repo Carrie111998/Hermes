@@ -144,12 +144,17 @@ def test_delegate_tool_classifies_a_crashed_child_as_failed():
     import tools.delegate_tool as dt
 
     src = inspect.getsource(dt)
-    assert "CRASH_EXIT_PREFIXES" in src, (
+    # Accepts either spelling: this branch originally inlined
+    # str(...).startswith(CRASH_EXIT_PREFIXES); the concurrent audit session
+    # promoted it to the shared turn_crashed() predicate, which is the same
+    # contract expressed once. What must not happen is delegate_tool consulting
+    # neither and going back to deriving success from summary-presence.
+    assert ("turn_crashed" in src or "CRASH_EXIT_PREFIXES" in src), (
         "delegate_tool no longer consults the crash exit reasons — a crashed "
         "child is reported to the parent as completed again"
     )
-    crash_at = src.index("_crashed = str(result.get(")
-    branch_at = src.index('elif _crashed:')
+    crash_at = src.index("child_crashed = turn_crashed(")
+    branch_at = src.index('elif child_crashed:')
     summary_at = src.index('elif summary and not _empty_sentinel:')
     assert crash_at < branch_at < summary_at, (
         "the crash branch must precede the summary branch, or an apology "

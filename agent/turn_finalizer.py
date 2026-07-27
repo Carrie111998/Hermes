@@ -80,6 +80,26 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+# Exit reasons written by the outer-loop exception handler
+# (agent/conversation_loop.py:6659-6672). That handler puts an apology string
+# into ``final_response`` and breaks WITHOUT setting ``failed``, so a crash is
+# otherwise shaped exactly like a successful answer.
+#
+# Exported as a predicate rather than duplicated at each call site: the finalizer
+# and delegate_tool must agree on what "crashed" means, and two copies of a
+# prefix tuple drift the moment a new exit reason is added.
+
+
+def turn_crashed(turn_exit_reason) -> bool:
+    """True when the turn ended in an internal crash rather than an answer.
+
+    Deliberately excludes ``guardrail_halt``: a hard stop after N identical tool
+    failures is an intentional early exit the operator opts into, and it is
+    test-locked as a completed turn.
+    """
+    return str(turn_exit_reason or "").startswith(CRASH_EXIT_PREFIXES)
+
+
 def finalize_turn(
     agent,
     *,
@@ -233,7 +253,7 @@ def finalize_turn(
     # Guardrail halts are deliberately NOT included. That path is a bounded,
     # test-locked stop with its own reporting, and treating it as failure would
     # change documented behaviour rather than fix a defect.
-    crashed = str(_turn_exit_reason).startswith(CRASH_EXIT_PREFIXES)
+    crashed = turn_crashed(_turn_exit_reason)
 
     completed = (
         final_response is not None
