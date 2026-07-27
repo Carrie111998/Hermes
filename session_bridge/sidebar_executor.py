@@ -43,6 +43,12 @@ _SIGNED_MARKER_RE = re.compile(
     r"HERMES_SESSION_BRIDGE_V1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
     r"(?![A-Za-z0-9_-])"
 )
+_AUTHENTICATED_MARKER_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"HERMES_SESSION_(?:BRIDGE|HYDRATION)_V1:"
+    r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    r"(?![A-Za-z0-9_-])"
+)
 
 
 class NativeCreateAmbiguous(RuntimeError):
@@ -60,6 +66,13 @@ class NativeCreateRejected(RuntimeError):
             raise ValueError("native create rejection code must be retryable")
         self.code = code
         super().__init__(code)
+
+
+class NativeTurnAmbiguous(RuntimeError):
+    """A native text turn may have persisted after dispatch uncertainty."""
+
+    def __init__(self) -> None:
+        super().__init__("native_turn_ambiguous")
 
 
 class NativeThreadUnrecoverable(RuntimeError):
@@ -417,6 +430,59 @@ class CodexAppServerSidebarDelivery:
         self._ensure_initialized(deadline)
         thread = self._read_or_resume_thread(wanted, deadline=deadline)
         return _exact_first_user_text(thread)
+
+    def thread_has_exact_marker(
+        self,
+        *,
+        thread_id: str,
+        marker: str,
+        deadline: float,
+    ) -> bool:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        exact_marker = _required_text(marker, "authenticated marker")
+        self._ensure_initialized(deadline)
+        thread = self._read_or_resume_thread(wanted, deadline=deadline)
+        return _thread_has_exact_marker(thread, exact_marker)
+
+    def start_text_turn_and_verify_marker(
+        self,
+        *,
+        thread_id: str,
+        message: str,
+        marker: str,
+        deadline: float,
+    ) -> None:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        text = _required_text(message, "Codex turn message")
+        exact_marker = _required_text(marker, "authenticated marker")
+        if exact_marker not in _AUTHENTICATED_MARKER_RE.findall(text):
+            raise ValueError("Codex turn marker is missing or embedded")
+        self._ensure_initialized(deadline)
+        try:
+            response = self._client.request(
+                "turn/start",
+                {
+                    "threadId": wanted,
+                    "input": [{"type": "text", "text": text}],
+                },
+                timeout=self._remaining(deadline),
+            )
+            turn_id = _started_turn_id(response)
+            self._wait_for_exact_turn_completion(
+                thread_id=wanted,
+                turn_id=turn_id,
+                deadline=deadline,
+            )
+            self._verify_persisted_registration(
+                thread_id=wanted,
+                turn_id=turn_id,
+                marker=exact_marker,
+                deadline=deadline,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise NativeTurnAmbiguous() from exc
 
     def _read_or_resume_thread(
         self,
@@ -1431,7 +1497,7 @@ def _thread_has_exact_marker(
                 if part.get("type") == "text" and isinstance(part_text, str):
                     text_parts.append(part_text)
             text = "".join(text_parts)
-            if marker in _SIGNED_MARKER_RE.findall(text):
+            if marker in _AUTHENTICATED_MARKER_RE.findall(text):
                 return True
     return False
 
@@ -1557,6 +1623,7 @@ __all__ = [
     "CodexAppServerSidebarDelivery",
     "NativeCreateAmbiguous",
     "NativeCreateRejected",
+    "NativeTurnAmbiguous",
     "NativeSidebarDelivery",
     "NativeThreadState",
     "NativeThreadStatus",

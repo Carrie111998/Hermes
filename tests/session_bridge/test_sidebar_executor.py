@@ -24,6 +24,7 @@ from session_bridge.sidebar_executor import (
     CodexAppServerSidebarDelivery,
     NativeCreateAmbiguous,
     NativeCreateRejected,
+    NativeTurnAmbiguous,
     NativeThreadState,
     NativeThreadStatus,
     NativeThreadUnrecoverable,
@@ -388,6 +389,73 @@ def test_codex_delivery_rejects_missing_initial_user_prompt() -> None:
     with pytest.raises(ValueError, match="initial user prompt"):
         delivery.read_thread_initial_prompt(
             thread_id=THREAD_1,
+            deadline=105.0,
+        )
+
+
+def test_codex_delivery_reads_exact_hydration_marker_without_mutation() -> None:
+    marker = "HERMES_SESSION_HYDRATION_V1:canonical.marker"
+    client = FakeCodexAppServerClient({
+        "thread/read": [_persisted_registration(f"hydrate\n{marker}")],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    found = delivery.thread_has_exact_marker(
+        thread_id=THREAD_1,
+        marker=marker,
+        deadline=105.0,
+    )
+
+    assert found is True
+    assert [method for method, _params, _timeout in client.calls] == ["thread/read"]
+
+
+def test_codex_delivery_starts_one_text_turn_and_verifies_hydration_marker() -> None:
+    marker = "HERMES_SESSION_HYDRATION_V1:canonical.marker"
+    message = f"# Imported Claude Code Session\n\nHydration marker: {marker}"
+    client = FakeCodexAppServerClient(
+        {"turn/start": [{"turn": {"id": TURN_1}}]},
+        notifications=[_turn_completed()],
+    )
+    fresh_client = FakeCodexAppServerClient({
+        "thread/resume": [_persisted_registration(message)],
+    })
+    delivery = CodexAppServerSidebarDelivery(
+        client,
+        fresh_client_factory=lambda: fresh_client,
+        monotonic=lambda: 100.0,
+    )
+
+    delivery.start_text_turn_and_verify_marker(
+        thread_id=THREAD_1,
+        message=message,
+        marker=marker,
+        deadline=105.0,
+    )
+
+    assert [method for method, _params, _timeout in client.calls] == ["turn/start"]
+    assert client.calls[0][1] == {
+        "threadId": THREAD_1,
+        "input": [{"type": "text", "text": message}],
+    }
+    assert [method for method, _params, _timeout in fresh_client.calls] == [
+        "thread/resume"
+    ]
+
+
+def test_codex_delivery_converts_post_dispatch_failure_to_turn_ambiguity() -> None:
+    marker = "HERMES_SESSION_HYDRATION_V1:canonical.marker"
+    message = f"# Imported Claude Code Session\n\nHydration marker: {marker}"
+    client = FakeCodexAppServerClient({
+        "turn/start": [RuntimeError("transport closed after dispatch")],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    with pytest.raises(NativeTurnAmbiguous):
+        delivery.start_text_turn_and_verify_marker(
+            thread_id=THREAD_1,
+            message=message,
+            marker=marker,
             deadline=105.0,
         )
 
