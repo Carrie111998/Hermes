@@ -1273,6 +1273,7 @@ _PROVIDER_ALIASES = {
     "gmicloud": "gmi",
     "fireworks-ai": "fireworks",
     "fw": "fireworks",
+    "imp": "impossibl",
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
     "minimax-portal": "minimax-oauth",
@@ -2106,7 +2107,7 @@ def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
 
 
 _AGGREGATOR_PROVIDERS = frozenset(
-    {"nous", "openrouter", "copilot", "kilocode"}
+    {"nous", "openrouter", "copilot", "kilocode", "impossibl"}
 )
 
 # Subscription/OAuth providers whose catalogs RE-EXPOSE other vendors' models
@@ -2287,6 +2288,16 @@ def detect_provider_for_model(
     """
     name = (model_name or "").strip()
     if not name:
+        return None
+
+    # A vendor/model ID is already native to the current aggregator's
+    # namespace. Do not reinterpret its vendor prefix as a reason to hop to
+    # OpenRouter or a direct provider; downstream live validation remains
+    # responsible for rejecting models the current aggregator does not serve.
+    if (
+        normalize_provider(current_provider) in _AGGREGATOR_PROVIDERS
+        and "/" in name
+    ):
         return None
 
     static_match = detect_static_provider_for_model(name, current_provider)

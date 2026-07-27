@@ -54,6 +54,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         is_aggregator=True,
         base_url_env_var="OPENROUTER_BASE_URL",
     ),
+    "impossibl": HermesOverlay(
+        transport="openai_chat",
+        is_aggregator=True,
+        extra_env_vars=("IMPOSSIBL_API_KEY",),
+        base_url_override="https://api.impossibl.com/v1",
+    ),
     "nous": HermesOverlay(
         transport="openai_chat",
         auth_type="oauth_device_code",
@@ -265,6 +271,9 @@ ALIASES: Dict[str, str] = {
     # openrouter
     "openai": "openrouter",     # bare "openai" → route through aggregator
 
+    # impossibl
+    "imp": "impossibl",
+
     # zai
     "glm": "zai",
     "z-ai": "zai",
@@ -393,6 +402,7 @@ ALIASES: Dict[str, str] = {
 _LABEL_OVERRIDES: Dict[str, str] = {
     "moa": "Mixture of Agents",
     "nous": "Nous Portal",
+    "impossibl": "Impossibl AI API",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
     "stepfun": "StepFun Step Plan",
@@ -823,12 +833,12 @@ def resolve_provider_full(
             from hermes_cli.auth import PROVIDER_REGISTRY as _AUTH_PROVIDER_REGISTRY
             _pcfg = _AUTH_PROVIDER_REGISTRY.get(raw)
             if _pcfg is not None:
-                _collapsed_siblings = [
-                    _rid
-                    for _rid in _AUTH_PROVIDER_REGISTRY
+                _collapsed_provider_ids = {
+                    _rcfg.id
+                    for _rid, _rcfg in _AUTH_PROVIDER_REGISTRY.items()
                     if normalize_provider(_rid) == canonical
-                ]
-                if len(_collapsed_siblings) > 1:
+                }
+                if len(_collapsed_provider_ids) > 1:
                     return ProviderDef(
                         id=_pcfg.id,
                         name=_pcfg.name,

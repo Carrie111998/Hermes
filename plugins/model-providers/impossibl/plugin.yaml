@@ -1,0 +1,5 @@
+name: impossibl-provider
+kind: model-provider
+version: 1.0.0
+description: Impossibl AI API — one API for models across providers
+author: Impossibl Inc.

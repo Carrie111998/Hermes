@@ -70,6 +70,7 @@ _AGGREGATOR_PROVIDERS: frozenset[str] = frozenset({
     "openrouter",
     "nous",
     "kilocode",
+    "impossibl",
 })
 
 # Providers that want bare names with dots replaced by hyphens.

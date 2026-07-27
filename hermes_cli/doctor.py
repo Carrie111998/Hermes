@@ -1065,6 +1065,7 @@ def run_doctor(args):
                 "lmstudio",
                 "nous",
                 "nvidia",
+                "impossibl",
                 # Fireworks' native model IDs are slash-form
                 # (accounts/fireworks/models/... and .../routers/...), so a "/"
                 # is expected, not an aggregator vendor prefix.
