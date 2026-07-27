@@ -12775,6 +12775,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if agent is None:
             return None
 
+        # Auto-recreate any orphaned subagents from a prior process
+        # checkpoint.  The orphans were detected by adopt_orphaned_subagents()
+        # at startup; now that the agent is ready, we re-delegate them.
+        try:
+            from tools.delegate_tool import recreate_pending_subagents
+            recreated = recreate_pending_subagents(agent)
+            if recreated > 0:
+                _cprint(
+                    f"  [yellow]🔄 Auto-recreated {recreated} orphaned "
+                    f"subagent(s) from previous session[/yellow]"
+                )
+        except Exception:
+            pass
+
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
         #            translate for Anthropic/Gemini/Bedrock).
