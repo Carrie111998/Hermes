@@ -223,13 +223,28 @@ def prepare() -> None:
             ],
         )
         objectives_db.transition_objective(conn, objective.id, "accepted", actor="employee:ceo")
-        objectives_db.enqueue_objective_event(
+        objective_triggers.subscribe(
             conn,
+            organization_id=organization_id,
             objective_id=objective.id,
-            event_type="objective.accepted",
-            payload={"source": "current-tree-acceptance"},
-            dedupe_key=f"acceptance:{objective.id}",
+            source_type="acceptance-webhook",
+            event_type="objective.requested",
         )
+        routed = objective_triggers.route_external_event(
+            conn,
+            organization_id=organization_id,
+            source_type="acceptance-webhook",
+            event_type="objective.requested",
+            source_reference="acceptance-request-0001",
+            payload={"source": "current-tree-acceptance"},
+            authentication_evidence={
+                "method": "acceptance-hmac",
+                "key_id": "acceptance-key",
+                "signature_validated": True,
+                "signed_timestamp": int(time.time()),
+            },
+        )
+        assert len(routed) == 1, routed
         objective_triggers.create_schedule(
             conn,
             organization_id=organization_id,
