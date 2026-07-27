@@ -255,6 +255,17 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   (benchmark RL), `-HermesHome` (flag instalador), `HermesGateway` (tarea schtasks),
   `window.__HERMES_SESSION_TOKEN__` (JS global), `Nous Portal`. Build limpio: 98/98
   warnings idénticos a la baseline.
+- Lote 5 (este commit): `user-guide/features/` (44 archivos). **No calificó para
+  auto-aprobación**: 1 `Nous Research` en `personality.md:127`, pero NO era atribución
+  factual de servicio sino un string de identidad embebido en el fallback de
+  prompt-assembly ("You are Hermes Agent... created by Nous Research...") — precedente
+  **G5 lote 13**: estos strings se rebrandean completos, no se preservan. Aplicado
+  transformador normal (sin `--skip-nous-research`, único caso en el lote) →
+  `"You are IYARI, an intelligent AI assistant created by Digital Services LLC..."`.
+  Preservado `NousResearch/hermes-example-plugins` (repo upstream distinto, mismo
+  precedente de lote 13, idéntico a la doc en inglés) en `browser.md`/
+  `extending-the-dashboard.md`. 13 headings cambiaron, ninguno con anchor interno real.
+  Build limpio: 98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 

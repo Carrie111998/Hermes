@@ -6,7 +6,7 @@ description: "基于浏览器的仪表板，用于管理配置、API 密钥、�
 
 # Web Dashboard
 
-Web Dashboard 是一个基于浏览器的 UI，用于管理你的 Hermes Agent 安装。无需编辑 YAML 文件或运行 CLI 命令，即可通过简洁的 Web 界面配置设置、管理 API 密钥并监控会话。
+Web Dashboard 是一个基于浏览器的 UI，用于管理你的 IYARI 安装。无需编辑 YAML 文件或运行 CLI 命令，即可通过简洁的 Web 界面配置设置、管理 API 密钥并监控会话。
 
 ## 快速开始
 
@@ -65,7 +65,7 @@ Chat 标签页是每次 `hermes dashboard` 启动的一部分——内嵌的浏�
 
 ### Chat（聊天）
 
-**Chat** 标签页将完整的 Hermes TUI（与 `hermes --tui` 相同的界面）直接嵌入浏览器。你在终端 TUI 中能做的一切——斜杠命令、模型选择器、工具调用卡片、Markdown 流式输出、clarify/sudo/approval 提示、皮肤主题——在这里都完全一致，因为 Dashboard 运行的是真实的 TUI 二进制文件，并通过 [xterm.js](https://xtermjs.org/) 的 WebGL 渲染器以像素级精度渲染其 ANSI 输出。
+**Chat** 标签页将完整的 IYARI TUI（与 `hermes --tui` 相同的界面）直接嵌入浏览器。你在终端 TUI 中能做的一切——斜杠命令、模型选择器、工具调用卡片、Markdown 流式输出、clarify/sudo/approval 提示、皮肤主题——在这里都完全一致，因为 Dashboard 运行的是真实的 TUI 二进制文件，并通过 [xterm.js](https://xtermjs.org/) 的 WebGL 渲染器以像素级精度渲染其 ANSI 输出。
 
 **工作原理：**
 
@@ -334,8 +334,8 @@ Dashboard 内置六个主题，并可通过用户自定义主题、插件标签�
 
 | 主题 | 特点 |
 |-------|-----------|
-| **Hermes Teal** (`default`) | 深青色 + 奶油色，系统字体，舒适间距 |
-| **Hermes Teal (Large)** (`default-large`) | 与 default 相同，但使用 18px 文字和更宽松的间距 |
+| **IYARI Teal** (`default`) | 深青色 + 奶油色，系统字体，舒适间距 |
+| **IYARI Teal (Large)** (`default-large`) | 与 default 相同，但使用 18px 文字和更宽松的间距 |
 | **Midnight** (`midnight`) | 深蓝紫色，Inter + JetBrains Mono |
 | **Ember** (`ember`) | 暖深红 + 古铜色，Spectral 衬线体 + IBM Plex Mono |
 | **Mono** (`mono`) | 灰度，IBM Plex，紧凑 |
