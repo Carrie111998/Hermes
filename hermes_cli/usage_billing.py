@@ -184,3 +184,34 @@ def allocate_events(conn: sqlite3.Connection, *, event_ids: Iterable[str], payme
                 continue
             raise ValueError("usage event is already allocated to another invoice") from exc
     conn.commit()
+
+
+def allocation_readback(
+    conn: sqlite3.Connection,
+    *,
+    payment_intent_id: str,
+    event_ids: Iterable[str],
+    expected_amount_minor: int,
+) -> dict[str, Any]:
+    """Independently read back the durable event-to-invoice ledger binding."""
+    ensure_schema(conn)
+    expected = set(str(value) for value in event_ids)
+    rows = conn.execute(
+        """SELECT u.id, u.amount_minor
+             FROM agentic_usage_invoice_allocations a
+             JOIN agentic_usage_events u ON u.id=a.usage_event_id
+            WHERE a.payment_intent_id=?
+            ORDER BY u.id""",
+        (payment_intent_id,),
+    ).fetchall()
+    actual = {str(row["id"]) for row in rows}
+    amount = sum(int(row["amount_minor"]) for row in rows)
+    return {
+        "passed": bool(expected) and actual == expected and amount == int(expected_amount_minor),
+        "expected_event_count": len(expected),
+        "actual_event_count": len(actual),
+        "expected_event_ids": sorted(expected),
+        "actual_event_ids": sorted(actual),
+        "allocated_amount_minor": amount,
+        "expected_amount_minor": int(expected_amount_minor),
+    }

@@ -1613,6 +1613,21 @@ def register_payment_adapters(
             )
         if action.action_type in {"payments.create_invoice", "payments.create_metered_invoice"}:
             passed = bool(row["provider_reference"] and intent["payment_url"])
+            allocation_facts = None
+            if action.action_type == "payments.create_metered_invoice":
+                from hermes_cli import usage_billing
+
+                allocation_facts = usage_billing.allocation_readback(
+                    authority_conn,
+                    payment_intent_id=str(intent["id"]),
+                    event_ids=(
+                        execution.result.get("usage_event_ids")
+                        or action.payload.get("usage_event_ids")
+                        or []
+                    ),
+                    expected_amount_minor=int(intent["amount_minor"]),
+                )
+                passed = passed and bool(allocation_facts["passed"])
         else:
             passed = row["status"] == "succeeded" and bool(row["provider_reference"])
         return VerificationOutcome(
@@ -1630,6 +1645,7 @@ def register_payment_adapters(
                     "currency": row["currency"],
                     "provider_reference": row["provider_reference"],
                     "provider_evidence": json.loads(row["evidence_json"]),
+                    **({"usage_allocation": allocation_facts} if allocation_facts else {}),
                 },
             ),
         )

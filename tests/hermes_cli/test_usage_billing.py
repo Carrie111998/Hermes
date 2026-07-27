@@ -104,3 +104,31 @@ def test_business_meter_isolated_from_inherited_model_usage_meter(tmp_path):
     assert conn.execute("SELECT COUNT(*) AS n FROM usage_events").fetchone()["n"] == 1
     assert conn.execute("SELECT COUNT(*) AS n FROM agentic_usage_events").fetchone()["n"] == 1
     assert business_event["amount_minor"] == 100
+
+
+def test_allocation_readback_requires_exact_events_and_total(tmp_path):
+    conn = objectives_db.connect(tmp_path / "usage.db")
+    event = usage_billing.record_usage(
+        conn, organization_id="org", customer_ref="customer-1", metric="job",
+        quantity=2, unit_price_minor=50, currency="USD", idempotency_key="event-1",
+    )
+    conn.execute(
+        """INSERT INTO payment_intents
+           (id,organization_id,account_id,direction,provider,party_json,amount_minor,
+            currency,purpose,status,idempotency_key,metadata_json,created_at,updated_at)
+           VALUES ('pi-readback','org','acct','inbound','fake','{}',100,'USD','usage','pending','pi-readback-key','{}',1,1)"""
+    )
+    conn.commit()
+    usage_billing.allocate_events(
+        conn, event_ids=[event["id"]], payment_intent_id="pi-readback"
+    )
+    result = usage_billing.allocation_readback(
+        conn, payment_intent_id="pi-readback", event_ids=[event["id"]],
+        expected_amount_minor=100,
+    )
+    assert result["passed"] is True
+    mismatch = usage_billing.allocation_readback(
+        conn, payment_intent_id="pi-readback", event_ids=["other-event"],
+        expected_amount_minor=100,
+    )
+    assert mismatch["passed"] is False

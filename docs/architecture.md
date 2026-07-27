@@ -64,3 +64,7 @@ tax rule is supplied through the existing accounting controls.
 Recovery retries are bound to the original payment-intent idempotency key. An
 already allocated event may be replayed only for that same intent; any attempt
 to attach it to a different invoice is rejected.
+
+The payment verifier independently reads the allocation ledger and requires
+the exact event-ID set and aggregate amount to match the payment intent before
+it can pass the metered-invoice action.

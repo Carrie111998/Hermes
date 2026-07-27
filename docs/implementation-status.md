@@ -11,6 +11,8 @@
   tax records, payment intents, and verification.
 - Immutable usage-event metering and exact-event metered invoicing with
   idempotent allocation guards against duplicate billing.
+- Metered-invoice verification independently reconciles the exact usage-event
+  set and aggregate amount against the payment intent.
 - Compliance inventory, obligations, deadlines, evidence, and audit export.
 - Authenticated external-event receipts with idempotent provenance and
   credential-redacted ingress envelopes.
