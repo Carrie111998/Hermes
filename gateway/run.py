@@ -1560,14 +1560,14 @@ def _ensure_ssl_certs() -> None:
 
     paths = ssl.get_default_verify_paths()
 
-    # Narrow macOS/Homebrew override: some Homebrew-based Python builds inside a
-    # venv report /private/etc/ssl/cert.pem as the default cafile, but the
-    # usable trust store (including imported corporate/intercepting CAs) lives
-    # in Homebrew's OpenSSL bundle. Only prefer the Homebrew bundle in that
-    # specific Darwin case instead of broadening behavior for all Homebrew
-    # installs.
+    # Some macOS venvs report this default while the usable trust store is in
+    # Homebrew's OpenSSL bundle. Keep the override limited to that case.
     problematic_darwin_defaults = {"/private/etc/ssl/cert.pem", "/etc/ssl/cert.pem"}
-    if sys.platform == "darwin" and (paths.cafile in problematic_darwin_defaults or paths.openssl_cafile in problematic_darwin_defaults):
+    is_problematic_darwin_default = (
+        paths.cafile in problematic_darwin_defaults
+        or paths.openssl_cafile in problematic_darwin_defaults
+    )
+    if sys.platform == "darwin" and is_problematic_darwin_default:
         for candidate in (
             "/opt/homebrew/etc/openssl@3/cert.pem",               # macOS Homebrew ARM
             "/usr/local/etc/openssl@3/cert.pem",                 # macOS Homebrew Intel
