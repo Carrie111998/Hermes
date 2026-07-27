@@ -264,6 +264,37 @@ Image manifest: `sha256:92e65135599ec03c747539b51bc4b5ca9bf1f406c50a97faf758366e
 This remains deterministic local-provider evidence, not production deployment
 or live payment evidence.
 
+## Payment rail plugins
+
+Charterforge supports optional payment rail plugins for receiving and sending
+payments. The `charterforge-stripe-rail` package is the reference implementation
+and is built separately from the core package.
+
+To install the Stripe rail plugin:
+
+```bash
+pip install charterforge-stripe-rail
+# Or with uv:
+uv pip install charterforge-stripe-rail
+```
+
+After installation, the Stripe rail registers itself via entry points and
+becomes discoverable by `charterforge business payment-rails`.
+
+To configure Stripe:
+1. Set `STRIPE_WEBHOOK_SIGNING_SECRET` in your environment (webhook endpoint secret)
+2. Set `STRIPE_API_KEY` for outbound payment operations (optional, not for webhook-only)
+3. Run `charterforge business payment-rails --check` to verify configuration
+
+The Stripe rail processes these webhook events:
+- `checkout.session.completed`
+- `payment_intent.succeeded`
+- `payment_intent.payment_failed`
+
+For autonomous funding, configure a Stripe webhook endpoint pointing to your
+Charterforge ingress route. The autonomous agent will then receive funding
+events and record them in the accounting ledger.
+
 The same acceptance was rerun from commit
 `fc69220e5c78f7c892f049749c37319283c4a18c` after exact-resource delegation
 enforcement. Command:
