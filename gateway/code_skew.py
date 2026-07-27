@@ -27,10 +27,22 @@ def _fingerprint() -> str | None:
     """Current checkout fingerprint, reusing the CLI's git-rev reader.
 
     ``hermes_cli.main`` is always already imported in a gateway process (it's
-    the entry point), so this import is free and avoids duplicating the
+    the entry point), so normally this import is free and avoids duplicating the
     worktree-aware ref resolution.
+
+    However, when launched via ``python -m hermes_cli.main`` the module is
+    first loaded as ``__main__``, not as ``hermes_cli.main``.  Re-importing
+    it via a ``from hermes_cli.main import ...`` would re-execute its
+    module-level code, including ``_apply_profile_override()`` — which would
+    strip ``--profile`` from argv again and then fall back to the sticky
+    active_profile, silently hijacking HERMES_HOME.  We therefore check
+    ``__main__`` first, which covers the ``-m`` case without a second import.
     """
     try:
+        __main_mod = __import__("__main__")
+        if hasattr(__main_mod, "_read_git_revision_fingerprint"):
+            return __main_mod._read_git_revision_fingerprint(_PROJECT_ROOT)
+
         from hermes_cli.main import _read_git_revision_fingerprint
 
         return _read_git_revision_fingerprint(_PROJECT_ROOT)
