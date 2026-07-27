@@ -789,6 +789,22 @@ uv run --extra dev pytest -q \
 Result: **25 passed, 0 failed**. Pausing autonomy revokes active employee
 grants and blocks delegated result handoff through the autonomy boundary.
 
+The complete current-tree Founder/CEO acceptance scenario was rerun on commit
+`5d8adc7a24f968c9c38ea4f597186e49bc522675` with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result: **current-tree agentic acceptance: PASS**. The scenario covered
+install, bootstrap, readiness blocked then satisfied, bounded CEO execution,
+process-separated delegation and evidence handoff, interrupted provider action
+with read-back convergence, inbound settlement and tax recording, restart
+recovery without duplicate effects, and master-stop fencing. The acceptance
+image digest was `sha256:5f905c0b55bc7b3866e935f78d0d8c0cb138a2d04aaea1e1a4a9c2988c6c3e9e`.
+This is controlled local-provider evidence, not proof of production provider
+credentials, corporate readiness, or legal/compliance certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
