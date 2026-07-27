@@ -171,6 +171,8 @@ recorded.
   and host-secret non-exfiltration checks; other providers remain unvalidated.
 - Added an independent local artifact installer with Python-version and
   destination safety checks; package-index publication remains unreleased.
+- Unconfigured business status now exposes a structured advisor handoff to the
+  explicit charter bootstrap command and confirms that autonomy has not begun.
 
 - `757408d82884afd60651762715c3ef00446bc0c0` — recorded the release
   readiness evidence documentation.

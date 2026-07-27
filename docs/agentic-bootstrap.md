@@ -5,6 +5,11 @@ solo-founder organization, Founder/CEO mandate, treasury account, initial
 capital entry, objective, cadence schedule, authority baseline, and recovery
 posture. It is safe to rerun against the same mounted state directory.
 
+Before initialization, `charterforge business status` is read-only and returns
+a structured `next_step` handoff. It points the advisor to the example charter
+and reports `autonomy_started: false`; status never bootstraps or enables
+unattended operation implicitly.
+
 From a source checkout or installed Charterforge environment:
 
 ```bash

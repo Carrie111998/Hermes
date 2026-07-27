@@ -22,6 +22,8 @@ acceptance evidence.
 - Hiring materialization rechecks current headcount and payroll limits against
   the immutable decision before adding an employee.
 - Founder/CEO organization bootstrap and versioned mandate.
+- Unconfigured operator status exposes a structured, non-mutating first-run
+  charter handoff without starting autonomy.
 - Advisor-by-default authority policy.
 - Exact solo-founder and employee delegation grants.
 - Evidence-based contractor/FTE decision and hierarchical profiles.
