@@ -88,6 +88,36 @@ def _reintroduce_phantom_path(src: str) -> str:
     return _sub(src, 'if home_path.parent.name == "profiles":', 'if False:')
 
 
+def _downgrade_sqlite_to_advisory(src: str) -> str:
+    """Upstream restores the original 'SQLite is advisory' behaviour."""
+    return _sub(src, "    ok = python_ok and sqlite_ok", "    ok = python_ok")
+
+
+def _unfix_crash_completion(src: str) -> str:
+    """A merge drops the crash exclusion; crashes report completed again."""
+    return _sub(src, "        and not _crashed" + chr(10), "")
+
+
+def _unscrub_steer_markers(src: str) -> str:
+    """Upstream drops the scrub; forged operator authority returns."""
+    return _sub(src,
+                "    wrapped = _scrub_steer_markers(_maybe_wrap_untrusted(name, content))",
+                "    wrapped = _maybe_wrap_untrusted(name, content)")
+
+
+def _ungate_plus_refspec_push(src: str) -> str:
+    """Upstream drops the +refspec pattern; force push auto-approves again."""
+    target = next(l for l in src.split(chr(10)) if "via +refspec" in l)
+    return _sub(src, target, "")
+
+
+def _unprotect_env_writes(src: str) -> str:
+    """Upstream drops the write-side .env check; secrets clobberable again."""
+    target = next(l for l in src.split(chr(10))
+                  if "_BLOCKED_PROJECT_ENV_BASENAMES" in l and "basename" in l)
+    return _sub(src, target, "    if False:")
+
+
 SCENARIOS: List[Scenario] = [
     Scenario("drop-user_message-kwarg",
              "upstream refactors the hook call; feedback-gate silently stops firing",
@@ -113,6 +143,21 @@ SCENARIOS: List[Scenario] = [
              "path helper reverted; receipts + HMAC key vanish into a phantom tree",
              PROFILE / "plugins" / "execution-receipts" / "execution_receipts.py",
              _reintroduce_phantom_path),
+    Scenario("downgrade-sqlite-to-advisory",
+             "merge restores advisory SQLite; a supported runtime reopens WAL corruption",
+             REPO / "hermes_cli" / "runtime_guard.py", _downgrade_sqlite_to_advisory),
+    Scenario("unfix-crash-completion",
+             "merge drops the crash exclusion; cron marks crashed jobs ok again",
+             REPO / "agent" / "turn_finalizer.py", _unfix_crash_completion),
+    Scenario("unscrub-steer-markers",
+             "merge drops the scrub; tool output can forge operator authority again",
+             REPO / "agent" / "tool_dispatch_helpers.py", _unscrub_steer_markers),
+    Scenario("ungate-plus-refspec-push",
+             "merge drops the +refspec pattern; force push auto-approves again",
+             REPO / "tools" / "approval.py", _ungate_plus_refspec_push),
+    Scenario("unprotect-env-writes",
+             "merge drops the .env write check; live credentials clobberable again",
+             REPO / "agent" / "file_safety.py", _unprotect_env_writes),
 ]
 
 

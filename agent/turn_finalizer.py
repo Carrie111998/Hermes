@@ -66,6 +66,27 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+# Exit reasons written by the outer-loop exception handler
+# (agent/conversation_loop.py:6659-6672). That handler puts an apology string
+# into ``final_response`` and breaks WITHOUT setting ``failed``, so a crash is
+# otherwise shaped exactly like a successful answer.
+#
+# Exported as a predicate rather than duplicated at each call site: the finalizer
+# and delegate_tool must agree on what "crashed" means, and two copies of a
+# prefix tuple drift the moment a new exit reason is added.
+_CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
+
+
+def turn_crashed(turn_exit_reason) -> bool:
+    """True when the turn ended in an internal crash rather than an answer.
+
+    Deliberately excludes ``guardrail_halt``: a hard stop after N identical tool
+    failures is an intentional early exit the operator opts into, and it is
+    test-locked as a completed turn.
+    """
+    return str(turn_exit_reason or "").startswith(_CRASH_EXIT_PREFIXES)
+
+
 def finalize_turn(
     agent,
     *,
@@ -192,9 +213,25 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+
+    # H-01: the outer-loop exception handler (conversation_loop.py:6659-6672)
+    # writes an apology into ``final_response`` and breaks WITHOUT setting
+    # ``failed`` — which is set at exactly one place in that whole loop. A crash
+    # therefore satisfied every clause below and reported success: cron marked
+    # the job "ok" (it only pattern-matches ``max_iterations_reached(``), and
+    # delegate_tool handed the parent ``status="completed"`` for work that never
+    # happened. The finalizer is the single point every break path flows
+    # through, so the correction belongs here rather than in each handler.
+    #
+    # Scoped to genuine crashes on purpose. ``guardrail_halt`` also arrives
+    # without ``failed``, and the ledger proposed bundling it in, but a hard
+    # stop after N identical tool failures is an intentional early exit that the
+    # operator opts into — it stays "completed" and is test-locked as such.
+    _crashed = turn_crashed(_turn_exit_reason)
     completed = (
         final_response is not None
         and not failed
+        and not _crashed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
