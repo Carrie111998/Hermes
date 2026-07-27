@@ -2,6 +2,7 @@
   "enabled": true,
   "operating_mode": "autonomous",
   "operator_role": "advisor",
+  "runtime_host": "either",
   "policy_version": "charterforge-bootstrap-v1",
   "allowed_capabilities": ["market.publish"],
   "allowed_systems": ["market"],
