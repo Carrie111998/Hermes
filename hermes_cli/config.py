@@ -2726,6 +2726,8 @@ DEFAULT_CONFIG = {
         # Default (None) uses the built-in "⚕ *Hermes Agent*" header.
         # Set to "" (empty string) to disable the header entirely.
         # Supports \n for newlines, e.g. "🤖 *My Bot*\n──────\n"
+        # Allow same-account group messages; group/mention gates still apply.
+        "process_from_me_groups": False,
     },
 
     # Telegram platform settings (gateway mode)
