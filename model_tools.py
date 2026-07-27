@@ -1106,7 +1106,12 @@ def _emit_post_tool_call_hook(
             middleware_trace=list(middleware_trace or []),
         )
     except Exception as _hook_err:
-        logger.debug("post_tool_call hook error: %s", _hook_err)
+        from agent.redact import redact_tool_error
+
+        logger.debug(
+            "post_tool_call hook error: %s",
+            redact_tool_error(_hook_err),
+        )
 
 
 def handle_function_call(
@@ -1254,7 +1259,12 @@ def handle_function_call(
             _tool_original_args = _tool_request_mw.original_payload
             _tool_middleware_trace = _tool_request_mw.trace
         except Exception as _mw_err:
-            logger.debug("tool_request middleware error: %s", _mw_err)
+            from agent.redact import redact_tool_error
+
+            logger.debug(
+                "tool_request middleware error: %s",
+                redact_tool_error(_mw_err),
+            )
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
@@ -1286,7 +1296,12 @@ def handle_function_call(
                     middleware_trace=list(_tool_middleware_trace),
                 )
             except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
+                from agent.redact import redact_tool_error
+
+                logger.debug(
+                    "pre_tool_call hook error: %s",
+                    redact_tool_error(_hook_err),
+                )
 
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -1316,7 +1331,12 @@ def handle_function_call(
             if edit_block_message is not None:
                 return edit_block_message
         except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
+            from agent.redact import redact_tool_error
+
+            logger.debug(
+                "ACP edit approval guard error: %s",
+                redact_tool_error(_edit_approval_err),
+            )
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 

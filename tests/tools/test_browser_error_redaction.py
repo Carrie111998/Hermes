@@ -13,6 +13,7 @@ _SENTINELS = {
     "cookie": "browser-cookie-sentinel-8390",
     "access": "browser-access-sentinel-8390",
     "refresh": "browser-refresh-sentinel-8390",
+    "callback_repr": "callback-repr-auth-sentinel-8390",
 }
 
 
@@ -24,6 +25,21 @@ def _credential_bearing_browser_error() -> RuntimeError:
         f'{{"access_token":"{_SENTINELS["access"]}",'
         f'"refresh_token":"{_SENTINELS["refresh"]}"}}'
     )
+
+
+class _CredentialBearingFailingCallback:
+    """Callable whose exception and diagnostic representation both carry secrets."""
+
+    def __init__(self, observed=None):
+        self.observed = observed
+
+    def __repr__(self):
+        return f"<callback Authorization: Bearer {_SENTINELS['callback_repr']}>"
+
+    def __call__(self, **payload):
+        if self.observed is not None:
+            self.observed.append(payload)
+        raise _credential_bearing_browser_error()
 
 
 def test_failing_browser_request_redacts_returned_error_transcript_and_logs(caplog):
@@ -104,6 +120,114 @@ def test_structured_browser_failure_is_redacted_before_observer_and_transcript()
         assert sentinel not in transcript
         assert sentinel not in observed_payload
     assert "***" in returned
+
+
+def test_post_tool_call_exception_redacts_browser_authentication_material(caplog):
+    """A failing observer cannot reflect browser credentials into process logs."""
+    from model_tools import handle_function_call
+    from hermes_cli.plugins import PluginManager
+
+    observed = []
+    raw = json.dumps(
+        {
+            "success": False,
+            "error": str(_credential_bearing_browser_error()),
+        }
+    )
+
+    manager = PluginManager()
+    manager._hooks["post_tool_call"] = [_CredentialBearingFailingCallback(observed)]
+    caplog.set_level(logging.DEBUG)
+    with (
+        patch("model_tools.registry.dispatch", return_value=raw),
+        patch("hermes_cli.plugins._plugin_manager", manager),
+    ):
+        returned = handle_function_call(
+            "browser_console",
+            {"expression": "fetch('/api/admin/acquisition')"},
+            task_id="fai-8390",
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+        )
+
+    transcript = json.dumps(
+        [{"role": "tool", "name": "browser_console", "content": returned}],
+        ensure_ascii=False,
+    )
+    observed_payload = json.dumps(observed, ensure_ascii=False)
+
+    assert observed, "post_tool_call observer did not receive the tool result"
+    for sentinel in _SENTINELS.values():
+        assert sentinel not in caplog.text
+        assert sentinel not in returned
+        assert sentinel not in observed_payload
+        assert sentinel not in transcript
+    assert "***" in caplog.text
+    assert "***" in returned
+
+
+def test_plugin_middleware_exception_redacts_authentication_material(caplog):
+    """Middleware callback isolation cannot persist raw credentials either."""
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    manager._middleware["tool_request"] = [_CredentialBearingFailingCallback()]
+    caplog.set_level(logging.WARNING)
+
+    assert manager.invoke_middleware("tool_request", payload={}) == []
+
+    for sentinel in _SENTINELS.values():
+        assert sentinel not in caplog.text
+    assert "***" in caplog.text
+
+
+def test_tool_execution_middleware_exception_redacts_browser_authentication_material(
+    caplog,
+):
+    """Execution middleware cannot bypass the manager's safe logging boundary."""
+    from hermes_cli.plugins import PluginManager
+    from model_tools import handle_function_call
+
+    observed = []
+    raw = json.dumps(
+        {
+            "success": False,
+            "error": str(_credential_bearing_browser_error()),
+        }
+    )
+
+    manager = PluginManager()
+    manager._middleware["tool_execution"] = [_CredentialBearingFailingCallback()]
+    manager._hooks["post_tool_call"] = [lambda **payload: observed.append(payload)]
+    caplog.set_level(logging.DEBUG)
+
+    with (
+        patch("hermes_cli.plugins._plugin_manager", manager),
+        patch("model_tools.registry.dispatch", return_value=raw),
+    ):
+        returned = handle_function_call(
+            "browser_console",
+            {"expression": "fetch('/api/admin/acquisition')"},
+            task_id="fai-8390",
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+        )
+
+    transcript = json.dumps(
+        [{"role": "tool", "name": "browser_console", "content": returned}],
+        ensure_ascii=False,
+    )
+    observed_payload = json.dumps(observed, ensure_ascii=False)
+
+    assert observed, "post_tool_call observer did not receive the tool result"
+    for sentinel in _SENTINELS.values():
+        assert sentinel not in caplog.text
+        assert sentinel not in returned
+        assert sentinel not in observed_payload
+        assert sentinel not in transcript
+    assert "***" in caplog.text
+    assert "***" in returned
+    assert "Traceback" not in caplog.text
 
 
 def test_registry_exception_is_redacted_before_dispatch_log_and_result(caplog):
