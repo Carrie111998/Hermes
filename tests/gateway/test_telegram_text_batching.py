@@ -139,6 +139,123 @@ class TestTextBatching:
         assert len(adapter._pending_text_batch_tasks) == 0
 
     @pytest.mark.asyncio
+    async def test_follow_up_text_does_not_cancel_dispatch_in_progress(self):
+        """A new batch must not cancel a prior event already being dispatched."""
+        adapter = _make_adapter()
+        adapter._text_batch_delay_seconds = 0.01
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        both_completed = asyncio.Event()
+        completed = []
+
+        async def handle_message(event):
+            if event.text == "first clarify response":
+                first_started.set()
+                await release_first.wait()
+            completed.append(event.text)
+            if len(completed) == 2:
+                both_completed.set()
+
+        adapter.handle_message = handle_message
+        adapter._enqueue_text_event(_make_event("first clarify response"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        adapter._enqueue_text_event(_make_event("second text"))
+        await asyncio.sleep(0.05)
+        assert completed == []
+
+        release_first.set()
+        await asyncio.wait_for(both_completed.wait(), timeout=1)
+
+        assert completed == ["first clarify response", "second text"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_follow_ups_remain_buffered_behind_active_dispatch(self):
+        """A third text must not drop a successor waiting behind active dispatch."""
+        adapter = _make_adapter()
+        adapter._text_batch_delay_seconds = 0.01
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        both_completed = asyncio.Event()
+        completed = []
+
+        async def handle_message(event):
+            if event.text == "first clarify response":
+                first_started.set()
+                await release_first.wait()
+            completed.append(event.text)
+            if len(completed) == 2:
+                both_completed.set()
+
+        adapter.handle_message = handle_message
+        adapter._enqueue_text_event(_make_event("first clarify response"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        adapter._enqueue_text_event(_make_event("second text"))
+        await asyncio.sleep(0.05)
+        adapter._enqueue_text_event(_make_event("third text"))
+        release_first.set()
+        await asyncio.wait_for(both_completed.wait(), timeout=1)
+
+        assert completed == ["first clarify response", "second text\nthird text"]
+
+    @pytest.mark.asyncio
+    async def test_successor_dispatches_after_predecessor_error(self):
+        """A failed predecessor must not strand an already-buffered successor."""
+        adapter = _make_adapter()
+        adapter._text_batch_delay_seconds = 0.01
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        successor_completed = asyncio.Event()
+        attempted = []
+
+        async def handle_message(event):
+            attempted.append(event.text)
+            if event.text == "first clarify response":
+                first_started.set()
+                await release_first.wait()
+                raise RuntimeError("simulated gateway dispatch failure")
+            successor_completed.set()
+
+        adapter.handle_message = handle_message
+        adapter._enqueue_text_event(_make_event("first clarify response"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        adapter._enqueue_text_event(_make_event("second text"))
+        release_first.set()
+        await asyncio.wait_for(successor_completed.wait(), timeout=1)
+
+        assert attempted == ["first clarify response", "second text"]
+        assert len(adapter._pending_text_batches) == 0
+        assert len(adapter._pending_text_batch_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_external_cancellation_still_cancels_dispatch_in_progress(self):
+        """Only batching supersession may preserve an in-progress dispatch."""
+        adapter = _make_adapter()
+        adapter._text_batch_delay_seconds = 0.01
+        dispatch_started = asyncio.Event()
+        dispatch_cancelled = asyncio.Event()
+
+        async def handle_message(event):
+            dispatch_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                dispatch_cancelled.set()
+
+        adapter.handle_message = handle_message
+        adapter._enqueue_text_event(_make_event("cancel me"))
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+        flush_task = next(iter(adapter._pending_text_batch_tasks.values()))
+
+        flush_task.cancel()
+        await asyncio.gather(flush_task, return_exceptions=True)
+
+        assert flush_task.cancelled()
+        await asyncio.wait_for(dispatch_cancelled.wait(), timeout=1)
+
+    @pytest.mark.asyncio
     async def test_dm_topic_batching_recovers_thread_before_keying(self):
         """DM-topic text batches should use the recovered topic lane."""
         adapter = _make_adapter()

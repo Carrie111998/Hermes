@@ -8756,13 +8756,27 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
+        predecessor_task = None
         if prior_task and not prior_task.done():
-            prior_task.cancel()
-        self._pending_text_batch_tasks[key] = asyncio.create_task(
-            self._flush_text_batch(key)
+            if getattr(prior_task, "_telegram_dispatch_started", False):
+                predecessor_task = prior_task
+            else:
+                predecessor_task = getattr(
+                    prior_task, "_telegram_dispatch_predecessor", None
+                )
+                prior_task._telegram_batch_superseded = True  # type: ignore[attr-defined]
+                prior_task.cancel()
+        flush_task = asyncio.create_task(
+            self._flush_text_batch(key, predecessor_task)
         )
+        flush_task._telegram_dispatch_predecessor = predecessor_task  # type: ignore[attr-defined]
+        self._pending_text_batch_tasks[key] = flush_task
 
-    async def _flush_text_batch(self, key: str) -> None:
+    async def _flush_text_batch(
+        self,
+        key: str,
+        predecessor_task: "asyncio.Task[None] | None" = None,
+    ) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
 
         Uses a longer delay when the latest chunk is near Telegram's 4096-char
@@ -8794,17 +8808,39 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
+            # Preserve Telegram arrival order. If a follow-up batch was created
+            # while the previous event was already being dispatched, wait for
+            # that dispatch before claiming the buffered successor event.
+            if predecessor_task is not None:
+                try:
+                    await asyncio.shield(predecessor_task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "[Telegram] Prior text dispatch failed; continuing buffered successor"
+                    )
+
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return
             if self._should_drop_delayed_delivery():
                 logger.debug("[Telegram] Dropping text batch flush after disconnect started")
                 return
+
             logger.info(
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            current_task._telegram_dispatch_started = True  # type: ignore[attr-defined]
             await self.handle_message(event)
+        except asyncio.CancelledError:
+            if getattr(current_task, "_telegram_batch_superseded", False):
+                return
+            if predecessor_task is not None and not predecessor_task.done():
+                predecessor_task.cancel()
+                await asyncio.gather(predecessor_task, return_exceptions=True)
+            raise
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
