@@ -1,12 +1,12 @@
 ---
 sidebar_position: 1
 title: "Nous Portal"
-description: "一个订阅，300+ 前沿模型，Tool Gateway，以及 Nous Chat —— 运行 Hermes Agent 的推荐方式"
+description: "一个订阅，300+ 前沿模型，Tool Gateway，以及 Nous Chat —— 运行 IYARI 的推荐方式"
 ---
 
 # Nous Portal
 
-[Nous Portal](https://portal.nousresearch.com) 是 Nous Research 的统一订阅网关，也是**运行 Hermes Agent 的推荐方式**。一次 OAuth 登录，即可替代原本需要手动配置的各模型厂商独立账号、API 密钥和计费关系。
+[Nous Portal](https://portal.nousresearch.com) 是 Nous Research 的统一订阅网关，也是**运行 IYARI 的推荐方式**。一次 OAuth 登录，即可替代原本需要手动配置的各模型厂商独立账号、API 密钥和计费关系。
 
 如果你只有时间配置一件事，就配置这个。最快路径：
 
@@ -42,7 +42,7 @@ Portal 代理了来自整个生态系统的精选 agentic 模型目录——统�
 
 ### Nous Tool Gateway
 
-同一订阅还解锁了 [Tool Gateway](/user-guide/features/tool-gateway)，将 Hermes Agent 的工具调用路由至 Nous 托管的基础设施。五个后端，一次登录：
+同一订阅还解锁了 [Tool Gateway](/user-guide/features/tool-gateway)，将 IYARI 的工具调用路由至 Nous 托管的基础设施。五个后端，一次登录：
 
 | 工具 | 合作方 | 功能说明 |
 |------|---------|--------------|
@@ -62,7 +62,7 @@ Portal 代理了来自整个生态系统的精选 agentic 模型目录——统�
 
 ### 凭证不落入 dotfiles
 
-由于所有请求都通过一个经 OAuth 认证的 Portal 会话路由，你不会积累一个包含十几个长期 API 密钥的 `.env` 文件。磁盘上唯一的凭证是 `~/.hermes/auth.json` 中的 refresh token（刷新令牌），Hermes 会在每次请求时从中生成短期 JWT——详见下方[令牌处理](#token-handling)。
+由于所有请求都通过一个经 OAuth 认证的 Portal 会话路由，你不会积累一个包含十几个长期 API 密钥的 `.env` 文件。磁盘上唯一的凭证是 `~/.hermes/auth.json` 中的 refresh token（刷新令牌），IYARI 会在每次请求时从中生成短期 JWT——详见下方[令牌处理](#token-handling)。
 
 ### 跨平台一致性
 
@@ -72,7 +72,7 @@ Portal 代理了来自整个生态系统的精选 agentic 模型目录——统�
 
 Nous Research 自家的 **Hermes 4** 系列（Hermes-4-70B、Hermes-4-405B）通过 Portal 提供，享有大幅折扣。这些是**前沿混合推理对话模型**——在数学、科学、指令遵循、schema 遵从、角色扮演和长文写作方面表现出色。
 
-但**不建议在 Hermes Agent 内部使用它们**。Hermes 4 针对对话和推理进行了调优，而非 agent 所依赖的高频工具调用循环。请将它们用于 [Nous Chat](https://chat.nousresearch.com)、研究工作流，或通过[订阅代理](/user-guide/features/subscription-proxy)从其他工具调用——但在 agent 场景下，请从目录中选择前沿 agentic 模型：
+但**不建议在 IYARI 内部使用它们**。Hermes 4 针对对话和推理进行了调优，而非 agent 所依赖的高频工具调用循环。请将它们用于 [Nous Chat](https://chat.nousresearch.com)、研究工作流，或通过[订阅代理](/user-guide/features/subscription-proxy)从其他工具调用——但在 agent 场景下，请从目录中选择前沿 agentic 模型：
 
 ```bash
 /model anthropic/claude-sonnet-4.6     # 最佳通用 agentic 模型
@@ -81,7 +81,7 @@ Nous Research 自家的 **Hermes 4** 系列（Hermes-4-70B、Hermes-4-405B）通
 /model deepseek/deepseek-v3.2          # 高性价比代码模型
 ```
 
-Portal 自身的[模型信息页](https://portal.nousresearch.com/info)也有相同警告，因此这不是 Hermes 侧的主观意见——这是 Nous Research 的官方指导。
+Portal 自身的[模型信息页](https://portal.nousresearch.com/info)也有相同警告，因此这不是 IYARI 侧的主观意见——这是 Nous Research 的官方指导。
 
 ## 配置
 
@@ -116,11 +116,11 @@ hermes model
 
 ### 无头环境 / SSH / 远程配置
 
-OAuth 需要浏览器，但回调的 loopback 运行在 Hermes 所在的机器上。对于远程主机，请参阅 [OAuth over SSH / 远程主机](/guides/oauth-over-ssh)——与其他基于 OAuth 的提供商相同的方式同样适用于 Portal（`ssh -L` 端口转发）。
+OAuth 需要浏览器，但回调的 loopback 运行在 IYARI 所在的机器上。对于远程主机，请参阅 [OAuth over SSH / 远程主机](/guides/oauth-over-ssh)——与其他基于 OAuth 的提供商相同的方式同样适用于 Portal（`ssh -L` 端口转发）。
 
 ### Profile 配置
 
-如果你使用 [Hermes profiles（配置文件）](/user-guide/profiles)，Portal 的 refresh token 会通过共享令牌存储自动在所有 profile 间共享。在任意 profile 上登录一次，其余 profile 自动获取——无需为每个 profile 重复 OAuth 流程。
+如果你使用 [IYARI profiles（配置文件）](/user-guide/profiles)，Portal 的 refresh token 会通过共享令牌存储自动在所有 profile 间共享。在任意 profile 上登录一次，其余 profile 自动获取——无需为每个 profile 重复 OAuth 流程。
 
 ## 日常使用 Portal
 
@@ -228,9 +228,9 @@ OAuth refresh token 单独存储在 `~/.hermes/auth.json`（不在 `config.yaml`
 
 ## 令牌处理
 
-Hermes 在每次推理调用时从存储的 Portal refresh token 生成短期 JWT，而非复用长期 API 密钥。令牌生命周期完全自动管理——刷新、生成、在瞬时 401 时重试——你无需关心这些细节。
+IYARI 在每次推理调用时从存储的 Portal refresh token 生成短期 JWT，而非复用长期 API 密钥。令牌生命周期完全自动管理——刷新、生成、在瞬时 401 时重试——你无需关心这些细节。
 
-如果 Portal 使 refresh token 失效（修改密码、手动撤销、会话过期），失效的 refresh token 会被**本地隔离**，Hermes 停止重放该令牌，你不会看到一连串相同的 401 错误。下一次调用会显示清晰的"需要重新认证"提示。运行 `hermes auth add nous` 重新登录；隔离状态在下次成功登录时自动清除。
+如果 Portal 使 refresh token 失效（修改密码、手动撤销、会话过期），失效的 refresh token 会被**本地隔离**，IYARI 停止重放该令牌，你不会看到一连串相同的 401 错误。下一次调用会显示清晰的"需要重新认证"提示。运行 `hermes auth add nous` 重新登录；隔离状态在下次成功登录时自动清除。
 
 ## 故障排查
 
@@ -256,7 +256,7 @@ Portal 通过 OpenRouter 代理，因此 OpenRouter 支持的所有模型通常�
 /model anthropic/claude-opus-4.6
 ```
 
-如果某个模型确实缺失，请[提交 issue](https://github.com/NousResearch/hermes-agent/issues)——我们将 Portal 目录同步至 Hermes，缺口通常意味着可以更新的路由配置。
+如果某个模型确实缺失，请[提交 issue](https://github.com/digital-services-llc/iyari/issues)——我们将 Portal 目录同步至 IYARI，缺口通常意味着可以更新的路由配置。
 
 ### 账单未出现在我的 Portal 账号中
 
@@ -265,8 +265,8 @@ Portal 通过 OpenRouter 代理，因此 OpenRouter 支持的所有模型通常�
 ## 另请参阅
 
 - **[Tool Gateway](/user-guide/features/tool-gateway)** —— 每个 gateway 工具的完整详情、每工具配置及定价
-- **[订阅代理](/user-guide/features/subscription-proxy)** —— 在非 Hermes 工具（其他 agent、脚本、第三方客户端）中使用你的 Portal 订阅
+- **[订阅代理](/user-guide/features/subscription-proxy)** —— 在非 IYARI 工具（其他 agent、脚本、第三方客户端）中使用你的 Portal 订阅
 - **[语音模式](/user-guide/features/voice-mode)** —— 使用 Portal 的 OpenAI TTS 进行语音对话
 - **[AI 提供商](/integrations/providers)** —— 完整提供商目录，供对比参考
 - **[OAuth over SSH](/guides/oauth-over-ssh)** —— 从远程主机或纯浏览器环境登录
-- **[Profiles](/user-guide/profiles)** —— 多个 Hermes 配置共享一个 Portal 登录
+- **[Profiles](/user-guide/profiles)** —— 多个 IYARI 配置共享一个 Portal 登录

@@ -236,6 +236,16 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   (incl. cita literal `"using Nous as inference provider"`). `User-Agent:
   "Hermes-Monitor/1.0"` → `"IYARI-Monitor/1.0"`. Build limpio: 98/98 warnings
   idénticos a la baseline.
+- Lote 3 (este commit): `integrations/`+`reference/` (14 archivos). **No calificó para
+  auto-aprobación** (mismo patrón de casos dudosos que G5 lotes 4/14): `--skip-nous-research`
+  para 6 atribuciones factuales (`nous-portal.md`×4, `providers.md`×1, `faq.md`×1,
+  precedente `faq:20`); edición manual `faq.md` `[Nous Research Discord]` →
+  `[IYARI 的 GitHub](https://github.com/digital-services-llc/iyari)` + `team@iyari.io`
+  (precedente `faq:844`); 4 falsos positivos de familia de modelos revertidos a mano
+  (`nous-portal.md:38` tabla `**Hermes**`, `providers.md:686`/`:759` `Hermes 2/3`,
+  `providers.md:807` `Mistral、Hermes）`) — el lookahead del regex no cubre "Hermes X"
+  con X≠3/4. 3 headings cambiaron (`faq.md` L15/L39/L745), sin anchors internos que
+  las referenciaran. Build limpio: 98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 
