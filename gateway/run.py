@@ -67,6 +67,10 @@ from agent.conversation_compression import (
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from agent.model_routing import (
+    classify_turn_complexity as _classify_turn_complexity_shared,
+    resolve_routing_decision,
+)
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -807,6 +811,75 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _parse_notify_schedule(raw: Optional[str]) -> List[float]:
+    """Parse a checkpoint schedule from a string or JSON list.
+
+    Accepts either ``"180,420,900"`` or ``"[180, 420, 900]"`` shapes. Any
+    non-positive or unparseable entry is silently dropped. The returned
+    list is deduplicated and sorted ascending — callers rely on that to
+    walk cumulative checkpoints in order.
+    """
+    if not raw:
+        return []
+    text = raw.strip()
+    if not text:
+        return []
+    parsed: List[float] = []
+    try:
+        if text.startswith("["):
+            loaded = json.loads(text)
+            if isinstance(loaded, (list, tuple)):
+                for item in loaded:
+                    try:
+                        v = float(item)
+                    except (TypeError, ValueError):
+                        continue
+                    if v > 0:
+                        parsed.append(v)
+    except (ValueError, TypeError):
+        parsed = []
+    if not parsed:
+        for token in text.replace(";", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                v = float(token)
+            except ValueError:
+                continue
+            if v > 0:
+                parsed.append(v)
+    parsed = sorted({round(v, 6) for v in parsed})
+    return parsed
+
+
+_TASK_DESC_MAX_LEN = 120
+
+
+def _sanitize_task_description(
+    text: Optional[str],
+    *,
+    max_len: int = _TASK_DESC_MAX_LEN,
+) -> str:
+    """Collapse whitespace and cap a user-turn text for status readouts.
+
+    Never treated as a prompt; downstream code only ever renders this
+    inside a plain-English "Working on: X" line, so control characters
+    and leading slashes stay literal (no instruction interpretation).
+    """
+    if not text:
+        return ""
+    try:
+        collapsed = " ".join(str(text).split()).strip()
+    except Exception:
+        return ""
+    if not collapsed:
+        return ""
+    if len(collapsed) > max_len:
+        collapsed = collapsed[: max(1, max_len - 1)].rstrip() + "…"
+    return collapsed
 
 
 def _is_fresh_gateway_interruption(
@@ -1945,6 +2018,14 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
+            if "gateway_notify_schedule" in _agent_cfg:
+                _sched_cfg = _agent_cfg["gateway_notify_schedule"]
+                if isinstance(_sched_cfg, (list, tuple)):
+                    os.environ["HERMES_AGENT_NOTIFY_SCHEDULE"] = ",".join(
+                        str(x) for x in _sched_cfg
+                    )
+                elif isinstance(_sched_cfg, str):
+                    os.environ["HERMES_AGENT_NOTIFY_SCHEDULE"] = _sched_cfg
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -3430,6 +3511,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # Sanitized, capped user-turn text per running session — surfaced by
+        # /agents and the long-running heartbeat as plain-English "working
+        # on X" context. Cleared with the rest of the running-agent slot
+        # in _release_all_running_agent_state_for.
+        self._running_agents_task: Dict[str, str] = {}
         self._active_session_leases: Dict[str, Any] = {}
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
@@ -4527,13 +4613,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
+    @staticmethod
+    def _classify_turn_complexity(user_message: str) -> str:
+        """Legacy compatibility shim around the shared centralized classifier."""
+        return _classify_turn_complexity_shared(user_message)
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
-
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        Uses the centralized routing module so gateway behavior matches CLI,
+        cron, and subagent delegation.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -4548,11 +4636,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+
+        selected_model = model
+        route_class = "session"
+        reasoning_config = None
+        route_profile = "session"
+        route_category = "session"
+        route_reason = "Session/default model"
+        escalation_reason = None
+        workflow_match = None
+        override_used = False
+        clean_message = str(user_message or "")
+        try:
+            user_config = _load_gateway_config()
+            decision = resolve_routing_decision(
+                message=user_message,
+                base_model=model,
+                fallback_reasoning_config=getattr(self, "_reasoning_config", None),
+                config=user_config,
+                surface="gateway",
+            )
+            selected_model = decision.model
+            reasoning_config = decision.reasoning_config
+            route_profile = decision.profile
+            route_category = decision.category
+            route_reason = decision.reason
+            escalation_reason = decision.escalation_reason
+            workflow_match = decision.workflow_match
+            override_used = decision.override_used
+            clean_message = decision.clean_message
+            route_class = _classify_turn_complexity_shared(clean_message)
+        except Exception:
+            pass
+
         route = {
-            "model": model,
+            "model": selected_model,
+            "route_class": route_class,
+            "route_profile": route_profile,
+            "route_category": route_category,
+            "route_reason": route_reason,
+            "route_override": override_used,
+            "route_escalation_reason": escalation_reason,
+            "route_workflow_match": workflow_match,
+            "reasoning_config": reasoning_config,
             "runtime": runtime,
+            "clean_message": clean_message,
             "signature": (
-                model,
+                selected_model,
                 runtime["provider"],
                 runtime["requested_provider"],
                 runtime["base_url"],
@@ -4561,6 +4691,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 tuple(runtime["args"]),
             ),
         }
+        logger.info(
+            "Turn routing: class=%s profile=%s category=%s model=%s reasoning=%s "
+            "override=%s escalation=%s workflow=%s reason=%s",
+            route_class,
+            route_profile,
+            route_category,
+            selected_model,
+            (reasoning_config or {}).get("effort", "none")
+            if reasoning_config is not None else "session",
+            override_used,
+            escalation_reason or "",
+            workflow_match or "",
+            route_reason,
+        )
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -6859,6 +7003,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    def _record_running_task_description(
+        self,
+        session_key: Optional[str],
+        raw_text: Optional[str],
+    ) -> None:
+        """Store a sanitized, capped one-liner of the current turn's task.
+
+        Feeds both the /agents readout and the long-running heartbeat.
+        Untrusted inbound text is never treated as an instruction — it is
+        collapsed to a single line and only ever rendered as content.
+        """
+        if not session_key:
+            return
+        store = getattr(self, "_running_agents_task", None)
+        if store is None:
+            store = {}
+            self._running_agents_task = store
+        desc = _sanitize_task_description(raw_text)
+        if desc:
+            store[session_key] = desc
+        else:
+            store.pop(session_key, None)
+
+    def _humanize_session_source(self, source: Any) -> str:
+        """Return a plain-English "which chat/thread" label for a source.
+
+        Preferred order: cached SessionSource.description (already handles
+        DM / group / channel / thread), then chat_name, then platform.
+        Falls back to a generic label rather than exposing raw internal
+        keys.
+        """
+        if source is None:
+            return "an active chat"
+        try:
+            desc = str(getattr(source, "description", "") or "").strip()
+        except Exception:
+            desc = ""
+        if desc:
+            return desc
+        chat_name = str(getattr(source, "chat_name", "") or "").strip()
+        if chat_name:
+            return chat_name
+        platform = getattr(source, "platform", None)
+        plat_label = getattr(platform, "value", None) or str(platform or "").strip()
+        if plat_label and plat_label.lower() != "none":
+            return f"{plat_label} chat"
+        return "an active chat"
+
+    def _humanize_session_key(self, session_key: Optional[str]) -> str:
+        """Look up the human-readable label for a session_key.
+
+        Uses the cached SessionSource populated on message ingestion; if
+        the key isn't cached (e.g. the session was created before this
+        runner booted), degrades to a generic label so no internal
+        session key is leaked to the user.
+        """
+        if not session_key:
+            return "an active chat"
+        cached = getattr(self, "_session_sources", None)
+        if cached is not None:
+            source = cached.get(session_key)
+            if source is not None:
+                return self._humanize_session_source(source)
+        return "an active chat"
+
     # Upper bound on off-loop agent-resource cleanup invoked from coroutines
     # running on the gateway's event loop (session-expiry sweep, in-turn
     # cache-hygiene re-eviction). _cleanup_agent_resources is synchronous and
@@ -7713,6 +7922,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # instead of spinning up a duplicate AIAgent (#45456).
             self._running_agents[entry.session_key] = _AGENT_PENDING_SENTINEL
             self._running_agents_ts[entry.session_key] = time.time()
+            self._record_running_task_description(
+                entry.session_key, "resuming previous turn"
+            )
             self._persist_active_agents()
 
             # Empty-text internal event — the _is_resume_pending branch in
@@ -12270,6 +12482,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._active_session_leases[_quick_key] = _active_session_lease
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        self._record_running_task_description(_quick_key, getattr(event, "text", ""))
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
@@ -15807,12 +16020,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(
+            reasoning_config: Dict[str, Any] = dict(self._resolve_session_reasoning_config(
                 source=source, model=model
-            )
+            ) or {})
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            _clean_prompt = turn_route.get("clean_message")
+            if isinstance(_clean_prompt, str) and _clean_prompt:
+                prompt = _clean_prompt
+            _routed_reasoning = turn_route.get("reasoning_config")
+            if isinstance(_routed_reasoning, dict):
+                reasoning_config = dict(_routed_reasoning)
+                self._reasoning_config = reasoning_config
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -18859,6 +19079,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Failed to release active session slot", exc_info=True)
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
+        if hasattr(self, "_running_agents_task"):
+            self._running_agents_task.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
         # Turn boundary: a running-agent slot was just released.  Persist the
@@ -21307,11 +21529,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
 
             pr = self._provider_routing
-            reasoning_config = self._resolve_session_reasoning_config(
+            reasoning_config: Dict[str, Any] = dict(self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
                 model=model,
-            )
+            ) or {})
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(
                 source=source, session_key=session_key
@@ -21431,6 +21653,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            _clean_message = turn_route.get("clean_message")
+            if (
+                isinstance(message, str)
+                and isinstance(_clean_message, str)
+                and _clean_message
+            ):
+                message = _clean_message
+            _routed_reasoning = turn_route.get("reasoning_config")
+            if isinstance(_routed_reasoning, dict):
+                reasoning_config = dict(_routed_reasoning)
+                self._reasoning_config = reasoning_config
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -22696,12 +22929,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
 
         # Periodic "still working" notifications for long-running tasks.
-        # Fires every N seconds so the user knows the agent hasn't died.
-        # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
-        # 0 = disable notifications.
+        # Two modes:
+        #   1) SCHEDULE — agent.gateway_notify_schedule (or
+        #      HERMES_AGENT_NOTIFY_SCHEDULE) is a cumulative list of elapsed
+        #      seconds. Sends ONE fresh notification at each checkpoint and
+        #      stops after the last (e.g. [180,420,900,1800,3600] pings at
+        #      3/7/15/30/60 min, then stays quiet).
+        #   2) INTERVAL fallback — legacy agent.gateway_notify_interval
+        #      (HERMES_AGENT_NOTIFY_INTERVAL) fires every N seconds and
+        #      edits a single heartbeat message in place. Preserved for
+        #      backward compatibility with users who never migrated.
+        # 0 (or invalid) disables notifications entirely.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        _NOTIFY_SCHEDULE = _parse_notify_schedule(
+            os.environ.get("HERMES_AGENT_NOTIFY_SCHEDULE")
+        )
         _long_running_mode = _display_surface_mode(
             "long_running_notifications",
             default=True,
@@ -22709,28 +22952,104 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
+            _NOTIFY_SCHEDULE = []
         _notify_start = time.time()
 
-        async def _notify_long_running():
+        def _build_heartbeat_text() -> str:
+            _elapsed_mins = int((time.time() - _notify_start) // 60)
+            _agent_ref = agent_holder[0]
+            _status_detail = ""
+            _want_iteration_detail = bool(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "busy_ack_detail",
+                    True,
+                )
+            )
+            if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
+                try:
+                    _a = _agent_ref.get_activity_summary()
+                    _parts = []
+                    if _want_iteration_detail:
+                        _parts.append(
+                            f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                        )
+                    _action = _a.get("current_tool") or _a.get("last_activity_desc")
+                    if _action:
+                        _parts.append(str(_action))
+                    if _parts:
+                        _status_detail = " — " + ", ".join(_parts)
+                except Exception:
+                    pass
+            if _long_running_mode == "generic":
+                return _generic_status_phrase("status")
+            _task_desc = ""
+            try:
+                _task_desc = (getattr(self, "_running_agents_task", {}) or {}).get(
+                    session_key, ""
+                )
+            except Exception:
+                _task_desc = ""
+            _thread_label = self._humanize_session_source(source)
+            # Plain-English checkpoint: no internal session keys, no model
+            # names, no raw commands. Task line is sanitized upstream.
+            _lines = [f"⏳ Still working — {_elapsed_mins} min so far{_status_detail}"]
+            if _task_desc:
+                _lines.append(f"Task: {_task_desc}")
+            if _thread_label:
+                _lines.append(f"Thread: {_thread_label}")
+            return "\n".join(_lines)
+
+        async def _send_heartbeat_new(_notify_adapter) -> None:
+            """Post a fresh heartbeat message (used by schedule mode)."""
+            _text = _build_heartbeat_text()
+            try:
+                _res = await _notify_adapter.send(
+                    source.chat_id,
+                    _text,
+                    metadata=_non_conversational_metadata(
+                        _status_thread_metadata, platform=source.platform
+                    ),
+                )
+                if getattr(_res, "success", False) and getattr(
+                    _res, "message_id", None
+                ):
+                    _mid = str(_res.message_id)
+                    if _cleanup_progress:
+                        _cleanup_msg_ids.append(_mid)
+            except Exception as _ne:
+                logger.debug("Scheduled long-running notification error: %s", _ne)
+
+        async def _notify_long_running_schedule():
+            """Cumulative one-shot notifications — no edit-in-place."""
+            _notify_adapter = self._adapter_for_source(source)
+            if not _notify_adapter:
+                return
+            for _checkpoint in _NOTIFY_SCHEDULE:
+                _remaining = _checkpoint - (time.time() - _notify_start)
+                if _remaining > 0:
+                    await asyncio.sleep(_remaining)
+                try:
+                    _exec_ref = _executor_task
+                except NameError:
+                    _exec_ref = None
+                if not self._should_emit_long_running_notification(
+                    session_key, agent_holder[0], _exec_ref
+                ):
+                    return
+                await _send_heartbeat_new(_notify_adapter)
+
+        async def _notify_long_running_interval():
+            """Legacy interval mode — edits one heartbeat in place."""
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self._adapter_for_source(source)
             if not _notify_adapter:
                 return
-            # Track the heartbeat message id so we can edit-in-place on
-            # platforms that support it (Telegram, Discord, Slack, etc.)
-            # instead of spamming a new "Still working" bubble every
-            # interval. Falls back to send-new when edit fails or isn't
-            # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
-                # Stop heartbeating once this run no longer owns the session
-                # slot or the executor has finished — otherwise a stale
-                # "running: delegate_task" bubble can outlive the run that
-                # spawned it (#12029). _executor_task is a closure var bound
-                # just after this task is scheduled; tolerate the brief window
-                # before then (the first wake is _NOTIFY_INTERVAL away anyway).
                 try:
                     _exec_ref = _executor_task
                 except NameError:
@@ -22739,41 +23058,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key, agent_holder[0], _exec_ref
                 ):
                     break
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available. Default
-                # heartbeat is terse: elapsed + current tool. Verbose
-                # iteration counter is gated on busy_ack_detail so users
-                # who want it can opt in per platform.
-                _agent_ref = agent_holder[0]
-                _status_detail = ""
-                _want_iteration_detail = bool(
-                    resolve_display_setting(
-                        user_config,
-                        platform_key,
-                        "busy_ack_detail",
-                        True,
-                    )
-                )
-                if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
-                    try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
-                            )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
-                        if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
-                    except Exception:
-                        pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-                )
+                _heartbeat_text = _build_heartbeat_text()
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -22801,7 +23086,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
-        _notify_task = asyncio.create_task(_notify_long_running())
+        if _NOTIFY_SCHEDULE:
+            _notify_task = asyncio.create_task(_notify_long_running_schedule())
+        else:
+            _notify_task = asyncio.create_task(_notify_long_running_interval())
 
         def _stream_confirmed_final_delivery(
             consumer,

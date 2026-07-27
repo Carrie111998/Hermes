@@ -30,6 +30,7 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
+from agent.model_routing import resolve_routing_decision
 
 from toolsets import TOOLSETS
 
@@ -1086,6 +1087,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    routed_reasoning_config: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1295,27 +1297,28 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: centralized routing result (if provided) wins.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+    child_reasoning = routed_reasoning_config if routed_reasoning_config is not None else parent_reasoning
+    if routed_reasoning_config is None:
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -2595,6 +2598,24 @@ def delegate_task(
 
     _origin_wake_sid = _current_origin_session_id()
 
+    full_config = {}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        full_config = load_config_readonly()
+    except Exception:
+        full_config = {}
+
+    workflow_reasoning_override = None
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        _delegation_effort = cfg.get("reasoning_effort")
+        if _delegation_effort or _delegation_effort is False:
+            workflow_reasoning_override = parse_reasoning_effort(_delegation_effort)
+    except Exception:
+        workflow_reasoning_override = None
+
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
@@ -2604,6 +2625,31 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            _base_model = creds["model"] or getattr(parent_agent, "model", None) or ""
+            _routed_model = _base_model
+            _routed_reasoning = getattr(parent_agent, "reasoning_config", None)
+            try:
+                _route_message = str(t["goal"])
+                _ctx = str(t.get("context") or "").strip()
+                if _ctx:
+                    _route_message = f"{_route_message}\n\n{_ctx}"
+                _decision = resolve_routing_decision(
+                    message=_route_message,
+                    base_model=_base_model,
+                    fallback_reasoning_config=_routed_reasoning,
+                    config=full_config,
+                    surface="subagent",
+                    workflow_model_override=creds["model"],
+                    workflow_reasoning_override=workflow_reasoning_override,
+                )
+                _routed_model = _decision.model or _base_model
+                _routed_reasoning = _decision.reasoning_config
+            except Exception:
+                logger.debug(
+                    "Subagent routing failed for task %s; falling back to inherited model",
+                    i,
+                    exc_info=True,
+                )
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2611,7 +2657,7 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=_routed_model or None,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -2624,6 +2670,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                routed_reasoning_config=_routed_reasoning,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names

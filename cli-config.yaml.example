@@ -140,6 +140,35 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
+# Centralized Routing (gateway/CLI/cron/subagents)
+# =============================================================================
+# Shared model/reasoning router used across Hermes surfaces.
+# Priority: explicit override > workflow route > safety escalation > classifier > default.
+# Inline explicit override syntax in a user prompt:
+#   [[route: luna high]]
+#   [[route: profile=creative]]
+#   [[route: maximum-quality]]
+#   [[route: no-escalation]]
+#
+# routing:
+#   enabled: true
+#   default_profile: balanced      # deterministic|fast|fast_plus|balanced|creative|strong|maximum|ultra
+#   allow_escalation: true
+#   profiles:
+#     deterministic: { model: "luna",  reasoning: "none" }
+#     fast:          { model: "luna",  reasoning: "low" }
+#     fast_plus:     { model: "luna",  reasoning: "medium" }
+#     balanced:      { model: "terra", reasoning: "medium" }
+#     creative:      { model: "terra", reasoning: "high" }
+#     strong:        { model: "sol",   reasoning: "high" }
+#     maximum:       { model: "sol",   reasoning: "max" }
+#     ultra:         { model: "sol",   reasoning: "ultra" }
+#   # Optional substring→profile map for known workflows.
+#   # workflow_routes:
+#   #   "youtube editor handoff": "fast"
+#   #   "launch strategy": "strong"
+
+# =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
 # =============================================================================
 # Control how requests are routed across providers on OpenRouter.
@@ -792,6 +821,24 @@ agent:
   # Fires once per run when inactivity reaches this threshold (seconds).
   # Set to 0 to disable the warning.
   # gateway_timeout_warning: 900
+
+  # Long-running "still working" heartbeats.
+  # Two modes, listed here in order of precedence:
+  #
+  #   gateway_notify_schedule: [180, 420, 900, 1800, 3600]
+  #     Cumulative elapsed-second checkpoints. One fresh notification per
+  #     checkpoint (no edit-in-place), then the gateway stays quiet after
+  #     the last entry. The example above pings at 3 min, 7 min, 15 min,
+  #     30 min, and 1 h — after that a genuinely stuck run does not spam.
+  #     Each ping is plain English: the current task + which chat/thread
+  #     it belongs to.
+  #
+  #   gateway_notify_interval: 180
+  #     Legacy periodic mode. Fires every N seconds and edits a single
+  #     heartbeat message in place. Used only when gateway_notify_schedule
+  #     is unset or empty. 0 disables notifications entirely.
+  # gateway_notify_schedule: []
+  # gateway_notify_interval: 180
 
   # Graceful drain timeout for gateway stop/restart (seconds).
   # Default 0 = no drain: a restart interrupts in-flight agents immediately,

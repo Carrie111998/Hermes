@@ -181,12 +181,15 @@ class CLIAgentSetupMixin:
 
     def _resolve_turn_agent_config(self, user_message: str) -> dict:
         """Build the effective model/runtime config for a single user turn.
-
-        Always uses the session's primary model/provider.  If the user has
-        toggled `/fast` on and the current model supports Priority
-        Processing / Anthropic fast mode, attach `request_overrides` so the
-        API call is marked accordingly.
+        Uses the centralized routing module so CLI routing behavior matches
+        gateway/cron/subagent routing decisions.
         """
+        from agent.model_routing import (
+            classify_turn_complexity as _classify_turn_complexity_shared,
+            resolve_routing_decision,
+        )
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import resolve_reasoning_config
         from hermes_cli.models import resolve_fast_mode_overrides
 
         runtime = {
@@ -201,11 +204,32 @@ class CLIAgentSetupMixin:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+        cfg = load_config_readonly()
+        fallback_reasoning = getattr(self, "reasoning_config", None)
+        if fallback_reasoning is None:
+            fallback_reasoning = resolve_reasoning_config(cfg, self.model)
+        decision = resolve_routing_decision(
+            message=user_message,
+            base_model=self.model,
+            fallback_reasoning_config=fallback_reasoning,
+            config=cfg,
+            surface="cli",
+        )
+        routed_model = decision.model or self.model
+        routed_reasoning = decision.reasoning_config
+        if isinstance(routed_reasoning, dict):
+            self.reasoning_config = dict(routed_reasoning)
         route = {
-            "model": self.model,
+            "model": routed_model,
+            "route_profile": decision.profile,
+            "route_category": decision.category,
+            "route_reason": decision.reason,
+            "route_class": _classify_turn_complexity_shared(user_message),
+            "reasoning_config": routed_reasoning,
+            "clean_message": decision.clean_message,
             "runtime": runtime,
             "signature": (
-                self.model,
+                routed_model,
                 runtime["provider"],
                 runtime["requested_provider"],
                 runtime["base_url"],

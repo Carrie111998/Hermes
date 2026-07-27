@@ -384,6 +384,15 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        # Keep attribution tests deterministic: these scenarios model exactly
+        # the explicit entries below, so disable ambient anthropic auto-seeding
+        # from ~/.claude credentials and env vars in the local machine.
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_provider_explicitly_configured",
+            lambda _provider: False,
+        )
+        for _var in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+            monkeypatch.delenv(_var, raising=False)
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(

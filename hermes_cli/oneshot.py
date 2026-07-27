@@ -321,7 +321,9 @@ def _run_agent(
     run a single conversation.  Returns ``(final_response, run_result)``."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
+    from agent.model_routing import resolve_routing_decision
     from hermes_cli.config import load_config
+    from hermes_constants import resolve_reasoning_config
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
@@ -337,7 +339,8 @@ def _run_agent(
         cfg_model = model_cfg.get("default") or model_cfg.get("model") or ""
 
     env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
-    effective_model = (model or "").strip() or env_model or cfg_model
+    explicit_model_input = (model or "").strip()
+    effective_model = explicit_model_input or env_model or cfg_model
 
     # Resolve effective provider: explicit arg → (auto-detect from model if
     # model was explicit) → env / config (handled inside resolve_runtime_provider).
@@ -382,6 +385,21 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
+    base_reasoning_config = resolve_reasoning_config(cfg, effective_model)
+    try:
+        routing_decision = resolve_routing_decision(
+            message=prompt,
+            base_model=effective_model,
+            fallback_reasoning_config=base_reasoning_config,
+            config=cfg,
+            surface="oneshot",
+            workflow_model_override=explicit_model_input or None,
+        )
+        effective_model = routing_decision.model or effective_model
+        reasoning_config = routing_decision.reasoning_config
+    except Exception:
+        reasoning_config = base_reasoning_config
+
     runtime = resolve_runtime_provider(
         requested=effective_provider,
         target_model=effective_model or None,
@@ -420,6 +438,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            reasoning_config=reasoning_config,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction

@@ -932,6 +932,28 @@ def _ensure_hermes_home_managed(home: Path):
 
 DEFAULT_CONFIG = {
     "model": "",
+    # Centralized per-turn/task routing policy shared by gateway, CLI, cron,
+    # oneshot, and subagent delegation. Disabled by default; when enabled,
+    # model/reasoning selection follows explicit override > workflow route >
+    # safety escalation > classifier > default_profile.
+    "routing": {
+        "enabled": False,
+        "default_profile": "balanced",
+        "allow_escalation": True,
+        "profiles": {
+            "deterministic": {"model": "luna", "reasoning": "none"},
+            "fast": {"model": "luna", "reasoning": "low"},
+            "fast_plus": {"model": "luna", "reasoning": "medium"},
+            "balanced": {"model": "terra", "reasoning": "medium"},
+            "creative": {"model": "terra", "reasoning": "high"},
+            "strong": {"model": "sol", "reasoning": "high"},
+            "maximum": {"model": "sol", "reasoning": "max"},
+            "ultra": {"model": "sol", "reasoning": "ultra"},
+        },
+        # Optional map of substring -> profile, e.g.:
+        #   {"youtube editor handoff": "fast"}
+        "workflow_routes": {},
+    },
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
@@ -1093,7 +1115,15 @@ DEFAULT_CONFIG = {
         # noise; 180s is a compromise that catches spinning weak-model runs
         # (60+ tool iterations with tiny output) before users assume the
         # bot is dead and /restart.
+        # Used as the fallback when gateway_notify_schedule is unset/empty.
         "gateway_notify_interval": 180,
+        # Cumulative "still working" checkpoint schedule (seconds since the
+        # turn started). When set to a non-empty list, the gateway sends
+        # ONE fresh notification at each elapsed checkpoint and stops after
+        # the last — e.g. [180, 420, 900, 1800, 3600] pings at 3 min, 7 min,
+        # 15 min, 30 min, and 1 h. Empty / invalid falls back to the older
+        # gateway_notify_interval behaviour.
+        "gateway_notify_schedule": [],
         # Freshness window for the gateway auto-continue note (seconds).
         # After a gateway crash/restart/SIGTERM mid-run, the next user
         # message gets a "[System note: your previous turn was

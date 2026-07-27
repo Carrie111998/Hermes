@@ -104,9 +104,10 @@ def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
 
 
-def test_turn_route_injects_priority_processing_without_changing_runtime():
+def test_turn_route_injects_priority_processing_without_changing_runtime(monkeypatch):
     runner = _make_runner()
     runner._service_tier = "priority"
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     runtime_kwargs = {
         "api_key": "***",
         "base_url": "https://openrouter.ai/api/v1",
@@ -124,9 +125,10 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     assert route["request_overrides"] == {"service_tier": "priority"}
 
 
-def test_turn_route_skips_priority_processing_for_unsupported_models():
+def test_turn_route_skips_priority_processing_for_unsupported_models(monkeypatch):
     runner = _make_runner()
     runner._service_tier = "priority"
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     runtime_kwargs = {
         "api_key": "***",
         "base_url": "https://openrouter.ai/api/v1",
