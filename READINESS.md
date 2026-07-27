@@ -83,8 +83,9 @@ determination until a newer evidence commit is recorded.
 
 ## Post-boundary evidence on current main
 
-The exact acceptance command set was rerun against current `main` at baseline
-commit `10cea9fc07`. This is a separate,
+The exact acceptance command set plus the installer contract was rerun against
+current `main` at baseline commit
+`6e0557637945de6a9775e2da0747871aa994fafd`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
@@ -111,7 +112,8 @@ tag above.
 - Packaging artifact regression: **2 passed, 0 failed**.
 - Combined governed-runtime and packaging command: **84 passed, 0 failed**.
 - Bootstrap/operator regression additions: **6 passed, 0 failed**.
-- Expanded current-main validation command: **90 passed, 0 failed**.
+- Expanded current-main validation command: **93 passed, 0 failed** across 10
+  files, including the independent installer contract.
 - Non-interactive bootstrap smoke: two consecutive bootstrap invocations
   returned identical organization/objective IDs, and `business status` reported
   configured state from the persistent directory.
