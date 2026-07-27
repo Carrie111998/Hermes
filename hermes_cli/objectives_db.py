@@ -1037,6 +1037,7 @@ def issue_permit(
         if action["status"] != "proposed":
             raise PermitError(f"action is not awaiting a permit: {action['status']}")
         objective = get_objective(conn, action["objective_id"])
+        _assert_employee_actor_scope(conn, action["objective_id"], issued_to)
         if objective.status not in {"planned", "authorized", "executing"}:
             raise PermitError(
                 f"objective status {objective.status} does not admit new permits"
