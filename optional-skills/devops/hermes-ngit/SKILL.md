@@ -3,7 +3,7 @@ name: hermes-ngit
 description: "Use this skill when working with Nostr-based Git repositories (ngit / gitworkshop.dev) for decentralized, permissionless code hosting — `ngit init`, `ngit sync`, `ngit send`, `ngit issue`, `ngit pr`, and native `git push`/`git clone` against nostr:// remotes."
 version: 1.0.1
 author: Joey Stanford
-license: MIT
+license: CC-BY-SA-4.0
 compatibility: "ngit installed (gitworkshop.dev/ngit) with git-remote-nostr on PATH; an identity configured via `git config --global nostr.nsec` or a bunker reference. No daemon required. Optional: `gh` CLI for GitHub mirroring."
 triggers:
   - ngit
