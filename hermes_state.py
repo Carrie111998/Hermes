@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
+from agent.session_activity import ActivityProvenance
 from agent.message_sanitization import _sanitize_surrogates
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -215,8 +216,8 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
 def _sql_session_last_active(alias: str = "s") -> str:
     """SQL expression for session recency used by list/status surfaces.
 
-    Freshest of ``last_activity_at`` (mid-turn agent heartbeat) and the
-    latest message timestamp, then fall back to ``started_at``.
+    Freshest of ``last_activity_at`` (mid-turn agent activity heartbeat) and
+    the latest message timestamp, then fall back to ``started_at``.
 
     Must not prefer a stale heartbeat over a newer message: durable
     heartbeats are rate-limited (~60s), so after a turn writes messages
@@ -1215,6 +1216,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -4862,28 +4865,58 @@ class SessionDB:
         self,
         session_id: str,
         ts: Optional[float] = None,
+        *,
+        description: Optional[str] = None,
+        provenance: Optional[ActivityProvenance] = None,
     ) -> None:
-        """Stamp ``sessions.last_activity_at`` for mid-turn agent liveness.
+        """Stamp durable mid-turn session activity (observation-only).
 
         Called (rate-limited) from ``AIAgent._touch_activity`` so gateway/CLI
-        session listings and ``hermes status`` observe API/tool/compaction
-        progress even when no new message row has been written yet (#72016).
+        surfaces and stall consumers observe API/tool/compaction activity
+        even when no new message row has been written yet (#72016 / #72039).
 
-        Never moves the timestamp backwards. No-ops when ``session_id`` is
-        empty or the row does not exist.
+        Never moves ``last_activity_at`` backwards. When the timestamp
+        advances, bounded ``last_activity_description`` /
+        ``last_activity_provenance`` are written with it. No-ops when
+        ``session_id`` is empty or the row does not exist.
         """
         if not session_id:
             return
+        from agent.session_activity import (
+            bound_activity_description,
+            normalize_activity_provenance,
+        )
+
         when = float(ts if ts is not None else time.time())
+        desc = bound_activity_description(description)
+        prov = normalize_activity_provenance(provenance).value
 
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET last_activity_at = ? "
+                "UPDATE sessions SET "
+                "last_activity_at = ?, "
+                "last_activity_description = ?, "
+                "last_activity_provenance = ? "
                 "WHERE id = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
-                (when, session_id, when),
+                (when, desc, prov, session_id, when),
             )
 
         self._execute_write(_do)
+
+    def get_session_activity(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the durable activity snapshot for *session_id*, or None."""
+        if not session_id:
+            return None
+        row = self.get_session(session_id)
+        if not row:
+            return None
+        from agent.session_activity import build_activity_snapshot
+
+        return build_activity_snapshot(
+            last_activity_at=row.get("last_activity_at"),
+            last_activity_description=row.get("last_activity_description"),
+            last_activity_provenance=row.get("last_activity_provenance"),
+        )
 
     def update_session_meta(
         self,

@@ -1,9 +1,10 @@
-"""Durable session activity heartbeats from AIAgent._touch_activity (#72016)."""
+"""Durable session activity projection from AIAgent._touch_activity (#72016)."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import run_agent
+from agent.session_activity import ActivityProvenance
 
 
 def _agent_with_db(session_id: str = "sess-1"):
@@ -12,16 +13,24 @@ def _agent_with_db(session_id: str = "sess-1"):
         _session_db=MagicMock(),
         _last_activity_ts=0.0,
         _last_activity_desc="",
+        _last_activity_provenance=ActivityProvenance.UNKNOWN,
         _session_activity_last_persist_mono=0.0,
+        _current_tool=None,
+        _api_call_count=0,
+        max_iterations=10,
+        iteration_budget=SimpleNamespace(used=0, max_total=10),
     )
     agent._touch_activity = run_agent.AIAgent._touch_activity.__get__(agent, SimpleNamespace)
     agent._persist_session_activity_if_due = (
         run_agent.AIAgent._persist_session_activity_if_due.__get__(agent, SimpleNamespace)
     )
+    agent.get_activity_summary = run_agent.AIAgent.get_activity_summary.__get__(
+        agent, SimpleNamespace
+    )
     return agent
 
 
-def test_touch_activity_persists_session_heartbeat_once_per_minute(monkeypatch):
+def test_touch_activity_persists_session_activity_once_per_minute(monkeypatch):
     agent = _agent_with_db()
     mono = {"t": 1000.0}
     monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_000.0)
@@ -30,7 +39,10 @@ def test_touch_activity_persists_session_heartbeat_once_per_minute(monkeypatch):
 
     agent._touch_activity("starting API call #1")
     agent._session_db.touch_session_activity.assert_called_once_with(
-        "sess-1", 1_700_000_000.0
+        "sess-1",
+        1_700_000_000.0,
+        description="starting API call #1",
+        provenance=ActivityProvenance.UNKNOWN,
     )
 
     agent._session_db.touch_session_activity.reset_mock()
@@ -41,7 +53,10 @@ def test_touch_activity_persists_session_heartbeat_once_per_minute(monkeypatch):
     mono["t"] = 1061.0
     agent._touch_activity("API call #1 completed")
     agent._session_db.touch_session_activity.assert_called_once_with(
-        "sess-1", 1_700_000_000.0
+        "sess-1",
+        1_700_000_000.0,
+        description="API call #1 completed",
+        provenance=ActivityProvenance.UNKNOWN,
     )
 
 
@@ -54,6 +69,37 @@ def test_touch_activity_skips_persist_without_session_db(monkeypatch):
 
     agent._touch_activity("starting API call #1")
     assert agent._last_activity_desc == "starting API call #1"
+    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+
+
+def test_touch_activity_accepts_named_provenance(monkeypatch):
+    agent = _agent_with_db()
+    monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: 1000.0)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    agent._touch_activity(
+        "compressing context",
+        provenance=ActivityProvenance.AGENT_COMPRESSION,
+    )
+    assert agent._last_activity_provenance is ActivityProvenance.AGENT_COMPRESSION
+    agent._session_db.touch_session_activity.assert_called_once_with(
+        "sess-1",
+        1_700_000_000.0,
+        description="compressing context",
+        provenance=ActivityProvenance.AGENT_COMPRESSION,
+    )
+
+    agent._session_db.touch_session_activity.reset_mock()
+    agent._session_activity_last_persist_mono = 0.0
+    agent._touch_activity("starting API call #1")
+    assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
+    agent._session_db.touch_session_activity.assert_called_once_with(
+        "sess-1",
+        1_700_000_000.0,
+        description="starting API call #1",
+        provenance=ActivityProvenance.UNKNOWN,
+    )
 
 
 def test_touch_activity_persist_errors_are_swallowed(monkeypatch):
@@ -65,3 +111,22 @@ def test_touch_activity_persist_errors_are_swallowed(monkeypatch):
 
     agent._touch_activity("tool completed: terminal (1.0s)")
     assert agent._last_activity_desc == "tool completed: terminal (1.0s)"
+
+
+def test_get_activity_summary_exposes_shared_activity_contract(monkeypatch):
+    agent = _agent_with_db()
+    monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_010.0)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    agent._last_activity_ts = 1_700_000_000.0
+    agent._last_activity_desc = "executing tool: terminal"
+    agent._last_activity_provenance = ActivityProvenance.UNKNOWN
+
+    summary = agent.get_activity_summary()
+    assert summary["last_activity_at"] == 1_700_000_000.0
+    assert summary["last_activity_description"] == "executing tool: terminal"
+    assert summary["last_activity_provenance"] == "unknown"
+    assert summary["seconds_since_activity"] == 10.0
+    assert summary["last_activity_ts"] == 1_700_000_000.0
+    assert summary["last_activity_desc"] == "executing tool: terminal"
+    assert "phase" not in summary
+    assert "last_progress_at" not in summary

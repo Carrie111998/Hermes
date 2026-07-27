@@ -149,6 +149,7 @@ from agent.memory_manager import sanitize_context
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
+from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -3430,7 +3431,12 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
-    def _touch_activity(self, desc: str) -> None:
+    def _touch_activity(
+        self,
+        desc: str,
+        *,
+        provenance: Optional[ActivityProvenance] = None,
+    ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
         Also bridges to the kanban board's heartbeat fields when this
@@ -3439,13 +3445,22 @@ class AIAgent:
         worker as stale (#31752). Bridge is rate-limited (60s) and
         best-effort — it never raises into the agent loop.
 
-        Separately, rate-limits a durable ``sessions.last_activity_at``
-        stamp via SessionDB so ``hermes sessions list`` / ``hermes status``
-        observe mid-turn API/tool/compaction progress across process
-        boundaries (#72016).
+        Separately, rate-limits a durable SessionDB activity projection
+        (``last_activity_at`` + bounded description/provenance) so
+        CLI/Gateway consumers share one observation source (#72016 / #72039).
+
+        ``provenance`` defaults to ``unknown`` (the ordinary agent activity
+        clock). Named values are for special writers (e.g. compression);
+        ordinary call sites should leave the default.
         """
+        from agent.session_activity import (
+            bound_activity_description,
+            normalize_activity_provenance,
+        )
+
         self._last_activity_ts = time.time()
-        self._last_activity_desc = desc
+        self._last_activity_desc = bound_activity_description(desc)
+        self._last_activity_provenance = normalize_activity_provenance(provenance)
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -3459,7 +3474,7 @@ class AIAgent:
         self._persist_session_activity_if_due()
 
     def _persist_session_activity_if_due(self) -> None:
-        """Best-effort durable activity heartbeat for SessionDB listings.
+        """Best-effort durable activity heartbeat for SessionDB consumers.
 
         Rate-limited to one write per 60s per agent (same cadence as the
         kanban auto-heartbeat). Fail-open: never raises into the agent loop.
@@ -3477,11 +3492,25 @@ class AIAgent:
             return
         self._session_activity_last_persist_mono = now_mono
         try:
-            touch(session_id, getattr(self, "_last_activity_ts", None))
+            from agent.session_activity import normalize_activity_provenance
+
+            touch(
+                session_id,
+                getattr(self, "_last_activity_ts", None),
+                description=getattr(self, "_last_activity_desc", None),
+                provenance=normalize_activity_provenance(
+                    getattr(self, "_last_activity_provenance", None)
+                ),
+            )
+        except TypeError:
+            # Older SessionDB stubs may only accept (session_id, ts).
+            try:
+                touch(session_id, getattr(self, "_last_activity_ts", None))
+            except Exception:
+                pass
         except Exception:
             # Never let durable heartbeat I/O break the agent loop.
             pass
-
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
 
@@ -3681,20 +3710,32 @@ class AIAgent:
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
-        Called by the gateway timeout handler to report what the agent was doing
-        when it was killed, and by the periodic "still working" notifications.
+        Exposes the shared activity observation contract
+        (``last_activity_at`` / ``last_activity_description`` /
+        ``last_activity_provenance``) plus short aliases
+        (``last_activity_ts`` / ``last_activity_desc`` / …) for existing
+        gateway and delegate readers.
         """
-        elapsed = time.time() - self._last_activity_ts
-        return {
-            "last_activity_ts": self._last_activity_ts,
-            "last_activity_desc": self._last_activity_desc,
-            "seconds_since_activity": round(elapsed, 1),
-            "current_tool": self._current_tool,
-            "api_call_count": self._api_call_count,
-            "max_iterations": self.max_iterations,
-            "budget_used": self.iteration_budget.used,
-            "budget_max": self.iteration_budget.max_total,
-        }
+        from agent.session_activity import (
+            ActivityProvenance,
+            build_activity_snapshot,
+        )
+
+        provenance = getattr(self, "_last_activity_provenance", None)
+        if provenance is None:
+            provenance = ActivityProvenance.UNKNOWN
+        return build_activity_snapshot(
+            last_activity_at=getattr(self, "_last_activity_ts", None),
+            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
+            last_activity_provenance=provenance,
+            extra={
+                "current_tool": self._current_tool,
+                "api_call_count": self._api_call_count,
+                "max_iterations": self.max_iterations,
+                "budget_used": self.iteration_budget.used,
+                "budget_max": self.iteration_budget.max_total,
+            },
+        )
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.

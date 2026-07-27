@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 import hermes_state
+from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
 
@@ -4662,17 +4663,30 @@ class TestListSessionsRich:
 
         before = db.list_sessions_rich()[0]["last_active"]
         heartbeat = 1_700_000_500.0
-        db.touch_session_activity("s1", heartbeat)
+        db.touch_session_activity(
+            "s1",
+            heartbeat,
+            description="starting API call #1",
+            provenance=ActivityProvenance.UNKNOWN,
+        )
         after = db.list_sessions_rich()[0]["last_active"]
         assert after == heartbeat
         assert after > before
 
         row = db.get_session("s1")
         assert row["last_activity_at"] == heartbeat
+        assert row["last_activity_description"] == "starting API call #1"
+        assert row["last_activity_provenance"] == "unknown"
+
+        activity = db.get_session_activity("s1")
+        assert activity["last_activity_at"] == heartbeat
+        assert activity["last_activity_description"] == "starting API call #1"
+        assert "phase" not in activity
 
         # Never move last_activity_at backwards.
-        db.touch_session_activity("s1", heartbeat - 100)
+        db.touch_session_activity("s1", heartbeat - 100, description="ignored")
         assert db.get_session("s1")["last_activity_at"] == heartbeat
+        assert db.get_session("s1")["last_activity_description"] == "starting API call #1"
 
     def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
         """Rate-limited heartbeats can lag message writes; last_active must take max."""
@@ -4684,7 +4698,7 @@ class TestListSessionsRich:
                 (1_700_000_800.0, "s1"),
             )
             db._conn.commit()
-        db.touch_session_activity("s1", 1_700_000_500.0)  # older than message
+        db.touch_session_activity("s1", 1_700_000_500.0, description="api")  # older than message
         assert db.list_sessions_rich()[0]["last_active"] == 1_700_000_800.0
 
     def test_list_gateway_sessions_last_active_uses_activity_heartbeat(self, db):
@@ -4704,10 +4718,16 @@ class TestListSessionsRich:
             db._conn.commit()
 
         heartbeat = 1_700_000_900.0
-        db.touch_session_activity("gw-1", heartbeat)
+        db.touch_session_activity(
+            "gw-1",
+            heartbeat,
+            description="compressing context",
+        )
         rows = db.list_gateway_sessions(active_only=True)
         assert len(rows) == 1
         assert rows[0]["last_active"] == heartbeat
+        activity = db.get_session_activity("gw-1")
+        assert activity["last_activity_description"] == "compressing context"
 
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
