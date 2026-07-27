@@ -875,6 +875,7 @@ class FakeStore:
         execution_blockers: tuple[str, ...] = (),
         active_lease: bool = False,
         execution_blockers_after_claim: tuple[str, ...] = (),
+        preview_sources: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.events = events
         self.jobs = jobs
@@ -891,6 +892,7 @@ class FakeStore:
         self.execution_blockers = execution_blockers
         self.active_lease = active_lease
         self.execution_blockers_after_claim = execution_blockers_after_claim
+        self.preview_sources = dict(preview_sources or {})
         self.candidates = {
             source: _candidate(source)
             for job in jobs
@@ -947,6 +949,10 @@ class FakeStore:
         if self.candidate_override is not None:
             return self.candidate_override
         return self.candidates[source_session_id]
+
+    def get_sidebar_preview_source(self, source_session_id: str) -> dict[str, Any]:
+        self.events.append(("preview", source_session_id))
+        return self.preview_sources[source_session_id]
 
     def bind_sidebar_thread(
         self, *, lease_token: str, codex_thread_id: str, now: float
@@ -1111,6 +1117,8 @@ class FakeNative:
         self.preflight_error = preflight_error
         self.preflight_calls = 0
         self.create_calls = 0
+        self.created_prompts: list[str] = []
+        self.registered_prompts: list[str] = []
 
     def preflight(self, *, deadline: float) -> None:
         del deadline
@@ -1136,6 +1144,7 @@ class FakeNative:
             deadline,
         ))
         self.create_calls += 1
+        self.created_prompts.append(prompt)
         if isinstance(self.create_result, Exception):
             raise self.create_result
         if self.after_create is not None:
@@ -1152,6 +1161,7 @@ class FakeNative:
     ) -> None:
         assert "Signed marker:" in prompt
         assert isinstance(fresh, bool)
+        self.registered_prompts.append(prompt)
         self.events.append(("register", thread_id, deadline, fresh))
         if self.register_error is not None:
             raise self.register_error
@@ -1187,6 +1197,8 @@ def _executor(
     *,
     read_timeout_seconds: float = 60.0,
     operation_budget_seconds: float = 240.0,
+    readable_preview_enabled: bool = False,
+    preview_budget_chars: int = 24_000,
 ) -> SidebarExecutor:
     return SidebarExecutor(
         store=cast(SessionBridgeStore, store),
@@ -1199,6 +1211,8 @@ def _executor(
         read_timeout_seconds=read_timeout_seconds,
         poll_interval=1.0,
         operation_budget_seconds=operation_budget_seconds,
+        readable_preview_enabled=readable_preview_enabled,
+        preview_budget_chars=preview_budget_chars,
     )
 
 
@@ -1422,6 +1436,57 @@ def test_zero_marker_candidates_create_bind_and_register_before_any_read() -> No
     assert events[3][1] == _expected_recovery_key(SOURCE_1)
     assert events[4][2] == _expected_recovery_key(SOURCE_1)
     assert events[6][3] is True
+
+
+def test_continuous_executor_creates_readable_registration_prompt_when_enabled() -> (
+    None
+):
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    preview_source = {
+        "source_session_id": SOURCE_1,
+        "provider": "claude",
+        "source_cursor": "cursor-1",
+        "source_hash": "hash-1",
+        "title": "Readable canary",
+        "captured_at": 8.0,
+        "messages": [
+            {"role": "user", "content": "first message", "timestamp": 1.0},
+            {"role": "assistant", "content": "second message", "timestamp": 2.0},
+        ],
+    }
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        preview_sources={SOURCE_1: preview_source},
+    )
+    native = FakeNative(events, create_result=THREAD_1)
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+        readable_preview_enabled=True,
+    ).run_once()
+
+    assert result.status == "visible"
+    assert native.created_prompts == native.registered_prompts
+    prompt = native.created_prompts[0]
+    assert prompt.startswith("# Imported Claude Code Session")
+    assert "## Last 5 Messages" in prompt
+    assert "first message" in prompt
+    assert "second message" in prompt
+    assert "## Bridge Registration" in prompt
+    assert "Signed marker:" in prompt
+    assert [event[0] for event in events][:6] == [
+        "claim",
+        "candidate",
+        "preview",
+        "find",
+        "reserve",
+        "create",
+    ]
 
 
 def test_existing_create_reservation_with_zero_recovery_never_creates() -> None:

@@ -2692,6 +2692,10 @@ class ProductionBackend:
                     ),
                 ),
                 marker_secret=marker_key,
+                readable_preview_enabled=(
+                    self.config.sidebar.readable_preview_enabled
+                ),
+                preview_budget_chars=self.config.sidebar.preview_budget_chars,
             )
             return self._sidebar_executor
         except ConfigurationFailure:

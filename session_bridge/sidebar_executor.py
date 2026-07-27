@@ -15,6 +15,7 @@ from agent.transports.codex_app_server import CodexAppServerError
 
 from .codex_adapter import SidebarThreadVerifier, SidebarVerificationError
 from .models import BridgeMarkerPayload, Provider, encode_bridge_marker
+from .preview import build_session_preview
 from .sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
@@ -504,6 +505,8 @@ class SidebarExecutor:
         read_timeout_seconds: float = 60.0,
         poll_interval: float = 0.25,
         operation_budget_seconds: float = 240.0,
+        readable_preview_enabled: bool = False,
+        preview_budget_chars: int = 24_000,
     ) -> None:
         if not isinstance(marker_secret, bytes) or not marker_secret:
             raise ValueError("sidebar executor marker secret is unavailable")
@@ -523,6 +526,15 @@ class SidebarExecutor:
             raise ValueError(
                 "sidebar executor operation budget must be shorter than the lease"
             )
+        if type(readable_preview_enabled) is not bool:
+            raise ValueError("sidebar executor readable preview flag must be boolean")
+        if (
+            type(preview_budget_chars) is not int
+            or not 1 <= preview_budget_chars <= 100_000
+        ):
+            raise ValueError(
+                "sidebar executor preview budget must be between 1 and 100000"
+            )
         self._store = store
         self._verifier = verifier
         self._native = native
@@ -533,6 +545,8 @@ class SidebarExecutor:
         self._read_timeout_seconds = float(read_timeout_seconds)
         self._poll_interval = float(poll_interval)
         self._operation_budget_seconds = float(operation_budget_seconds)
+        self._readable_preview_enabled = readable_preview_enabled
+        self._preview_budget_chars = preview_budget_chars
 
     def run_once(self) -> SidebarExecutionResult:
         with _PROCESS_DELIVERY_LOCK:
@@ -693,7 +707,57 @@ class SidebarExecutor:
             policy_generation=1,
         )
         marker = encode_bridge_marker(expected, self._marker_secret)
-        prompt = build_registration_prompt(candidate, marker)
+        preview = None
+        if self._readable_preview_enabled:
+            try:
+                snapshot = self._store.get_sidebar_preview_source(
+                    source_session_id
+                )
+                if (
+                    not isinstance(snapshot, Mapping)
+                    or snapshot.get("source_session_id") != source_session_id
+                    or snapshot.get("provider") != candidate.provider.value
+                ):
+                    raise ValueError("sidebar source preview identity is malformed")
+                preview = build_session_preview(
+                    source_session_id=source_session_id,
+                    source_cursor=_required_text(
+                        snapshot.get("source_cursor"),
+                        "preview source cursor",
+                    ),
+                    source_hash=_required_text(
+                        snapshot.get("source_hash"),
+                        "preview source hash",
+                    ),
+                    title=cast(str | None, snapshot.get("title")),
+                    provider=candidate.provider.value,
+                    cwd=candidate.cwd,
+                    captured_at=cast(float, snapshot.get("captured_at")),
+                    messages=cast(
+                        list[Mapping[str, Any]],
+                        snapshot.get("messages"),
+                    ),
+                    git_root=candidate.git_root,
+                    git_branch=candidate.git_branch,
+                    git_head=candidate.git_head,
+                    worktree_id=candidate.worktree_id,
+                    budget_chars=self._preview_budget_chars,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except (KeyError, TypeError, ValueError):
+                return self._settle(
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    error_code="source_identity_mismatch",
+                )
+            except Exception:
+                return self._settle(
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    error_code="bridge_temporarily_unavailable",
+                )
+        prompt = build_registration_prompt(candidate, marker, preview=preview)
         expected_recovery_key = sidebar_create_recovery_key(
             marker,
             self._marker_secret,
