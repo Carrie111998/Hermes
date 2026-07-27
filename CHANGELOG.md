@@ -170,8 +170,10 @@ recorded.
 - `1bf543e12f7b14bd4d808fbb1438690a594f53e9` — stopped the supervised
   objective worker on global `recovery_blocked` results so unavailable
   authority recovery cannot leave the runtime polling for new work.
+- `a4ae9be834e76548c96556fd2ecf41cbd2b1c4e1` — shared the fail-closed
+  supervisor status contract with the gateway-hosted objective loop.
 - Current-main focused acceptance rerun at baseline
-  `1bf543e12f7b14bd4d808fbb1438690a594f53e9`: 6 Founder/CEO E2E tests, 44
+  `a4ae9be834e76548c96556fd2ecf41cbd2b1c4e1`: 6 Founder/CEO E2E tests, 45
   objective service/runtime/worker tests, and 18 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
