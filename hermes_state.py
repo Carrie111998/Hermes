@@ -1265,6 +1265,13 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS gateway_transcript_retries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -1292,6 +1299,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_gateway_transcript_retries_session
+    ON gateway_transcript_retries(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
@@ -6456,36 +6465,48 @@ class SessionDB:
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
         """
-        # Display metadata is presentation-only and never changes the model
-        # context role/content replayed to providers.
-        display_metadata_json = self._encode_display_metadata(display_metadata)
-        # Serialize structured fields to JSON before entering the write txn
-        reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
+        message = {
+            "role": role,
+            "content": content,
+            "tool_name": tool_name,
+            "tool_calls": tool_calls,
+            "tool_call_id": tool_call_id,
+            "token_count": token_count,
+            "finish_reason": finish_reason,
+            "reasoning": reasoning,
+            "reasoning_content": reasoning_content,
+            "reasoning_details": reasoning_details,
+            "codex_reasoning_items": codex_reasoning_items,
+            "codex_message_items": codex_message_items,
+            "platform_message_id": platform_message_id,
+            "observed": observed,
+            "effect_disposition": effect_disposition,
+            "timestamp": timestamp,
+            "api_content": api_content,
+            "display_kind": display_kind,
+            "display_metadata": display_metadata,
+        }
+        prepared = self._prepare_appended_message(message)
+        return self._execute_write(
+            lambda conn: self._append_message_in_transaction(
+                conn,
+                session_id,
+                prepared,
+                compression_lock_holder=compression_lock_holder,
+            )
         )
-        codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
-        )
-        codex_message_items_json = (
-            json.dumps(codex_message_items)
-            if codex_message_items else None
-        )
-        # tool_calls may arrive as a Python list (from the live agent) or
-        # as a JSON string (from import/export). Parse first to avoid
-        # double-encoding.
+
+    def _prepare_appended_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize one append payload before entering a write transaction."""
+        tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, str):
             try:
                 tool_calls = json.loads(tool_calls)
             except (json.JSONDecodeError, TypeError):
                 tool_calls = []
-        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-        # Multimodal content (list of parts) must be JSON-encoded: sqlite3
-        # cannot bind list/dict parameters directly.
-        stored_content = self._encode_content(content)
 
         message_timestamp = time.time()
+        timestamp = message.get("timestamp")
         if timestamp is not None:
             try:
                 if hasattr(timestamp, "timestamp"):
@@ -6495,81 +6516,281 @@ class SessionDB:
             except (TypeError, ValueError):
                 logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
 
-        # Pre-compute tool call count
         num_tool_calls = 0
         if tool_calls is not None:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
-        def _do(conn):
-            active_lock = conn.execute(
-                "SELECT holder FROM compression_locks "
-                "WHERE session_id = ? AND expires_at > ?",
-                (session_id, time.time()),
-            ).fetchone()
-            if (
-                active_lock is not None
-                and active_lock["holder"] != compression_lock_holder
-            ):
-                raise CompressionSessionBusyError(
-                    f"Session {session_id!r} is being compressed by another writer"
-                )
-            session = conn.execute(
-                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if (
-                session is not None
-                and session["ended_at"] is not None
-                and session["end_reason"] == "compression"
-            ):
-                raise CompressionSessionClosedError(session_id)
-            cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
-                   reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    role,
-                    stored_content,
-                    tool_call_id,
-                    tool_calls_json,
-                    _scrub_surrogates(tool_name),
-                    effect_disposition,
-                    message_timestamp,
-                    token_count,
-                    finish_reason,
-                    _scrub_surrogates(reasoning),
-                    _scrub_surrogates(reasoning_content),
-                    reasoning_details_json,
-                    codex_items_json,
-                    codex_message_items_json,
-                    platform_message_id,
-                    1 if observed else 0,
-                    1,
-                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
-                    _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
-                    display_metadata_json,
-                ),
-            )
-            msg_id = cursor.lastrowid
+        return {
+            "role": message.get("role", "unknown"),
+            "content": self._encode_content(message.get("content")),
+            "tool_call_id": message.get("tool_call_id"),
+            "tool_calls": json.dumps(tool_calls) if tool_calls else None,
+            "tool_name": _scrub_surrogates(message.get("tool_name")),
+            "effect_disposition": message.get("effect_disposition"),
+            "timestamp": message_timestamp,
+            "token_count": message.get("token_count"),
+            "finish_reason": message.get("finish_reason"),
+            "reasoning": _scrub_surrogates(message.get("reasoning")),
+            "reasoning_content": _scrub_surrogates(message.get("reasoning_content")),
+            "reasoning_details": (
+                json.dumps(message.get("reasoning_details"))
+                if message.get("reasoning_details") else None
+            ),
+            "codex_reasoning_items": (
+                json.dumps(message.get("codex_reasoning_items"))
+                if message.get("codex_reasoning_items") else None
+            ),
+            "codex_message_items": (
+                json.dumps(message.get("codex_message_items"))
+                if message.get("codex_message_items") else None
+            ),
+            "platform_message_id": message.get("platform_message_id"),
+            "observed": 1 if message.get("observed") else 0,
+            "api_content": (
+                _scrub_surrogates(message.get("api_content"))
+                if isinstance(message.get("api_content"), str) else None
+            ),
+            "display_kind": (
+                _scrub_surrogates(message.get("display_kind"))
+                if isinstance(message.get("display_kind"), str) else None
+            ),
+            "display_metadata": self._encode_display_metadata(
+                message.get("display_metadata")
+            ),
+            "num_tool_calls": num_tool_calls,
+        }
 
-            # Update counters
-            if num_tool_calls > 0:
-                conn.execute(
-                    """UPDATE sessions SET message_count = message_count + 1,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (num_tool_calls, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+    def _append_message_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        message: Dict[str, Any],
+        *,
+        compression_lock_holder: Optional[str] = None,
+    ) -> int:
+        """Insert one prepared message and update counters on *conn*."""
+        active_lock = conn.execute(
+            "SELECT holder FROM compression_locks "
+            "WHERE session_id = ? AND expires_at > ?",
+            (session_id, time.time()),
+        ).fetchone()
+        if (
+            active_lock is not None
+            and active_lock["holder"] != compression_lock_holder
+        ):
+            raise CompressionSessionBusyError(
+                f"Session {session_id!r} is being compressed by another writer"
+            )
+        session = conn.execute(
+            "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if (
+            session is not None
+            and session["ended_at"] is not None
+            and session["end_reason"] == "compression"
+        ):
+            raise CompressionSessionClosedError(session_id)
+
+        cursor = conn.execute(
+            """INSERT INTO messages (session_id, role, content, tool_call_id,
+               tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+               reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+               codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                message["role"],
+                message["content"],
+                message["tool_call_id"],
+                message["tool_calls"],
+                message["tool_name"],
+                message["effect_disposition"],
+                message["timestamp"],
+                message["token_count"],
+                message["finish_reason"],
+                message["reasoning"],
+                message["reasoning_content"],
+                message["reasoning_details"],
+                message["codex_reasoning_items"],
+                message["codex_message_items"],
+                message["platform_message_id"],
+                message["observed"],
+                1,
+                message["api_content"],
+                message["display_kind"],
+                message["display_metadata"],
+            ),
+        )
+        msg_id = cursor.lastrowid
+        if msg_id is None:
+            raise RuntimeError("message insert did not produce a row id")
+        num_tool_calls = message["num_tool_calls"]
+        if num_tool_calls > 0:
+            conn.execute(
+                """UPDATE sessions SET message_count = message_count + 1,
+                   tool_call_count = tool_call_count + ? WHERE id = ?""",
+                (num_tool_calls, session_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (session_id,),
+            )
+        return msg_id
+
+    def enqueue_gateway_transcript_retry(
+        self,
+        session_id: str,
+        message: Dict[str, Any],
+        *,
+        max_pending: int = 200,
+    ) -> Dict[str, Any]:
+        """Durably stage a gateway transcript append before touching FTS.
+
+        This table has no FTS triggers, so it remains writable when a corrupt
+        FTS shadow table rejects inserts into ``messages``. The returned row id
+        is later consumed by :meth:`replay_gateway_transcript_retry`.
+        """
+        payload = dict(message)
+        staged_at = time.time()
+        timestamp = payload.get("timestamp")
+        if timestamp is None:
+            payload["timestamp"] = staged_at
+        else:
+            try:
+                if hasattr(timestamp, "timestamp"):
+                    payload["timestamp"] = float(timestamp.timestamp())
+                else:
+                    payload["timestamp"] = float(timestamp)
+            except (TypeError, ValueError):
+                payload["timestamp"] = staged_at
+        message_json = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+
+        def _do(conn):
+            cursor = conn.execute(
+                "INSERT INTO gateway_transcript_retries "
+                "(session_id, message_json, created_at) VALUES (?, ?, ?)",
+                (session_id, message_json, staged_at),
+            )
+            retry_id = int(cursor.lastrowid)
+            dropped_ids: List[int] = []
+            if max_pending > 0:
+                rows = conn.execute(
+                    "SELECT id FROM gateway_transcript_retries "
+                    "WHERE session_id = ? ORDER BY id DESC",
                     (session_id,),
-                )
-            return msg_id
+                ).fetchall()
+                if len(rows) > max_pending:
+                    dropped_ids = [int(row["id"]) for row in rows[max_pending:]]
+                    placeholders = ",".join("?" for _ in dropped_ids)
+                    conn.execute(
+                        f"DELETE FROM gateway_transcript_retries "
+                        f"WHERE id IN ({placeholders})",
+                        dropped_ids,
+                    )
+            return {"id": retry_id, "dropped_ids": dropped_ids}
 
         return self._execute_write(_do)
+
+    def list_gateway_transcript_retries(self) -> List[Dict[str, Any]]:
+        """Return staged gateway transcript appends in durable arrival order."""
+        conn = self._conn
+        if conn is None:
+            return []
+        with self._lock:
+            rows = conn.execute(
+                "SELECT id, session_id, message_json, created_at "
+                "FROM gateway_transcript_retries ORDER BY id"
+            ).fetchall()
+        retries = []
+        for row in rows:
+            try:
+                message = json.loads(row["message_json"])
+                if not isinstance(message, dict):
+                    raise TypeError("message payload is not an object")
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.error(
+                    "Ignoring invalid gateway transcript retry row %s: %s",
+                    row["id"],
+                    exc,
+                )
+                message = None
+            retries.append(
+                {
+                    "id": int(row["id"]),
+                    "session_id": row["session_id"],
+                    "message": message,
+                    "created_at": row["created_at"],
+                }
+            )
+        return retries
+
+    def replay_gateway_transcript_retry(
+        self,
+        retry_id: int,
+        *,
+        target_session_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Atomically append one staged message and acknowledge its journal row."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT session_id, message_json FROM gateway_transcript_retries "
+                "WHERE id = ?",
+                (retry_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            message = json.loads(row["message_json"])
+            if not isinstance(message, dict):
+                raise TypeError("gateway transcript retry payload is not an object")
+            prepared = self._prepare_appended_message(message)
+            message_id = self._append_message_in_transaction(
+                conn,
+                target_session_id or row["session_id"],
+                prepared,
+            )
+            conn.execute(
+                "DELETE FROM gateway_transcript_retries WHERE id = ?",
+                (retry_id,),
+            )
+            return message_id
+
+        return self._execute_write(_do)
+
+    def discard_gateway_transcript_retry(self, retry_id: int) -> None:
+        """Discard one retry row that can no longer be routed safely."""
+        self._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM gateway_transcript_retries WHERE id = ?",
+                (retry_id,),
+            )
+        )
+
+    def clear_gateway_transcript_retries(self, session_id: str) -> None:
+        """Clear staged rows before a transcript rewrite or rewind."""
+        self._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM gateway_transcript_retries WHERE session_id = ?",
+                (session_id,),
+            )
+        )
+
+    def reroute_gateway_transcript_retries(
+        self, source_session_id: str, target_session_id: str
+    ) -> None:
+        """Move a compression-ended parent's remaining retries to its child."""
+        self._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE gateway_transcript_retries SET session_id = ? "
+                "WHERE session_id = ?",
+                (target_session_id, source_session_id),
+            )
+        )
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,

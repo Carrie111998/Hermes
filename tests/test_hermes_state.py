@@ -1254,6 +1254,64 @@ class TestMessageStorage:
         session = db.get_session("s1")
         assert session["message_count"] == 2
 
+    def test_gateway_transcript_retry_replay_is_atomic(self, db, monkeypatch):
+        db.create_session(session_id="s1", source="telegram")
+        staged = db.enqueue_gateway_transcript_retry(
+            "s1",
+            {
+                "role": "assistant",
+                "content": "durable answer",
+                "tool_calls": [
+                    {"id": "call-1", "function": {"name": "terminal", "arguments": "{}"}}
+                ],
+                "reasoning": "private reasoning",
+                "api_content": "wire-exact answer",
+                "display_kind": "gateway",
+                "display_metadata": {"source": "telegram"},
+            },
+        )
+        original_append = db._append_message_in_transaction
+
+        def fail_before_ack(conn, session_id, message, **kwargs):
+            original_append(conn, session_id, message, **kwargs)
+            raise RuntimeError("crash before journal acknowledgement")
+
+        monkeypatch.setattr(db, "_append_message_in_transaction", fail_before_ack)
+        with pytest.raises(RuntimeError, match="journal acknowledgement"):
+            db.replay_gateway_transcript_retry(staged["id"])
+
+        assert db.get_messages_as_conversation("s1") == []
+        assert [row["id"] for row in db.list_gateway_transcript_retries()] == [
+            staged["id"]
+        ]
+        assert db.get_session("s1")["message_count"] == 0
+
+        monkeypatch.setattr(db, "_append_message_in_transaction", original_append)
+        db.replay_gateway_transcript_retry(staged["id"])
+
+        messages = db.get_messages("s1")
+        assert len(messages) == 1
+        assert messages[0]["content"] == "durable answer"
+        assert messages[0]["reasoning"] == "private reasoning"
+        assert messages[0]["api_content"] == "wire-exact answer"
+        assert messages[0]["display_metadata"] == {"source": "telegram"}
+        assert db.list_gateway_transcript_retries() == []
+        assert db.get_session("s1")["message_count"] == 1
+
+    def test_gateway_transcript_retry_cap_is_durable(self, db):
+        db.create_session(session_id="s1", source="telegram")
+        for index in range(3):
+            db.enqueue_gateway_transcript_retry(
+                "s1",
+                {"role": "user", "content": f"message-{index}"},
+                max_pending=2,
+            )
+
+        assert [
+            row["message"]["content"]
+            for row in db.list_gateway_transcript_retries()
+        ] == ["message-1", "message-2"]
+
     def test_observed_flag_round_trips_for_gateway_replay(self, db):
         db.create_session(session_id="s1", source="telegram:-100")
         db.append_message(

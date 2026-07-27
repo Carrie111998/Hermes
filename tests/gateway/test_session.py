@@ -2273,6 +2273,151 @@ class TestRewriteTranscriptPreservesReasoning:
 
 
 class TestGatewaySessionDbRecovery:
+    def test_transcript_retry_survives_restart_and_replays(self, tmp_path, monkeypatch):
+        import hermes_state
+        import sqlite3
+
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        store._db.create_session("s1", source="telegram")
+        if not store._db._fts_enabled:
+            store._db.close()
+            pytest.skip("FTS5 unavailable in this build")
+        store._db.append_message("s1", role="user", content="before corruption")
+
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "UPDATE messages_fts_data "
+            "SET block = X'DEADBEEFDEADBEEFDEADBEEFDEADBEEF'"
+        )
+        raw.commit()
+        raw.close()
+
+        # Simulate corruption persisting after both one-shot rebuild paths were
+        # already consumed in this process.
+        store._db._fts_runtime_rebuild_attempted = True
+        store._fts_rebuild_attempted = True
+        store.append_to_transcript("s1", {"role": "user", "content": "survive restart"})
+
+        assert [
+            message["content"]
+            for message in store._db.get_messages_as_conversation("s1")
+        ] == ["before corruption"]
+        assert [
+            row["message"]["content"]
+            for row in store._db.list_gateway_transcript_retries()
+        ] == ["survive restart"]
+        store._db.close()
+
+        restarted = SessionStore(
+            sessions_dir=tmp_path / "sessions", config=GatewayConfig()
+        )
+
+        assert [
+            message["content"]
+            for message in restarted._db.get_messages_as_conversation("s1")
+        ] == ["before corruption", "survive restart"]
+        assert restarted._db.list_gateway_transcript_retries() == []
+        restarted._db.close()
+
+    def test_transcript_retry_stays_durable_when_startup_replay_fails(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        store._db.create_session("s1", source="telegram")
+
+        def fail_append(_session_id, _message):
+            raise RuntimeError("persistent write failure")
+
+        monkeypatch.setattr(store, "_append_transcript_message", fail_append)
+        store.append_to_transcript("s1", {"role": "user", "content": "keep me"})
+        store._db.close()
+
+        def fail_replay(*_args, **_kwargs):
+            raise RuntimeError("persistent write failure")
+
+        monkeypatch.setattr(SessionDB, "replay_gateway_transcript_retry", fail_replay)
+        restarted = SessionStore(
+            sessions_dir=tmp_path / "sessions", config=GatewayConfig()
+        )
+
+        assert restarted._db.get_messages_as_conversation("s1") == []
+        assert [
+            row["message"]["content"]
+            for row in restarted._db.list_gateway_transcript_retries()
+        ] == ["keep me"]
+        restarted._db.close()
+
+    def test_transcript_retry_restart_reroutes_parent_backlog_to_child(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        store._db.create_session("parent", source="telegram")
+
+        def fail_append(_session_id, _message):
+            raise RuntimeError("persistent write failure")
+
+        monkeypatch.setattr(store, "_append_transcript_message", fail_append)
+        store.append_to_transcript("parent", {"role": "user", "content": "first"})
+        store.append_to_transcript(
+            "parent", {"role": "assistant", "content": "second"}
+        )
+        store._db.end_session("parent", "compression")
+        store._db.create_session(
+            "child", source="telegram", parent_session_id="parent"
+        )
+        store._db.close()
+
+        restarted = SessionStore(
+            sessions_dir=tmp_path / "sessions", config=GatewayConfig()
+        )
+
+        assert restarted._db.get_messages_as_conversation("parent") == []
+        assert [
+            message["content"]
+            for message in restarted._db.get_messages_as_conversation("child")
+        ] == ["first", "second"]
+        assert restarted._db.list_gateway_transcript_retries() == []
+        restarted._db.close()
+
+    @pytest.mark.parametrize("operation", ["rewrite", "rewind"])
+    def test_transcript_mutation_clears_durable_retries(
+        self, tmp_path, monkeypatch, operation
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        store._db.create_session("s1", source="telegram")
+        store._db.append_message("s1", role="user", content="persisted")
+
+        def fail_append(_session_id, _message):
+            raise RuntimeError("persistent write failure")
+
+        monkeypatch.setattr(store, "_append_transcript_message", fail_append)
+        store.append_to_transcript(
+            "s1", {"role": "assistant", "content": "stale pending"}
+        )
+        assert len(store._db.list_gateway_transcript_retries()) == 1
+
+        if operation == "rewrite":
+            assert store.rewrite_transcript(
+                "s1", [{"role": "user", "content": "replacement"}]
+            )
+        else:
+            assert store.rewind_session("s1", 1) is not None
+
+        assert store._db.list_gateway_transcript_retries() == []
+        store._db.close()
+
     def test_compression_closed_parent_reroutes_without_retry_queue(self, tmp_path):
         import threading
         from types import SimpleNamespace
