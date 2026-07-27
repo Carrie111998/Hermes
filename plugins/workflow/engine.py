@@ -2965,6 +2965,7 @@ class WorkflowEngine:
                         if has_active_review:
                             break
                 if has_active_review:
+                    print(f"   🔍 has_active_review=True — layer={layer}")
                     # Review loop active — don't re-enter layer dispatch.
                     # Instead, poll the implement card for its next
                     # "pending review" block. The dispatcher handles
