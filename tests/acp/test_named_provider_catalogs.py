@@ -8,13 +8,15 @@ offer them — the TUI ``/model`` picker already renders these entries
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from acp.exceptions import RequestError
 from acp_adapter.server import HermesACPAgent, _named_custom_provider_catalogs
 from acp_adapter.session import SessionManager
-from acp.schema import SessionModelState
+from acp.schema import SessionModelState, SetSessionModelResponse
+from hermes_state import SessionDB
 
 
 MANTLE_URL = "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
@@ -201,3 +203,77 @@ class TestModelStateIncludesNamedProviders:
         provider, model = parse_model_input(choice_id, "bedrock")
         assert provider == "custom:bedrock-mantle"
         assert model == "openai.gpt-5.5"
+
+    @pytest.mark.asyncio
+    async def test_set_model_validates_declared_named_provider_catalog(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(
+            db=db,
+            agent_factory=lambda: SimpleNamespace(
+                model="gpt-5.4",
+                provider="openai-codex",
+                base_url="https://api.openai.com/v1",
+                api_mode="codex_responses",
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd=str(tmp_path))
+        replacement_agent = SimpleNamespace(
+            model="openai.gpt-5.5",
+            provider="custom:bedrock-mantle",
+            base_url=MANTLE_URL,
+            api_mode="codex_responses",
+        )
+        make_agent = MagicMock(return_value=replacement_agent)
+        monkeypatch.setattr(manager, "_make_agent", make_agent)
+        picker_context = MagicMock()
+        picker_context.with_overrides.return_value = picker_context
+
+        with (
+            patch(
+                "hermes_cli.inventory.load_picker_context",
+                return_value=picker_context,
+            ),
+            patch(
+                "hermes_cli.inventory.build_models_payload",
+                return_value={"providers": []},
+            ),
+            patch(
+                "acp_adapter.server._named_custom_provider_catalogs",
+                return_value=[
+                    (
+                        "custom:bedrock-mantle",
+                        "AWS Bedrock Mantle",
+                        [("openai.gpt-5.5", "")],
+                    )
+                ],
+            ),
+        ):
+            result = await acp_agent.set_session_model(
+                model_id="custom:bedrock-mantle:openai.gpt-5.5",
+                session_id=state.session_id,
+            )
+            with pytest.raises(RequestError) as exc_info:
+                await acp_agent.set_session_model(
+                    model_id="custom:bedrock-mantle:not-declared",
+                    session_id=state.session_id,
+                )
+
+        assert isinstance(result, SetSessionModelResponse)
+        assert exc_info.value.code == -32602
+        error_data = exc_info.value.data
+        assert isinstance(error_data, dict)
+        assert error_data["provider"] == "custom:bedrock-mantle"
+        assert state.model == "openai.gpt-5.5"
+        assert state.agent is replacement_agent
+        make_agent.assert_called_once_with(
+            session_id=state.session_id,
+            cwd=str(tmp_path),
+            model="openai.gpt-5.5",
+            requested_provider="custom:bedrock-mantle",
+            base_url=None,
+            api_mode=None,
+        )
+        db.close()
