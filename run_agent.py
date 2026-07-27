@@ -6512,9 +6512,23 @@ class AIAgent:
             if idle_timeout <= 0:
                 return _run(None)
 
-            existing_prompt = getattr(self, "_cached_system_prompt", None)
-            if not existing_prompt:
-                existing_prompt = self._build_system_prompt(system_message)
+            # Resolve the fallback prompt lazily on timeout only. Eager
+            # rebuild here would raise before compress_context runs whenever
+            # _cached_system_prompt is unset and _build_system_prompt fails
+            # (lock-refresher / noop-exception tests rely on that path).
+            def _fallback_prompt():
+                cached = getattr(self, "_cached_system_prompt", None)
+                if cached:
+                    return cached
+                try:
+                    return self._build_system_prompt(system_message)
+                except Exception:
+                    logger.debug(
+                        "compress_context timeout fallback prompt rebuild "
+                        "failed; using raw system_message",
+                        exc_info=True,
+                    )
+                    return system_message or ""
 
             def _on_timeout(idle, waited, since_progress):
                 logger.warning(
@@ -6564,7 +6578,7 @@ class AIAgent:
             return run_compress_context_with_progress_timeout(
                 worker=_run,
                 messages=messages,
-                system_prompt_fallback=existing_prompt,
+                system_prompt_fallback=_fallback_prompt,
                 idle_timeout_seconds=idle_timeout,
                 total_ceiling_seconds=total_ceiling,
                 on_timeout=_on_timeout,

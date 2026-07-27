@@ -192,22 +192,13 @@ class TestRunCompressContextWithProgressTimeout:
         assert prompt == "p"
         assert msgs[0]["content"] == "ok"
 
-    def test_uses_daemon_executor(self, monkeypatch):
-        from tools.daemon_pool import DaemonThreadPoolExecutor
-
-        created = []
-
-        class TrackingPool(DaemonThreadPoolExecutor):
-            def __init__(self, *args, **kwargs):
-                created.append(type(self))
-                super().__init__(*args, **kwargs)
-
-        monkeypatch.setattr(
-            "tools.daemon_pool.DaemonThreadPoolExecutor",
-            TrackingPool,
-        )
+    def test_runs_worker_off_caller_thread(self):
+        """Mirror gateway run_in_executor: compress work must leave the caller thread."""
+        caller = threading.current_thread().ident
+        seen = {}
 
         def worker(fence: CompressionCommitFence):
+            seen["worker"] = threading.current_thread().ident
             if not fence.begin_commit():
                 return ([], "")
             try:
@@ -215,14 +206,26 @@ class TestRunCompressContextWithProgressTimeout:
             finally:
                 fence.finish_commit()
 
-        run_compress_context_with_progress_timeout(
+        msgs, prompt = run_compress_context_with_progress_timeout(
             worker=worker,
             messages=[],
             system_prompt_fallback="",
             idle_timeout_seconds=1.0,
             total_ceiling_seconds=1.0,
         )
-        assert created and issubclass(created[0], DaemonThreadPoolExecutor)
+        assert seen.get("worker") is not None
+        assert seen["worker"] != caller
+        assert prompt == "p"
+        assert msgs[0]["content"] == "ok"
+
+    def test_reuses_module_shared_executor(self):
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+        from agent import conversation_compression as mod
+
+        first = mod._get_compress_timeout_executor()
+        second = mod._get_compress_timeout_executor()
+        assert first is second
+        assert isinstance(first, DaemonThreadPoolExecutor)
 
 
 class TestCompressContextForwarderOwnsTimeout:
@@ -286,6 +289,60 @@ class TestCompressContextForwarderOwnsTimeout:
         )
         assert cooldown_args[0] == 60.0
         assert "host compress_context timeout" in cooldown_args[1]
+
+    def test_fallback_prompt_resolved_lazily_on_timeout(self, monkeypatch):
+        """Eager prompt rebuild must not run before compression starts."""
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.session_id = "s1"
+        agent._cached_system_prompt = None
+        agent._emit_warning = MagicMock()
+        agent._conversation_root_id = MagicMock(return_value=None)
+        agent.context_compressor = MagicMock()
+        agent.context_compressor._consecutive_timeout_failures = 0
+        agent.context_compressor._record_compression_failure_cooldown = MagicMock()
+        builds = {"n": 0}
+
+        def boom_build(*_a, **_kw):
+            builds["n"] += 1
+            raise RuntimeError("prompt rebuild boom")
+
+        agent._build_system_prompt = boom_build
+
+        hang = threading.Event()
+
+        def fake_compress(agent_obj, messages, system_message, **kwargs):
+            hang.wait(timeout=2)
+            fence = kwargs.get("commit_fence")
+            if fence is not None and not fence.begin_commit():
+                return messages, "sys"
+            return messages, "sys"
+
+        monkeypatch.setattr(
+            "agent.conversation_compression.compress_context",
+            fake_compress,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            lambda compression_cfg=None: (0.05, 0.2),
+        )
+        monkeypatch.setattr(
+            "agent.portal_tags.get_conversation_context",
+            lambda: object(),
+        )
+
+        original = [{"role": "user", "content": "stay"}]
+        out_msgs, out_prompt = AIAgent._compress_context(
+            agent, original, "sys"
+        )
+        hang.set()
+
+        assert out_msgs is original
+        assert out_prompt == "sys"
+        # Fallback rebuild runs only on the timeout return path.
+        assert builds["n"] == 1
+        agent._emit_warning.assert_called_once()
 
     def test_caller_fence_bypasses_owned_wrapper(self, monkeypatch):
         from run_agent import AIAgent

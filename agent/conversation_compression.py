@@ -290,6 +290,34 @@ class CompressionCommitFence:
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
 
+# Shared daemon pool for sync compress_context timeout wraps — analogous to
+# asyncio's default executor used by gateway session hygiene's
+# ``loop.run_in_executor(None, ...)``, but daemon so a fence-cancelled hung
+# worker cannot block interpreter exit via concurrent.futures' atexit join.
+# Created lazily; never shut down per call (a timed-out worker may still be
+# winding down after fence cancel).
+_compress_timeout_executor = None
+_compress_timeout_executor_lock = threading.Lock()
+
+
+def _get_compress_timeout_executor():
+    """Return the process-wide compress-timeout DaemonThreadPoolExecutor."""
+    global _compress_timeout_executor
+    executor = _compress_timeout_executor
+    if executor is not None:
+        return executor
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    with _compress_timeout_executor_lock:
+        if _compress_timeout_executor is None:
+            # Match asyncio's default-executor sizing heuristic.
+            workers = min(32, (os.cpu_count() or 1) + 4)
+            _compress_timeout_executor = DaemonThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="compress-ctx-timeout",
+            )
+        return _compress_timeout_executor
+
 
 def resolve_context_compression_timeouts(
     compression_cfg: Optional[dict] = None,
@@ -338,7 +366,7 @@ def run_compress_context_with_progress_timeout(
     *,
     worker: Callable[[CompressionCommitFence], Tuple[list, str]],
     messages: list,
-    system_prompt_fallback: str,
+    system_prompt_fallback: Any,
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     on_timeout: Optional[Callable[[float, float, float], None]] = None,
@@ -354,6 +382,10 @@ def run_compress_context_with_progress_timeout(
     thread detached — the fence prevents a late commit from mutating session
     state. When the worker already entered the commit boundary, waits for that
     commit to finish and returns its result.
+
+    ``system_prompt_fallback`` may be a string or a zero-arg callable resolved
+    only on the timeout path, so successful compression never pays for (or
+    fails on) an eager prompt rebuild.
     """
     if idle_timeout_seconds <= 0:
         raise ValueError(
@@ -361,84 +393,79 @@ def run_compress_context_with_progress_timeout(
             "idle_timeout_seconds > 0; call compress_context directly to disable"
         )
 
+    def _resolve_fallback_prompt() -> str:
+        if callable(system_prompt_fallback):
+            return system_prompt_fallback()
+        return system_prompt_fallback
+
     fence = CompressionCommitFence()
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
-    # Daemon workers: on cancel we shutdown(wait=False) and must not register
-    # with concurrent.futures' atexit join (stdlib pool would block process exit
-    # while a hung summary call is still running).
-    from tools.daemon_pool import DaemonThreadPoolExecutor
+    # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
+    # wait_for loop (gateway/run.py): offload compress_context onto the shared
+    # daemon pool, poll with an inactivity budget + total ceiling, then
+    # fence-cancel on timeout so a late commit cannot land. Daemon workers
+    # match tool_executor: a cancelled hung summary must not block process exit.
     from tools.thread_context import propagate_context_to_thread
 
-    executor = DaemonThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="compress-ctx-timeout",
-    )
-    # Bare ThreadPoolExecutor workers start with an empty ContextVar map;
-    # propagate the parent conversation/approval context into the worker.
+    executor = _get_compress_timeout_executor()
+    # Bare pool workers start with an empty ContextVar map; propagate the
+    # parent conversation/approval context into the worker.
     future = executor.submit(propagate_context_to_thread(worker), fence)
     wait_started = time.monotonic()
-    try:
-        while True:
-            waited = time.monotonic() - wait_started
-            remaining_ceiling = ceiling - waited
-            if remaining_ceiling <= 0:
-                break
-            wait_slice = min(idle, remaining_ceiling)
-            try:
-                result = future.result(timeout=wait_slice)
-                executor.shutdown(wait=False)
-                return result
-            except concurrent.futures.TimeoutError:
-                waited = time.monotonic() - wait_started
-                since_progress = fence.seconds_since_progress()
-                if since_progress < idle and waited < ceiling:
-                    logger.info(
-                        "Context compression still streaming after %.0fs "
-                        "(last progress %.1fs ago) — extending wait "
-                        "(ceiling %.0fs)",
-                        waited,
-                        since_progress,
-                        ceiling,
-                    )
-                    continue
-                break
-
-        cancelled: Optional[bool] = None
-        while cancelled is None:
-            cancelled = fence.try_cancel_before_commit()
-            if cancelled is None:
-                time.sleep(0.001)
-        if not cancelled:
-            result = future.result()
-            executor.shutdown(wait=False)
-            return result
-
+    while True:
         waited = time.monotonic() - wait_started
-        since_progress = fence.seconds_since_progress()
-        if on_timeout is not None:
-            try:
-                on_timeout(idle, waited, since_progress)
-            except Exception:
-                logger.debug(
-                    "compress_context timeout callback failed",
-                    exc_info=True,
+        remaining_ceiling = ceiling - waited
+        if remaining_ceiling <= 0:
+            break
+        wait_slice = min(idle, remaining_ceiling)
+        try:
+            return future.result(timeout=wait_slice)
+        except concurrent.futures.TimeoutError:
+            waited = time.monotonic() - wait_started
+            since_progress = fence.seconds_since_progress()
+            if since_progress < idle and waited < ceiling:
+                logger.info(
+                    "Context compression still streaming after %.0fs "
+                    "(last progress %.1fs ago) — extending wait "
+                    "(ceiling %.0fs)",
+                    waited,
+                    since_progress,
+                    ceiling,
                 )
-        else:
-            logger.warning(
-                "Context compression made no progress for %.1fs "
-                "(total wait %.1fs, ceiling %.1fs); continuing without "
-                "compression",
-                since_progress,
-                waited,
-                ceiling,
+                continue
+            break
+
+    cancelled: Optional[bool] = None
+    while cancelled is None:
+        cancelled = fence.try_cancel_before_commit()
+        if cancelled is None:
+            time.sleep(0.001)
+    if not cancelled:
+        return future.result()
+
+    waited = time.monotonic() - wait_started
+    since_progress = fence.seconds_since_progress()
+    if on_timeout is not None:
+        try:
+            on_timeout(idle, waited, since_progress)
+        except Exception:
+            logger.debug(
+                "compress_context timeout callback failed",
+                exc_info=True,
             )
-        # Detach the worker: fence cancel won, so a late commit cannot land.
-        executor.shutdown(wait=False)
-        return messages, system_prompt_fallback
-    except BaseException:
-        executor.shutdown(wait=False)
-        raise
+    else:
+        logger.warning(
+            "Context compression made no progress for %.1fs "
+            "(total wait %.1fs, ceiling %.1fs); continuing without "
+            "compression",
+            since_progress,
+            waited,
+            ceiling,
+        )
+    # Leave the future on the shared pool: fence cancel won, so a late
+    # commit cannot land (same detachment model as gateway hygiene).
+    return messages, _resolve_fallback_prompt()
 
 
 def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
