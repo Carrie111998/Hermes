@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Tax-rate records now use immutable supersession lineage; amended rates replace
+  the current rule explicitly, branch-from-old-rule attempts are rejected, and
+  tax calculation ignores superseded rules.
 - Lifecycle maintenance now requeues authorized and executing objectives that
   have no pending or processing wake event, allowing a fresh worker to resume
   after a crash between action execution and event scheduling.

@@ -80,6 +80,8 @@ acceptance evidence.
 - Lifecycle maintenance requeues authorized and executing objectives whose
   wake event was lost during a crash, preserving durable recovery without
   requiring a human to redispatch the objective.
+- Tax-rate records are immutable and explicitly supersedable; amended rules
+  become the sole current calculation authority for future transactions.
 - Security-readiness blocks now create deduplicated, organization-scoped
   advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.

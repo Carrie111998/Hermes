@@ -451,6 +451,15 @@ Result: **2 passed, 0 failed**. Maintenance now creates a durable
 `objective.executing.reconcile` wake when a crash leaves an executing objective
 without a pending or processing event.
 
+Tax-rule authority was validated with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_accounting_db.py tests/hermes_cli/test_finance_and_payments.py -q
+```
+
+Result: **31 passed, 0 failed**. Tax calculations use only the current
+supersession leaf, and amended-rate lineage remains immutable.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

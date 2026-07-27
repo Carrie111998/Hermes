@@ -143,6 +143,40 @@ def test_tax_calculation_requires_verified_effective_rule(conn):
     ) == (60, rule)
 
 
+def test_tax_rate_supersession_is_immutable_and_current_only(conn):
+    now = int(time.time())
+    registration = accounting_db.configure_tax_registration(
+        conn, organization_id="org_1", jurisdiction="US-PA", tax_type="sales",
+        filing_frequency="quarterly", effective_from=now - 10,
+        evidence={"authority": "state registration"},
+    )
+    prior = accounting_db.configure_tax_rate(
+        conn, registration_id=registration, tax_code="standard",
+        rate_basis_points=600, effective_from=now - 10,
+        authority_source="https://authority.example/tax", verified_at=now - 10,
+    )
+    replacement = accounting_db.configure_tax_rate(
+        conn, registration_id=registration, tax_code="standard",
+        rate_basis_points=700, effective_from=now - 5,
+        authority_source="https://authority.example/tax-amended", verified_at=now - 5,
+        supersedes_id=prior, supersession_reason="State rate amended",
+    )
+    assert accounting_db.calculate_tax(
+        conn, organization_id="org_1", jurisdiction="US-PA",
+        tax_type="sales", tax_code="standard", taxable_minor=1000,
+        occurred_at=now,
+    ) == (70, replacement)
+    with pytest.raises(accounting_db.AccountingError, match="current record"):
+        accounting_db.configure_tax_rate(
+            conn, registration_id=registration, tax_code="standard",
+            rate_basis_points=800, effective_from=now,
+            authority_source="https://authority.example/tax-branch", verified_at=now,
+            supersedes_id=prior, supersession_reason="Conflicting branch",
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("UPDATE tax_rates SET rate_basis_points=1 WHERE id=?", (replacement,))
+
+
 def test_fiscal_period_lifecycle_is_evidenced_idempotent_and_non_overlapping(conn):
     period = accounting_db.open_fiscal_period(
         conn,

@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS tax_rates (
     id TEXT PRIMARY KEY, registration_id TEXT NOT NULL, tax_code TEXT NOT NULL,
     rate_basis_points INTEGER NOT NULL, effective_from INTEGER NOT NULL,
     effective_to INTEGER, authority_source TEXT NOT NULL, verified_at INTEGER NOT NULL,
+    supersedes_id TEXT, supersession_reason TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(registration_id) REFERENCES tax_registrations(id),
     CHECK(rate_basis_points >= 0)
 );
@@ -89,6 +90,10 @@ CREATE TRIGGER IF NOT EXISTS tax_obligation_events_immutable_update
 BEFORE UPDATE ON tax_obligation_events BEGIN SELECT RAISE(ABORT, 'tax obligation events are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS tax_obligation_events_immutable_delete
 BEFORE DELETE ON tax_obligation_events BEGIN SELECT RAISE(ABORT, 'tax obligation events are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS tax_rates_immutable_update
+BEFORE UPDATE ON tax_rates BEGIN SELECT RAISE(ABORT, 'tax rates are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS tax_rates_immutable_delete
+BEFORE DELETE ON tax_rates BEGIN SELECT RAISE(ABORT, 'tax rates are immutable'); END;
 """
 
 CONTRACT_TRIGGER_SQL = """
@@ -166,7 +171,27 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             "SELECT 1 FROM sqlite_master WHERE type='trigger' "
             "AND name='fiscal_periods_contract_immutable_update'"
         ).fetchone()
+        tax_rate_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tax_rates)")
+        }
         if "evidence_json" in period_columns and trigger is not None:
+            if "supersedes_id" not in tax_rate_columns:
+                conn.execute("ALTER TABLE tax_rates ADD COLUMN supersedes_id TEXT")
+            if "supersession_reason" not in tax_rate_columns:
+                conn.execute(
+                    "ALTER TABLE tax_rates ADD COLUMN supersession_reason "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS tax_rates_immutable_update
+                   BEFORE UPDATE ON tax_rates
+                   BEGIN SELECT RAISE(ABORT, 'tax rates are immutable'); END;"""
+            )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS tax_rates_immutable_delete
+                   BEFORE DELETE ON tax_rates
+                   BEGIN SELECT RAISE(ABORT, 'tax rates are immutable'); END;"""
+            )
             return
     conn.executescript(SCHEMA_SQL)
     period_columns = {
@@ -176,6 +201,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE fiscal_periods ADD COLUMN "
             "evidence_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    tax_rate_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tax_rates)")
+    }
+    if "supersedes_id" not in tax_rate_columns:
+        conn.execute("ALTER TABLE tax_rates ADD COLUMN supersedes_id TEXT")
+    if "supersession_reason" not in tax_rate_columns:
+        conn.execute(
+            "ALTER TABLE tax_rates ADD COLUMN supersession_reason "
+            "TEXT NOT NULL DEFAULT ''"
         )
     conn.executescript(CONTRACT_TRIGGER_SQL)
 
@@ -401,18 +436,45 @@ def configure_tax_rate(
     effective_from: int,
     authority_source: str,
     verified_at: int,
+    supersedes_id: Optional[str] = None,
+    supersession_reason: Optional[str] = None,
 ) -> str:
     if not authority_source or verified_at <= 0:
         raise AccountingError("tax rate requires a verified authority source")
+    ensure_schema(conn)
+    if supersedes_id:
+        prior = conn.execute(
+            """SELECT registration_id,tax_code FROM tax_rates WHERE id=?""",
+            (supersedes_id,),
+        ).fetchone()
+        if (
+            prior is None
+            or str(prior["registration_id"]) != registration_id
+            or str(prior["tax_code"]) != tax_code
+        ):
+            raise AccountingError(
+                "tax-rate supersession must reference the same registration and code"
+            )
+        if conn.execute(
+            "SELECT 1 FROM tax_rates WHERE supersedes_id=? LIMIT 1",
+            (supersedes_id,),
+        ).fetchone() is not None:
+            raise AccountingError(
+                "tax-rate supersession must reference the current record"
+            )
+        if not str(supersession_reason or "").strip():
+            raise AccountingError("tax-rate supersession requires a reason")
     rate_id = _id("taxrate")
     with conn:
         conn.execute(
             """INSERT INTO tax_rates
                (id, registration_id, tax_code, rate_basis_points, effective_from,
-                authority_source, verified_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                authority_source, verified_at, supersedes_id, supersession_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rate_id, registration_id, tax_code, rate_basis_points, effective_from,
-                authority_source, verified_at,
+                authority_source, verified_at, supersedes_id,
+                str(supersession_reason or ""),
             ),
         )
     return rate_id
@@ -436,6 +498,10 @@ def calculate_tax(
              AND rg.effective_from <= ? AND tr.effective_from <= ?
              AND (rg.effective_to IS NULL OR rg.effective_to >= ?)
              AND (tr.effective_to IS NULL OR tr.effective_to >= ?)
+             AND NOT EXISTS (
+                 SELECT 1 FROM tax_rates newer
+                  WHERE newer.supersedes_id = tr.id
+             )
            ORDER BY tr.effective_from DESC LIMIT 1""",
         (
             organization_id, jurisdiction, tax_type, tax_code, occurred_at,
@@ -468,7 +534,11 @@ def calculate_tax_for_rule(
               AND rg.jurisdiction=?
               AND rg.effective_from <= ? AND tr.effective_from <= ?
               AND (rg.effective_to IS NULL OR rg.effective_to >= ?)
-              AND (tr.effective_to IS NULL OR tr.effective_to >= ?)""",
+              AND (tr.effective_to IS NULL OR tr.effective_to >= ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM tax_rates newer
+                   WHERE newer.supersedes_id = tr.id
+              )""",
         (tax_rule_id, organization_id, jurisdiction, occurred_at, occurred_at,
          occurred_at, occurred_at),
     ).fetchone()
