@@ -15,6 +15,7 @@ from pathlib import Path
 
 from hermes_cli import compliance_db, finance_db, objectives_db, payment_controls
 from hermes_cli.payments import (
+    InboundPaymentRail,
     OutboundPaymentRail,
     PaymentService,
     ProviderPayment,
@@ -45,7 +46,7 @@ def _state_path() -> Path:
 def _load_provider() -> dict:
     path = _state_path()
     if not path.exists():
-        return {"send_attempts": 0, "payments": {}}
+        return {"send_attempts": 0, "payments": {}, "receivables": {}}
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -53,8 +54,27 @@ def _save_provider(value: dict) -> None:
     _state_path().write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
 
-class InterruptedRail(OutboundPaymentRail):
+class InterruptedRail(OutboundPaymentRail, InboundPaymentRail):
     name = PROVIDER
+
+    def create_receivable(self, **kwargs) -> ProviderPayment:
+        state = _load_provider()
+        reference = "provider-receivable-0001"
+        state.setdefault("receivables", {})[reference] = {
+            "status": "succeeded",
+            "amount_minor": int(kwargs["amount_minor"]),
+            "currency": str(kwargs["currency"]).upper(),
+            "evidence": {"provider_event": "receivable-created"},
+        }
+        _save_provider(state)
+        return ProviderPayment(
+            reference,
+            "succeeded",
+            int(kwargs["amount_minor"]),
+            str(kwargs["currency"]).upper(),
+            payment_url="https://provider.invalid/receivable/0001",
+            evidence={"provider_event": "receivable-created"},
+        )
 
     def send_payment(self, **kwargs) -> ProviderPayment:
         state = _load_provider()
@@ -73,7 +93,11 @@ class InterruptedRail(OutboundPaymentRail):
         )
 
     def get_payment(self, reference: str) -> ProviderPayment:
-        payment = _load_provider().get("payments", {}).get(reference)
+        provider = _load_provider()
+        payment = (
+            provider.get("payments", {}).get(reference)
+            or provider.get("receivables", {}).get(reference)
+        )
         if payment is None:
             raise KeyError(reference)
         return ProviderPayment(
@@ -132,6 +156,20 @@ def interrupt() -> None:
             jurisdiction="GLOBAL",
             registry_authority="acceptance-registry",
             registry_reference="provider-recovery-outbound",
+            aml_screening_delegated=True,
+            sanctions_screening_delegated=True,
+            verified_at=int(time.time()) - 1,
+            expires_at=int(time.time()) + 3600,
+            evidence={"test_provider": True},
+        )
+        compliance_db.verify_payment_provider(
+            conn,
+            organization_id=ORG,
+            provider=PROVIDER,
+            direction="inbound",
+            jurisdiction="GLOBAL",
+            registry_authority="acceptance-registry",
+            registry_reference="provider-recovery-inbound",
             aml_screening_delegated=True,
             sanctions_screening_delegated=True,
             verified_at=int(time.time()) - 1,
@@ -218,7 +256,34 @@ def recover() -> None:
             (intent_id,),
         ).fetchone()["n"] == 1
         assert finance_db.account_balance(conn, str(marker["account_id"])) == 4_000
-        print(json.dumps({"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1}))
+        receivable = service.create_receivable(
+            organization_id=ORG,
+            account_id=str(marker["account_id"]),
+            provider=PROVIDER,
+            amount_minor=500,
+            currency="USD",
+            customer={"account": "customer-provider-recovery"},
+            customer_jurisdiction="US",
+            purpose="Inbound provider recovery acceptance",
+            idempotency_key="provider-recovery-receivable-0001",
+        )
+        assert receivable["direction"] == "incoming", receivable
+        settled_receivable = service.reconcile(receivable["id"])
+        assert settled_receivable["status"] == "succeeded", settled_receivable
+        retried_receivable = service.create_receivable(
+            organization_id=ORG,
+            account_id=str(marker["account_id"]),
+            provider=PROVIDER,
+            amount_minor=500,
+            currency="USD",
+            customer={"account": "customer-provider-recovery"},
+            customer_jurisdiction="US",
+            purpose="Inbound provider recovery acceptance",
+            idempotency_key="provider-recovery-receivable-0001",
+        )
+        assert retried_receivable["id"] == receivable["id"]
+        assert finance_db.account_balance(conn, str(marker["account_id"])) == 4_500
+        print(json.dumps({"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 500}))
     finally:
         conn.close()
 
