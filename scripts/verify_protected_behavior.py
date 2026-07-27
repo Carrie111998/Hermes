@@ -20,6 +20,7 @@ Exit 0 only when every simulated regression was caught.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -27,9 +28,38 @@ from pathlib import Path
 from typing import Callable, List
 
 REPO = Path(__file__).resolve().parents[1]
-HERMES_HOME = REPO.parent
-PROFILE = HERMES_HOME / "profiles" / "aletheon"
 CONTRACT_SUITE = "tests/contract/test_protected_behavior.py"
+
+
+def _find_profile() -> Path:
+    """Locate the live profile regardless of checkout layout.
+
+    Same trap as the contract suite: REPO.parent is wrong when running from a
+    git worktree, and HERMES_HOME can point at the hermes ROOT — which also has
+    a plugins/ dir. A profile is defined structurally by sitting directly under
+    a `profiles/` directory; matching on plugins/ alone silently turned every
+    profile scenario into a no-op SKIP.
+    """
+    candidates = []
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        home = Path(env_home)
+        candidates += [home, home / "profiles" / "aletheon"]
+    candidates += [
+        REPO.parent / "profiles" / "aletheon",
+        Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "aletheon",
+        Path.home() / ".hermes" / "profiles" / "aletheon",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.parent.name == "profiles" and (candidate / "plugins").is_dir():
+                return candidate
+        except OSError:
+            continue
+    return REPO.parent / "profiles" / "aletheon"
+
+
+PROFILE = _find_profile()
 
 
 @dataclass
@@ -88,6 +118,28 @@ def _reintroduce_phantom_path(src: str) -> str:
     return _sub(src, 'if home_path.parent.name == "profiles":', 'if False:')
 
 
+def _drop_steer_neutralization(src: str) -> str:
+    return _sub(src,
+                "wrapped = _neutralize_steer_markers(_maybe_wrap_untrusted(name, content))",
+                "wrapped = _maybe_wrap_untrusted(name, content)")
+
+
+def _restore_blocking_with(src: str) -> str:
+    """Put the batch branch back inside a joining `with` block."""
+    return _sub(src,
+                "executor = DaemonThreadPoolExecutor(max_workers=max_children)",
+                "with DaemonThreadPoolExecutor(max_workers=max_children) as executor:\n"
+                "                pass  # simulated regression")
+
+
+def _allow_crash_completion(src: str) -> str:
+    return _sub(src, "        and not crashed\n", "")
+
+
+def _drop_lease_binding(src: str) -> str:
+    return _sub(src, "        if is_background and delegation_id:", "        if False:")
+
+
 SCENARIOS: List[Scenario] = [
     Scenario("drop-user_message-kwarg",
              "upstream refactors the hook call; feedback-gate silently stops firing",
@@ -113,6 +165,19 @@ SCENARIOS: List[Scenario] = [
              "path helper reverted; receipts + HMAC key vanish into a phantom tree",
              PROFILE / "plugins" / "execution-receipts" / "execution_receipts.py",
              _reintroduce_phantom_path),
+    Scenario("drop-steer-marker-neutralization",
+             "tool output can forge operator authority via the steer marker again",
+             REPO / "agent" / "tool_dispatch_helpers.py", _drop_steer_neutralization),
+    Scenario("restore-blocking-with-block",
+             "batch delegation back inside `with`; interrupt cannot escape __exit__",
+             REPO / "tools" / "delegate_tool.py", _restore_blocking_with),
+    Scenario("allow-crashed-turn-to-complete",
+             "a crashed turn reports completed=True; cron marks the job ok",
+             REPO / "agent" / "turn_finalizer.py", _allow_crash_completion),
+    Scenario("stop-binding-delegation-leases",
+             "guard releases on the dispatch return again; lease covers 0.2s",
+             PROFILE / "plugins" / "delegation-guard" / "plugin.py",
+             _drop_lease_binding),
 ]
 
 

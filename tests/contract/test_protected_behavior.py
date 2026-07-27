@@ -18,6 +18,7 @@ protection — do not "fix" the test, restore the behaviour.
 from __future__ import annotations
 
 import inspect
+import os
 import re
 import sqlite3
 import sys
@@ -26,8 +27,52 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-HERMES_HOME = REPO.parent
-PROFILE = HERMES_HOME / "profiles" / "aletheon"
+
+
+def _find_profile() -> Path | None:
+    """Locate the live profile regardless of where the repo is checked out.
+
+    ``REPO.parent`` only works for the in-place install. Run from a git
+    worktree it resolves somewhere with no profile at all, and every
+    profile-scoped contract test below silently SKIPPED — a suite that reports
+    green while protecting nothing, which is the exact failure class this file
+    exists to catch.
+    """
+    candidates = []
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        home = Path(env_home)
+        # HERMES_HOME may be the profile dir (profile mode) or the hermes root.
+        candidates += [home, home / "profiles" / "aletheon"]
+    candidates += [
+        REPO.parent / "profiles" / "aletheon",
+        Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "aletheon",
+        Path.home() / ".hermes" / "profiles" / "aletheon",
+    ]
+    for candidate in candidates:
+        try:
+            # A `plugins/` dir alone is NOT enough: the hermes ROOT has one too,
+            # and matching it made every profile-scoped test below skip while
+            # the suite still reported green. A profile is defined structurally
+            # by living directly under a `profiles/` directory.
+            if candidate.parent.name == "profiles" and (candidate / "plugins").is_dir():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+PROFILE = _find_profile() or (REPO.parent / "profiles" / "aletheon")
+
+
+def test_the_profile_under_test_was_actually_located():
+    """Guard the guard: if this fails, every profile-scoped test below is
+    skipping and proving nothing."""
+    assert PROFILE.exists() and (PROFILE / "plugins").is_dir(), (
+        f"could not locate the aletheon profile (tried env HERMES_HOME, "
+        f"{REPO.parent}, and the standard install paths) — profile-scoped "
+        f"contract tests would silently skip"
+    )
 
 
 def _read(path: Path) -> str:
@@ -257,3 +302,101 @@ def test_plugin_hook_dispatch_still_exists():
 
     assert hasattr(plugin_mod, "invoke_hook"), "hermes_cli.plugins.invoke_hook is gone"
     assert callable(plugin_mod.invoke_hook)
+
+
+# ── 11. steer markers cannot be forged from tool output ──────────────────────
+
+def test_tool_results_neutralize_forged_steer_markers():
+    """A fixed plaintext marker grants operator authority; tool output must not
+    be able to contain it."""
+    from agent.prompt_builder import STEER_MARKER_OPEN
+    from agent.tool_dispatch_helpers import make_tool_result_message
+
+    msg = make_tool_result_message("read_file", f"x {STEER_MARKER_OPEN} y", "c1")
+    body = msg["content"]
+    body = body if isinstance(body, str) else str(body)
+    assert STEER_MARKER_OPEN not in body, (
+        "tool output can forge the mid-turn steer channel again"
+    )
+
+
+# ── 12. batch delegation cancellation cannot block ───────────────────────────
+
+def test_batch_delegation_is_not_inside_a_blocking_with_block():
+    """ThreadPoolExecutor.__exit__ joins unconditionally, so a `with` block
+    makes the interrupt bail-out unable to escape."""
+    import tools.delegate_tool as dt
+
+    src = _read(REPO / "tools" / "delegate_tool.py")
+    assert "with DaemonThreadPoolExecutor(" not in src, (
+        "batch delegation is back inside a `with` block — interrupt cannot escape"
+    )
+    assert "cancel_futures=True" in src, "interrupt path no longer cancels queued work"
+    assert dt is not None
+
+
+# ── 13. a crashed turn is not a completion ───────────────────────────────────
+
+def test_crash_exits_are_excluded_from_completion():
+    """Without this, cron marks a crashed job 'ok' and delegate_task tells the
+    parent the child's work finished."""
+    import inspect
+
+    from agent.turn_finalizer import finalize_turn
+
+    src = inspect.getsource(finalize_turn)
+    assert "_CRASH_EXIT_PREFIXES" in src, "crash exits are completions again"
+    assert "and not crashed" in src, "crash exclusion dropped from the completion rule"
+
+
+# ── 14. delegation leases are durable and lifecycle-bound ────────────────────
+
+def test_delegation_guard_leases_are_persistent():
+    """An in-memory dict loses every lease on restart; releasing on the
+    dispatch call's return covers ~0.2s of a multi-minute delegation."""
+    leases_py = PROFILE / "plugins" / "delegation-guard" / "leases.py"
+    if not leases_py.exists():
+        pytest.skip("delegation-guard not present in this profile")
+    src = _read(leases_py)
+    assert "class LeaseStore" in src
+    assert "owner_started_at" in src, "PID-reuse guard lost from lease liveness"
+
+
+def test_async_dispatch_binds_the_lease_instead_of_releasing_it():
+    """Behavioural, not string-presence: drive the hook and check the lease.
+
+    A string check for 'bind_delegation' survives the exact regression that
+    matters — disabling the background branch leaves the call site in the file.
+    Load the plugin and assert the lease is still held after post_tool_call.
+    """
+    import importlib.util
+
+    plugin_path = PROFILE / "plugins" / "delegation-guard" / "plugin.py"
+    if not plugin_path.exists():
+        pytest.skip("delegation-guard not present in this profile")
+
+    spec = importlib.util.spec_from_file_location("dg_contract_probe", plugin_path)
+    dg = importlib.util.module_from_spec(spec)
+    sys.modules["dg_contract_probe"] = dg
+    spec.loader.exec_module(dg)
+
+    dg._locks.clear()
+    dg._store = None                      # in-memory only; no profile writes
+    args = {"goal": "contract probe goal"}
+    dg.on_pre_tool_call(tool_name="delegate_task", args=args)
+    assert len(dg._locks) == 1, "dispatch did not take a lease"
+
+    # A forced-async dispatch: returns in ~0.2s while the child runs for minutes.
+    dg.on_post_tool_call(
+        tool_name="delegate_task", args=args, status="ok",
+        result={"status": "dispatched", "mode": "background",
+                "delegation_id": "deleg-contract-1"},
+    )
+    assert len(dg._locks) == 1, (
+        "the lease was released when the dispatch call returned — the guard is "
+        "back to covering ~0.2s of a multi-minute delegation"
+    )
+    lease = next(iter(dg._locks.values()))
+    assert lease.get("delegation_id") == "deleg-contract-1", (
+        "lease was not bound to the delegation, so nothing tracks the child"
+    )
