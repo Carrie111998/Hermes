@@ -89,14 +89,6 @@ def test_registry_has_exact_seed_checks_and_portal_scope():
     assert registry.checks[-1].scope == "portal"
 
 
-def test_case_sampling_is_deterministic_and_bounded():
-    bundles = [{"case": {"job_no": f"JOB-{index:02d}"}} for index in range(15)]
-    first = [item["case"]["job_no"] for item in core.sample_bundles(bundles)]
-    second = [item["case"]["job_no"] for item in core.sample_bundles(list(reversed(bundles)))]
-    assert first == second
-    assert len(first) == 10
-
-
 @pytest.mark.parametrize(
     ("count", "last", "trigger", "expected", "reason"),
     [
@@ -755,74 +747,6 @@ def test_run_cli_emits_top_level_health_metrics(tmp_path, monkeypatch, capsys):
     assert output["coverage_ratio"] == 1.0
     assert output["defect_trend"] == [{"defects": 1}]
     assert (output["human_caught"], output["loop_caught"]) == (2, 3)
-
-
-def test_external_finalize_refuses_two_pass_self_attestation(tmp_path):
-    batch = snapshot()
-    batch.update({"cursor_start": 9, "cursor_end": 11})
-    # Root's real collector serializes fields as objects, not JSON strings.
-    batch["observations"][0]["fields"] = {"source_refs": ["wa-10", "wa-11"]}
-    batch_path = tmp_path / "source-batch.json"
-    batch_path.write_text(json.dumps(batch))
-    registry = core.load_registry()
-    case_checks = []
-    for item in registry.checks:
-        if item.scope == "case":
-            case_checks.append(
-                {
-                    "check_id": item.id,
-                    "outcome": "unsure" if item.id == "photos-bound-to-correct-work-item" else "pass",
-                    "evidence_message_ids": ["wa-10"],
-                    "reason": "Grounded fixture evidence.",
-                    "page_evidence": "Case screenshot.",
-                }
-            )
-    external = {
-        "evaluator_session": "independent-judge",
-        "two_pass_evidence": {
-            "naive_checker_session_id": "external-naive",
-            "registry_checker_session_id": "independent-judge",
-            "naive_registry_exposed": False,
-        },
-        "overall": "One photo association is uncertain.",
-        "cases": [
-            {
-                "case_id": 7,
-                "job_no": "AM/JOB/2607/0001",
-                "checks": case_checks,
-                "page_to_source": "pass",
-                "source_to_page": "pass",
-                "manager_sense": "pass",
-            }
-        ],
-        "portal_checks": [
-            {
-                "check_id": "filter-covers-badge-states",
-                "outcome": "fail",
-                "evidence_message_ids": [],
-                "reason": "New badge has no filter.",
-                "page_evidence": "Cases screenshot.",
-            }
-        ],
-    }
-    judge_path = tmp_path / "judge-result.json"
-    judge_path.write_text(json.dumps(external))
-    (tmp_path / "case-7.png").write_bytes(b"png")
-    (tmp_path / "portal-cases.png").write_bytes(b"portal")
-    filer = FakeFiler()
-    store = core.StateStore(tmp_path / "state")
-    core.initialize_cursor(store, 9, NOW)
-    with pytest.raises(core.EvalError, match="external finalization is disabled"):
-        core.finalize_external(
-            store,
-            batch_path=batch_path,
-            judgment_path=judge_path,
-            artifacts_dir=tmp_path,
-            maker_session_id="maker-1",
-            filer=filer,
-            golden_judge=FakeJudge(),
-            now=NOW,
-        )
 
 
 def test_initialize_cursor_requires_pristine_state(tmp_path):
