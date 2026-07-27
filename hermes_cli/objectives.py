@@ -366,6 +366,9 @@ def objectives_command(args: argparse.Namespace) -> int:
             verification_id = db.record_verification(
                 conn,
                 objective_id=args.objective_id,
+                organization_id=db.get_objective(
+                    conn, args.objective_id
+                ).organization_id,
                 plan_id=args.plan_id,
                 verifier=args.verifier,
                 method=args.method,

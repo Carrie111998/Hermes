@@ -1339,6 +1339,7 @@ def record_verification(
     conn: sqlite3.Connection,
     *,
     objective_id: str,
+    organization_id: Optional[str] = None,
     plan_id: str,
     verifier: str,
     method: str,
@@ -1357,6 +1358,14 @@ def record_verification(
     ).fetchone()
     if plan is None or plan["objective_id"] != objective_id:
         raise ObjectiveStateError("verification plan does not belong to objective")
+    objective = conn.execute(
+        "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)
+    ).fetchone()
+    if objective is None or (
+        organization_id is not None
+        and str(objective["organization_id"]) != organization_id
+    ):
+        raise ObjectiveStateError("verification organization does not match objective")
     evidence_json = _json(evidence)
     verification_id = _new_id("verify")
     with conn:

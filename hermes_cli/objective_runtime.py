@@ -836,6 +836,9 @@ class ObjectiveRuntime:
             verification_id = db.record_verification(
                 self.conn,
                 objective_id=objective_id,
+                organization_id=db.get_objective(
+                    self.conn, objective_id
+                ).organization_id,
                 plan_id=str(action_row["plan_id"]),
                 action_id=action_id,
                 execution_result_id=str(result["id"]),
@@ -1271,6 +1274,9 @@ class ObjectiveRuntime:
             verification_id = db.record_verification(
                 self.conn,
                 objective_id=objective_id,
+                organization_id=db.get_objective(
+                    self.conn, objective_id
+                ).organization_id,
                 plan_id=plan_id,
                 verifier=self.verifier.identity,
                 method="objective success criteria",
@@ -1837,6 +1843,9 @@ class ObjectiveRuntime:
         objective_verification_id = db.record_verification(
             self.conn,
             objective_id=objective_id,
+            organization_id=db.get_objective(
+                self.conn, objective_id
+            ).organization_id,
             plan_id=plan_id,
             verifier=self.verifier.identity,
             method="objective success criteria",
