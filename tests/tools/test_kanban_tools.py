@@ -1560,6 +1560,33 @@ def test_link_happy_path(worker_env):
     assert d["ok"] is True
 
 
+def test_link_authorization_binds_exact_board_and_task_pair(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        a = kb.create_task(conn, title="A-auth", assignee="x")
+        b = kb.create_task(conn, title="B-auth", assignee="x")
+    finally:
+        conn.close()
+    calls = []
+
+    def record(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("hermes_cli.workforce_delegation.authorize_worker_action", record)
+    from tools import kanban_tools as kt
+    out = kt._handle_link({"parent_id": a, "child_id": b})
+    assert json.loads(out)["ok"] is True
+    assert calls == [
+        {
+            "capability": "kanban.link",
+            "system": "kanban",
+            "target_resource": calls[0]["target_resource"],
+        }
+    ]
+    assert calls[0]["target_resource"].startswith("kanban-action:")
+
+
 def test_link_rejects_self_reference(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_link({"parent_id": worker_env, "child_id": worker_env})

@@ -29,6 +29,7 @@ through the board.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 from typing import Any, Optional
@@ -39,6 +40,20 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+
+def _authorize_kanban_mutation(operation: str, scope: dict) -> None:
+    """Require a governed permit for an exact durable board mutation."""
+    resource = "kanban-action:" + hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    authorize_worker_action(
+        capability=f"kanban.{operation}",
+        system="kanban",
+        target_resource=resource,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1397,6 +1412,18 @@ def _handle_link(args: dict, **kw) -> str:
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
+    try:
+        _authorize_kanban_mutation(
+            "link",
+            {
+                "operation": "link",
+                "parent_id": str(parent_id),
+                "child_id": str(child_id),
+                "board": board or os.getenv("HERMES_KANBAN_BOARD") or "default",
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"kanban_link authorization denied: {exc}")
     try:
         kb, conn = _connect(board=board)
         try:
