@@ -187,6 +187,12 @@ python -m pip install /path/to/charterforge-stripe-payment-rail
 charterforge business payment-rails
 ```
 
+This command is read-only and safe before credentials are configured. It
+reports each discovered inbound/outbound rail as `available: true` or
+`available: false` with a bounded reason. A listed rail is not evidence that
+payments are authorized; provider verification, jurisdictional compliance
+evidence, and exact payment controls remain required before execution.
+
 The package uses hosted Stripe Checkout Sessions for inbound payments and
 Stripe Connect Transfers for outbound payments. Checkout payment methods remain
 Stripe-managed rather than being hardcoded. Both directions preserve Charterforge'

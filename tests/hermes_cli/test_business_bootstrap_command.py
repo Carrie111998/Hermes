@@ -68,3 +68,30 @@ def test_unconfigured_snapshot_exposes_safe_first_run_handoff():
         "authority": "advisor must review and provide an enabled charter",
         "autonomy_started": False,
     }
+
+
+def test_payment_rails_is_read_only_and_surfaces_unavailable_provider(
+    monkeypatch, capsys
+):
+    class EntryPoint:
+        name = "stripe"
+
+        def load(self):
+            raise ValueError("STRIPE_SECRET_KEY is required for the Stripe rail")
+
+    class EntryPoints:
+        def select(self, *, group):
+            return [EntryPoint()] if group == "charterforge.inbound_payment_rails" else []
+
+    monkeypatch.setattr("hermes_cli.payments.metadata.entry_points", lambda: EntryPoints())
+    args = _parser().parse_args(["business", "payment-rails"])
+    assert business.business_command(args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["inbound"] == [{
+        "available": False,
+        "direction": "inbound",
+        "group": "charterforge.inbound_payment_rails",
+        "name": "stripe",
+        "reason": "ValueError: STRIPE_SECRET_KEY is required for the Stripe rail",
+    }]
+    assert output["outbound"] == []

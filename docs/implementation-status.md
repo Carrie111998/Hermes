@@ -176,6 +176,11 @@ acceptance evidence.
   still requires separate installation, credentials, provider assessment, and
   jurisdictional compliance evidence. Webhook admission rejects missing or
   malformed positive amount/currency facts.
+- `charterforge business payment-rails` is a read-only provider discovery check.
+  It reports unavailable optional rails (for example, Stripe without
+  `STRIPE_SECRET_KEY`) with the construction error instead of treating an
+  installed package as payment readiness. A rail remains inadmissible until
+  current provider evidence and execution credentials are separately present.
 - AgentMail configuration exists; provider availability and plan terms are
   external facts.
 - Compliance tracking exists; legal applicability is not autonomously proven.

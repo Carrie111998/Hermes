@@ -38,7 +38,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--charter-file", type=Path, required=True,
         help="JSON file containing the non-interactive agentic operating charter",
     )
-    sub.add_parser("payment-rails", help="List installed standalone payment rails")
+    sub.add_parser(
+        "payment-rails",
+        help="Inspect installed payment rails and credential readiness (read-only)",
+    )
     audit = sub.add_parser(
         "audit-export",
         help="Export a hash-verifiable financial decision lineage package",
@@ -443,15 +446,7 @@ def business_command(args: argparse.Namespace) -> int:
     with db.connect_closing(getattr(args, "db", None)) as conn:
         command = args.business_command
         if command == "payment-rails":
-            print(
-                json.dumps(
-                    {
-                        "inbound": sorted(payments.load_inbound_payment_rails()),
-                        "outbound": sorted(payments.load_outbound_payment_rails()),
-                    },
-                    indent=2,
-                )
-            )
+            print(json.dumps(payments.payment_rail_status(), indent=2, sort_keys=True))
             return 0
         if command == "status":
             value = build_business_snapshot(conn)

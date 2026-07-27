@@ -165,6 +165,65 @@ def load_payment_rails() -> dict[str, PaymentRail]:
     return discovered
 
 
+def payment_rail_status() -> dict[str, list[dict[str, Any]]]:
+    """Report discovered payment rails without requiring provider credentials.
+
+    Entry-point construction is deliberately isolated here: optional providers
+    commonly require a secret at construction time.  A missing secret must be
+    visible as an unavailable rail, not make an operator's read-only discovery
+    command crash or imply that payments are ready.
+    """
+    groups = {
+        "inbound": (
+            "charterforge.inbound_payment_rails",
+            "charterforge.payment_rails",
+            "hermes.inbound_payment_rails",
+            "hermes.payment_rails",
+        ),
+        "outbound": (
+            "charterforge.outbound_payment_rails",
+            "charterforge.payment_rails",
+            "hermes.outbound_payment_rails",
+            "hermes.payment_rails",
+        ),
+    }
+    result: dict[str, list[dict[str, Any]]] = {"inbound": [], "outbound": []}
+    seen: set[tuple[str, str]] = set()
+    entry_points = metadata.entry_points()
+    for direction, group_names in groups.items():
+        for group in group_names:
+            selected = (
+                entry_points.select(group=group)
+                if hasattr(entry_points, "select")
+                else entry_points.get(group, ())
+            )
+            for entry_point in selected:
+                key = (direction, entry_point.name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                record: dict[str, Any] = {
+                    "name": entry_point.name,
+                    "direction": direction,
+                    "group": group,
+                    "available": False,
+                }
+                try:
+                    loaded = entry_point.load()
+                    rail = loaded() if isinstance(loaded, type) else loaded
+                    expected = InboundPaymentRail if direction == "inbound" else OutboundPaymentRail
+                    if not isinstance(rail, expected):
+                        raise TypeError(f"does not implement {expected.__name__}")
+                    record["available"] = True
+                    record["rail_name"] = rail.name
+                except Exception as exc:  # discovery is read-only and fail-closed
+                    record["reason"] = f"{type(exc).__name__}: {exc}"
+                result[direction].append(record)
+    for direction in result:
+        result[direction].sort(key=lambda item: (item["name"], item["group"]))
+    return result
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Initialize payment tables without releasing an active authority transaction."""
     if conn.in_transaction:

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `business payment-rails` now performs credential-safe, read-only payment-rail
+  discovery and reports unavailable optional providers without implying
+  settlement readiness.
+
 ## 0.19.0-agentic-foundation — 2026-07-27
 
 This is the consolidated release-evidence boundary for the independent
