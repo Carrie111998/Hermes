@@ -11,7 +11,13 @@ def _mock_subprocess_run(monkeypatch):
     """Mock subprocess.run to intercept docker run -d and docker version calls.
 
     Returns a list of captured (cmd, kwargs) tuples for inspection.
+
+    Pre-seeds the cgroup-limit probe cache to ``True`` so the throwaway probe
+    container (a ``docker run ... sleep 0``) does not run and pollute the
+    captured call list — these tests inspect the real sandbox-start ``run``.
+    Tests that exercise the probe itself live in test_docker_cgroup_limits.py.
     """
+    docker_env._cgroup_limits_ok = True
     calls = []
 
     def _run(cmd, **kwargs):
@@ -39,11 +45,14 @@ def _make_dummy_env(**kwargs):
         persistent_filesystem=kwargs.get("persistent_filesystem", False),
         task_id=kwargs.get("task_id", "test-task"),
         volumes=kwargs.get("volumes", []),
+        forward_env=kwargs.get("forward_env"),
         network=kwargs.get("network", True),
         host_cwd=kwargs.get("host_cwd"),
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
+        extra_args=kwargs.get("extra_args", []),
+        persist_across_processes=kwargs.get("persist_across_processes", True),
     )
 
 
@@ -107,7 +116,10 @@ def test_ensure_docker_available_uses_resolved_executable(monkeypatch):
         (["/opt/homebrew/bin/docker", "version"], {
             "capture_output": True,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
             "timeout": 5,
+            "stdin": subprocess.DEVNULL,
         })
     ]
 
@@ -302,6 +314,40 @@ def test_init_env_args_prefers_shell_env_over_hermes_dotenv(monkeypatch):
     assert "value_from_dotenv" not in args_str
 
 
+def test_init_env_args_uses_hermes_dotenv_for_empty_shell_env(monkeypatch):
+    """A transient empty-string in the live env must fall back to .env, not win.
+
+    Regression: the disk fallback used to fire only on `value is None`, so a
+    present-but-empty `MY_SECRET=""` skipped it and was forwarded as `-e
+    MY_SECRET=`, clobbering the correct value sitting in ~/.hermes/.env.
+    """
+    env = _make_execute_only_env(["MY_SECRET"])
+
+    monkeypatch.setenv("MY_SECRET", "")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {"MY_SECRET": "value_from_dotenv"})
+
+    args = env._build_init_env_args()
+
+    # Assert on the resolved value, not the printed -e flag: the disk value
+    # must win and a blank "MY_SECRET=" flag must never be emitted.
+    assert "MY_SECRET=value_from_dotenv" in args
+    assert "MY_SECRET=" not in args
+
+
+def test_init_env_args_never_forwards_blank_secret(monkeypatch):
+    """A legitimately-empty key with no disk value is not forwarded as -e KEY=."""
+    env = _make_execute_only_env(["MY_SECRET"])
+
+    monkeypatch.setenv("MY_SECRET", "")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    args = env._build_init_env_args()
+
+    # The key must not appear at all — not even as an empty -e MY_SECRET= flag.
+    assert not any(a.startswith("MY_SECRET=") for a in args)
+    assert "MY_SECRET" not in " ".join(args)
+
+
 # ── docker_env tests ──────────────────────────────────────────────
 
 
@@ -318,6 +364,52 @@ def test_docker_env_appears_in_run_command(monkeypatch):
     run_args_str = " ".join(run_args)
     assert "SSH_AUTH_SOCK=/run/user/1000/ssh-agent.sock" in run_args_str
     assert "GNUPGHOME=/root/.gnupg" in run_args_str
+
+
+def _node_options_from_run(calls):
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    args = run_calls[0][0]
+    for i, a in enumerate(args):
+        if a == "-e" and i + 1 < len(args) and args[i + 1].startswith("NODE_OPTIONS="):
+            return args[i + 1].split("=", 1)[1]
+    return None
+
+
+def test_egress_node_options_overrides_conflicting_ca_flag(monkeypatch):
+    """maxpetrusenko P1: a conflicting docker_env NODE_OPTIONS CA-mode flag
+    (--use-bundled-ca) must be replaced by the egress-required --use-openssl-ca,
+    not left to survive alongside it (final Node trust would depend on order)."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env, "_egress_proxy_args_for_docker",
+        lambda: ([], {"_HERMES_EGRESS_NODE_OPTIONS_APPEND": "--use-openssl-ca"}, []),
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(env={"NODE_OPTIONS": "--max-old-space-size=8192 --use-bundled-ca"})
+
+    node_opts = (_node_options_from_run(calls) or "").split()
+    assert "--use-openssl-ca" in node_opts, "egress CA flag must be present"
+    assert "--use-bundled-ca" not in node_opts, "conflicting CA flag must be stripped"
+    # Operator's unrelated tuning must be preserved.
+    assert "--max-old-space-size=8192" in node_opts
+
+
+def test_egress_node_options_preserves_operator_tuning(monkeypatch):
+    """Non-conflicting operator NODE_OPTIONS survive the egress append-merge."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env, "_egress_proxy_args_for_docker",
+        lambda: ([], {"_HERMES_EGRESS_NODE_OPTIONS_APPEND": "--use-openssl-ca"}, []),
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(env={"NODE_OPTIONS": "--max-old-space-size=4096"})
+
+    node_opts = (_node_options_from_run(calls) or "").split()
+    assert "--use-openssl-ca" in node_opts
+    assert "--max-old-space-size=4096" in node_opts
 
 
 def test_docker_env_appears_in_init_env_args(monkeypatch):
@@ -637,6 +729,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-agent": "1",
         "hermes-task-id": "abc",
         "hermes-profile": "default",
+        "hermes-egress": "off",
     }
 
 
@@ -668,8 +761,13 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
             if sub == "ps":
                 if ps_state is None:
                     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                # 3-field format: ID, State, EgressLabel.  When egress_label
+                # is "off" the code parses all three fields; <no value> means
+                # the container has no egress label, which is acceptable.
                 return subprocess.CompletedProcess(
-                    cmd, 0, stdout=f"reused-cid\t{ps_state}\n", stderr="",
+                    cmd, 0,
+                    stdout=f"reused-cid\t{ps_state}\t<no value>\n",
+                    stderr="",
                 )
             if sub == "start":
                 if not start_succeeds:
@@ -712,6 +810,95 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     )
 
 
+def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
+    """A container created before egress was enabled lacks the proxy env vars
+    and CA mount.  Reusing it would silently bypass the credential firewall."""
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (
+            ["-v", "/tmp/ca:/etc/ssl/certs/hermes-egress-ca.crt:ro"],
+            {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            ["--add-host", "host.docker.internal:host-gateway"],
+        ),
+    )
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "ps":
+                # Simulate an old pre-egress container: without the egress label
+                # filter it would match; with the filter Docker returns no match.
+                assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="reuse-egress")
+
+    assert env._container_id == "fresh-cid"
+    run_invocations = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
+    ]
+    assert run_invocations, "egress-enabled containers require a fresh docker run"
+
+
+def test_forward_env_provider_key_collision_refuses_under_egress(monkeypatch):
+    """docker_forward_env is explicit, but it still must not smuggle real
+    provider keys into an enforced egress sandbox."""
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-real")
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (
+            [],
+            {
+                "HTTPS_PROXY": "http://host.docker.internal:9090",
+                "OPENROUTER_API_KEY": "hermes-proxy-openrouter-token",
+                "HERMES_PROXY_TOKEN_OPENROUTER_API_KEY": "hermes-proxy-openrouter-token",
+            },
+            [],
+        ),
+    )
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="docker_forward_env.*OPENROUTER_API_KEY"):
+        _make_dummy_env(forward_env=["OPENROUTER_API_KEY"])
+
+
+def test_extra_args_proxy_override_refuses_under_egress(monkeypatch):
+    """docker_extra_args are appended after Hermes args, so egress enforcement
+    must reject critical overrides before Docker sees them."""
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (
+            [],
+            {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            [],
+        ),
+    )
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="docker_extra_args.*HTTPS_PROXY"):
+        _make_dummy_env(extra_args=["-e", "HTTPS_PROXY="])
+
+
 def test_reuse_starts_stopped_container_before_attaching(monkeypatch):
     """A labeled container in ``exited`` state must be restarted via
     ``docker start`` before the new Hermes process uses it. Without this
@@ -752,6 +939,84 @@ def test_reuse_falls_back_to_fresh_run_when_start_fails(monkeypatch):
     assert run_invocations, "fallback to fresh docker run must happen on start failure"
 
 
+def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
+    """When ``docker run`` fails (e.g. exit 125), the partially-created
+    container must be removed by name.
+
+    Docker can create the container object before failing to start it,
+    leaving a stale ``Created`` container. The exited-only orphan reaper
+    (``reap_orphan_containers``, ``status=exited``) never catches a
+    ``Created`` orphan, so without this cleanup it leaks permanently.
+    Regression for #7439. Salvage of #7440 (@Tranquil-Flow).
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+
+    cleanup_calls = []
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "ps":
+                # No reusable container -> fall through to a fresh `docker run`.
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "run":
+                raise subprocess.CalledProcessError(
+                    125, cmd, output="", stderr="docker: Error response from daemon"
+                )
+            if sub == "rm":
+                cleanup_calls.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _make_dummy_env()
+
+    assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
+    rm_cmd = cleanup_calls[0]
+    assert rm_cmd[1] == "rm" and rm_cmd[2] == "-f"
+    assert rm_cmd[3].startswith("hermes-"), "should remove the container by its generated name"
+
+
+def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
+    """When ``docker run`` times out (e.g. slow image pull), the
+    partially-created container must be removed. Salvage of #7440
+    (@Tranquil-Flow); regression for #7439.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+
+    cleanup_calls = []
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "ps":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "run":
+                raise subprocess.TimeoutExpired(cmd, 120)
+            if sub == "rm":
+                cleanup_calls.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _make_dummy_env()
+
+    assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
+    rm_cmd = cleanup_calls[0]
+    assert rm_cmd[1] == "rm" and rm_cmd[2] == "-f"
+    assert rm_cmd[3].startswith("hermes-"), "should remove the container by its generated name"
+
+
 def test_no_reuse_when_persist_across_processes_disabled(monkeypatch):
     """Opt-out path: ``persist_across_processes=False`` skips the ps probe
     entirely and always starts a fresh container, matching the pre-fix
@@ -788,10 +1053,11 @@ def test_find_reusable_container_prefers_running_over_stopped(monkeypatch):
             if cmd[1] == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
             if cmd[1] == "ps":
-                # Two matches: stopped first, running second.
+                # Two matches: stopped first, running second.  3-field format
+                # with absent egress label for the "off" path.
                 return subprocess.CompletedProcess(
                     cmd, 0,
-                    stdout="stopped-cid\texited\nrunning-cid\trunning\n",
+                    stdout="stopped-cid\texited\t<no value>\nrunning-cid\trunning\t<no value>\n",
                     stderr="",
                 )
         return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
@@ -801,6 +1067,71 @@ def test_find_reusable_container_prefers_running_over_stopped(monkeypatch):
     env = _make_dummy_env(task_id="dup-match")
     assert env._container_id == "running-cid", (
         f"running container should win over stopped duplicate, got {env._container_id!r}"
+    )
+
+
+def test_find_reusable_handles_empty_label_string(monkeypatch):
+    """Docker CLI v29.5.3 returns an empty string (NOT ``<no value>``)
+    for absent labels.  The trailing tab produces ``cid\\trunning\\t\\n``;
+    we must not strip the trailing tab or the three-field parser drops the
+    container.  Regression test for the egilewski review on #48073."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+            if cmd[1] == "ps":
+                # Docker v29.5.3: absent label → empty string, trailing tab
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout="safe-cid\trunning\t\n",
+                    stderr="",
+                )
+        return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="empty-label")
+    assert env._container_id == "safe-cid", (
+        f"container with empty-string label should be reused, got {env._container_id!r}"
+    )
+
+
+def test_reuse_off_rejects_non_off_egress_container(monkeypatch):
+    """When egress is off, a container that still has hermes-egress=on
+    (e.g. from before ``hermes egress disable``) must be rejected and a
+    fresh container created.  The post-filter protects against silently
+    reusing a container with baked-in proxy env and CA mounts."""
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+
+    def _run(cmd, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+            if cmd[1] == "ps":
+                # Return a container with hermes-egress=on.  With egress=off
+                # the three-field format includes the label; the post-filter
+                # must skip this entry.
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout="stale-cid\trunning\ton\n",
+                    stderr="",
+                )
+            if cmd[1] == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="egress-off-reject")
+    # Should fall through to fresh container because the stale one has
+    # hermes-egress=on.
+    assert env._container_id == "fresh-cid", (
+        f"expected fresh container, got {env._container_id!r}"
     )
 
 
@@ -1079,7 +1410,7 @@ def test_wait_for_cleanup_returns_true_when_no_thread_started():
     shutdowns."""
     env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
     # No _cleanup_thread set — simulates an env that was never cleanup()'d.
-    assert env.wait_for_cleanup(timeout=1.0) is True
+    assert env.wait_for_cleanup(timeout=10.0) is True
 
 
 def test_wait_for_cleanup_after_cleanup_returns_true(monkeypatch):
@@ -1483,3 +1814,240 @@ def test_credential_mount_works_when_source_is_valid_file(monkeypatch, tmp_path)
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
     assert "token.json" in run_args_str
+
+
+# ── s6-overlay /init image handling (issue #34628) ────────────────
+
+
+def _mock_subprocess_run_with_entrypoint(monkeypatch, entrypoint_json):
+    """Like _mock_subprocess_run, but `docker image inspect` returns the given
+    entrypoint JSON so _image_uses_init_entrypoint can be exercised end-to-end.
+    """
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if cmd[1] == "image" and len(cmd) >= 3 and cmd[2] == "inspect":
+                return subprocess.CompletedProcess(cmd, 0, stdout=entrypoint_json + "\n", stderr="")
+            if cmd[1] == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fake-container-id\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    return calls
+
+
+def test_image_uses_init_entrypoint_detects_s6_init(monkeypatch):
+    """An image whose entrypoint is /init is detected as an s6-overlay image."""
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout='["/init"]', stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    assert docker_env._image_uses_init_entrypoint("/usr/bin/docker", "hermes-agent:latest") is True
+
+
+def test_image_uses_init_entrypoint_false_for_plain_image(monkeypatch):
+    """A normal image (no /init entrypoint) is not treated as s6-overlay."""
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout='["/bin/sh","-c"]', stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    assert docker_env._image_uses_init_entrypoint("/usr/bin/docker", "python:3.11") is False
+
+
+def test_image_uses_init_entrypoint_false_for_null_entrypoint(monkeypatch):
+    """Images with no declared entrypoint (null) keep hardened defaults."""
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="null", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    assert docker_env._image_uses_init_entrypoint("/usr/bin/docker", "alpine") is False
+
+
+def test_image_uses_init_entrypoint_false_on_inspect_failure(monkeypatch):
+    """An inspect failure (e.g. image not pulled) is best-effort -> defaults kept."""
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No such image")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    assert docker_env._image_uses_init_entrypoint("/usr/bin/docker", "missing:tag") is False
+
+
+def test_image_uses_init_entrypoint_false_on_exception(monkeypatch):
+    """A subprocess error never raises out of detection — defaults kept."""
+    def _run(cmd, **kwargs):
+        raise OSError("docker daemon down")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    assert docker_env._image_uses_init_entrypoint("/usr/bin/docker", "x") is False
+
+
+def test_s6_image_skips_docker_init_and_mounts_run_exec(monkeypatch):
+    """For an s6-overlay /init image, docker run must omit --init and mount
+    /run with exec (issue #34628)."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run_with_entrypoint(monkeypatch, '["/init"]')
+
+    _make_dummy_env(image="hermes-agent:latest")
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+
+    assert "--init" not in run_args, "s6 /init image must not get Docker --init"
+
+    tmpfs_vals = [run_args[i + 1] for i, a in enumerate(run_args[:-1]) if a == "--tmpfs"]
+    run_mounts = [v for v in tmpfs_vals if v.startswith("/run:")]
+    assert run_mounts, f"no /run tmpfs mount found in {tmpfs_vals}"
+    assert "exec" in run_mounts[0] and "noexec" not in run_mounts[0], (
+        f"/run must be mounted exec for s6 images, got: {run_mounts[0]}"
+    )
+
+
+def test_plain_image_keeps_docker_init_and_run_noexec(monkeypatch):
+    """A non-s6 image keeps the hardened defaults: Docker --init and noexec /run."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run_with_entrypoint(monkeypatch, '["/bin/sh","-c"]')
+
+    _make_dummy_env(image="python:3.11")
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args = run_calls[0][0]
+
+    assert "--init" in run_args, "non-s6 image must keep Docker --init"
+
+    tmpfs_vals = [run_args[i + 1] for i, a in enumerate(run_args[:-1]) if a == "--tmpfs"]
+    run_mounts = [v for v in tmpfs_vals if v.startswith("/run:")]
+    assert run_mounts, f"no /run tmpfs mount found in {tmpfs_vals}"
+    assert "noexec" in run_mounts[0], (
+        f"/run must stay noexec for non-s6 images, got: {run_mounts[0]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Out-of-band container removal recovery (issue #36266, PR #36631)
+# ---------------------------------------------------------------------------
+
+
+def test_is_container_gone_matches_removal_errors(monkeypatch):
+    """``_is_container_gone`` recognizes the docker errors that mean the
+    container no longer exists, and does NOT match ordinary command failures.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env()
+
+    # Positive: the daemon's "container gone" phrasings.
+    assert env._is_container_gone(
+        "Error response from daemon: No such container: hermes-abc123"
+    )
+    assert env._is_container_gone("Error: No such container: deadbeef")
+    assert env._is_container_gone(
+        "Error response from daemon: Container abc is not running"
+    )
+
+    # Control / negative: a real command failure must NOT be misclassified as
+    # the container being gone — otherwise every non-zero exit would trigger a
+    # spurious container recreation.
+    assert not env._is_container_gone("bash: nonsuch: command not found")
+    assert not env._is_container_gone("Traceback (most recent call last): ...")
+    assert not env._is_container_gone("")
+    assert not env._is_container_gone("permission denied")
+
+
+def test_execute_recovers_from_out_of_band_removal(monkeypatch):
+    """When a persistent container is removed out-of-band, ``execute`` detects
+    the "No such container" error, recreates the container, and retries once —
+    returning success transparently.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        persistent_filesystem=True,
+        persist_across_processes=True,
+    )
+
+    # First execute() sees a dead container; second (post-recovery) succeeds.
+    outputs = iter([
+        {"output": "Error response from daemon: No such container: hermes-x", "returncode": 1},
+        {"output": "ok", "returncode": 0},
+    ])
+
+    def _fake_super_execute(self, command, cwd="", **kwargs):
+        return next(outputs)
+
+    recreate_calls = []
+
+    def _fake_recreate(self):
+        recreate_calls.append(True)
+        self._container_id = "recovered-container-id"
+        return True
+
+    monkeypatch.setattr(docker_env.BaseEnvironment, "execute", _fake_super_execute)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_recreate_container", _fake_recreate
+    )
+
+    result = env.execute("echo hi")
+
+    assert recreate_calls == [True], "recovery should have been attempted exactly once"
+    assert result.get("returncode") == 0, f"expected success after recovery, got {result!r}"
+    assert result.get("output") == "ok"
+
+
+def test_execute_does_not_recover_when_not_persistent(monkeypatch):
+    """A non-persistent session must NOT trigger container recreation on a
+    "No such container" error — recovery is only meaningful for the persistent,
+    cross-process container that can be removed out-of-band.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        persistent_filesystem=True,
+        persist_across_processes=False,
+    )
+
+    def _fake_super_execute(self, command, cwd="", **kwargs):
+        return {"output": "No such container: x", "returncode": 1}
+
+    def _fail_recreate(self):
+        pytest.fail("recreation must not run when persist_across_processes is False")
+
+    monkeypatch.setattr(docker_env.BaseEnvironment, "execute", _fake_super_execute)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_recreate_container", _fail_recreate
+    )
+
+    result = env.execute("echo hi")
+    assert result.get("returncode") == 1, "the original error must pass through unchanged"
+
+
+def test_execute_does_not_recover_on_ordinary_failure(monkeypatch):
+    """A genuine non-zero exit that is NOT a container-gone error must pass
+    through without triggering recovery (guards against over-eager recreation).
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        persistent_filesystem=True,
+        persist_across_processes=True,
+    )
+
+    def _fake_super_execute(self, command, cwd="", **kwargs):
+        return {"output": "bash: badcmd: command not found", "returncode": 127}
+
+    def _fail_recreate(self):
+        pytest.fail("recreation must not run for an ordinary command failure")
+
+    monkeypatch.setattr(docker_env.BaseEnvironment, "execute", _fake_super_execute)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_recreate_container", _fail_recreate
+    )
+
+    result = env.execute("badcmd")
+    assert result.get("returncode") == 127
+    assert "command not found" in result.get("output", "")

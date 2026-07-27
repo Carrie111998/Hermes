@@ -102,6 +102,138 @@ def test_codex_stream_wire_error_event_surfaces_stream_error_event(provider_mess
     assert excinfo.value.body["error"]["message"] == provider_message
 
 
+# ---------------------------------------------------------------------------
+# Nested error envelope on ``type=error`` SSE frames (opencode#36130 port)
+#
+# The Responses spec carries error details at the top level of the frame,
+# but the official OpenAI SDK and several OpenAI-compatible proxies wrap
+# them in an HTTP-style nested envelope:
+#   {"type": "error", "error": {"code": ..., "message": ..., "param": ...}}
+# Before the fix, _raise_stream_error only read top-level fields, so these
+# frames collapsed to the generic "stream emitted error event" placeholder
+# and the error classifier never saw the provider's real code/message.
+# ---------------------------------------------------------------------------
+
+
+def test_codex_stream_wire_error_event_nested_envelope_dict():
+    """Details nested under ``error`` (dict shape) are surfaced."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield {
+                "type": "error",
+                "sequence_number": 2,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "prompt too long",
+                    "param": "input",
+                },
+            }
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "prompt too long" in str(excinfo.value)
+    assert excinfo.value.code == "context_length_exceeded"
+    assert excinfo.value.param == "input"
+    assert excinfo.value.body["error"]["message"] == "prompt too long"
+
+
+def test_codex_stream_wire_error_event_nested_envelope_attr_style():
+    """Details nested under ``error`` (SDK attr-object shape) are surfaced."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield SimpleNamespace(
+                type="error",
+                message=None,
+                code=None,
+                param=None,
+                error=SimpleNamespace(
+                    type="rate_limit_error",
+                    code="rate_limit_exceeded",
+                    message="Slow down",
+                    param=None,
+                ),
+            )
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "Slow down" in str(excinfo.value)
+    assert excinfo.value.code == "rate_limit_exceeded"
+
+
+def test_codex_stream_wire_error_event_top_level_wins_over_envelope():
+    """Top-level fields keep precedence when both shapes are present."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield {
+                "type": "error",
+                "message": "top-level message",
+                "code": "top_level_code",
+                "error": {"message": "nested message", "code": "nested_code"},
+            }
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "top-level message" in str(excinfo.value)
+    assert excinfo.value.code == "top_level_code"
+
+
+def test_codex_stream_wire_error_event_null_fields_fall_back_to_placeholder():
+    """Spec-compliant frames with null fields keep the stable placeholder."""
+    from run_agent import _StreamErrorEvent
+
+    agent = _make_codex_agent()
+
+    class _ErrorCreateStream:
+        def __iter__(self_inner):
+            yield {"type": "error", "code": None, "message": None, "param": None, "error": None}
+
+        def close(self_inner):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = _ErrorCreateStream()
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        agent._run_codex_stream({}, client=mock_client)
+
+    assert "stream emitted error event" in str(excinfo.value)
+    assert excinfo.value.code is None
+
+
 def test_codex_stream_retries_remote_protocol_error_once():
     """Transport errors (``httpx.RemoteProtocolError``) trigger a single retry.
 
@@ -172,22 +304,19 @@ def test_codex_stream_truncated_no_terminal_event_raises():
 
 
 # ---------------------------------------------------------------------------
-# Fix B: surface xAI's entitlement body verbatim (no editorializing)
-#
-# The original PR #26644 appended a hint that led with "X Premium+ does NOT
-# include xAI API access — only standalone SuperGrok subscribers can use this
-# provider."  xAI announced on 2026-05-16 that X Premium subs now work in
-# Hermes (https://x.ai/news/grok-hermes), making that hint actively wrong:
-# a Premium+ user hitting a real entitlement issue (no Grok sub, wrong tier,
-# exhausted quota) would be misdirected to switch subscriptions when their
-# Premium sub is in fact valid.  We now surface xAI's own body text verbatim
-# (which already says "Manage subscriptions at https://grok.com/?_s=usage")
-# and leave the diagnosis to xAI's wording.
+# Fix B: friendly entitlement message
 # ---------------------------------------------------------------------------
 
 
-def test_summarize_api_error_surfaces_xai_entitlement_body_verbatim():
-    """xAI's OAuth 403 body must surface as-is, with no Hermes-side hint."""
+def test_summarize_api_error_decorates_xai_entitlement_403():
+    """xAI's OAuth 403 must surface the X Premium+ gotcha + neutral causes.
+
+    Wording deliberately leads with the X Premium+ gotcha because that's
+    the #1 confusing case: people see Grok in their X app, assume it
+    works here too, and hit this 403 with no idea API access is a
+    separate SKU.  Other causes (no subscription, wrong tier, exhausted
+    quota) follow.
+    """
     from run_agent import AIAgent
 
     error = RuntimeError(
@@ -197,15 +326,45 @@ def test_summarize_api_error_surfaces_xai_entitlement_body_verbatim():
         "subscriptions at https://grok.com'}"
     )
     summary = AIAgent._summarize_api_error(error)
-    # xAI's own body text must reach the user — they need it to diagnose.
+    # The original xAI text must survive — it's still useful diagnostic info.
     assert "do not have an active Grok subscription" in summary
-    # No stale claim that X Premium is incompatible with Hermes.
-    assert "X Premium+ does NOT include" not in summary
-    assert "standalone SuperGrok subscribers" not in summary
+    # The hint MUST lead with the X Premium+ gotcha (most likely cause
+    # for users who think they're subscribed).
+    assert "X Premium+ does NOT include" in summary
+    assert "standalone SuperGrok subscribers" in summary
+    # Other causes still listed.
+    assert "no Grok subscription" in summary
+    assert "tier doesn't include this model" in summary
+    assert "quota is exhausted" in summary
+    # The hint must point at the usage page where the user can verify.
+    assert "https://grok.com/?_s=usage" in summary
+    # Switching providers is still a valid escape hatch.
+    assert "/model" in summary
 
 
-def test_summarize_api_error_xai_body_message_unwrapped():
-    """SDK-style error with structured body surfaces the message cleanly."""
+def test_summarize_api_error_does_not_accuse_subscribers():
+    """Hint must not confidently say the user has no subscription.
+
+    Don Piedro reported his subscription is active. The hint must not
+    contradict him — leading with the X Premium+ gotcha gives subscribers
+    a plausible reason ("oh, I'm on Premium+ not pure SuperGrok") instead
+    of accusing them of lying about having a subscription.
+    """
+    from run_agent import AIAgent
+
+    error = RuntimeError(
+        "HTTP 403: do not have an active Grok subscription"
+    )
+    summary = AIAgent._summarize_api_error(error)
+    # MUST NOT contain language that flatly assumes the user is unsubscribed.
+    assert "lacks SuperGrok" not in summary
+    assert "you are not subscribed" not in summary.lower()
+    # MUST lead with the most-likely-but-non-accusatory cause.
+    assert "X Premium+ does NOT include" in summary
+
+
+def test_summarize_api_error_decorates_xai_body_message():
+    """SDK-style error with structured body must also get the hint."""
     from run_agent import AIAgent
 
     class _XaiErr(Exception):
@@ -222,9 +381,48 @@ def test_summarize_api_error_xai_body_message_unwrapped():
 
     summary = AIAgent._summarize_api_error(_XaiErr("403"))
     assert "HTTP 403" in summary
-    assert "do not have an active Grok subscription" in summary
-    # No editorializing on top of xAI's own wording.
-    assert "X Premium+ does NOT include" not in summary
+    assert "X Premium+ does NOT include" in summary
+
+
+def test_summarize_api_error_handles_nested_provider_message():
+    """HF router may put a structured object in error.message."""
+    from run_agent import AIAgent
+
+    class _NestedProviderErr(Exception):
+        status_code = 400
+        body = {
+            "error": {
+                "message": {
+                    "type": "Bad Request",
+                    "code": "context_length_exceeded",
+                    "message": (
+                        "This model's maximum context length is 262144 tokens. "
+                        "Please reduce the length of the messages."
+                    ),
+                    "param": None,
+                },
+                "type": "invalid_request_error",
+                "param": None,
+                "code": None,
+            }
+        }
+
+    summary = AIAgent._summarize_api_error(_NestedProviderErr("400"))
+    assert "HTTP 400" in summary
+    assert "maximum context length is 262144 tokens" in summary
+    assert "context_length_exceeded" not in summary
+
+
+def test_summarize_api_error_idempotent_for_entitlement_hint():
+    """Decorating twice must not double up the hint."""
+    from run_agent import AIAgent
+
+    raw = "HTTP 403: do not have an active Grok subscription"
+    once = AIAgent._decorate_xai_entitlement_error(raw)
+    twice = AIAgent._decorate_xai_entitlement_error(once)
+    assert once == twice
+    # Sanity: the hint did fire on the first pass.
+    assert "X Premium+ does NOT include" in once
 
 
 def test_summarize_api_error_passes_through_unrelated_errors():
@@ -508,7 +706,7 @@ def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
@@ -537,6 +735,69 @@ def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
     assert refresh_calls["n"] == 0, "try_refresh_current must NOT be called on entitlement 403"
 
 
+def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
+    """xAI's explicit spending-limit 403 must rotate, not hit the entitlement guard."""
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    agent = _make_codex_agent()
+    next_entry = MagicMock(id="healthy-account")
+    refresh_calls = {"n": 0}
+
+    class _SpendingLimitError(Exception):
+        status_code = 403
+        body = {
+            "code": "personal-team-blocked:spending-limit",
+            "error": (
+                "You have run out of credits or need a Grok subscription. "
+                "Add credits at Grok or upgrade at Grok."
+            ),
+        }
+
+    class _FakePool:
+        provider = "xai-oauth"
+
+        def try_refresh_matching(self, api_key_hint=None):
+            refresh_calls["n"] += 1
+            return MagicMock(id="should_not_be_called")
+
+        def mark_exhausted_and_rotate(
+            self,
+            *,
+            status_code,
+            error_context=None,
+            api_key_hint=None,
+        ):
+            assert status_code == 403
+            assert api_key_hint == "test-key"
+            assert error_context == {
+                "reason": "personal-team-blocked:spending-limit",
+                "message": (
+                    "You have run out of credits or need a Grok subscription. "
+                    "Add credits at Grok or upgrade at Grok."
+                ),
+            }
+            return next_entry
+
+    error = _SpendingLimitError("Error code: 403")
+    classified = classify_api_error(error, provider="xai-oauth", model="grok-4.5")
+    error_context = agent._extract_api_error_context(error)
+    setattr(agent, "_credential_pool", _FakePool())
+    agent._swap_credential = MagicMock()
+
+    recovered, retried_429 = agent._recover_with_credential_pool(
+        status_code=error.status_code,
+        has_retried_429=False,
+        classified_reason=classified.reason,
+        error_context=error_context,
+    )
+
+    assert classified.reason == FailoverReason.billing
+    assert recovered is True
+    assert retried_429 is False
+    assert refresh_calls["n"] == 0
+    agent._swap_credential.assert_called_once_with(next_entry)
+
+
 def test_recover_with_credential_pool_skips_refresh_on_bare_403_for_xai_oauth():
     """A bare HTTP 403 from ``xai-oauth`` (no keyword match) must NOT loop refresh.
 
@@ -555,7 +816,7 @@ def test_recover_with_credential_pool_skips_refresh_on_bare_403_for_xai_oauth():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
@@ -596,7 +857,7 @@ def test_recover_with_credential_pool_still_refreshes_genuine_auth_failure():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             # Return a fake refreshed entry — semantically "refresh worked"
             entry = MagicMock()
@@ -777,7 +1038,7 @@ def test_recover_with_credential_pool_refreshes_on_xai_bad_credentials_403():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             entry = MagicMock()
             entry.id = "entry_refreshed_after_stale"
@@ -833,7 +1094,7 @@ def test_recover_with_credential_pool_still_blocks_real_entitlement():
     refresh_calls = {"n": 0}
 
     class _FakePool:
-        def try_refresh_current(self):
+        def try_refresh_matching(self, api_key_hint=None):
             refresh_calls["n"] += 1
             return MagicMock(id="should_not_be_called")
 
@@ -910,6 +1171,29 @@ def test_grok_4_still_resolves_to_256k():
         # must be "grok-4" (or a more specific variant family if one is
         # ever added).  The 256k contract must hold.
         assert DEFAULT_CONTEXT_LENGTHS[matched_key] == 256_000
+
+
+def test_grok_composer_context_length_is_200k():
+    """grok-composer-2.5-fast is OAuth-only and missing from /v1/models.
+
+    Without a specific entry it fell through to the generic ``grok`` 131k
+    catch-all.  xAI publishes a 200k usable context window for Composer 2.5
+    on Grok Build (SuperGrok / Premium+); /v1/responses additionally caps
+    the input+output budget at ~262144, but the usable context (what we
+    track) is 200k.
+    """
+    from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+
+    assert DEFAULT_CONTEXT_LENGTHS["grok-composer"] == 200_000
+    slug = "grok-composer-2.5-fast"
+    matched_key = max(
+        (k for k in DEFAULT_CONTEXT_LENGTHS if k in slug.lower()),
+        key=len,
+    )
+    assert matched_key == "grok-composer", (
+        f"Expected longest-first match on grok-composer for {slug}, got {matched_key}"
+    )
+    assert DEFAULT_CONTEXT_LENGTHS[matched_key] == 200_000
 
 
 # ---------------------------------------------------------------------------
