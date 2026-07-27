@@ -3,6 +3,16 @@ import sqlite3
 from hermes_cli import metered_billing
 
 
+def test_meter_schema_read_preserves_active_transaction(tmp_path):
+    conn = sqlite3.connect(tmp_path / "authority.db")
+    conn.row_factory = sqlite3.Row
+    metered_billing.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    metered_billing.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_subcent_usage_accumulates_without_rounding_loss():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
