@@ -14,8 +14,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Kept in sync with compresr.integrations.hermes.cache (CACHE_SUBPATH).
-_COMPRESR_CACHE_SUBPATH = "cache/compresr/tool-output"
+# Literal fallback used only when the SDK isn't importable yet (so cache wiring
+# still happens before the delegate below reports the missing package). When the
+# SDK is present its cache.CACHE_SUBPATH is the single source of truth.
+_FALLBACK_CACHE_SUBPATH = "cache/compresr/tool-output"
 
 _INSTALL_HINT = (
     "compresr: the `compresr` Python package is not installed in Hermes's "
@@ -27,9 +29,14 @@ _INSTALL_HINT = (
 def register(ctx: Any) -> None:
     """Wire the SDK's cache dir into the backend surface, then delegate to it."""
     try:
+        from compresr.integrations.hermes.cache import CACHE_SUBPATH
+    except Exception:
+        CACHE_SUBPATH = _FALLBACK_CACHE_SUBPATH
+
+    try:
         from tools.credential_files import register_cache_dir
 
-        register_cache_dir(_COMPRESR_CACHE_SUBPATH)
+        register_cache_dir(CACHE_SUBPATH)
     except Exception as e:  # cache wiring must never block plugin load
         logger.debug("compresr: could not register cache dir (%s)", e)
 

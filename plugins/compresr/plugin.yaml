@@ -1,5 +1,6 @@
 name: compresr
 version: 1.0.0
+kind: backend
 description: >-
   Query-aware context + tool-output compression via Compresr (YC W26).
   Out-of-tree, SDK-backed: all logic ships in the `compresr` PyPI package

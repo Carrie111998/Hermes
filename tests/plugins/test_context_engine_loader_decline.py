@@ -71,3 +71,19 @@ def test_module_without_register_still_uses_subclass_scan(tmp_path):
     engine = _load_engine_from_dir(engine_dir)
     assert engine is not None
     assert engine.name == "probe"
+
+
+def test_register_that_raises_falls_through_to_subclass_scan(tmp_path):
+    # A register() that blows up (not a deliberate decline) must not strand the
+    # engine: the loader falls back to the subclass scan and still returns it.
+    engine_dir = _write_engine(
+        tmp_path,
+        "raising_engine",
+        """
+        def register(ctx):
+            raise RuntimeError("boom during register")
+        """,
+    )
+    engine = _load_engine_from_dir(engine_dir)
+    assert engine is not None
+    assert engine.name == "probe"
