@@ -274,3 +274,5 @@ recorded.
   mandatory when consuming execution permits.
 - `70261890ea87714194914b3dd04bff8e0a73ef5b` — bound execution-result
   recording to the organization executing the governed action.
+- `e860e36534bf323f61a4ee4f0ab4c940020fd97a` — bound durable verification
+  recording to the organization executing the governed action.
