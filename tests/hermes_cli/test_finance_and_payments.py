@@ -26,6 +26,15 @@ def test_finance_schema_read_preserves_active_transaction(tmp_path):
     conn.rollback()
 
 
+def test_payment_control_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    payment_controls.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    payment_controls.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 class FakeRail(PaymentRail):
     name = "fake"
 
