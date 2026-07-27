@@ -1,5 +1,6 @@
 import { QueryClient } from '@tanstack/react-query'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { atom } from 'nanostores'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -9,9 +10,9 @@ import { modelOptionsQueryKey } from '@/lib/model-options'
 
 // Hoisted mocks — vi.mock factories run before static imports, so mutable
 // state must be declared with vi.hoisted() to survive the hoisting order.
-const { cwdFollowMock, currentCwdState } = vi.hoisted(() => ({
+const { cwdFollowMock, cwdAtom } = vi.hoisted(() => ({
   cwdFollowMock: vi.fn<(_: string) => Promise<void>>(async () => undefined),
-  currentCwdState: { value: '' }
+  cwdAtom: atom('')
 }))
 
 vi.mock('@/store/projects', () => ({
@@ -23,11 +24,7 @@ vi.mock('@/store/session', async () => {
 
   return {
     ...actual,
-    // $currentCwd is a nanostore atom — use a getter so tests can swap
-    // the value without re-importing the module.
-    get $currentCwd() {
-      return { get: () => currentCwdState.value }
-    }
+    $currentCwd: cwdAtom
   }
 })
 
@@ -185,7 +182,7 @@ describe('message.complete sidebar refresh coalescing', () => {
 describe('session.info cwd-follow guard', () => {
   beforeEach(() => {
     cwdFollowMock.mockReset()
-    currentCwdState.value = ''
+    cwdAtom.set('')
   })
 
   it('does not follow the cwd on the first session.info after reconnect (initial learn)', async () => {
@@ -198,7 +195,7 @@ describe('session.info cwd-follow guard', () => {
   })
 
   it('follows the cwd on a genuine move (non-empty → different non-empty)', async () => {
-    currentCwdState.value = '/Users/test/projects/foo'
+    cwdAtom.set('/Users/test/projects/foo')
 
     await mountStream()
 
