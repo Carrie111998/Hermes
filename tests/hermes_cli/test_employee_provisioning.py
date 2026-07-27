@@ -23,7 +23,7 @@ def test_employee_profile_is_mandate_bound_and_does_not_clone_secrets(
     ceo = org.propose_employee(
         conn,
         organization_id=organization_id,
-        display_name="Hermes",
+        display_name="Charterforge",
         title="CEO",
         level="ceo",
         manager_id=None,

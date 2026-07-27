@@ -1509,7 +1509,7 @@ def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path
     assert "npm audit fix" not in out
     # ... and explains the workspace advisories are build-time tooling whose
     # manual remediation may hit a known npm arborist crash, so the user isn't
-    # left thinking a crashing command means a broken Hermes install.
+    # left thinking a crashing command means a broken Charterforge install.
     assert "build-time tooling" in out
     assert "known npm bug" in out
     assert "lockfile bump" in out

@@ -120,7 +120,7 @@ def test_uninstall_gui_removes_only_gui_artifacts(tmp_path, monkeypatch):
 def test_uninstall_gui_removes_userdata(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     _make_agent(hermes_home)
-    userdata = tmp_path / "Hermes-userdata"
+    userdata = tmp_path / "Charterforge-userdata"
     userdata.mkdir()
     (userdata / "connection.json").write_text("{}")
 
@@ -134,7 +134,7 @@ def test_uninstall_gui_removes_userdata(tmp_path, monkeypatch):
 def test_uninstall_gui_keeps_userdata_when_requested(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     _make_agent(hermes_home)
-    userdata = tmp_path / "Hermes-userdata"
+    userdata = tmp_path / "Charterforge-userdata"
     userdata.mkdir()
 
     monkeypatch.setattr(gu, "packaged_gui_app_paths", lambda: [])
@@ -147,7 +147,7 @@ def test_uninstall_gui_keeps_userdata_when_requested(tmp_path, monkeypatch):
 def test_uninstall_gui_removes_packaged_bundle(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     _make_agent(hermes_home)
-    bundle = tmp_path / "Hermes.app"
+    bundle = tmp_path / "Charterforge.app"
     (bundle / "Contents").mkdir(parents=True)
 
     monkeypatch.setattr(gu, "packaged_gui_app_paths", lambda: [bundle])
@@ -176,16 +176,16 @@ def test_gui_install_summary_shape(tmp_path, monkeypatch):
 
 
 def test_userdata_dir_per_platform(monkeypatch):
-    """userData path matches Electron's app.getPath('userData') for "Hermes"."""
+    """userData path matches Electron's app.getPath('userData') for "Charterforge"."""
     home = Path("/home/tester")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     monkeypatch.setattr(gu.sys, "platform", "darwin")
-    assert gu.desktop_userdata_dir() == home / "Library" / "Application Support" / "Hermes"
+    assert gu.desktop_userdata_dir() == home / "Library" / "Application Support" / "Charterforge"
 
     monkeypatch.setattr(gu.sys, "platform", "linux")
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    assert gu.desktop_userdata_dir() == home / ".config" / "Hermes"
+    assert gu.desktop_userdata_dir() == home / ".config" / "Charterforge"
 
 
 def test_userdata_dir_windows(monkeypatch):
@@ -193,7 +193,7 @@ def test_userdata_dir_windows(monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(gu.sys, "platform", "win32")
     monkeypatch.setenv("APPDATA", r"C:\Users\tester\AppData\Roaming")
-    assert gu.desktop_userdata_dir() == Path(r"C:\Users\tester\AppData\Roaming") / "Hermes"
+    assert gu.desktop_userdata_dir() == Path(r"C:\Users\tester\AppData\Roaming") / "Charterforge"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")

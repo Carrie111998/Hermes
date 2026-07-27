@@ -127,7 +127,7 @@ class TestValidateProfileName:
 
     @pytest.mark.parametrize("name", ["hermes", "test", "tmp", "root", "sudo"])
     def test_reserved_names_rejected(self, name):
-        """Reserved names collide with the Hermes install itself or with
+        """Reserved names collide with the Charterforge install itself or with
         common system binaries — reject them at validate time so
         create/install/rename all share one gate."""
         with pytest.raises(ValueError, match="reserved"):
@@ -1391,7 +1391,7 @@ class TestExportImport:
         Docker/custom deployments often set HERMES_HOME to a working
         directory that also contains unrelated user projects (``x11-dev/``,
         etc.).  The root-level allow-list filters those out so only known
-        Hermes artifacts end up in the archive. Replaces the old
+        Charterforge artifacts end up in the archive. Replaces the old
         exhaustive blacklist.
         """
         default_dir = get_profile_dir("default")

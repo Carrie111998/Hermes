@@ -40,9 +40,9 @@ def _make_packaged_executable(root: Path, monkeypatch, platform: str = "darwin")
     monkeypatch.setattr(cli_main.sys, "platform", platform)
     desktop_dir = root / "apps" / "desktop"
     if platform == "darwin":
-        exe = desktop_dir / "release" / "mac-arm64" / "Hermes.app" / "Contents" / "MacOS" / "Hermes"
+        exe = desktop_dir / "release" / "mac-arm64" / "Charterforge.app" / "Contents" / "MacOS" / "Charterforge"
     elif platform == "win32":
-        exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
+        exe = desktop_dir / "release" / "win-unpacked" / "Charterforge.exe"
     else:
         exe = desktop_dir / "release" / "linux-unpacked" / "hermes"
     exe.parent.mkdir(parents=True)
@@ -86,7 +86,7 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
     """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
     shell out to bare ``node``. When Desktop is launched from the updater chain
-    the parent PATH is stripped, so the install env MUST carry the Hermes-managed
+    the parent PATH is stripped, so the install env MUST carry the Charterforge-managed
     Node ahead of that bare PATH or the install dies with ``node: not found``.
     """
     import os
@@ -755,7 +755,7 @@ def test_gui_does_not_retry_after_packaged_executable_exists(tmp_path, monkeypat
     Electron-download problem the cache purge + mirror retries exist to repair.
 
     Regression for #40187: a late failure such as macOS code signing leaves
-    Hermes.app/Contents/MacOS/Hermes in place. Re-downloading Electron can't
+    Charterforge.app/Contents/MacOS/Charterforge in place. Re-downloading Electron can't
     repair a signing failure, so the destructive purge + slow mirror retry must
     be skipped — we fail directly instead of grinding through an identical retry.
     """
@@ -977,9 +977,9 @@ def test_stop_desktop_build_lock_terminates_only_release_procs(tmp_path, monkeyp
     desktop_dir = tmp_path / "apps" / "desktop"
     release = desktop_dir / "release" / "win-unpacked"
     release.mkdir(parents=True)
-    locker_exe = release / "Hermes.exe"
+    locker_exe = release / "Charterforge.exe"
     locker_exe.write_text("", encoding="utf-8")
-    other_exe = tmp_path / "elsewhere" / "Hermes.exe"
+    other_exe = tmp_path / "elsewhere" / "Charterforge.exe"
     other_exe.parent.mkdir(parents=True)
     other_exe.write_text("", encoding="utf-8")
 

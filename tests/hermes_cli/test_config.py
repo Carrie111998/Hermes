@@ -1644,7 +1644,7 @@ class TestEnvWriteDenylist:
     the session token lives in the SPA's HTML where any future plugin
     XSS or local process could exfiltrate it). Without this gate, an
     attacker who steals the token could plant
-    ``LD_PRELOAD=/tmp/evil.so`` in ``.env`` and own the next Hermes
+    ``LD_PRELOAD=/tmp/evil.so`` in ``.env`` and own the next Charterforge
     process on next startup via the dotenv → ``os.environ`` chain in
     ``hermes_cli/env_loader.py``.
 

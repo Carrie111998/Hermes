@@ -1,4 +1,4 @@
-"""Dashboard Hermes Console websocket tests."""
+"""Dashboard Charterforge Console websocket tests."""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def test_console_ws_runs_read_only_command(console_client):
         conn.send_json({"type": "input", "line": "help"})
 
         output = _recv_until(conn, "output")
-        assert "Hermes Console" in output["data"]
+        assert "Charterforge Console" in output["data"]
         complete = _recv_until(conn, "complete", status="ok")
         assert complete["prompt"] == "hermes> "
 

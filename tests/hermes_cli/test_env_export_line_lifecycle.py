@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from hermes_cli.web_server import _SESSION_TOKEN, app
 
 client = TestClient(app)
-HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
+HEADERS = {"X-Charterforge-Session-Token": _SESSION_TOKEN}
 
 # Classic-PAT-shaped token, constructed at runtime (36 chars after prefix).
 OLD_PAT = "ghp_" + "A" * 36

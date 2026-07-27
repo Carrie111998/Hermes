@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from hermes_cli.web_server import _SESSION_TOKEN, app
 
 client = TestClient(app)
-HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
+HEADERS = {"X-Charterforge-Session-Token": _SESSION_TOKEN}
 
 # Runtime-constructed fake credentials (never literal key-shaped strings).
 FAKE_ZAI_KEY = "zk-" + "a" * 24

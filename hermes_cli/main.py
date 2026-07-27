@@ -545,7 +545,9 @@ def _apply_profile_override() -> None:
         except Exception:
             return None
 
-        candidate = home / ".hermes" / "profiles" / name
+        candidate = home / ".charterforge" / "profiles" / name
+        if not candidate.is_dir():
+            candidate = home / ".hermes" / "profiles" / name
         try:
             if candidate.is_dir():
                 return str(candidate)
@@ -616,7 +618,10 @@ def _apply_profile_override() -> None:
     # still read active_profile — the user may have switched profiles via
     # `hermes profile use` and the gateway should honour that choice.
     # See issue #22502.
-    hermes_home_env = os.environ.get("HERMES_HOME", "")
+    hermes_home_env = (
+        os.environ.get("CHARTERFORGE_HOME", "")
+        or os.environ.get("HERMES_HOME", "")
+    )
     if profile_name is None and hermes_home_env:
         if Path(hermes_home_env).parent.name == "profiles":
             return
@@ -667,6 +672,8 @@ def _apply_profile_override() -> None:
                 file=sys.stderr,
             )
             return
+        os.environ["CHARTERFORGE_HOME"] = hermes_home
+        # Inherited modules still read the legacy name during migration.
         os.environ["HERMES_HOME"] = hermes_home
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:

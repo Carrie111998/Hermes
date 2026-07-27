@@ -29,7 +29,7 @@ def test_whatsapp_pairing_watcher_records_qr_and_connected():
     proc = _FakeProc([
         '{"event":"started","session":"/tmp/session"}\n',
         '{"event":"qr","qr":"qr-payload"}\n',
-        '{"event":"connected","user":{"id":"15551234567:1@s.whatsapp.net","name":"Hermes Bot"}}\n',
+        '{"event":"connected","user":{"id":"15551234567:1@s.whatsapp.net","name":"Charterforge Bot"}}\n',
     ])
     record = ws._WhatsAppOnboardingSession(
         proc=proc,
@@ -47,7 +47,7 @@ def test_whatsapp_pairing_watcher_records_qr_and_connected():
     assert record.status == "connected"
     assert record.qr_payload == "qr-payload"
     assert record.account_id == "15551234567:1@s.whatsapp.net"
-    assert record.account_name == "Hermes Bot"
+    assert record.account_name == "Charterforge Bot"
     assert record.account_phone == "15551234567"
     assert record.error is None
     ws._whatsapp_onboarding_sessions.clear()
@@ -65,14 +65,14 @@ def test_whatsapp_pairing_payload_includes_linked_account():
         expires_at_ts=time.time() + 600,
         status="connected",
         account_id="15551234567@s.whatsapp.net",
-        account_name="Hermes Bot",
+        account_name="Charterforge Bot",
         account_phone="15551234567",
     )
 
     payload = ws._whatsapp_onboarding_payload("pairing", record)
 
     assert payload["account_id"] == "15551234567@s.whatsapp.net"
-    assert payload["account_name"] == "Hermes Bot"
+    assert payload["account_name"] == "Charterforge Bot"
     assert payload["account_phone"] == "15551234567"
 
 
@@ -218,7 +218,7 @@ def test_start_whatsapp_onboarding_existing_creds_returns_linked_account(monkeyp
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     (session_dir / "creds.json").write_text(
-        '{"me":{"id":"15551234567:1@s.whatsapp.net","name":"Hermes Bot"}}',
+        '{"me":{"id":"15551234567:1@s.whatsapp.net","name":"Charterforge Bot"}}',
         encoding="utf-8",
     )
 
@@ -246,7 +246,7 @@ def test_start_whatsapp_onboarding_existing_creds_returns_linked_account(monkeyp
     assert result["status"] == "connected"
     assert result["qr_payload"] is None
     assert result["account_id"] == "15551234567:1@s.whatsapp.net"
-    assert result["account_name"] == "Hermes Bot"
+    assert result["account_name"] == "Charterforge Bot"
     assert result["account_phone"] == "15551234567"
     assert old_record.status == "cancelled"
     assert old_proc.terminated is True

@@ -33,7 +33,7 @@ def _ceo(conn, organization_id):
     return org.propose_employee(
         conn,
         organization_id=organization_id,
-        display_name="Hermes",
+        display_name="Charterforge",
         title="Chief Executive Officer",
         level="ceo",
         manager_id=None,
@@ -157,7 +157,7 @@ def test_hiring_is_bounded_by_headcount_and_payroll(conn):
     ceo = org.propose_employee(
         conn,
         organization_id=company,
-        display_name="Hermes",
+        display_name="Charterforge",
         title="CEO",
         level="ceo",
         manager_id=None,

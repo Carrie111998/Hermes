@@ -109,7 +109,7 @@ def test_ambient_pool_source_does_not_count_as_explicit(tmp_path, monkeypatch):
 
 
 def test_explicit_pool_source_counts_as_explicit(tmp_path, monkeypatch):
-    """manual / device_code / PKCE pool entries reflect explicit Hermes flows."""
+    """manual / device_code / PKCE pool entries reflect explicit Charterforge flows."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {
         "version": 1,

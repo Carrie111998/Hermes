@@ -337,7 +337,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_environment(tmp_path, monkeypatch):
+def _hermetic_environment(tmp_path, monkeypatch, request):
     """Blank out all credential/behavioral env vars so local and CI match.
 
     Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
@@ -410,6 +410,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
+
+    # `_apply_profile_override()` intentionally writes launch-scope home
+    # variables directly before imports. Remove those direct writes after each
+    # test so a canonical rebrand test cannot shadow a later legacy-alias test.
+    request.addfinalizer(
+        lambda: (
+            os.environ.pop("CHARTERFORGE_HOME", None),
+            os.environ.pop("HERMES_HOME", None),
+        )
+    )
 
 
 # Backward-compat alias — old tests reference this fixture name. Keep it

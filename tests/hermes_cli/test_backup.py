@@ -406,7 +406,7 @@ class TestBackup:
         # Add a nested hermes-agent directory inside skills (like the real layout)
         nested = hermes_home / "skills" / "autonomous-ai-agents" / "hermes-agent"
         nested.mkdir(parents=True)
-        (nested / "SKILL.md").write_text("# Hermes Agent Skill\n")
+        (nested / "SKILL.md").write_text("# Charterforge Skill\n")
         (nested / "sub").mkdir()
         (nested / "sub" / "item.txt").write_text("nested content\n")
 
@@ -521,7 +521,7 @@ class TestValidateBackupZip:
                 zf.writestr(name, "dummy")
 
     def test_state_db_passes(self, tmp_path):
-        """A zip containing state.db is accepted as a valid Hermes backup."""
+        """A zip containing state.db is accepted as a valid Charterforge backup."""
         from hermes_cli.backup import _validate_backup_zip
         zip_path = tmp_path / "backup.zip"
         self._make_zip(zip_path, ["state.db", "sessions/abc.json"])
@@ -2487,7 +2487,7 @@ class TestPreMigrationBackup:
         assert "gateway.pid" not in names
 
     def test_restorable_with_hermes_import(self, hermes_home, tmp_path):
-        """The zip produced by pre-migration backup must be a valid Hermes
+        """The zip produced by pre-migration backup must be a valid Charterforge
         backup — `hermes import` should accept it."""
         from hermes_cli.backup import create_pre_migration_backup, _validate_backup_zip
         out = create_pre_migration_backup(hermes_home=hermes_home)

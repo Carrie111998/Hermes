@@ -196,12 +196,12 @@ def test_gateway_cmd_script_uses_console_python_without_replace_or_start_churn(m
     monkeypatch.setattr(
         gateway_windows,
         "_resolve_detached_python",
-        lambda exe: (exe, r"C:\\Hermes\\hermes-agent\\venv", []),
+        lambda exe: (exe, r"C:\\Charterforge\\hermes-agent\\venv", []),
     )
 
     content = gateway_windows._build_gateway_cmd_script(
-        r"C:\\Hermes\\hermes-agent\\venv\\Scripts\\python.exe",
-        r"C:\\Hermes\\hermes-agent",
+        r"C:\\Charterforge\\hermes-agent\\venv\\Scripts\\python.exe",
+        r"C:\\Charterforge\\hermes-agent",
         r"C:\\HermesHome\\profiles\\alice",
         "--profile alice",
     )
@@ -272,7 +272,7 @@ def test_elevated_gateway_command_uses_hidden_console_python(monkeypatch):
 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(gateway_windows, "_current_profile_cli_args", lambda: ["--profile", "alice"])
-    monkeypatch.setattr(gateway_windows.sys, "executable", r"C:\Hermes\venv\Scripts\python.exe")
+    monkeypatch.setattr(gateway_windows.sys, "executable", r"C:\Charterforge\venv\Scripts\python.exe")
     monkeypatch.setattr(gateway_windows.ctypes, "windll", FakeWindll(), raising=False)
 
     assert gateway_windows._launch_elevated_gateway_command("install", ["--start-now", "--elevated-handoff"])
@@ -280,7 +280,7 @@ def test_elevated_gateway_command_uses_hidden_console_python(monkeypatch):
     assert len(calls) == 1
     _hwnd, verb, executable, params, cwd, show = calls[0]
     assert verb == "runas"
-    assert executable == r"C:\Hermes\venv\Scripts\python.exe"
+    assert executable == r"C:\Charterforge\venv\Scripts\python.exe"
     assert "--profile alice gateway install --start-now --elevated-handoff" in params
     assert show == 0
     assert cwd
@@ -340,8 +340,8 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     )
     content = gateway_windows._build_gateway_vbs_script(
         r"C:\venv\Scripts\python.exe",
-        r"C:\Hermes",
-        r"C:\Hermes",
+        r"C:\Charterforge",
+        r"C:\Charterforge",
         "--profile work",
     )
     assert "cmd.exe" not in content.lower()
@@ -489,7 +489,7 @@ def test_install_access_denied_launches_elevated_install_before_startup_fallback
     out = capsys.readouterr().out
     assert "administrator approval" in out
     assert "UAC is Windows' admin approval prompt" in out
-    assert "Launched elevated Hermes gateway install prompt" in out
+    assert "Launched elevated Charterforge gateway install prompt" in out
 
 
 def test_install_prompts_start_choices_before_uac(monkeypatch, tmp_path, capsys):
@@ -664,7 +664,7 @@ def test_uninstall_access_denied_prompts_before_elevating(monkeypatch, tmp_path,
     out = capsys.readouterr().out
     assert "uninstall needs administrator approval" in out
     assert "UAC is Windows' admin approval prompt" in out
-    assert "Launched elevated Hermes gateway uninstall prompt" in out
+    assert "Launched elevated Charterforge gateway uninstall prompt" in out
 
 
 def test_uninstall_access_denied_declined_keeps_task_and_cleans_files(monkeypatch, tmp_path, capsys):

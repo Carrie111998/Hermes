@@ -256,9 +256,9 @@ def test_skip_build_custom_env_dist_missing_does_not_attempt_recovery(
 @pytest.mark.parametrize(
     "path,expected",
     [
-        ("/Applications/Hermes.app/Contents/Resources/app.asar/dist", True),
-        ("/Applications/Hermes.app/Contents/Resources/app.asar.unpacked/dist", True),
-        (r"C:\Users\u\AppData\Local\Programs\Hermes\resources\app.asar\dist", True),
+        ("/Applications/Charterforge.app/Contents/Resources/app.asar/dist", True),
+        ("/Applications/Charterforge.app/Contents/Resources/app.asar.unpacked/dist", True),
+        (r"C:\Users\u\AppData\Local\Programs\Charterforge\resources\app.asar\dist", True),
         ("/home/u/custom-dashboard-dist", False),
         ("", False),
     ],
@@ -274,7 +274,7 @@ def test_standalone_dashboard_drops_electron_packaged_web_dist(
     is built/served instead of the desktop renderer."""
     _wire_common(main_mod, monkeypatch)
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
-    packaged = "/Applications/Hermes.app/Contents/Resources/app.asar/dist"
+    packaged = "/Applications/Charterforge.app/Contents/Resources/app.asar/dist"
     monkeypatch.setenv("HERMES_WEB_DIST", packaged)
 
     started = []

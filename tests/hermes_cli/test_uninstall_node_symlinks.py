@@ -3,7 +3,7 @@
 Regression for #34536: the POSIX installer drops node/npm/npx symlinks in
 ~/.local/bin pointing into $HERMES_HOME/node and prepends ~/.local/bin to
 PATH, shadowing an existing nvm. Uninstall must remove those symlinks, but
-only when they still resolve into the Hermes-managed node dir.
+only when they still resolve into the Charterforge-managed node dir.
 """
 
 import os
@@ -96,7 +96,7 @@ def test_handles_missing_local_bin(fake_home):
 
 
 def test_removes_dangling_symlink_into_hermes_node(fake_home):
-    """A link into the Hermes node dir is removed even if the target file is
+    """A link into the Charterforge node dir is removed even if the target file is
     already gone (dangling) \u2014 the link still shadows PATH."""
     hermes_home = fake_home / ".hermes"
     node_bin = hermes_home / "node" / "bin"
@@ -114,12 +114,12 @@ def test_removes_dangling_symlink_into_hermes_node(fake_home):
 
 
 def test_only_some_links_present(fake_home):
-    """Removes the Hermes links that exist; ignores the ones that don't."""
+    """Removes the Charterforge links that exist; ignores the ones that don't."""
     hermes_home = fake_home / ".hermes"
     node_bin = _make_hermes_node(hermes_home)
     local_bin = fake_home / ".local" / "bin"
 
-    # Only npm and npx are Hermes-managed; node is a real user binary.
+    # Only npm and npx are Charterforge-managed; node is a real user binary.
     (local_bin / "npm").symlink_to(node_bin / "npm")
     (local_bin / "npx").symlink_to(node_bin / "npx")
     (local_bin / "node").write_text("#!/bin/sh\n")
