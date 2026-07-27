@@ -35,6 +35,8 @@
   child grants are bounded by that parent grant's capabilities, systems,
   toolsets, skills, exact resource, budget, and expiry, preventing transitive
   privilege amplification through the reporting hierarchy.
+- Grant admission now requires the delegator employee and mandate to be
+  active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority
   verification can prove the exact parent authorization chain instead of
   inferring it from aggregate mandate fields.

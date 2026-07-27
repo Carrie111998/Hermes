@@ -442,6 +442,17 @@ def test_grant_rejects_cumulative_delegator_budget_expansion(tmp_path, monkeypat
         _grant(conn, ids, action_id=second_action, budget_minor=200)
 
 
+def test_suspended_delegator_cannot_issue_new_grant(tmp_path, monkeypatch):
+    company = _company(tmp_path, monkeypatch)
+    conn = company[0]
+    ids = company[1:]
+    organization_db.transition_employee(conn, ids[1], "suspended", actor="control")
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="delegator employee is not active"
+    ):
+        _grant(conn, ids)
+
+
 def test_grant_binding_is_one_to_one_and_profile_snapshot_must_be_current(
     tmp_path, monkeypatch
 ):

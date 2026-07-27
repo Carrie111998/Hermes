@@ -172,6 +172,16 @@ def create_grant(
     )
     if manager_mandate is None:
         raise DelegationError("delegator has no current mandate")
+    manager_record = organization_db.get_employee_record(
+        conn, str(manager_employee_id)
+    )
+    if str(manager_record.get("status")) != "active":
+        raise DelegationError("delegator employee is not active")
+    if int(manager_mandate["starts_at"]) > now or (
+        manager_mandate["expires_at"] is not None
+        and int(manager_mandate["expires_at"]) <= now
+    ):
+        raise DelegationError("delegator mandate is not currently active")
     # A subordinate may only sub-delegate authority that was explicitly
     # delegated to it.  Its standing mandate is not sufficient: mandates can
     # describe the employee's role, while the execution grant is the narrower

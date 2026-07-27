@@ -27,6 +27,8 @@ acceptance evidence.
   an active parent grant, so privilege cannot be amplified through hierarchy.
 - Delegation grants persist the exact action system and target resource, and
   Kanban bindings must match that immutable scope before a worker can launch.
+- Grant admission requires the delegator employee and mandate to be active at
+  issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,
   and cumulative child budgets cannot exceed the parent grant ceiling; a
   subordinate cannot reuse authority on another objective or subdivide the
