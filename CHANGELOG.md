@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Kanban inline and URL attachment writes now require exact artifact permits
+  bound to task, board, filename, content identity/source, and content type
+  before durable storage or remote download.
 - Kanban comments now require an exact `kanban.comment` permit bound to the
   task, board, runtime author, and redacted body before durable handoff
   evidence is written.

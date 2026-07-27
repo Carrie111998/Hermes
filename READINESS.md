@@ -1689,6 +1689,28 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production multi-tenant evidence storage or external authorization.
 
+## Kanban attachment authority evidence (4485007496)
+
+Kanban attachment writes now require exact permits before durable effects. Inline
+attachments bind task, board, filename, content type, size, and content hash;
+URL attachments bind task, board, source URL, filename, and content type before
+the remote fetch begins.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **124 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:ddf6fe1704ad13a0ff8e49a39dd2d2c955b68e888687bc12ce354119f6c8acd9`.
+This remains deterministic local-provider evidence and does not establish
+production artifact storage, remote-provider credentials, or external
+authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
