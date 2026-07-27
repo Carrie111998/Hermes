@@ -19,3 +19,12 @@ def test_terminal_tool_none_command_returns_clean_error():
     assert result["status"] == "error"
     assert "expected string" in result["error"].lower()
     assert "nonetype" in result["error"].lower()
+
+
+def test_governed_terminal_requires_worker_contract(monkeypatch):
+    """A terminal worker cannot fall back to unrestricted shell access."""
+    monkeypatch.setenv("HERMES_EXECUTION_CONTRACT_ID", "grant-missing-context")
+    result = json.loads(terminal_tool("echo should-not-run"))
+
+    assert result["exit_code"] == -1
+    assert "governed worker action identity is incomplete" in result["error"]

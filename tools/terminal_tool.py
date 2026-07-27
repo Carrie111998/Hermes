@@ -2157,6 +2157,19 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
+        # A governed worker may execute only the exact command resource that
+        # was issued in its immutable task grant. The command is deliberately
+        # part of the resource string: shell text can encode redirects,
+        # pipelines, and path traversal, so a broad "terminal" capability is
+        # not an admissible substitute. Interactive sessions without a worker
+        # execution contract retain the normal terminal policy.
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        authorize_worker_action(
+            capability="terminal.exec",
+            system="localhost" if env_type == "local" else env_type,
+            target_resource=f"command:{command}",
+        )
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with

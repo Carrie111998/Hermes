@@ -56,6 +56,9 @@ acceptance evidence.
 - Worker resource scope is stored separately from the Kanban coordination
   resource, so exact execution targets remain enforceable even when the task
   board is a different resource.
+- Governed terminal execution is also fail-closed at the tool boundary: the
+  exact shell command is part of the authorized resource, preventing a broad
+  terminal grant from becoming unrestricted shell access.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

@@ -64,6 +64,9 @@
 - Employee grants now persist worker resource scope separately from the
   Kanban binding scope, allowing an exact local file or service resource to be
   authorized without confusing it with the task board used for coordination.
+- Governed terminal workers now require `terminal.exec` plus an exact
+  `command:<shell text>` resource at execution time; a worker with only a
+  broad terminal/toolset grant cannot run an unlisted command.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy
