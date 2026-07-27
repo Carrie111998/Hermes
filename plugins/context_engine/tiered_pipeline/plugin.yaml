@@ -1,0 +1,3 @@
+name: tiered_pipeline
+description: Three-tier L1/L2/L3 context pipeline with active-task protection
+version: 1.0.0
