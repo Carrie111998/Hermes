@@ -664,8 +664,12 @@ def organization_planning_context(
         }
         for row in conn.execute(
             """SELECT id,regime_id,name,required_control,effective_to,status
-               FROM compliance_obligations
+              FROM compliance_obligations
               WHERE organization_id=? AND status='active'
+                AND NOT EXISTS (
+                  SELECT 1 FROM compliance_obligations newer
+                   WHERE newer.supersedes_id = compliance_obligations.id
+                )
               ORDER BY effective_from,id LIMIT 20""",
             (organization_id,),
         ).fetchall()

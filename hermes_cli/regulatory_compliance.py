@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS compliance_applicability (
     id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, regime_id TEXT NOT NULL,
     verdict TEXT NOT NULL, rationale TEXT NOT NULL, evidence_json TEXT NOT NULL,
     assessed_by TEXT NOT NULL, assessed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    supersedes_id TEXT, supersession_reason TEXT NOT NULL DEFAULT '',
     UNIQUE(organization_id, regime_id, assessed_at),
     FOREIGN KEY(regime_id) REFERENCES compliance_regimes(id)
 );
@@ -27,12 +28,14 @@ CREATE TABLE IF NOT EXISTS compliance_obligations (
     name TEXT NOT NULL, action_tags_json TEXT NOT NULL, required_control TEXT NOT NULL,
     effective_from INTEGER NOT NULL, effective_to INTEGER,
     evidence_json TEXT NOT NULL, status TEXT NOT NULL,
+    supersedes_id TEXT, supersession_reason TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(regime_id) REFERENCES compliance_regimes(id)
 );
 CREATE TABLE IF NOT EXISTS compliance_control_evidence (
     id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, control_name TEXT NOT NULL,
     verifier TEXT NOT NULL, verdict TEXT NOT NULL, evidence_json TEXT NOT NULL,
-    evidence_sha256 TEXT NOT NULL, verified_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+    evidence_sha256 TEXT NOT NULL, verified_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    supersedes_id TEXT, supersession_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE TRIGGER IF NOT EXISTS compliance_applicability_immutable_update
 BEFORE UPDATE ON compliance_applicability
@@ -155,6 +158,25 @@ def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _next_record_time(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    timestamp_column: str,
+    scope_columns: tuple[str, ...],
+    scope_values: tuple[str, ...],
+) -> int:
+    """Return a monotonic integer timestamp for same-second append records."""
+    predicates = " AND ".join(f"{column}=?" for column in scope_columns)
+    row = conn.execute(
+        f"SELECT MAX({timestamp_column}) AS latest FROM {table} WHERE {predicates}",
+        scope_values,
+    ).fetchone()
+    now = int(time.time())
+    latest = int(row["latest"]) if row and row["latest"] is not None else 0
+    return max(now, latest + 1)
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     # Compliance checks run inside action admission and evidence commits.
     # Never let ``executescript`` implicitly commit an active authority
@@ -187,8 +209,37 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             )
         }
         if required_tables <= tables and required_triggers <= triggers:
+            _migrate_supersession_columns(conn)
             return
     conn.executescript(SCHEMA_SQL)
+    _migrate_supersession_columns(conn)
+
+
+def _migrate_supersession_columns(conn: sqlite3.Connection) -> None:
+    """Add lineage columns to stores created before supersession support."""
+    columns_by_table = {
+        "compliance_applicability": {
+            "supersedes_id": "TEXT",
+            "supersession_reason": "TEXT NOT NULL DEFAULT ''",
+        },
+        "compliance_obligations": {
+            "supersedes_id": "TEXT",
+            "supersession_reason": "TEXT NOT NULL DEFAULT ''",
+        },
+        "compliance_control_evidence": {
+            "supersedes_id": "TEXT",
+            "supersession_reason": "TEXT NOT NULL DEFAULT ''",
+        },
+    }
+    for table, required in columns_by_table.items():
+        existing = {
+            str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for column, definition in required.items():
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
 
 
 def seed_starter_regimes(conn: sqlite3.Connection, *, review_interval_days: int = 30) -> None:
@@ -248,7 +299,10 @@ def assess_applicability(
     evidence: Any,
     assessed_by: str,
     expires_at: int,
+    supersedes_id: str | None = None,
+    supersession_reason: str | None = None,
 ) -> str:
+    ensure_schema(conn)
     if verdict not in {"applicable", "not_applicable"}:
         raise ValueError("applicability verdict must be applicable or not_applicable")
     if not rationale or not evidence or expires_at <= int(time.time()):
@@ -258,16 +312,41 @@ def assess_applicability(
     ).fetchone()
     if regime is None or str(regime["status"]) != "active":
         raise ComplianceGateError("applicability requires an active known regime")
+    if supersedes_id:
+        prior = conn.execute(
+            """SELECT organization_id,regime_id FROM compliance_applicability
+               WHERE id=?""",
+            (supersedes_id,),
+        ).fetchone()
+        if (
+            prior is None
+            or str(prior["organization_id"]) != organization_id
+            or str(prior["regime_id"]) != regime_id
+        ):
+            raise ComplianceGateError(
+                "applicability supersession must reference the same organization and regime"
+            )
+        if not str(supersession_reason or "").strip():
+            raise ComplianceGateError("applicability supersession requires a reason")
     assessment_id = f"applicability_{uuid.uuid4().hex}"
+    assessed_at = _next_record_time(
+        conn,
+        table="compliance_applicability",
+        timestamp_column="assessed_at",
+        scope_columns=("organization_id", "regime_id"),
+        scope_values=(organization_id, regime_id),
+    )
     with conn:
         conn.execute(
             """INSERT INTO compliance_applicability
                (id, organization_id, regime_id, verdict, rationale, evidence_json,
-                assessed_by, assessed_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                assessed_by, assessed_at, expires_at, supersedes_id,
+                supersession_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 assessment_id, organization_id, regime_id, verdict, rationale,
-                _json(evidence), assessed_by, int(time.time()), expires_at,
+                _json(evidence), assessed_by, assessed_at, expires_at,
+                supersedes_id, str(supersession_reason or ""),
             ),
         )
     return assessment_id
@@ -282,6 +361,8 @@ def record_control_evidence(
     verdict: str,
     evidence: Any,
     expires_at: int,
+    supersedes_id: str | None = None,
+    supersession_reason: str | None = None,
 ) -> str:
     import hashlib
 
@@ -289,18 +370,44 @@ def record_control_evidence(
         raise ValueError("control evidence requires pass/fail and evidence")
     if expires_at <= int(time.time()):
         raise ComplianceGateError("control evidence expiry must be in the future")
+    ensure_schema(conn)
+    if supersedes_id:
+        prior = conn.execute(
+            """SELECT organization_id,control_name FROM compliance_control_evidence
+               WHERE id=?""",
+            (supersedes_id,),
+        ).fetchone()
+        if (
+            prior is None
+            or str(prior["organization_id"]) != organization_id
+            or str(prior["control_name"]) != control_name
+        ):
+            raise ComplianceGateError(
+                "control supersession must reference the same organization and control"
+            )
+        if not str(supersession_reason or "").strip():
+            raise ComplianceGateError("control supersession requires a reason")
     evidence_json = _json(evidence)
     evidence_id = f"controlevidence_{uuid.uuid4().hex}"
+    verified_at = _next_record_time(
+        conn,
+        table="compliance_control_evidence",
+        timestamp_column="verified_at",
+        scope_columns=("organization_id", "control_name"),
+        scope_values=(organization_id, control_name),
+    )
     with conn:
         conn.execute(
             """INSERT INTO compliance_control_evidence
                (id, organization_id, control_name, verifier, verdict,
-                evidence_json, evidence_sha256, verified_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                evidence_json, evidence_sha256, verified_at, expires_at,
+                supersedes_id, supersession_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 evidence_id, organization_id, control_name, verifier, verdict,
                 evidence_json, hashlib.sha256(evidence_json.encode()).hexdigest(),
-                int(time.time()), expires_at,
+                verified_at, expires_at, supersedes_id,
+                str(supersession_reason or ""),
             ),
         )
     return evidence_id
@@ -317,7 +424,10 @@ def register_obligation(
     effective_from: int,
     evidence: Any,
     effective_to: int | None = None,
+    supersedes_id: str | None = None,
+    supersession_reason: str | None = None,
 ) -> str:
+    ensure_schema(conn)
     if not name or not required_control or not evidence:
         raise ValueError("obligation requires name, control, and source evidence")
     regime = conn.execute(
@@ -325,16 +435,34 @@ def register_obligation(
     ).fetchone()
     if regime is None or str(regime["status"]) != "active":
         raise ComplianceGateError("obligation requires an active known regime")
+    if supersedes_id:
+        prior = conn.execute(
+            """SELECT organization_id,regime_id FROM compliance_obligations
+               WHERE id=?""",
+            (supersedes_id,),
+        ).fetchone()
+        if (
+            prior is None
+            or str(prior["organization_id"]) != organization_id
+            or str(prior["regime_id"]) != regime_id
+        ):
+            raise ComplianceGateError(
+                "obligation supersession must reference the same organization and regime"
+            )
+        if not str(supersession_reason or "").strip():
+            raise ComplianceGateError("obligation supersession requires a reason")
     obligation_id = f"obligation_{uuid.uuid4().hex}"
     with conn:
         conn.execute(
             """INSERT INTO compliance_obligations
                (id, organization_id, regime_id, name, action_tags_json,
-                required_control, effective_from, effective_to, evidence_json, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')""",
+                required_control, effective_from, effective_to, evidence_json, status,
+                supersedes_id, supersession_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
             (
                 obligation_id, organization_id, regime_id, name, _json(action_tags),
                 required_control, effective_from, effective_to, _json(evidence),
+                supersedes_id, str(supersession_reason or ""),
             ),
         )
     return obligation_id
@@ -358,6 +486,10 @@ def authorize_action(
         assessment = conn.execute(
             """SELECT * FROM compliance_applicability
                WHERE organization_id = ? AND regime_id = ? AND expires_at > ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM compliance_applicability newer
+                    WHERE newer.supersedes_id = compliance_applicability.id
+                 )
                ORDER BY assessed_at DESC LIMIT 1""",
             (organization_id, regime["id"], now),
         ).fetchone()
@@ -372,7 +504,11 @@ def authorize_action(
             """SELECT * FROM compliance_obligations
                WHERE organization_id = ? AND regime_id = ? AND status = 'active'
                  AND effective_from <= ?
-                 AND (effective_to IS NULL OR effective_to >= ?)""",
+                 AND (effective_to IS NULL OR effective_to >= ?)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM compliance_obligations newer
+                    WHERE newer.supersedes_id = compliance_obligations.id
+                 )""",
             (organization_id, regime["id"], now, now),
         ).fetchall()
         if not obligations:
@@ -387,6 +523,10 @@ def authorize_action(
                 """SELECT id FROM compliance_control_evidence
                    WHERE organization_id = ? AND control_name = ?
                      AND verdict = 'pass' AND expires_at > ?
+                     AND NOT EXISTS (
+                       SELECT 1 FROM compliance_control_evidence newer
+                        WHERE newer.supersedes_id = compliance_control_evidence.id
+                     )
                    ORDER BY verified_at DESC LIMIT 1""",
                 (organization_id, obligation["required_control"], now),
             ).fetchone()

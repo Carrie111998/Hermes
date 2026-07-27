@@ -79,11 +79,9 @@ def _latest_expiring_rows(
         SELECT a.id,a.regime_id,a.verdict,a.expires_at
           FROM compliance_applicability a
          WHERE a.organization_id=? AND a.expires_at<=?
-           AND a.assessed_at=(
-                 SELECT MAX(latest.assessed_at)
-                   FROM compliance_applicability latest
-                  WHERE latest.organization_id=a.organization_id
-                    AND latest.regime_id=a.regime_id
+           AND NOT EXISTS (
+                 SELECT 1 FROM compliance_applicability newer
+                  WHERE newer.supersedes_id=a.id
                )
          ORDER BY a.expires_at,a.id
         """,
@@ -103,11 +101,9 @@ def _latest_expiring_rows(
         SELECT e.id,e.control_name,e.verdict,e.expires_at
           FROM compliance_control_evidence e
          WHERE e.organization_id=? AND e.expires_at<=?
-           AND e.verified_at=(
-                 SELECT MAX(latest.verified_at)
-                   FROM compliance_control_evidence latest
-                  WHERE latest.organization_id=e.organization_id
-                    AND latest.control_name=e.control_name
+           AND NOT EXISTS (
+                 SELECT 1 FROM compliance_control_evidence newer
+                  WHERE newer.supersedes_id=e.id
                )
          ORDER BY e.expires_at,e.id
         """,

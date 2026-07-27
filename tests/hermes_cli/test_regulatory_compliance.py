@@ -105,6 +105,127 @@ def test_compliance_evidence_records_are_append_only():
         )
 
 
+def test_compliance_supersession_preserves_lineage_and_current_authority():
+    conn = connection()
+    future = int(time.time()) + 3600
+    applicability_id = compliance.assess_applicability(
+        conn,
+        organization_id="org_1",
+        regime_id="casl",
+        verdict="applicable",
+        rationale="Canadian commercial messages are planned",
+        evidence={"review": "r1"},
+        assessed_by="advisor:legal",
+        expires_at=future,
+    )
+    compliance.register_obligation(
+        conn,
+        organization_id="org_1",
+        regime_id="casl",
+        name="Consent control",
+        action_tags=["commercial_email"],
+        required_control="email.consent",
+        effective_from=1,
+        evidence={"source": "policy-1"},
+    )
+    passing_id = compliance.record_control_evidence(
+        conn,
+        organization_id="org_1",
+        control_name="email.consent",
+        verifier="control:test",
+        verdict="pass",
+        evidence={"check": "ok"},
+        expires_at=future,
+    )
+    context = {
+        "jurisdictions": ["CA"],
+        "activities": ["commercial_email"],
+        "data_classes": [],
+        "entity_attributes": [],
+    }
+    assert compliance.authorize_action(
+        conn, organization_id="org_1", context=context
+    )["regimes"] == [{"regime": "casl", "verdict": "applicable"}]
+
+    failed_id = compliance.record_control_evidence(
+        conn,
+        organization_id="org_1",
+        control_name="email.consent",
+        verifier="control:test",
+        verdict="fail",
+        evidence={"check": "revoked"},
+        expires_at=future,
+        supersedes_id=passing_id,
+        supersession_reason="Consent record was revoked",
+    )
+    assert conn.execute(
+        "SELECT supersedes_id FROM compliance_control_evidence WHERE id=?",
+        (failed_id,),
+    ).fetchone()["supersedes_id"] == passing_id
+    with pytest.raises(compliance.ComplianceGateError, match="no current"):
+        compliance.authorize_action(
+            conn, organization_id="org_1", context=context
+        )
+
+    current_id = compliance.assess_applicability(
+        conn,
+        organization_id="org_1",
+        regime_id="casl",
+        verdict="not_applicable",
+        rationale="The campaign was cancelled",
+        evidence={"review": "r2"},
+        assessed_by="advisor:legal",
+        expires_at=future,
+        supersedes_id=applicability_id,
+        supersession_reason="Business scope changed",
+    )
+    assert conn.execute(
+        "SELECT supersedes_id FROM compliance_applicability WHERE id=?",
+        (current_id,),
+    ).fetchone()["supersedes_id"] == applicability_id
+    assert compliance.authorize_action(
+        conn, organization_id="org_1", context=context
+    )["regimes"] == [{"regime": "casl", "verdict": "not_applicable"}]
+
+
+def test_compliance_supersession_requires_same_scope_and_reason():
+    conn = connection()
+    future = int(time.time()) + 3600
+    prior = compliance.assess_applicability(
+        conn,
+        organization_id="org_1",
+        regime_id="casl",
+        verdict="not_applicable",
+        rationale="Initial review",
+        evidence={"review": "r1"},
+        assessed_by="advisor:legal",
+        expires_at=future,
+    )
+    with pytest.raises(compliance.ComplianceGateError, match="same organization"):
+        compliance.assess_applicability(
+            conn,
+            organization_id="org_2",
+            regime_id="casl",
+            verdict="not_applicable",
+            rationale="Different tenant",
+            evidence={"review": "r2"},
+            assessed_by="advisor:legal",
+            expires_at=future,
+            supersedes_id=prior,
+            supersession_reason="wrong scope",
+        )
+    with pytest.raises(compliance.ComplianceGateError, match="requires a reason"):
+        compliance.assess_applicability(
+            conn,
+            organization_id="org_1",
+            regime_id="casl",
+            verdict="not_applicable",
+            rationale="Updated review",
+            evidence={"review": "r3"},
+            assessed_by="advisor:legal",
+            expires_at=future,
+            supersedes_id=prior,
+        )
 def test_schema_check_does_not_commit_active_authority_transaction():
     conn = connection()
     conn.execute("CREATE TABLE authority_sentinel (value TEXT NOT NULL)")
