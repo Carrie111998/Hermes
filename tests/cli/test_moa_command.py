@@ -156,3 +156,32 @@ class TestBareMoaModelSwitch:
         assert result.target_provider == "moa"
         assert result.new_model == "review"
         assert result.is_global is True
+
+    def test_prefixed_moa_preset_uses_virtual_provider_in_session(self):
+        from hermes_cli.model_switch import switch_model
+
+        config = _make_cli(default_preset="review").config
+        with (
+            patch("hermes_cli.config.load_config", return_value=config),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "moa-virtual-provider",
+                    "base_url": "moa://local",
+                    "api_mode": "chat_completions",
+                },
+            ),
+            patch("hermes_cli.model_switch.get_model_info", return_value=None),
+            patch("hermes_cli.model_switch.get_model_capabilities", return_value=None),
+        ):
+            result = switch_model(
+                "moa:review",
+                "openrouter",
+                "anthropic/claude-opus-4.8",
+                current_base_url="https://openrouter.ai/api/v1",
+                current_api_key="test-key",
+            )
+
+        assert result.success is True, result.error_message
+        assert result.target_provider == "moa"
+        assert result.new_model == "review"
