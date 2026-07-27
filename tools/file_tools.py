@@ -1926,6 +1926,19 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
+        # Search is a read-capable filesystem operation in its own right. A
+        # governed worker must hold an explicit ``file.search`` grant for the
+        # exact canonical search root; a ``file.read`` grant for one file does
+        # not implicitly authorize directory enumeration or content search.
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        if os.environ.get("HERMES_EXECUTION_CONTRACT_ID") and resolved_path is None:
+            raise RuntimeError("governed search requires an exact file target")
+        if resolved_path is not None:
+            authorize_worker_action(
+                capability="file.search",
+                system="localhost",
+                target_resource=os.path.realpath(str(resolved_path)),
+            )
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
