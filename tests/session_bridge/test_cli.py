@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 import pytest
 
+import session_bridge.cli as cli_module
 from agent.transports.codex_app_server import CodexAppServerError
 
 # The canonical runner uses ``env -i``. Windows' stdlib ignores HOME and needs
@@ -73,6 +74,9 @@ from session_bridge.sidebar_executor import (
     CodexAppServerSidebarDelivery,
     SidebarExecutionResult,
     SidebarExecutor,
+)
+from session_bridge.sidebar_hydration_executor import (
+    SidebarHydrationExecutionResult,
 )
 from session_bridge.store import SessionBridgeStore
 
@@ -5097,6 +5101,158 @@ def test_continuous_visibility_worker_keeps_start_to_start_interval() -> None:
     assert waits == [pytest.approx(23.5)]
 
 
+def test_continuous_sidebar_recovery_worker_drains_then_uses_idle_wait() -> None:
+    calls: list[str] = []
+    waits: list[float] = []
+    results = iter((
+        {"lane": "hydration", "status": "visible"},
+        {"lane": "registration", "status": "idle"},
+    ))
+
+    class StopAfterIdle:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            waits.append(timeout)
+            return len(waits) == 2
+
+    cli_module._run_continuous_sidebar_recovery_worker(
+        run_once=lambda: calls.append("run") or next(results),
+        close=lambda: calls.append("close"),
+        stop=StopAfterIdle(),
+        actionable_interval_seconds=0.05,
+        idle_interval_seconds=2.0,
+    )
+
+    assert calls == ["run", "run", "close"]
+    assert waits == [0.05, 2.0]
+
+
+def test_production_sidebar_recovery_once_prioritizes_hydration_then_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    )
+    calls: list[str] = []
+    hydration_results = iter((
+        SidebarHydrationExecutionResult(status="visible"),
+        SidebarHydrationExecutionResult(status="idle"),
+    ))
+
+    class HydrationExecutor:
+        def run_once(self) -> SidebarHydrationExecutionResult:
+            calls.append("hydration")
+            return next(hydration_results)
+
+    class RegistrationExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            calls.append("registration")
+            return SidebarExecutionResult(status="idle")
+
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_hydration_executor",
+        lambda: HydrationExecutor(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_executor",
+        lambda: RegistrationExecutor(),
+    )
+
+    first = backend.run_sidebar_recovery_once()
+    second = backend.run_sidebar_recovery_once()
+
+    assert first == {
+        "lane": "hydration",
+        "status": "visible",
+        "job_id": None,
+        "error_code": None,
+    }
+    assert second == {
+        "lane": "registration",
+        "status": "idle",
+        "job_id": None,
+        "thread_id": None,
+        "error_code": None,
+    }
+    assert calls == ["hydration", "hydration", "registration"]
+
+
+def test_production_serve_owns_one_internal_sidebar_recovery_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    )
+    recovery_calls: list[str] = []
+    threads: list[object] = []
+
+    class RecoveryBackend:
+        def run_sidebar_recovery_once(self) -> dict[str, object]:
+            recovery_calls.append("run")
+            return {"lane": "registration", "status": "idle"}
+
+        def close(self) -> None:
+            recovery_calls.append("close")
+
+    recovery_backend = RecoveryBackend()
+
+    class FakeThread:
+        def __init__(
+            self,
+            *,
+            target: object,
+            kwargs: dict[str, object],
+            name: str,
+            daemon: bool,
+        ) -> None:
+            self.target = target
+            self.kwargs = kwargs
+            self.name = name
+            self.daemon = daemon
+            self.started = False
+            self.join_timeout: float | None = None
+            threads.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def join(self, timeout: float) -> None:
+            self.join_timeout = timeout
+
+    monkeypatch.setattr(
+        backend,
+        "_apply_sidebar_create_reservation_cutover",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(backend, "_provider_runtime", lambda **_kwargs: object())
+    monkeypatch.setattr(backend, "_require_catalog", lambda: object())
+    monkeypatch.setattr(backend, "_require_store", lambda: object())
+    monkeypatch.setattr("session_bridge.cli.resolve_bearer_token", lambda: "token")
+    monkeypatch.setattr("session_bridge.cli.create_app", lambda **_kwargs: object())
+    monkeypatch.setattr("session_bridge.cli.ProductionBackend", lambda _config: recovery_backend)
+    monkeypatch.setattr("session_bridge.cli.threading.Thread", FakeThread)
+    monkeypatch.setattr("uvicorn.run", lambda *_args, **_kwargs: None)
+
+    backend.serve()
+
+    assert len(threads) == 1
+    thread = threads[0]
+    assert thread.name == "session-bridge-sidebar-recovery"
+    assert thread.daemon is True
+    assert thread.started is True
+    assert thread.join_timeout == 5.0
+    assert thread.target is cli_module._run_continuous_sidebar_recovery_worker
+    assert thread.kwargs["run_once"] == recovery_backend.run_sidebar_recovery_once
+    assert thread.kwargs["close"] == recovery_backend.close
+    assert thread.kwargs["stop"].is_set() is True
+    assert recovery_calls == []
+
+
 def test_scan_defaults_to_catalog_only_all_history_newest_first(capsys):
     backend = FakeBackend()
 
@@ -5326,12 +5482,7 @@ def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
             providers=(Provider.CODEX,),
         )
         assert isinstance(coordinator._sidebar_verifier, SidebarThreadVerifier)
-        assert isinstance(coordinator._sidebar_executor, SidebarExecutor)
-        assert isinstance(
-            coordinator._sidebar_executor._native,
-            CodexAppServerSidebarDelivery,
-        )
-        assert coordinator._sidebar_executor._native._client is client
+        assert coordinator._sidebar_executor is None
 
         claim = asyncio.run(
             coordinator.claim_sidebar_jobs_for_delivery(now=now, limit=1)

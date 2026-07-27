@@ -100,6 +100,7 @@ from .sidebar_executor import (
     NativeThreadUnrecoverable,
     SidebarExecutor,
 )
+from .sidebar_hydration_executor import SidebarHydrationExecutor
 from .store import (
     HYDRATION_FATAL_ERRORS,
     HYDRATION_RETRYABLE_ERRORS,
@@ -183,6 +184,37 @@ def _run_continuous_visibility_worker(
                 _LOG.exception("continuous Claude visibility cycle failed")
             elapsed = max(0.0, monotonic() - started)
             if stop.wait(max(0.0, interval_seconds - elapsed)):
+                break
+    finally:
+        close()
+
+
+def _run_continuous_sidebar_recovery_worker(
+    *,
+    run_once: Callable[[], Mapping[str, Any]],
+    close: Callable[[], object],
+    stop: Any,
+    actionable_interval_seconds: float = 0.05,
+    idle_interval_seconds: float = 2.0,
+    unsettled_interval_seconds: float = 5.0,
+) -> None:
+    """Drain durable sidebar work without AI heartbeats or provider-scan timing."""
+
+    try:
+        while not stop.is_set():
+            try:
+                result = run_once()
+                status = result.get("status") if isinstance(result, Mapping) else None
+            except Exception:
+                _LOG.exception("continuous sidebar recovery cycle failed")
+                status = "unsettled"
+            if status == "idle":
+                interval = idle_interval_seconds
+            elif status == "unsettled":
+                interval = unsettled_interval_seconds
+            else:
+                interval = actionable_interval_seconds
+            if stop.wait(interval):
                 break
     finally:
         close()
@@ -659,6 +691,7 @@ class ProductionBackend:
         self._codex_client: CodexAppServerClient | None = None
         self._sidebar_codex_client: CodexAppServerClient | None = None
         self._sidebar_executor: SidebarExecutor | None = None
+        self._sidebar_hydration_executor: SidebarHydrationExecutor | None = None
 
     def close(self) -> None:
         provider_client, self._codex_client = self._codex_client, None
@@ -668,6 +701,7 @@ class ProductionBackend:
         )
         db, self._db = self._db, None
         self._sidebar_executor = None
+        self._sidebar_hydration_executor = None
         self._store = None
         self._catalog = None
         self._coordinator = None
@@ -696,6 +730,8 @@ class ProductionBackend:
     def serve(self) -> None:
         visibility_stop: threading.Event | None = None
         visibility_thread: threading.Thread | None = None
+        sidebar_recovery_stop: threading.Event | None = None
+        sidebar_recovery_thread: threading.Thread | None = None
         try:
             if self.config.mirrors.automatic_creation:
                 try:
@@ -718,6 +754,22 @@ class ProductionBackend:
                 config=self.config,
                 token=token,
             )
+            if self.config.sidebar.enabled and self.config.sidebar.continuous:
+                sidebar_recovery_backend = ProductionBackend(self.config)
+                sidebar_recovery_stop = threading.Event()
+                sidebar_recovery_thread = threading.Thread(
+                    target=_run_continuous_sidebar_recovery_worker,
+                    kwargs={
+                        "run_once": (
+                            sidebar_recovery_backend.run_sidebar_recovery_once
+                        ),
+                        "close": sidebar_recovery_backend.close,
+                        "stop": sidebar_recovery_stop,
+                    },
+                    name="session-bridge-sidebar-recovery",
+                    daemon=True,
+                )
+                sidebar_recovery_thread.start()
             if (
                 self.config.claude_visibility.enabled
                 and self.config.claude_visibility.continuous
@@ -754,6 +806,10 @@ class ProductionBackend:
                 raise ConfigurationFailure("service_authorization_failed") from exc
             raise ProviderDegraded("service_start_failed") from exc
         finally:
+            if sidebar_recovery_stop is not None:
+                sidebar_recovery_stop.set()
+            if sidebar_recovery_thread is not None:
+                sidebar_recovery_thread.join(timeout=5.0)
             if visibility_stop is not None:
                 visibility_stop.set()
             if visibility_thread is not None:
@@ -1229,6 +1285,20 @@ class ProductionBackend:
             raise
         except Exception as exc:
             raise ProviderDegraded("sidebar_executor_failed") from exc
+
+    def run_sidebar_recovery_once(self) -> Mapping[str, Any]:
+        if not self.config.sidebar.enabled or not self.config.sidebar.continuous:
+            raise RolloutGateBlocked("sidebar_continuous_worker_inactive")
+        try:
+            hydration = self._require_sidebar_hydration_executor().run_once()
+            if hydration.status != "idle":
+                return {"lane": "hydration", **asdict(hydration)}
+            registration = self._require_sidebar_executor().run_once()
+            return {"lane": "registration", **asdict(registration)}
+        except (ConfigurationFailure, RolloutGateBlocked):
+            raise
+        except Exception as exc:
+            raise ProviderDegraded("sidebar_recovery_failed") from exc
 
     def sidebar_retry_bound(
         self,
@@ -2730,15 +2800,7 @@ class ProductionBackend:
                 if codex_source is not None
                 else None
             )
-            sidebar_executor = (
-                self._require_sidebar_executor()
-                if (
-                    not catalog_only
-                    and effective_config.sidebar.enabled
-                    and effective_config.sidebar.continuous
-                )
-                else None
-            )
+            sidebar_executor = None
             mirror_float = (
                 ClaudeMirrorFloatWorker(
                     self._require_store(),
@@ -2820,6 +2882,38 @@ class ProductionBackend:
         except Exception as exc:
             self.close()
             raise ConfigurationFailure("sidebar_executor_unavailable") from exc
+
+    def _require_sidebar_hydration_executor(self) -> SidebarHydrationExecutor:
+        if self._sidebar_hydration_executor is not None:
+            return self._sidebar_hydration_executor
+        try:
+            marker_key = resolve_marker_key()
+            coordinator = self._provider_runtime(
+                targets=True,
+                catalog_only=False,
+                providers=(Provider.CLAUDE, Provider.CODEX),
+            )
+            native = self._require_sidebar_terminal_delivery()
+
+            def _claim_once():
+                return asyncio.run(
+                    coordinator.claim_sidebar_hydration_for_delivery(limit=1)
+                )
+
+            self._sidebar_hydration_executor = SidebarHydrationExecutor(
+                claim_once=_claim_once,
+                store=self._require_store(),
+                native=native,
+                marker_secret=marker_key,
+            )
+            return self._sidebar_hydration_executor
+        except ConfigurationFailure:
+            raise
+        except Exception as exc:
+            self.close()
+            raise ConfigurationFailure(
+                "sidebar_hydration_executor_unavailable"
+            ) from exc
 
     def _require_sidebar_terminal_delivery(self) -> CodexAppServerSidebarDelivery:
         """Build the narrow read/resume-only provider boundary for terminal proof."""
