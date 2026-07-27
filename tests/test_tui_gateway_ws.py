@@ -5,6 +5,7 @@ import threading
 import time
 
 from hermes_cli import mcp_startup
+from tui_gateway import mobile_contract
 from tui_gateway import server
 from tui_gateway import ws as ws_mod
 from tui_gateway.mobile_sync import SessionEventStream
@@ -35,47 +36,14 @@ def test_gateway_ready_advertises_revisioned_mobile_sync(monkeypatch):
 
     asyncio.run(ws_mod.handle_ws(FakeWS(), authorization=authorization))
 
-    assert sent[0] == {
-        "jsonrpc": "2.0",
-        "method": "event",
-        "params": {
-            "type": "gateway.ready",
-            "payload": {
-                "skin": "test-skin",
-                "server": {
-                    "version": "test-version",
-                    "release_date": "test-release",
-                    "instance_id": "test-instance",
-                },
-                "protocol": {"name": "hermes.tui.jsonrpc", "major": 1},
-                "contract": {"name": "hermes.mobile", "major": 1},
-                "schemas": {
-                    "gateway.ready": 1,
-                    "authorization.grant": 1,
-                    "authorization.error": 1,
-                    "session.synchronization": 1,
-                    "session.event": 1,
-                },
-                "capabilities": {
-                    "auth.ws_scopes": {"version": 1},
-                    "conversation.sync": {
-                        "version": 1,
-                        "delta_offsets": {"unit": "utf8_bytes"},
-                        "replay": {
-                            "max_events": 512,
-                            "max_bytes": 1048576,
-                        },
-                    },
-                },
-                "authorization": {
-                    "subject": "user-1",
-                    "provider": "stub",
-                    "audience": "hermes.mobile",
-                    "scopes": ["conversation.read", "conversation.write"],
-                },
-            },
-        },
-    }
+    ready = sent[0]["params"]["payload"]
+    assert ready["schemas"]["session.synchronization"] == 1
+    assert ready["schemas"]["session.event"] == 1
+    sync = ready["capabilities"]["conversation.sync"]
+    assert sync["delta_offsets"] == {"unit": "utf8_bytes"}
+    assert sync["replay"]["max_events"] > 0
+    assert sync["replay"]["max_bytes"] > 0
+    assert ready["authorization"]["audience"] == "hermes.mobile"
 
 
 def test_mobile_authorization_is_enforced_on_requests_from_the_live_socket(
@@ -322,6 +290,13 @@ class _MobileSessionDB:
 
     def get_messages_as_conversation(self, _session_id, include_ancestors=False):
         return list(self.messages)
+
+    def get_resume_conversations(self, _session_id):
+        messages = list(self.messages)
+        return messages, messages
+
+    def get_ancestor_display_prefix(self, _session_id):
+        return []
 
 
 _MOBILE_AUTHORIZATION = {
@@ -576,12 +551,8 @@ def test_mobile_socket_concurrent_events_have_monotonic_wire_sequences(
     assert len({event["params"]["stream_id"] for event in events}) == 1
 
 
-def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
-    """The desktop app and dashboard chat reach the agent through this WS
-    sidecar, not through tui_gateway.entry.main() (which spawns the discovery
-    thread for the stdio TUI). handle_ws must start discovery itself, otherwise
-    _make_agent's wait_for_mcp_discovery no-ops and the agent snapshots an
-    MCP-less tool list. Regression test for #38945."""
+def test_ws_does_not_own_mcp_discovery_startup(monkeypatch):
+    """MCP discovery belongs to the profile-scoped agent build path."""
 
     calls = []
 

@@ -54,6 +54,13 @@ class SessionDBStub:
     def get_messages_as_conversation(self, _session_id, include_ancestors=False):
         return list(self.messages)
 
+    def get_resume_conversations(self, _session_id):
+        messages = list(self.messages)
+        return messages, messages
+
+    def get_ancestor_display_prefix(self, _session_id):
+        return []
+
 
 @pytest.fixture(autouse=True)
 def isolated_gateway(monkeypatch):
@@ -778,7 +785,7 @@ def test_deferred_prompt_start_advances_revision_before_agent_ready(monkeypatch)
         assert release_wait.wait(timeout=2)
         return server._err(rid, 5000, "test build stopped")
 
-    monkeypatch.setattr(server, "_wait_agent", blocked_wait)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda session, rid, _sid: blocked_wait(session, rid))
     try:
         submitted = server.dispatch(
             {
