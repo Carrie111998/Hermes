@@ -33,17 +33,44 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Activate venv ───────────────────────────────────────────────────────────
+# Probe order matters: repo-local venvs win over the shared ~/.hermes one.
+# A venv only qualifies if pytest is actually importable — a venv that exists
+# but was never populated (or was created for a different purpose) would
+# otherwise shadow a working one later in the list and fail with a bare
+# "No module named pytest".
+CANDIDATES=("$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv")
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+SKIPPED_NO_PYTEST=()
+
+for candidate in "${CANDIDATES[@]}"; do
+  [ -x "$candidate/bin/python" ] || continue
+  if "$candidate/bin/python" -c "import pytest" >/dev/null 2>&1; then
     VENV="$candidate"
     break
   fi
+  SKIPPED_NO_PYTEST+=("$candidate")
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  if [ ${#SKIPPED_NO_PYTEST[@]} -gt 0 ]; then
+    echo "error: found virtualenv(s) without pytest installed:" >&2
+    for v in "${SKIPPED_NO_PYTEST[@]}"; do
+      echo "         $v" >&2
+    done
+    echo "       install the dev extras into one of them, e.g.:" >&2
+    echo "         ${SKIPPED_NO_PYTEST[0]}/bin/python -m pip install -e '.[dev]'" >&2
+  else
+    echo "error: no virtualenv found. Looked in:" >&2
+    for c in "${CANDIDATES[@]}"; do
+      echo "         $c" >&2
+    done
+  fi
   exit 1
+fi
+
+if [ ${#SKIPPED_NO_PYTEST[@]} -gt 0 ]; then
+  echo "note: skipped venv without pytest: ${SKIPPED_NO_PYTEST[*]}" >&2
+  echo "      using $VENV" >&2
 fi
 
 PYTHON="$VENV/bin/python"
