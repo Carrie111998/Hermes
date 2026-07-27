@@ -1749,6 +1749,22 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _seen.add(_r)
         _resolved_paths.sort()
 
+        # Patch operations are writes even though they use a separate tool
+        # entry point from ``write_file_tool``. Governed workers must prove an
+        # exact ``file.write`` grant for every canonical target before locks or
+        # patch parsing can reach the filesystem. An empty/unresolvable target
+        # is also fail-closed for contracted workers; interactive sessions keep
+        # the historical patch behavior because the authorizer is a no-op.
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        if os.environ.get("HERMES_EXECUTION_CONTRACT_ID") and not _resolved_paths:
+            raise RuntimeError("governed patch requires an exact file target")
+        for _resolved in _resolved_paths:
+            authorize_worker_action(
+                capability="file.write",
+                system="localhost",
+                target_resource=os.path.realpath(_resolved),
+            )
+
         # Acquire per-path locks in sorted order via ExitStack.  On single
         # path this degenerates to one lock; on empty list (unresolvable)
         # it's a no-op and execution falls through unchanged.

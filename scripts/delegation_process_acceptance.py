@@ -39,7 +39,7 @@ def _worker_code() -> str:
 import json, os
 from pathlib import Path
 from hermes_cli import kanban_db, workforce_delegation
-from tools.file_tools import read_file_tool, write_file_tool
+from tools.file_tools import patch_tool, read_file_tool, write_file_tool
 
 grant = workforce_delegation.validate_worker_launch(
     enabled_toolsets=["terminal", "files"],
@@ -64,6 +64,15 @@ blocked_write = write_file_tool(
 )
 if "not granted" not in blocked_write:
     raise RuntimeError(f"file write was not rejected: {blocked_write}")
+blocked_patch = patch_tool(
+    mode="replace",
+    path=input_path,
+    old_string="delegated evidence",
+    new_string="must not patch",
+    task_id=os.environ["HERMES_KANBAN_TASK"],
+)
+if "not granted" not in blocked_patch:
+    raise RuntimeError(f"file patch was not rejected: {blocked_patch}")
 with kanban_db.connect_closing(board=os.environ["HERMES_DELEGATION_BOARD"]) as board:
     task_id = os.environ["HERMES_KANBAN_TASK"]
     if not kanban_db.complete_task(
