@@ -85,6 +85,19 @@ def test_charter_rejects_zero_or_unfundable_planner_reservation():
         )
 
 
+def test_charter_rejects_unbounded_or_malformed_solo_founder_surfaces():
+    with pytest.raises(ValueError, match="cannot include"):
+        policy.validate_charter(
+            _charter(solo_founder={"toolsets": ["all"], "skills": []})
+        )
+    with pytest.raises(ValueError, match="non-empty strings"):
+        policy.validate_charter(
+            _charter(solo_founder={"toolsets": ["web", ""], "skills": []})
+        )
+    with pytest.raises(ValueError, match="must be a mapping"):
+        policy.validate_charter(_charter(solo_founder=["web"]))
+
+
 def test_out_of_scope_capability_escalates_instead_of_self_expanding():
     decision = policy.evaluate_action(
         objective=_objective(),

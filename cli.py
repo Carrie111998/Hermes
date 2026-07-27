@@ -16585,7 +16585,10 @@ def main(
             try:
                 from hermes_cli.workforce_delegation import validate_worker_launch
 
-                validate_worker_launch()
+                validate_worker_launch(
+                    enabled_toolsets=cli.enabled_toolsets,
+                    enabled_skills=cli.preloaded_skills,
+                )
             except Exception as exc:
                 print(
                     f"Employee task authorization failed: {exc}",

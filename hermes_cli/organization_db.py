@@ -629,8 +629,22 @@ def _solo_founder_mandate(charter: Mapping[str, Any], purpose: str) -> dict[str,
         "systems": sorted(
             set(str(item) for item in charter.get("allowed_systems") or [])
         ),
-        "toolsets": [],
-        "skills": [],
+        "toolsets": sorted(
+            set(
+                str(item)
+                for item in (charter.get("solo_founder") or {}).get(
+                    "toolsets", []
+                )
+            )
+        ),
+        "skills": sorted(
+            set(
+                str(item)
+                for item in (charter.get("solo_founder") or {}).get(
+                    "skills", []
+                )
+            )
+        ),
         "kpis": ["objective outcomes", "runway", "compliance"],
         "escalation": {
             "to": "human_advisor",

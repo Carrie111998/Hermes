@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import os
 import sqlite3
 import subprocess
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import objectives_db, workforce_delegation
 
 
 @pytest.fixture
@@ -3116,6 +3118,20 @@ class TestSharedBoardPaths:
                 self.pid = 4242
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        monkeypatch.setattr(
+            objectives_db,
+            "connect_closing",
+            lambda path: contextlib.nullcontext(object()),
+        )
+        monkeypatch.setattr(
+            workforce_delegation,
+            "grant_for_task",
+            lambda conn, task_id: {
+                "id": "taskgrant_test",
+                "toolsets": ["web"],
+                "skills": ["research"],
+            },
+        )
 
         task = kb.Task(
             id="t_dispatch_env",
@@ -3149,6 +3165,10 @@ class TestSharedBoardPaths:
         assert env["HERMES_BUSINESS_AUTHORITY_DB"] == str(
             (default_home / "objectives.db").resolve()
         )
+        assert "--toolsets" in captured["cmd"]
+        assert captured["cmd"][captured["cmd"].index("--toolsets") + 1] == "web"
+        assert "--skills" in captured["cmd"]
+        assert captured["cmd"][captured["cmd"].index("--skills") + 1] == "research"
 
 
 # ---------------------------------------------------------------------------

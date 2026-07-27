@@ -1783,6 +1783,26 @@ def setup_agentic_settings(config: dict):
     current["allowed_capabilities"] = _parse_csv_values(capabilities)
     current["allowed_systems"] = _parse_csv_values(systems)
     current["forbidden_capabilities"] = _parse_csv_values(forbidden)
+    solo_founder = current.setdefault(
+        "solo_founder",
+        copy.deepcopy(DEFAULT_CONFIG["agentic"]["solo_founder"]),
+    )
+    print_info(
+        "Solo-founder work is self-dispatched under exact task grants; "
+        "choose only the CLI toolsets and skills the CEO may use."
+    )
+    solo_founder["toolsets"] = _parse_csv_values(
+        prompt(
+            "Solo-founder worker toolsets (comma-separated; blank disables general work)",
+            ",".join(solo_founder.get("toolsets") or []),
+        )
+    )
+    solo_founder["skills"] = _parse_csv_values(
+        prompt(
+            "Solo-founder force-loadable skills (comma-separated)",
+            ",".join(solo_founder.get("skills") or []),
+        )
+    )
     email_config = (
         current.setdefault("communications", {})
         .setdefault("email", copy.deepcopy(

@@ -105,6 +105,7 @@ def create_grant(
     body: str,
     capabilities: list[str],
     systems: list[str],
+    toolsets: list[str],
     skills: list[str],
     budget_minor: int,
     expires_at: int,
@@ -147,13 +148,25 @@ def create_grant(
         raise DelegationError("task grant outlives the employee mandate")
     requested_capabilities = sorted(set(capabilities))
     requested_systems = sorted(set(systems))
+    requested_toolsets = sorted(set(toolsets))
     requested_skills = sorted(set(skills))
-    if not requested_capabilities or not requested_systems:
-        raise DelegationError("task grant requires capabilities and systems")
+    if (
+        not requested_capabilities
+        or not requested_systems
+        or not requested_toolsets
+    ):
+        raise DelegationError(
+            "task grant requires capabilities, systems, and toolsets"
+        )
     if not set(requested_capabilities).issubset(set(mandate["capabilities"])):
         raise DelegationError("task capability exceeds employee mandate")
     if not set(requested_systems).issubset(set(mandate["systems"])):
         raise DelegationError("task system exceeds employee mandate")
+    mandate_toolsets = set(str(item) for item in mandate.get("toolsets") or [])
+    if "all" in requested_toolsets or not set(requested_toolsets).issubset(
+        mandate_toolsets
+    ):
+        raise DelegationError("task toolset exceeds employee mandate")
     if not set(requested_skills).issubset(set(mandate.get("skills") or [])):
         raise DelegationError("task skill exceeds employee mandate")
     if budget_minor < 0:
@@ -209,7 +222,6 @@ def create_grant(
             objective["max_spend_minor"]
         ):
             raise DelegationError("task grants exceed objective budget")
-    toolsets = sorted(set(str(item) for item in mandate.get("toolsets") or []))
     contract = {
         "organization_id": organization_id,
         "objective_id": objective_id,
@@ -223,7 +235,7 @@ def create_grant(
         "body_sha256": _hash(body),
         "capabilities": requested_capabilities,
         "systems": requested_systems,
-        "toolsets": toolsets,
+        "toolsets": requested_toolsets,
         "skills": requested_skills,
         "budget_minor": budget_minor,
         "expires_at": expires_at,
@@ -405,7 +417,11 @@ def verify_grants(conn: sqlite3.Connection, organization_id: str) -> bool:
     return True
 
 
-def validate_worker_launch() -> dict[str, Any] | None:
+def validate_worker_launch(
+    *,
+    enabled_toolsets: list[str],
+    enabled_skills: list[str],
+) -> dict[str, Any] | None:
     """Fail closed when a spawned employee worker cannot prove its task grant."""
     grant_id = str(os.environ.get("HERMES_EXECUTION_CONTRACT_ID") or "").strip()
     if not grant_id:
@@ -444,6 +460,16 @@ def validate_worker_launch() -> dict[str, Any] | None:
         ):
             raise DelegationError(
                 "employee or mandate changed after task authorization"
+            )
+        actual_toolsets = sorted(set(str(item) for item in enabled_toolsets))
+        if actual_toolsets != sorted(set(str(item) for item in grant["toolsets"])):
+            raise DelegationError(
+                "worker toolsets do not match the exact task grant"
+            )
+        actual_skills = sorted(set(str(item) for item in enabled_skills))
+        if actual_skills != sorted(set(str(item) for item in grant["skills"])):
+            raise DelegationError(
+                "worker skills do not match the exact task grant"
             )
         scope = worker_scope(conn, grant_id)
     with kanban_db.connect_closing() as board:

@@ -439,6 +439,7 @@ def test_ceo_evaluates_then_hires_worker_across_verified_cycles(
         "skills": ["security.audit"],
         "task_capabilities": ["security.audit"],
         "task_systems": ["security"],
+        "task_toolsets": ["terminal"],
         "task_budget_minor": 100,
         "task_expires_at": int(time.time()) + 1_800,
     }

@@ -2480,6 +2480,13 @@ DEFAULT_CONFIG = {
         "allowed_capabilities": [],
         "forbidden_capabilities": [],
         "allowed_systems": [],
+        "solo_founder": {
+            # Exact CLI toolsets/skills the CEO may use in self-dispatched
+            # Kanban work. Empty means the CEO can govern but cannot launch
+            # general-purpose work until setup explicitly scopes this surface.
+            "toolsets": [],
+            "skills": [],
+        },
         "approval_required_capabilities": [],
         "max_autonomous_risk": "low",
         "allow_irreversible": False,

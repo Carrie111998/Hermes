@@ -8884,15 +8884,6 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
@@ -8901,7 +8892,30 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    if task.execution_contract_id:
+        from hermes_cli import workforce_delegation
+        from hermes_cli.objectives_db import connect_closing
+
+        with connect_closing(Path(env["HERMES_BUSINESS_AUTHORITY_DB"])) as authority:
+            grant = workforce_delegation.grant_for_task(authority, task.id)
+        if (
+            grant is None
+            or str(grant["id"]) != str(task.execution_contract_id)
+            or not grant["toolsets"]
+        ):
+            raise RuntimeError(
+                "governed Kanban worker has no exact executable toolset grant"
+            )
+        worker_toolsets = sorted(set(str(item) for item in grant["toolsets"]))
+        worker_skills = sorted(set(str(item) for item in grant["skills"]))
+    else:
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        worker_skills = task.skills or []
+    # A governed task receives both surfaces from its immutable grant.
+    # Per-name pairs are easier to audit in process listings.
+    for skill in worker_skills:
+        if skill:
+            cmd.extend(["--skills", skill])
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

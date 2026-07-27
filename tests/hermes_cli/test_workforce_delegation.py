@@ -27,6 +27,10 @@ def _company(tmp_path, monkeypatch):
         charter={
             "allowed_capabilities": ["work.delegate"],
             "allowed_systems": ["kanban"],
+            "solo_founder": {
+                "toolsets": ["web"],
+                "skills": ["research"],
+            },
             "max_action_spend_minor": 1_000,
         },
     )
@@ -126,6 +130,7 @@ def _grant(conn, ids, **overrides):
         "body": "Summarize independently sourced customer evidence.",
         "capabilities": ["web.read"],
         "systems": ["web"],
+        "toolsets": ["web"],
         "skills": ["research"],
         "budget_minor": 200,
         "expires_at": int(time.time()) + 1_800,
@@ -159,11 +164,61 @@ def test_exact_employee_task_grant_is_mandate_bound_and_immutable(
         )
 
 
+def test_solo_founder_can_self_dispatch_only_with_exact_mandate_surface(
+    tmp_path, monkeypatch
+):
+    company = _company(tmp_path, monkeypatch)
+    conn = company[0]
+    organization_id, ceo_id, _, _, objective_id, action_id = company[1:]
+    grant_id, created = workforce_delegation.create_grant(
+        conn,
+        organization_id=organization_id,
+        objective_id=objective_id,
+        action_id=action_id,
+        manager_employee_id=ceo_id,
+        assignee_profile="default",
+        title="Founder research",
+        body="Collect evidence before deciding whether to hire.",
+        capabilities=["work.delegate"],
+        systems=["kanban"],
+        toolsets=["web"],
+        skills=["research"],
+        budget_minor=100,
+        expires_at=int(time.time()) + 1_800,
+    )
+    grant = conn.execute(
+        "SELECT * FROM employee_task_grants WHERE id=?", (grant_id,)
+    ).fetchone()
+    assert created is True
+    assert grant["employee_id"] == ceo_id
+    assert grant["manager_employee_id"] == ceo_id
+    assert grant["toolsets_json"] == '["web"]'
+    assert grant["skills_json"] == '["research"]'
+    with pytest.raises(workforce_delegation.DelegationError, match="toolset"):
+        workforce_delegation.create_grant(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective_id,
+            action_id=action_id,
+            manager_employee_id=ceo_id,
+            assignee_profile="default",
+            title="Founder terminal work",
+            body="Attempt broader execution.",
+            capabilities=["work.delegate"],
+            systems=["kanban"],
+            toolsets=["terminal"],
+            skills=["research"],
+            budget_minor=100,
+            expires_at=int(time.time()) + 1_800,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("capabilities", ["email.send"], "capability"),
         ("systems", ["payments"], "system"),
+        ("toolsets", ["terminal"], "toolset"),
         ("skills", ["outreach"], "skill"),
         ("budget_minor", 501, "budget"),
     ],
@@ -326,7 +381,25 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
     monkeypatch.setenv("HERMES_BUSINESS_AUTHORITY_DB", str(tmp_path / "hermes" / "objectives.db"))
     monkeypatch.setenv("HERMES_PROFILE", "ada-research")
 
-    assert workforce_delegation.validate_worker_launch()["id"] == grant_id
+    assert (
+        workforce_delegation.validate_worker_launch(
+            enabled_toolsets=["web"],
+            enabled_skills=["research"],
+        )["id"]
+        == grant_id
+    )
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="exact task grant"
+    ):
+        workforce_delegation.validate_worker_launch(
+            enabled_toolsets=["web", "terminal"],
+            enabled_skills=["research"],
+        )
+    with pytest.raises(workforce_delegation.DelegationError, match="skills"):
+        workforce_delegation.validate_worker_launch(
+            enabled_toolsets=["web"],
+            enabled_skills=[],
+        )
     with kanban_db.connect_closing() as board:
         kanban_db.complete_task(
             board, task_id, summary="Evidence synthesis ready for review"
@@ -367,4 +440,7 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
     with pytest.raises(
         workforce_delegation.DelegationError, match="no longer matches"
     ):
-        workforce_delegation.validate_worker_launch()
+        workforce_delegation.validate_worker_launch(
+            enabled_toolsets=["web"],
+            enabled_skills=["research"],
+        )

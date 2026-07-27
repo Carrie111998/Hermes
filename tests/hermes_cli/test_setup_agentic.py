@@ -11,6 +11,8 @@ def test_setup_agentic_defaults_to_advisor_autonomy(monkeypatch):
             "crm.write,email.send",
             "crm,agentmail",
             "company.delete",
+            "web,terminal",
+            "research",
             "ceo@agentmail.to",
             "2500",
             "1000",
@@ -47,6 +49,8 @@ def test_setup_agentic_defaults_to_advisor_autonomy(monkeypatch):
     assert charter["runtime_host"] == "gateway"
     assert charter["allowed_capabilities"] == ["crm.write", "email.send"]
     assert charter["allowed_systems"] == ["crm", "agentmail"]
+    assert charter["solo_founder"]["toolsets"] == ["web", "terminal"]
+    assert charter["solo_founder"]["skills"] == ["research"]
     assert (
         charter["communications"]["email"]["inbox_id"]
         == "ceo@agentmail.to"

@@ -234,6 +234,10 @@ def test_setup_revision_supersedes_ceo_mandate_and_profile_snapshot(
         "allowed_systems": ["objectives", "kanban"],
         "forbidden_capabilities": ["funds.custody"],
         "max_action_spend_minor": 100,
+        "solo_founder": {
+            "toolsets": ["web"],
+            "skills": ["research"],
+        },
         "finance": {"base_currency": "USD"},
     }
     organization_id, ceo_id = org.bootstrap_solo_founder(
@@ -265,6 +269,8 @@ def test_setup_revision_supersedes_ceo_mandate_and_profile_snapshot(
     assert second["supersedes_id"] == first["id"]
     assert second["capabilities"] == sorted(revised_capabilities)
     assert second["systems"] == ["objectives"]
+    assert second["toolsets"] == ["web"]
+    assert second["skills"] == ["research"]
     assert second["budget_minor"] == 50
     assert first["capabilities"] == sorted(initial_capabilities)
     organization = connection.execute(

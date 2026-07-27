@@ -69,6 +69,21 @@ def validate_charter(charter: Mapping[str, Any]) -> None:
         ttl_value = charter.get(key, 300)
         if not isinstance(ttl_value, int) or ttl_value < 3:
             raise ValueError(f"agentic.{key} must be an integer of at least 3")
+    solo_founder = charter.get("solo_founder") or {}
+    if not isinstance(solo_founder, Mapping):
+        raise ValueError("agentic.solo_founder must be a mapping")
+    for key in ("toolsets", "skills"):
+        values = solo_founder.get(key, [])
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) or not item.strip() for item in values
+        ):
+            raise ValueError(
+                f"agentic.solo_founder.{key} must be a list of non-empty strings"
+            )
+    if "all" in _string_set(solo_founder.get("toolsets")):
+        raise ValueError(
+            "agentic.solo_founder.toolsets cannot include the unrestricted all toolset"
+        )
     approvals = charter.get("action_approvals") or {}
     default_approval_ttl = int(approvals.get("default_ttl_seconds", 900))
     maximum_approval_ttl = int(approvals.get("maximum_ttl_seconds", 3600))
