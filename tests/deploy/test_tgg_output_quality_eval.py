@@ -51,16 +51,26 @@ def snapshot() -> dict:
 def judgment(checker: str = "judge-2") -> dict:
     registry = core.load_registry()
     values = ["pass", "fail", "unsure"]
-    return {
-        "checker_session_id": checker,
+    naive = {
         "source_to_page": "pass",
         "page_to_source": "fail",
         "manager_readability": "unsure",
         "summary": "One source fact is missing.",
+    }
+    registry_pass = {
         "checks": [
             {"id": item.id, "result": values[index % 3], "evidence": f"evidence {index}"}
             for index, item in enumerate(registry.checks)
-        ],
+        ]
+    }
+    return {
+        "checker_session_id": checker,
+        "naive_checker_session_id": "judge-naive",
+        "registry_checker_session_id": checker,
+        "naive_pass": naive,
+        "registry_pass": registry_pass,
+        **naive,
+        **registry_pass,
     }
 
 
@@ -249,31 +259,24 @@ def test_strict_judgment_preserves_unsure_and_rejects_maker():
         core.validate_judgment(broken, registry, "maker-1")
 
 
-def test_injected_judge_command_receives_paths_and_is_strict(tmp_path):
+def test_injected_judge_command_refuses_single_pass_bypass(tmp_path):
     bundle = tmp_path / "bundle.json"
     bundle.write_text("{}")
     screen = tmp_path / "screen.png"
     screen.write_bytes(b"x")
-    seen = {}
-
-    def command(argv, **kwargs):
-        seen["request"] = json.loads(kwargs["input"])
-        return subprocess.CompletedProcess(argv, 0, json.dumps(judgment()), "")
-
-    result = core.Judge(command=command, command_argv=["fixture-judge"]).judge(
-        bundle,
-        {
-            "screenshot": str(screen),
-            "portal_screenshot": str(screen),
-            "snapshot": str(bundle),
-            "portal_snapshot": str(bundle),
-            "url": core.case_url("AM/JOB/2607/0001"),
-        },
-        core.load_registry(),
-        "maker-1",
-    )
-    assert result["page_to_source"] == "fail"
-    assert seen["request"]["maker_session_id"] == "maker-1"
+    with pytest.raises(core.EvalError, match="two isolated passes"):
+        core.Judge(command_argv=["fixture-judge"]).judge(
+            bundle,
+            {
+                "screenshot": str(screen),
+                "portal_screenshot": str(screen),
+                "snapshot": str(bundle),
+                "portal_snapshot": str(bundle),
+                "url": core.case_url("AM/JOB/2607/0001"),
+            },
+            core.load_registry(),
+            "maker-1",
+        )
 
 
 def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
@@ -328,11 +331,18 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
         "maker-thread",
     )
     assert result["checker_session_id"] == "fresh-registry-checker"
+    assert result["naive_checker_session_id"] == "fresh-naive-checker"
+    assert result["registry_checker_session_id"] == "fresh-registry-checker"
     assert result["summary"] == "cold manager read"
     assert len(seen["argv"]) == 2
     assert "registry=" not in seen["prompts"][0]
     assert "checklist" in seen["prompts"][0]
     assert "registry=" in seen["prompts"][1]
+    assert "-C" in seen["argv"][0]
+    assert "--skip-git-repo-check" in seen["argv"][0]
+    for item in core.load_registry().checks:
+        assert item.id not in seen["prompts"][0]
+        assert item.statement not in seen["prompts"][0]
     assert all("CODEX_THREAD_ID" not in env for env in seen["env"])
     assert all("MARSHAL_SESSION_ID" not in env for env in seen["env"])
     image_args = [
@@ -341,6 +351,74 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
         if value == "-i"
     ]
     assert str(source_image) in image_args
+
+
+def test_default_judge_rejects_malformed_pass_without_keyerror(tmp_path):
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text("{}")
+    screen = tmp_path / "screen.png"
+    screen.write_bytes(b"png")
+
+    def command(argv, **_kwargs):
+        output = Path(argv[argv.index("--output-last-message") + 1])
+        output.write_text("{}")
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"type": "thread.started", "thread_id": "fresh"}) + "\n", ""
+        )
+
+    with pytest.raises(core.EvalError, match="naive judge pass has an invalid shape"):
+        core.Judge(command=command).judge(
+            bundle,
+            {
+                "screenshot": str(screen),
+                "portal_screenshot": str(screen),
+                "snapshot": str(bundle),
+                "portal_snapshot": str(bundle),
+                "url": "fixture://case",
+            },
+            core.load_registry(),
+            "maker",
+        )
+
+
+def test_default_judge_rejects_reused_pass_session(tmp_path):
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text("{}")
+    screen = tmp_path / "screen.png"
+    screen.write_bytes(b"png")
+
+    def command(argv, **_kwargs):
+        output = Path(argv[argv.index("--output-last-message") + 1])
+        schema = Path(argv[argv.index("--output-schema") + 1]).name
+        output.write_text(
+            json.dumps(
+                {
+                    "source_to_page": "pass",
+                    "page_to_source": "pass",
+                    "manager_readability": "pass",
+                    "summary": "clear",
+                }
+                if schema == "naive-judge-schema.json"
+                else {"checks": judgment()["checks"]}
+            )
+        )
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"type": "thread.started", "thread_id": "same"}) + "\n", ""
+        )
+
+    with pytest.raises(core.EvalError, match="reused one checker session"):
+        core.Judge(command=command).judge(
+            bundle,
+            {
+                "screenshot": str(screen),
+                "portal_screenshot": str(screen),
+                "snapshot": str(bundle),
+                "portal_snapshot": str(bundle),
+                "url": "fixture://case",
+            },
+            core.load_registry(),
+            "maker",
+        )
 
 
 def test_defect_filing_dedupes_locally(tmp_path):
@@ -693,6 +771,11 @@ def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
             )
     external = {
         "evaluator_session": "independent-judge",
+        "two_pass_evidence": {
+            "naive_checker_session_id": "external-naive",
+            "registry_checker_session_id": "independent-judge",
+            "naive_registry_exposed": False,
+        },
         "overall": "One photo association is uncertain.",
         "cases": [
             {

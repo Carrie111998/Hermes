@@ -23,7 +23,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[4]
 DEPLOY_DIR = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = DEPLOY_DIR / "quality-checks.yaml"
-JUDGE_SCHEMA_PATH = Path(__file__).with_name("judge-schema.json")
 NAIVE_JUDGE_SCHEMA_PATH = Path(__file__).with_name("naive-judge-schema.json")
 REGISTRY_JUDGE_SCHEMA_PATH = Path(__file__).with_name("registry-judge-schema.json")
 FIXTURE_DIR = ROOT / "tests/fixtures/clients/tgg/output-quality"
@@ -528,6 +527,10 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
         raise EvalError("judge response must be a JSON object")
     required = {
         "checker_session_id",
+        "naive_checker_session_id",
+        "registry_checker_session_id",
+        "naive_pass",
+        "registry_pass",
         "source_to_page",
         "page_to_source",
         "manager_readability",
@@ -541,12 +544,34 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
         raise EvalError("judge checker_session_id is missing")
     if checker == maker_session_id:
         raise EvalError("checker session equals maker session")
+    naive_checker = value["naive_checker_session_id"]
+    registry_checker = value["registry_checker_session_id"]
+    if not all(isinstance(item, str) and item for item in (naive_checker, registry_checker)):
+        raise EvalError("two-pass checker session ids are missing")
+    if maker_session_id in {naive_checker, registry_checker}:
+        raise EvalError("checker session equals maker session")
+    if naive_checker == registry_checker:
+        raise EvalError("naive and registry passes reused one checker session")
+    naive_pass = value["naive_pass"]
+    registry_pass = value["registry_pass"]
+    if not isinstance(naive_pass, dict) or set(naive_pass) != {
+        "source_to_page", "page_to_source", "manager_readability", "summary"
+    }:
+        raise EvalError("naive pass has an invalid shape")
+    if not isinstance(registry_pass, dict) or set(registry_pass) != {"checks"}:
+        raise EvalError("registry pass has an invalid shape")
     for axis in ("source_to_page", "page_to_source", "manager_readability"):
         if value[axis] not in RESULTS:
             raise EvalError(f"invalid {axis} result")
     if not isinstance(value["summary"], str) or not value["summary"].strip():
         raise EvalError("judge summary is empty")
     checks = value["checks"]
+    if any(value[axis] != naive_pass[axis] for axis in ("source_to_page", "page_to_source", "manager_readability")):
+        raise EvalError("combined axes diverge from naive pass")
+    if value["summary"] != naive_pass["summary"]:
+        raise EvalError("combined summary diverges from naive pass")
+    if checks != registry_pass["checks"]:
+        raise EvalError("combined checks diverge from registry pass")
     if not isinstance(checks, list):
         raise EvalError("judge checks must be an array")
     found: dict[str, dict[str, Any]] = {}
@@ -599,22 +624,7 @@ class Judge:
             f"portal_snapshot={captures['portal_snapshot']}\nregistry={REGISTRY_PATH}\n"
         )
         if self.command_argv:
-            request = {
-                "prompt": naive_prompt,
-                "registry_prompt": registry_prompt,
-                "bundle_path": str(bundle_path),
-                "captures": captures,
-                "registry": [item.__dict__ for item in registry.checks],
-                "maker_session_id": maker_session_id,
-            }
-            result = self.command(self.command_argv, input=json_dump(request), capture_output=True)
-            if result.returncode:
-                raise EvalError(f"injected judge command failed: {result.stderr.strip()}")
-            try:
-                value = json.loads(result.stdout)
-            except json.JSONDecodeError as exc:
-                raise EvalError("injected judge command returned invalid JSON") from exc
-            return validate_judgment(value, registry, maker_session_id)
+            raise EvalError("injected judge commands are disabled; two isolated passes are required")
 
         with tempfile.TemporaryDirectory(prefix="tgg-output-judge-") as tmp:
             try:
@@ -654,7 +664,9 @@ class Judge:
             ):
                 checker_env.pop(key, None)
 
-            def run_pass(prompt: str, schema: Path, output_name: str) -> tuple[dict[str, Any], str]:
+            def run_pass(
+                prompt: str, schema: Path, output_name: str, *, isolated: bool = False
+            ) -> tuple[dict[str, Any], str]:
                 output = Path(tmp) / output_name
                 argv = [
                     "codex", "exec", "--json", "--sandbox", "read-only",
@@ -663,10 +675,19 @@ class Judge:
                     "-i", captures["screenshot"],
                     "-i", captures["portal_screenshot"],
                 ]
+                if isolated:
+                    naive_root = Path(tmp) / "naive-root"
+                    naive_root.mkdir(exist_ok=True)
+                    argv.extend(["-C", str(naive_root), "--skip-git-repo-check", "--ignore-rules"])
                 for source_image in source_images:
                     argv.extend(["-i", source_image])
                 argv.append("-")
-                result = self.command(argv, input=prompt, capture_output=True, env=checker_env)
+                try:
+                    result = self.command(
+                        argv, input=prompt, capture_output=True, env=checker_env, timeout=60
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise EvalError(f"vision judge timed out: {output_name}") from exc
                 if result.returncode:
                     raise EvalError(f"vision judge failed: {result.stderr.strip()}")
                 checker_id = None
@@ -683,10 +704,26 @@ class Judge:
                     value = json.loads(output.read_text())
                 except (OSError, json.JSONDecodeError) as exc:
                     raise EvalError("vision judge did not write strict JSON") from exc
+                if schema == NAIVE_JUDGE_SCHEMA_PATH:
+                    required = {
+                        "source_to_page", "page_to_source", "manager_readability", "summary"
+                    }
+                    if not isinstance(value, dict) or set(value) != required:
+                        raise EvalError("naive judge pass has an invalid shape")
+                    if any(value[axis] not in RESULTS for axis in required - {"summary"}):
+                        raise EvalError("naive judge pass has an invalid result")
+                    if not isinstance(value["summary"], str) or not value["summary"].strip():
+                        raise EvalError("naive judge pass has an empty summary")
+                elif (
+                    not isinstance(value, dict)
+                    or set(value) != {"checks"}
+                    or not isinstance(value["checks"], list)
+                ):
+                    raise EvalError("registry judge pass has an invalid shape")
                 return value, str(checker_id)
 
             naive, naive_checker = run_pass(
-                naive_prompt, NAIVE_JUDGE_SCHEMA_PATH, "naive.json"
+                naive_prompt, NAIVE_JUDGE_SCHEMA_PATH, "naive.json", isolated=True
             )
             registry_result, registry_checker = run_pass(
                 registry_prompt, REGISTRY_JUDGE_SCHEMA_PATH, "registry.json"
@@ -695,6 +732,10 @@ class Judge:
                 raise EvalError("checker session equals maker session")
             value = {
                 "checker_session_id": registry_checker,
+                "naive_checker_session_id": naive_checker,
+                "registry_checker_session_id": registry_checker,
+                "naive_pass": naive,
+                "registry_pass": registry_result,
                 "source_to_page": naive["source_to_page"],
                 "page_to_source": naive["page_to_source"],
                 "manager_readability": naive["manager_readability"],
@@ -1099,6 +1140,21 @@ def finalize_external(
         return {"ok": True, "ran": False, "reason": "already-finalized", "cursor": state["cursor"]}
     if int(state.get("cursor", 0)) != cursor_start:
         raise EvalError("local cursor does not match the external batch start")
+    two_pass = raw_judgment.get("two_pass_evidence")
+    if not isinstance(two_pass, dict) or set(two_pass) != {
+        "naive_checker_session_id",
+        "registry_checker_session_id",
+        "naive_registry_exposed",
+    }:
+        raise EvalError("external judgment has no strict two-pass evidence")
+    naive_checker = two_pass["naive_checker_session_id"]
+    registry_checker = two_pass["registry_checker_session_id"]
+    if not all(isinstance(item, str) and item for item in (naive_checker, registry_checker)):
+        raise EvalError("external two-pass checker ids are missing")
+    if naive_checker == registry_checker or maker_session_id in {naive_checker, registry_checker}:
+        raise EvalError("external two-pass checker separation failed")
+    if two_pass["naive_registry_exposed"] is not False:
+        raise EvalError("external naive pass was exposed to the registry")
     run_id = f"external-{cursor_start + 1}-{cursor_end}"
     evidence_dir = store.root / "runs" / run_id
     evidence_dir.mkdir(parents=True, exist_ok=True)
