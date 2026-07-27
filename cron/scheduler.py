@@ -299,6 +299,31 @@ class CronJobRunResult:
         yield self.error
 
 
+# Canonical silence tokens recognized in cron output.  Cron's contract is
+# intentionally looser than the gateway's exact-whole-response rule: the cron
+# system prompt *instructs* the agent to emit "[SILENT]", and real agents often
+# bracket it with a short note or trailing newline.  We therefore suppress when
+# a marker is the entire response OR appears as its own first/last line — but
+# NOT when a token merely appears mid-sentence in a genuine report (e.g.
+# "I considered staying [SILENT] but here is the summary…" must deliver).
+# The actual matcher is shared with the webhook lane —
+# gateway.response_filters.is_autonomous_silence_response — so the two
+# autonomous lanes cannot drift apart.
+
+
+def _is_cron_silence_response(text: str) -> bool:
+    """Return True when a cron final response should suppress delivery.
+
+    Recognizes the bracketed ``[SILENT]`` sentinel (whole-response, first line,
+    or last line) plus the bracketless ``SILENT`` / ``NO_REPLY`` / ``NO REPLY``
+    variants the model emits when it drops the brackets. Whitespace-trimmed and
+    case-insensitive. A token buried mid-sentence is delivered.
+    """
+    from gateway.response_filters import is_autonomous_silence_response
+
+    return is_autonomous_silence_response(text)
+
+
 def _cron_run_result(
     success: bool,
     output: str,
@@ -316,7 +341,6 @@ def _cron_run_result(
         delivery_outcome=delivery_outcome,
         turn_id=turn_id,
     )
-
 
 def _mechanical_cron_suppress_result(
     job_id: str,
@@ -3384,7 +3408,7 @@ def run_job(
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}

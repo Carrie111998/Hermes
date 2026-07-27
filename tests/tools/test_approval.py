@@ -65,6 +65,41 @@ class TestDetectDangerousRm:
         assert key is not None
         assert "delete" in desc.lower()
 
+    def test_rm_flags_after_operands_detected(self):
+        # GNU rm permutes options: `rm build/ -rf` == `rm -rf build/`.
+        # Port of openai/codex#33464.
+        for cmd in (
+            "rm build/ -rf",
+            "rm build/ -r -f",
+            "rm build/ -fR",
+            "rm build/ --recursive --force",
+            "rm build/ --force --recursive",
+            "rm ~/projects -rf",
+            "sudo rm build/ -rf",
+            "rm -f build/ -r",
+            "rm one two three -rf",
+        ):
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"{cmd!r} should require approval"
+            assert "delete" in desc.lower()
+
+    def test_rm_flags_after_operands_no_false_positives(self):
+        for cmd in (
+            # after a bare `--`, -rf-looking tokens are literal filenames
+            "rm -- -weird-r-file",
+            "rm -f -- -r-file",
+            # a later pipeline/command segment's flags don't belong to rm
+            "rm foo | grep -r bar",
+            "rm foo; ls -lart",
+            # long options whose `r` is not whitespace-anchored
+            "npm rm somepkg --registry=https://registry.npmjs.org",
+            "rm old.log --verbose",
+            # plain multi-operand deletes stay safe
+            "rm build/file.txt other.txt",
+        ):
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is False, f"{cmd!r} should be safe, got: {desc}"
+
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
         with mock_patch("tempfile.gettempdir", return_value="/tmp"):
             canonical_temp = os.path.realpath("/tmp")
@@ -2116,11 +2151,13 @@ class TestApprovalTimeoutIsNotConsent:
         os.environ.pop("HERMES_CRON_SESSION", None)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+        self._session_key_token = mod.set_current_session_key(self.SESSION_KEY)
 
     def teardown_method(self):
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod.reset_current_session_key(self._session_key_token)
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
