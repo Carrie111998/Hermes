@@ -314,6 +314,21 @@ def find_docker() -> Optional[str]:
     return None
 
 
+def _is_podman_runtime(executable: str) -> bool:
+    """Return whether *executable* resolves to a Podman CLI.
+
+    Rootless Podman needs ``--userns keep-id`` in addition to ``--user`` to
+    preserve bind-mount ownership. Follow compatibility symlinks (commonly
+    ``docker -> podman``) without executing another runtime probe.
+    """
+    names = {Path(executable).name.lower()}
+    try:
+        names.add(Path(executable).resolve().name.lower())
+    except (OSError, RuntimeError):
+        pass
+    return any(name == "podman" or name.startswith("podman.") for name in names)
+
+
 # Security flags applied to every container.
 # The container itself is the security boundary (isolated from host).
 # We drop all capabilities then add back the minimum needed:
@@ -604,6 +619,24 @@ def _extra_args_egress_collisions(
         elif arg in network_flags or any(arg.startswith(f"{flag}=") for flag in network_flags):
             collisions.append(arg)
         i += 1
+    return sorted(set(collisions))
+
+
+def _extra_args_identity_collisions(extra_args: list[str]) -> list[str]:
+    """Return extra args that conflict with backend-controlled user identity."""
+    collisions: list[str] = []
+    for arg in extra_args:
+        if (
+            arg in {"--user", "-u", "--userns"}
+            or arg.startswith("--user=")
+            or arg.startswith("--userns=")
+            or (
+                arg.startswith("-u")
+                and not arg.startswith("--")
+                and len(arg) > 2
+            )
+        ):
+            collisions.append(arg)
     return sorted(set(collisions))
 
 
@@ -1219,6 +1252,11 @@ class DockerEnvironment(BaseEnvironment):
         for key in sorted(merged_env):
             env_args.extend(["-e", f"{key}={merged_env[key]}"])
 
+        # Resolve the container executable before identity args: Podman needs
+        # an explicit keep-id user namespace while Docker only accepts --user.
+        # Resolving once also keeps non-PATH Docker Desktop installs working.
+        self._docker_exe = find_docker() or "docker"
+
         # Optional: run the container as the host user so files written into
         # bind-mounted dirs (/workspace, /root, docker_volumes entries) are
         # owned by that user on the host instead of by root. Skip cleanly on
@@ -1227,8 +1265,15 @@ class DockerEnvironment(BaseEnvironment):
         if run_as_host_user:
             user_spec = _resolve_host_user_spec()
             if user_spec is not None:
-                user_args = ["--user", user_spec]
-                logger.info("Docker: running container as host user %s", user_spec)
+                if _is_podman_runtime(self._docker_exe):
+                    user_args = ["--userns", "keep-id", "--user", user_spec]
+                    logger.info(
+                        "Podman: keeping host user namespace and running as %s",
+                        user_spec,
+                    )
+                else:
+                    user_args = ["--user", user_spec]
+                    logger.info("Docker: running container as host user %s", user_spec)
             else:
                 logger.warning(
                     "docker_run_as_host_user is enabled but this platform does "
@@ -1237,10 +1282,6 @@ class DockerEnvironment(BaseEnvironment):
                 )
                 # Fall back to the full cap set — without --user, an image's
                 # init may still need s6-setuidgid/gosu/su to drop privileges.
-
-        # Resolve the docker executable once so it works even when
-        # /usr/local/bin is not in PATH (common on macOS gateway/service).
-        self._docker_exe = find_docker() or "docker"
 
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
         # and exec /run/s6/basedir/bin/init during startup. For those images we
@@ -1262,13 +1303,23 @@ class DockerEnvironment(BaseEnvironment):
 
         logger.info(f"Docker volume_args: {volume_args}")
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
-        # Appended last so they can override defaults if needed.
+        # Passed through unchanged after validating the narrow controls Hermes
+        # owns.
         validated_extra = []
         for arg in (extra_args or []):
             if not isinstance(arg, str):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
+        if run_as_host_user:
+            _identity_collisions = _extra_args_identity_collisions(validated_extra)
+            if _identity_collisions:
+                raise ValueError(
+                    "docker_extra_args conflicts with docker_run_as_host_user "
+                    f"identity control: {_identity_collisions}. Remove --user, "
+                    "-u, and --userns options; Hermes sets the host UID/GID "
+                    "and Podman keep-id mapping."
+                )
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
                 validated_extra, _critical_egress_names,
