@@ -290,6 +290,47 @@ def _record_child_handoff_telemetry(
         logger.debug("handoff telemetry build failed", exc_info=True)
 
 
+def _tool_content_to_text(content: Any) -> str:
+    """Normalize tool content blocks into a readable text preview.
+
+    Tool results can arrive as strings, dicts, or lists of content blocks.
+    We preserve the useful text when possible and fall back to a JSON-ish
+    representation only when there is no better textual form.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        try:
+            return json.dumps(content, ensure_ascii=False, default=str)
+        except Exception:
+            return str(content)
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+                    continue
+                nested_content = item.get("content")
+                if isinstance(nested_content, str) and nested_content:
+                    parts.append(nested_content)
+                    continue
+                try:
+                    parts.append(json.dumps(item, ensure_ascii=False, default=str))
+                except Exception:
+                    parts.append(str(item))
+                continue
+            parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
 def _extract_output_tail(
     result: Dict[str, Any],
     *,
@@ -328,9 +369,7 @@ def _extract_output_tail(
             break
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
-        content = msg.get("content") or ""
-        if not isinstance(content, str):
-            content = str(content)
+        content = _tool_content_to_text(msg.get("content"))
         is_error = _looks_like_error_output(content)
         tool_name = pending_call_by_id.get(msg.get("tool_call_id") or "", "tool")
         # Preserve line structure so the overlay's wrapped scroll region can
@@ -343,7 +382,7 @@ def _extract_output_tail(
     return tail
 
 
-def _looks_like_error_output(content: str) -> bool:
+def _looks_like_error_output(content: Any) -> bool:
     """Conservative stderr/error detector for tool-result previews.
 
     The old heuristic flagged any preview containing the substring "error",
@@ -355,6 +394,19 @@ def _looks_like_error_output(content: str) -> bool:
     """
     if not content:
         return False
+
+    if isinstance(content, list):
+        return any(_looks_like_error_output(item) for item in content)
+
+    if isinstance(content, dict):
+        if content.get("error"):
+            return True
+        status = str(content.get("status") or "").strip().lower()
+        if status in {"error", "failed", "failure", "timeout"}:
+            return True
+        content = _tool_content_to_text(content)
+    elif not isinstance(content, str):
+        content = _tool_content_to_text(content)
 
     head = content.lstrip()
     if head.startswith("{") or head.startswith("["):
@@ -1769,6 +1821,8 @@ def _run_single_child(
                             trace_by_id[tc_id] = entry_t
                 elif msg.get("role") == "tool":
                     content = msg.get("content", "")
+                    if not isinstance(content, str):
+                        content = str(content)
                     is_error = _looks_like_error_output(content)
                     result_meta = {
                         "result_bytes": len(content),

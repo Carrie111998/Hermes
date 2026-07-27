@@ -29,8 +29,10 @@ from tools.delegate_tool import (
     _build_child_progress_callback,
     _build_child_system_prompt,
     _strip_blocked_tools,
+    _extract_output_tail,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _looks_like_error_output,
 )
 
 
@@ -259,6 +261,39 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("Task 0 must be an object", result["error"])
         mock_run.assert_not_called()
+
+    def test_looks_like_error_output_handles_list_content(self):
+        # Regression for delegate_tool.py: tool messages can arrive with list
+        # content, and the error detector must not crash on non-string input.
+        self.assertFalse(_looks_like_error_output(["tool result", {"ok": True}]))
+
+    def test_looks_like_error_output_handles_structured_dict(self):
+        self.assertTrue(_looks_like_error_output({"error": "boom"}))
+        self.assertTrue(_looks_like_error_output({"status": "failed"}))
+
+    def test_extract_output_tail_normalizes_structured_content(self):
+        result = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-1", "function": {"name": "lookup"}},
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": [{"type": "text", "text": "Error: boom"}],
+                },
+            ]
+        }
+
+        tail = _extract_output_tail(result)
+
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0]["tool"], "lookup")
+        self.assertTrue(tail[0]["is_error"])
+        self.assertIn("Error: boom", tail[0]["preview"])
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_rejects_malformed_json_string_tasks(self, mock_run):
