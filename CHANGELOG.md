@@ -61,6 +61,9 @@
 - Governed file-worker operations now revalidate the live grant at execution
   time and require exact `file.read` or `file.write` capability, `localhost`
   system, and canonical target-resource equality before opening the path.
+- Employee grants now persist worker resource scope separately from the
+  Kanban binding scope, allowing an exact local file or service resource to be
+  authorized without confusing it with the task board used for coordination.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

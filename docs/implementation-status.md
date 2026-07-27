@@ -53,6 +53,9 @@ acceptance evidence.
 - File reads and writes performed by governed workers are checked again at
   execution time against the live grant. A read grant cannot write, and a
   grant for one canonical local path cannot access another path.
+- Worker resource scope is stored separately from the Kanban coordination
+  resource, so exact execution targets remain enforceable even when the task
+  board is a different resource.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

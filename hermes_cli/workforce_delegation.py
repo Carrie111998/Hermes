@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS employee_task_grants (
     toolsets_json TEXT NOT NULL,
     skills_json TEXT NOT NULL,
     resource_scope_json TEXT NOT NULL DEFAULT '{}',
+    worker_resource_scope_json TEXT NOT NULL DEFAULT '{}',
     parent_grant_id TEXT,
     budget_minor INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
@@ -132,6 +133,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if "parent_grant_id" not in columns:
         conn.execute(
             "ALTER TABLE employee_task_grants ADD COLUMN parent_grant_id TEXT"
+        )
+    if "worker_resource_scope_json" not in columns:
+        conn.execute(
+            "ALTER TABLE employee_task_grants ADD COLUMN "
+            "worker_resource_scope_json TEXT NOT NULL DEFAULT '{}'"
         )
 
 
@@ -322,6 +328,20 @@ def create_grant(
     }
     if not resource_scope["system"] or not resource_scope["target_resource"]:
         raise DelegationError("task grant requires an exact resource scope")
+    worker_system = str(action_payload.get("task_system") or "").strip()
+    worker_target = str(action_payload.get("task_target_resource") or "").strip()
+    if bool(worker_system) != bool(worker_target):
+        raise DelegationError(
+            "worker resource scope requires both task_system and "
+            "task_target_resource"
+        )
+    worker_resource_scope = (
+        {"system": worker_system, "target_resource": worker_target}
+        if worker_system and worker_target
+        else {}
+    )
+    if worker_resource_scope and worker_system not in requested_systems:
+        raise DelegationError("worker resource system exceeds task systems")
     if budget_minor < 0:
         raise DelegationError("task budget cannot be negative")
     parent_grant_id = None
@@ -359,6 +379,8 @@ def create_grant(
                     "target_resource"
                 )
                 == resource_scope["target_resource"]
+                and json.loads(row["worker_resource_scope_json"] or "{}")
+                == worker_resource_scope
                 and expires_at <= int(row["expires_at"])
                 and budget_minor <= int(row["budget_minor"])
             )
@@ -470,6 +492,8 @@ def create_grant(
         "budget_minor": budget_minor,
         "expires_at": expires_at,
     }
+    if worker_resource_scope:
+        contract["worker_resource_scope"] = worker_resource_scope
     digest = _hash(_json(contract))
     existing = conn.execute(
         "SELECT id,contract_sha256 FROM employee_task_grants WHERE action_id=?",
@@ -486,8 +510,9 @@ def create_grant(
                  employee_id,assignee_profile,mandate_id,mandate_version,
                  title_sha256,body_sha256,capabilities_json,systems_json,
                  toolsets_json,skills_json,resource_scope_json,parent_grant_id,
-                 budget_minor,expires_at,contract_sha256,created_at
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 worker_resource_scope_json,budget_minor,expires_at,
+                 contract_sha256,created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 grant_id,
                 organization_id,
@@ -506,6 +531,7 @@ def create_grant(
                 _json(requested_skills),
                 _json(resource_scope),
                 parent_grant_id,
+                _json(worker_resource_scope),
                 budget_minor,
                 expires_at,
                 digest,
@@ -572,6 +598,7 @@ def worker_scope(conn: sqlite3.Connection, grant_id: str) -> str:
             f"- Toolsets: {', '.join(json.loads(row['toolsets_json'])) or '(none)'}",
             f"- Skills: {', '.join(json.loads(row['skills_json'])) or '(none)'}",
             f"- Resource scope: {row['resource_scope_json']}",
+            f"- Worker resource scope: {row['worker_resource_scope_json']}",
             f"- Budget ceiling (minor units): {row['budget_minor']}",
             f"- Expires at (Unix): {row['expires_at']}",
             "- Prohibited actions: "
@@ -627,7 +654,7 @@ def authorize_worker_action(
             raise DelegationError(
                 f"worker capability {requested_capability!r} is not granted"
             )
-        scope = grant.get("resource_scope") or {}
+        scope = grant.get("worker_resource_scope") or {}
         if str(scope.get("system") or "") != requested_system:
             raise DelegationError("worker action system exceeds the exact grant scope")
         if str(scope.get("target_resource") or "") != requested_resource:
@@ -654,6 +681,7 @@ def grant_for_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | N
         "toolsets_json",
         "skills_json",
         "resource_scope_json",
+        "worker_resource_scope_json",
     ):
         result[key.removesuffix("_json")] = json.loads(result.pop(key))
     return result
@@ -685,6 +713,11 @@ def verify_grants(conn: sqlite3.Connection, organization_id: str) -> bool:
             "budget_minor": int(row["budget_minor"]),
             "expires_at": int(row["expires_at"]),
         }
+        worker_scope_json = json.loads(
+            row["worker_resource_scope_json"] or "{}"
+        )
+        if worker_scope_json:
+            contract["worker_resource_scope"] = worker_scope_json
         if _hash(_json(contract)) != str(row["contract_sha256"]):
             return False
         manager = conn.execute(
@@ -750,6 +783,10 @@ def verify_grants(conn: sqlite3.Connection, organization_id: str) -> bool:
             if json.loads(row["resource_scope_json"] or "{}") != json.loads(
                 parent["resource_scope_json"] or "{}"
             ):
+                return False
+            if json.loads(
+                row["worker_resource_scope_json"] or "{}"
+            ) != json.loads(parent["worker_resource_scope_json"] or "{}"):
                 return False
             child_budget = int(
                 conn.execute(

@@ -160,6 +160,8 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
             "task_systems": ["web"],
             "task_toolsets": ["web"],
             "task_skills": ["research"],
+            "task_system": "web",
+            "task_target_resource": "/tmp/allowed-evidence.txt",
         },
         expected_outcome="bounded worker task",
         required_capability="work.delegate",
@@ -167,6 +169,30 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
         risk_class="low",
         reversible=True,
         proposed_by=f"employee:{ids[1]}",
+    )
+    grant_id, created = workforce_delegation.create_grant(
+        conn,
+        organization_id=ids[0],
+        objective_id=ids[4],
+        action_id=action_id,
+        manager_employee_id=ids[1],
+        assignee_profile="ada-research",
+        title="Interview synthesis",
+        body="Summarize independently sourced customer evidence.",
+        capabilities=["web.read"],
+        systems=["web"],
+        toolsets=["web"],
+        skills=["research"],
+        budget_minor=200,
+        expires_at=int(time.time()) + 1_800,
+    )
+    assert created is True
+    row = conn.execute(
+        "SELECT worker_resource_scope_json FROM employee_task_grants WHERE id=?",
+        (grant_id,),
+    ).fetchone()
+    assert row["worker_resource_scope_json"] == (
+        '{"system":"web","target_resource":"/tmp/allowed-evidence.txt"}'
     )
     with pytest.raises(
         workforce_delegation.DelegationError,
@@ -768,16 +794,9 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
         )["id"]
         == grant_id
     )
-    workforce_delegation.authorize_worker_action(
-        capability="web.read", system="kanban", target_resource="default"
-    )
-    with pytest.raises(workforce_delegation.DelegationError, match="capability"):
+    with pytest.raises(workforce_delegation.DelegationError, match="system"):
         workforce_delegation.authorize_worker_action(
-            capability="file.write", system="kanban", target_resource="default"
-        )
-    with pytest.raises(workforce_delegation.DelegationError, match="resource"):
-        workforce_delegation.authorize_worker_action(
-            capability="web.read", system="kanban", target_resource="other"
+            capability="web.read", system="kanban", target_resource="default"
         )
     with pytest.raises(
         workforce_delegation.DelegationError, match="capabilities"
