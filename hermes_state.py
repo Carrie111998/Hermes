@@ -2545,15 +2545,24 @@ class SessionDB:
     def close(self):
         """Close the database connection.
 
-        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        Uses a PASSIVE WAL checkpoint rather than TRUNCATE. A TRUNCATE
+        checkpoint (which grabs an exclusive lock and rewrites b-tree pages)
+        is unsafe when shutdown is triggered by SIGTERM while writes are still
+        in flight (systemd timer, `systemctl restart`, Ctrl-C during a busy
+        session) — the interrupted truncation corrupts the main DB file and
+        leaves the WAL empty, so there is no rollback path (issue #45383,
+        field report 2026-07-27). PASSIVE replays committed frames without an
+        exclusive lock and cannot tear pages; the WAL is settled on the next
+        open via the normal recovery cadence. Shrink-to-zero is not needed at
+        close because a fresh gateway reopens the same DB and continues from
+        the high-water mark.
         """
         with self._lock:
             if self._conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception as exc:
-                    logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
+                    logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
 
@@ -3118,10 +3127,10 @@ class SessionDB:
             # immediately regardless of readers.
             try:
                 with self._lock:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception as exc:
                 logger.debug(
-                    "WAL checkpoint (TRUNCATE) after optimize VACUUM failed: %s",
+                    "WAL checkpoint (PASSIVE) after optimize VACUUM failed: %s",
                     exc,
                 )
 
@@ -10641,11 +10650,13 @@ class SessionDB:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM.
+            # Best-effort PASSIVE WAL checkpoint first, then VACUUM.
+            # PASSIVE (not TRUNCATE) to avoid exclusive-lock b-tree corruption
+            # if a concurrent shutdown races this path (issue #45383).
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
+                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
             self._conn.execute("VACUUM")
         return optimized
 
