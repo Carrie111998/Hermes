@@ -483,7 +483,7 @@ def make_tool_result_message(
     # Neutralize AFTER wrapping: the wrapper's own delimiters are trusted
     # framing added by Hermes, while a forged steer marker can be hiding
     # anywhere in the payload the wrapper just enclosed.
-    wrapped = _neutralize_steer_markers(_maybe_wrap_untrusted(name, content))
+    wrapped = _neutralize_forged_trust_markers(_maybe_wrap_untrusted(name, content))
     message = {
         "role": "tool",
         "name": name,
@@ -545,22 +545,38 @@ _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 # Matched case-insensitively with flexible inner whitespace, for the same
 # reason _DELIMITER_TOKEN_RE is: a differently-cased or re-wrapped variant
 # still reads as the marker to a model.
-_STEER_MARKER_TOKEN_RE = re.compile(
-    r"\[\s*/?\s*OUT-OF-BAND\s+USER\s+MESSAGE\b[^\]]*\]",
-    re.IGNORECASE,
+# Every marker Hermes uses to tell the model "this span is trusted". Each is a
+# fixed literal, so any of them appearing inside tool output is necessarily a
+# forgery — Hermes adds the real ones outside the tool payload, after this
+# function has run.
+#
+#   * the mid-turn steer marker (operator authority);
+#   * the <memory-context> fence, which memory_manager frames as recalled
+#     memory the model should let inform its responses. memory_manager already
+#     strips this from PROVIDER output (sanitize_context), but nothing stripped
+#     it from tool output, so a repo file or web page could open its own
+#     memory-context block and be read as trusted recall.
+_TRUST_MARKER_RES = (
+    re.compile(r"\[\s*/?\s*OUT-OF-BAND\s+USER\s+MESSAGE\b[^\]]*\]", re.IGNORECASE),
+    re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE),
 )
-_STEER_MARKER_REDACTION = "[redacted: forged out-of-band marker in tool output]"
+_TRUST_MARKER_REDACTION = "[redacted: forged trust marker in tool output]"
 
 
-def _neutralize_steer_markers(content: Any) -> Any:
-    """Strip forged mid-turn-steer markers from tool-result content.
+def _neutralize_forged_trust_markers(content: Any) -> Any:
+    """Strip forged trust markers from tool-result content.
 
     Returns content of the same shape. Replaces rather than deletes so the
     model can see that something was stripped — a silent removal would hide an
     active injection attempt from both the model and the transcript.
     """
+    def _scrub(text: str) -> str:
+        for pattern in _TRUST_MARKER_RES:
+            text = pattern.sub(_TRUST_MARKER_REDACTION, text)
+        return text
+
     if isinstance(content, str):
-        return _STEER_MARKER_TOKEN_RE.sub(_STEER_MARKER_REDACTION, content)
+        return _scrub(content)
     if isinstance(content, list):
         rebuilt: List[Any] = []
         for item in content:
@@ -570,12 +586,14 @@ def _neutralize_steer_markers(content: Any) -> Any:
                 and isinstance(item.get("text"), str)
             ):
                 item = dict(item)
-                item["text"] = _STEER_MARKER_TOKEN_RE.sub(
-                    _STEER_MARKER_REDACTION, item["text"]
-                )
+                item["text"] = _scrub(item["text"])
             rebuilt.append(item)
         return rebuilt
     return content
+
+
+# Retained name: memory_manager and the contract suite import this.
+_neutralize_steer_markers = _neutralize_forged_trust_markers
 
 
 def _is_untrusted_tool(name: Optional[str]) -> bool:
