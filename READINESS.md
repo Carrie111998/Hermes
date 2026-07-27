@@ -1121,6 +1121,21 @@ Result: **24 passed, 0 failed**. The worker is authorized for
 `file.write` operation are rejected. This is deterministic authority-store
 evidence and does not establish host filesystem access for production workers.
 
+The file authorization proof was extended through the actual tool entry points
+on current `main` commit `793c7ccc50` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_agentic_business_e2e.py \
+  tests/tools/test_file_tools.py
+```
+
+Result: **75 passed, 0 failed**. The allowed read passed authorization before
+filesystem access; a retargeted read and a write attempt were rejected by the
+same live worker contract. This remains deterministic local authority-store
+evidence and does not establish production host-filesystem access.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

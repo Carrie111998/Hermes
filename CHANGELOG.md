@@ -82,6 +82,9 @@
 - The delegation regression now exercises the concrete local-file contract:
   `file.read` on `localhost:/home/mike/ceofile.txt` cannot read
   `/home/mike/notceofile.txt` or write the granted file.
+- The same regression now invokes the real `read_file_tool` and
+  `write_file_tool` entry points, proving the exact grant is enforced before
+  filesystem access rather than only by a direct policy-unit call.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

@@ -70,6 +70,8 @@ acceptance evidence.
 - The delegated-worker regression suite proves the concrete least-privilege
   contract: an exact read target succeeds, a sibling target is rejected, and
   a write capability cannot be inferred from the read grant.
+- The proof exercises the actual file-tool entry points, so the execution
+  boundary cannot bypass the grant by calling a tool directly.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;
