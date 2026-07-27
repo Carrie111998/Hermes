@@ -1647,6 +1647,27 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production multi-tenant board deployment or external authorization.
 
+## Kanban creation authority evidence (279558018c)
+
+`kanban.create` now requires a SHA-256 resource derived from the complete
+requested task contract: title, body, assignee, parents, tenant, priority,
+workspace/project, skills, model/provider, goal settings, status, session, and
+board. This prevents task creation from bypassing the delegation boundary.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **121 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:c7cade3b2bc4d5f2f15a086970b5ff7fd78386765cc893685c0264fff0d0885b`.
+This remains deterministic local-provider evidence and does not establish
+production multi-tenant task dispatch or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

@@ -68,6 +68,8 @@ acceptance evidence.
   tool allow-list, and backend environment before a child process starts.
 - Kanban task-link mutations are governed by exact parent, child, board, and
   operation scope before durable relationship changes.
+- Kanban task creation is governed by the complete requested task contract,
+  preventing workers from manufacturing broader or differently assigned work.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,

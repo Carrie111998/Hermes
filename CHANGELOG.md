@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Kanban task creation now requires an exact contract-bound `kanban.create`
+  permit covering task identity, assignment, dependencies, tenant, workspace,
+  project, skills, model/provider, goal settings, status, session, and board.
 - Kanban task linking now requires a `kanban.link` permit bound to the exact
   parent task, child task, board, and operation before durable state changes.
 - `execute_code` permits now bind the script, task identity, effective sandbox
