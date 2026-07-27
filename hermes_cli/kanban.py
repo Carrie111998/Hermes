@@ -2170,55 +2170,45 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Goal-mode pre-completion judge gate (mirrors the gate in
-            # tools/kanban_tools.py:_handle_complete — Issue #38367).
-            # Without this, a goal_mode worker can call
-            # `hermes kanban complete <id>` from the terminal tool and
-            # bypass the auxiliary judge that the tool-call path enforces.
+            # Goal-mode pre-completion judge gate (shared with the
+            # kanban_complete tool path — Issue #38367). Without this, a
+            # goal_mode worker can call `hermes kanban complete <id>` from
+            # the terminal tool and bypass the auxiliary judge that the
+            # tool-call path enforces. See hermes_cli/kanban_judge_gate.py
+            # for the transport-failure and rejection-ceiling semantics.
+            from hermes_cli import kanban_judge_gate as judge_gate
+
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode:
-                judge_available = False
-                try:
-                    from agent.auxiliary_client import get_text_auxiliary_client
-                    _client, _model = get_text_auxiliary_client("goal_judge")
-                    judge_available = _client is not None and bool(_model)
-                except Exception:
-                    pass
-                if judge_available:
-                    from hermes_cli.goals import judge_goal
-                    verdict = "done"
-                    reason = ""
-                    try:
-                        # judge_goal returns (verdict, reason, parse_failed,
-                        # wait_directive, transport_failed) — see
-                        # hermes_cli/goals.py. Unpacking fewer raises
-                        # ValueError into the fail-open handler below,
-                        # silently disabling the gate.
-                        verdict, reason, _, _, _ = judge_goal(
-                            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                            last_response=(summary or args.result or "").strip(),
-                        )
-                    except Exception as judge_exc:
-                        import logging as _logging
-                        _logging.getLogger(__name__).warning(
-                            "goal judge check failed, allowing completion: %s",
-                            judge_exc,
-                            exc_info=True,
-                        )
-                    if verdict != "done":
-                        print(
-                            f"kanban: goal completion of {tid} rejected by judge: {reason}. "
-                            f"Provide evidence matching the task's acceptance criteria.",
-                            file=sys.stderr,
-                        )
-                        failed.append(tid)
-                        continue
+            gate = judge_gate.evaluate(
+                kb, conn, task, summary or args.result or "", task_id=tid,
+            )
+            if not gate.allow:
+                print(
+                    f"kanban: goal completion of {tid} rejected by judge: "
+                    f"{gate.reason}. Provide evidence matching the task's "
+                    f"acceptance criteria.",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
+
+            # Per-task copy: `metadata` is shared across every id in this
+            # loop, so stamping it in place would leak one card's bypass
+            # record onto the next.
+            task_metadata = metadata
+            bypass = gate.bypass_kind()
+            if bypass:
+                task_metadata = dict(metadata or {})
+                task_metadata["judge_gate"] = {
+                    "bypass": bypass,
+                    "reason": gate.reason,
+                }
 
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
-                metadata=metadata,
+                metadata=task_metadata,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
