@@ -159,6 +159,10 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.AGENT_LOOP_FAULT: _Spec(Attention.WARN, ALERTS),
     _E.RESOURCE_PRESSURE: _Spec(Attention.WARN, ALERTS),
     _E.CODE_DRIFT: _Spec(Attention.WARN, ALERTS),           # hook: resolved → INFO
+    # The boot report fires only when a boot broke something (2026-07-27):
+    # degraded host, not an operator action. HIGH default + WARN means it
+    # survives significant_only but does not page unless emitted CRITICAL.
+    _E.BOOT_SUMMARY: _Spec(Attention.WARN, ALERTS),
     _E.WATCHDOG_TICK: _Spec(Attention.TRACE, ALERTS),
     _E.WATCHDOG_PROBE_TRANSITION: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
     _E.WATCHDOG_BURST: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),

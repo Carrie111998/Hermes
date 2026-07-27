@@ -528,6 +528,12 @@ class TelegramNotifier(BaseSubscriber):
             from events.formatting import code_drift_body
             return code_drift_body(p)
 
+        if et == EventType.BOOT_SUMMARY:
+            # 2026-07-27: failures/anomalies are lists, so the generic
+            # fallback below would render Python list reprs into the topic.
+            from events.formatting import boot_summary_body
+            return boot_summary_body(p)
+
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"
 

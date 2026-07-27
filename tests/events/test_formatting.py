@@ -490,3 +490,81 @@ class TestCodeDriftBody:
         e = _make_event(EventType.CODE_DRIFT, source="system",
                         payload={"status": "resolved"})
         assert header_dot(e) == PRIORITY_EMOJI[Priority.LOW]
+
+
+class TestBootSummaryBody:
+    """BOOT_SUMMARY bodies (2026-07-27).
+
+    laptop-start.ps1 used to post its boot report as raw text straight at the
+    watchdog_alerts thread, so it was the one message in the feed with no
+    priority dot, icon or source/timestamp header. Routing it through the bus
+    fixes the header but hands `failures`/`anomalies` — both LISTS — to the
+    notifier's generic fallback, which splats Python list reprs. These pin the
+    plain-language body that replaces it.
+    """
+
+    def _payload(self, **over):
+        p = {
+            "boot_id": "20260727-132212", "state": "failed",
+            "total": 22, "done": 20, "failed": 2, "skipped": 1,
+            "failures": ["[critical] gbrain-http: port 7483 never opened",
+                         "[important] mempalace: timed out after 90s"],
+            "anomalies": ["task-329-kill: soak task killed at 578s"],
+        }
+        p.update(over)
+        return p
+
+    def test_headline_carries_boot_id_state_and_counts(self):
+        from events.formatting import boot_summary_body
+        body = boot_summary_body(self._payload())
+        head = body.splitlines()[0]
+        assert "20260727-132212" in head
+        assert "FAILED" in head
+        assert "20/22" in head
+        assert "2 failed" in head
+        assert "1 skipped" in head
+
+    def test_failures_and_anomalies_are_listed_as_lines(self):
+        from events.formatting import boot_summary_body
+        body = boot_summary_body(self._payload())
+        assert "gbrain-http: port 7483 never opened" in body
+        assert "mempalace: timed out after 90s" in body
+        assert "task-329-kill: soak task killed at 578s" in body
+        # Never a raw Python list repr — that is the bug this replaces.
+        assert "['" not in body and "']" not in body
+
+    def test_long_lists_are_bounded_with_a_remainder_line(self):
+        from events.formatting import boot_summary_body
+        body = boot_summary_body(self._payload(
+            failures=[f"[critical] svc-{i}: down" for i in range(12)]))
+        assert "svc-0: down" in body
+        assert "svc-11" not in body
+        assert "7 more" in body
+
+    def test_clean_boot_still_yields_a_body(self):
+        """The producer only emits on trouble, but a hand-run emit with no
+        failures must not produce an empty message (an empty body would strand
+        the header alone in the feed)."""
+        from events.formatting import boot_summary_body
+        body = boot_summary_body(self._payload(
+            state="done", done=22, failed=0, skipped=0,
+            failures=[], anomalies=[]))
+        assert body.strip()
+        assert "22/22" in body
+
+    def test_empty_payload_does_not_raise(self):
+        from events.formatting import boot_summary_body
+        assert boot_summary_body({}).strip()
+
+    def test_icon_matches_the_laptop_start_fallback_glyph(self):
+        """laptop-start.ps1's non-bus fallback header hardcodes U+1F97E so a
+        fallback message looks like the bus-rendered one. If this icon changes,
+        that fallback must change with it."""
+        e = _make_event(EventType.BOOT_SUMMARY, source="laptop-start")
+        assert event_icon(e) == "\U0001F97E"
+
+    def test_whatsapp_header_uses_plain_language(self):
+        e = _make_event(EventType.BOOT_SUMMARY, source="laptop-start")
+        header = format_whatsapp_header(e)
+        assert "BOOT_SUMMARY" not in header
+        assert "BOOT PROBLEMS" in header

@@ -2278,3 +2278,37 @@ class TestJobflowFailureRouting:
             {"job_name": "jobflow-applier"},
         )
         assert notifier.resolve_target(ev)[2] == "100"
+
+
+class TestBootSummaryBody:
+    """BOOT_SUMMARY must reach the plain-language body, not the generic
+    key:value fallback — `failures` and `anomalies` are lists, and the
+    fallback renders lists as Python reprs (2026-07-27)."""
+
+    def test_body_is_plain_language_not_a_list_repr(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.BOOT_SUMMARY, "laptop-start",
+            {"boot_id": "20260727-132212", "state": "failed",
+             "total": 22, "done": 20, "failed": 2, "skipped": 1,
+             "failures": ["[critical] gbrain-http: port 7483 never opened"],
+             "anomalies": ["task-329-kill: soak task killed at 578s"]},
+        )
+        body = notifier._format_payload(event)
+        assert "gbrain-http: port 7483 never opened" in body
+        assert "['" not in body and "']" not in body
+
+    def test_boot_summary_lands_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.BOOT_SUMMARY, "laptop-start", {"state": "failed"},
+        )
+        assert notifier.resolve_target(event)[2] == "100"

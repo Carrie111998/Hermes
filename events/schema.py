@@ -343,6 +343,26 @@ class EventType(Enum):
     #   repo (str)              — checkout path probed
     CODE_DRIFT = ("code_drift", Priority.HIGH)
 
+    # Laptop boot report — added 2026-07-27. ~/laptop-start.ps1 posts a summary
+    # of the logon boot (which services came up, which failed, which anomalies
+    # fired) and used to send it as RAW TEXT straight at the watchdog_alerts
+    # thread, bypassing events.formatting: it was the one message in the feed
+    # with no priority dot, no icon and no source/timestamp header. The script
+    # now shells out to `python -m events.emit_external --type boot_summary`
+    # (see events/emit_external.py) so an out-of-process producer can reach the
+    # bus; the raw send survives only as a fallback for a boot so broken that
+    # Python or the bus DB is unusable. Emitted ONLY when the boot had trouble
+    # (Get-BootSummaryPayload returns null on a clean boot), so this is an
+    # alert, not a heartbeat. HIGH so it survives significant_only /
+    # digest_only verbosity; WARN on watchdog_alerts, which means no WhatsApp
+    # page unless a caller explicitly passes --priority critical. Payload:
+    #   boot_id (str)          — laptop-start's boot id, e.g. "20260727-132212"
+    #   state (str)            — "done" | "failed"
+    #   total/done/failed/skipped (int) — step counts for the boot
+    #   failures (list[str])   — "[tier] name: detail" per failed step
+    #   anomalies (list[str])  — "kind: detail" per error-severity anomaly
+    BOOT_SUMMARY = ("boot_summary", Priority.HIGH)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

@@ -135,6 +135,12 @@ EVENT_TYPE_EMOJI = {
     # not running what main says should be running. Shuffle arrows read as
     # "the code paths crossed"; distinct from 🔃 (PR opened).
     EventType.CODE_DRIFT:               "🔀",
+    # Laptop boot report (2026-07-27) — a boot that came up with services
+    # missing. The boot glyph is deliberately the same code point that
+    # ~/laptop-start.ps1 hardcodes in its non-bus fallback header
+    # (U+1F97E), so a fallback message and a bus-rendered one look alike;
+    # changing it here means changing it there too.
+    EventType.BOOT_SUMMARY:             "🥾",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)
@@ -259,6 +265,7 @@ WHATSAPP_TITLE_BY_EVENT = {
     EventType.RESOURCE_PRESSURE:           "RESOURCE PRESSURE",
     EventType.CODE_DRIFT:                  "STALE CODE RUNNING",
     EventType.DIGEST_GENERATED:            "MORNING DIGEST",
+    EventType.BOOT_SUMMARY:                "BOOT PROBLEMS",
 }
 
 
@@ -575,4 +582,45 @@ def code_drift_body(p: dict) -> str:
         lines.append(
             f"Fix: git -C {repo} merge --ff-only main, then restart the gateway."
         )
+    return "\n".join(lines)
+
+
+def boot_summary_body(payload: dict, *, max_listed: int = 5) -> str:
+    """Plain-language BOOT_SUMMARY body (2026-07-27).
+
+    ~/laptop-start.ps1 emits this only when the logon boot had trouble, so the
+    body leads with the damage: how many services came up out of how many, then
+    the failed steps and error-severity anomalies as individual lines. Both
+    ``failures`` and ``anomalies`` are LISTS, which the notifier's generic
+    key:value fallback renders as Python list reprs — hence a dedicated body.
+
+    Counts are rendered as given rather than recomputed from the lists: the
+    producer's counts cover every step, while the lists carry only the ones it
+    chose to name.
+    """
+    p = payload or {}
+    boot_id = p.get("boot_id") or "?"
+    state = str(p.get("state") or "?").upper()
+    failures = [str(f).strip() for f in (p.get("failures") or []) if str(f).strip()]
+    anomalies = [str(a).strip() for a in (p.get("anomalies") or []) if str(a).strip()]
+
+    head = (f"Boot {boot_id} finished {state} — "
+            f"{p.get('done', '?')}/{p.get('total', '?')} services up")
+    extra = [f"{p[k]} {k}" for k in ("failed", "skipped") if p.get(k)]
+    if extra:
+        head += f" ({', '.join(extra)})"
+    lines = [head + "."]
+
+    for label, items, mark in (("failing step", failures, "✗"),
+                               ("anomaly", anomalies, "⚠")):
+        for item in items[:max_listed]:
+            lines.append(f"{mark} {item}")
+        hidden = len(items) - max_listed
+        if hidden > 0:
+            plural = "s" if hidden != 1 else ""
+            lines.append(f"…and {hidden} more {label}{plural}")
+
+    if not failures and not anomalies:
+        lines.append("No failing steps were named.")
+    lines.append("Full detail: tray Boot panel.")
     return "\n".join(lines)

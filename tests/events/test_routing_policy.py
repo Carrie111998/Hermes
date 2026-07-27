@@ -362,3 +362,27 @@ def test_aliases_are_acyclic():
             assert key not in seen
             seen.add(key)
             key = TOPIC_ALIASES[key]
+
+
+def test_boot_summary_is_warn_on_alerts_without_paging():
+    """laptop-start.ps1's boot report (2026-07-27) is a degraded-host signal,
+    not an operator action: WARN on the alerts topic, HIGH so it survives
+    significant_only/digest_only verbosity, and no WhatsApp page unless a
+    caller explicitly overrides the priority to CRITICAL."""
+    route = classify(make_event(
+        EventType.BOOT_SUMMARY,
+        {"boot_id": "20260727-132212", "state": "failed", "failed": 2},
+        source="laptop-start"))
+    assert route.attention is Attention.WARN
+    assert route.topic_key == ALERTS
+    assert route.priority is Priority.HIGH
+    assert route.wa_tier is None
+    assert route.batch is False
+
+
+def test_boot_summary_at_critical_pages_urgent():
+    """The WARN contract: an explicit --priority critical emit escalates."""
+    route = classify(make_event(
+        EventType.BOOT_SUMMARY, {"state": "failed"},
+        priority=Priority.CRITICAL, source="laptop-start"))
+    assert route.wa_tier == WA_URGENT
