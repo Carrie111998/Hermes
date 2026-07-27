@@ -6,6 +6,7 @@ import json
 import math
 import multiprocessing
 import os
+import stat
 import sys
 import threading
 import time
@@ -125,6 +126,25 @@ def test_marker_entry_cap_includes_the_new_turn(tmp_path, monkeypatch):
     entries = json.loads(path.read_text(encoding="utf-8"))
     assert len(entries) == 32
     assert "new" in entries
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is POSIX durability")
+def test_marker_replace_fsyncs_payload_and_parent_directory(tmp_path, monkeypatch):
+    from tui_gateway import turn_marker
+
+    synced_modes: list[int] = []
+    real_fsync = turn_marker.os.fsync
+
+    def tracking_fsync(fd: int):
+        synced_modes.append(os.fstat(fd).st_mode)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(turn_marker.os, "fsync", tracking_fsync)
+
+    record_turn_start(tmp_path, "session", "durable prompt")
+
+    assert any(stat.S_ISREG(mode) for mode in synced_modes)
+    assert any(stat.S_ISDIR(mode) for mode in synced_modes)
 
 
 def _concurrent_marker_writer(home: str, key: str, barrier) -> None:
