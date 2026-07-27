@@ -111,6 +111,7 @@ hermes-home isolation in tests.
 | Commit | What it is |
 |---|---|
 | `763e4c2f8` | the merge that reconciled local `main` with `origin/main` (1,241 upstream commits). The base every entry above sits on. |
+| `75a67b162` | reconciles this branch with `origin/main` (**160** upstream commits). One conflict, `gateway/run.py`, resolved BY HUNK: an adjacent-addition clash where ours added `_start_worker_bridge_watchers()` and theirs added `on_spawn=None` to `_spawn_supervised()`. Both kept — `on_spawn` is used 5× in upstream's body, and the local method is called at `gateway/run.py:8734` with zero upstream equivalent, so **each whole-side choice breaks the other outright**. Branch is now 0 behind upstream. |
 | `6ab037f1e` | **"restore upstream changes lost by file-level conflict resolution"** — a previous merge resolved a conflict by taking one whole side, silently dropping upstream work, and this commit put it back. |
 
 `6ab037f1e` is the precedent for this entire ledger: whole-file conflict
