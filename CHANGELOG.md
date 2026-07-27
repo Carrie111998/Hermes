@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Kanban comments now require an exact `kanban.comment` permit bound to the
+  task, board, runtime author, and redacted body before durable handoff
+  evidence is written.
 - Kanban task creation now requires an exact contract-bound `kanban.create`
   permit covering task identity, assignment, dependencies, tenant, workspace,
   project, skills, model/provider, goal settings, status, session, and board.

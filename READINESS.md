@@ -1668,6 +1668,27 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production multi-tenant task dispatch or external authorization.
 
+## Kanban comment authority evidence (464f01f0ea)
+
+`kanban.comment` now requires a SHA-256 resource derived from the exact task,
+board, runtime author, and redacted comment body. Durable handoff evidence
+cannot be redirected or rewritten under a broader comment grant, and caller
+supplied author identities remain ignored.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **122 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:6592d9e527e686808ed44081adfb16331e8a26d9fd825832a3f62ee5b83149ab`.
+This remains deterministic local-provider evidence and does not establish
+production multi-tenant evidence storage or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
