@@ -31,6 +31,9 @@ acceptance evidence.
 - Governed browser workers must authorize each browser operation separately
   against the exact session resource; a navigation grant does not imply click,
   typing, evaluation, screenshot, or other browser authority.
+- Navigation permits additionally bind the exact browser session to a hashed
+  destination URL, preventing cross-session replay of an otherwise valid URL
+  grant.
 - Raw CDP access is also governed: each call is bound to the exact CDP method,
   browser session, and optional target/frame resource.
 - Desktop computer-use actions are governed per operation and desktop session;

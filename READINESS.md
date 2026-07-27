@@ -1506,6 +1506,31 @@ acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production messaging credentials, permissions, or external authorization.
 
+## Browser navigation authority evidence (8782d3a21d)
+
+Browser navigation now requires `browser.navigate` against a resource derived
+from the exact browser session and a SHA-256 digest of the normalized URL.
+Navigation remains distinct from click, typing, evaluation, snapshot, and CDP
+capabilities; a URL grant cannot be replayed in another worker session.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/browser_tool.py
+uv run --extra dev pytest -q \
+  tests/tools/test_browser_camofox.py \
+  tests/tools/test_browser_hardening.py \
+  tests/tools/test_browser_secret_exfil.py \
+  tests/tools/test_browser_ssrf_local.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **104 browser regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:08a98c235cb09005802fa7454ea5feaaec49c01059eb89b805b5d18b7d8a00b2`.
+This remains deterministic local-provider evidence and does not establish
+production browser credentials, permissions, or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

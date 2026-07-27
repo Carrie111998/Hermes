@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Browser navigation permits now bind to the exact browser session as well as
+  the destination URL, preventing a URL grant from being replayed in another
+  worker's browser context.
 - Outbound `send_message` and reaction actions now require permits bound to
   the resolved platform, chat, thread, exact message or emoji, media list, and
   delivery mode; target aliases and content changes cannot reuse a grant.
