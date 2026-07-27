@@ -45,6 +45,8 @@
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy
   `__unscoped__` objective stores retain their explicit compatibility path.
+- Organization-bound permits now require a known employee executor; control
+  or arbitrary service labels cannot receive execution authority implicitly.
 - Revocation checks now traverse the parent-grant chain and fail closed when
   any ancestor is revoked or the chain is cyclic, fencing descendant workers
   and result handoffs immediately.

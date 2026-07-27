@@ -1037,7 +1037,9 @@ def issue_permit(
         if action["status"] != "proposed":
             raise PermitError(f"action is not awaiting a permit: {action['status']}")
         objective = get_objective(conn, action["objective_id"])
-        _assert_employee_actor_scope(conn, action["objective_id"], issued_to)
+        _assert_employee_actor_scope(
+            conn, action["objective_id"], issued_to, require_employee=True
+        )
         if objective.status not in {"planned", "authorized", "executing"}:
             raise PermitError(
                 f"objective status {objective.status} does not admit new permits"
@@ -1435,14 +1437,13 @@ def _has_passing_current_plan_verification(
 
 
 def _assert_employee_actor_scope(
-    conn: sqlite3.Connection, objective_id: str, actor: str
+    conn: sqlite3.Connection,
+    objective_id: str,
+    actor: str,
+    *,
+    require_employee: bool = False,
 ) -> None:
-    """Reject employee identities attempting to mutate another organization."""
-    if not actor.startswith("employee:"):
-        return
-    employee_id = actor.split(":", 1)[1].strip()
-    if not employee_id:
-        raise ObjectiveStateError("employee actor identity is empty")
+    """Check an employee actor, optionally requiring it for execution permits."""
     objective = conn.execute(
         "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)
     ).fetchone()
@@ -1458,6 +1459,15 @@ def _assert_employee_actor_scope(
         # Legacy objective stores use synthetic planner/worker identities and
         # have no organization-level employee authority to resolve.
         return
+    if not actor.startswith("employee:"):
+        if not require_employee:
+            return
+        raise ObjectiveStateError(
+            "organization-bound execution actor must be an employee identity"
+        )
+    employee_id = actor.split(":", 1)[1].strip()
+    if not employee_id:
+        raise ObjectiveStateError("employee actor identity is empty")
     employee = conn.execute(
         "SELECT organization_id,status FROM employees WHERE id=?", (employee_id,)
     ).fetchone()

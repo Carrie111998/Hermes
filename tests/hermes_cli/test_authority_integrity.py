@@ -123,11 +123,20 @@ def test_policy_revision_revokes_every_unconsumed_execution_permit(tmp_path):
         reversible=True,
         proposed_by="employee:ceo",
     )
+    with pytest.raises(db.ObjectiveStateError, match="execution actor"):
+        db.issue_permit(
+            conn,
+            action_id,
+            capability="work.delegate",
+            issued_to="executor:kanban",
+            policy_version="charter-v1",
+            expires_at=int(time.time()) + 300,
+        )
     permit_id = db.issue_permit(
         conn,
         action_id,
         capability="work.delegate",
-        issued_to="executor:kanban",
+        issued_to=f"employee:{organization_db.active_ceo(conn)['id']}",
         policy_version="charter-v1",
         expires_at=int(time.time()) + 300,
     )

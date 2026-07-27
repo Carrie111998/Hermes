@@ -37,6 +37,9 @@ acceptance evidence.
   the only compatibility alias is `employee:ceo`, which resolves to the
   active CEO of the objective's organization. Legacy `__unscoped__` objective
   stores remain explicitly outside the organization identity boundary.
+- Organization-bound execution permits require a known `employee:<id>`
+  executor; control and arbitrary service labels cannot be used as an
+  execution principal without an explicit employee identity.
 - Registered action payload schemas and temporal observation windows are
   validated before permit admission and again at the final execution boundary.
 - Runtime construction rejects self-supervising verifier identities; verifier
