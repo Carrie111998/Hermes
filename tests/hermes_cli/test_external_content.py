@@ -7,6 +7,15 @@ from hermes_cli import external_content
 from hermes_cli import objectives_db
 
 
+def test_external_content_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    external_content.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    external_content.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_prompt_injection_is_quarantined_and_never_treated_as_authority():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
