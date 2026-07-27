@@ -44,6 +44,11 @@ ahead. Nothing has been pushed.
 | `326ebcf2f` | batch-delegation cancellation must not block | `tools/delegate_tool.py` | `tests/tools/test_delegate_batch_cancellation.py`, contract #12 | upstream stops using a joining `with` block |
 | `10ba6cc4f` | alert cursor advances only after a durable hand-off | `gateway/worker_bridge_watchers.py` | `tests/gateway/test_worker_bridge_alert_handoff.py` | the adapter gains a real delivery acknowledgement |
 | `8364110ab` | `_worker` arg shape branches on the running CPython | `tools/daemon_pool.py` | `tests/tools/test_daemon_pool.py`, contract #7 | upstream stops mirroring the private stdlib function |
+| `077df8c92` | force push via `+refspec` classified dangerous; `.env` write-denied (H-24, H-25) | `tools/approval.py`, `agent/file_safety.py` | `tests/tools/test_destructive_gate_gaps.py`, contract #15 | upstream gates both |
+| `0c7763004` | warn before overwriting a file never read (H-23) | `tools/file_state.py` | `tests/tools/test_file_staleness.py`, contract #16 | upstream adds read-before-write feedback |
+| `07be9aa79` | recalled memory threat-scanned and framed as evidence (H-09) | `agent/memory_manager.py` | `tests/agent/test_memory_context_trust.py`, contract #17 | upstream scans provider prefetch |
+| `7069765d9` | injected guidance stops overriding identity approval rules (H-06) | `agent/prompt_builder.py` | `tests/agent/test_guidance_does_not_override_identity.py`, contract #18 | upstream removes the bypass phrasing |
+| `2fdfe381d` | contract tests + regression simulations for the five above | — (local-policy) | self-verifying via the harness | never |
 
 **Highest merge sensitivity:** `run_agent.py` (~17.8k lines) and
 `agent/tool_dispatch_helpers.py`. A whole-file conflict resolution on either
