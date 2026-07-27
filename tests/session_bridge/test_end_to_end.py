@@ -57,6 +57,8 @@ from session_bridge.sidebar import (
     VerifiedSidebarThread,
     encode_hydration_marker,
 )
+from session_bridge.sidebar_executor import NativeTurnAmbiguous
+from session_bridge.sidebar_hydration_executor import SidebarHydrationExecutor
 from session_bridge.store import SessionBridgeStore
 
 
@@ -2737,6 +2739,322 @@ def test_reported_legacy_task_hydrates_once_and_reconciles_ambiguous_send(
             and "set_thread_archived" not in {event["tool"] for event in trace}
             for trace in hydration_traces
         )
+    finally:
+        harness.close()
+
+
+def test_sidebar_backlog_recovery_preserves_exact_tasks_and_drains_both_ledgers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from session_bridge.cli import ProductionBackend
+
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        legacy_sources: list[str] = []
+        for label in ("legacy-a", "legacy-b"):
+            cwd = tmp_path / label
+            harness.add_project(f"{label}-project", cwd)
+            source_id = harness.seed_source(
+                Provider.CLAUDE,
+                label,
+                cwd=cwd,
+                content=f"{label}-message-0",
+            )
+            for index in range(1, 7):
+                harness.db.append_message(
+                    source_id,
+                    "user" if index % 2 == 0 else "assistant",
+                    f"{label}-message-{index}",
+                    timestamp=harness.now - 7 + index,
+                )
+            legacy_sources.append(source_id)
+
+        assert harness.register().queued == 2
+        with harness.client() as client:
+            assert all(
+                harness.run_worker_once(client)[0]["state"]
+                == SidebarJobState.VISIBLE.value
+                for _ in legacy_sources
+            )
+
+        harness.config = replace(
+            harness.config,
+            sidebar=replace(
+                harness.config.sidebar,
+                readable_preview_enabled=True,
+                legacy_hydration_enabled=True,
+            ),
+        )
+        harness.coordinator._config = harness.config
+        harness._rebuild_app()
+        readable_cwd = tmp_path / "already-readable"
+        harness.add_project("already-readable-project", readable_cwd)
+        readable_source = harness.seed_source(
+            Provider.CLAUDE,
+            "already-readable",
+            cwd=readable_cwd,
+            content="already-readable-message",
+        )
+        assert harness.register().queued == 1
+        with harness.client() as client:
+            assert harness.run_worker_once(client)[0]["state"] == (
+                SidebarJobState.VISIBLE.value
+            )
+
+        original_thread_ids = {
+            source_id: str(
+                harness.store.get_sidebar_job_for_source(source_id)[
+                    "codex_thread_id"
+                ]
+            )
+            for source_id in (*legacy_sources, readable_source)
+        }
+
+        class ExactNativeRecovery:
+            def __init__(self) -> None:
+                self.ambiguous_thread_id = original_thread_ids[legacy_sources[1]]
+                self.dropped = False
+
+            def read_thread_initial_prompt(
+                self,
+                *,
+                thread_id: str,
+                deadline: float,
+            ) -> str:
+                assert deadline > 0
+                return str(harness.native.read_thread(thread_id=thread_id)["prompt"])
+
+            def thread_has_exact_marker(
+                self,
+                *,
+                thread_id: str,
+                marker: str,
+                deadline: float,
+            ) -> bool:
+                assert deadline > 0
+                return any(
+                    marker in turn["content"] and turn["status"] == "completed"
+                    for turn in harness.native.read_thread(thread_id=thread_id)[
+                        "turns"
+                    ]
+                )
+
+            def start_text_turn_and_verify_marker(
+                self,
+                *,
+                thread_id: str,
+                message: str,
+                marker: str,
+                deadline: float,
+            ) -> None:
+                assert deadline > 0
+                drop = thread_id == self.ambiguous_thread_id and not self.dropped
+                if drop:
+                    self.dropped = True
+                try:
+                    harness.native.send_message_to_thread(
+                        thread_id=thread_id,
+                        message=message,
+                        drop_after_append=drop,
+                    )
+                except RuntimeError as exc:
+                    raise NativeTurnAmbiguous(
+                        "synthetic post-dispatch ambiguity"
+                    ) from exc
+                assert self.thread_has_exact_marker(
+                    thread_id=thread_id,
+                    marker=marker,
+                    deadline=deadline,
+                )
+
+        native_recovery = ExactNativeRecovery()
+        backend = ProductionBackend(harness.config)
+        backend._store = harness.store
+        backend._catalog = harness.catalog
+        monkeypatch.setattr(
+            "session_bridge.cli.resolve_marker_key",
+            lambda: _MARKER_SECRET,
+        )
+        monkeypatch.setattr(
+            "session_bridge.cli.time.time",
+            lambda: harness.now,
+        )
+        monkeypatch.setattr(
+            backend,
+            "_require_sidebar_terminal_delivery",
+            lambda: native_recovery,
+        )
+
+        dry_run = backend.sidebar_hydration_seed_backfill(
+            days=30,
+            apply=False,
+            confirmation=None,
+        )
+        assert dry_run == {
+            "mode": "dry_run",
+            "days": 30,
+            "examined": 3,
+            "eligible": 2,
+            "already_readable": 1,
+            "seeded": 0,
+            "blocked": 0,
+            "blocked_codes": {},
+        }
+        applied = backend.sidebar_hydration_seed_backfill(
+            days=30,
+            apply=True,
+            confirmation="HYDRATE_ALL_EXACT_EXISTING_TASKS",
+        )
+        assert applied == {**dry_run, "mode": "apply", "seeded": 2}
+
+        hydration_executor = SidebarHydrationExecutor(
+            claim_once=lambda: asyncio.run(
+                harness.coordinator.claim_sidebar_hydration_for_delivery(limit=1)
+            ),
+            store=harness.store,
+            native=native_recovery,
+            marker_secret=_MARKER_SECRET,
+            clock=lambda: harness.now,
+            monotonic=lambda: 1_000.0,
+        )
+        create_count_before_hydration = len(harness.native.create_calls)
+        hydration_results = [
+            hydration_executor.run_once(),
+            hydration_executor.run_once(),
+        ]
+        assert [result.status for result in hydration_results] == [
+            "visible",
+            "retry",
+        ]
+        harness.advance_retry()
+        reconciled = hydration_executor.run_once()
+        assert reconciled.status == "visible"
+        assert len(harness.native.create_calls) == create_count_before_hydration
+
+        sent_by_thread = {
+            thread_id: [
+                message
+                for sent_id, message in harness.native.send_calls
+                if sent_id == thread_id
+            ]
+            for thread_id in original_thread_ids.values()
+        }
+        for source_id in legacy_sources:
+            thread_id = original_thread_ids[source_id]
+            assert len(sent_by_thread[thread_id]) == 1
+            last_five = sent_by_thread[thread_id][0].split(
+                "## Last 5 Messages",
+                1,
+            )[1].split("## In-place Session Bridge Hydration", 1)[0]
+            label = source_id.removeprefix("claude:")
+            for index in range(2, 7):
+                assert f"{label}-message-{index}" in last_five
+            assert f"{label}-message-1" not in last_five
+            assert (
+                harness.store.get_sidebar_job_for_source(source_id)[
+                    "codex_thread_id"
+                ]
+                == thread_id
+            )
+        assert sent_by_thread[original_thread_ids[readable_source]] == []
+
+        pending_sources: list[str] = []
+        final_now = harness.now
+        for label, age in (
+            ("oldest", 100.0),
+            ("fresh-3", 3.0),
+            ("fresh-2", 2.0),
+            ("fresh-1", 1.0),
+        ):
+            harness.now = final_now - age
+            cwd = tmp_path / label
+            harness.add_project(f"{label}-project", cwd)
+            pending_sources.append(
+                harness.seed_source(
+                    Provider.CLAUDE,
+                    label,
+                    cwd=cwd,
+                    content=f"{label}-message",
+                )
+            )
+        harness.now = final_now
+        pending_backfill = asyncio.run(
+            harness.coordinator.backfill_sidebar_jobs_once(
+                days=30,
+                limit=10,
+                apply=True,
+                now=harness.now,
+            )
+        )
+        assert pending_backfill.queued == 4
+
+        def _prepare_pending_lane(conn) -> None:
+            conn.execute(
+                "DELETE FROM session_bridge_state WHERE key = ?",
+                ("session-bridge:sidebar:pending-lane:v1",),
+            )
+
+        harness.db._execute_write(_prepare_pending_lane)
+        harness._rebuild_app()
+        with harness.client() as client:
+            for index, _source_id in enumerate(pending_sources):
+                outcome = harness.run_worker_once(client)
+                assert outcome, (
+                    index,
+                    harness.store.sidebar_delivery_status(now=harness.now),
+                )
+                assert outcome[0]["state"] == SidebarJobState.VISIBLE.value
+
+        registration_order = [
+            decode_bridge_marker(
+                _registration_marker(call["prompt"]),
+                _MARKER_SECRET,
+            ).source_session_id
+            for call in harness.native.create_calls[-4:]
+        ]
+        assert registration_order == [
+            pending_sources[3],
+            pending_sources[2],
+            pending_sources[1],
+            pending_sources[0],
+        ]
+        assert len(harness.native.create_calls) == (
+            create_count_before_hydration + len(pending_sources)
+        )
+        assert harness.native.app_server_create_calls == []
+
+        sidebar_counts = harness.store.sidebar_delivery_status(
+            now=harness.now
+        )["counts"]
+        hydration_counts = harness.store.sidebar_hydration_status(
+            harness.now
+        )["counts"]
+        assert all(
+            sidebar_counts[state.value] == 0
+            for state in (
+                SidebarJobState.PENDING,
+                SidebarJobState.LEASED,
+                SidebarJobState.RETRY,
+            )
+        )
+        assert all(
+            hydration_counts[state.value] == 0
+            for state in (
+                SidebarHydrationState.PENDING,
+                SidebarHydrationState.LEASED,
+                SidebarHydrationState.RETRY,
+            )
+        )
+        assert sidebar_counts[SidebarJobState.FAILED.value] == 0
+        assert hydration_counts[SidebarHydrationState.FAILED.value] == 0
+        for source_id, thread_id in original_thread_ids.items():
+            assert (
+                harness.store.get_sidebar_job_for_source(source_id)[
+                    "codex_thread_id"
+                ]
+                == thread_id
+            )
     finally:
         harness.close()
 
