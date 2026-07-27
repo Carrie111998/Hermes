@@ -33,6 +33,8 @@
   deduplicated advisor intervention for each stale worker.
 - Gateway-hosted objective supervision now reconciles stale gateway workers
   before registering a replacement worker.
+- Supervised workers now fence each cycle on their durable heartbeat lease and
+  stop when that lease is revoked.
 - Autonomous readiness stops now persist advisor handoffs for missing CEO
   authority, unavailable governed capabilities, and unreachable objectives;
   objectives without admissible verifiers are blocked before execution.

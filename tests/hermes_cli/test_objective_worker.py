@@ -159,6 +159,34 @@ def test_worker_heartbeat_continues_during_blocking_cycle(tmp_path):
         assert int(row["heartbeat_at"]) > 1
 
 
+def test_worker_stops_after_its_lease_is_revoked_during_tick(tmp_path):
+    path = tmp_path / "authority.db"
+    calls = []
+
+    def tick():
+        calls.append(True)
+        conn = objectives_db.connect(path)
+        try:
+            conn.execute(
+                "UPDATE objective_workers SET status='stale', stop_reason=? "
+                "WHERE status='running'",
+                ("heartbeat_stale",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return SimpleNamespace(status="idle")
+
+    assert objective_worker.run_forever(
+        db_path=path, interval_seconds=0.01, tick=tick, max_cycles=10
+    ) == 1
+    conn = objectives_db.connect(path)
+    worker = objective_worker.worker_health(conn)[0]
+    assert calls == [True]
+    assert worker["status"] == "stale"
+    assert worker["stop_reason"] == "heartbeat_stale"
+
+
 def test_repeated_systemic_failures_open_circuit_and_exit_nonzero(
     tmp_path, monkeypatch
 ):

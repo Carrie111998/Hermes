@@ -416,14 +416,21 @@ def run_forever(
         )
         worker_id = register_worker(conn)
         try:
-            with WorkerHeartbeatKeeper(conn, worker_id):
+            with WorkerHeartbeatKeeper(conn, worker_id) as heartbeat_keeper:
                 while (
                     not stop_requested.is_set()
                     and (max_cycles is None or cycles < max_cycles)
                 ):
+                    try:
+                        heartbeat_keeper.assert_healthy()
+                    except RuntimeError:
+                        shutdown_reason = "worker_lease_lost"
+                        exit_code = 1
+                        break
                     consecutive_failures = 0
                     try:
                         outcome = tick()
+                        heartbeat_keeper.assert_healthy()
                         status = str(getattr(outcome, "status", "unknown"))
                         consecutive_failures = heartbeat(
                             conn, worker_id, cycle_status=status
@@ -436,9 +443,17 @@ def run_forever(
                             )
                             break
                     except Exception as exc:
-                        consecutive_failures = heartbeat(
-                            conn, worker_id, cycle_status="worker_error", error=str(exc)
-                        )
+                        try:
+                            consecutive_failures = heartbeat(
+                                conn,
+                                worker_id,
+                                cycle_status="worker_error",
+                                error=str(exc),
+                            )
+                        except RuntimeError:
+                            shutdown_reason = "worker_lease_lost"
+                            exit_code = 1
+                            break
                         from hermes_cli import operational_control
 
                         if operational_control.autonomy_state(conn)["mode"] != "autonomous":

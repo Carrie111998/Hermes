@@ -605,8 +605,15 @@ async def gateway_watcher(runner) -> None:
         try:
             with objective_worker.WorkerHeartbeatKeeper(
                 health_conn, worker_id
-            ):
+            ) as heartbeat_keeper:
                 while runner._running:
+                    try:
+                        heartbeat_keeper.assert_healthy()
+                    except RuntimeError:
+                        logger.error(
+                            "objective runtime heartbeat lease lost; stopping gateway worker"
+                        )
+                        return
                     try:
                         config = load_config()
                         charter = config.get("agentic") or {}
@@ -653,6 +660,7 @@ async def gateway_watcher(runner) -> None:
                     consecutive_failures = 0
                     try:
                         outcome = await asyncio.to_thread(tick_once)
+                        heartbeat_keeper.assert_healthy()
                         consecutive_failures = objective_worker.heartbeat(
                             health_conn, worker_id, cycle_status=outcome.status
                         )
@@ -666,12 +674,18 @@ async def gateway_watcher(runner) -> None:
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        consecutive_failures = objective_worker.heartbeat(
-                            health_conn,
-                            worker_id,
-                            cycle_status="worker_error",
-                            error=str(exc),
-                        )
+                        try:
+                            consecutive_failures = objective_worker.heartbeat(
+                                health_conn,
+                                worker_id,
+                                cycle_status="worker_error",
+                                error=str(exc),
+                            )
+                        except RuntimeError:
+                            logger.error(
+                                "objective runtime heartbeat lease lost after tick; stopping gateway worker"
+                            )
+                            return
                         logger.exception("objective runtime tick failed")
                         if consecutive_failures >= failure_threshold:
                             objective_worker.open_worker_circuit(

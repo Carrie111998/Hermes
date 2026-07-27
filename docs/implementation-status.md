@@ -52,6 +52,8 @@
   deduplicated advisor intervention with restart/diagnose/manual options.
 - Gateway-hosted objective supervision applies the same stale-worker
   reconciliation before registering its replacement worker.
+- Supervised workers assert their heartbeat lease before and after each tick;
+  a revoked lease stops the process before it can begin another cycle.
 - Readiness stops now persist deduplicated advisor handoffs for missing CEO
   authority, unavailable governed capabilities, and objectives without an
   admissible success verifier; unreachable objectives are blocked before any
