@@ -339,6 +339,41 @@ class TestNodeToolRunnable:
 
         assert find_node_executable("npm") is None
 
+    def test_missing_managed_npm_heals_when_node_present(self, tmp_path, monkeypatch):
+        """A gutted tree (node exists, npm missing entirely) must still heal.
+
+        Previously heal only ran when a broken npm *file* was found, so a
+        tree stripped down to just node never healed — and, because the tree
+        was still "present", find_node_executable never fell back to PATH
+        either, failing every npm resolution forever.
+        """
+        profile_home = tmp_path / "profiles" / "assistant"
+        managed_bin = profile_home / "node" / "bin"
+        managed_bin.mkdir(parents=True)
+        self._stub(managed_bin, "node", "#!/bin/sh\necho '22.0.0'\nexit 0\n")
+        heal_called = {"value": False}
+
+        system_bin = tmp_path / "system-bin"
+        system_bin.mkdir()
+        self._stub(system_bin, "npm", "#!/bin/sh\necho '11.10.0'\nexit 0\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("PATH", str(system_bin))
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+
+        def _heal():
+            heal_called["value"] = True
+            healed = managed_bin / "npm"
+            healed.write_text("#!/bin/sh\necho '22.0.0'\nexit 0\n")
+            healed.chmod(0o755)
+            return True
+
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", _heal)
+
+        resolved = find_node_executable("npm")
+        assert heal_called["value"] is True
+        assert resolved == str(managed_bin / "npm")
+
     def test_healthy_managed_npm_still_preferred(self, tmp_path, monkeypatch):
         profile_home = tmp_path / "profiles" / "assistant"
         managed_bin = profile_home / "node" / "bin"
@@ -353,6 +388,63 @@ class TestNodeToolRunnable:
         monkeypatch.setenv("PATH", str(system_bin))
 
         assert find_node_executable("npm") == str(managed_npm)
+
+
+class TestInstallExtractedNodeTree:
+    """_install_extracted_node_tree() must never gut an existing tree."""
+
+    def test_additive_install_over_gutted_tree(self, tmp_path):
+        extracted = tmp_path / "extracted"
+        (extracted / "node_modules" / "npm").mkdir(parents=True)
+        (extracted / "node.exe").write_text("new-node")
+        (extracted / "npm.cmd").write_text("new-npm")
+        (extracted / "node_modules" / "npm" / "cli.js").write_text("cli")
+
+        target = tmp_path / "node"
+        target.mkdir()
+        (target / "node.exe").write_text("old-node")
+
+        hermes_constants._install_extracted_node_tree(extracted, target)
+
+        assert (target / "node.exe").read_text() == "new-node"
+        assert (target / "npm.cmd").read_text() == "new-npm"
+        assert (target / "node_modules" / "npm" / "cli.js").read_text() == "cli"
+
+    def test_locked_file_renamed_aside_and_replaced(self, tmp_path, monkeypatch):
+        """A destination that cannot be overwritten is renamed aside, not fatal."""
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        (extracted / "node.exe").write_text("new-node")
+        (extracted / "npm.cmd").write_text("new-npm")
+
+        target = tmp_path / "node"
+        target.mkdir()
+        locked = target / "node.exe"
+        locked.write_text("old-node")
+
+        real_replace = os.replace
+        state = {"denied": False}
+
+        def _replace(src, dst):
+            # Deny the first direct overwrite of node.exe, as Windows does
+            # for a running executable; renames of it still succeed.
+            if (
+                not state["denied"]
+                and Path(dst) == locked
+                and str(src).endswith(".hermes-heal-new")
+            ):
+                state["denied"] = True
+                raise PermissionError(13, "in use", str(dst))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(hermes_constants.os, "replace", _replace)
+
+        hermes_constants._install_extracted_node_tree(extracted, target)
+
+        assert (target / "node.exe").read_text() == "new-node"
+        assert (target / "npm.cmd").read_text() == "new-npm"
+        assert not list(target.rglob("*.hermes-heal-old"))
+        assert not list(target.rglob("*.hermes-heal-new"))
 
 
 class TestIsContainer:
