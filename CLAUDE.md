@@ -236,3 +236,17 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   (incl. cita literal `"using Nous as inference provider"`). `User-Agent:
   "Hermes-Monitor/1.0"` → `"IYARI-Monitor/1.0"`. Build limpio: 98/98 warnings
   idénticos a la baseline.
+
+## Auto-aprobación delegada (GRUPO 6)
+
+El usuario delega aprobación previa para lotes mecánicos de rebranding en `website/i18n/zh-Hans/`. Claude Code puede aplicar, commitear y pushear SIN preguntar si se cumplen TODAS estas condiciones:
+
+1. Alcance del lote está en la tabla de lotes del GRUPO 6.
+2. Dry-run muestra solo transformaciones esperadas: `Hermes Agent`→IYARI, `Hermes` suelto→IYARI, `NousResearch/hermes-agent`→digital-services-llc/iyari.
+3. Se preservan: `hermes` minúscula, `HERMES_*`, URLs `nousresearch.com`/`hermes-agent.nousresearch.com`, IDs modelo `NousResearch/Hermes-*`, `LICENSE`, Nous Portal, clases `Hermes*`, `HermesBench`, `X-Hermes-*`.
+4. Auditoría residual no encuentra `Hermes`/`Nous Research` no preservados.
+5. Build acotado `npm run build -- --locale zh-Hans` no introduce warnings ni anclas rotas nuevas respecto a la línea base.
+6. Mensaje de commit: `G6 lote N: rebrand i18n/zh-Hans/<ruta>/ (X archivos)`.
+7. Autor: `Digital Services LLC <info@digitalservices.app>`, sin Co-Authored-By.
+
+Si FALTA alguna condición, Claude para y pregunta. Esta delegación NO aplica a Fase 1, operaciones destructivas ni gasto extra no presupuestado.
