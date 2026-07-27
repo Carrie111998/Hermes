@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Objective runtime now classifies LLM/provider rate-limit failures, persists a
+  durable retry marker and backoff, honors provider retry hints, and resumes
+  the claimed event without replaying an external action.
 - Added `scripts/run_agentic_acceptance.sh`, a current-tree install-to-restart
   Founder/CEO acceptance scenario with durable recovery and zero duplicate
   provider effects; evidence is recorded in `docs/agentic-bootstrap.md` and

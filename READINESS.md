@@ -170,6 +170,19 @@ scripts/run_tests.sh -q -j 4 \
 Result: **23 passed, 0 failed**. This focused ingress regression is supporting
 evidence, not an expansion of the release-gate capability inventory.
 
+LLM/provider rate-limit recovery was separately validated on current `main`
+with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_objective_runtime.py -q
+```
+
+Result: **26 passed, 0 failed**. The regression raises a deterministic 429-like
+planner failure, records `rate_limited:` in the durable inbox error, retries
+after the persisted backoff, and verifies exactly one execution result. This
+is local deterministic provider-boundary evidence; it does not establish live
+LLM credentials, vendor rate-limit behavior, or production availability.
+
 ## Current-tree install-to-restart acceptance
 
 The current main branch has a separate, broader acceptance scenario. It is not

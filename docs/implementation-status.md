@@ -29,6 +29,9 @@ acceptance evidence.
   charter handoff without starting autonomy.
 - Standalone objective-worker launch registers durable worker health and stops
   fail-closed when the provider/evidence boundary is unavailable.
+- Planner/provider rate-limit failures are classified explicitly, persisted in
+  the durable event retry state with bounded backoff, and recover on a later
+  tick without losing the claim or duplicating an action.
 - Fail-closed worker cycle reasons are retained in `last_error` for operator
   diagnosis instead of being reduced to a status-only signal.
 - Security-readiness blocks now create deduplicated, organization-scoped
