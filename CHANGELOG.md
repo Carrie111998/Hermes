@@ -52,6 +52,9 @@
   require `mcp.call` permits bound to the exact configured server and tool
   (plus URI or prompt name where applicable); MCP cannot bypass the authority
   plane merely because a server advertises a tool.
+- Cron scheduler mutations (`create`, `update`, `pause`, `resume`, `remove`,
+  and immediate run) now require operation-specific permits bound to the exact
+  scheduled job, or the exact creation identity before a job exists.
 - Grant admission now requires the delegator employee and mandate to be
   active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority

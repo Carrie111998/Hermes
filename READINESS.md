@@ -1360,6 +1360,32 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production MCP-server trust or external authorization.
 
+## Scheduler authority evidence (47c396c62b)
+
+Cron mutations now require operation-specific capabilities (`cron.create`,
+`cron.update`, `cron.pause`, `cron.resume`, `cron.remove`, or `cron.run`) and
+an exact scheduler resource. Existing jobs use `cron-job:<id>`; creation uses
+`cron-create:<name-or-schedule>`. Read-only listing remains available without
+mutation authority, while immediate execution is governed as a run action.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/cronjob_tools.py tests/tools/test_cronjob_tools.py
+uv run --extra dev pytest -q \
+  tests/tools/test_cronjob_tools.py \
+  tests/tools/test_cronjob_run_immediate.py \
+  tests/tools/test_cron_approval_mode.py \
+  tests/tools/test_cron_prompt_injection.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **125 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:e57b0e27ae859805458206cad65384b7f7139a3694aeba91d581c125e59d9f3f`.
+This remains deterministic local-provider evidence and does not establish
+production scheduler deployment or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

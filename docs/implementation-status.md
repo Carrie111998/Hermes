@@ -38,6 +38,8 @@ acceptance evidence.
   callback or an unrestricted computer-use toolset.
 - Dynamic MCP tools and resource/prompt utilities are governed per server and
   tool, with URI or prompt-name scope for parameterized utility calls.
+- Cron scheduler mutations are governed per operation and exact job resource;
+  scheduled work cannot be created, changed, or fired by an unpermitted worker.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,
