@@ -1,24 +1,33 @@
 ---
 sidebar_position: 2
 title: "Installation"
-description: "Install Hermes Agent on Linux, macOS, WSL2, native Windows, or Android via Termux"
+description: "Install the independently maintained Charterforge runtime from source"
 ---
 
 # Installation
 
-Get Hermes Agent up and running in under two minutes!
+Charterforge is currently installed from this fork's source checkout. No
+independent hosted installer or release artifact is claimed here.
 
 :::tip Platform Support
 For the full platform support matrix (which OSes, distribution methods, and
 platform-gated features are supported), see **[Platform Support](./platform-support.md)**.
 :::
 
-## Quick Install
-### With the Hermes Desktop installer on macOS or Windows (recommended)
-To easily install the command-line and desktop applications, [download the Hermes Desktop installer](https://hermes-agent.nousresearch.com/) from our website and run it.
+## Source install
 
-### Without Hermes Desktop:
-For a command-line only install without Hermes Desktop, run:
+Clone the independent fork, create the project environment, and invoke the
+canonical command through the supported `uv` entrypoint:
+
+```bash
+git clone https://github.com/mikeholownych/hermes-agent.git charterforge
+cd charterforge
+uv sync
+uv run charterforge --help
+```
+
+The legacy installer URLs and `hermes` commands below are retained only as
+upstream-reference material and are not Charterforge distribution endpoints.
 
 #### Linux / macOS / WSL2 / Android (Termux)
 ```bash

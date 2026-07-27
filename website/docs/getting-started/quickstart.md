@@ -1,12 +1,14 @@
 ---
 sidebar_position: 1
 title: "Quickstart"
-description: "Your first conversation with Hermes Agent — from install to chatting in under 5 minutes"
+description: "Your first Charterforge conversation from a source checkout"
 ---
 
 # Quickstart
 
-This guide gets you from zero to a working Hermes setup that survives real use. Install, choose a provider, verify a working chat, and know exactly what to do when something breaks.
+This guide gets you from a source checkout to a working Charterforge setup.
+Install, choose a provider, verify a working chat, and know exactly what to do
+when something breaks.
 
 ## Prefer to watch?
 
@@ -46,12 +48,17 @@ Pick the row that matches your goal:
 
 ---
 
-## 1. Install Hermes Agent
-### With the Hermes Desktop installer on macOS or Windows (recommended)
-To easily install the command-line and desktop applications, [download the Hermes Desktop installer](https://hermes-agent.nousresearch.com/) from our website and run it.
+## 1. Install Charterforge from source
 
-### Without Hermes Desktop:
-For a command-line only install without Hermes Desktop, run:
+```bash
+git clone https://github.com/mikeholownych/hermes-agent.git charterforge
+cd charterforge
+uv sync
+uv run charterforge --help
+```
+
+The legacy installer snippets below are upstream reference material, not
+implemented Charterforge download endpoints.
 
 #### Linux / macOS / WSL2 / Android (Termux)
 ```bash

@@ -7,10 +7,13 @@ const config: Config = {
   tagline: 'The self-improving AI agent',
   favicon: 'img/favicon.ico',
 
-  url: 'https://hermes-agent.nousresearch.com',
+  // This fork has no separately hosted documentation domain. Keep generated
+  // links rooted at the independently maintained repository rather than the
+  // upstream Hermes site.
+  url: 'https://github.com/mikeholownych/hermes-agent',
   baseUrl: '/docs/',
 
-  organizationName: 'NousResearch',
+  organizationName: 'mikeholownych',
   projectName: 'charterforge',
 
   onBrokenLinks: 'warn',
