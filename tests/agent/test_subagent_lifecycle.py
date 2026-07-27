@@ -1,5 +1,6 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -81,6 +82,29 @@ def test_duplicate_correlation_and_permission_validation(lifecycle):
     with pytest.raises(SubagentLifecycleError, match="working_directory"):
         lifecycle.launch(SubagentLaunchRequest(goal="x", working_directory="C:/"))
     lifecycle.wait(handle, timeout_seconds=1)
+
+
+def test_accepts_plugin_registered_toolset(lifecycle, monkeypatch):
+    from tools.registry import registry
+
+    monkeypatch.setattr(
+        registry,
+        "get_registered_toolset_names",
+        lambda: {"plugin-supervisor-control"},
+    )
+    parent = SimpleNamespace(
+        session_id="plugin-parent",
+        enabled_toolsets=["plugin-supervisor-control"],
+    )
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(
+        SubagentLaunchRequest(
+            goal="x",
+            allowed_toolsets=("plugin-supervisor-control",),
+            correlation_id="plugin-toolset",
+        )
+    )
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
 
 
 def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
@@ -172,7 +196,9 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     child.session_id = "child-session"
     hook = Mock()
 
-    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent", lambda **_kwargs: child
+    )
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
         lambda *_args, **_kwargs: {
@@ -218,7 +244,8 @@ def test_plugin_context_uses_turn_scoped_parent(monkeypatch):
 
     parent = SimpleNamespace(session_id="gateway-parent", enabled_toolsets=["file"])
     monkeypatch.setattr(
-        "tools.delegate_tool._build_child_agent", lambda **_kwargs: FakeChild("sa-gateway")
+        "tools.delegate_tool._build_child_agent",
+        lambda **_kwargs: FakeChild("sa-gateway"),
     )
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
@@ -254,3 +281,128 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     assert agent.run_conversation("hello") == {"final_response": "ok"}
     assert observed == [agent]
     assert get_active_subagent_parent() is None
+
+
+def test_private_context_is_hidden_available_only_in_child_and_cleared(monkeypatch):
+    parent = SimpleNamespace(session_id="parent-private", enabled_toolsets=["file"])
+    child = FakeChild("sa-private")
+    secret = {"opaque": "do-not-serialize"}
+    observed = []
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent", lambda **_kwargs: child
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+
+    def run(_index, _goal, running_child, _parent):
+        with bind_subagent_parent(running_child):
+            observed.append(service.current_private_context())
+        return {
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", run)
+    request = SubagentLaunchRequest(goal="x", private_context=secret)
+    assert "do-not-serialize" not in repr(request)
+
+    handle = service.launch(request)
+    assert "do-not-serialize" not in repr(handle.to_dict())
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
+    assert observed == [secret]
+    assert child._plugin_private_context is None
+    assert service.current_private_context() is None
+
+
+def test_publish_progress_is_bounded_rate_limited_and_priority_can_bypass(monkeypatch):
+    parent = SimpleNamespace(session_id="parent-progress", enabled_toolsets=["file"])
+    child = FakeChild("sa-progress")
+    relayed = []
+    receipts = []
+    child.tool_progress_callback = lambda *args, **kwargs: relayed.append((
+        args,
+        kwargs,
+    ))
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent", lambda **_kwargs: child
+    )
+    ticks = iter((10.0, 11.0, 12.0))
+    monkeypatch.setattr("agent.subagent_lifecycle.time.monotonic", lambda: next(ticks))
+
+    service = SubagentLifecycleService(lambda: parent)
+
+    def run(_index, _goal, running_child, _parent):
+        with bind_subagent_parent(running_child):
+            receipts.append(service.publish_progress("first milestone"))
+            receipts.append(service.publish_progress("too soon"))
+            receipts.append(service.publish_progress("owner gate", priority=True))
+        return {
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", run)
+    handle = service.launch(SubagentLaunchRequest(goal="x"))
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
+    assert receipts == [True, False, True]
+    assert [call[0] for call in relayed] == [
+        ("subagent_progress", "first milestone"),
+        ("subagent_progress", "owner gate"),
+    ]
+
+
+def test_terminal_callback_can_relaunch_on_same_parent_without_active_turn(monkeypatch):
+    parent = SimpleNamespace(session_id="parent-relaunch", enabled_toolsets=["file"])
+    counter = iter(range(2))
+    callback_finished = threading.Event()
+    relaunched = []
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent",
+        lambda **_kwargs: FakeChild(f"sa-relaunch-{next(counter)}"),
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *_args, **_kwargs: {
+            "status": "completed",
+            "summary": "generation done",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        },
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+
+    def on_terminal(handle, snapshot, result):
+        assert snapshot.state is SubagentState.SUCCEEDED
+        assert result.ready
+        replacement = service.relaunch(
+            handle,
+            SubagentLaunchRequest(
+                goal="replacement",
+                correlation_id="generation-2",
+                private_context={"generation": 2},
+            ),
+        )
+        relaunched.append(replacement)
+        callback_finished.set()
+
+    first = service.launch(
+        SubagentLaunchRequest(
+            goal="first",
+            correlation_id="generation-1",
+            on_terminal=on_terminal,
+        )
+    )
+    assert service.wait(first, timeout_seconds=1).state is SubagentState.SUCCEEDED
+    assert callback_finished.wait(1)
+    assert len(relaunched) == 1
+    second = relaunched[0]
+    assert second.subagent_id != first.subagent_id
+    assert second.parent_session_id == first.parent_session_id
+    assert service.wait(second, timeout_seconds=1).state is SubagentState.SUCCEEDED

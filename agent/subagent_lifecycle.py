@@ -13,6 +13,7 @@ import enum
 import hashlib
 import hmac
 import json
+import logging
 import math
 import secrets
 import threading
@@ -22,12 +23,16 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from typing import Any, Callable, Mapping, Optional
 
 
-PUBLIC_CONTRACT_VERSION = 1
+PUBLIC_CONTRACT_VERSION = 2
 _MAX_GOAL_CHARS = 16_000
 _MAX_CONTEXT_CHARS = 32_000
 _MAX_METADATA_BYTES = 8_192
 _MAX_RESULT_CHARS = 32_000
 _TERMINAL_RETENTION_SECONDS = 3_600
+_PRIVATE_CONTEXT_ATTR = "_plugin_private_context"
+_MAX_PROGRESS_CHARS = 500
+_MIN_PROGRESS_INTERVAL_SECONDS = 5.0
+logger = logging.getLogger(__name__)
 
 
 class SubagentLifecycleError(ValueError):
@@ -59,6 +64,10 @@ class SubagentLaunchRequest:
     correlation_id: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
+    private_context: Any = dataclasses.field(default=None, repr=False, compare=False)
+    on_terminal: Optional[Callable[..., None]] = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,6 +153,11 @@ class _Record:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
+    parent_agent: Any = dataclasses.field(default=None, repr=False)
+    on_terminal: Optional[Callable[..., None]] = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    last_progress_monotonic: Optional[float] = None
 
 
 class _Registry:
@@ -194,12 +208,23 @@ class SubagentLifecycleService:
     def __init__(self, parent_agent_resolver: Callable[[], Any]) -> None:
         self._parent_agent_resolver = parent_agent_resolver
 
+    @property
+    def contract_version(self) -> int:
+        """Return the exact public lifecycle contract implemented by this host."""
+        return PUBLIC_CONTRACT_VERSION
+
     def launch(self, request: SubagentLaunchRequest) -> SubagentHandle:
         parent = self._parent_agent_resolver()
         if parent is None:
             raise SubagentLifecycleError(
                 "No active Hermes parent session is available."
             )
+        return self._launch_with_parent(request, parent)
+
+    def _launch_with_parent(
+        self, request: SubagentLaunchRequest, parent: Any
+    ) -> SubagentHandle:
+        """Launch with a host-owned parent retained only for in-process relaunch."""
         self._validate_request(request, parent)
         parent_session_id = str(getattr(parent, "session_id", "") or "") or None
         if request.parent_session_id and request.parent_session_id != parent_session_id:
@@ -250,12 +275,32 @@ class SubagentLifecycleService:
             int(getattr(child, "_delegate_depth", 1) or 1),
             self._capability(subagent_id, parent_session_id, created),
         )
-        record = _Record(handle, SubagentState.PENDING, created, agent=child)
+        record = _Record(
+            handle,
+            SubagentState.PENDING,
+            created,
+            agent=child,
+            parent_agent=parent if request.on_terminal is not None else None,
+            on_terminal=request.on_terminal,
+        )
+        # Attach only after every public handle/record field is safely constructed.
+        # The value is absent from prompts, model config, metadata, and repr output.
+        setattr(child, _PRIVATE_CONTEXT_ATTR, request.private_context)
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        try:
+            record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        except Exception as exc:
+            setattr(child, _PRIVATE_CONTEXT_ATTR, None)
+            with _REGISTRY.lock:
+                _REGISTRY.records.pop(subagent_id, None)
+                if request.correlation_id:
+                    _REGISTRY.correlations.pop(correlation_key, None)
+            raise SubagentLifecycleError(
+                "Hermes failed to schedule the child."
+            ) from exc
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
@@ -337,7 +382,101 @@ class SubagentLifecycleService:
         with _REGISTRY.lock:
             return SubagentReconnectResult(True, record.state)
 
-    def _record(self, handle: SubagentHandle) -> Optional[_Record]:
+    def relaunch(
+        self,
+        previous_handle: SubagentHandle,
+        request: SubagentLaunchRequest,
+    ) -> SubagentHandle:
+        """Launch a replacement from a terminal handle in the same host process.
+
+        The previous handle is an unforgeable process-local capability. Its retained
+        parent is never returned to plugin code and is discarded with the bounded
+        terminal record. Relaunch deliberately does not claim process-restart
+        recovery; after restart the handle remains unknown.
+        """
+        record = self._record(previous_handle, require_active_parent=False)
+        if record is None:
+            raise SubagentLifecycleError("Unknown previous subagent handle.")
+        with _REGISTRY.lock:
+            if record.result is None or record.state not in {
+                SubagentState.SUCCEEDED,
+                SubagentState.FAILED,
+                SubagentState.INTERRUPTED,
+                SubagentState.CANCELLED,
+            }:
+                raise SubagentLifecycleError(
+                    "A replacement can only follow a terminal subagent."
+                )
+            parent = record.parent_agent
+        if parent is None:
+            raise SubagentLifecycleError("The retained parent is unavailable.")
+        retained_parent_id = str(getattr(parent, "session_id", "") or "") or None
+        if retained_parent_id != previous_handle.parent_session_id:
+            raise SubagentLifecycleError("The retained parent no longer matches.")
+        return self._launch_with_parent(request, parent)
+
+    def current_private_context(self) -> Any:
+        """Return the opaque context attached to the currently executing child.
+
+        The value exists only while that child is alive and is never copied into a
+        prompt, model-callable schema, handle, status, result, or retained record.
+        """
+        agent = get_active_subagent_parent()
+        if agent is None:
+            return None
+        return getattr(agent, _PRIVATE_CONTEXT_ATTR, None)
+
+    def publish_progress(self, summary: str, *, priority: bool = False) -> bool:
+        """Relay one bounded child milestone to its origin display callback.
+
+        Routine updates are limited to one per child every five seconds. Priority
+        owner-gate, anomaly, and terminal updates may bypass that interval. The
+        caller still decides which durable events are useful enough to summarize.
+        """
+        if not isinstance(summary, str):
+            raise SubagentLifecycleError("Progress summary must be a string.")
+        clean = " ".join(summary.split())
+        if not clean or len(clean) > _MAX_PROGRESS_CHARS:
+            raise SubagentLifecycleError(
+                "Progress summary must contain 1 to 500 visible characters."
+            )
+        if not isinstance(priority, bool):
+            raise SubagentLifecycleError("priority must be a boolean.")
+        agent = get_active_subagent_parent()
+        subagent_id = str(getattr(agent, "_subagent_id", "") or "")
+        callback = getattr(agent, "tool_progress_callback", None)
+        if not subagent_id or not callable(callback):
+            return False
+        now = time.monotonic()
+        with _REGISTRY.lock:
+            record = _REGISTRY.records.get(subagent_id)
+            if (
+                record is None
+                or record.agent is not agent
+                or record.state not in {SubagentState.STARTING, SubagentState.RUNNING}
+            ):
+                return False
+            previous = record.last_progress_monotonic
+            if (
+                not priority
+                and previous is not None
+                and now - previous < _MIN_PROGRESS_INTERVAL_SECONDS
+            ):
+                return False
+            record.last_progress_monotonic = now
+        try:
+            callback("subagent_progress", clean)
+        except Exception:
+            logger.debug("Subagent progress callback failed", exc_info=True)
+            return False
+        return True
+
+    def _record(
+        self,
+        handle: SubagentHandle,
+        *,
+        require_active_parent: bool = True,
+    ) -> Optional[_Record]:
         if (
             not isinstance(handle, SubagentHandle)
             or type(handle.contract_version) is not int
@@ -372,12 +511,16 @@ class SubagentLifecycleService:
             ),
         ):
             return None
-        parent = self._parent_agent_resolver()
-        active_parent_id = str(getattr(parent, "session_id", "") or "") or None
-        if active_parent_id != handle.parent_session_id:
-            return None
+        if require_active_parent:
+            parent = self._parent_agent_resolver()
+            active_parent_id = str(getattr(parent, "session_id", "") or "") or None
+            if active_parent_id != handle.parent_session_id:
+                return None
         with _REGISTRY.lock:
-            return _REGISTRY.records.get(handle.subagent_id)
+            record = _REGISTRY.records.get(handle.subagent_id)
+            if record is None or record.handle != handle:
+                return None
+            return record
 
     @staticmethod
     def _cleanup_locked() -> None:
@@ -462,12 +605,28 @@ class SubagentLifecycleService:
                 json.dumps(payload, sort_keys=True, default=str).encode()
             ).hexdigest(),
         )
+        child = record.agent
+        if child is not None:
+            setattr(child, _PRIVATE_CONTEXT_ATTR, None)
         with _REGISTRY.lock:
             record.agent = None
             record.result = result
             record.state = result.terminal_state
             record.completed_at = result.completed_at
             record.updated_at = result.completed_at or time.time()
+            terminal_status = SubagentStatus(
+                record.handle, record.state, record.updated_at
+            )
+            on_terminal = record.on_terminal
+        if on_terminal is not None:
+            try:
+                on_terminal(record.handle, terminal_status, result)
+            except Exception:
+                logger.warning("Subagent terminal callback failed", exc_info=True)
+            finally:
+                with _REGISTRY.lock:
+                    record.on_terminal = None
+                    record.parent_agent = None
 
     @staticmethod
     def _capability(
@@ -500,6 +659,8 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError(
                 "Per-launch timeout is not supported; configure delegation timeout explicitly."
             )
+        if request.on_terminal is not None and not callable(request.on_terminal):
+            raise SubagentLifecycleError("on_terminal must be callable.")
         if request.working_directory is not None:
             raise SubagentLifecycleError(
                 "working_directory is not supported because Hermes delegates use isolated task environments."
@@ -518,8 +679,10 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError("metadata exceeds 8192 bytes.")
         if request.allowed_toolsets:
             from toolsets import TOOLSETS
+            from tools.registry import registry
 
-            unknown = set(request.allowed_toolsets) - set(TOOLSETS)
+            registered = set(TOOLSETS) | set(registry.get_registered_toolset_names())
+            unknown = set(request.allowed_toolsets) - registered
             if unknown:
                 raise SubagentLifecycleError(
                     f"Unknown toolsets: {', '.join(sorted(unknown))}."
