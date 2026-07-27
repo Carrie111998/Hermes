@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS employee_task_grants (
     systems_json TEXT NOT NULL,
     toolsets_json TEXT NOT NULL,
     skills_json TEXT NOT NULL,
+    resource_scope_json TEXT NOT NULL DEFAULT '{}',
     budget_minor INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     contract_sha256 TEXT NOT NULL,
@@ -114,11 +115,19 @@ def _hash(value: str) -> str:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     organization_db.ensure_schema(conn)
-    if conn.in_transaction and conn.execute(
+    table_exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_task_grants'"
-    ).fetchone():
-        return
-    conn.executescript(SCHEMA_SQL)
+    ).fetchone() is not None
+    if not table_exists:
+        conn.executescript(SCHEMA_SQL)
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(employee_task_grants)")
+    }
+    if "resource_scope_json" not in columns:
+        conn.execute(
+            "ALTER TABLE employee_task_grants ADD COLUMN resource_scope_json TEXT NOT NULL DEFAULT '{}'"
+        )
 
 
 @_serialized_grant_mutation
@@ -223,6 +232,18 @@ def create_grant(
         set(manager_mandate.get("skills") or [])
     ):
         raise DelegationError("task skill exceeds delegator authority")
+    action_row = conn.execute(
+        "SELECT payload_json FROM candidate_actions WHERE id=?", (action_id,)
+    ).fetchone()
+    if action_row is None:
+        raise DelegationError("employee task grant action is missing")
+    action_payload = json.loads(action_row["payload_json"])
+    resource_scope = {
+        "system": str(action_payload.get("system") or "").strip(),
+        "target_resource": str(action_payload.get("target_resource") or "").strip(),
+    }
+    if not resource_scope["system"] or not resource_scope["target_resource"]:
+        raise DelegationError("task grant requires an exact resource scope")
     if budget_minor < 0:
         raise DelegationError("task budget cannot be negative")
     mandate_budget = mandate["budget_minor"]
@@ -295,6 +316,7 @@ def create_grant(
         "systems": requested_systems,
         "toolsets": requested_toolsets,
         "skills": requested_skills,
+        "resource_scope": resource_scope,
         "budget_minor": budget_minor,
         "expires_at": expires_at,
     }
@@ -313,9 +335,9 @@ def create_grant(
                  id,organization_id,objective_id,action_id,manager_employee_id,
                  employee_id,assignee_profile,mandate_id,mandate_version,
                  title_sha256,body_sha256,capabilities_json,systems_json,
-                 toolsets_json,skills_json,budget_minor,expires_at,
-                 contract_sha256,created_at
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 toolsets_json,skills_json,resource_scope_json,budget_minor,
+                 expires_at,contract_sha256,created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 grant_id,
                 organization_id,
@@ -332,6 +354,7 @@ def create_grant(
                 _json(requested_systems),
                 _json(toolsets),
                 _json(requested_skills),
+                _json(resource_scope),
                 budget_minor,
                 expires_at,
                 digest,
@@ -345,6 +368,16 @@ def bind_task(
     conn: sqlite3.Connection, *, grant_id: str, task_id: str, board: str
 ) -> tuple[str, bool]:
     ensure_schema(conn)
+    grant = conn.execute(
+        "SELECT resource_scope_json FROM employee_task_grants WHERE id=?",
+        (grant_id,),
+    ).fetchone()
+    if grant is None:
+        raise DelegationError("employee task grant not found")
+    scope = json.loads(grant["resource_scope_json"] or "{}")
+    target_resource = str(scope.get("target_resource") or "").strip()
+    if target_resource and target_resource != str(board):
+        raise DelegationError("task board exceeds the exact grant resource scope")
     existing = conn.execute(
         """SELECT id,kanban_task_id,board FROM employee_task_bindings
             WHERE grant_id=?""",
@@ -386,6 +419,7 @@ def worker_scope(conn: sqlite3.Connection, grant_id: str) -> str:
             f"- Systems: {', '.join(json.loads(row['systems_json']))}",
             f"- Toolsets: {', '.join(json.loads(row['toolsets_json'])) or '(none)'}",
             f"- Skills: {', '.join(json.loads(row['skills_json'])) or '(none)'}",
+            f"- Resource scope: {row['resource_scope_json']}",
             f"- Budget ceiling (minor units): {row['budget_minor']}",
             f"- Expires at (Unix): {row['expires_at']}",
             "- Prohibited actions: "
@@ -412,7 +446,13 @@ def grant_for_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | N
     if row is None:
         return None
     result = dict(row)
-    for key in ("capabilities_json", "systems_json", "toolsets_json", "skills_json"):
+    for key in (
+        "capabilities_json",
+        "systems_json",
+        "toolsets_json",
+        "skills_json",
+        "resource_scope_json",
+    ):
         result[key.removesuffix("_json")] = json.loads(result.pop(key))
     return result
 
@@ -438,6 +478,7 @@ def verify_grants(conn: sqlite3.Connection, organization_id: str) -> bool:
             "systems": json.loads(row["systems_json"]),
             "toolsets": json.loads(row["toolsets_json"]),
             "skills": json.loads(row["skills_json"]),
+            "resource_scope": json.loads(row["resource_scope_json"] or "{}"),
             "budget_minor": int(row["budget_minor"]),
             "expires_at": int(row["expires_at"]),
         }

@@ -157,6 +157,7 @@ def test_exact_employee_task_grant_is_mandate_bound_and_immutable(
     assert workforce_delegation.verify_grants(conn, ids[0]) is True
     scope = workforce_delegation.worker_scope(conn, grant_id)
     assert "Capabilities: web.read" in scope
+    assert '"target_resource":"default"' in scope
     assert "Prohibited actions: publish, purchase" in scope
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         conn.execute(
@@ -246,6 +247,10 @@ def test_grant_binding_is_one_to_one_and_profile_snapshot_must_be_current(
     assert workforce_delegation.bind_task(
         conn, grant_id=grant_id, task_id="task_1", board="default"
     ) == (binding_id, False)
+    with pytest.raises(workforce_delegation.DelegationError, match="resource scope"):
+        workforce_delegation.bind_task(
+            conn, grant_id=grant_id, task_id="task_other_board", board="other"
+        )
     with pytest.raises(workforce_delegation.DelegationError, match="different"):
         workforce_delegation.bind_task(
             conn, grant_id=grant_id, task_id="task_2", board="default"

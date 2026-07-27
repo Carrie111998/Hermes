@@ -15,6 +15,9 @@
 - Delegation grants now fail closed when any capability, system, toolset, skill,
   budget, or expiry would exceed the current delegator mandate, in addition to
   the subordinate mandate and objective scope.
+- Delegation grants now persist the exact action resource scope and reject a
+  Kanban binding to a different board; legacy grants without a scope fail closed
+  until reissued under a current action contract.
 - Tax-rate records now use immutable supersession lineage; amended rates replace
   the current rule explicitly, branch-from-old-rule attempts are rejected, and
   tax calculation ignores superseded rules.

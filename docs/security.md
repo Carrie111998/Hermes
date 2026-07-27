@@ -20,7 +20,7 @@ permit, and a policy decision within the current objective and charter.
 
 Employee grants apply the same non-amplification rule across the subordinate
 mandate and the delegator mandate, including capabilities, systems, toolsets,
-skills, budget, and expiry. Filesystem access is only available through a
+skills, resource scope, budget, and expiry. Filesystem access is only available through a
 registered typed executor; raw shell access is not implied by a read grant.
 
 External vendor plugins and payment rails should remain separate packages.

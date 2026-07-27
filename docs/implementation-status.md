@@ -16,6 +16,8 @@ acceptance evidence.
 - Delegation is authority-monotone: grants are bounded by the current
   delegator mandate as well as the subordinate mandate, objective scope,
   budget, and expiry; privilege cannot be amplified through hierarchy.
+- Delegation grants persist the exact action system and target resource, and
+  Kanban bindings must match that immutable scope before a worker can launch.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Registered action payload schemas and temporal observation windows are
