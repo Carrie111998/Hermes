@@ -82,6 +82,9 @@ acceptance evidence.
   authority, unavailable governed capabilities, and objectives without an
   admissible success verifier; unreachable objectives are blocked before any
   plan or external action is attempted.
+- Proposed objectives that reach the runtime without acceptance now create a
+  durable acceptance handoff; an evidence-bearing advisor acceptance
+  transitions the objective to `accepted` and emits a fresh wake event.
 - Runtime-host mismatches and charters with no registered action contracts also
   persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted

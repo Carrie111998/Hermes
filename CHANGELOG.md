@@ -172,8 +172,11 @@ recorded.
   authority recovery cannot leave the runtime polling for new work.
 - `a4ae9be834e76548c96556fd2ecf41cbd2b1c4e1` — shared the fail-closed
   supervisor status contract with the gateway-hosted objective loop.
+- `8e415f4ed85339b6bb3dc83e39b93b938028f6c3` — made proposed-objective
+  acceptance an explicit evidence-bearing advisor handoff that wakes the
+  governed runtime after acceptance.
 - Current-main focused acceptance rerun at baseline
-  `a4ae9be834e76548c96556fd2ecf41cbd2b1c4e1`: 6 Founder/CEO E2E tests, 45
+  `8e415f4ed85339b6bb3dc83e39b93b938028f6c3`: 6 Founder/CEO E2E tests, 46
   objective service/runtime/worker tests, and 18 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
