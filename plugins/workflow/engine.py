@@ -2463,6 +2463,18 @@ class WorkflowEngine:
                             results[nid] = "done"
                             print(f"   🔓 {nid} — SYNTHETIC (auto-complete)")
                             continue
+                        # Skip nodes that are reviewers for other nodes — the
+                        # supervisor will dispatch them on demand when the
+                        # creator blocks with "pending review".
+                        is_reviewer = any(
+                            nid in other_node.reviews
+                            for other_nid, other_node in workflow.nodes.items()
+                            if other_nid != nid
+                        )
+                        if is_reviewer:
+                            state.status = "pending"
+                            print(f"   ⏳ {nid} — REVIEWER (will be dispatched by supervisor)")
+                            continue
                         state.status = "running"
                         state.started_at = datetime.now(timezone.utc).isoformat()
                         try:
