@@ -4039,6 +4039,8 @@ class SessionStore:
         messages: List[Dict[str, Any]],
         active_only: bool = False,
         reject_active_turn_lease: bool = False,
+        *,
+        expected_revision=None,
     ) -> bool:
         """Replace the entire transcript for a session with new messages.
 
@@ -4068,19 +4070,29 @@ class SessionStore:
             return True
         with self._get_transcript_drain_lock():
             try:
-                self._db.replace_messages(
-                    session_id,
-                    messages,
-                    active_only=active_only,
-                    reject_active_turn_lease=reject_active_turn_lease,
-                )
+                replace_kwargs = {
+                    "active_only": active_only,
+                    "reject_active_turn_lease": reject_active_turn_lease,
+                }
+                if expected_revision is not None:
+                    replace_kwargs["expected_revision"] = expected_revision
+                self._db.replace_messages(session_id, messages, **replace_kwargs)
             except Exception as e:
+                from hermes_state import CompressionTranscriptRevisionError
+
+                if isinstance(e, CompressionTranscriptRevisionError):
+                    raise
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
                 return False
             self._clear_dirty_transcript(session_id)
             return True
 
-    def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
+    def load_transcript(
+        self,
+        session_id: str,
+        *,
+        with_revision: bool = False,
+    ):
         """Load all messages from a session's transcript.
 
         state.db is the canonical store. The legacy JSONL fallback was removed
@@ -4093,8 +4105,16 @@ class SessionStore:
         chain while reads queried the stale id directly — the transcript
         "vanished" (disk=0) even though every message sat healthy under the
         child session.
+
+        ``with_revision=True`` returns ``(messages, revision)`` captured in one
+        read. When the store is unavailable the revision degrades to ``None``
+        rather than raising: an unverifiable projection must fail closed at the
+        agent chokepoint (which re-anchors, or returns
+        ``compression_projection_unverifiable``), not crash the inbound turn.
         """
         if not self._db:
+            if with_revision:
+                return [], None
             return []
         # Follow the write-side reroute chain (cycle-guarded, same shape as
         # append_to_transcript).
@@ -4117,7 +4137,9 @@ class SessionStore:
             # would otherwise re-trigger the pre-request repair on every
             # request forever — heal it once at the restore boundary.
             return self._db.get_messages_as_conversation(
-                session_id, repair_alternation=True
+                session_id,
+                repair_alternation=True,
+                with_revision=with_revision,
             )
         except Exception as e:
             # A failed read must be distinguishable from an empty transcript:
@@ -4128,6 +4150,8 @@ class SessionStore:
                 "downstream must not treat this as data loss): %s",
                 session_id, e,
             )
+            if with_revision:
+                return [], None
             return []
 
     def rewind_session(
@@ -4161,13 +4185,23 @@ class SessionStore:
                 split_user_originated_turn,
                 user_originated_turn_view,
             )
+            from hermes_state import CompressionTranscriptRevisionError
 
             try:
                 expected_active_ids = self._db.get_active_message_ids(session_id)
-                durable = self._db.get_messages_as_conversation(
-                    session_id,
-                    include_row_ids=True,
-                )
+                try:
+                    durable, revision = self._db.get_messages_as_conversation(
+                        session_id,
+                        include_row_ids=True,
+                        with_revision=True,
+                    )
+                except TypeError:
+                    # Legacy SessionDB-like adapter without the atomic contract.
+                    durable = self._db.get_messages_as_conversation(
+                        session_id,
+                        include_row_ids=True,
+                    )
+                    revision = None
                 user_indices = [
                     index
                     for index, message in enumerate(durable)
@@ -4193,13 +4227,18 @@ class SessionStore:
                 # so /retry can explain why the selected carrier is unsafe.
                 target_text = retryable_user_text(target_view.get("content"))
             try:
+                rewind_kwargs = {
+                    "preserve_compaction_handoff": handoff is not None,
+                    "expected_active_ids": expected_active_ids,
+                    "expected_target_content": target_view.get("content"),
+                }
+                if revision is not None:
+                    rewind_kwargs["expected_revision"] = revision
                 result = self._db.rewind_to_message(
-                    session_id,
-                    target_id,
-                    preserve_compaction_handoff=handoff is not None,
-                    expected_active_ids=expected_active_ids,
-                    expected_target_content=target_view.get("content"),
+                    session_id, target_id, **rewind_kwargs
                 )
+            except CompressionTranscriptRevisionError:
+                raise
             except ValueError as e:
                 logger.debug("rewind_session: %s", e)
                 return None

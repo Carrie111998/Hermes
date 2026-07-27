@@ -2409,7 +2409,7 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
+                _appended = self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
                     compression_lock_holder=getattr(
@@ -2422,7 +2422,20 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    with_revision=True,
                 )
+                # Adopt the fence the append actually committed, read inside the
+                # same transaction — never recompute it here, where a concurrent
+                # writer's row would be missed. SessionDB-like adapters that
+                # ignore ``with_revision`` still return a bare id (or nothing);
+                # they own no CAS either, so the agent simply keeps its fence.
+                if isinstance(_appended, tuple) and len(_appended) == 2:
+                    from hermes_state import DurableTranscriptRevision
+
+                    _, durable_revision = _appended
+                    if isinstance(durable_revision, DurableTranscriptRevision):
+                        self._durable_transcript_revision = durable_revision
+
                 from agent.transcript_repair import sync_flushed_message_markers
 
                 sync_flushed_message_markers(_batch_msgs, _batch_rows)
@@ -8606,6 +8619,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        conversation_history_revision: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8980,6 +8994,7 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        conversation_history_revision=conversation_history_revision,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

@@ -1100,7 +1100,9 @@ class SessionSearchMixin:
         session_id: str,
         limit: int = 20,
         include_inactive: bool = False,
-    ) -> List[Dict[str, Any]]:
+        *,
+        with_revision: bool = False,
+    ):
         """Return the *limit* most-recent user messages, newest first.
 
         Each entry is a dict with keys ``id``, ``timestamp``, ``preview``.
@@ -1129,15 +1131,30 @@ class SessionSearchMixin:
         # excludes handoffs with a DB pick that includes them, soft-deleting
         # the wrong turn.
         fetch_limit = int(limit) * 2 + 5
+        revision = None
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT id, timestamp, content FROM messages "
-                "WHERE session_id = ? AND role = 'user'"
-                f"{active_clause}{display_clause} "
-                "ORDER BY id DESC LIMIT ?",
-                (session_id, fetch_limit),
-            )
-            rows = cursor.fetchall()
+            started_transaction = not self._conn.in_transaction
+            if started_transaction:
+                self._conn.execute("BEGIN")
+            try:
+                cursor = self._conn.execute(
+                    "SELECT id, timestamp, content FROM messages "
+                    "WHERE session_id = ? AND role = 'user'"
+                    f"{active_clause}{display_clause} "
+                    "ORDER BY id DESC LIMIT ?",
+                    (session_id, fetch_limit),
+                )
+                rows = cursor.fetchall()
+                if with_revision:
+                    revision = self._active_message_revision_in_current_transaction(
+                        session_id
+                    )
+                if started_transaction:
+                    self._conn.commit()
+            except BaseException:
+                if started_transaction and self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
         from agent.context_compressor import ContextCompressor
 
@@ -1174,6 +1191,8 @@ class SessionSearchMixin:
                     "preview": preview,
                 }
             )
+        if with_revision:
+            return result, revision
         return result
 
     @staticmethod
