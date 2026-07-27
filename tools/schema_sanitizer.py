@@ -302,6 +302,19 @@ def strip_nullable_unions(
     return stripped
 
 
+# JSON-Schema keywords whose values ARE schemas, collections of schemas, or
+# maps of name -> schema. ``convert_tuple_items_to_prefix_items`` recurses only
+# through these; everything else is instance data and is passed through.
+_SUBSCHEMA_KEYS = frozenset({
+    "additionalItems", "additionalProperties", "contains", "propertyNames",
+    "not", "if", "then", "else", "unevaluatedItems", "unevaluatedProperties",
+    "contentSchema",
+})
+_SUBSCHEMA_LIST_KEYS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SUBSCHEMA_MAP_KEYS = frozenset({
+    "properties", "patternProperties", "dependentSchemas", "$defs", "definitions",
+})
+
 
 def convert_tuple_items_to_prefix_items(schema: Any) -> Any:
     """Convert draft-07 tuple-form array schemas to draft 2020-12 ``prefixItems``.
@@ -314,12 +327,21 @@ def convert_tuple_items_to_prefix_items(schema: Any) -> Any:
     exact keyword translation defined by the 2020-12 spec:
 
       * list-valued ``items`` -> ``prefixItems`` (same sub-schemas, same order)
+      * an EMPTY ``items: []`` is dropped rather than translated: it asserts no
+        positional constraint, and 2020-12 requires ``prefixItems`` to be a
+        non-empty array, so emitting ``prefixItems: []`` would itself be invalid
       * a sibling draft-07 ``additionalItems`` -> ``items`` (its 2020-12 name)
       * if a hand-authored ``prefixItems`` is already present, the redundant
         tuple ``items`` is dropped instead of clobbering it
 
     Single-schema ``items`` (a dict) and every non-array construct are left
     untouched, so already-valid schemas are never altered.
+
+    Recursion is restricted to schema-valued keywords. Annotation keywords
+    such as ``default``, ``const``, ``enum`` and ``examples`` hold literal
+    instance data, so a nested ``items`` key inside one is a value rather than
+    a schema and is preserved verbatim — rewriting it would silently change a
+    tool's default instead of fixing its schema.
     """
     if isinstance(schema, list):
         return [convert_tuple_items_to_prefix_items(item) for item in schema]
@@ -329,14 +351,33 @@ def convert_tuple_items_to_prefix_items(schema: Any) -> Any:
     tuple_items = isinstance(schema.get("items"), list)
     for key, value in schema.items():
         if key == "items" and tuple_items:
-            if "prefixItems" not in schema:
+            if "prefixItems" not in schema and value:
                 out["prefixItems"] = [convert_tuple_items_to_prefix_items(v) for v in value]
-            # redundant tuple ``items`` alongside hand-authored ``prefixItems`` is dropped
+            # An EMPTY tuple ``items: []`` carries no positional constraint, and
+            # ``prefixItems`` MUST be a non-empty array, so the keyword is simply
+            # dropped rather than emitted empty. A redundant tuple ``items``
+            # alongside a hand-authored ``prefixItems`` is dropped for its own
+            # reason: not clobbering the hand-authored value.
         elif key == "additionalItems" and tuple_items:
             out["items"] = convert_tuple_items_to_prefix_items(value)
-        else:
+        elif key == "items" or key in _SUBSCHEMA_KEYS:
             out[key] = convert_tuple_items_to_prefix_items(value)
+        elif key in _SUBSCHEMA_LIST_KEYS and isinstance(value, list):
+            out[key] = [convert_tuple_items_to_prefix_items(v) for v in value]
+        elif key in _SUBSCHEMA_MAP_KEYS and isinstance(value, dict):
+            out[key] = {
+                k: convert_tuple_items_to_prefix_items(v) for k, v in value.items()
+            }
+        else:
+            # Not a schema-valued keyword. Annotation keywords (``default``,
+            # ``const``, ``enum``, ``examples``) hold literal instance data, so
+            # an ``items`` key inside one is a value, not a schema — rewriting
+            # it would corrupt the tool's data. Unknown/vendor keywords are
+            # passed through for the same reason. Mirrors the annotation
+            # pass-through in ``_sanitize_node`` below.
+            out[key] = copy.deepcopy(value) if isinstance(value, (list, dict)) else value
     return out
+
 
 def _sanitize_node(node: Any, path: str) -> Any:
     """Recursively sanitize a JSON-Schema fragment.
