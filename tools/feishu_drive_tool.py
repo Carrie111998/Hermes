@@ -6,6 +6,7 @@ The lark client is injected per-thread by the comment event handler.
 """
 
 import json
+import hashlib
 import logging
 import threading
 
@@ -25,6 +26,20 @@ def set_client(client):
 def get_client():
     """Return the lark client for the current thread, or None."""
     return getattr(_local, "client", None)
+
+
+def _authorize_comment_action(capability: str, scope: dict) -> None:
+    """Require a governed worker permit for the exact comment mutation."""
+    resource = "feishu-comment:" + hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    authorize_worker_action(
+        capability=capability,
+        system="feishu",
+        target_resource=resource,
+    )
 
 
 def _check_feishu():
@@ -301,6 +316,20 @@ def _handle_reply_comment(args: dict, **kwargs) -> str:
         }
     }
 
+    try:
+        _authorize_comment_action(
+            "feishu.comment.reply",
+            {
+                "operation": "reply",
+                "file_token": file_token,
+                "comment_id": comment_id,
+                "file_type": file_type,
+                "content": content,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"Reply comment authorization denied: {exc}")
+
     code, msg, data = _do_request(
         client, "POST", _REPLY_COMMENT_URI,
         paths={"file_token": file_token, "comment_id": comment_id},
@@ -366,6 +395,19 @@ def _handle_add_comment(args: dict, **kwargs) -> str:
             {"type": "text", "text": content},
         ],
     }
+
+    try:
+        _authorize_comment_action(
+            "feishu.comment.add",
+            {
+                "operation": "add",
+                "file_token": file_token,
+                "file_type": file_type,
+                "content": content,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"Add comment authorization denied: {exc}")
 
     code, msg, data = _do_request(
         client, "POST", _ADD_COMMENT_URI,
