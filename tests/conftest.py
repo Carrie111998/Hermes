@@ -215,6 +215,24 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
     "HERMES_TENANT",
+    # Governed-worker execution-contract vars.  When tests run inside a
+    # Hermes delegated-child context (e.g. the agent itself dispatching a
+    # cron job or subagent), these are set in process env and would trip the
+    # ``_assert_not_delegated_child_mutation`` guard in kanban_db, causing
+    # unrelated workforce-delegation tests to fail.  Clear them so tests
+    # exercise the production pathway with a clean slate, exactly as they
+    # would on CI.
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_EXECUTION_CONTRACT_ID",
+    "HERMES_BUSINESS_AUTHORITY_DB",
+    "HERMES_WORKER_EVIDENCE",
+    "HERMES_WORKER_INPUT",
+    "HERMES_DELEGATION_BOARD",
+    "HERMES_DELEGATION_AUTHORITY_DB",
+    # HERMES_PROFILE selects the active profile.  If inherited from a worker
+    # launch env, it causes profile-scoped reads to diverge from the per-test
+    # HERMES_HOME.  Tests that depend on a specific profile set it explicitly.
+    "HERMES_PROFILE",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
     # otherwise-unrelated config tests away from the default "hermes" host.
