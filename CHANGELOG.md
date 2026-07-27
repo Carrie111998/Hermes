@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Outbound `send_message` and reaction actions now require permits bound to
+  the resolved platform, chat, thread, exact message or emoji, media list, and
+  delivery mode; target aliases and content changes cannot reuse a grant.
 - Feishu document comment replies and additions now require separate,
   operation-specific permits bound to the exact document, comment (when
   applicable), content, and file type before any provider POST.

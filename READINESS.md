@@ -1475,6 +1475,37 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production Feishu credentials, permissions, or external authorization.
 
+## Outbound messaging authority evidence (287a9c8db5)
+
+`send_message` and reaction actions now authorize only after target resolution.
+The permit resource is a SHA-256 digest of the exact operation, resolved
+platform and chat, thread or message ID, message or emoji, media paths, and
+delivery mode. This prevents a worker from changing content or retargeting an
+alias while reusing a previously issued permit.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/send_message_tool.py \
+  tests/tools/test_send_message_react.py \
+  tests/tools/test_send_message_target_parse.py
+uv run --extra dev pytest -q \
+  tests/tools/test_send_message_react.py \
+  tests/tools/test_send_message_target_parse.py
+uv run --extra dev pytest -q \
+  tests/tools/test_send_message_tool.py \
+  tests/tools/test_signal_media.py \
+  tests/tools/test_slack_send_message_media.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **15 focused tests passed, 12 broader tests passed with 4 optional
+skips, Ruff passed, and current-tree agentic acceptance passed**. The
+acceptance image manifest digest was
+`sha256:f99812aa2e3d68880263645f08b913b9f215a2a006ea0e1bc89a22128c14240f`.
+This remains deterministic local-provider evidence and does not establish
+production messaging credentials, permissions, or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
