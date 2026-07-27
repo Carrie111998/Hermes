@@ -2290,7 +2290,7 @@ def run_conversation(
                         provider_name = f"model={response.model}"
                     
                     # Check for x-openrouter-provider or similar metadata
-                    if provider_name == "Unknown" and response:
+                    if provider_name == "Unknown" and response and hasattr(response, "__dict__"):
                         # Log all response attributes for debugging
                         resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
                         if agent.verbose_logging:
