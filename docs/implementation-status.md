@@ -185,6 +185,10 @@ acceptance evidence.
   external facts.
 - Compliance tracking exists; legal applicability is not autonomously proven.
 - Local terminal execution is available but is not isolation.
+- `docker-compose.yml` now provides an opt-in `agentic` profile for a
+  standalone Founder/CEO worker. Compose configuration is validated locally;
+  this does not constitute a production deployment, registry publication, or
+  live-provider readiness proof.
 
 ## Not implemented or not proven
 
