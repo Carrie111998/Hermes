@@ -1,0 +1,125 @@
+{
+  "enabled": true,
+  "operating_mode": "autonomous",
+  "operator_role": "advisor",
+  "runtime_host": "standalone",
+  "policy_version": "charterforge-autonomous-business-v1",
+  "allowed_capabilities": [
+    "market.publish",
+    "market.research",
+    "objectives.create",
+    "objectives.update",
+    "kanban.create",
+    "kanban.read",
+    "kanban.write",
+    "kanban.complete",
+    "work.delegate",
+    "web.search",
+    "web.extract",
+    "code.execute",
+    "file.read",
+    "file.write",
+    "payments.receive",
+    "payments.send"
+  ],
+  "allowed_systems": [
+    "market",
+    "objectives",
+    "kanban",
+    "web",
+    "code",
+    "files",
+    "payments",
+    "model",
+    "terminal"
+  ],
+  "allowed_toolsets": [
+    "web",
+    "terminal",
+    "file",
+    "delegation"
+  ],
+  "allowed_skills": [
+    "brainstorming",
+    "research",
+    "content-generation",
+    "business",
+    "marketing"
+  ],
+  "forbidden_capabilities": [
+    "company.delete",
+    "authority.revoke"
+  ],
+  "max_autonomous_risk": "medium",
+  "allow_irreversible": false,
+  "max_action_spend_minor": 50000,
+  "permit_ttl_seconds": 600,
+  "operating_cadence": {
+    "enabled": true,
+    "interval_hours": 4
+  },
+  "finance": {
+    "base_currency": "USD",
+    "initial_capital_minor": 100000,
+    "tax_profile": {
+      "legal_entity_type": "unconfigured",
+      "jurisdictions": []
+    }
+  },
+  "initial_mandate": {
+    "organization_name": "Autonomous Business LLC",
+    "purpose": "Build and launch a profitable autonomous business from ideation to first verified revenue",
+    "desired_outcome": "Achieve first verified customer payment with positive unit economics",
+    "success_criteria": [
+      {
+        "verifier": "accounting.revenue_at_least",
+        "params": {
+          "amount_minor": 1000,
+          "currency": "USD"
+        }
+      },
+      {
+        "verifier": "accounting.books_balanced",
+        "params": {}
+      },
+      {
+        "verifier": "accounting.gross_margin_positive",
+        "params": {}
+      }
+    ],
+    "termination_conditions": [
+      "capital exhausted",
+      "objective expires",
+      "human advisor intervention"
+    ],
+    "duration_days": 30,
+    "execution_strategy": {
+      "phases": [
+        {
+          "name": "ideation",
+          "duration_days": 3,
+          "objective": "Generate and validate 10 business ideas, select top 3 for testing",
+          "approach": "market research, competitor analysis, customer interviews"
+        },
+        {
+          "name": "validation",
+          "duration_days": 7,
+          "objective": "Test demand for top 3 ideas with landing pages and pre-orders",
+          "approach": "web scrapers, email outreach, payment capture"
+        },
+        {
+          "name": "build",
+          "duration_days": 14,
+          "objective": "Build MVP for winning idea and launch to paying customers",
+          "approach": "rapid prototyping, deployment, customer onboarding"
+        },
+        {
+          "name": "scale",
+          "duration_days": 6,
+          "objective": "Optimize conversion and repeat profitable acquisition pattern",
+          "approach": "A/B testing, funnel optimization, content marketing"
+        }
+      ]
+    }
+  }
+}
