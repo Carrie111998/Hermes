@@ -32,6 +32,7 @@ Usage:
 """
 
 import importlib.util
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,13 @@ from typing import Optional, Dict, Any, List
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _terminal_action_resource(scope: dict) -> str:
+    """Return the immutable resource identity for one terminal action."""
+    return "terminal-action:" + hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -2157,19 +2165,6 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
-        # A governed worker may execute only the exact command resource that
-        # was issued in its immutable task grant. The command is deliberately
-        # part of the resource string: shell text can encode redirects,
-        # pipelines, and path traversal, so a broad "terminal" capability is
-        # not an admissible substitute. Interactive sessions without a worker
-        # execution contract retain the normal terminal policy.
-        from hermes_cli.workforce_delegation import authorize_worker_action
-        authorize_worker_action(
-            capability="terminal.exec",
-            system="localhost" if env_type == "local" else env_type,
-            target_resource=f"command:{command}",
-        )
-
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
@@ -2218,6 +2213,28 @@ def terminal_tool(
             cwd = config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
+
+        # A governed worker may execute only the exact terminal action that
+        # was issued in its immutable task grant. Bind every execution-affecting
+        # field, not just shell text: changing cwd, background/PTY mode,
+        # timeout, or notification behavior requires a new permit.
+        action_scope = {
+            "command": command,
+            "cwd": cwd,
+            "background": bool(background),
+            "timeout": effective_timeout,
+            "pty": bool(pty),
+            "notify_on_complete": bool(notify_on_complete),
+            "watch_patterns": list(watch_patterns or []),
+            "task_id": task_id,
+            "environment": env_type,
+        }
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        authorize_worker_action(
+            capability="terminal.exec",
+            system="localhost" if env_type == "local" else env_type,
+            target_resource=_terminal_action_resource(action_scope),
+        )
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.

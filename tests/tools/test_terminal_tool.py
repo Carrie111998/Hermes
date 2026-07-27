@@ -30,6 +30,25 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "do not re-source the same environment before every command" in description
 
 
+def test_terminal_action_resource_binds_execution_context():
+    base = {
+        "command": "cat /tmp/report",
+        "cwd": "/tmp",
+        "background": False,
+        "timeout": 30,
+        "pty": False,
+        "notify_on_complete": False,
+        "watch_patterns": [],
+        "task_id": "worker-1",
+        "environment": "local",
+    }
+    resource = terminal_tool._terminal_action_resource(base)
+    assert resource.startswith("terminal-action:")
+    assert resource != terminal_tool._terminal_action_resource({**base, "cwd": "/"})
+    assert resource != terminal_tool._terminal_action_resource({**base, "background": True})
+    assert resource != terminal_tool._terminal_action_resource({**base, "command": "cat /tmp/other"})
+
+
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
