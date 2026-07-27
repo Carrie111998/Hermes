@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from hermes_cli import finance_db, objective_service, organization_db
+from hermes_cli import (
+    business_security,
+    finance_db,
+    objective_service,
+    operational_control,
+    organization_db,
+)
 from hermes_cli import objectives_db as db
 
 
@@ -10,6 +16,34 @@ def test_disabled_service_does_not_open_runtime_store(monkeypatch):
     )
     outcome = objective_service.tick_once()
     assert outcome.status == "disabled"
+
+
+def test_missing_ceo_authority_creates_deduplicated_advisor_handoff(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "readiness.db"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agentic": {"enabled": True}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.business_security.evaluate_security_readiness",
+        lambda _config: business_security.SecurityReadiness(True, ()),
+    )
+
+    first = objective_service.tick_once(db_path=database)
+    second = objective_service.tick_once(db_path=database)
+
+    assert first.status == second.status == "configuration_blocked"
+    with db.connect(database) as conn:
+        interventions = operational_control.list_interventions(conn)
+    assert len(interventions) == 1
+    assert interventions[0]["category"] == "ceo_authority_missing"
+    assert {option["id"] for option in interventions[0]["options"]} == {
+        "bootstrap",
+        "repair",
+        "manual",
+    }
 
 
 def test_runtime_build_exposes_only_registered_actions(tmp_path):

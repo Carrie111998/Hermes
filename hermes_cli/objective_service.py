@@ -29,6 +29,32 @@ from hermes_cli.objective_runtime import CycleOutcome, ObjectiveRuntime
 logger = logging.getLogger(__name__)
 
 
+def _raise_readiness_intervention(
+    conn,
+    *,
+    category: str,
+    summary: str,
+    context: dict[str, Any],
+    options: list[dict[str, str]],
+    organization_id: str = "__unscoped__",
+    objective_id: Optional[str] = None,
+    dedupe_key: Optional[str] = None,
+) -> None:
+    """Persist a bounded advisor handoff for a deterministic readiness stop."""
+    from hermes_cli import operational_control
+
+    operational_control.raise_intervention(
+        conn,
+        organization_id=organization_id,
+        objective_id=objective_id,
+        category=category,
+        summary=summary,
+        context=context,
+        options=options,
+        dedupe_key=dedupe_key,
+    )
+
+
 def build_runtime(
     conn,
     config: dict[str, Any],
@@ -219,6 +245,21 @@ def tick_once(
 
         ceo = organization_db.active_ceo(conn)
         if ceo is None:
+            _raise_readiness_intervention(
+                conn,
+                category="ceo_authority_missing",
+                summary="Autonomous operation has no active Founder/CEO authority record",
+                context={
+                    "reason": "no active CEO authority record is configured",
+                    "required_role": "founder_ceo",
+                },
+                options=[
+                    {"id": "bootstrap", "label": "Complete Founder/CEO bootstrap"},
+                    {"id": "repair", "label": "Repair the authority record"},
+                    {"id": "manual", "label": "Remain in manual operation"},
+                ],
+                dedupe_key="readiness:ceo-authority-missing",
+            )
             return CycleOutcome(
                 None,
                 None,
@@ -370,6 +411,25 @@ def tick_once(
         )
         runtime = build_runtime(conn, config, board=board)
         if runtime.unavailable_allowed_capabilities:
+            _raise_readiness_intervention(
+                conn,
+                organization_id=str(ceo["organization_id"]),
+                category="runtime_capability_unavailable",
+                summary="The charter allows capabilities with no governed executor",
+                context={
+                    "capabilities": list(runtime.unavailable_allowed_capabilities),
+                    "authority_boundary": "No external action was attempted",
+                },
+                options=[
+                    {"id": "configure", "label": "Configure a governed executor"},
+                    {"id": "narrow_charter", "label": "Narrow the allowed capabilities"},
+                    {"id": "manual", "label": "Remain in manual operation"},
+                ],
+                dedupe_key=(
+                    "readiness:runtime-capability-unavailable:"
+                    + str(ceo["organization_id"])
+                ),
+            )
             return CycleOutcome(
                 None,
                 None,
@@ -379,9 +439,37 @@ def tick_once(
             )
         if runtime.unreachable_objectives:
             item = runtime.unreachable_objectives[0]
+            objective_id = str(item["objective_id"])
+            objective = db.get_objective(conn, objective_id)
+            if objective.status in {"accepted", "planned"}:
+                db.transition_objective(
+                    conn,
+                    objective_id,
+                    "blocked",
+                    actor="control:readiness",
+                    reason=str(item["reason"]),
+                )
+            _raise_readiness_intervention(
+                conn,
+                organization_id=str(ceo["organization_id"]),
+                objective_id=objective_id,
+                category="objective_unreachable",
+                summary="An active objective has no admissible success verifier",
+                context={
+                    "reason": str(item["reason"]),
+                    "objective_id": objective_id,
+                    "authority_boundary": "No plan or external action was attempted",
+                },
+                options=[
+                    {"id": "configure_verifier", "label": "Configure a verifier contract"},
+                    {"id": "redefine_success", "label": "Redefine success criteria"},
+                    {"id": "abandon", "label": "Abandon the objective"},
+                ],
+                dedupe_key=f"readiness:objective-unreachable:{objective_id}",
+            )
             return CycleOutcome(
                 None,
-                str(item["objective_id"]),
+                objective_id,
                 "configuration_blocked",
                 str(item["reason"]),
             )

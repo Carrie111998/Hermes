@@ -31,6 +31,9 @@
 - Worker supervision now persists expired heartbeat leases as `stale` workers
   with an explicit stop reason during supervisor startup and emits a
   deduplicated advisor intervention for each stale worker.
+- Autonomous readiness stops now persist advisor handoffs for missing CEO
+  authority, unavailable governed capabilities, and unreachable objectives;
+  objectives without admissible verifiers are blocked before execution.
 - Hardened durable runtime ledgers so schema checks preserve active authority
   transactions across finance, accounting, payments, compliance, approvals,
   event ingress, billing, commitments, metrics, worker state, and audit
