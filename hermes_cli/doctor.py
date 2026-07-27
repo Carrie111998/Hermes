@@ -942,6 +942,33 @@ def run_doctor(args):
                 _status["reason"] or "",
             )
         check_info(f"Route: provider={_prov or 'unset'} base_url={_base or 'unset'}")
+
+        # tool_use_enforcement: "auto" matches the MODEL NAME against a list of
+        # family substrings (gpt, codex, gemini, glm, qwen, ...). When the model
+        # is a router alias the real family is hidden, nothing matches, and both
+        # the enforcement block and the per-family operational guidance behind
+        # it are silently never injected. Report it rather than let "auto" look
+        # like it is doing something.
+        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_MODELS
+
+        _enf = (_rcfg.get("agent") or {}).get("tool_use_enforcement", "auto")
+        _model_name = str((_model_cfg or {}).get("default") or "").lower()
+        if isinstance(_enf, str) and _enf.lower() in {"auto", ""}:
+            _matched = [p for p in TOOL_USE_ENFORCEMENT_MODELS if p in _model_name]
+            if _matched:
+                check_ok(f"Tool-use enforcement: auto matches {_matched[0]!r}")
+            else:
+                check_warn(
+                    f"Tool-use enforcement 'auto' never fires for model "
+                    f"{_model_name or '(unset)'!r}",
+                    "the name matches no known model family (it is probably a "
+                    "router alias), so neither the enforcement block nor the "
+                    "per-family guidance is injected. Set "
+                    "agent.tool_use_enforcement: true to force it, or list the "
+                    "substrings that identify this route.",
+                )
+        else:
+            check_info(f"Tool-use enforcement: {_enf!r} (explicit, not auto-detected)")
     except Exception as e:
         check_warn(f"Reasoning-effort probe failed: {e}")
 

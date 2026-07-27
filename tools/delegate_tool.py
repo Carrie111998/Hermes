@@ -2317,9 +2317,13 @@ def _run_single_child(
         except Exception:
             _files_read = []
         try:
+            # None = no path filter. This passed [] and meant "all writes"
+            # (see the old trailing comment), but an empty filter matched
+            # nothing, so files_written was empty in EVERY subagent.complete
+            # event ever emitted.
             _files_written_map = file_state.writes_since(
-                "", wall_start, []
-            )  # all writes since wall_start
+                "", wall_start, None
+            )
         except Exception:
             _files_written_map = {}
         _files_written = sorted(

@@ -49,6 +49,10 @@ ahead. Nothing has been pushed.
 | `07be9aa79` | recalled memory threat-scanned and framed as evidence (H-09) | `agent/memory_manager.py` | `tests/agent/test_memory_context_trust.py`, contract #17 | upstream scans provider prefetch |
 | `7069765d9` | injected guidance stops overriding identity approval rules (H-06) | `agent/prompt_builder.py` | `tests/agent/test_guidance_does_not_override_identity.py`, contract #18 | upstream removes the bypass phrasing |
 | `2fdfe381d` | contract tests + regression simulations for the five above | — (local-policy) | self-verifying via the harness | never |
+| `222ef7f83` | memory bounded on read, unreadable files reported, trust fence unforgeable (H-10, H-11, H-12) | `tools/memory_tool.py`, `agent/tool_dispatch_helpers.py` | `tests/tools/test_memory_bounds_and_trust.py`, contract #11 | upstream bounds recall and strips its own fences from tool output |
+| `75bf49c3e` | the parent classifies a crashed child as failed (H-01 completion); CLI reasoning resync (H-18); Bedrock drop reported (H-17) | `agent/turn_finalizer.py`, `tools/delegate_tool.py`, `cli.py` | `tests/agent/test_turn_completion_honesty.py`, contract #13 | upstream propagates crash state to the parent |
+| `0f24558bf`, `4673c6360` | git exit 1 is only "expected" for query subcommands (H-26) | `tools/terminal_tool.py` | `tests/tools/test_exit_code_interpretation.py` | upstream makes the note subcommand-aware |
+| `a800784b4` | Bedrock transport name + harness anchor corrections | — (test-only) | the harness itself (15/15) | never |
 
 **Highest merge sensitivity:** `run_agent.py` (~17.8k lines) and
 `agent/tool_dispatch_helpers.py`. A whole-file conflict resolution on either
