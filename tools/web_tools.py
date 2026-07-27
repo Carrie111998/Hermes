@@ -37,12 +37,20 @@ Usage:
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
 import asyncio
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
+
+
+def _web_action_resource(kind: str, scope: dict) -> str:
+    """Return an exact resource identity for a provider-backed web action."""
+    return f"web-{kind}:" + hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
 # proxy, client construction, and response-shape normalizers all live in
 # plugins.web.firecrawl.provider. We re-export the names that external
@@ -676,7 +684,9 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         authorize_worker_action(
             capability="web.search",
             system="web",
-            target_resource=f"query:{query}",
+            target_resource=_web_action_resource(
+                "search", {"query": query, "limit": limit}
+            ),
         )
 
         # Dispatch through the web search registry. All 7 providers
@@ -849,7 +859,10 @@ async def web_extract_tool(
             authorize_worker_action(
                 capability="web.read",
                 system="web",
-                target_resource=url,
+                target_resource=_web_action_resource(
+                    "read",
+                    {"url": url, "format": format, "char_limit": char_limit},
+                ),
             )
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──

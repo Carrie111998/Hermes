@@ -914,3 +914,18 @@ def test_governed_web_search_requires_worker_contract(monkeypatch):
 
     assert "error" in result
     assert "governed worker action identity is incomplete" in result["error"]
+
+
+def test_web_action_resource_binds_query_and_output_limits():
+    from tools.web_tools import _web_action_resource
+
+    search = _web_action_resource("search", {"query": "report", "limit": 5})
+    assert search != _web_action_resource("search", {"query": "report", "limit": 100})
+    assert search != _web_action_resource("search", {"query": "other", "limit": 5})
+
+    read = _web_action_resource(
+        "read", {"url": "https://example.com", "format": "markdown", "char_limit": 5000}
+    )
+    assert read != _web_action_resource(
+        "read", {"url": "https://example.com", "format": "text", "char_limit": 5000}
+    )
