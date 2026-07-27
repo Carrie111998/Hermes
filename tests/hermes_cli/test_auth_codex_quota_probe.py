@@ -189,7 +189,9 @@ def test_probe_sends_chatgpt_account_id_from_jwt(monkeypatch):
 
 def _write_auth_store(hermes_home, payload):
     hermes_home.mkdir(parents=True, exist_ok=True)
-    (hermes_home / "auth.json").write_text(json.dumps(payload, indent=2))
+    (hermes_home / "auth.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
 
 
 def _exhausted_pool_store(now=None):
@@ -249,7 +251,7 @@ def test_clear_cooldowns_only_touches_quota_shaped_entries(tmp_path, monkeypatch
 
     assert clear_codex_pool_quota_cooldowns() == 1
 
-    store = json.loads((hermes_home / "auth.json").read_text())
+    store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entries = {e["id"]: e for e in store["credential_pool"]["openai-codex"]}
     assert entries["cred-quota"]["last_status"] is None
     assert entries["cred-quota"]["last_error_reset_at"] is None
@@ -281,7 +283,7 @@ def test_clear_cooldowns_scoped_to_access_token(tmp_path, monkeypatch):
 
     assert clear_codex_pool_quota_cooldowns("tok-other") == 1
 
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entries = {e["id"]: e for e in persisted["credential_pool"]["openai-codex"]}
     assert entries["cred-quota-2"]["last_status"] is None
     assert entries["cred-quota"]["last_status"] == "exhausted"
@@ -341,7 +343,7 @@ def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     assert resolved["api_key"] == "tok-quota"
     assert resolved["source"] == "credential_pool"
 
-    store = json.loads((hermes_home / "auth.json").read_text())
+    store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entry = store["credential_pool"]["openai-codex"][0]
     assert entry["last_status"] is None
     assert entry["last_error_reset_at"] is None
@@ -393,7 +395,7 @@ def test_resolver_refreshes_expired_token_before_quota_reset_probe(
     assert refresh_calls == [(expired_token, "refresh-old")]
     assert probe_tokens == [fresh_token]
 
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = persisted["credential_pool"]["openai-codex"][0]
     assert persisted_entry["access_token"] == fresh_token
     assert persisted_entry["refresh_token"] == "refresh-new"
@@ -460,7 +462,7 @@ def test_resolver_keeps_cooldown_after_refresh_when_probe_negative(
     assert exc.value.code == auth_mod.CODEX_RATE_LIMITED_CODE
     assert probe_tokens == [fresh_token]
 
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = persisted["credential_pool"]["openai-codex"][0]
     assert persisted_entry["access_token"] == fresh_token
     assert persisted_entry["refresh_token"] == "refresh-new"
@@ -611,7 +613,7 @@ def test_device_code_probe_refresh_syncs_pool_and_singleton_with_probe_owned_coo
     assert [item.access_token for item in available] == (
         [fresh_token] if probe_restored else []
     )
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = persisted["credential_pool"]["openai-codex"][0]
     singleton = persisted["providers"]["openai-codex"]
     assert persisted_entry["access_token"] == fresh_token
@@ -664,14 +666,16 @@ def test_pool_quota_refresh_rereads_latest_canonical_chain_under_lock(
     pool = load_pool("openai-codex")
 
     def _reauth_after_preliminary_sync(item):
-        latest = json.loads((hermes_home / "auth.json").read_text())
+        latest = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
         singleton = latest["providers"]["openai-codex"]
         singleton["tokens"] = {
             "access_token": latest_expired_token,
             "refresh_token": "refresh-latest",
         }
         singleton["last_refresh"] = "2026-07-27T08:00:00Z"
-        (hermes_home / "auth.json").write_text(json.dumps(latest))
+        (hermes_home / "auth.json").write_text(
+            json.dumps(latest), encoding="utf-8"
+        )
         return item
 
     monkeypatch.setattr(
@@ -694,7 +698,7 @@ def test_pool_quota_refresh_rereads_latest_canonical_chain_under_lock(
 
     assert pool._available_entries(clear_expired=True, refresh=False) == []
     assert refresh_calls == [(latest_expired_token, "refresh-latest")]
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = persisted["credential_pool"]["openai-codex"][0]
     assert persisted_entry["access_token"] == fresh_token
     assert persisted_entry["refresh_token"] == "refresh-fresh"
@@ -736,14 +740,16 @@ def test_pool_singleton_rotation_preserves_quota_cooldown_until_positive_probe(
     from agent.credential_pool import load_pool
 
     pool = load_pool("openai-codex")
-    rotated_store = json.loads((hermes_home / "auth.json").read_text())
+    rotated_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     rotated_singleton = rotated_store["providers"]["openai-codex"]
     rotated_singleton["tokens"] = {
         "access_token": rotated_token,
         "refresh_token": "refresh-rotated",
     }
     rotated_singleton["last_refresh"] = "2026-07-27T08:00:00Z"
-    (hermes_home / "auth.json").write_text(json.dumps(rotated_store))
+    (hermes_home / "auth.json").write_text(
+        json.dumps(rotated_store), encoding="utf-8"
+    )
     probe_tokens = []
 
     def _probe(token, **kwargs):
@@ -754,7 +760,7 @@ def test_pool_singleton_rotation_preserves_quota_cooldown_until_positive_probe(
 
     assert pool._available_entries(clear_expired=True, refresh=False) == []
     assert probe_tokens == [rotated_token]
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = persisted["credential_pool"]["openai-codex"][0]
     assert persisted_entry["access_token"] == rotated_token
     assert persisted_entry["refresh_token"] == "refresh-rotated"
@@ -823,7 +829,7 @@ def test_pool_probe_does_not_overwrite_concurrent_reauthentication(
 
     assert [item.access_token for item in available] == [newer_token]
     assert available[0].refresh_token == "refresh-newer"
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = persisted["credential_pool"]["openai-codex"][0]
     singleton = persisted["providers"]["openai-codex"]
     assert persisted_entry["access_token"] == newer_token
@@ -913,7 +919,7 @@ def test_pool_final_persist_does_not_rollback_reauth_after_owner_clear(
 
     pool._available_entries(clear_expired=True, refresh=False)
 
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = next(
         item
         for item in persisted["credential_pool"]["openai-codex"]
@@ -925,6 +931,100 @@ def test_pool_final_persist_does_not_rollback_reauth_after_owner_clear(
     assert persisted_entry["last_refresh"] == "2026-07-27T09:00:00Z"
     assert singleton["tokens"]["access_token"] == newer_token
     assert singleton["tokens"]["refresh_token"] == "refresh-newer"
+
+
+def test_stale_pool_write_preserves_newer_manual_device_code_chain(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    stale_token = _jwt({"exp": now + 1800, "jti": "stale-manual"})
+    newer_token = _jwt({"exp": now + 3600, "jti": "newer-manual"})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": stale_token,
+            "refresh_token": "refresh-stale-manual",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+    stale_snapshot = dict(entry)
+
+    newer_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    newer_entry = newer_store["credential_pool"]["openai-codex"][0]
+    newer_entry.update(
+        {
+            "access_token": newer_token,
+            "refresh_token": "refresh-newer-manual",
+            "last_refresh": "2026-07-27T09:00:00Z",
+        }
+    )
+    _write_auth_store(hermes_home, newer_store)
+
+    auth_mod.write_credential_pool("openai-codex", [stale_snapshot])
+
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == newer_token
+    assert persisted_entry["refresh_token"] == "refresh-newer-manual"
+    assert persisted_entry["last_refresh"] == "2026-07-27T09:00:00Z"
+
+
+def test_stale_pool_write_does_not_refreeze_newer_reauthentication(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    stale_token = _jwt({"exp": now + 1800, "jti": "stale-reauth"})
+    newer_token = _jwt({"exp": now + 3600, "jti": "newer-reauth"})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": stale_token,
+            "refresh_token": "refresh-stale-reauth",
+            "last_refresh": "2026-07-27T07:00:00Z",
+            "last_status": "exhausted",
+            "last_status_at": now - 60,
+            "last_error_code": 429,
+            "last_error_reason": "usage_limit_reached",
+            "last_error_reset_at": now + 3600,
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+    stale_snapshot = dict(entry)
+
+    newer_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    newer_entry = newer_store["credential_pool"]["openai-codex"][0]
+    newer_entry.update(
+        {
+            "access_token": newer_token,
+            "refresh_token": "refresh-newer-reauth",
+            "last_refresh": "2026-07-27T09:00:00Z",
+        }
+    )
+    for status_field in auth_mod._POOL_STATUS_FIELDS:
+        newer_entry[status_field] = None
+    _write_auth_store(hermes_home, newer_store)
+
+    auth_mod.write_credential_pool("openai-codex", [stale_snapshot])
+
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == newer_token
+    assert persisted_entry["refresh_token"] == "refresh-newer-reauth"
+    assert persisted_entry["last_refresh"] == "2026-07-27T09:00:00Z"
+    assert persisted_entry["last_status"] is None
+    assert persisted_entry["last_status_at"] is None
+    assert persisted_entry["last_error_code"] is None
+    assert persisted_entry["last_error_reason"] is None
+    assert persisted_entry["last_error_reset_at"] is None
 
 
 def test_resolver_surfaces_terminal_probe_refresh_failure(tmp_path, monkeypatch):
@@ -961,7 +1061,7 @@ def test_resolver_surfaces_terminal_probe_refresh_failure(tmp_path, monkeypatch)
 
     assert exc_info.value.code == "invalid_grant"
     assert exc_info.value.relogin_required is True
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     persisted_entry = persisted["credential_pool"]["openai-codex"][0]
     assert persisted_entry["last_status"] == "dead"
     assert persisted_entry["last_error_code"] == 401
@@ -1022,7 +1122,7 @@ def test_pool_adopts_terminal_probe_refresh_failure_as_dead(tmp_path, monkeypatc
     assert adopted.last_error_code == 401
     assert adopted.last_error_reason == "invalid_grant"
     assert adopted.last_error_reset_at is None
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     singleton = persisted["providers"]["openai-codex"]
     assert "access_token" not in singleton["tokens"]
     assert "refresh_token" not in singleton["tokens"]
@@ -1074,10 +1174,12 @@ def test_pool_throttles_repeated_quota_probe_refresh_failures(
     assert reloaded_pool._available_entries(clear_expired=True, refresh=False) == []
     assert refresh_calls == [(expired_token, "refresh-old")]
 
-    rotated_store = json.loads((hermes_home / "auth.json").read_text())
+    rotated_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     rotated_entry = rotated_store["credential_pool"]["openai-codex"][0]
     rotated_entry["refresh_token"] = "refresh-new-chain"
-    (hermes_home / "auth.json").write_text(json.dumps(rotated_store))
+    (hermes_home / "auth.json").write_text(
+        json.dumps(rotated_store), encoding="utf-8"
+    )
     getattr(auth_mod, "_codex_quota_refresh_failure_cache").clear()
     rotated_pool = load_pool("openai-codex")
     assert rotated_pool._available_entries(clear_expired=True, refresh=False) == []
@@ -1125,34 +1227,34 @@ def test_profile_load_keeps_canonical_global_codex_fallback_read_only(
     loaded = load_pool("openai-codex")
 
     assert [entry.id for entry in loaded.entries()] == ["cred-quota"]
-    profile_after = json.loads(profile_path.read_text())
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
     assert not profile_after["credential_pool"].get("openai-codex")
     assert "openai-codex" not in profile_after["providers"]
 
     rotated_token = _jwt({"exp": now + 3600, "jti": "rotated-global"})
-    rotated_global = json.loads(global_path.read_text())
+    rotated_global = json.loads(global_path.read_text(encoding="utf-8"))
     singleton = rotated_global["providers"]["openai-codex"]
     singleton["tokens"] = {
         "access_token": rotated_token,
         "refresh_token": "refresh-global-rotated",
     }
     singleton["last_refresh"] = "2026-07-27T08:00:00Z"
-    global_path.write_text(json.dumps(rotated_global))
+    global_path.write_text(json.dumps(rotated_global), encoding="utf-8")
     monkeypatch.setattr(
         auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: False
     )
 
     assert loaded._available_entries(clear_expired=True, refresh=False) == []
-    profile_after = json.loads(profile_path.read_text())
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
     assert not profile_after["credential_pool"].get("openai-codex")
-    global_after = json.loads(global_path.read_text())
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
     global_entry = global_after["credential_pool"]["openai-codex"][0]
     assert global_entry["access_token"] == rotated_token
     assert global_entry["refresh_token"] == "refresh-global-rotated"
     assert global_entry["last_status"] == "exhausted"
 
     local_token = _jwt({"exp": now + 7200, "jti": "local-login"})
-    local_store = json.loads(profile_path.read_text())
+    local_store = json.loads(profile_path.read_text(encoding="utf-8"))
     local_store["providers"]["openai-codex"] = {
         "auth_mode": "chatgpt",
         "label": "local-login",
@@ -1162,11 +1264,11 @@ def test_profile_load_keeps_canonical_global_codex_fallback_read_only(
         },
         "last_refresh": "2026-07-27T09:00:00Z",
     }
-    profile_path.write_text(json.dumps(local_store))
+    profile_path.write_text(json.dumps(local_store), encoding="utf-8")
 
     available = loaded._available_entries(clear_expired=True, refresh=False)
     assert [item.access_token for item in available] == [local_token]
-    global_after_local_login = json.loads(global_path.read_text())
+    global_after_local_login = json.loads(global_path.read_text(encoding="utf-8"))
     unchanged_global = global_after_local_login["credential_pool"]["openai-codex"][0]
     assert unchanged_global["access_token"] == rotated_token
     assert unchanged_global["last_status"] == "exhausted"
@@ -1226,12 +1328,12 @@ def test_profile_local_reauth_does_not_inherit_global_fallback_cooldown(
     available = pool._available_entries(clear_expired=True, refresh=False)
 
     assert [item.access_token for item in available] == [local_token]
-    profile_after = json.loads(profile_path.read_text())
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
     local_entry = profile_after["credential_pool"]["openai-codex"][0]
     assert local_entry["access_token"] == local_token
     assert local_entry["refresh_token"] == "refresh-profile-new"
     assert local_entry["last_status"] is None
-    global_after = json.loads(global_path.read_text())
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
     persisted_global = global_after["credential_pool"]["openai-codex"][0]
     assert persisted_global["access_token"] == global_token
     assert persisted_global["last_status"] == "exhausted"
@@ -1304,8 +1406,8 @@ def test_profile_quota_probe_refreshes_global_fallback_owner(
     )
     assert refresh_calls == [(expired_token, "refresh-global-old")]
 
-    profile_after = json.loads(profile_path.read_text())
-    global_after = json.loads(global_path.read_text())
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
     assert not profile_after["credential_pool"].get("openai-codex")
     assert "openai-codex" not in profile_after["providers"]
     persisted_entry = global_after["credential_pool"]["openai-codex"][0]
@@ -1365,8 +1467,8 @@ def test_resolver_refreshes_global_fallback_owner(tmp_path, monkeypatch):
     assert resolved["api_key"] == fresh_token
     assert resolved["source"] == "credential_pool"
     assert refresh_calls == [(expired_token, "refresh-global-old")]
-    profile_after = json.loads(profile_path.read_text())
-    global_after = json.loads(global_path.read_text())
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
     assert not profile_after["credential_pool"].get("openai-codex")
     persisted_entry = global_after["credential_pool"]["openai-codex"][0]
     assert persisted_entry["access_token"] == fresh_token
@@ -1524,7 +1626,7 @@ def test_redeem_reset_clears_pool_cooldowns(tmp_path, monkeypatch):
     )
     assert result.redeemed
 
-    store = json.loads((hermes_home / "auth.json").read_text())
+    store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entry = store["credential_pool"]["openai-codex"][0]
     assert entry["last_status"] is None
     assert entry["last_error_reset_at"] is None

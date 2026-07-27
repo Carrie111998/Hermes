@@ -1485,8 +1485,8 @@ def _merge_disk_cooldown_state(
     cooldowns are not resurrected, so the pool's own expiry-clear (which
     resets ``last_status_at`` to None) is never overridden.
 
-    For singleton-seeded Codex OAuth rows, also retain an on-disk token chain
-    with a strictly newer ``last_refresh``. Codex refresh tokens are single-use;
+    For Codex device-code OAuth rows, also retain an on-disk token chain with a
+    strictly newer ``last_refresh``. Codex refresh tokens are single-use;
     allowing any stale whole-pool snapshot to restore the older refresh token
     would make the next process replay an already consumed grant. For every
     Codex row, the same recency rule preserves a newer persisted quota-refresh
@@ -1504,10 +1504,12 @@ def _merge_disk_cooldown_state(
         )
 
         disk_status = disk_entry.get("last_status")
+        memory_source = entry.get("source")
+        disk_source = disk_entry.get("source")
         if (
             provider_id == "openai-codex"
-            and entry.get("source") == "device_code"
-            and disk_entry.get("source") == "device_code"
+            and memory_source in {"device_code", "manual:device_code"}
+            and disk_source == memory_source
         ):
             disk_refresh_at = (
                 _parse_absolute_timestamp(disk_entry.get("last_refresh")) or 0.0
@@ -1528,6 +1530,13 @@ def _merge_disk_cooldown_state(
                     disk_value = disk_entry.get(token_field)
                     if disk_value not in (None, ""):
                         entry[token_field] = disk_value
+                # Lifecycle state belongs to the token generation. A quota-
+                # probe refresh preserves its exhausted gate on disk, while a
+                # newer explicit reauthentication clears that gate. Adopting
+                # only the chain would let a stale snapshot re-freeze the new
+                # login on its next whole-pool write.
+                for status_field in _POOL_STATUS_FIELDS:
+                    entry[status_field] = disk_entry.get(status_field)
         if provider_id == "openai-codex":
             disk_failure_at = (
                 _parse_absolute_timestamp(
