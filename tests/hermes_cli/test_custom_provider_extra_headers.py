@@ -10,6 +10,7 @@ from hermes_cli.config import (
     _normalize_custom_provider_entry,
     apply_custom_provider_extra_headers_to_client_kwargs,
     get_custom_provider_extra_headers,
+    get_custom_provider_session_affinity,
     normalize_extra_headers,
 )
 from hermes_cli import models as models_mod
@@ -30,6 +31,42 @@ def test_normalize_entry_keeps_extra_headers():
         "X-Custom-Auth": "tok",
         "X-Client-Name": "hermes",
     }
+
+
+def test_session_affinity_requires_explicit_matching_provider_opt_in():
+    providers = [
+        {
+            "name": "opted-in-proxy",
+            "base_url": "https://proxy.example.com/anthropic/",
+            "session_affinity": True,
+        },
+        {
+            "name": "default-proxy",
+            "base_url": "https://other.example.com/anthropic",
+        },
+    ]
+
+    assert get_custom_provider_session_affinity(
+        "https://proxy.example.com/anthropic/v1",
+        custom_providers=providers,
+    ) is True
+    assert get_custom_provider_session_affinity(
+        "https://other.example.com/anthropic",
+        custom_providers=providers,
+    ) is False
+
+
+def test_normalize_entry_keeps_session_affinity_opt_in():
+    normalized = _normalize_custom_provider_entry(
+        {
+            "name": "my-proxy",
+            "base_url": "https://proxy.example.com/anthropic",
+            "session_affinity": True,
+        }
+    )
+
+    assert normalized is not None
+    assert normalized["session_affinity"] is True
 
 
 
