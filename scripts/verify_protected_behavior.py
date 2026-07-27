@@ -140,6 +140,28 @@ def _drop_lease_binding(src: str) -> str:
     return _sub(src, "        if is_background and delegation_id:", "        if False:")
 
 
+def _drop_refspec_force_pattern(src: str) -> str:
+    """Neuter the + refspec regex without touching its neighbours.
+
+    Single-line anchors throughout: a multi-line anchor must reproduce the
+    file's exact indentation and escaping, and goes silently STALE the
+    moment either shifts.
+    """
+    return _sub(src, r"\s\+\S'", r"\sNEVERMATCHES'")
+
+
+def _drop_env_write_block(src: str) -> str:
+    return _sub(src, "in _BLOCKED_PROJECT_ENV_BASENAMES:", "in frozenset():")
+
+
+def _restore_silent_overwrite(src: str) -> str:
+    return _sub(src, "                if os.path.getsize(resolved) > 0:", "                if False:")
+
+
+def _drop_memory_threat_scan(src: str) -> str:
+    return _sub(src, '"[System note: recalled memory context', '"[System note: authoritative reference data')
+
+
 SCENARIOS: List[Scenario] = [
     Scenario("drop-user_message-kwarg",
              "upstream refactors the hook call; feedback-gate silently stops firing",
@@ -178,6 +200,18 @@ SCENARIOS: List[Scenario] = [
              "guard releases on the dispatch return again; lease covers 0.2s",
              PROFILE / "plugins" / "delegation-guard" / "plugin.py",
              _drop_lease_binding),
+    Scenario("drop-refspec-force-pattern",
+             "git push origin +main bypasses the force-push approval gate again",
+             REPO / "tools" / "approval.py", _drop_refspec_force_pattern),
+    Scenario("drop-env-write-block",
+             ".env becomes destroyable while still unreadable",
+             REPO / "agent" / "file_safety.py", _drop_env_write_block),
+    Scenario("restore-silent-overwrite",
+             "write_file silently replaces a file the agent never read",
+             REPO / "tools" / "file_state.py", _restore_silent_overwrite),
+    Scenario("reframe-memory-as-authoritative",
+             "untrusted provider memory is laundered back into an obey-this framing",
+             REPO / "agent" / "memory_manager.py", _drop_memory_threat_scan),
 ]
 
 
