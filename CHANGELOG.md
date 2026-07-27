@@ -183,8 +183,10 @@ recorded.
   provider assessments before rail authorization.
 - `d38f119ee35f9f0998f220f2883720f32a1d006c` — rejected provider assessments
   that were already expired at admission.
+- `a498499a0273adb8d849474e5c461bdf0dd27443` — enforced standalone worker
+  deployment-role and live-host checks even for injected callbacks.
 - Current-main focused acceptance rerun at baseline
-  `d38f119ee35f9f0998f220f2883720f32a1d006c`: 6 Founder/CEO E2E tests, 47
+  `a498499a0273adb8d849474e5c461bdf0dd27443`: 6 Founder/CEO E2E tests, 47
   objective service/runtime/worker tests, and 20 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.

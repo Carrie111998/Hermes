@@ -94,6 +94,9 @@ acceptance evidence.
   a rail can be authorized.
 - Payment-provider assessments also reject evidence already expired at
   admission; only currently valid assessments can enter the authorization set.
+- Standalone workers enforce the configured deployment role and live worker
+  registration even when an embedding supplies a callback; callback injection
+  cannot bypass supervised-host boundaries.
 - Runtime-host mismatches and charters with no registered action contracts also
   persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted
@@ -152,7 +155,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`d38f119ee35f9f0998f220f2883720f32a1d006c` passed 6 Founder/CEO E2E tests, 47
+`a498499a0273adb8d849474e5c461bdf0dd27443` passed 6 Founder/CEO E2E tests, 47
 objective service/runtime/worker tests, and 20 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
