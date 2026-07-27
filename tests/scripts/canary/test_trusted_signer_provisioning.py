@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -511,3 +512,317 @@ def test_runtime_receipt_projection_replays_after_staged_crash(
 
     assert runtime_receipt.read_bytes() == current_raw
     assert not replacement.exists()
+
+
+def _projection_rollover_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    provisioning.SignerLayout,
+    Mapping[str, object],
+    Mapping[str, bytes],
+    Mapping[str, bytes],
+]:
+    previous_revision = "a" * 40
+    current_revision = "b" * 40
+    uid = os.getuid()
+    gid = os.getgid()
+    release_base = tmp_path / "releases"
+    previous_release = release_base / previous_revision
+    current_release = release_base / current_revision
+    previous_release.mkdir(parents=True)
+    current_release.mkdir()
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+
+    def layout(revision: str) -> provisioning.SignerLayout:
+        release = release_base / revision
+        return provisioning.SignerLayout(
+            role="cloud",
+            release_base=release_base,
+            release=release,
+            authority_manifest=release / "package-manifest.json",
+            pinned_public_key=release / "cloud.pub",
+            private_key=tmp_path / "private.key",
+            installed_public_key=tmp_path / "installed.pub",
+            config=tmp_path / "config.json",
+            replay_directory=tmp_path / "replay",
+            receipt=receipt_root / f"cloud-signer-{revision}.json",
+            lock=tmp_path / "lock",
+            activation_seal=tmp_path / "activation-seal",
+            current_link=tmp_path / "current",
+            private_uid=uid,
+            private_gid=gid,
+            config_uid=uid,
+            config_gid=gid,
+            replay_uid=uid,
+            replay_gid=gid,
+            receipt_uid=uid,
+            receipt_gid=gid,
+            sudoers=tmp_path / "sudoers",
+            sudoers_template=release / "sudoers.in",
+            release_uid=uid,
+            release_gid=gid,
+            runtime_entrypoint_name="provision",
+        )
+
+    current_layout = layout(current_revision)
+    previous_layout = layout(previous_revision)
+    projection_paths = {
+        "installed_public_key": (
+            current_layout.installed_public_key,
+            uid,
+            gid,
+            0o444,
+        ),
+        "config": (current_layout.config, uid, gid, 0o444),
+        "sudoers": (current_layout.sudoers, uid, gid, 0o440),
+    }
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_paths",
+        lambda selected: (
+            projection_paths
+            if selected in {current_layout, previous_layout}
+            else (_ for _ in ()).throw(AssertionError("unexpected layout"))
+        ),
+    )
+    previous_public = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    current_private = Ed25519PrivateKey.generate()
+    current_public = current_private.public_key().public_bytes_raw()
+    previous_authority: Mapping[str, object] = {
+        "package_sha256": "1" * 64,
+        "public_raw": previous_public,
+        "public_key_id": hashlib.sha256(previous_public).hexdigest(),
+    }
+    current_authority: Mapping[str, object] = {
+        "package_sha256": "2" * 64,
+        "public_raw": current_public,
+        "public_key_id": hashlib.sha256(current_public).hexdigest(),
+    }
+    previous_payloads = {
+        "installed_public_key": previous_public,
+        "config": b'{"projection":"previous"}',
+        "sudoers": (
+            f"root ALL=(root) NOPASSWD: "
+            f"{release_base}/{previous_revision}/bin/provision\n"
+        ).encode("ascii"),
+    }
+    current_payloads = {
+        "installed_public_key": current_public,
+        "config": b'{"projection":"current"}',
+        "sudoers": (
+            f"root ALL=(root) NOPASSWD: "
+            f"{release_base}/{current_revision}/bin/provision\n"
+        ).encode("ascii"),
+    }
+    current_layout.private_key.write_bytes(current_private.private_bytes_raw())
+    current_layout.private_key.chmod(0o400)
+    for name, (path, _uid, _gid, mode) in provisioning._projection_paths(
+        current_layout
+    ).items():
+        path.write_bytes(previous_payloads[name])
+        path.chmod(mode)
+
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_layout",
+        lambda revision, *, role: (
+            previous_layout
+            if revision == previous_revision and role == "cloud"
+            else (_ for _ in ()).throw(AssertionError("unexpected release"))
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_release_and_authority",
+        lambda selected: (
+            previous_authority
+            if selected is previous_layout
+            else (_ for _ in ()).throw(AssertionError("unexpected layout"))
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_payloads",
+        lambda selected, *, authority: (
+            previous_payloads
+            if selected is previous_layout and authority is previous_authority
+            else (
+                current_payloads
+                if selected is current_layout and authority is current_authority
+                else (_ for _ in ()).throw(
+                    AssertionError("unexpected projection")
+                )
+            )
+        ),
+    )
+    return (
+        current_layout,
+        current_authority,
+        previous_payloads,
+        current_payloads,
+    )
+
+
+def test_projection_rollover_replaces_only_exact_predecessor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+
+    provisioning._recover_release_bound_projections(
+        layout,
+        authority=authority,
+    )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == current_payloads[name]
+        assert path.read_bytes() != previous_payloads[name]
+    intent = provisioning._projection_intent_path(layout)
+    assert intent.exists()
+    assert intent.stat().st_mode & 0o777 == 0o444
+
+
+def test_projection_rollover_replays_mixed_crash_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        _previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+
+    def crash_after_config_stage(name: str) -> None:
+        if name == "config":
+            raise SimulatedCrash("simulated_projection_rollover_crash")
+
+    with pytest.raises(SimulatedCrash):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+            after_stage=crash_after_config_stage,
+        )
+
+    provisioning._recover_release_bound_projections(
+        layout,
+        authority=authority,
+    )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == current_payloads[name]
+        replacement = path.parent / (
+            f".{path.name}.muncho-projection-{layout.release.name}"
+        )
+        assert not replacement.exists()
+
+
+def test_projection_rollover_rejects_unbound_mixed_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        _previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+    layout.installed_public_key.chmod(0o644)
+    layout.installed_public_key.write_bytes(
+        current_payloads["installed_public_key"]
+    )
+    layout.installed_public_key.chmod(0o444)
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_projection_rollover_invalid",
+    ):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+        )
+
+    assert not provisioning._projection_intent_path(layout).exists()
+
+
+def test_projection_rollover_never_replaces_mismatched_private_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        previous_payloads,
+        _current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+    layout.private_key.chmod(0o600)
+    layout.private_key.write_bytes(Ed25519PrivateKey.generate().private_bytes_raw())
+    layout.private_key.chmod(0o400)
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_private_public_mismatch",
+    ):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+        )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == previous_payloads[name]
+    assert not provisioning._projection_intent_path(layout).exists()
+
+
+def test_projection_rollover_rechecks_inert_boundary_after_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+
+    def activate_after_stage(name: str) -> None:
+        if name == "installed_public_key":
+            layout.activation_seal.write_bytes(b"activation-race")
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_activation_not_inert",
+    ):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+            after_stage=activate_after_stage,
+        )
+
+    assert (
+        layout.installed_public_key.read_bytes()
+        == previous_payloads["installed_public_key"]
+    )
+    layout.activation_seal.unlink()
+
+    provisioning._recover_release_bound_projections(
+        layout,
+        authority=authority,
+    )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == current_payloads[name]
