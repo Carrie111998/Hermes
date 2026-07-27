@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Kanban completion and block transitions now require exact lifecycle permits
+  bound to task, board, handoff/reason payload, artifacts or block kind, and
+  expected worker run identity before objective state can advance or pause.
 - Kanban heartbeat lease extensions now require an exact permit bound to task,
   board, note, claim lock, and expected worker run identity.
 - Kanban inline and URL attachment writes now require exact artifact permits

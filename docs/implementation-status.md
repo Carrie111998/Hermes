@@ -76,6 +76,9 @@ acceptance evidence.
   identity and source scope before storage or download.
 - Kanban heartbeat lease extensions are governed by exact task, board, note,
   claim-lock, and worker-run scope before lifecycle state changes.
+- Kanban completion and block transitions are governed by exact closure or
+  escalation payloads in addition to existing ownership, evidence, judge, and
+  expected-run checks.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,

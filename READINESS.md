@@ -1732,6 +1732,28 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production distributed lease infrastructure or external authorization.
 
+## Kanban closure authority evidence (20f5bc014f)
+
+Kanban completion and block transitions now require exact permits before task
+state changes. Completion binds task, board, redacted summary/result/metadata,
+created cards, artifacts, and expected run; block binds task, board, redacted
+reason, kind, and expected run. Existing goal-judge, ownership, artifact, and
+run-integrity checks remain authoritative.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **127 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:7f4b920906366658208ebb096dc76f53d49b74401dc7f4f826334f03d21b3c13`.
+This remains deterministic local-provider evidence and does not establish
+production distributed lifecycle infrastructure or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
