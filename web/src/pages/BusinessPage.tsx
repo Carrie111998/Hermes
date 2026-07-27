@@ -104,7 +104,7 @@ export default function BusinessPage() {
           <RefreshCw className="h-4 w-4" /> Refresh
         </Button>
         {data.autonomy?.mode === "autonomous" ? (
-          <Button tone="destructive" onClick={() => void setAutonomy("paused")}>
+          <Button destructive onClick={() => void setAutonomy("paused")}>
             Pause autonomy
           </Button>
         ) : (
@@ -218,7 +218,7 @@ export default function BusinessPage() {
                   last cycle: {worker.last_cycle_status ?? "none"}
                 </span>
               </div>
-              <Badge tone={worker.healthy ? "neutral" : "destructive"}>
+              <Badge tone={worker.healthy ? "secondary" : "destructive"}>
                 {worker.effective_status} · {worker.heartbeat_age_seconds}s
               </Badge>
             </div>
@@ -291,7 +291,7 @@ export default function BusinessPage() {
               <div key={experiment.id} className="rounded border border-border p-3">
                 <div className="flex items-start justify-between gap-3">
                   <p className="text-sm font-medium">{experiment.name}</p>
-                  <Badge tone={experiment.status === "stopped" ? "destructive" : "neutral"}>
+                  <Badge tone={experiment.status === "stopped" ? "destructive" : "secondary"}>
                     {experiment.status}
                   </Badge>
                 </div>
@@ -313,7 +313,7 @@ export default function BusinessPage() {
                   <p className="text-sm font-medium">{objective.desired_outcome}</p>
                   <p className="font-mono text-xs text-muted-foreground">{objective.id}</p>
                 </div>
-                <Badge tone={objective.status === "blocked" ? "destructive" : "neutral"}>
+                <Badge tone={objective.status === "blocked" ? "destructive" : "secondary"}>
                   {objective.status}
                 </Badge>
               </div>
@@ -388,7 +388,7 @@ export default function BusinessPage() {
               <div key={employee.id} style={{ paddingLeft: employee.depth * 16 }} className="text-sm">
                 <span className="font-medium">{employee.title}</span>
                 <span className="ml-2 text-muted-foreground">{employee.display_name}</span>
-                <Badge className="ml-2" tone="neutral">{employee.status}</Badge>
+                <Badge className="ml-2" tone="secondary">{employee.status}</Badge>
               </div>
             ))}
           </CardContent>
