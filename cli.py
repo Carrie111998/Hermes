@@ -1115,6 +1115,28 @@ def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
         pass  # best-effort — never block shutdown on watchdog setup
 
 
+def _cleanup_watchdog_timeout_seconds() -> float:
+    """Return the operator override or a provider-aware cleanup deadline."""
+    configured = os.getenv("HERMES_EXIT_WATCHDOG_S")
+    if configured is not None:
+        try:
+            return float(configured)
+        except (TypeError, ValueError):
+            return 30.0
+
+    timeout_s = 30.0
+    memory_manager = getattr(_active_agent_ref, "_memory_manager", None)
+    hint = getattr(memory_manager, "shutdown_timeout_seconds", None)
+    if callable(hint):
+        try:
+            # Leave headroom for transcript finalization and the other bounded
+            # cleanup stages that run before memory-provider teardown.
+            timeout_s = max(timeout_s, float(hint()) + 15.0)
+        except Exception:
+            pass
+    return timeout_s
+
+
 _signal_watchdog_armed = False
 
 
@@ -1147,10 +1169,7 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
     if _signal_watchdog_armed:
         return
     _signal_watchdog_armed = True
-    try:
-        base = float(os.getenv("HERMES_EXIT_WATCHDOG_S", "30"))
-    except (TypeError, ValueError):
-        base = 30.0
+    base = _cleanup_watchdog_timeout_seconds()
     if base <= 0:
         return  # explicitly disabled
     try:
@@ -1169,7 +1188,7 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     # Bound total shutdown time: if cleanup (or the interpreter's
     # thread-join teardown after it) wedges, force-exit instead of
     # leaving a zombie CLI holding the terminal for minutes.
-    _arm_exit_watchdog()
+    _arm_exit_watchdog(timeout_s=_cleanup_watchdog_timeout_seconds())
 
     # Reset terminal input modes first, before the slower resource teardown
     # below (MCP / browser / memory shutdown can take seconds). On Ctrl+C the

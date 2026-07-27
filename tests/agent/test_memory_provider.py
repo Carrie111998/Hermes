@@ -389,6 +389,41 @@ class TestMemoryManager:
         mgr.shutdown_all()
         assert order == ["external", "builtin"]  # reverse order
 
+    def test_shutdown_timeout_includes_provider_hints(self):
+        class HintProvider(FakeMemoryProvider):
+            def shutdown_timeout_seconds(self):
+                return 7.0
+
+        mgr = MemoryManager()
+        provider = HintProvider("external")
+        mgr.add_provider(provider)
+
+        assert mgr.shutdown_timeout_seconds() == 12.0
+
+    def test_shutdown_retries_opted_in_provider_and_budgets_retry(self):
+        class RetryProvider(FakeMemoryProvider):
+            shutdown_retryable = True
+
+            def __init__(self):
+                super().__init__("external")
+                self.shutdown_calls = 0
+
+            def shutdown_timeout_seconds(self):
+                return 7.0
+
+            def shutdown(self):
+                self.shutdown_calls += 1
+                if self.shutdown_calls == 1:
+                    raise RuntimeError("still draining")
+
+        mgr = MemoryManager()
+        provider = RetryProvider()
+        mgr.add_provider(provider)
+
+        assert mgr.shutdown_timeout_seconds() == 19.0
+        mgr.shutdown_all()
+        assert provider.shutdown_calls == 2
+
     def test_initialize_all(self):
         mgr = MemoryManager()
         p1 = FakeMemoryProvider("builtin")

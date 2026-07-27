@@ -1141,6 +1141,29 @@ class MemoryManager:
                     provider.name, e,
                 )
 
+    def shutdown_timeout_seconds(self) -> float:
+        """Return a conservative watchdog hint for provider teardown."""
+        total = _SYNC_DRAIN_TIMEOUT_S
+        for provider in self._providers:
+            hint = getattr(provider, "shutdown_timeout_seconds", None)
+            if not callable(hint):
+                continue
+            try:
+                value = hint()
+                if not isinstance(value, (int, float, str)):
+                    raise TypeError("shutdown timeout must be numeric")
+                provider_timeout = max(0.0, float(value))
+                if getattr(provider, "shutdown_retryable", False):
+                    provider_timeout *= 2.0
+                total += provider_timeout
+            except Exception:
+                logger.debug(
+                    "Memory provider '%s' returned an invalid shutdown timeout",
+                    provider.name,
+                    exc_info=True,
+                )
+        return total
+
     def shutdown_all(self) -> None:
         """Shut down all providers (reverse order for clean teardown).
 
@@ -1159,6 +1182,16 @@ class MemoryManager:
                     "Memory provider '%s' shutdown failed: %s",
                     provider.name, e,
                 )
+                if not getattr(provider, "shutdown_retryable", False):
+                    continue
+                try:
+                    provider.shutdown()
+                except Exception as retry_error:
+                    logger.warning(
+                        "Memory provider '%s' shutdown retry failed: %s",
+                        provider.name,
+                        retry_error,
+                    )
 
     @property
     def shutdown_drain_state(self) -> Dict[str, Any]:

@@ -22,6 +22,26 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 
+def test_cleanup_watchdog_accounts_for_memory_shutdown(monkeypatch):
+    import cli as cli_mod
+
+    monkeypatch.delenv("HERMES_EXIT_WATCHDOG_S", raising=False)
+    agent = MagicMock()
+    agent._memory_manager.shutdown_timeout_seconds.return_value = 40.0
+    cli_mod._active_agent_ref = agent
+    try:
+        assert cli_mod._cleanup_watchdog_timeout_seconds() == 55.0
+    finally:
+        cli_mod._active_agent_ref = None
+
+
+def test_cleanup_watchdog_preserves_operator_override(monkeypatch):
+    import cli as cli_mod
+
+    monkeypatch.setenv("HERMES_EXIT_WATCHDOG_S", "12")
+    assert cli_mod._cleanup_watchdog_timeout_seconds() == 12.0
+
+
 @patch("hermes_cli.plugins.invoke_hook")
 def test_cleanup_forwards_session_messages(mock_invoke_hook):
     """_run_cleanup forwards a populated ``_session_messages`` list."""
