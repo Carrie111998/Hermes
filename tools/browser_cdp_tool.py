@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error
@@ -27,6 +28,58 @@ from tools.registry import registry, tool_error
 logger = logging.getLogger(__name__)
 
 CDP_DOCS_URL = "https://chromedevtools.github.io/devtools-protocol/"
+
+_TASK_BOUND_MUTATING_CDP_METHODS = {
+    "Runtime.evaluate",
+    "Runtime.callFunctionOn",
+    "Page.navigate",
+    "Page.reload",
+    "Page.handleJavaScriptDialog",
+}
+_TASK_BOUND_MUTATING_CDP_PREFIXES = (
+    "Input.",
+    "DOM.set",
+    "DOM.remove",
+    "DOM.focus",
+    "DOM.scrollIntoView",
+    "DOMStorage.",
+    "Storage.",
+    "Network.set",
+    "Network.delete",
+    "Browser.set",
+    "Browser.grantPermissions",
+    "Browser.resetPermissions",
+)
+
+
+def _task_bound_cdp_guard(method: str) -> Optional[str]:
+    """Deny raw CDP mutation escape hatches for Grace execution tasks."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing() as conn:
+            guarded = kb.is_grace_execution_task(conn, task_id)
+    except Exception as exc:
+        return (
+            "Task-bound raw CDP safety check failed closed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if not guarded:
+        return None
+    if method in _TASK_BOUND_MUTATING_CDP_METHODS or method.startswith(
+        _TASK_BOUND_MUTATING_CDP_PREFIXES
+    ):
+        return (
+            f"Task-bound raw CDP mutation blocked: {method} is an unguarded "
+            "escape hatch. Use the contract-approved browser_navigate, "
+            "browser_snapshot, and guarded browser action tools; do not retry "
+            "with Runtime.evaluate, DOM, Input, Page, Network, Storage, or "
+            "Browser mutation fallbacks."
+        )
+    return None
 
 # ``websockets`` is a direct hermes-agent dependency because the browser CDP
 # supervisor and browser_dialog tool import it during tool discovery. Wrap the
@@ -330,6 +383,11 @@ def browser_cdp(
         JSON string ``{"success": True, "method": ..., "result": {...}}`` on
         success, or ``{"error": "..."}`` on failure.
     """
+    if isinstance(method, str):
+        guard_error = _task_bound_cdp_guard(method)
+        if guard_error:
+            return tool_error(guard_error, method=method)
+
     # --- Route iframe-scoped calls through the supervisor ---------------
     if frame_id:
         return _browser_cdp_via_supervisor(
