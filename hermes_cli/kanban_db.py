@@ -2543,6 +2543,99 @@ def _latest_product_writer_agent(conn: sqlite3.Connection, task_id: str) -> Opti
     return None
 
 
+def _executor_from_run_metadata(metadata: object) -> Optional[dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return None
+    executor = metadata.get("executor")
+    required = {"profile", "provider", "model", "effort", "surface"}
+    if not isinstance(executor, dict) or not required <= set(executor):
+        return None
+    cleaned = {key: str(executor.get(key) or "").strip() for key in required}
+    if not all(cleaned.values()):
+        return None
+    cleaned["source"] = str(executor.get("source") or "dispatcher")
+    cleaned["version"] = 1
+    return cleaned
+
+
+def _latest_product_step_executor(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step_key: str,
+) -> Optional[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT metadata FROM task_runs
+         WHERE task_id = ? AND step_key = ?
+           AND metadata IS NOT NULL AND metadata != ''
+         ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+        """,
+        (task_id, step_key),
+    ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        executor = _executor_from_run_metadata(metadata)
+        if executor is not None:
+            return executor
+    return None
+
+
+def _canonicalize_product_ai_provenance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step_key: Optional[str],
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    """Prefer dispatcher-stamped executor facts over worker-authored aliases."""
+    step = str(step_key or "")
+    role_key = {
+        "development": "writer",
+        "test": "tester",
+        "review": "reviewer",
+    }.get(step)
+    if role_key is None:
+        return metadata
+    task = get_task(conn, task_id)
+    run = get_run(conn, task.current_run_id) if task and task.current_run_id else None
+    executor = _executor_from_run_metadata(run.metadata if run else None)
+    writer_executor = (
+        _latest_product_step_executor(conn, task_id, "development")
+        if step == "review"
+        else None
+    )
+    if executor is None and writer_executor is None:
+        return metadata
+
+    canonical = dict(metadata or {})
+    provenance = canonical.get("ai_provenance")
+    provenance = dict(provenance) if isinstance(provenance, dict) else {}
+
+    def _stamp(role: str, identity: dict[str, Any]) -> None:
+        existing = provenance.get(role)
+        role_facts = dict(existing) if isinstance(existing, dict) else {}
+        role_facts.update(
+            {
+                "agent": identity["provider"],
+                "provider": identity["provider"],
+                "model": identity["model"],
+                "effort": identity["effort"],
+                "profile": identity["profile"],
+                "surface": identity["surface"],
+            }
+        )
+        provenance[role] = role_facts
+
+    if executor is not None:
+        _stamp(role_key, executor)
+    if writer_executor is not None:
+        _stamp("writer", writer_executor)
+    canonical["ai_provenance"] = provenance
+    return canonical
+
+
 def _record_product_provenance_rejection(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2609,9 +2702,51 @@ def _validate_product_ai_provenance(
             raise ProductProvenanceError(reason, task_id, step)
         return
     if step == "review":
+        task = get_task(conn, task_id)
+        current_run = (
+            get_run(conn, task.current_run_id)
+            if task is not None and task.current_run_id is not None
+            else None
+        )
+        reviewer_executor = _executor_from_run_metadata(
+            current_run.metadata if current_run is not None else None
+        )
+        writer_executor = _latest_product_step_executor(
+            conn, task_id, "development"
+        )
+        if (reviewer_executor is None) != (writer_executor is None):
+            writer_provider = (
+                writer_executor["provider"]
+                if writer_executor is not None
+                else None
+            )
+            reviewer_provider = (
+                reviewer_executor["provider"]
+                if reviewer_executor is not None
+                else None
+            )
+            reason = (
+                "Review completion rejected: canonical writer and reviewer "
+                "executor identities are both required when either dispatched "
+                "run is canonically stamped; Hermes will not compare a trusted "
+                "runtime identity with a worker-authored alias."
+            )
+            _record_product_provenance_rejection(
+                conn,
+                task_id,
+                step_key=step,
+                reason=reason,
+                writer_agent=writer_provider,
+                reviewer_agent=reviewer_provider,
+            )
+            raise ProductProvenanceError(reason, task_id, step)
+
         reviewer = _reviewer_agent_from_metadata(metadata)
         supplied_writer = _writer_agent_from_metadata(metadata)
         writer = supplied_writer or _latest_product_writer_agent(conn, task_id)
+        if reviewer_executor is not None and writer_executor is not None:
+            reviewer = reviewer_executor["provider"]
+            writer = writer_executor["provider"]
         missing: list[str] = []
         if not reviewer:
             missing.append("ai_provenance.reviewer.agent")
@@ -2629,9 +2764,10 @@ def _validate_product_ai_provenance(
             raise ProductProvenanceError(reason, task_id, step, missing=missing)
         if _agent_compare_key(writer) == _agent_compare_key(reviewer):
             reason = (
-                "Review completion rejected: reviewer AI must differ from "
-                f"writer AI (both were {reviewer!r}). Use Codex to review "
-                "Claude Code output, or Claude Code to review Codex output."
+                "Review completion rejected: canonical reviewer provider must "
+                "differ from the canonical writer provider "
+                f"(both were {reviewer!r}). Select an independently configured "
+                "reviewer runtime; Hermes will not choose a fallback."
             )
             _record_product_provenance_rejection(
                 conn, task_id, step_key=step, reason=reason,
@@ -2823,6 +2959,9 @@ def _complete_product_workflow_step(
         raise ValueError("unresolved product preflight; use kanban_resolve")
     transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(pre_step or ""))
     if transition is not None and transition.get("next_step"):
+        metadata = _canonicalize_product_ai_provenance(
+            conn, task_id, pre_step, metadata,
+        )
         _validate_product_ai_provenance(
             conn, task_id, pre_step, metadata, meta,
         )
@@ -6328,6 +6467,30 @@ def get_work_contract(
     return result
 
 
+def work_contract_view(
+    conn: sqlite3.Connection, contract_id: Optional[str]
+) -> Optional[dict[str, Any]]:
+    """Return the bounded authority fields workers may consume."""
+    if not contract_id:
+        return None
+    stored = get_work_contract(conn, contract_id)
+    if stored is None:
+        raise ValueError(f"missing Work Contract {contract_id}")
+    contract = stored["contract"]
+    return {
+        "id": stored["id"],
+        "digest": stored["digest"],
+        "policy_version": contract.get("policy_version"),
+        "qualification_path": contract.get("qualification_path"),
+        "request_id": contract.get("request_id"),
+        "work": contract.get("work"),
+        "routing": contract.get("routing"),
+        "handover": contract.get("handover"),
+        "rules": contract.get("rules"),
+        "classification": contract.get("classification"),
+    }
+
+
 def add_epic_membership(
     conn: sqlite3.Connection,
     *,
@@ -7546,11 +7709,24 @@ def _end_run(
     if int(row["current_run_id"]) != run_id:
         return None
     active = conn.execute(
-        "SELECT id FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        "SELECT id, metadata FROM task_runs "
+        "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
         (run_id, task_id),
     ).fetchone()
     if active is None:
         return None
+    final_metadata = dict(metadata or {})
+    try:
+        active_metadata = (
+            json.loads(active["metadata"]) if active["metadata"] else {}
+        )
+    except (TypeError, ValueError):
+        active_metadata = {}
+    if isinstance(active_metadata, dict):
+        for key in ("review_base_sha", "review_head_sha", "executor"):
+            value = active_metadata.get(key)
+            if value is not None:
+                final_metadata.setdefault(key, value)
     closed = conn.execute(
         """
         UPDATE task_runs
@@ -7572,7 +7748,11 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            (
+                json.dumps(final_metadata, ensure_ascii=False)
+                if final_metadata
+                else None
+            ),
             now,
             run_id,
             task_id,
@@ -12797,6 +12977,9 @@ def handoff(
             board=board,
         )
 
+    metadata = _canonicalize_product_ai_provenance(
+        conn, task_id, step, metadata,
+    )
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
 
     sha = _commit_worker_diff(conn, task_id)
@@ -12888,6 +13071,180 @@ def handoff(
     return True
 
 
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class ReviewTargetPreparationError(RuntimeError):
+    """Reviewer input could not be pinned safely before worker launch."""
+
+
+class WorkerRuntimeIdentityError(RuntimeError):
+    """A governed worker runtime could not be identified canonically."""
+
+
+def _review_git_output(workspace: Path, *args: str) -> str:
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        raise ReviewTargetPreparationError("git executable is unavailable")
+    try:
+        result = subprocess.run(
+            [git_executable, "-C", str(workspace), *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ReviewTargetPreparationError(
+            f"git {' '.join(args)} failed: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown git error").strip()
+        raise ReviewTargetPreparationError(
+            f"git {' '.join(args)} failed: {detail[:300]}"
+        )
+    return (result.stdout or "").strip()
+
+
+def _review_target_branch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path,
+    *,
+    board: Optional[str] = None,
+) -> str:
+    """Resolve the board-owned branch against which Reviewer compares."""
+    story_base = _story_base_branch(conn, task_id, board=board)
+    if story_base:
+        return story_base
+    meta = product_board_metadata(board) or {}
+    board_checkout = str(meta.get("default_workdir") or "").strip()
+    if not board_checkout:
+        raise ReviewTargetPreparationError(
+            "product board has no target checkout"
+        )
+    checkout_root = _git_toplevel(Path(board_checkout).expanduser())
+    if checkout_root is None:
+        raise ReviewTargetPreparationError(
+            "product board target checkout is not a git repository"
+        )
+    if _git_common_dir(checkout_root) != _git_common_dir(workspace):
+        raise ReviewTargetPreparationError(
+            "product board target checkout does not match the task repository"
+        )
+    target_branch = _git_current_branch(checkout_root)
+    if not target_branch:
+        raise ReviewTargetPreparationError(
+            "product board target checkout has no active branch"
+        )
+    return target_branch
+
+
+def _prepare_review_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    """Pin immutable base/head commits into the active review run."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ReviewTargetPreparationError(f"task {task_id} not found")
+    if task.current_step_key != "review":
+        return None
+    if not task.workspace_path:
+        raise ReviewTargetPreparationError("task has no workspace path")
+    try:
+        expected_workspace = Path(task.workspace_path).expanduser().resolve(strict=True)
+        actual_workspace = Path(workspace).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ReviewTargetPreparationError(f"workspace is unavailable: {exc}") from exc
+    if actual_workspace != expected_workspace:
+        raise ReviewTargetPreparationError(
+            f"launch workspace {actual_workspace} does not match task workspace "
+            f"{expected_workspace}"
+        )
+    if not actual_workspace.is_dir():
+        raise ReviewTargetPreparationError(
+            f"task workspace is not a directory: {actual_workspace}"
+        )
+    if task.current_run_id is None:
+        raise ReviewTargetPreparationError("task has no active review run")
+    run = get_run(conn, task.current_run_id)
+    if (
+        run is None
+        or run.task_id != task_id
+        or run.ended_at is not None
+        or run.status != "running"
+        or run.profile != "reviewer"
+        or run.step_key != "review"
+    ):
+        raise ReviewTargetPreparationError("active run is not the current review run")
+
+    dirty = _review_git_output(
+        actual_workspace, "status", "--porcelain", "--untracked-files=all"
+    )
+    if dirty:
+        raise ReviewTargetPreparationError("review workspace is dirty or uncommitted")
+    head_sha = _review_git_output(
+        actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
+    )
+    base_ref = _review_target_branch(
+        conn, task_id, actual_workspace, board=board
+    )
+    base_sha = _review_git_output(
+        actual_workspace, "merge-base", base_ref, head_sha
+    )
+    if not _FULL_GIT_SHA_RE.fullmatch(base_sha):
+        raise ReviewTargetPreparationError("review base is not a full commit SHA")
+    if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
+        raise ReviewTargetPreparationError("review head is not a full commit SHA")
+
+    metadata = dict(run.metadata or {})
+    metadata.update(
+        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET metadata = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (json.dumps(metadata, sort_keys=True), run.id, task_id),
+        )
+        if cur.rowcount != 1:
+            raise ReviewTargetPreparationError(
+                "active review run changed before target pinning"
+            )
+    return {"review_base_sha": base_sha, "review_head_sha": head_sha}
+
+
+def _pin_review_target_or_block(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    if task.current_step_key != "review" or task.assignee != "reviewer":
+        return True
+    try:
+        _prepare_review_target(conn, task.id, workspace, board=board)
+        return True
+    except Exception as exc:
+        _record_task_failure(
+            conn,
+            task.id,
+            f"review target preparation: {exc}",
+            outcome="spawn_failed",
+            failure_limit=1,
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+        )
+        return False
+
+
 def _spawn_one_v2(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12920,6 +13277,16 @@ def _spawn_one_v2(
         # Already claimed (or no longer ready) -- the CAS fire-once
         # guarantee: nothing to do on this or any later pass.
         return None
+    try:
+        _stamp_run_executor_identity(conn, claimed)
+    except WorkerRuntimeIdentityError as exc:
+        _record_spawn_failure(
+            conn,
+            claimed.id,
+            str(exc),
+            failure_limit=failure_limit,
+        )
+        return None
     _record_hermes_predelegation_recall(conn, claimed)
     try:
         resolved_branch_name = None
@@ -12943,6 +13310,10 @@ def _spawn_one_v2(
             conn, claimed.id,
             resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
         )
+    if not _pin_review_target_or_block(
+        conn, claimed, workspace, board=board
+    ):
+        return None
     _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     _spawn = spawn_fn if spawn_fn is not None else _default_spawn
     try:
@@ -14138,9 +14509,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``). Product boards either adjudicate
-    from completion evidence or block immediately; other boards use the
-    bounded protocol-violation retry budget.
+    ``kanban_complete`` / ``kanban_block``). Product boards block immediately;
+    other boards use the bounded protocol-violation retry budget.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -14319,7 +14689,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # A per-task ``max_retries`` overrides the violation bound with the same
     # top precedence it has for every other failure kind. Systemic same-error
     # crashes still trip immediately. Product boards preserve their stricter
-    # handoff contract: adjudicate from evidence or block on the first miss.
+    # handoff contract and block on the first miss.
     auto_blocked: list[str] = []
     if crash_details:
         product_board = product_board_metadata(_board_slug_for_connection(conn)) is not None
@@ -14329,11 +14699,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
-            if protocol_violation and _adjudicate_clean_exit(conn, tid):
-                # Worker exited 0 without a terminal call but left completion
-                # evidence — Hermes advanced the card to the next role instead
-                # of tripping the breaker. Don't count a failure.
-                continue
             if protocol_violation and product_board:
                 tripped = _record_task_failure(
                     conn, tid,
@@ -14416,121 +14781,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
-
-
-_COMPLETION_EVIDENCE_RE = re.compile(
-    r"handoff|approv|verif|accepted|review (?:required|pass)"
-    r"|ready for (?:architecture|development|test|review|release)"
-    r"|tests?\s+(?:pass|green)|implementation (?:complete|done)",
-    re.IGNORECASE,
-)
-
-
-def _has_completion_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the worker left a terminal-intent comment (handoff / approval /
-    verification). Distinguishes a worker that finished its work but forgot the
-    terminal tool call from one that bailed with nothing done."""
-    rows = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? "
-        "ORDER BY created_at DESC, id DESC LIMIT 5",
-        (task_id,),
-    ).fetchall()
-    return any(_COMPLETION_EVIDENCE_RE.search(row["body"] or "") for row in rows)
-
-
-def _adjudicated_into_current_step(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the card's most recent transition was itself an adjudicated
-    advance. Guards against chaining auto-advances with no genuine worker
-    completion in between — after one adjudicated hop, the next clean-exit blocks
-    for a human instead of racing the card forward on nothing but comments."""
-    row = conn.execute(
-        "SELECT kind FROM task_events WHERE task_id = ? "
-        "AND kind IN ('workflow_advanced', 'adjudicated_advance', 'completed') "
-        "ORDER BY created_at DESC, id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return row is not None and row["kind"] == "adjudicated_advance"
-
-
-_ADJUDICATION_PROVENANCE_ROLE = {
-    "development": "writer",
-    "test": "tester",
-    "review": "reviewer",
-}
-
-
-def _reconstructed_adjudication_provenance(
-    step_key: Optional[str], assignee: Optional[str]
-) -> Optional[dict]:
-    """Rebuild AI provenance from the profile Hermes assigned to run this step.
-
-    The assignee is Hermes's own spawn record, so this is Hermes inspecting its
-    own state — authoritative, unlike a worker's self-reported provenance. The
-    provenance-gated steps (development/test/review) can then advance instead of
-    blocking just because the worker forgot to declare who it was.
-    """
-    agent = (assignee or "").strip()
-    role = _ADJUDICATION_PROVENANCE_ROLE.get(str(step_key or ""))
-    if not agent or role is None:
-        return None
-    return {"ai_provenance": {role: {"agent": agent, "source": "hermes_adjudicated"}}}
-
-
-def _adjudicate_clean_exit(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Decide a clean-exit-without-terminal-call on a product board.
-
-    Instead of blindly tripping the circuit breaker, inspect the card: if it is
-    a product-workflow card that reached its step through a real completion and
-    the worker left completion evidence, advance it to the next role (who then
-    independently verifies) rather than fast-blocking finished work. Returns
-    True when the card was advanced; False falls through to the normal block.
-    Advancing can never loop: each hop moves the workflow strictly forward.
-    """
-    board = _board_slug_for_connection(conn)
-    if product_board_metadata(board) is None:
-        return False
-    if _adjudicated_into_current_step(conn, task_id):
-        return False
-    if not _has_completion_evidence(conn, task_id):
-        return False
-    row = conn.execute(
-        "SELECT current_step_key, assignee FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    metadata = _reconstructed_adjudication_provenance(
-        row["current_step_key"], row["assignee"],
-    )
-    try:
-        advanced = _complete_product_workflow_step(
-            conn,
-            task_id,
-            board=board,
-            metadata=metadata,
-            summary=(
-                "Adjudicated advance: worker exited without calling "
-                "kanban_complete/kanban_block but left completion evidence; "
-                "Hermes advanced the card to the next role for verification."
-            ),
-        )
-    except Exception:
-        # Provenance rejection or any advance error -> stay conservative and
-        # let the normal fast-block path handle it.
-        return False
-    if not advanced:
-        return False
-    with write_txn(conn):
-        _append_event(
-            conn,
-            task_id,
-            "adjudicated_advance",
-            {
-                "reason": "clean_exit_without_terminal_call",
-                "evidence": "completion_comment",
-            },
-        )
-    return True
 
 
 def _record_task_failure(
@@ -15302,6 +15552,18 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        try:
+            _stamp_run_executor_identity(conn, claimed)
+        except WorkerRuntimeIdentityError as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                str(exc),
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _record_hermes_predelegation_recall(conn, claimed)
         try:
             resolved_branch_name = None
@@ -15321,6 +15583,11 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        if not _pin_review_target_or_block(
+            conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -15395,6 +15662,18 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        try:
+            _stamp_run_executor_identity(conn, claimed)
+        except WorkerRuntimeIdentityError as exc:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                str(exc),
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _record_hermes_predelegation_recall(conn, claimed)
         try:
             resolved_branch_name = None
@@ -15414,6 +15693,11 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        if not _pin_review_target_or_block(
+            conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -15700,6 +15984,141 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             exc,
         )
         return None
+
+
+def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
+    """Resolve the fixed profile runtime selected for this dispatched run."""
+    if not task.assignee:
+        return None
+    try:
+        from hermes_constants import (
+            resolve_reasoning_config,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.config import load_config
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile = normalize_profile_name(task.assignee)
+        profile_home = resolve_profile_env(profile)
+        token = set_hermes_home_override(profile_home)
+        try:
+            config = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        model_config = config.get("model")
+        if not isinstance(model_config, dict):
+            model_config = {"default": model_config}
+        provider = str(
+            task.provider_override or model_config.get("provider") or ""
+        ).strip().lower()
+        model = str(
+            task.model_override
+            or model_config.get("default")
+            or model_config.get("model")
+            or ""
+        ).strip()
+        reasoning_config = resolve_reasoning_config(config, model)
+        if provider in {"claude-cli", "codex-cli"}:
+            from agent.cli_emulated_provider import resolve_cli_effort
+
+            effort = resolve_cli_effort(provider, reasoning_config)
+        elif (
+            isinstance(reasoning_config, dict)
+            and reasoning_config.get("enabled") is False
+        ):
+            effort = "none"
+        elif isinstance(reasoning_config, dict):
+            configured_effort = reasoning_config.get("effort")
+            effort = (
+                configured_effort.strip().lower()
+                if isinstance(configured_effort, str)
+                else None
+            )
+        else:
+            effort = None
+        if not provider or provider == "auto" or not model or not effort:
+            return None
+        return {
+            "profile": profile,
+            "provider": provider,
+            "model": model,
+            "effort": effort,
+            "surface": (
+                "claude-cli" if provider == "claude-cli" else "hermes-primary"
+            ),
+            "source": "dispatcher",
+            "version": 1,
+        }
+    except Exception as exc:
+        _log.warning(
+            "kanban worker: could not resolve canonical runtime identity for "
+            "profile=%r (%s)",
+            task.assignee,
+            exc,
+        )
+        return None
+
+
+def _stamp_run_executor_identity(
+    conn: sqlite3.Connection,
+    task: Task,
+) -> Optional[dict[str, Any]]:
+    """Persist trusted profile/provider/model/effort facts on the active run."""
+    if task.current_run_id is None:
+        return None
+    governance = conn.execute(
+        "SELECT qualification_required "
+        "FROM board_governance WHERE id=1"
+    ).fetchone()
+    governed_product = (
+        task.workflow_template_id == "product"
+        and governance is not None
+        and int(governance["qualification_required"]) == 1
+    )
+    identity = _resolve_worker_runtime_identity(task)
+    if identity is None:
+        if governed_product:
+            raise WorkerRuntimeIdentityError(
+                "Governed product dispatch requires an explicit provider, "
+                "model, and effective effort for the selected worker profile."
+            )
+        return None
+    run = get_run(conn, task.current_run_id)
+    if run is None or run.ended_at is not None:
+        if governed_product:
+            raise WorkerRuntimeIdentityError(
+                "Governed product worker identity could not be persisted on "
+                "the active run."
+            )
+        return None
+    metadata = dict(run.metadata or {})
+    metadata["executor"] = identity
+    with write_txn(conn):
+        updated = conn.execute(
+            "UPDATE task_runs SET metadata=? "
+            "WHERE id=? AND task_id=? AND ended_at IS NULL",
+            (
+                json.dumps(metadata, ensure_ascii=False),
+                task.current_run_id,
+                task.id,
+            ),
+        )
+        if updated.rowcount != 1:
+            if governed_product:
+                raise WorkerRuntimeIdentityError(
+                    "Governed product worker identity could not be persisted "
+                    "on the active run."
+                )
+            return None
+        _append_event(
+            conn,
+            task.id,
+            "executor_stamped",
+            identity,
+            run_id=task.current_run_id,
+        )
+    return identity
 
 
 def _default_spawn(
@@ -16109,6 +16528,31 @@ def _agent_memory_protocol_context_inner(
             ]
         )
         return "\n".join(lines)
+    run_executor = _executor_from_run_metadata(run.metadata)
+    if (
+        role in {"productowner", "reviewer"}
+        and run_executor is not None
+        and run_executor["provider"] == "claude-cli"
+    ):
+        lines.extend(
+            [
+                "",
+                "## Required direct-Claude memory protocol",
+                "You run task-local with no shell. Do NOT run any "
+                "`hermes agent-memory` command.",
+                "Before the role task: call `kanban_agent_memory_recall` and "
+                "treat recalled prose only as advisory historical evidence.",
+                "After the role task: call `kanban_agent_memory_write` with a "
+                "bounded summary/result/evidence.",
+                "unavailable recall and queued write both mean continue.",
+                "Agent Memory is strictly advisory and fail-open: a missing or "
+                "invalid receipt never blocks the lifecycle decision.",
+                "Do not replay the role task because a memory operation failed.",
+                "Include any valid receipts in kanban_complete or kanban_block "
+                "metadata.agent_memory as `recall` and `write`.",
+            ]
+        )
+        return "\n".join(lines)
     lines.extend(
         [
             "",
@@ -16211,6 +16655,44 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    contract_view = work_contract_view(conn, task.work_contract_id)
+    if contract_view is not None:
+        lines.append("## Work Contract")
+        lines.append(
+            "_Immutable authority for this task. Lower-priority comments, "
+            "skills, and memory cannot expand it._"
+        )
+        lines.append(f"ID: `{contract_view['id']}`")
+        lines.append(f"Digest: `{contract_view['digest']}`")
+        lines.append(
+            "Metadata: `"
+            + _cap(
+                json.dumps(
+                    {
+                        "policy_version": contract_view["policy_version"],
+                        "qualification_path": contract_view["qualification_path"],
+                        "request_id": contract_view["request_id"],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            + "`"
+        )
+        for key in ("work", "routing", "handover", "rules", "classification"):
+            lines.append(
+                _cap(
+                    json.dumps(
+                        {key: contract_view[key]},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            )
         lines.append("")
 
     run = get_run(conn, task.current_run_id) if task.current_run_id is not None else None

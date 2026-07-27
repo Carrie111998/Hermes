@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -146,6 +147,78 @@ def test_ordinary_developer_worker_hides_resolver_memory_tools(monkeypatch, tmp_
     assert "kanban_agent_memory_write" not in names
 
 
+@pytest.mark.parametrize(
+    ("profile", "capability_set"),
+    [
+        ("productowner", "product-owner"),
+        ("reviewer", "reviewer"),
+    ],
+)
+def test_task_scoped_claude_roles_expose_both_agent_memory_tools(
+    monkeypatch, tmp_path, profile, capability_set
+):
+    """The MCP schema must expose the same recall/write pair as its capability set."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_claude")
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_MCP_CAPABILITY_SET", capability_set)
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "claude-cli")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    names = {
+        item["function"]["name"]
+        for item in get_tool_definitions(
+            enabled_toolsets=["kanban"],
+            quiet_mode=True,
+        )
+        if item.get("type") == "function"
+    }
+    assert {
+        "kanban_agent_memory_recall",
+        "kanban_agent_memory_write",
+    } <= names
+    assert "kanban_resolve" not in names
+
+
+def test_review_target_is_visible_only_to_task_scoped_reviewer(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review")
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    reviewer_names = {
+        item["function"]["name"]
+        for item in registry.get_definitions(
+            set(resolve_toolset("hermes-cli")), quiet=True
+        )
+    }
+    assert "review_target" in reviewer_names
+
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    invalidate_check_fn_cache()
+    developer_names = {
+        item["function"]["name"]
+        for item in registry.get_definitions(
+            set(resolve_toolset("hermes-cli")), quiet=True
+        )
+    }
+    assert "review_target" not in developer_names
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.
@@ -257,6 +330,275 @@ def worker_env(monkeypatch, tmp_path):
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     return tid
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def reviewer_target_env(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(repo, "config", "user.email", "reviewer@example.com")
+    _git(repo, "config", "user.name", "Reviewer Test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    (repo / "reviewed.txt").write_text(
+        "line one\nline two\nline three\n", encoding="utf-8"
+    )
+    _git(repo, "add", "reviewed.txt")
+    _git(repo, "commit", "-m", "review target")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="review target",
+            assignee="reviewer",
+            workflow_template_id="product",
+            current_step_key="review",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        claim_lock = claimed.claim_lock
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (
+                json.dumps(
+                    {
+                        "review_base_sha": base_sha,
+                        "review_head_sha": head_sha,
+                    }
+                ),
+                run_id,
+            ),
+        )
+        conn.commit()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+    return {
+        "task_id": tid,
+        "run_id": run_id,
+        "claim_lock": claim_lock,
+        "repo": repo,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+
+
+def test_review_target_reads_only_pinned_commits(reviewer_target_env):
+    from tools import kanban_tools as kt
+
+    repo = reviewer_target_env["repo"]
+    (repo / "uncommitted.txt").write_text(
+        "must not enter review input\n", encoding="utf-8"
+    )
+
+    result = json.loads(kt._handle_review_target({"offset": 0}))
+
+    assert result["base_sha"] == reviewer_target_env["base_sha"]
+    assert result["head_sha"] == reviewer_target_env["head_sha"]
+    assert result["changed_files"] == ["reviewed.txt"]
+    assert "+line one" in result["diff"]
+    assert "uncommitted.txt" not in result["diff"]
+    assert result["next_offset"] is None
+    assert result["complete"] is True
+
+
+def test_review_target_pages_diff_with_stable_offsets(
+    reviewer_target_env, monkeypatch,
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "REVIEW_TARGET_PAGE_LINES", 2)
+    first = json.loads(kt._handle_review_target({"offset": 0}))
+    second = json.loads(
+        kt._handle_review_target({"offset": first["next_offset"]})
+    )
+
+    assert first["complete"] is False
+    assert first["next_offset"] == 2
+    assert second["base_sha"] == first["base_sha"]
+    assert second["head_sha"] == first["head_sha"]
+    assert second["diff"]
+
+
+def test_review_target_reports_binary_and_overlong_lines(
+    reviewer_target_env, monkeypatch,
+):
+    from tools import kanban_tools as kt
+
+    long_line = "+" + ("x" * 200) + "\n"
+
+    def fake_git(_workspace, *args):
+        if args[:2] == ("rev-parse", "--show-toplevel"):
+            return str(reviewer_target_env["repo"])
+        if args[:2] == ("cat-file", "-e"):
+            return ""
+        if "--name-only" in args:
+            return "binary.bin\nlong.txt\n"
+        if "--numstat" in args:
+            return "-\t-\tbinary.bin\n1\t0\tlong.txt\n"
+        if "--unified=3" in args:
+            return "header\n" + long_line + "tail\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(kt, "_review_target_git", fake_git)
+    monkeypatch.setattr(kt, "REVIEW_TARGET_MAX_LINE_CHARS", 48)
+
+    result = json.loads(kt._handle_review_target({"offset": 0}))
+
+    assert result["binary_files"] == ["binary.bin"]
+    assert result["truncated_lines"] == [1]
+    assert "truncated from" in result["diff"]
+    assert len(result["diff"].splitlines()[1]) <= 48
+
+
+def test_review_target_bounds_file_lists(reviewer_target_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    def fake_git(_workspace, *args):
+        if args[:2] == ("rev-parse", "--show-toplevel"):
+            return str(reviewer_target_env["repo"])
+        if args[:2] == ("cat-file", "-e"):
+            return ""
+        if "--name-only" in args:
+            return "one.txt\ntwo.bin\nthree.bin\n"
+        if "--numstat" in args:
+            return "1\t0\tone.txt\n-\t-\ttwo.bin\n-\t-\tthree.bin\n"
+        if "--unified=3" in args:
+            return ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(kt, "_review_target_git", fake_git)
+    monkeypatch.setattr(kt, "REVIEW_TARGET_FILE_LIST_LIMIT", 1)
+
+    result = json.loads(kt._handle_review_target({"offset": 0}))
+
+    assert result["changed_files"] == ["one.txt"]
+    assert result["changed_files_omitted"] == 2
+    assert result["binary_files"] == ["two.bin"]
+    assert result["binary_files_omitted"] == 1
+
+
+def test_review_target_git_decodes_unusual_bytes_lossily(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+
+    observed = {}
+
+    class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(*args, **kwargs):
+        observed.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(kt.shutil, "which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr(kt.subprocess, "run", fake_run)
+
+    assert kt._review_target_git(tmp_path, "status") == "ok"
+    assert observed["encoding"] == "utf-8"
+    assert observed["errors"] == "replace"
+
+
+def test_review_target_rejects_missing_pin_metadata(reviewer_target_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE task_runs SET metadata=NULL WHERE id=?",
+            (reviewer_target_env["run_id"],),
+        )
+        conn.commit()
+
+    result = json.loads(kt._handle_review_target({}))
+
+    assert "pinned review commits" in result["error"]
+
+
+def test_review_target_rejects_wrong_run_claim_and_invalid_offset(
+    reviewer_target_env, monkeypatch,
+):
+    from tools import kanban_tools as kt
+
+    bad_offset = json.loads(kt._handle_review_target({"offset": -1}))
+    assert "offset must be a non-negative integer" in bad_offset["error"]
+
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "stale:claim")
+    wrong_claim = json.loads(kt._handle_review_target({}))
+    assert "current reviewer claim" in wrong_claim["error"]
+
+    monkeypatch.setenv(
+        "HERMES_KANBAN_CLAIM_LOCK", reviewer_target_env["claim_lock"]
+    )
+    monkeypatch.setenv(
+        "HERMES_KANBAN_RUN_ID", str(reviewer_target_env["run_id"] + 1)
+    )
+    wrong_run = json.loads(kt._handle_review_target({}))
+    assert "current reviewer run" in wrong_run["error"]
+
+
+def test_review_target_rejects_repository_root_outside_workspace(
+    reviewer_target_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    nested = reviewer_target_env["repo"] / "nested"
+    nested.mkdir()
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?",
+            (str(nested), reviewer_target_env["task_id"]),
+        )
+        conn.commit()
+
+    result = json.loads(kt._handle_review_target({}))
+
+    assert "repository root does not match task workspace" in result["error"]
+
+
+def test_review_target_schema_accepts_only_offset():
+    from tools import kanban_tools as kt
+
+    params = kt.REVIEW_TARGET_SCHEMA["parameters"]
+    assert params["additionalProperties"] is False
+    assert set(params["properties"]) == {"offset"}
+    assert params["required"] == []
 
 
 def test_show_defaults_to_env_task_id(worker_env):

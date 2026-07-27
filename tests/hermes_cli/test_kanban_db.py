@@ -4555,6 +4555,50 @@ def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypat
     assert row["status"] == "running"
 
 
+def test_spawn_one_v2_stamps_runtime_identity_before_spawn(
+    kanban_home, tmp_path, monkeypatch
+):
+    """The event-driven v2 path stamps the same executor facts as polling."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-stamps-runtime"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    stamped: list[str] = []
+
+    def stamp(_conn, task):
+        stamped.append(task.id)
+        return {
+            "profile": "developer",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+        }
+
+    monkeypatch.setattr(kb, "_stamp_run_executor_identity", stamp)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        pid = kb._spawn_one_v2(
+            conn,
+            tid,
+            board=board,
+            spawn_fn=lambda _task, _workspace, board=None: 4242,
+        )
+
+    assert pid == 4242
+    assert stamped == [tid]
+
+
 def test_spawn_one_v2_failure_clears_running_flag(kanban_home, tmp_path, monkeypatch):
     """R3 fix: claim_task sets running=1 at claim time (R1), and a failed
     spawn now goes through _record_task_failure (via _record_spawn_failure),
@@ -6930,7 +6974,10 @@ def test_product_review_completion_rejects_same_ai_as_writer(kanban_home):
             (tid,),
         )
         conn.commit()
-        with pytest.raises(kb.ProductProvenanceError, match="reviewer AI must differ"):
+        with pytest.raises(
+            kb.ProductProvenanceError,
+            match="canonical reviewer provider must differ",
+        ):
             kb.complete_task(
                 conn,
                 tid,
@@ -6988,6 +7035,383 @@ def test_product_review_completion_accepts_different_ai_reviewer(kanban_home):
     assert provenance["writer_agent"] == "claude-code"
     assert provenance["reviewer_agent"] == "codex"
     assert provenance["review_rule"]["different_agent"] is True
+
+
+def _stamp_test_runtime(
+    monkeypatch,
+    conn,
+    task,
+    *,
+    provider: str,
+    model: str,
+    effort: str,
+):
+    identity = {
+        "profile": task.assignee,
+        "provider": provider,
+        "model": model,
+        "effort": effort,
+        "surface": "claude-cli" if provider == "claude-cli" else "hermes-primary",
+        "source": "dispatcher",
+        "version": 1,
+    }
+    monkeypatch.setattr(
+        kb, "_resolve_worker_runtime_identity", lambda _task: identity
+    )
+    assert kb._stamp_run_executor_identity(conn, task) == identity
+    return identity
+
+
+def test_dispatched_run_canonical_executor_overrides_writer_self_report(
+    kanban_home, monkeypatch
+):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Canonical writer identity",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, tid, board="prod")
+        assert claimed is not None
+        identity = _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            claimed,
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            effort="xhigh",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented directly.",
+            metadata={
+                "ai_provenance": {
+                    "writer": {
+                        "agent": "forged-claude",
+                        "branch": "feature/canonical-writer",
+                    }
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+            board="prod",
+            product_role_assignees={"tester": "tester"},
+        )
+        run = kb.get_run(conn, claimed.current_run_id)
+        provenance = kb.latest_ai_provenance_by_task(conn, [tid])[tid]
+
+    assert run is not None
+    assert run.metadata["executor"] == identity
+    assert run.metadata["ai_provenance"]["writer"]["agent"] == "openai-codex"
+    assert run.metadata["ai_provenance"]["writer"]["model"] == "gpt-5.6-sol"
+    assert run.metadata["ai_provenance"]["writer"]["effort"] == "xhigh"
+    assert provenance["writer_agent"] == "openai-codex"
+    assert provenance["branch"] == "feature/canonical-writer"
+
+
+def test_review_independence_uses_canonical_provider_not_worker_alias(
+    kanban_home, monkeypatch
+):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Canonical reviewer independence",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        writer = kb.claim_task(conn, tid, board="prod")
+        assert writer is not None
+        _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            writer,
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            effort="xhigh",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented directly.",
+            metadata={"ai_provenance": {"writer": {"agent": "anything"}}},
+            expected_run_id=writer.current_run_id,
+            board="prod",
+            product_role_assignees={"tester": "tester"},
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='review', status='review', "
+            "assignee='reviewer' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        reviewer = kb.claim_review_task(conn, tid)
+        assert reviewer is not None
+        _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            reviewer,
+            provider="openai-codex",
+            model="different-model",
+            effort="high",
+        )
+
+        with pytest.raises(
+            kb.ProductProvenanceError,
+            match="canonical reviewer provider must differ",
+        ):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Claims an independent review.",
+                metadata={
+                    "ai_provenance": {
+                        "reviewer": {"agent": "claude-cli", "verdict": "approved"}
+                    }
+                },
+                expected_run_id=reviewer.current_run_id,
+                board="prod",
+            )
+
+        rejected = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == kb.PRODUCT_PROVENANCE_BLOCKED_EVENT
+        ][-1]
+    assert rejected.payload["writer_agent"] == "openai-codex"
+    assert rejected.payload["reviewer_agent"] == "openai-codex"
+
+
+def test_review_rejects_partial_canonical_executor_identity(
+    kanban_home, monkeypatch
+):
+    """A stamped reviewer must not compare against a legacy writer alias."""
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="Partial canonical reviewer identity",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        writer = kb.claim_task(conn, tid, board="prod")
+        assert writer is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Legacy unstamped development run.",
+            metadata={
+                "ai_provenance": {
+                    "writer": {"agent": "legacy-writer-alias"}
+                }
+            },
+            expected_run_id=writer.current_run_id,
+            board="prod",
+            product_role_assignees={"tester": "tester"},
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='review', status='review', "
+            "assignee='reviewer' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        reviewer = kb.claim_review_task(conn, tid)
+        assert reviewer is not None
+        _stamp_test_runtime(
+            monkeypatch,
+            conn,
+            reviewer,
+            provider="claude-cli",
+            model="claude-opus-5",
+            effort="high",
+        )
+
+        with pytest.raises(
+            kb.ProductProvenanceError,
+            match="canonical writer and reviewer executor identities",
+        ):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Must not compare canonical identity with an alias.",
+                metadata={
+                    "ai_provenance": {
+                        "reviewer": {
+                            "agent": "claude-cli",
+                            "verdict": "approved",
+                        }
+                    }
+                },
+                expected_run_id=reviewer.current_run_id,
+                board="prod",
+            )
+
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == "review"
+    assert task.status == "running"
+
+
+def test_runtime_identity_uses_effective_per_model_cli_effort(
+    kanban_home, monkeypatch, tmp_path
+):
+    """Canonical effort matches override resolution and CLI clamping."""
+    import hermes_cli.config as config_module
+    import hermes_cli.profiles as profiles_module
+
+    profile_home = tmp_path / "reviewer-profile"
+    profile_home.mkdir()
+    monkeypatch.setattr(
+        profiles_module, "resolve_profile_env", lambda _profile: profile_home
+    )
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "claude-cli",
+                "default": "claude-opus-5",
+            },
+            "agent": {
+                "reasoning_effort": "high",
+                "reasoning_overrides": {"claude-opus-5": "ultra"},
+            },
+        },
+    )
+    task = types.SimpleNamespace(
+        assignee="reviewer",
+        provider_override=None,
+        model_override=None,
+    )
+
+    identity = kb._resolve_worker_runtime_identity(task)
+
+    assert identity is not None
+    assert identity["provider"] == "claude-cli"
+    assert identity["model"] == "claude-opus-5"
+    assert identity["effort"] == "max"
+
+
+def test_strict_product_run_requires_canonical_runtime_identity(
+    kanban_home, monkeypatch
+):
+    """Governed product dispatch fails closed when identity is unresolved."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Governed identity required",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        with kb.authorized_governance_write():
+            conn.execute(
+                "UPDATE board_governance "
+                "SET qualification_required=1 WHERE id=1"
+            )
+        conn.commit()
+        monkeypatch.setattr(
+            kb, "_resolve_worker_runtime_identity", lambda _task: None
+        )
+
+        with pytest.raises(
+            kb.WorkerRuntimeIdentityError,
+            match="explicit provider, model, and effective effort",
+        ):
+            kb._stamp_run_executor_identity(conn, claimed)
+
+
+def test_strict_product_run_rejects_identity_that_cannot_be_persisted(
+    kanban_home, monkeypatch
+):
+    """A resolved identity is not enough when its active run has ended."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Governed identity persistence required",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        with kb.authorized_governance_write():
+            conn.execute(
+                "UPDATE board_governance "
+                "SET qualification_required=1 WHERE id=1"
+            )
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE id=?",
+            (int(time.time()), claimed.current_run_id),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worker_runtime_identity",
+            lambda _task: {
+                "profile": "developer",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+                "surface": "hermes-primary",
+                "source": "dispatcher",
+                "version": 1,
+            },
+        )
+
+        with pytest.raises(
+            kb.WorkerRuntimeIdentityError,
+            match="could not be persisted on the active run",
+        ):
+            kb._stamp_run_executor_identity(conn, claimed)
+
+
+@pytest.mark.parametrize("review", [False, True])
+def test_dispatch_records_runtime_identity_failure_and_blocks(
+    kanban_home, monkeypatch, review
+):
+    """Both polling loops turn identity errors into bounded spawn failures."""
+    import hermes_cli.profiles as profiles_module
+
+    monkeypatch.setattr(profiles_module, "profile_exists", lambda _name: True)
+
+    def fail_stamp(_conn, _task):
+        raise kb.WorkerRuntimeIdentityError("canonical identity unavailable")
+
+    monkeypatch.setattr(kb, "_stamp_run_executor_identity", fail_stamp)
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Dispatch identity failure",
+            assignee="reviewer" if review else "developer",
+            workflow_template_id="product",
+            current_step_key="review" if review else "development",
+        )
+        if review:
+            conn.execute(
+                "UPDATE tasks SET status='review' WHERE id=?",
+                (tid,),
+            )
+            conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert result.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.last_failure_error == "canonical identity unavailable"
 
 
 def test_product_human_block_routes_to_hermes_preflight_before_blocked(kanban_home):
@@ -8310,6 +8734,287 @@ def test_dispatch_review_spawns_when_ready_empty(
     assert spawns[0] == t
 
 
+def _seed_product_review_worktree(
+    conn, board: str, repo: Path, *, dirty=False, base_ref="main"
+):
+    tid = kb.create_task(
+        conn,
+        title="Review committed change",
+        board=board,
+        assignee="reviewer",
+        workflow_template_id="product",
+        current_step_key="review",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+        max_retries=5,
+    )
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task, board=board)
+    kb.set_workspace_path(conn, tid, str(workspace))
+    kb.set_branch_name(conn, tid, branch)
+    head_sha = _commit_file(
+        workspace,
+        "reviewed.txt",
+        "immutable reviewer input\n",
+        "reviewed change",
+    )
+    if dirty:
+        (workspace / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+    base_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", base_ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return tid, workspace, base_sha, head_sha
+
+
+def test_dispatch_pins_review_target_before_reviewer_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-pinned"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+
+        def capture_spawn(task, launched_workspace, board=None):
+            run = kb.get_run(conn, task.current_run_id)
+            observed.append((launched_workspace, run.metadata))
+            return 4242
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+
+    assert result.spawned[0][0] == tid
+    assert observed == [
+        (
+            str(workspace),
+            {"review_base_sha": base_sha, "review_head_sha": head_sha},
+        )
+    ]
+
+
+def test_pinned_review_target_survives_run_completion(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-audit"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 4242,
+        )
+        assert result.spawned[0][0] == tid
+        running_task = kb.get_task(conn, tid)
+        assert running_task.current_run_id is not None
+        run_id = running_task.current_run_id
+        with kb.write_txn(conn):
+            assert kb._end_run(
+                conn,
+                tid,
+                outcome="completed",
+                metadata={"findings": []},
+                expected_run_id=run_id,
+            ) == run_id
+        run = kb.get_run(conn, run_id)
+
+    assert run.metadata == {
+        "findings": [],
+        "review_base_sha": base_sha,
+        "review_head_sha": head_sha,
+    }
+
+
+def test_dispatch_blocks_dirty_review_target_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-dirty"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    spawned = []
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
+            conn, board, repo, dirty=True
+        )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: spawned.append(args) or 4242,
+            failure_limit=5,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned == []
+    assert tid in result.auto_blocked
+    assert task.status == "blocked"
+    assert "review target preparation" in task.last_failure_error
+    assert "dirty" in task.last_failure_error
+
+
+def test_review_target_preparation_rejects_workspace_mismatch(
+    kanban_home, tmp_path,
+):
+    board = "review-target-workspace-mismatch"
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    _init_git_repo(repo)
+    _init_git_repo(other)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        assert kb.claim_task(conn, tid) is not None
+        with pytest.raises(
+            kb.ReviewTargetPreparationError,
+            match="does not match task workspace",
+        ):
+            kb._prepare_review_target(conn, tid, other, board=board)
+
+
+def test_dispatch_review_pins_against_board_checkout_branch(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "review-target-develop"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "develop", str(repo)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        check=True,
+    )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "base"],
+        check=True,
+    )
+    _v2_product_board_with_repo(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
+            conn, board, repo, base_ref="develop"
+        )
+
+        def capture_spawn(task, launched_workspace, board=None):
+            observed.append(kb.get_run(conn, task.current_run_id).metadata)
+            return 4242
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+
+    assert result.spawned[0][0] == tid
+    assert observed == [
+        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+    ]
+    assert workspace.name == tid
+
+
+def test_dispatch_custom_review_assignee_does_not_require_reviewer_pin(
+    kanban_home, all_assignees_spawnable,
+):
+    spawned = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="custom non-Claude review",
+            assignee="alice",
+            workflow_template_id="product",
+            current_step_key="review",
+        )
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        conn.commit()
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args, **kwargs: spawned.append(args) or 4242,
+        )
+
+    assert result.spawned[0][0] == tid
+    assert len(spawned) == 1
+
+
+def test_unexpected_review_pin_failure_blocks_without_aborting_dispatch(
+    kanban_home, tmp_path, all_assignees_spawnable, monkeypatch,
+):
+    board = "review-target-unexpected-failure"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
+            conn, board, repo
+        )
+        monkeypatch.setattr(
+            kb,
+            "_prepare_review_target",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+            ),
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 4242,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert tid in result.auto_blocked
+    assert result.spawned == []
+    assert task.status == "blocked"
+    assert "review target preparation" in task.last_failure_error
+
+
+def test_review_git_output_decodes_unusual_bytes_lossily(
+    kanban_home, monkeypatch, tmp_path,
+):
+    observed = {}
+
+    class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(*args, **kwargs):
+        observed.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(kb.shutil, "which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr(kb.subprocess, "run", fake_run)
+
+    assert kb._review_git_output(tmp_path, "status") == "ok"
+    assert observed["encoding"] == "utf-8"
+    assert observed["errors"] == "replace"
+
+
 def test_has_spawnable_review_true(kanban_home):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
     with kb.connect() as conn:
@@ -9432,11 +10137,9 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Clean-exit adjudication: a worker that finishes its work but exits without
-# calling kanban_complete / kanban_block should NOT be fast-blocked as a
-# protocol violation when it left completion evidence. Instead Hermes advances
-# the card to the next role (who independently verifies), matching the rule
-# that Hermes inspects state itself rather than trusting the terminal call.
+# Product-card clean exits fail closed: only the structured completion/block
+# protocol may advance or stop a product workflow. Comments that merely look
+# like handoff evidence are not an authority boundary.
 # ---------------------------------------------------------------------------
 
 
@@ -9469,10 +10172,10 @@ def _add_handoff_comment(conn, tid, body="Architecture handoff — ready for dev
     conn.commit()
 
 
-def test_detect_crashed_workers_adjudicates_clean_exit_with_evidence(
+def test_product_worker_clean_exit_ignores_completion_like_prose(
     kanban_home, monkeypatch,
 ):
-    """Clean-exit worker + completion evidence -> advance, not fast-block."""
+    """Completion-looking comments cannot advance a product workflow."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -9488,47 +10191,16 @@ def test_detect_crashed_workers_adjudicates_clean_exit_with_evidence(
         task = kb.get_task(conn, tid)
         kinds = [event.kind for event in kb.list_events(conn, tid)]
 
-    assert task.status == "ready", f"expected advanced (ready), got {task.status}"
-    assert task.current_step_key == "development"
-    assert "workflow_advanced" in kinds
-    assert "adjudicated_advance" in kinds
+    assert task.status == "blocked"
+    assert task.current_step_key == "architecture"
+    assert "workflow_advanced" not in kinds
+    assert "adjudicated_advance" not in kinds
 
 
-def test_detect_crashed_workers_adjudicates_provenance_gated_step(
+def test_product_worker_clean_exit_blocks_without_protocol_completion(
     kanban_home, monkeypatch,
 ):
-    """A provenance-gated step (development) still advances: Hermes reconstructs
-    provenance from the assignee it spawned, rather than blocking finished work."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
-
-    kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
-        tid = _make_running_product_card(
-            conn, _kb, step="development", assignee="developer",
-        )
-        _add_handoff_comment(
-            conn, tid,
-            body="Development handoff — implementation complete, ready for test.",
-        )
-
-        kb.detect_crashed_workers(conn)
-
-        task = kb.get_task(conn, tid)
-
-    assert task.status == "ready", (
-        f"expected advanced, got step={task.current_step_key} status={task.status}"
-    )
-    assert task.current_step_key == "test"
-
-
-def test_detect_crashed_workers_clean_exit_without_evidence_still_blocks(
-    kanban_home, monkeypatch,
-):
-    """No completion evidence -> the fast-block is preserved. A worker that
-    bailed with nothing done must not be advanced."""
+    """A product worker that omits the terminal protocol blocks on first miss."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -9547,49 +10219,10 @@ def test_detect_crashed_workers_clean_exit_without_evidence_still_blocks(
     assert task.current_step_key == "architecture"
 
 
-def test_detect_crashed_workers_does_not_chain_adjudicated_advances(
+def test_product_worker_nonzero_exit_retains_retry_semantics(
     kanban_home, monkeypatch,
 ):
-    """After one adjudicated advance, a second clean-exit at the new step blocks
-    for a human instead of racing the card forward on comments alone."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
-
-    host = _kb._claimer_id().split(":", 1)[0]
-    kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
-        tid = _make_running_product_card(
-            conn, _kb, step="architecture", max_retries=5,
-        )
-        _add_handoff_comment(conn, tid)
-
-        # First clean-exit -> adjudicated advance to development.
-        kb.detect_crashed_workers(conn)
-        assert kb.get_task(conn, tid).current_step_key == "development"
-
-        # Development worker also clean-exits, with a comment, but no genuine
-        # completion happened in between.
-        conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
-            (91002, f"{host}:w2", tid),
-        )
-        _add_handoff_comment(conn, tid, body="Development handoff — ready for test. Approved.")
-        conn.commit()
-
-        kb.detect_crashed_workers(conn)
-        task = kb.get_task(conn, tid)
-
-    assert task.status == "blocked", f"chained advance should block, got {task.status}"
-    assert task.current_step_key == "development"
-
-
-def test_detect_crashed_workers_nonzero_exit_unaffected_by_adjudication(
-    kanban_home, monkeypatch,
-):
-    """A normal (nonzero) crash keeps isolated-retry semantics — adjudication
-    only applies to clean-exit protocol violations, never touches real crashes."""
+    """A normal (nonzero) crash keeps the existing isolated-retry semantics."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)

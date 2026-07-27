@@ -491,6 +491,24 @@ def _gateway_provider_error_reply(text: str) -> str:
     )
 
 
+def _gateway_auth_route_failure_reply(profile: Any, provider: Any) -> str:
+    """Name the failed configured route without reflecting unsafe raw details."""
+    def _label(value: Any, fallback: str) -> str:
+        candidate = str(value or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}", candidate):
+            return candidate
+        return fallback
+
+    profile_label = _label(profile, "default")
+    if profile_label == "default":
+        profile_label = "Default"
+    provider_label = _label(provider, "configured provider")
+    return (
+        f"⚠️ {profile_label} profile could not authenticate {provider_label}. "
+        "No fallback was used. Check gateway logs or run the provider status check."
+    )
+
+
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"^\s*(\W*\s*)?("
     r"api\s+(?:call\s+)?failed"
@@ -21062,8 +21080,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
+                profile_name = (
+                    getattr(source, "profile", None) or self._active_profile_name()
+                )
+                provider_name = None
+                if session_key:
+                    override = self._session_model_overrides.get(session_key)
+                    if isinstance(override, dict):
+                        provider_name = override.get("provider")
+                if not provider_name:
+                    model_config = user_config.get("model")
+                    if isinstance(model_config, dict):
+                        provider_name = model_config.get("provider")
+                logger.warning(
+                    "Gateway runtime resolution failed for profile=%s provider=%s: %s",
+                    profile_name or "default",
+                    provider_name or "(configured)",
+                    exc,
+                )
                 return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
+                    "final_response": _gateway_auth_route_failure_reply(
+                        profile_name,
+                        provider_name,
+                    ),
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],

@@ -31,6 +31,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -47,6 +51,11 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+REVIEW_TARGET_PAGE_LINES = 400
+REVIEW_TARGET_PAGE_CHARS = 48_000
+REVIEW_TARGET_MAX_LINE_CHARS = 4_000
+REVIEW_TARGET_FILE_LIST_LIMIT = 200
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -128,6 +137,32 @@ def _check_resolver_mode() -> bool:
     """Expose the Resolver mutation only to a task-scoped Resolver run."""
     return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
         os.environ.get("HERMES_PROFILE") == "resolver"
+    )
+
+
+def _check_agent_memory_worker_mode() -> bool:
+    """Expose memory tools only to a trusted governed worker runtime."""
+    if _check_resolver_mode():
+        return True
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    from agent.transports.hermes_tools_mcp_server import (
+        CLAUDE_TASK_CAPABILITY_BY_PROFILE,
+    )
+
+    expected_capability = CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and bool(
+        expected_capability
+    ) and (
+        os.environ.get("HERMES_MCP_CAPABILITY_SET") == expected_capability
+    ) and (
+        os.environ.get("HERMES_INFERENCE_PROVIDER") == "claude-cli"
+    )
+
+
+def _check_reviewer_mode() -> bool:
+    """Expose immutable review input only to the current Reviewer worker."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
+        os.environ.get("HERMES_PROFILE") == "reviewer"
     )
 
 
@@ -533,6 +568,225 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _review_target_git(workspace: Path, *args: str) -> str:
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        raise ValueError("git executable is unavailable")
+    try:
+        result = subprocess.run(
+            [git_executable, "-C", str(workspace), *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"git {' '.join(args)} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown git error").strip()
+        raise ValueError(f"git {' '.join(args)} failed: {detail[:300]}")
+    return result.stdout or ""
+
+
+def _bounded_review_diff_page(
+    diff: str,
+    offset: int,
+) -> tuple[str, Optional[int], bool, list[int]]:
+    """Return a bounded page where offsets address original diff lines."""
+    lines = diff.splitlines(keepends=True)
+    if offset > len(lines):
+        raise ValueError("offset exceeds the pinned diff")
+
+    page: list[str] = []
+    truncated_lines: list[int] = []
+    total_chars = 0
+    line_index = offset
+    line_limit = max(
+        1,
+        min(REVIEW_TARGET_MAX_LINE_CHARS, REVIEW_TARGET_PAGE_CHARS),
+    )
+    while (
+        line_index < len(lines)
+        and line_index - offset < REVIEW_TARGET_PAGE_LINES
+    ):
+        original = lines[line_index]
+        rendered = original
+        was_truncated = len(original) > line_limit
+        if was_truncated:
+            newline = "\n" if original.endswith("\n") else ""
+            marker = (
+                f"... [line {line_index} truncated from "
+                f"{len(original)} chars]{newline}"
+            )
+            if len(marker) >= line_limit:
+                rendered = marker[:line_limit]
+            else:
+                rendered = original[: line_limit - len(marker)] + marker
+
+        if page and total_chars + len(rendered) > REVIEW_TARGET_PAGE_CHARS:
+            break
+        page.append(rendered)
+        total_chars += len(rendered)
+        if was_truncated:
+            truncated_lines.append(line_index)
+        line_index += 1
+
+    complete = line_index >= len(lines)
+    return (
+        "".join(page),
+        None if complete else line_index,
+        complete,
+        truncated_lines,
+    )
+
+
+def _handle_review_target(args: dict, **kw) -> str:
+    """Return a bounded diff page for the current run's pinned commits."""
+    if not _check_reviewer_mode():
+        return tool_error(
+            "review_target is restricted to a task-scoped reviewer profile"
+        )
+    offset = args.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return tool_error("review_target: offset must be a non-negative integer")
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID") or ""
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        return tool_error("review_target: current reviewer run is missing")
+
+    try:
+        kb, conn = _connect()
+        try:
+            task = kb.get_task(conn, task_id)
+            if (
+                task is None
+                or task.current_step_key != "review"
+                or task.current_run_id != run_id
+            ):
+                return tool_error(
+                    "review_target: task is not owned by the current reviewer run"
+                )
+            run = kb.get_run(conn, run_id)
+            if (
+                run is None
+                or run.task_id != task_id
+                or run.profile != "reviewer"
+                or run.step_key != "review"
+                or run.ended_at is not None
+                or run.status != "running"
+            ):
+                return tool_error(
+                    "review_target: task is not owned by the current reviewer run"
+                )
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            if (
+                not claim_lock
+                or task.claim_lock != claim_lock
+                or run.claim_lock != claim_lock
+            ):
+                return tool_error(
+                    "review_target: task is not owned by the current reviewer claim"
+                )
+            metadata = run.metadata if isinstance(run.metadata, dict) else {}
+            base_sha = metadata.get("review_base_sha")
+            head_sha = metadata.get("review_head_sha")
+            if (
+                not isinstance(base_sha, str)
+                or not _FULL_GIT_SHA_RE.fullmatch(base_sha)
+                or not isinstance(head_sha, str)
+                or not _FULL_GIT_SHA_RE.fullmatch(head_sha)
+            ):
+                return tool_error(
+                    "review_target: active run has no valid pinned review commits"
+                )
+            if not task.workspace_path:
+                return tool_error("review_target: task workspace is missing")
+            workspace = Path(task.workspace_path).expanduser().resolve(strict=True)
+            if not workspace.is_dir():
+                return tool_error("review_target: task workspace is not a directory")
+            repo_root = Path(
+                _review_target_git(
+                    workspace, "rev-parse", "--show-toplevel"
+                ).strip()
+            ).resolve(strict=True)
+            if repo_root != workspace:
+                return tool_error(
+                    "review_target: repository root does not match task workspace"
+                )
+            _review_target_git(workspace, "cat-file", "-e", f"{base_sha}^{{commit}}")
+            _review_target_git(workspace, "cat-file", "-e", f"{head_sha}^{{commit}}")
+            all_changed_files = [
+                line
+                for line in _review_target_git(
+                    workspace,
+                    "diff",
+                    "--name-only",
+                    base_sha,
+                    head_sha,
+                    "--",
+                    ".",
+                ).splitlines()
+                if line
+            ]
+            all_binary_files = []
+            for line in _review_target_git(
+                workspace,
+                "diff",
+                "--numstat",
+                base_sha,
+                head_sha,
+                "--",
+                ".",
+            ).splitlines():
+                fields = line.split("\t", 2)
+                if len(fields) == 3 and fields[:2] == ["-", "-"]:
+                    all_binary_files.append(fields[2])
+            changed_files = all_changed_files[:REVIEW_TARGET_FILE_LIST_LIMIT]
+            binary_files = all_binary_files[:REVIEW_TARGET_FILE_LIST_LIMIT]
+            diff = _review_target_git(
+                workspace,
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--unified=3",
+                base_sha,
+                head_sha,
+                "--",
+                ".",
+            )
+            diff_page, next_offset, complete, truncated_lines = (
+                _bounded_review_diff_page(diff, offset)
+            )
+            return json.dumps(
+                {
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                    "changed_files": changed_files,
+                    "changed_files_omitted": (
+                        len(all_changed_files) - len(changed_files)
+                    ),
+                    "binary_files": binary_files,
+                    "binary_files_omitted": (
+                        len(all_binary_files) - len(binary_files)
+                    ),
+                    "diff": diff_page,
+                    "truncated_lines": truncated_lines,
+                    "next_offset": next_offset,
+                    "complete": complete,
+                }
+            )
+        finally:
+            conn.close()
+    except (OSError, ValueError) as exc:
+        return tool_error(f"review_target: {exc}")
+    except Exception as exc:
+        logger.exception("review_target failed")
+        return tool_error(f"review_target: {exc}")
+
+
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
@@ -590,6 +844,9 @@ def _handle_show(args: dict, **kw) -> str:
 
             response = {
                 "task": _task_dict(task),
+                "work_contract": kb.work_contract_view(
+                    conn, task.work_contract_id
+                ),
                 "epic": (
                     {
                         "id": epic_id,
@@ -1060,20 +1317,24 @@ def _handle_resolve(args: dict, **kw) -> str:
         return tool_error(f"kanban_resolve: {e}")
 
 
-def _resolver_agent_memory_identity(board_arg: Optional[str]):
-    """Resolve the governed Agent Memory identity for the active Resolver run.
+def _agent_memory_worker_identity(board_arg: Optional[str]):
+    """Resolve the governed Agent Memory identity for the active worker run.
 
-    The Resolver is spawned task-local and read-only, so it cannot shell out to
-    ``hermes agent-memory``. These narrow tools stand in for that CLI, but every
-    identity field is derived from the active task/run/DB — never from the
-    caller — so a resolver can only ever produce receipts bound to its own run.
+    These narrow tools stand in for the unavailable Agent Memory CLI. Every
+    identity field is derived from the active task/run/DB and trusted runtime
+    environment — never from the caller — so a worker can only produce receipts
+    bound to its own run.
 
     Returns ``(kb, conn, tid, board, run_id, function_id, title, query,
     delegation_id, executor)`` on success (the caller owns closing ``conn``), or
     a ``tool_error`` string the caller should return verbatim.
     """
-    if os.environ.get("HERMES_PROFILE") != "resolver":
-        return tool_error("restricted to the resolver profile")
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not _check_agent_memory_worker_mode():
+        return tool_error(
+            "restricted to an active Resolver or direct Claude worker with "
+            "its exact profile capability set"
+        )
     tid = _default_task_id(None)
     if not tid:
         return tool_error("task_id is required (set HERMES_KANBAN_TASK in the env)")
@@ -1113,7 +1374,7 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
         task = kb.get_task(conn, tid)
         if task is None or task.current_run_id is None:
             conn.close()
-            return tool_error("no active run for this resolver task")
+            return tool_error("no active run for this Agent Memory task")
         if pinned_run_id != task.current_run_id:
             conn.close()
             return tool_error(
@@ -1122,9 +1383,22 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
                 "receipts)"
             )
         run = kb.get_run(conn, task.current_run_id)
-        if run is None or run.ended_at is not None or run.profile != "resolver":
+        if run is None or run.ended_at is not None or run.profile != profile:
             conn.close()
-            return tool_error("the active run is not a resolver run")
+            return tool_error("the active run profile does not match this worker")
+        is_resolver = profile == "resolver"
+        if not is_resolver:
+            pinned_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            if (
+                not pinned_lock
+                or pinned_lock != task.claim_lock
+                or pinned_lock != run.claim_lock
+            ):
+                conn.close()
+                return tool_error(
+                    "the dispatcher claim lock is missing or stale; refusing "
+                    "to mint Agent Memory receipts"
+                )
         identity = kb._agent_memory_governed_identity(conn, tid, board=board)
         if identity is None:
             conn.close()
@@ -1136,21 +1410,35 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
         delegation_id = kb._agent_memory_delegation_id(board, tid, run_id)
         role = kb._agent_memory_hermes_role(task, run)
         responsibility = "reviewer" if run.step_key == "review" else "writer"
-        model = (
-            os.environ.get("HERMES_INFERENCE_MODEL")
-            or os.environ.get("HERMES_MODEL")
-            or "resolver"
-        )
+        model = os.environ.get("HERMES_INFERENCE_MODEL")
+        if is_resolver:
+            model = model or os.environ.get("HERMES_MODEL") or "resolver"
+        elif not model:
+            conn.close()
+            return tool_error(
+                "the direct Claude inference model is missing; refusing to "
+                "mint Agent Memory receipts"
+            )
         from hermes_cli.agent_memory_vault import ExecutorIdentity
 
-        executor = ExecutorIdentity(
-            agent_id="hermes",
-            model=model,
-            surface="hermes-child",
-            hermes_role=role,
-            execution_id=f"resolver-{delegation_id.split(':', 1)[-1]}",
-            responsibility=responsibility,
-        )
+        if is_resolver:
+            executor = ExecutorIdentity(
+                agent_id="hermes",
+                model=model,
+                surface="hermes-child",
+                hermes_role=role,
+                execution_id=f"resolver-{delegation_id.split(':', 1)[-1]}",
+                responsibility=responsibility,
+            )
+        else:
+            executor = ExecutorIdentity(
+                agent_id="claude-cli",
+                model=model,
+                surface="claude-cli",
+                hermes_role=role,
+                execution_id=f"claude-cli-{profile}-{run_id}",
+                responsibility=responsibility,
+            )
         return (
             kb, conn, tid, board, run_id, function_id, title, query,
             delegation_id, executor,
@@ -1161,13 +1449,13 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
 
 
 def _handle_agent_memory_recall(args: dict, **kw) -> str:
-    """Run canonical Agent Memory recall for the active Resolver run."""
+    """Run canonical Agent Memory recall for the active governed worker."""
     unexpected = sorted(set(args) - {"board"})
     if unexpected:
         return tool_error(
             "kanban_agent_memory_recall: unexpected fields: " + ", ".join(unexpected)
         )
-    resolved = _resolver_agent_memory_identity(args.get("board"))
+    resolved = _agent_memory_worker_identity(args.get("board"))
     if isinstance(resolved, str):
         return resolved
     (kb, conn, tid, board, run_id, function_id, title, query,
@@ -1212,7 +1500,7 @@ def _handle_agent_memory_recall(args: dict, **kw) -> str:
 
 
 def _handle_agent_memory_write(args: dict, **kw) -> str:
-    """Store one bounded gist for the active Resolver run and return its receipt."""
+    """Store one bounded gist for the active governed worker."""
     content_fields = {
         "summary", "result", "evidence", "reused", "maturity", "behavior",
         "decisions", "open_loops",
@@ -1237,7 +1525,7 @@ def _handle_agent_memory_write(args: dict, **kw) -> str:
             + ", ".join(sorted(_ALLOWED_MATURITY))
         )
 
-    resolved = _resolver_agent_memory_identity(args.get("board"))
+    resolved = _agent_memory_worker_identity(args.get("board"))
     if isinstance(resolved, str):
         return resolved
     (kb, conn, tid, board, run_id, function_id, title, query,
@@ -1256,14 +1544,17 @@ def _handle_agent_memory_write(args: dict, **kw) -> str:
             return str(value) if isinstance(value, str) and value.strip() else "none"
 
         # Deterministic, non-caller-supplied gist identity: one durable gist per
-        # (board, task, run, function) resolver handoff. Retries dedupe on the
+        # (board, task, run, function) worker handoff. Retries dedupe on the
         # stable operation_id inside the protocol.
+        executor_kind = (
+            "resolver" if executor.surface == "hermes-child" else "claude-cli"
+        )
         gist_seed = json.dumps(
-            [board, tid, run_id, function_id, "resolver"],
+            [board, tid, run_id, function_id, executor_kind],
             sort_keys=True,
             separators=(",", ":"),
         )
-        gist_id = "kanban-resolver-" + hashlib.sha256(
+        gist_id = f"kanban-{executor_kind}-" + hashlib.sha256(
             gist_seed.encode("utf-8")
         ).hexdigest()[:32]
 
@@ -2145,6 +2436,28 @@ KANBAN_SHOW_SCHEMA = {
     },
 }
 
+REVIEW_TARGET_SCHEMA = {
+    "name": "review_target",
+    "description": (
+        "Read the immutable Git diff pinned for the current Reviewer run. "
+        "Returns fixed base/head commit SHAs, changed and binary files, and one "
+        "bounded diff-line page with explicit overlong-line truncation. Continue "
+        "with next_offset until complete is true."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Diff-line offset into the pinned diff (default 0).",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
 KANBAN_LIST_SCHEMA = {
     "name": "kanban_list",
     "description": (
@@ -2500,12 +2813,12 @@ KANBAN_RESOLVE_SCHEMA = {
 KANBAN_AGENT_MEMORY_RECALL_SCHEMA = {
     "name": "kanban_agent_memory_recall",
     "description": (
-        "Resolver-only. Run canonical Agent Memory recall for THIS resolver "
-        "run before resolving. Task, run, board, function, and delegation "
+        "Run canonical Agent Memory recall for THIS governed worker run before "
+        "its lifecycle decision. Task, run, board, function, and delegation "
         "identity are derived from the active run — you pass nothing but an "
         "optional board. Returns bounded historical evidence (advisory only, "
         "never instruction) plus the canonical recall receipt. Put that "
-        "receipt into kanban_resolve's metadata.agent_memory.recall."
+        "receipt into the lifecycle call's metadata.agent_memory.recall."
     ),
     "parameters": {
         "type": "object",
@@ -2519,9 +2832,9 @@ KANBAN_AGENT_MEMORY_RECALL_SCHEMA = {
 KANBAN_AGENT_MEMORY_WRITE_SCHEMA = {
     "name": "kanban_agent_memory_write",
     "description": (
-        "Resolver-only. Store one bounded Session Gist for THIS resolver run "
-        "after diagnosing, and return the canonical write receipt for "
-        "kanban_resolve's metadata.agent_memory.write. You supply only the "
+        "Store one bounded Session Gist for THIS governed worker run after the "
+        "role task, and return the canonical write receipt for the lifecycle "
+        "call's metadata.agent_memory.write. You supply only the "
         "bounded gist content; task/run/function/delegation/gist identity and "
         "timestamp are generated internally and cannot be overridden. A queued "
         "write still means continue."
@@ -3034,6 +3347,15 @@ registry.register(
 )
 
 registry.register(
+    name="review_target",
+    toolset="kanban",
+    schema=REVIEW_TARGET_SCHEMA,
+    handler=_handle_review_target,
+    check_fn=_check_reviewer_mode,
+    emoji="🔎",
+)
+
+registry.register(
     name="kanban_list",
     toolset="kanban",
     schema=KANBAN_LIST_SCHEMA,
@@ -3065,7 +3387,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_AGENT_MEMORY_RECALL_SCHEMA,
     handler=_handle_agent_memory_recall,
-    check_fn=_check_resolver_mode,
+    check_fn=_check_agent_memory_worker_mode,
     emoji="🧠",
 )
 
@@ -3074,7 +3396,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_AGENT_MEMORY_WRITE_SCHEMA,
     handler=_handle_agent_memory_write,
-    check_fn=_check_resolver_mode,
+    check_fn=_check_agent_memory_worker_mode,
     emoji="🧠",
 )
 

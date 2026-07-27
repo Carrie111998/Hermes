@@ -1,15 +1,13 @@
-"""Hermes-tools-as-MCP server for the codex_app_server runtime.
+"""Hermes tools exposed through a role-scoped stdio MCP server.
 
-When the user runs `openai/*` turns through the codex app-server, codex
-owns the loop and builds its own tool list. By default, that means
-Hermes' richer tool surface — web search, browser automation,
-delegate_task subagents, vision analysis, persistent memory, skills,
-cross-session search, image generation, TTS — is unreachable.
+The default capability set preserves the historical codex_app_server surface.
+Task-scoped external runtimes select a smaller immutable surface with
+``HERMES_MCP_CAPABILITY_SET``.
 
-This module exposes a curated subset of those Hermes tools to the
-spawned codex subprocess via stdio MCP. Codex registers it as a normal
-MCP server (per `~/.codex/config.toml [mcp_servers.hermes-tools]`) and
-the user gets full Hermes capability inside a Codex turn.
+This module exposes a curated subset of those Hermes tools to Codex and
+task-scoped Claude subprocesses via stdio MCP. Codex registers it as a
+normal MCP server (per `~/.codex/config.toml [mcp_servers.hermes-tools]`);
+Claude receives a strict inline server entry for one task-scoped turn.
 
 Scope (what we expose):
   - web_search, web_extract              — Firecrawl, no codex equivalent
@@ -38,8 +36,8 @@ What we DO NOT expose:
                                            comment on EXPOSED_TOOLS below.
 
 Run with: python -m agent.transports.hermes_tools_mcp_server
-Spawned by: CodexAppServerSession.ensure_started() when the runtime is
-            active and config opts in.
+Spawned by: CodexAppServerSession.ensure_started() or the task-scoped
+            Claude primary adapter.
 """
 
 from __future__ import annotations
@@ -97,7 +95,7 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
     return inspect.Signature(params, return_annotation=str), annots
 
 
-# Tools we expose. Each name MUST match a registered Hermes tool that
+# Codex-app compatibility tools. Each name MUST match a registered Hermes tool that
 # `model_tools.handle_function_call()` can dispatch.
 #
 # What we deliberately DO NOT expose:
@@ -109,7 +107,7 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 #     the running AIAgent context to dispatch (mid-loop state), so a
 #     stateless MCP callback can't drive them. Hermes' default runtime
 #     keeps these working; the codex_app_server runtime cannot.
-EXPOSED_TOOLS: tuple[str, ...] = (
+CODEX_APP_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
     "browser_navigate",
@@ -149,6 +147,78 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_link",
 )
 
+PRODUCT_OWNER_TOOLS: tuple[str, ...] = (
+    "kanban_show",
+    "kanban_create",
+    "kanban_comment",
+    "kanban_heartbeat",
+    "kanban_agent_memory_recall",
+    "kanban_agent_memory_write",
+    "kanban_complete",
+    "kanban_block",
+)
+
+REVIEWER_TOOLS: tuple[str, ...] = (
+    "kanban_show",
+    "kanban_comment",
+    "kanban_heartbeat",
+    "kanban_agent_memory_recall",
+    "kanban_agent_memory_write",
+    "kanban_complete",
+    "kanban_block",
+    "review_target",
+)
+
+CAPABILITY_SETS: dict[str, tuple[str, ...]] = {
+    "codex-app": CODEX_APP_TOOLS,
+    "product-owner": PRODUCT_OWNER_TOOLS,
+    "reviewer": REVIEWER_TOOLS,
+}
+
+CLAUDE_TASK_CAPABILITY_BY_PROFILE = {
+    "productowner": "product-owner",
+    "reviewer": "reviewer",
+}
+
+CAPABILITY_INSTRUCTIONS = {
+    "codex-app": (
+        "Hermes Agent tools exposed to an external runtime. Use only the "
+        "capabilities present in this server."
+    ),
+    "product-owner": (
+        "You are the task-scoped Product Owner. Your filesystem access is "
+        "read-only. Own only the assigned backlog item. You may submit bounded "
+        "child-intake proposals with kanban_create, but qualification owns "
+        "trusted routing and dependencies; you cannot link cards directly. "
+        "This headless run cannot conduct a live interview: post the exact "
+        "decision request and call kanban_block when operator input is needed. "
+        "You cannot create or upload attachments, and attachment content is "
+        "unavailable through this bridge. If the assignment "
+        "requires unavailable attachment content or file/attachment creation, "
+        "comment on the task and call kanban_block with that missing-capability "
+        "reason; do not infer the missing content or broaden access."
+    ),
+    "reviewer": (
+        "You are the task-scoped Reviewer. Your filesystem access is read-only. "
+        "Inspect only the pinned candidate exposed by review_target. You cannot "
+        "create or upload attachments, and attachment content is unavailable "
+        "through this bridge. If required evidence is unavailable, comment on "
+        "the task and call kanban_block with that missing-capability reason."
+    ),
+}
+
+# Backward compatibility for existing imports and codex_app_server tests.
+EXPOSED_TOOLS = CODEX_APP_TOOLS
+
+
+def selected_tool_names(environ=None) -> tuple[str, ...]:
+    """Select a fixed capability set; unknown explicit values fail closed."""
+    source = os.environ if environ is None else environ
+    raw = source.get("HERMES_MCP_CAPABILITY_SET")
+    if raw is None or not str(raw).strip():
+        return CODEX_APP_TOOLS
+    return CAPABILITY_SETS.get(str(raw).strip(), ())
+
 
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
@@ -167,14 +237,14 @@ def _build_server() -> Any:
         handle_function_call,
     )
 
+    capability_set = (
+        os.environ.get("HERMES_MCP_CAPABILITY_SET") or "codex-app"
+    ).strip() or "codex-app"
     mcp = FastMCP(
         "hermes-tools",
-        instructions=(
-            "Hermes Agent's tool surface, exposed for use inside a Codex "
-            "session. Use these for capabilities Codex's built-in toolset "
-            "doesn't cover: web search/extract, browser automation, "
-            "subagent delegation, vision, image generation, persistent "
-            "memory, skills, and cross-session search."
+        instructions=CAPABILITY_INSTRUCTIONS.get(
+            capability_set,
+            "No audited Hermes capability set was selected. Do not proceed.",
         ),
     )
 
@@ -186,9 +256,10 @@ def _build_server() -> Any:
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
+    selected = selected_tool_names()
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    for name in selected:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -241,7 +312,7 @@ def _build_server() -> Any:
     logger.info(
         "hermes-tools MCP server registered %d/%d tools",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(selected),
     )
     return mcp
 

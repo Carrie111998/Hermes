@@ -426,6 +426,43 @@ def test_handoff_v2_materializes_executable_card_with_canonical_worktree(
         connection.close()
 
 
+def test_materialized_worker_and_show_receive_the_signed_work_contract(
+    tmp_path, monkeypatch
+):
+    """A worker must see the authority it is expected to obey."""
+    board = "strict-work-contract-context"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_card(connection, board)
+        task = kb.get_task(connection, task_id)
+        context = kb.build_worker_context(connection, task_id)
+
+    assert "## Work Contract" in context
+    assert f"ID: `{task.work_contract_id}`" in context
+    assert '"scope":[]' in context
+    assert '"out_of_scope":[]' in context
+    assert '"done_when":[]' in context
+    assert '"forbidden":[]' in context
+    assert '"classification"' in context
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    from tools import kanban_tools
+
+    shown = json.loads(kanban_tools._handle_show({}))
+    assert shown["work_contract"]["id"] == task.work_contract_id
+    assert shown["work_contract"]["digest"]
+    assert shown["work_contract"]["work"]["outcome"] == "safe execution"
+    assert shown["work_contract"]["routing"]["entry_phase"] == "development"
+    assert shown["work_contract"]["handover"]["next_phase"] == "test"
+    assert shown["work_contract"]["rules"] == {
+        "allowed": [],
+        "forbidden": [],
+    }
+    assert "## Work Contract" in shown["worker_context"]
+
+
 def test_epic_contract_materializes_as_non_executable_container(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()

@@ -48,8 +48,8 @@ def test_project_create_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "do not create a story card" in queued
     assert "ask breakdown questions" in queued
     assert "branch -> commit -> review -> merge" in queued
-    assert "different AI reviewer" in queued
-    assert "Hermes must inspect the diff" in queued
+    assert "writer and reviewer providers separate" in queued
+    assert "Hermes kernel gates validate" in queued
 
 
 def test_project_import_slash_sets_agent_seed_and_informative_ack(capsys):
@@ -84,8 +84,8 @@ def test_project_import_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "Wayfinder" in queued
     assert "broad_product_surface" in queued
     assert "branch -> commit -> review -> merge" in queued
-    assert "different AI reviewer" in queued
-    assert "Hermes must inspect the diff" in queued
+    assert "writer and reviewer providers separate" in queued
+    assert "Hermes kernel gates validate" in queued
 
 
 def test_project_workflow_queue_fallback_prefixes_seed_so_it_is_not_slash_redispatched(capsys):

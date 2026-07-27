@@ -256,6 +256,55 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_run_agent_auth_failure_names_profile_and_provider_without_raw_error(
+    monkeypatch, tmp_path
+):
+    """Operators need the failed route, while chat must not receive auth details."""
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "model": {
+                "default": "gpt-5.6-sol",
+                "provider": "openai-codex",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_gateway_model",
+        lambda config=None: "gpt-5.6-sol",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        MagicMock(
+            side_effect=RuntimeError(
+                "No Codex credentials stored; secret diagnostic must stay in logs"
+            )
+        ),
+    )
+
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    response = result["final_response"]
+    assert "Default profile could not authenticate openai-codex" in response
+    assert "No fallback was used" in response
+    assert "secret diagnostic" not in response
+
+
+@pytest.mark.asyncio
 async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()

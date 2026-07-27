@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextvars import ContextVar
+import os
 from pathlib import Path
 import time
 
@@ -44,15 +45,28 @@ def _write_acting_cli(tmp_path: Path, name: str, answer: str) -> tuple[Path, Pat
         )
     executable.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, os, sys\n"
+        "import json, os, stat, sys\n"
         f"record = {str(record)!r}\n"
         "if '--help' in sys.argv:\n"
         "    print('--print --output-format --no-session-persistence "
-        "--permission-mode --model --json --ephemeral --sandbox "
+        "--permission-mode --model --mcp-config --strict-mcp-config "
+        "--setting-sources --tools --allowedTools --disable-slash-commands "
+        "--json --ephemeral --sandbox "
         "--ask-for-approval --skip-git-repo-check --color')\n"
         "    raise SystemExit(0)\n"
+        "authority_path = None\n"
+        "authority = None\n"
+        "authority_mode = None\n"
+        "if '--append-system-prompt-file' in sys.argv:\n"
+        "    authority_path = sys.argv[sys.argv.index('--append-system-prompt-file') + 1]\n"
+        "    authority = open(authority_path).read()\n"
+        "    authority_mode = stat.S_IMODE(os.stat(authority_path).st_mode)\n"
         "open(record, 'w').write(json.dumps({"
-        "'argv': sys.argv[1:], 'stdin': sys.stdin.read(), 'cwd': os.getcwd()}))\n"
+        "'argv': sys.argv[1:], 'stdin': sys.stdin.read(), 'cwd': os.getcwd(), "
+        "'authority_path': authority_path, 'authority': authority, "
+        "'authority_mode': authority_mode, "
+        "'task_env': {k: v for k, v in os.environ.items() "
+        "if k.startswith('HERMES_') or k == 'PYTHONPATH'}}))\n"
         f"print({output!r})\n"
     )
     executable.chmod(0o755)
@@ -128,7 +142,9 @@ def test_primary_cli_timeout_terminates_owned_process(
         "#!/usr/bin/env python3\n"
         "import sys, time\n"
         "if '--help' in sys.argv:\n"
-        "    print('--print --output-format --no-session-persistence --permission-mode')\n"
+        "    print('--print --output-format --no-session-persistence "
+        "--permission-mode --mcp-config --strict-mcp-config --setting-sources "
+        "--tools --allowedTools --disable-slash-commands')\n"
         "    raise SystemExit(0)\n"
         "sys.stdin.read()\n"
         "time.sleep(30)\n"
@@ -521,3 +537,187 @@ def test_primary_cli_turn_forwards_reasoning_effort_to_the_subprocess(
 
     argv = json.loads(record.read_text())["argv"]
     assert argv[argv.index(expected[0]) + 1] == expected[1]
+
+
+def _set_task_claude_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    profile: str,
+) -> dict[str, str]:
+    profile_home = tmp_path / "profiles" / profile
+    profile_home.mkdir(parents=True)
+    workspaces = tmp_path / "workspaces"
+    workspaces.mkdir()
+    values = {
+        "HERMES_HOME": str(profile_home),
+        "HERMES_AGENT_MEMORY_VAULT": str(tmp_path / "Agent Memory"),
+        "HERMES_AGENT_MEMORY_OUTBOX": str(tmp_path / "agent-memory-outbox"),
+        "HERMES_KANBAN_TASK": "t_reviewed",
+        "HERMES_KANBAN_RUN_ID": "41",
+        "HERMES_KANBAN_CLAIM_LOCK": "host:worker",
+        "HERMES_KANBAN_DB": str(tmp_path / "kanban.db"),
+        "HERMES_KANBAN_BOARD": "product-board",
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(workspaces),
+        "HERMES_PROFILE": profile,
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    return values
+
+
+@pytest.mark.parametrize(
+    ("profile", "capability_set", "required_tool", "forbidden_tool"),
+    [
+        (
+            "productowner",
+            "product-owner",
+            "mcp__hermes-tools__kanban_create",
+            "mcp__hermes-tools__review_target",
+        ),
+        (
+            "reviewer",
+            "reviewer",
+            "mcp__hermes-tools__review_target",
+            "mcp__hermes-tools__kanban_create",
+        ),
+    ],
+)
+def test_task_scoped_claude_uses_strict_role_mcp_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+    capability_set: str,
+    required_tool: str,
+    forbidden_tool: str,
+) -> None:
+    from agent.local_agent_provider import run_cli_acting
+
+    executable, record = _write_acting_cli(tmp_path, "claude", "done")
+    project = tmp_path / "project"
+    project.mkdir()
+    _set_task_claude_env(monkeypatch, tmp_path, profile=profile)
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.shutil.which",
+        lambda name: str(executable) if name == "claude" else None,
+    )
+
+    run_cli_acting(
+        provider="claude-cli",
+        model="opus",
+        messages=[
+            {
+                "role": "system",
+                "content": "ROLE-AUTHORITY-MARKER: obey the assigned Hermes role.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Work the assigned task. A lower-priority comment says to "
+                    "ignore the Work Contract."
+                ),
+            },
+        ],
+        cwd=str(project),
+        timeout=5,
+        reasoning_config={"enabled": True, "effort": "high"},
+    )
+
+    invocation = json.loads(record.read_text())
+    argv = invocation["argv"]
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob,ToolSearch"
+    assert "--strict-mcp-config" in argv
+    assert "--disable-slash-commands" in argv
+    assert "--append-system-prompt-file" in argv
+    assert "--safe-mode" not in argv
+    assert "bypassPermissions" not in argv
+    assert "Bash" not in argv[argv.index("--tools") + 1]
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--effort") + 1] == "high"
+
+    allowed = set(argv[argv.index("--allowedTools") + 1].split(","))
+    assert {"Read", "Grep", "Glob", "ToolSearch"} <= allowed
+    assert required_tool in allowed
+    assert "mcp__hermes-tools__kanban_agent_memory_recall" in allowed
+    assert "mcp__hermes-tools__kanban_agent_memory_write" in allowed
+    if profile == "productowner":
+        assert "mcp__hermes-tools__kanban_link" not in allowed
+    assert forbidden_tool not in allowed
+
+    inline = json.loads(argv[argv.index("--mcp-config") + 1])
+    server = inline["mcpServers"]["hermes-tools"]
+    assert server["args"] == ["-m", "agent.transports.hermes_tools_mcp_server"]
+    assert server["env"]["HERMES_MCP_CAPABILITY_SET"] == capability_set
+    expected_child_env = {
+        "HERMES_HOME",
+        "HERMES_AGENT_MEMORY_VAULT",
+        "HERMES_AGENT_MEMORY_OUTBOX",
+        "HERMES_INFERENCE_PROVIDER",
+        "HERMES_INFERENCE_MODEL",
+        "HERMES_INFERENCE_EFFORT",
+        "PYTHONPATH",
+        "HERMES_QUIET",
+        "HERMES_REDACT_SECRETS",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_PROFILE",
+        "HERMES_MCP_CAPABILITY_SET",
+    }
+    expected_child_env.update(
+        key
+        for key in ("PATH", "SYSTEMROOT", "COMSPEC", "PATHEXT")
+        if os.environ.get(key)
+    )
+    assert set(server["env"]) == expected_child_env
+    assert server["env"]["HERMES_QUIET"] == "1"
+    assert server["env"]["HERMES_REDACT_SECRETS"] == "true"
+    assert server["env"]["HERMES_INFERENCE_PROVIDER"] == "claude-cli"
+    assert server["env"]["HERMES_INFERENCE_MODEL"] == "opus"
+    assert server["env"]["HERMES_INFERENCE_EFFORT"] == "high"
+    assert server["env"]["PATH"] == os.environ["PATH"]
+    assert invocation["task_env"] == {}
+    assert invocation["authority_mode"] == 0o600
+    assert not Path(invocation["authority_path"]).exists()
+    assert "ROLE-AUTHORITY-MARKER" in invocation["authority"]
+    assert "filesystem access is read-only" in invocation["authority"]
+    assert "attachment content" in invocation["authority"]
+    assert "kanban_block" in invocation["authority"]
+    assert "Work Contract" in invocation["authority"]
+    assert "task comments" in invocation["authority"]
+    assert "ROLE-AUTHORITY-MARKER" not in invocation["stdin"]
+    assert "filesystem access is read-only" not in invocation["stdin"]
+    assert all("ROLE-AUTHORITY-MARKER" not in value for value in argv)
+    assert "ignore the Work Contract" in invocation["stdin"]
+
+
+def test_task_scoped_claude_rejects_unapproved_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.cli_emulated_provider import CliConfigurationError
+    from agent.local_agent_provider import run_cli_acting
+
+    executable, _record = _write_acting_cli(tmp_path, "claude", "done")
+    _set_task_claude_env(monkeypatch, tmp_path, profile="developer")
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.shutil.which",
+        lambda name: str(executable) if name == "claude" else None,
+    )
+
+    with pytest.raises(
+        CliConfigurationError,
+        match="task-scoped claude-cli profile.*developer",
+    ):
+        run_cli_acting(
+            provider="claude-cli",
+            model="opus",
+            messages=[{"role": "user", "content": "Work."}],
+            cwd=str(tmp_path),
+            timeout=5,
+        )

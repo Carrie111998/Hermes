@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.prompt_builder import KANBAN_GUIDANCE
 from agent.system_prompt import build_system_prompt_parts
 
 
@@ -68,6 +69,34 @@ def _stable_prompt(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
+
+
+def test_task_scoped_claude_system_prompt_omits_unavailable_generic_tool_guidance(
+    monkeypatch,
+):
+    """The native authority must not simultaneously require hidden Hermes tools."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_scoped")
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    agent = _make_agent(
+        provider="claude-cli",
+        model="opus",
+        valid_tool_names={
+            "terminal",
+            "memory",
+            "skill_manage",
+            "kanban_show",
+            "kanban_attach",
+            "clarify",
+        },
+        _kanban_worker_guidance=KANBAN_GUIDANCE,
+    )
+
+    stable = _stable_prompt(agent)
+
+    assert "kanban_attach" not in stable
+    assert "skill_manage" not in stable
+    assert "Do not call `clarify`" not in stable
+    assert "You are Hermes Agent" in stable
 
 
 def _init_code_repo(path):

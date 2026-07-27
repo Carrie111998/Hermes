@@ -80,10 +80,26 @@ fi
 
 
 # ── Run in hermetic env ──────────────────────────────────────────────────────
+# Create the process-wide test home only after virtualenv/plugin discovery,
+# which legitimately reads the operator HOME.  Pytest collection and every
+# child process receive the isolated HOME/HERMES_HOME below; this closes the
+# gap before the per-test fixture starts.
+TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/hermes-test-home.XXXXXX")"
+# Normalize TMPDIR spelling once. On macOS TMPDIR commonly ends in "/" and
+# traverses the /var -> /private/var symlink; preserving either spelling makes
+# HOME disagree with pathlib/expanduser in tests and child processes.
+TEST_HOME="$(cd "$TEST_HOME" && pwd -P)"
+mkdir -m 700 "$TEST_HOME/.hermes"
+cleanup_test_home() {
+  rm -rf -- "$TEST_HOME"
+}
+trap cleanup_test_home EXIT
+
 # env -i: start with empty environment, opt-in only what we need.
-# No credential var can leak — you'd have to explicitly add it here.
+# No credential or live Agent Memory path can leak — it would have to be
+# explicitly added here.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
-echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (isolated HOME/HERMES_HOME; TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
@@ -96,9 +112,11 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-exec env -i \
+set +e
+env -i \
   PATH="$PATH" \
-  HOME="$HOME" \
+  HOME="$TEST_HOME" \
+  HERMES_HOME="$TEST_HOME/.hermes" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
@@ -107,3 +125,6 @@ exec env -i \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+status=$?
+set -e
+exit "$status"
