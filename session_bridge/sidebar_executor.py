@@ -247,7 +247,11 @@ class CodexAppServerSidebarDelivery:
         if not isinstance(fresh, bool):
             raise ValueError("fresh registration flag is malformed")
         if not fresh:
-            thread = self._read_or_resume_thread(wanted, deadline=deadline)
+            thread = self._read_or_resume_thread(
+                wanted,
+                deadline=deadline,
+                resume_not_loaded=True,
+            )
             if _thread_has_exact_marker(thread, marker):
                 return
         # A just-started thread exists only in this app-server process until
@@ -428,7 +432,11 @@ class CodexAppServerSidebarDelivery:
     ) -> str:
         wanted = _required_text(thread_id, "Codex thread ID")
         self._ensure_initialized(deadline)
-        thread = self._read_or_resume_thread(wanted, deadline=deadline)
+        thread = self._read_or_resume_thread(
+            wanted,
+            deadline=deadline,
+            resume_not_loaded=True,
+        )
         return _exact_first_user_text(thread)
 
     def thread_has_exact_marker(
@@ -441,8 +449,16 @@ class CodexAppServerSidebarDelivery:
         wanted = _required_text(thread_id, "Codex thread ID")
         exact_marker = _required_text(marker, "authenticated marker")
         self._ensure_initialized(deadline)
-        thread = self._read_or_resume_thread(wanted, deadline=deadline)
-        return _thread_has_exact_marker(thread, exact_marker)
+        thread = self._read_or_resume_thread(
+            wanted,
+            deadline=deadline,
+            resume_not_loaded=True,
+        )
+        return _thread_has_exact_marker(
+            thread,
+            exact_marker,
+            allow_interrupted=True,
+        )
 
     def start_text_turn_and_verify_marker(
         self,
@@ -495,6 +511,7 @@ class CodexAppServerSidebarDelivery:
         thread_id: str,
         *,
         deadline: float,
+        resume_not_loaded: bool = False,
     ) -> Mapping[str, Any]:
         wanted = _required_text(thread_id, "Codex thread ID")
         try:
@@ -519,7 +536,28 @@ class CodexAppServerSidebarDelivery:
                 ):
                     raise NativeThreadUnrecoverable(wanted) from resume_exc
                 raise
-        return _exact_thread(response, wanted)
+        thread = _exact_thread(response, wanted)
+        status = thread.get("status")
+        if (
+            resume_not_loaded
+            and isinstance(status, Mapping)
+            and status.get("type") == "notLoaded"
+        ):
+            try:
+                response = self._client.request(
+                    "thread/resume",
+                    {"threadId": wanted},
+                    timeout=self._remaining(deadline),
+                )
+            except CodexAppServerError as resume_exc:
+                if (
+                    resume_exc.code == -32600
+                    and resume_exc.message == f"no rollout found for thread id {wanted}"
+                ):
+                    raise NativeThreadUnrecoverable(wanted) from resume_exc
+                raise
+            thread = _exact_thread(response, wanted)
+        return thread
 
     def rename_thread(
         self,
@@ -1471,6 +1509,7 @@ def _thread_has_exact_marker(
     marker: str,
     *,
     turn_id: str | None = None,
+    allow_interrupted: bool = False,
 ) -> bool:
     turns = thread.get("turns")
     assert isinstance(turns, list)
@@ -1478,7 +1517,12 @@ def _thread_has_exact_marker(
         if not isinstance(turn, dict):
             continue
         turn = cast(dict[str, object], turn)
-        if turn.get("status") != "completed":
+        accepted_statuses = (
+            {"completed", "interrupted"}
+            if allow_interrupted
+            else {"completed"}
+        )
+        if turn.get("status") not in accepted_statuses:
             continue
         if turn_id is not None and turn.get("id") != turn_id:
             continue

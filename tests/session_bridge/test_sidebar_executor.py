@@ -410,6 +410,38 @@ def test_codex_delivery_reads_exact_hydration_marker_without_mutation() -> None:
     assert [method for method, _params, _timeout in client.calls] == ["thread/read"]
 
 
+def test_codex_delivery_resumes_not_loaded_snapshot_before_marker_reconciliation() -> None:
+    marker = "HERMES_SESSION_HYDRATION_V1:canonical.marker"
+    client = FakeCodexAppServerClient({
+        "thread/read": [
+            {
+                "thread": {
+                    "id": THREAD_1,
+                    "cwd": "C:/source",
+                    "status": {"type": "notLoaded"},
+                    "turns": [],
+                }
+            }
+        ],
+        "thread/resume": [
+            _persisted_registration(f"hydrate\n{marker}", status="interrupted")
+        ],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    found = delivery.thread_has_exact_marker(
+        thread_id=THREAD_1,
+        marker=marker,
+        deadline=105.0,
+    )
+
+    assert found is True
+    assert [method for method, _params, _timeout in client.calls] == [
+        "thread/read",
+        "thread/resume",
+    ]
+
+
 def test_codex_delivery_starts_one_text_turn_and_verifies_hydration_marker() -> None:
     marker = "HERMES_SESSION_HYDRATION_V1:canonical.marker"
     message = f"# Imported Claude Code Session\n\nHydration marker: {marker}"
