@@ -192,9 +192,27 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+
+    # A crash exit is NOT a completion. conversation_loop.py:6659-6672 handles
+    # both crash paths by writing an apology into final_response and breaking —
+    # without setting ``failed``. (`failed = True` appears exactly once in that
+    # 6698-line loop, at :1582, for an unrelated Ollama branch.) Every
+    # ingredient of the old expression was therefore satisfied on a crash, and
+    # the turn reported completed=True: cron/scheduler.py marked the job "ok"
+    # and delegate_task handed the parent exit_reason="completed" for work that
+    # died mid-way. cron's own comment assumed run_agent set failed=True here;
+    # it never did.
+    #
+    # Guardrail halts are deliberately NOT included. That path is a bounded,
+    # test-locked stop with its own reporting, and treating it as failure would
+    # change documented behaviour rather than fix a defect.
+    _CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
+    crashed = str(_turn_exit_reason).startswith(_CRASH_EXIT_PREFIXES)
+
     completed = (
         final_response is not None
         and not failed
+        and not crashed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
