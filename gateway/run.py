@@ -9292,6 +9292,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Session stall notify skipped (no chat_id): session=%s",
                     session_key,
                 )
+                # Cannot deliver; latch to avoid log spam every tick.
                 notified_map[session_key] = True
                 continue
             try:
@@ -9306,14 +9307,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=metadata,
                 )
                 sent += 1
+                notified_map[session_key] = True
             except Exception as exc:
                 logger.warning(
                     "Session stall notify failed for %s: %s",
                     session_key,
                     exc,
                 )
-            # Latch even on send failure so we don't spam every tick.
-            notified_map[session_key] = True
+                # Do not latch — retry next watcher tick until delivery or episode clear.
 
         # Drop latches for sessions that no longer appear in any pending map.
         for key in list(notified_map.keys()):

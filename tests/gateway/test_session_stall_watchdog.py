@@ -109,6 +109,14 @@ def test_should_clear_when_pending_gone_or_activity_resumes():
     )
 
 
+def test_should_clear_holds_latch_when_idle_unknown():
+    assert not should_clear_session_stall_notification(
+        timeout_seconds=300,
+        idle_seconds=None,
+        has_pending_inbound=True,
+    )
+
+
 def test_format_session_stall_notification_minutes():
     msg = format_session_stall_notification(125)
     assert "2 min ago" in msg
@@ -317,6 +325,86 @@ async def test_check_session_stalls_logs_compression_provenance(caplog):
         assert await runner._check_session_stalls(60) == 1
     assert any("agent.compression" in r.message for r in caplog.records)
     assert any("compressing context" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_does_not_renotify_after_summary_gap():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:gap"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 1
+
+    # Transient observation gap (no summary API).
+    runner._running_agents[session_key] = _AgentWithoutSummary(time.time() - 999)
+    assert await runner._check_session_stalls(60) == 0
+    assert runner._session_stall_notified.get(session_key) is True
+
+    # Stale progress returns — must not spam again in the same episode.
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+    assert await runner._check_session_stalls(60) == 0
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_retries_after_send_failure():
+    class _FailThenOk(_FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def send(self, chat_id, content, metadata=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("boom")
+            await super().send(chat_id, content, metadata=metadata)
+
+    adapter = _FailThenOk()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:retry"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 0
+    assert session_key not in runner._session_stall_notified
+    assert await runner._check_session_stalls(60) == 1
+    assert runner._session_stall_notified.get(session_key) is True
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_renotifies_after_resume_then_restall():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:episode"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 1
+
+    # Activity resumes (still pending) — clears latch for a new episode.
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 5)
+    assert await runner._check_session_stalls(60) == 0
+    assert session_key not in runner._session_stall_notified
+
+    # Stall again — second episode may notify once more.
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+    assert await runner._check_session_stalls(60) == 1
+    assert len(adapter.sent) == 2
+
+
+def test_resolve_idle_rejects_nonfinite_seconds_since_activity():
+    now = 1_000_000.0
+    idle = resolve_session_idle_seconds_from_activity(
+        {
+            "seconds_since_activity": float("nan"),
+            "last_activity_at": now - 15,
+        },
+        now=now,
+    )
+    assert idle == 15.0
 
 
 def test_session_stall_timeout_in_default_config():

@@ -20,6 +20,7 @@ description + provenance).
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Optional
 
 
@@ -53,8 +54,9 @@ def should_clear_session_stall_notification(
         return True
     if timeout_seconds <= 0:
         return True
+    # Unknown progress: hold the latch. Do not treat observation gaps as recovery.
     if idle_seconds is None:
-        return True
+        return False
     return idle_seconds < timeout_seconds
 
 
@@ -89,9 +91,11 @@ def resolve_session_idle_seconds_from_activity(
         except (TypeError, ValueError):
             idle = None
         else:
-            if idle < 0:
-                return 0.0
-            return idle
+            if math.isfinite(idle):
+                if idle < 0:
+                    return 0.0
+                return idle
+            # Non-finite: fall through to last_activity_at / last_activity_ts
 
     ts = activity.get("last_activity_at")
     if ts is None:
@@ -101,6 +105,8 @@ def resolve_session_idle_seconds_from_activity(
     try:
         when = float(ts)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(when):
         return None
 
     if now is None:
