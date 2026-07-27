@@ -822,6 +822,23 @@ This remains deterministic local-provider evidence; it does not establish
 production provider credentials, corporate readiness, or legal/compliance
 certification.
 
+After tightening organization actor identity resolution, the acceptance was
+rerun on current `main` commit
+`61c570d33c4571bce3efb8e04633922c12e603f9` with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result: **current-tree agentic acceptance: PASS**. Install/bootstrap,
+blocked-to-ready readiness, bounded CEO execution, process-separated
+delegation, uncertain provider read-back, inbound tax settlement, durable
+restart recovery, and master-stop fencing passed. The acceptance image digest
+was `sha256:87a21204e5e034b36587cb2e13441b4f081799e38b0b8696a9a486c869dc4adf`.
+This is deterministic local-provider evidence and does not establish
+production provider credentials, corporate readiness, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
