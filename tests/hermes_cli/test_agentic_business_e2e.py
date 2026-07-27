@@ -209,6 +209,90 @@ def test_event_driven_business_replans_then_verifies_and_preserves_evidence(tmp_
     assert market.offers == {"offer:first"}
 
 
+def test_founder_ceo_operating_loop_acceptance(tmp_path):
+    """Release gate: the solo Founder/CEO runs a complete loop without a turn."""
+    conn = objectives_db.connect(tmp_path / "founder-ceo-acceptance.db")
+    charter = {
+        "enabled": True,
+        "operating_cadence": {"enabled": False},
+        "operating_mode": "autonomous",
+        "operator_role": "advisor",
+        "policy_version": "charter-v1",
+        "allowed_capabilities": ["market.publish"],
+        "forbidden_capabilities": [],
+        "allowed_systems": ["market"],
+        "approval_required_capabilities": [],
+        "max_autonomous_risk": "low",
+        "allow_irreversible": False,
+        "max_action_spend_minor": 0,
+        "permit_ttl_seconds": 300,
+        "finance": {"base_currency": "USD"},
+    }
+    organization_id, ceo_id = organization_db.bootstrap_solo_founder(
+        conn,
+        organization_name="Founder CEO Acceptance Company",
+        purpose="Operate a verified offer autonomously",
+        profile_name="acceptance",
+        charter=charter,
+    )
+    ceo = organization_db.active_ceo(conn)
+    organization = conn.execute(
+        "SELECT operator_role FROM organizations WHERE id=?",
+        (organization_id,),
+    ).fetchone()
+    mandate = organization_db.get_current_mandate(conn, ceo_id)
+    assert ceo["id"] == ceo_id
+    assert ceo["level"] == "ceo"
+    assert organization["operator_role"] == "advisor"
+    assert mandate["version"] == 1
+
+    objective = objectives_db.create_objective(
+        conn,
+        organization_id=organization_id,
+        desired_outcome="Publish and verify the acceptance offer",
+        originator=f"employee:{ceo_id}",
+        permitted_systems=["market"],
+        success_criteria=[
+            {"verifier": "market.external_offer_visible", "params": {"offer": "first"}}
+        ],
+    )
+    objectives_db.transition_objective(
+        conn, objective.id, "accepted", actor=f"employee:{ceo_id}"
+    )
+    objectives_db.enqueue_objective_event(
+        conn,
+        objective_id=objective.id,
+        event_type="objective.accepted",
+        payload={"origin": "founder_ceo_acceptance"},
+        dedupe_key=f"founder-ceo-acceptance:{objective.id}",
+    )
+    market = ExternalMarket()
+    runtime = ObjectiveRuntime(
+        conn,
+        planner=TwoCyclePlanner(),
+        executor=market,
+        verifier=MarketVerifier(market),
+        charter=charter,
+        policy_version="charter-v1",
+        runtime_id="runtime:founder-ceo-acceptance",
+    )
+
+    first = runtime.tick()
+    second = runtime.tick()
+
+    assert first.status == "progressed"
+    assert second.status == "verified"
+    assert objectives_db.get_objective(conn, objective.id).status == "verified"
+    assert market.offers == {"offer:first"}
+    snapshot = objectives_db.objective_snapshot(conn, objective.id)
+    assert [plan["version"] for plan in snapshot["plans"]] == [1, 2]
+    assert snapshot["actions"][0]["proposed_by"] == "employee:ceo"
+    assert snapshot["verifications"][-1]["verdict"] == "pass"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM intervention_queue WHERE status='open'"
+    ).fetchone()[0] == 0
+
+
 def test_ceo_evaluates_then_hires_worker_across_verified_cycles(
     tmp_path, monkeypatch
 ):

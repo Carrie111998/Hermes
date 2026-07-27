@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.19.0-agentic-foundation — 2026-07-27
+
+This is the consolidated release-evidence boundary for the independent
+Charterforge agentic runtime. It is a controlled-runtime foundation boundary,
+not a claim of production autonomous-business readiness.
+
+### Included
+
+- Founder/CEO solo-founder bootstrap with advisor-by-default human posture.
+- Durable objectives, immutable plans, admissible permits, event-driven
+  replanning, independent verification, audit lineage, and bounded worker
+  coordination.
+- Fail-closed authority, budget, payment, accounting, compliance, recovery,
+  lease, and advisor-intervention controls.
+- Explicit end-to-end acceptance evidence in
+  `tests/hermes_cli/test_agentic_business_e2e.py::test_founder_ceo_operating_loop_acceptance`.
+
+### Evidence boundary
+
+- Controlled Founder/CEO runtime acceptance: **PASS** when the exact commands
+  in [READINESS.md](READINESS.md) pass at the recorded evidence commit.
+- Production autonomous business operation: **NOT READY**.
+- Universal legal, tax, payment, and compliance operation: **NOT PROVEN**.
+- Evidence commit SHA: recorded in [READINESS.md](READINESS.md) after the
+  baseline commit is created.
+
 ## Unreleased
 
 - Added the optional standalone `charterforge-stripe-rail` package for

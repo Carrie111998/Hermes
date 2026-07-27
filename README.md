@@ -134,6 +134,7 @@ recorded as a limitation, not a passing check.
 
 ## Documentation
 
+- [Readiness determination and release evidence](READINESS.md)
 - [Agentic Business OS guide](website/docs/guides/agentic-business-os.md)
 - [Architecture](docs/architecture.md)
 - [Company operating model](docs/company-operating-model.md)
