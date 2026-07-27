@@ -16,6 +16,9 @@ The optional Stripe package follows this boundary: it uses an in-memory HTTP
 client, sends the secret only to Stripe, and records no raw card or bank data.
 Its outbound implementation is deliberately limited to explicitly identified
 Connected Accounts and fails closed for arbitrary payees.
+Stripe webhook ingress verifies the provider timestamp/HMAC signature before
+writing a typed, idempotent external-event receipt; raw webhook bodies are not
+persisted.
 
 Terminal execution can use inherited local, Docker, SSH, Singularity, Modal,
 or Daytona backends. A local terminal is not a sandbox. Production operators

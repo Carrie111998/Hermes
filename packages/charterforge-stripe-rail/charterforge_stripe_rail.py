@@ -2,13 +2,96 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
+import time
 from typing import Any, Mapping
 
 import httpx
 # The provider contract remains in the core compatibility package so this
 # optional package does not add a model-tool or runtime dependency surface.
 from hermes_cli.payments import PaymentRail, ProviderPayment
+
+
+class StripeWebhookError(ValueError):
+    """Raised when a Stripe webhook cannot be authenticated or routed."""
+
+
+def _verify_signature(raw_body: bytes, signature_header: str, secret: str,
+                      *, now: int | None = None,
+                      tolerance_seconds: int = 300) -> dict[str, Any]:
+    values: dict[str, list[str]] = {}
+    for item in signature_header.split(","):
+        key, _, value = item.partition("=")
+        if key and value:
+            values.setdefault(key, []).append(value)
+    timestamp = values.get("t", [""])[0]
+    try:
+        signed_at = int(timestamp)
+    except ValueError as exc:
+        raise StripeWebhookError("Stripe webhook timestamp is invalid") from exc
+    current = int(time.time()) if now is None else int(now)
+    if abs(current - signed_at) > tolerance_seconds:
+        raise StripeWebhookError("Stripe webhook timestamp is outside the replay window")
+    expected = hmac.new(
+        secret.encode("utf-8"), f"{timestamp}.".encode("utf-8") + raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not any(hmac.compare_digest(expected, candidate) for candidate in values.get("v1", [])):
+        raise StripeWebhookError("Stripe webhook signature is invalid")
+    return {"scheme": "stripe_signature_v1", "signed_timestamp": timestamp}
+
+
+def route_webhook_event(conn, *, organization_id: str, raw_body: bytes,
+                        signature_header: str, signing_secret: str,
+                        now: int | None = None) -> list[str]:
+    """Authenticate and durably route a Stripe payment event into objectives."""
+    if not signing_secret:
+        raise StripeWebhookError("Stripe webhook signing secret is required")
+    evidence = _verify_signature(raw_body, signature_header, signing_secret, now=now)
+    try:
+        event = json.loads(raw_body)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StripeWebhookError("Stripe webhook body is not valid JSON") from exc
+    if not isinstance(event, Mapping):
+        raise StripeWebhookError("Stripe webhook body must be an object")
+    event_type = str(event.get("type") or "")
+    allowed = {
+        "checkout.session.completed",
+        "payment_intent.succeeded",
+        "payment_intent.payment_failed",
+    }
+    if event_type not in allowed:
+        raise StripeWebhookError(f"unsupported Stripe payment event: {event_type}")
+    event_id = str(event.get("id") or "")
+    data = event.get("data")
+    obj = data.get("object") if isinstance(data, Mapping) else None
+    if not event_id or not isinstance(obj, Mapping) or not obj.get("id"):
+        raise StripeWebhookError("Stripe webhook omitted event or object identity")
+    payload = {
+        "provider_event_id": event_id,
+        "provider_object_id": str(obj["id"]),
+        "status": str(obj.get("payment_status", obj.get("status", "unknown"))),
+        "amount_minor": obj.get("amount_total", obj.get("amount")),
+        "currency": obj.get("currency"),
+        "livemode": bool(obj.get("livemode", False)),
+    }
+    from hermes_cli import objective_triggers
+
+    try:
+        return objective_triggers.route_external_event(
+            conn,
+            organization_id=organization_id,
+            source_type="stripe",
+            event_type=event_type,
+            source_reference=event_id,
+            payload=payload,
+            authentication_evidence={**evidence, "provider_event_id": event_id},
+        )
+    except objective_triggers.TriggerError as exc:
+        raise StripeWebhookError(str(exc)) from exc
 
 
 class StripeRail(PaymentRail):
