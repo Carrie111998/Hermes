@@ -47,7 +47,9 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
+
+from pydantic import WithJsonSchema
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,8 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
         if pname.startswith("_"):
             continue
         py = _JSON_TO_PY.get((pspec or {}).get("type"), Any)
+        if set(pspec or {}) - {"type"}:
+            py = Annotated[py, WithJsonSchema(dict(pspec))]
         ann, default = (
             (py, inspect.Parameter.empty)
             if pname in required
@@ -269,7 +273,13 @@ def _build_server() -> Any:
     # MCP clients see the same parameter docs Hermes gives the model.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (
+            get_tool_definitions(
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            or []
+        )
         if isinstance(td, dict) and td.get("type") == "function"
     }
 

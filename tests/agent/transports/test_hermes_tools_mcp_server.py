@@ -326,6 +326,58 @@ class TestCapabilitySets:
 
         assert server._tool_manager._tools == {}
 
+    def test_real_intake_server_registers_all_tools_with_nested_decision_schema(
+        self, monkeypatch, tmp_path,
+    ):
+        from agent.transports import hermes_tools_mcp_server as m
+        from model_tools import _clear_tool_defs_cache
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_PROFILE", "productowner")
+        monkeypatch.setenv("HERMES_WORK_INBOX_INTAKE", "qi_one")
+        monkeypatch.setenv("HERMES_WORK_INBOX_RUN_ID", "7")
+        monkeypatch.setenv("HERMES_WORK_INBOX_CLAIM_LOCK", "claim")
+        monkeypatch.setenv(
+            "HERMES_MCP_CAPABILITY_SET", "product-owner-intake"
+        )
+        monkeypatch.setattr(
+            "tools.kanban_tools._is_delegated_child_context",
+            lambda: False,
+        )
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+
+        server = m._build_server()
+        registered = server._tool_manager._tools
+
+        assert set(registered) == set(m.PRODUCT_OWNER_INTAKE_TOOLS)
+        decision = registered["work_inbox_decide"].parameters
+        assert decision["properties"]["disposition"]["enum"] == [
+            "accepted",
+            "needs_clarification",
+            "rejected",
+        ]
+        proposal = next(
+            item
+            for item in decision["properties"]["proposal"]["anyOf"]
+            if item.get("type") == "object"
+        )
+        assert set(proposal["required"]) == {
+            "work",
+            "routing",
+            "handover",
+            "rules",
+            "classification",
+            "stories",
+        }
+        assert set(proposal["properties"]["routing"]["required"]) == {
+            "entry_phase",
+            "assignee",
+            "epic_id",
+            "dependencies",
+        }
+
 
 class TestMain:
     def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):

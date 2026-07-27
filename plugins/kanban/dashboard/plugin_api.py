@@ -864,7 +864,13 @@ def get_work_inbox_status(
         response = {
             "intake_id": intake_id,
             "status": record["status"],
-            "reason": decision.get("reason") if decision else None,
+            "reason": (
+                redact_sensitive_text(
+                    str(decision.get("reason") or ""), force=True
+                )
+                if decision
+                else None
+            ),
             "items": _materialized_intake_items(conn, intake_id),
         }
         if question is not None:

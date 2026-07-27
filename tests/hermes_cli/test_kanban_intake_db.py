@@ -405,6 +405,50 @@ def test_live_intake_worker_renews_expired_claim_instead_of_reclaiming(conn):
     ).fetchone()["claim_expires"] == 326
     assert renewed_run["status"] == "running"
     assert renewed_run["claim_expires"] == 326
+    assert renewed_run["last_heartbeat_at"] == 20
+    assert kb.list_qualification_intake_events(conn, intake_id)[-1]["kind"] == (
+        "claim_extended"
+    )
+
+
+def test_live_intake_worker_cannot_renew_past_max_runtime(conn):
+    intake_id = kb.create_qualification_intake(
+        conn, raw_request="wedged assessment", source="chat", created_at=10
+    )
+    run = kb.claim_qualification_intake(
+        conn,
+        intake_id,
+        profile="productowner",
+        runtime_identity={
+            "provider": "claude-cli",
+            "model": "claude-opus-5",
+            "effort": "high",
+        },
+        lease_seconds=5,
+        now=20,
+    )
+    assert kb.set_qualification_intake_worker_pid(
+        conn,
+        intake_id=intake_id,
+        run_id=run["id"],
+        claim_lock=run["claim_lock"],
+        worker_pid=4242,
+    )
+
+    assert kb.recover_stale_qualification_intakes(
+        conn,
+        now=621,
+        max_runtime_seconds=600,
+        pid_alive=lambda pid: pid == 4242,
+    ) == {"retried": 0, "attention_required": 1}
+
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == (
+        "attention_required"
+    )
+    ended = kb.get_qualification_intake_run(conn, run["id"])
+    assert ended["status"] == "completed"
+    assert ended["outcome"] == "reclaimed"
+    assert ended["last_heartbeat_at"] == 20
 
 
 def test_interrupted_modern_table_migration_recovers_orphaned_legacy_rows(tmp_path):

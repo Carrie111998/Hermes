@@ -6861,17 +6861,21 @@ def recover_stale_qualification_intakes(
     conn: sqlite3.Connection,
     *,
     failure_limit: int = 2,
+    lease_seconds: int = 300,
+    max_runtime_seconds: int = 15 * 60,
     now: Optional[int] = None,
     pid_alive: Optional[Callable[[int], bool]] = None,
 ) -> dict[str, int]:
     """Reclaim expired or dead direct-PO attempts without creating cards."""
 
+    if int(lease_seconds) < 1 or int(max_runtime_seconds) < 1:
+        raise ValueError("lease and max runtime must be positive")
     timestamp = int(time.time()) if now is None else int(now)
     alive = pid_alive or _qualification_worker_pid_alive
     rows = conn.execute(
         """
         SELECT q.id AS intake_id, q.current_run_id, q.claim_lock,
-               q.claim_expires, r.worker_pid
+               q.claim_expires, r.worker_pid, r.started_at
           FROM qualification_intake q
           JOIN qualification_intake_runs r ON r.id = q.current_run_id
          WHERE q.status = 'running' AND r.status = 'running'
@@ -6887,29 +6891,79 @@ def recover_stale_qualification_intakes(
         worker_alive = (
             worker_pid is not None and alive(int(worker_pid))
         )
-        if expired and worker_alive:
+        runtime_exceeded = (
+            timestamp - int(row["started_at"]) > int(max_runtime_seconds)
+        )
+        if expired and worker_alive and not runtime_exceeded:
+            extended_expires = timestamp + int(lease_seconds)
             try:
-                heartbeat_qualification_intake(
-                    conn,
-                    intake_id=str(row["intake_id"]),
-                    run_id=int(row["current_run_id"]),
-                    claim_lock=str(row["claim_lock"]),
-                    now=timestamp,
-                )
+                with write_txn(conn):
+                    run_update = conn.execute(
+                        "UPDATE qualification_intake_runs "
+                        "SET claim_expires = ? "
+                        "WHERE id = ? AND intake_id = ? AND status = 'running' "
+                        "AND claim_lock = ?",
+                        (
+                            extended_expires,
+                            int(row["current_run_id"]),
+                            str(row["intake_id"]),
+                            str(row["claim_lock"]),
+                        ),
+                    )
+                    if run_update.rowcount != 1:
+                        raise RuntimeError(
+                            "intake run claim changed during lease extension"
+                        )
+                    intake_update = conn.execute(
+                        "UPDATE qualification_intake "
+                        "SET claim_expires = ?, updated_at = ? "
+                        "WHERE id = ? AND status = 'running' "
+                        "AND current_run_id = ? AND claim_lock = ?",
+                        (
+                            extended_expires,
+                            timestamp,
+                            str(row["intake_id"]),
+                            int(row["current_run_id"]),
+                            str(row["claim_lock"]),
+                        ),
+                    )
+                    if intake_update.rowcount != 1:
+                        raise RuntimeError(
+                            "intake claim changed during lease extension"
+                        )
+                    append_qualification_intake_event(
+                        conn,
+                        intake_id=str(row["intake_id"]),
+                        run_id=int(row["current_run_id"]),
+                        kind="claim_extended",
+                        payload={
+                            "claim_expires": extended_expires,
+                            "worker_pid": int(worker_pid),
+                        },
+                        created_at=timestamp,
+                    )
             except RuntimeError:
-                pass
+                logger.warning(
+                    "qualification intake claim changed during lease extension",
+                    exc_info=True,
+                )
             continue
         dead = worker_pid is not None and not worker_alive
-        if not expired and not dead:
+        if not expired and not dead and not runtime_exceeded:
             continue
+        error = (
+            "worker exceeded maximum intake runtime"
+            if runtime_exceeded
+            else "worker exited or claim heartbeat expired"
+        )
         status = fail_qualification_intake_run(
             conn,
             intake_id=str(row["intake_id"]),
             run_id=int(row["current_run_id"]),
             claim_lock=str(row["claim_lock"]),
             outcome="reclaimed",
-            error="worker exited or claim heartbeat expired",
-            failure_limit=failure_limit,
+            error=error,
+            failure_limit=1 if runtime_exceeded else failure_limit,
             now=timestamp,
         )
         if status == "pending":

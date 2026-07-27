@@ -408,6 +408,47 @@ def test_clarification_question_is_redacted_before_external_status_response(
     assert "private-token" not in status.text
 
 
+def test_decision_reason_is_redacted_before_external_status_response(
+    app_client, strict_board, strong_secret, monkeypatch,
+):
+    headers = {"Authorization": f"Bearer {strong_secret}"}
+    submitted = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {"functional_intent": {"title": "Reject safely"}},
+        },
+    )
+    intake_id = submitted.json()["intake_id"]
+    with kb.connect(board=strict_board) as conn:
+        kb.record_qualification_decision(
+            conn,
+            intake_id=intake_id,
+            decision="rejected",
+            actor_profile="productowner",
+            reason="Rejected after reading private-token",
+        )
+    monkeypatch.setattr(
+        sys.modules["hermes_dashboard_plugin_kanban"],
+        "redact_sensitive_text",
+        lambda value, **_kwargs: str(value).replace(
+            "private-token", "«redacted»"
+        ),
+    )
+
+    status = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers=headers,
+    )
+
+    assert status.status_code == 200
+    assert status.json()["reason"] == "Rejected after reading «redacted»"
+    assert "private-token" not in status.text
+
+
 def test_clarification_response_cannot_cross_intake_source(
     app_client, strict_board, strong_secret,
 ):
