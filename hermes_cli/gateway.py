@@ -3833,6 +3833,218 @@ def _retry_launchctl_bootstrap_until_registered(
 # so an OS update that fixes the underlying issue allows automatic recovery.
 
 
+# ── Service-account / LaunchDaemon support (#72790) ────────────────────────
+# When `hermes gateway install` runs on a macOS service account (one that never
+# logs in), the GUI domain (gui/<uid>) does not support launchd service
+# management.  LaunchAgent bootstrap fails with exit 125, and the install
+# silently degraded to an unsupervised background process — no crash-restart,
+# no boot-start.
+#
+# Fix: detect the scenario early and either (A) install a LaunchDaemon via
+# /Library/LaunchDaemons (requires sudo) or (B) fail loudly with instructions.
+
+_LAUNCHD_DAEMON_PLIST_DIR = Path("/Library/LaunchDaemons")
+
+
+def get_launchdaemon_plist_path() -> Path:
+    """Return the LaunchDaemon plist path for system-level supervision."""
+    suffix = _profile_suffix()
+    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    return _LAUNCHD_DAEMON_PLIST_DIR / f"{name}.plist"
+
+
+def _probe_gui_domain_supported() -> bool:
+    """Return True when the current user's GUI domain supports launchd services.
+
+    On a normal login account, ``launchctl print gui/<uid>`` succeeds.
+    On a macOS service account (no Aqua/login session), it fails with
+    exit 125 ("Domain does not support specified action").
+    """
+    uid = os.getuid()
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}"],
+            check=False,
+            timeout=5,
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def _get_service_account_username() -> str | None:
+    """Return the username of the current account (for LaunchDaemon UserName key)."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, ImportError):
+        return None
+
+
+def _is_running_as_root() -> bool:
+    """Return True when the current process has effective uid 0."""
+    return os.geteuid() == 0
+
+
+def generate_launchdaemon_plist() -> str:
+    """Generate a LaunchDaemon plist for system-level gateway supervision.
+
+    Used for service accounts that have no GUI domain. The LaunchDaemon runs
+    under the target service account (via UserName key) and provides
+    crash-restart and boot-start supervision.
+    """
+    python_path = get_python_path()
+    working_dir = _stable_service_working_dir()
+    hermes_home = str(get_hermes_home().resolve())
+    log_dir = get_hermes_home() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    label = get_launchd_label()
+    username = _get_service_account_username() or "_hermes"
+
+    # Build PATH — same logic as generate_launchd_plist()
+    detected_venv = _detect_venv_dir()
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    priority_dirs = _build_service_path_dirs()
+    resolved_node = shutil.which("node")
+    if resolved_node:
+        resolved_node_dir = str(Path(resolved_node).parent)
+        if resolved_node_dir not in priority_dirs:
+            priority_dirs.append(resolved_node_dir)
+    sane_path = ":".join(
+        dict.fromkeys(
+            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
+        )
+    )
+
+    profile_arg = _profile_arg(hermes_home)
+    prog_args = [
+        f"<string>{python_path}</string>",
+        "<string>-m</string>",
+        "<string>hermes_cli.main</string>",
+    ]
+    if profile_arg:
+        for part in profile_arg.split():
+            prog_args.append(f"<string>{part}</string>")
+    prog_args.extend([
+        "<string>gateway</string>",
+        "<string>run</string>",
+        "<string>--replace</string>",
+    ])
+    prog_args_xml = "\n        ".join(prog_args)
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>UserName</key>
+    <string>{username}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        {prog_args_xml}
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{working_dir}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{sane_path}</string>
+        <key>VIRTUAL_ENV</key>
+        <string>{venv_dir}</string>
+        <key>HERMES_HOME</key>
+        <string>{hermes_home}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>25</integer>
+
+    <key>StandardOutPath</key>
+    <string>{log_dir}/gateway.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/gateway.error.log</string>
+</dict>
+</plist>
+"""
+
+
+def _launchd_install_as_daemon(force: bool = False) -> bool:
+    """Install the gateway as a LaunchDaemon (system-level supervision).
+
+    Requires root/sudo. Returns True on success, False on failure.
+    Used for service accounts where LaunchAgent (gui/<uid>) is unavailable.
+    """
+    if not _is_running_as_root():
+        return False
+
+    daemon_plist_path = get_launchdaemon_plist_path()
+
+    if daemon_plist_path.exists() and not force:
+        print(f"LaunchDaemon already installed at: {daemon_plist_path}")
+        print("Use --force to reinstall")
+        return True
+
+    daemon_plist_path.parent.mkdir(parents=True, exist_ok=True)
+    daemon_plist = generate_launchdaemon_plist()
+    print(f"Installing LaunchDaemon to: {daemon_plist_path}")
+
+    try:
+        daemon_plist_path.write_text(daemon_plist, encoding="utf-8")
+        subprocess.run(
+            ["launchctl", "bootstrap", "system", str(daemon_plist_path)],
+            check=True,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as e:
+        print_error(f"Failed to bootstrap LaunchDaemon: launchctl exit {e.returncode}")
+        return False
+    except OSError as e:
+        print_error(f"Failed to write LaunchDaemon plist: {e}")
+        return False
+
+    print()
+    print("✓ LaunchDaemon installed and loaded!")
+    print("  The gateway will auto-start at boot and restart on crash.")
+    _clear_launchd_unsupported_marker()
+    return True
+
+
+def _launchd_uninstall_daemon() -> None:
+    """Remove the LaunchDaemon installation if present."""
+    daemon_plist_path = get_launchdaemon_plist_path()
+    label = get_launchd_label()
+    try:
+        subprocess.run(
+            ["launchctl", "bootout", f"system/{label}"],
+            check=False,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    if daemon_plist_path.exists():
+        try:
+            daemon_plist_path.unlink()
+            print(f"✓ Removed {daemon_plist_path}")
+        except OSError:
+            print(f"⚠ Could not remove {daemon_plist_path} (permission denied)")
+
+
+# ── launchd unsupported marker ─────────────────────────────────────────────
 def _launchd_unsupported_marker_path() -> Path:
     return get_hermes_home() / ".gateway-launchd-unsupported"
 
@@ -3927,9 +4139,14 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     print(f"⚠ launchd cannot manage the gateway on this macOS version ({reason}).")
     if _spawn_detached_gateway():
         print("✓ Started gateway as a background process instead")
-        print("  It will NOT auto-start at login or auto-restart on crash.")
+        print("  ⚠⚠⚠ UNSUPERVISED — the gateway will NOT auto-start at login "
+              "or auto-restart on crash. ⚠⚠⚠")
         print(f"  Logs: {_dhh()}/logs/gateway.log")
         print("  Stop it with: hermes gateway stop")
+        if is_macos() and not _probe_gui_domain_supported():
+            print()
+            print("  ℹ This account has no login session (service account).")
+            print(f"  Install a LaunchDaemon with: sudo {get_python_path()} -m hermes_cli.main gateway install")
         return True
     print_error("Failed to start the gateway as a background process.")
     print(
@@ -4246,6 +4463,43 @@ def launchd_install(force: bool = False):
         print("Use --force to reinstall")
         return
 
+    # ── Service-account detection (#72790) ──────────────────────────────────
+    # On macOS service accounts (no login session), gui/<uid> does not support
+    # launchd service management.  LaunchAgent bootstrap will fail with exit
+    # 125 and silently degrade to an unsupervised background process.
+    # Detect this early and route to a LaunchDaemon (system-level supervision)
+    # when running as root, or fail loudly with instructions.
+    if is_macos() and not _probe_gui_domain_supported():
+        if _is_running_as_root():
+            print(
+                "⚠ This account has no login session (no GUI domain) — "
+                "installing as LaunchDaemon instead of LaunchAgent."
+            )
+            if _launchd_install_as_daemon(force=force):
+                return
+            # Daemon install failed (write to /Library/LaunchDaemons or
+            # bootstrap error) — fall through to the Agent install path which
+            # will fail and offer the detached workaround.
+            print("⚠ LaunchDaemon install failed; trying LaunchAgent path …")
+        else:
+            print_error(
+                "⚠ This macOS account has no GUI domain — LaunchAgent "
+                "supervision is unavailable.\n"
+                "\n"
+                "This is typical for service accounts that never log in.\n"
+                "To install with supervised auto-start/restart, run:\n"
+                f"  sudo {get_python_path()} -m hermes_cli.main gateway install\n"
+                "\n"
+                "Or manually install a LaunchDaemon to "
+                f"{get_launchdaemon_plist_path()} with UserName set to "
+                f"'{_get_service_account_username() or '<service-user>'}'.\n"
+                "\n"
+                "Without supervision the gateway will NOT auto-start at boot "
+                "or restart on crash."
+            )
+            # Continue to the regular Agent install — it will fail with
+            # exit 125 and trigger the detached fallback below.
+
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
@@ -4287,12 +4541,46 @@ def launchd_uninstall():
         plist_path.unlink()
         print(f"✓ Removed {plist_path}")
 
+    # Also clean up LaunchDaemon if present (service-account installs, #72790)
+    _launchd_uninstall_daemon()
+
     print("✓ Service uninstalled")
 
 
 def launchd_start():
-    plist_path = get_launchd_plist_path()
+    # Check LaunchDaemon first (service-account installs, #72790)
+    daemon_plist_path = get_launchdaemon_plist_path()
     label = get_launchd_label()
+    if daemon_plist_path.exists():
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=10,
+            )
+            if result.returncode == 0 and _parse_launchd_pid_from_list_output(result.stdout) is not None:
+                print("✓ LaunchDaemon service already running")
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        # Try to bootstrap the daemon
+        print("↻ Starting LaunchDaemon service")
+        try:
+            subprocess.run(
+                ["launchctl", "bootstrap", "system", str(daemon_plist_path)],
+                check=True,
+                timeout=30,
+            )
+            print("✓ LaunchDaemon service started")
+            _clear_launchd_unsupported_marker()
+            return
+        except subprocess.CalledProcessError as e:
+            print_error(f"Failed to start LaunchDaemon: launchctl exit {e.returncode}")
+            print("  Try: sudo launchctl bootstrap system " + str(daemon_plist_path))
+            return
+
+    plist_path = get_launchd_plist_path()
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
@@ -4350,6 +4638,37 @@ def launchd_start():
 
 def launchd_stop():
     label = get_launchd_label()
+
+    # Check LaunchDaemon first (service-account installs, #72790)
+    daemon_plist_path = get_launchdaemon_plist_path()
+    if daemon_plist_path.exists():
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=10,
+            )
+            if result.returncode == 0 and _parse_launchd_pid_from_list_output(result.stdout) is not None:
+                print("↻ Stopping LaunchDaemon service")
+                try:
+                    from gateway.status import get_running_pid, write_planned_stop_marker
+                    pid = get_running_pid(cleanup_stale=False)
+                    if pid is not None:
+                        write_planned_stop_marker(pid)
+                except Exception:
+                    pass
+                subprocess.run(
+                    ["launchctl", "bootout", f"system/{label}"],
+                    check=False,
+                    timeout=90,
+                )
+                _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+                print("✓ LaunchDaemon service stopped")
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
     target = f"{_launchd_domain()}/{label}"
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
@@ -4433,6 +4752,62 @@ def _wait_for_gateway_exit(
 
 def launchd_restart():
     label = get_launchd_label()
+
+    # Check LaunchDaemon first (service-account installs, #72790)
+    daemon_plist_path = get_launchdaemon_plist_path()
+    if daemon_plist_path.exists():
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=10,
+            )
+            if result.returncode == 0 and _parse_launchd_pid_from_list_output(result.stdout) is not None:
+                print("↻ Restarting LaunchDaemon service")
+                drain_timeout = _get_restart_drain_timeout()
+                from gateway.status import get_running_pid
+
+                try:
+                    pid = get_running_pid()
+                    if pid is not None:
+                        print(
+                            f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
+                            f"(up to {drain_timeout:.0f}s)..."
+                        )
+                        try:
+                            terminate_pid(pid, force=False)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pid = None
+                        if pid is not None:
+                            exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+                            if not exited:
+                                print(
+                                    f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
+                                )
+                except Exception:
+                    pass
+                subprocess.run(
+                    ["launchctl", "bootout", f"system/{label}"],
+                    check=False,
+                    timeout=30,
+                )
+                try:
+                    subprocess.run(
+                        ["launchctl", "bootstrap", "system", str(daemon_plist_path)],
+                        check=True,
+                        timeout=30,
+                    )
+                    print("✓ LaunchDaemon service restarted")
+                    _clear_launchd_unsupported_marker()
+                    return
+                except subprocess.CalledProcessError as e:
+                    print_error(f"Failed to restart LaunchDaemon: launchctl exit {e.returncode}")
+                    print("  Try: sudo launchctl bootout system/{label} && sudo launchctl bootstrap system " + str(daemon_plist_path))
+                    return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
@@ -4508,6 +4883,25 @@ def launchd_restart():
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+
+    # Also check LaunchDaemon (service-account installs, #72790)
+    daemon_plist_path = get_launchdaemon_plist_path()
+    daemon_running = False
+    daemon_pid = None
+    if daemon_plist_path.exists():
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=10,
+            )
+            if result.returncode == 0:
+                daemon_running = True
+                daemon_pid = _parse_launchd_pid_from_list_output(result.stdout)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
     try:
         result = subprocess.run(
             ["launchctl", "list", label],
@@ -4544,12 +4938,30 @@ def launchd_status(deep: bool = False):
     launchd_unsupported = _launchd_unsupported_marker_exists()
 
     # ── Report ──
-    print(f"Launchd plist: {plist_path}")
+    print(f"LaunchAgent plist: {plist_path}")
     if launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
     else:
         print("⚠ Service definition is stale relative to the current Hermes install")
         print("  Run: hermes gateway start")
+
+    if daemon_plist_path.exists():
+        print(f"LaunchDaemon plist: {daemon_plist_path}")
+        if daemon_running:
+            pid_str = f" (PID {daemon_pid})" if daemon_pid else ""
+            print(f"✓ Gateway supervised by LaunchDaemon{pid_str}")
+            print("  Auto-start at boot and auto-restart on crash are available.")
+            # Daemon takes precedence — return early
+            if deep:
+                log_file = get_hermes_home() / "logs" / "gateway.log"
+                if log_file.exists():
+                    print()
+                    print("Recent logs:")
+                    subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+            return
+        else:
+            print("⚠ LaunchDaemon is installed but not loaded")
+            print("  Run: sudo launchctl bootstrap system " + str(daemon_plist_path))
 
     if service_listed:
         if launchd_pid is not None:
