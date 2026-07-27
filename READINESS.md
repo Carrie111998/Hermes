@@ -468,6 +468,22 @@ commit `b587ca533a9a5f0f8d1518d0d963395fbe108e9a` on 2026-07-27. It returned
 succeeded with `duplicate_provider_calls: 0` and `duplicate_effects: 0`.
 Image manifest: `sha256:4f6bfd947234c853b0f1bad3a1467318d58529f3ed15b2b1e4e77c4ce1e7260a`.
 
+The governed runtime regression was also run from current `main` (`cd256040a36a281d61356b57f4c43ac4c4563bd2`) with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_objective_runtime.py \
+  tests/hermes_cli/test_objective_service.py \
+  tests/hermes_cli/test_objective_worker.py \
+  tests/hermes_cli/test_objectives_db.py \
+  tests/hermes_cli/test_workforce_delegation.py
+```
+
+Result: **79 passed, 0 failed**. This is focused regression evidence for
+durable objective recovery, event claims, worker failure handling, permits,
+and authority-monotone delegation; it does not expand the container acceptance
+scope or prove production provider readiness.
+
 Compliance lineage was separately validated with:
 
 ```sh
