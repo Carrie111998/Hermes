@@ -303,6 +303,14 @@ def test_intervention_dedupe_cannot_cross_organization(tmp_path):
         dedupe_key="shared-dedupe-key-0001",
     )
     assert first
+    with pytest.raises(PermissionError, match="organization_id is required"):
+        operational_control.resolve_intervention(
+            conn,
+            first,
+            option_id="abandon",
+            actor="human:advisor",
+            evidence={"decision": "scoped review"},
+        )
     with pytest.raises(PermissionError, match="another organization"):
         operational_control.raise_intervention(
             conn,

@@ -52,6 +52,9 @@
 - Intervention resolution now requires an explicitly identified human advisor
   identity; CEO, worker, and runtime identities cannot self-resolve an open
   escalation even with evidence-shaped payloads.
+- Organization-scoped intervention resolution now fails closed when the caller
+  omits organization scope; only explicitly unscoped control records may use
+  the legacy scope-free path.
 - Delegation grants now persist the exact action resource scope and reject a
   Kanban binding to a different board; legacy grants without a scope fail closed
   until reissued under a current action contract.

@@ -472,6 +472,10 @@ def resolve_intervention(
     row = conn.execute(query, params).fetchone()
     if row is None or row["status"] != "open":
         raise ValueError("intervention is not open")
+    if organization_id is None and str(row["organization_id"]) != "__unscoped__":
+        raise PermissionError(
+            "organization_id is required to resolve an organization-scoped intervention"
+        )
     actor_identity = str(actor or "").strip().lower()
     if not actor_identity:
         raise PermissionError("intervention resolution requires an actor")

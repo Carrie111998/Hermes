@@ -38,6 +38,9 @@ Intervention resolution is an explicit human boundary: only `human:*` actors
 or the documented `owner`/`advisor`/`approver` aliases may resolve an open
 handoff. Employee, runtime, and worker identities are rejected even when they
 provide syntactically valid evidence.
+Organization-bound interventions also require the caller to provide the
+matching organization scope; omitted scope is accepted only for explicitly
+unscoped control records.
 
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
