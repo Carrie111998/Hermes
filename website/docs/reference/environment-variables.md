@@ -123,6 +123,7 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | `HERMES_NOUS_MIN_KEY_TTL_SECONDS` | Min agent key TTL before re-mint (default: 1800 = 30min) |
 | `HERMES_NOUS_TIMEOUT_SECONDS` | HTTP timeout for Nous credential / token flows |
 | `HERMES_DUMP_REQUESTS` | Dump API request payloads to log files (`true`/`false`) |
+| `HERMES_DISABLE_REQUEST_DUMPS` | Never write `request_dump_*.json`, including the error paths that dump unconditionally (`true`/`false`) |
 | `HERMES_PREFILL_MESSAGES_FILE` | Path to a JSON file of ephemeral prefill messages injected at API-call time |
 | `HERMES_TIMEZONE` | IANA timezone override (for example `America/New_York`) |
 
@@ -777,6 +778,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_OPTIONAL_SKILLS` | Comma-separated list of optional-skill names to auto-install on first run. |
 | `HERMES_DEBUG_INTERRUPT` | Set to `1` to log detailed interrupt/cancel tracing to `agent.log`. |
 | `HERMES_DUMP_REQUESTS` | Dump API request payloads to log files (`true`/`false`) |
+| `HERMES_DISABLE_REQUEST_DUMPS` | Never write `request_dump_*.json`, including the error paths that dump unconditionally (`true`/`false`) |
 | `HERMES_DUMP_REQUEST_STDOUT` | Dump API request payloads to stdout instead of log files. |
 | `HERMES_OAUTH_TRACE` | Set to `1` to log OAuth token exchange and refresh attempts. Includes redacted timing info. |
 | `HERMES_OAUTH_FILE` | Override the path used for OAuth credential storage (default: `~/.hermes/auth.json`). |

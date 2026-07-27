@@ -2895,6 +2895,49 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
 
 
+def test_dump_api_request_debug_disabled_writes_nothing(monkeypatch, tmp_path):
+    """HERMES_DISABLE_REQUEST_DUMPS=1 suppresses the dump and touches no disk."""
+    monkeypatch.setenv("HERMES_DISABLE_REQUEST_DUMPS", "1")
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "http://127.0.0.1:9208/v1"
+    agent.logs_dir = tmp_path
+
+    dump_file = agent._dump_api_request_debug(_codex_request_kwargs(), reason="preflight")
+
+    assert dump_file is None
+    assert list(tmp_path.glob("request_dump_*.json")) == []
+
+
+def test_dump_api_request_debug_disabled_also_suppresses_error_dumps(monkeypatch, tmp_path):
+    """The opt-out covers the error paths, which otherwise dump unconditionally."""
+    monkeypatch.setenv("HERMES_DISABLE_REQUEST_DUMPS", "true")
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "http://127.0.0.1:9208/v1"
+    agent.logs_dir = tmp_path
+
+    dump_file = agent._dump_api_request_debug(
+        _codex_request_kwargs(),
+        reason="max_retries_exhausted",
+        error=RuntimeError("boom"),
+    )
+
+    assert dump_file is None
+    assert list(tmp_path.glob("request_dump_*.json")) == []
+
+
+def test_dump_api_request_debug_enabled_by_default(monkeypatch, tmp_path):
+    """Without the opt-out the dump still lands, so the default is unchanged."""
+    monkeypatch.delenv("HERMES_DISABLE_REQUEST_DUMPS", raising=False)
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "http://127.0.0.1:9208/v1"
+    agent.logs_dir = tmp_path
+
+    dump_file = agent._dump_api_request_debug(_codex_request_kwargs(), reason="preflight")
+
+    assert dump_file is not None
+    assert dump_file.exists()
+
+
 def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
     """Debug dumps should show /responses URL when in codex_responses mode."""
     import json

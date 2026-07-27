@@ -1707,7 +1707,16 @@ def dump_api_request_debug(
     Captures the request body from api_kwargs (excluding transport-only keys
     like timeout). Intended for debugging provider-side 4xx failures where
     retries are not useful.
+
+    Set ``HERMES_DISABLE_REQUEST_DUMPS=1`` to skip these dumps entirely. The
+    redaction below only recognizes credentials by value pattern or by
+    sensitive-looking key name, so a secret the user pasted into the
+    conversation still reaches disk in cleartext: it sits in ordinary message
+    text, under no sensitive key, in a shape no pattern covers. Opting out is
+    the only way to guarantee no request body is persisted.
     """
+    if env_var_enabled("HERMES_DISABLE_REQUEST_DUMPS"):
+        return None
     try:
         body = copy.deepcopy(api_kwargs)
         body.pop("timeout", None)
