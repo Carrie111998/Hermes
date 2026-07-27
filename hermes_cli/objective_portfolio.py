@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
+from functools import wraps
 from typing import Any, Mapping, Optional
 
 from hermes_cli import objectives_db
@@ -40,10 +41,41 @@ TERMINAL = frozenset(
 )
 
 
+def _serialized_portfolio_mutation(function):
+    """Serialize portfolio admission checks with SQLite's write lock.
+
+    Budget, active-objective, and successor checks must observe one coherent
+    snapshot.  A deferred transaction lets two runtimes both pass those
+    checks before either inserts its child; ``BEGIN IMMEDIATE`` makes the
+    admission decision and materialization one serialized operation on the
+    supported single-host authority store.
+    """
+
+    @wraps(function)
+    def wrapped(conn, *args, **kwargs):
+        ensure_schema(conn)
+        owns_transaction = not conn.in_transaction
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = function(conn, *args, **kwargs)
+        except Exception:
+            if owns_transaction:
+                conn.rollback()
+            raise
+        else:
+            if owns_transaction:
+                conn.commit()
+            return result
+
+    return wrapped
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
 
 
+@_serialized_portfolio_mutation
 def create_child_objective(
     conn: sqlite3.Connection,
     *,
@@ -62,7 +94,6 @@ def create_child_objective(
     max_active_objectives: int,
 ) -> tuple[str, bool]:
     """Create and wake one accepted child without expanding parent authority."""
-    ensure_schema(conn)
     if len(idempotency_key.strip()) < 16:
         raise ValueError("child objective requires a high-entropy idempotency key")
     if max_active_objectives <= 0:
@@ -191,6 +222,7 @@ def create_child_objective(
     return child.id, True
 
 
+@_serialized_portfolio_mutation
 def create_successor_objective(
     conn: sqlite3.Connection,
     *,
@@ -209,7 +241,6 @@ def create_successor_objective(
     max_active_objectives: int,
 ) -> tuple[str, bool]:
     """Create one peer root that continues the organization's objective chain."""
-    ensure_schema(conn)
     if len(idempotency_key.strip()) < 16:
         raise ValueError("successor objective requires a high-entropy idempotency key")
     existing = conn.execute(

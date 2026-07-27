@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -122,6 +123,7 @@ def test_children_cannot_expand_scope_or_oversubscribe_parent_budget(tmp_path):
             idempotency_key="child-objective-invalid-system-0001",
             **common,
         )
+
     objective_portfolio.create_child_objective(
         conn,
         desired_outcome="First funded workstream",
@@ -139,6 +141,44 @@ def test_children_cannot_expand_scope_or_oversubscribe_parent_budget(tmp_path):
             idempotency_key="child-objective-budget-two-0001",
             **common,
         )
+
+
+def test_concurrent_child_admission_serializes_active_ceiling(tmp_path):
+    conn, _, parent = _parent(tmp_path)
+    db_path = tmp_path / "authority.db"
+
+    def create(index):
+        worker_conn = objectives_db.connect(db_path)
+        try:
+            try:
+                return objective_portfolio.create_child_objective(
+                    worker_conn,
+                    parent_objective_id=parent.id,
+                    desired_outcome=f"Concurrent workstream {index}",
+                    success_criteria=[{"verifier": "test.pass", "params": {}}],
+                    termination_conditions=[],
+                    permitted_systems=["kanban"],
+                    prohibited_actions=["data.delete"],
+                    constraints=[],
+                    allocated_budget_minor=0,
+                    currency="USD",
+                    expires_at=int(time.time()) + 3_600,
+                    idempotency_key=f"concurrent-child-admission-{index:04d}",
+                    created_by="employee:ceo",
+                    max_active_objectives=2,
+                )
+            except PermissionError:
+                return None
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, (1, 2)))
+    assert sum(result is not None and result[1] for result in results) == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM objectives WHERE organization_id=? AND status='accepted'",
+        (parent.organization_id,),
+    ).fetchone()[0] == 2
 
 
 def test_exact_creation_key_cancels_only_its_child(tmp_path):
