@@ -160,6 +160,12 @@ The current branch is ahead of the validated boundary; these changes do not
 inherit the boundary's PASS determination until a newer evidence commit is
 recorded.
 
+### Deployability evidence
+
+- Local Docker image build and supervised-entrypoint bootstrap/status
+  persistence smoke passed at the current main; registry publication and
+  production deployment remain unreleased.
+
 - `757408d82884afd60651762715c3ef00446bc0c0` — recorded the release
   readiness evidence documentation.
 - `172a515c6b5d7efeef1a4e222c5c35ca46246a0b` — escalated stale outbound spend

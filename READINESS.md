@@ -115,6 +115,11 @@ tag above.
 - Non-interactive bootstrap smoke: two consecutive bootstrap invocations
   returned identical organization/objective IDs, and `business status` reported
   configured state from the persistent directory.
+- Container image/startup persistence smoke: `docker build --tag
+  charterforge:agentic-smoke .` passed; supervised `/init` startup and shutdown
+  passed across four `docker run --rm` invocations using a mounted state
+  directory, with stable organization/objective IDs. Image digest:
+  `sha256:5448ca6ad296a7bf1678f5ae5c8c9d8b14d84592d2c7828c7fd050769b1ff1dd`.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.
 

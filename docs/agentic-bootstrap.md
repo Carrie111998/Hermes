@@ -24,6 +24,34 @@ The example deliberately starts with a USD 10.00 capital seed, a low-risk
 market capability, and no payment-provider credentials. Replace the charter
 with an advisor-reviewed file before enabling real external systems.
 
+## Container smoke contract
+
+The image build and supervised entrypoint were exercised locally on 2026-07-27
+with Docker using image digest
+`sha256:5448ca6ad296a7bf1678f5ae5c8c9d8b14d84592d2c7828c7fd050769b1ff1dd`.
+The build passed, all supervised services started and stopped cleanly, and two
+bootstrap invocations against the same mounted `/opt/data` volume returned the
+same organization and objective IDs. This is local image/startup/persistence
+proof, not registry publication, provider readiness, or production availability
+evidence.
+
+The executed smoke command was:
+
+```bash
+docker build --tag charterforge:agentic-smoke .
+state_dir=$(mktemp -d)
+docker run --rm -e HERMES_HOME=/opt/data -e CHARTERFORGE_HOME=/opt/data \
+  -v "$state_dir:/opt/data" charterforge:agentic-smoke \
+  business bootstrap --charter-file /opt/hermes/examples/agentic-charter.json
+docker run --rm -e HERMES_HOME=/opt/data -e CHARTERFORGE_HOME=/opt/data \
+  -v "$state_dir:/opt/data" charterforge:agentic-smoke business status
+docker run --rm -e HERMES_HOME=/opt/data -e CHARTERFORGE_HOME=/opt/data \
+  -v "$state_dir:/opt/data" charterforge:agentic-smoke \
+  business bootstrap --charter-file /opt/hermes/examples/agentic-charter.json
+docker run --rm -e HERMES_HOME=/opt/data -e CHARTERFORGE_HOME=/opt/data \
+  -v "$state_dir:/opt/data" charterforge:agentic-smoke business status
+```
+
 ## Restart proof
 
 The bootstrap command is resumable: a second invocation against the same state
