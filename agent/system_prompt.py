@@ -470,10 +470,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
+        #
+        # skip_project_context: gate project-context files (AGENTS.md,
+        # CLAUDE.md, .cursorrules) behind the coding_context setting, matching
+        # the same check coding_system_blocks already uses (#72268).
+        _is_coding = False
+        try:
+            from agent.coding_context import is_coding_context
+            _is_coding = is_coding_context(
+                platform=agent.platform,
+                cwd=resolve_context_cwd(),
+            )
+        except Exception:
+            pass
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+            skip_project_context=not _is_coding)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 

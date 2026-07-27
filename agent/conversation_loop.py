@@ -2130,7 +2130,14 @@ def run_conversation(
                             _is_stub_stall = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                             )
-                            if truncated_tool_call_retries < 4:
+                            # Also count this as a length continuation so the
+                            # 4-retry ceiling can trip even when the truncated
+                            # turn carries a tool call. Without this, a model
+                            # whose oversized read-only tool calls keep
+                            # overflowing the output cap gets re-nudged
+                            # indefinitely (#72329).
+                            length_continue_retries += 1
+                            if truncated_tool_call_retries < 4 and length_continue_retries < 4:
                                 truncated_tool_call_retries += 1
                                 if _is_stub_stall:
                                     # The stream broke mid tool-call (network /
