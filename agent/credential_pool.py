@@ -778,6 +778,43 @@ class CredentialPool:
             ),
         )
 
+    def _quarantine_dead_chain(
+        self,
+        entry: PooledCredential,
+        sources: Set[str],
+    ) -> List[str]:
+        """Drop singleton-seeded entries that carry the same dead refresh chain.
+
+        The provider quarantine branches in ``_refresh_entry`` fire when
+        ``entry``'s refresh token is terminally dead.  What they must remove is
+        every *other* copy of that same dead chain — singleton-seeded entries
+        are re-seeded from ``auth.json``, so a copy left behind would keep
+        re-driving the doomed refresh.
+
+        Matching on the refresh token rather than on ``source`` alone is what
+        makes that precise.  A pool routinely holds entries on *different*
+        chains: an old ``manual:device_code`` entry stranded on a revoked
+        lineage alongside a ``device_code`` entry seeded from a freshly
+        re-authed singleton.  Removing by source alone destroyed the healthy
+        entry whenever the stale manual one failed — the same asymmetry the
+        ``store_refresh == entry_refresh`` guard already prevents for the
+        singleton's *tokens* — leaving nothing selectable, so the caller's agent
+        session never started (``profiles/financier``, 2026-07-22..27).
+
+        Mutates ``self._entries``; returns the removed ids for the caller to
+        fold into its own ``_persist`` so the quarantine stays a single write.
+        """
+        dead_refresh = str(entry.refresh_token or "").strip()
+        removed_ids = [
+            item.id for item in self._entries
+            if item.source in sources
+            and str(item.refresh_token or "").strip() == dead_refresh
+        ]
+        if removed_ids:
+            removed = set(removed_ids)
+            self._entries = [item for item in self._entries if item.id not in removed]
+        return removed_ids
+
     def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
         """Sync a claude_code pool entry from ~/.claude/.credentials.json if tokens differ.
 
@@ -1421,14 +1458,7 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source != "device_code"
-                    ]
+                    removed_ids = self._quarantine_dead_chain(entry, {"device_code"})
                     # A ``manual:device_code`` entry does not match the
                     # ``device_code`` removal filter above, so it survives the
                     # quarantine with its dead refresh token intact.  Mark it
@@ -1496,14 +1526,7 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source != "device_code"
-                    ]
+                    removed_ids = self._quarantine_dead_chain(entry, {"device_code"})
                     # A ``manual:device_code`` entry does not match the
                     # ``device_code`` removal filter above, so it survives the
                     # quarantine with its dead refresh token intact.  Mark it
@@ -1568,14 +1591,7 @@ class CredentialPool:
                         auth_mod.NOUS_DEVICE_CODE_SOURCE,
                         f"manual:{auth_mod.NOUS_DEVICE_CODE_SOURCE}",
                     }
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source in singleton_sources
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source not in singleton_sources
-                    ]
+                    removed_ids = self._quarantine_dead_chain(entry, singleton_sources)
                     if self._current_id == entry.id:
                         self._current_id = None
                     self._persist(removed_ids=removed_ids)

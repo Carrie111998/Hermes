@@ -1471,12 +1471,16 @@ def test_nous_pool_terminal_refresh_removes_device_code_entry(tmp_path, monkeypa
     selected = pool.select()
     assert selected is not None
     assert selected.source == "device_code"
+    # Carries the SAME refresh chain as the entry that dies below — that is what
+    # "holds the dead OAuth state" means, and it is why the quarantine reclaims
+    # it.  A singleton-seeded entry on a *different* chain must instead survive;
+    # see test_nous_terminal_refresh_keeps_healthy_singleton_seeded_entry.
     pool.add_entry(PooledCredential.from_dict("nous", {
         "id": "legacy-seeded",
         "source": "manual:device_code",
         "auth_type": "oauth",
         "access_token": "old-access-token",
-        "refresh_token": "old-refresh-token",
+        "refresh_token": "refresh-token",
         "agent_key": "old-agent-key",
     }))
     pool.add_entry(PooledCredential.from_dict("nous", {
@@ -3721,3 +3725,269 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     assert synced.last_error_reason is None
     assert synced.last_error_message is None
     assert synced.last_error_reset_at is None
+
+
+def test_codex_terminal_refresh_keeps_healthy_singleton_seeded_entry(tmp_path, monkeypatch):
+    """Regression (financier outage 2026-07-22..27): a terminal failure on a manual
+    entry must not delete the healthy singleton-seeded entry.
+
+    The ``openai-codex`` quarantine branch removes **every** ``source ==
+    "device_code"`` entry unconditionally — it is not gated by the
+    ``store_refresh == entry_refresh`` check that (correctly) guards clearing the
+    singleton's tokens just above it.  So when a priority-0 ``manual:device_code``
+    entry carrying a *dead* refresh chain fails terminally, the branch rightly
+    declines to clear the good singleton's tokens, and then deletes the healthy
+    ``device_code`` entry seeded from that same good singleton — an entry holding
+    a still-valid access token on a *different* chain.
+
+    ``select()`` then has nothing usable to hand back, so the caller's agent
+    session never starts.  ``profiles/financier`` produced zero agent sessions
+    from 2026-07-22T11:05:15Z through 2026-07-27 while all six of its crons kept
+    reporting ``last_status: ok``.  It also explains the pool-id churn
+    (``2e2e9a -> 2d9111``): the healthy entry is destroyed and re-seeded with a
+    new positional id on every terminal failure.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+
+    now = int(time.time())
+    live_access = _jwt_with_claims({"exp": now + 7 * 24 * 3600})
+    dead_access = _jwt_with_claims({"exp": now - 7 * 24 * 3600})
+
+    payload = _codex_auth_store(live_access, "live-refresh-chain")
+    payload["credential_pool"] = {
+        "openai-codex": [
+            {
+                # The dead pre-relogin lineage: sorts FIRST (priority 0), so it
+                # is the entry whose doomed refresh drives the quarantine.
+                "id": "9666c0",
+                "label": "stale-manual",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": dead_access,
+                "refresh_token": "dead-refresh-chain",
+            },
+            {
+                # Seeded from the *live* singleton — a different, healthy chain.
+                "id": "2d9111",
+                "label": "singleton-seeded",
+                "auth_type": "oauth",
+                "priority": 3,
+                "source": "device_code",
+                "access_token": live_access,
+                "refresh_token": "live-refresh-chain",
+            },
+        ]
+    }
+    _write_auth_store(tmp_path, payload)
+
+    from agent.credential_pool import load_pool
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    def _reused(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh token already used",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _reused)
+
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+
+    # The good singleton's tokens survive (this half already works).
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    tokens = auth_payload["providers"]["openai-codex"]["tokens"]
+    assert tokens["access_token"] == live_access
+    assert tokens["refresh_token"] == "live-refresh-chain"
+
+    # ...and so must the entry seeded from it: its chain is not the dead one.
+    assert "2d9111" in [entry.id for entry in pool.entries()]
+    assert "2d9111" in [
+        entry["id"] for entry in auth_payload["credential_pool"]["openai-codex"]
+    ]
+
+    # A usable credential must be returned, and it must still be a live pool
+    # member — a selection that is not in ``entries()`` cannot be rotated or
+    # marked exhausted by the caller.
+    assert selected is not None
+    assert selected.id == "2d9111"
+    assert pool.current() is not None
+
+    # The next selection (e.g. after a 401 rotate) must also find it.
+    assert pool.select() is not None
+
+
+def test_xai_terminal_refresh_keeps_healthy_singleton_seeded_entry(tmp_path, monkeypatch):
+    """Mirror of the Codex financier defect on the xAI quarantine branch.
+
+    Written as a deliberate mirror of the Codex branch, it carries the same
+    ungated ``source == "device_code"`` removal: a terminal failure on a manual
+    entry stranded on a revoked chain deletes the ``device_code`` entry seeded
+    from a *different*, healthy singleton.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+    now = int(time.time())
+    live_access = _jwt_with_claims({"exp": now + 7 * 24 * 3600})
+    dead_access = _jwt_with_claims({"exp": now - 7 * 24 * 3600})
+
+    payload = _xai_auth_store(live_access, "live-refresh-chain")
+    payload["credential_pool"] = {
+        "xai-oauth": [
+            {
+                "id": "stale-manual",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": dead_access,
+                "refresh_token": "dead-refresh-chain",
+            },
+            {
+                "id": "singleton-seeded",
+                "auth_type": "oauth",
+                "priority": 3,
+                "source": "device_code",
+                "access_token": live_access,
+                "refresh_token": "live-refresh-chain",
+            },
+        ]
+    }
+    _write_auth_store(tmp_path, payload)
+
+    from agent.credential_pool import load_pool
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    def _terminal(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="xai-oauth",
+            code="xai_refresh_failed",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_xai_oauth_pure", _terminal)
+
+    pool = load_pool("xai-oauth")
+    selected = pool.select()
+
+    # The healthy singleton's tokens are correctly preserved...
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    tokens = auth_payload["providers"]["xai-oauth"]["tokens"]
+    assert tokens["access_token"] == live_access
+    assert tokens["refresh_token"] == "live-refresh-chain"
+
+    # ...and so must the entry seeded from it.
+    assert "singleton-seeded" in [entry.id for entry in pool.entries()]
+    assert selected is not None
+    assert selected.id == "singleton-seeded"
+    assert pool.current() is not None
+
+
+def test_nous_terminal_refresh_keeps_healthy_singleton_seeded_entry(tmp_path, monkeypatch):
+    """Mirror of the Codex financier defect on the Nous quarantine branch.
+
+    Nous removes both ``device_code`` and ``manual:device_code`` sources, so its
+    ungated removal is the widest of the three: a terminal failure on one chain
+    wipes every singleton-seeded entry regardless of which chain it holds.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
+
+    expires_at = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
+    live_key = _jwt_with_claims({
+        "sub": "test-user",
+        "scope": ["inference:invoke"],
+        "exp": int(time.time() + 3600),
+    })
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "nous",
+            "providers": {
+                "nous": {
+                    "portal_base_url": "https://portal.example.com",
+                    "inference_base_url": "https://inference.example.com/v1",
+                    "client_id": "hermes-cli",
+                    "token_type": "Bearer",
+                    "scope": "inference:invoke",
+                    "access_token": live_key,
+                    "refresh_token": "live-refresh-chain",
+                    "expires_at": expires_at,
+                    "agent_key": live_key,
+                    "agent_key_expires_at": expires_at,
+                }
+            },
+            "credential_pool": {
+                "nous": [
+                    {
+                        # Stranded on an older, revoked chain — sorts FIRST, so
+                        # this is the entry whose doomed refresh quarantines.
+                        "id": "stale-manual",
+                        "source": "manual:device_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "access_token": "dead-access-token",
+                        "refresh_token": "dead-refresh-chain",
+                        "agent_key": "dead-agent-key",
+                        "portal_base_url": "https://portal.example.com",
+                        "inference_base_url": "https://inference.example.com/v1",
+                        "scope": "inference:invoke",
+                    },
+                    {
+                        # Seeded from the LIVE singleton — a different chain.
+                        "id": "singleton-seeded",
+                        "source": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 3,
+                        "access_token": live_key,
+                        "refresh_token": "live-refresh-chain",
+                        "expires_at": expires_at,
+                        "agent_key": live_key,
+                        "agent_key_expires_at": expires_at,
+                        "portal_base_url": "https://portal.example.com",
+                        "inference_base_url": "https://inference.example.com/v1",
+                        "scope": "inference:invoke",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli import auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    pool = load_pool("nous")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "stale-manual"
+
+    def _terminal(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials", _terminal)
+
+    assert pool.try_refresh_current() is None
+
+    # The entry on the live chain must survive a failure of the dead chain.
+    assert "singleton-seeded" in [entry.id for entry in pool.entries()]
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert "singleton-seeded" in [
+        entry["id"] for entry in auth_payload["credential_pool"]["nous"]
+    ]
+    # ...and the pool must still hand back a usable credential.
+    assert pool.select() is not None
