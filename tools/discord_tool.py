@@ -26,6 +26,7 @@ actionable guidance the model can relay to the user.
 """
 
 import json
+import hashlib
 import logging
 import os
 import threading
@@ -1039,6 +1040,38 @@ def _run_discord_action(
         return json.dumps({
             "error": f"Missing required parameters for '{action}': {', '.join(missing)}",
         })
+
+    # Discord is an external communication/administration surface. Governed
+    # workers must present an exact action permit before the REST request; bind
+    # the resource to every supplied target and argument so a permit cannot be
+    # replayed against another guild, channel, member, role, or message.
+    request_scope = {
+        "action": action,
+        "guild_id": guild_id,
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "role_id": role_id,
+        "message_id": message_id,
+        "query": query,
+        "name": name,
+        "limit": limit,
+        "before": before,
+        "after": after,
+        "auto_archive_duration": auto_archive_duration,
+    }
+    resource = "discord-action:" + hashlib.sha256(
+        json.dumps(request_scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    try:
+        authorize_worker_action(
+            capability=f"discord.{action}",
+            system="discord",
+            target_resource=resource,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Discord authorization denied: {exc}"})
 
     try:
         return action_fn(

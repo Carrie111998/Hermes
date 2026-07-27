@@ -43,6 +43,50 @@ def _mock_urlopen(response_data, status=200):
     return mock_resp
 
 
+def test_discord_action_authorization_is_payload_scoped(monkeypatch):
+    calls = []
+
+    def record(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", record
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "tools.discord_tool._discord_request", lambda *args, **kwargs: {}
+    )
+
+    discord_admin_handler(
+        action="delete_message", channel_id="channel-1", message_id="message-1"
+    )
+
+    assert calls[0][0:2] == ("discord.delete_message", "discord")
+    assert calls[0][2].startswith("discord-action:")
+
+
+def test_discord_authorization_denial_precedes_rest_request(monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+    def reject(*_args, **_kwargs):
+        raise RuntimeError("discord authority denied")
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", reject
+    )
+    request = MagicMock()
+    monkeypatch.setattr("tools.discord_tool._discord_request", request)
+
+    result = json.loads(
+        discord_admin_handler(
+            action="delete_message", channel_id="channel-1", message_id="message-1"
+        )
+    )
+
+    assert "authorization denied" in result["error"]
+    request.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Token / check_fn
 # ---------------------------------------------------------------------------
