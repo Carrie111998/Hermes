@@ -345,6 +345,60 @@ def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     assert entry["last_error_reset_at"] is None
 
 
+def test_resolver_refreshes_expired_token_before_quota_reset_probe(
+    tmp_path, monkeypatch
+):
+    """A stale 429 cooldown must not become permanent when its probe token expires."""
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    _write_auth_store(hermes_home, store)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        }
+
+    probe_tokens = []
+
+    def _probe(token, **kwargs):
+        probe_tokens.append(token)
+        return token == fresh_token
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _probe)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == fresh_token
+    assert resolved["source"] == "credential_pool"
+    assert refresh_calls == [(expired_token, "refresh-old")]
+    assert probe_tokens == [fresh_token]
+
+    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-new"
+    assert persisted_entry["last_status"] is None
+    assert persisted_entry["last_error_reset_at"] is None
+
+
 def test_resolver_keeps_cooldown_when_probe_negative(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _write_auth_store(hermes_home, _pool_only_rate_limited_store())
@@ -358,6 +412,60 @@ def test_resolver_keeps_cooldown_when_probe_negative(tmp_path, monkeypatch):
         resolve_codex_runtime_credentials()
     assert exc.value.code == auth_mod.CODEX_RATE_LIMITED_CODE
     assert "retry after" in str(exc.value)
+
+
+def test_resolver_keeps_cooldown_after_refresh_when_probe_negative(
+    tmp_path, monkeypatch
+):
+    """A fresh probe token is persisted, but refresh alone must not lift quota."""
+    now = time.time()
+    reset_at = now + 3 * 24 * 3600
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+            "last_error_reset_at": reset_at,
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    _write_auth_store(hermes_home, store)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *args, **kwargs: {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        },
+    )
+    probe_tokens = []
+
+    def _probe(token, **kwargs):
+        probe_tokens.append(token)
+        return False
+
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _probe)
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == auth_mod.CODEX_RATE_LIMITED_CODE
+    assert probe_tokens == [fresh_token]
+
+    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-new"
+    assert persisted_entry["last_status"] == "exhausted"
+    assert persisted_entry["last_error_code"] == 429
+    assert persisted_entry["last_error_reason"] == "usage_limit_reached"
+    assert persisted_entry["last_error_reset_at"] == reset_at
 
 
 def test_resolver_keeps_cooldown_when_probe_indeterminate(tmp_path, monkeypatch):
@@ -394,6 +502,57 @@ def test_pool_entry_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     assert len(available) == 1
     assert available[0].last_status == "ok"
     assert available[0].last_error_reset_at is None
+
+
+def test_pool_refreshes_expired_token_before_quota_reset_probe(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        }
+
+    probe_tokens = []
+
+    def _probe(token, **kwargs):
+        probe_tokens.append(token)
+        return token == fresh_token
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _probe)
+
+    available = pool._available_entries(clear_expired=True, refresh=True)
+
+    assert len(available) == 1
+    assert available[0].access_token == fresh_token
+    assert available[0].refresh_token == "refresh-new"
+    assert available[0].last_status == "ok"
+    assert refresh_calls == [(expired_token, "refresh-old")]
+    assert probe_tokens == [fresh_token]
 
 
 def test_pool_entry_stays_frozen_when_probe_negative(tmp_path, monkeypatch):

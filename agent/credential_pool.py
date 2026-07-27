@@ -1566,6 +1566,53 @@ class CredentialPool:
             logger.debug("Codex quota-restored probe failed", exc_info=True)
             return False
 
+    def _refresh_codex_quota_probe_entry(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        """Adopt a fresh probe token while deliberately preserving quota state.
+
+        The usage endpoint cannot authenticate an expired access token, so the
+        token pair must be rotated first. That rotation does *not* prove quota
+        availability: ``last_status=exhausted`` and its reset metadata remain
+        intact unless the subsequent usage probe returns a positive result.
+        """
+        if self.provider != "openai-codex":
+            return entry
+        try:
+            probe_status = auth_mod._refresh_codex_pool_token_for_quota_probe(
+                {
+                    "id": entry.id,
+                    "access_token": entry.access_token,
+                    "base_url": entry.base_url,
+                }
+            )
+            fresh_access = str(probe_status.get("access_token") or "").strip()
+            if not fresh_access or fresh_access == entry.access_token:
+                return entry
+            updated = replace(
+                entry,
+                access_token=fresh_access,
+                refresh_token=(
+                    str(probe_status.get("refresh_token") or "").strip()
+                    or entry.refresh_token
+                ),
+                last_refresh=(
+                    str(probe_status.get("last_refresh") or "").strip()
+                    or entry.last_refresh
+                ),
+            )
+            # The auth helper already persisted this token pair under the
+            # cross-process auth-store lock while retaining exhausted/error
+            # fields. This only synchronizes the process-local mirror.
+            self._replace_entry(entry, updated)
+            return updated
+        except Exception:
+            logger.debug(
+                "Failed to refresh Codex quota-probe credential",
+                exc_info=True,
+            )
+            return entry
+
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
         if entry.auth_type != AUTH_TYPE_OAUTH:
             return False
@@ -1700,6 +1747,8 @@ class CredentialPool:
                     # while the account is already usable again — a throttled
                     # live probe of the Codex usage endpoint detects that and
                     # lifts the stale cooldown (issue #43747).
+                    if clear_expired:
+                        entry = self._refresh_codex_quota_probe_entry(entry)
                     if not (
                         clear_expired
                         and self._codex_quota_restored_upstream(entry)

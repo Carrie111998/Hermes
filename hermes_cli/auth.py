@@ -3904,9 +3904,10 @@ def resolve_codex_runtime_credentials(
             # redeemed, plan upgraded, window reset upstream).  The persisted
             # ``last_error_reset_at`` can be days in the future while the
             # account is already usable again — see issue #43747.
-            stale_token = str(pool_rate_limit.get("access_token") or "").strip()
-            if stale_token and _probe_codex_quota_restored(
-                stale_token,
+            probe_status = _refresh_codex_pool_token_for_quota_probe(pool_rate_limit)
+            probe_token = str(probe_status.get("access_token") or "").strip()
+            if probe_token and _probe_codex_quota_restored(
+                probe_token,
                 base_url=pool_rate_limit.get("base_url"),
             ):
                 logger.info(
@@ -4237,6 +4238,7 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
             if reset_at is not None and reset_at <= now:
                 continue
             return {
+                "id": entry.get("id"),
                 "label": entry.get("label"),
                 "last_refresh": entry.get("last_refresh"),
                 "reset_at": reset_at,
@@ -4248,6 +4250,96 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     except Exception:
         logger.debug("Codex pool rate-limit lookup failed", exc_info=True)
     return None
+
+
+def _refresh_codex_pool_token_for_quota_probe(
+    rate_limit_status: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist a usable probe token while preserving its quota cooldown.
+
+    A persisted 429 may outlive the access token that originally received it.
+    The usage endpoint cannot authenticate that expired token, so refresh and
+    persist the matching pool row first under the auth-store lock. This changes
+    only token metadata: all quota error/reset fields remain intact until a
+    subsequent positive usage probe invokes the normal cooldown-clear path. A
+    negative probe therefore leaves a fresh token paired with
+    ``last_status=exhausted`` by design.
+    """
+    result = dict(rate_limit_status)
+    stale_token = str(result.get("access_token") or "").strip()
+    if not stale_token or not _codex_access_token_is_expiring(stale_token, 0):
+        return result
+
+    entry_id = str(result.get("id") or "").strip()
+    if not entry_id:
+        return result
+
+    try:
+        # Serialize the complete single-use lifecycle: re-read the latest row,
+        # exchange its refresh token, then atomically save the replacement
+        # before another process can load and reuse the consumed token.
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            pool = auth_store.get("credential_pool")
+            entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+            if not isinstance(entries, list):
+                return result
+
+            entry = next(
+                (
+                    candidate
+                    for candidate in entries
+                    if isinstance(candidate, dict)
+                    and str(candidate.get("id") or "") == entry_id
+                ),
+                None,
+            )
+            if not isinstance(entry, dict):
+                return result
+            if entry.get("last_status") != "exhausted" or not _is_codex_rate_limit_shaped(
+                entry.get("last_error_code"),
+                entry.get("last_error_reason"),
+                entry.get("last_error_message"),
+            ):
+                return result
+
+            current_access = str(entry.get("access_token") or "").strip()
+            if not current_access:
+                return result
+            if not _codex_access_token_is_expiring(current_access, 0):
+                result["access_token"] = current_access
+                current_refresh = str(entry.get("refresh_token") or "").strip()
+                if current_refresh:
+                    result["refresh_token"] = current_refresh
+                if entry.get("last_refresh"):
+                    result["last_refresh"] = entry["last_refresh"]
+                return result
+
+            current_refresh = str(entry.get("refresh_token") or "").strip()
+            if not current_refresh:
+                return result
+            refreshed = refresh_codex_oauth_pure(current_access, current_refresh)
+            fresh_access = str(refreshed.get("access_token") or "").strip()
+            if not fresh_access:
+                return result
+
+            entry["access_token"] = fresh_access
+            fresh_refresh = str(refreshed.get("refresh_token") or "").strip()
+            if fresh_refresh:
+                entry["refresh_token"] = fresh_refresh
+            if refreshed.get("last_refresh"):
+                entry["last_refresh"] = refreshed["last_refresh"]
+            _save_auth_store(auth_store)
+            result["access_token"] = fresh_access
+            result["refresh_token"] = entry.get("refresh_token")
+            result["last_refresh"] = entry.get("last_refresh")
+            return result
+    except Exception:
+        logger.debug(
+            "Failed to refresh expired Codex token for quota probe",
+            exc_info=True,
+        )
+        return result
 
 
 def _pool_codex_access_token() -> str:
