@@ -323,6 +323,8 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(len(captured_events), 1)
         self.assertIn("[Subject: Help with Python]", captured_events[0].text)
         self.assertIn("How do I use lists?", captured_events[0].text)
+        self.assertEqual(captured_events[0].message_id, "<msg2@test.com>")
+        self.assertEqual(captured_events[0].source.message_id, "<msg2@test.com>")
 
     def test_reply_subject_not_duplicated(self):
         """Re: subjects should not be prepended to body."""

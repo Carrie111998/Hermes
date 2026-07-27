@@ -5213,6 +5213,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queued_events.setdefault(session_key, []).insert(0, next_queued)
         return pending_event
 
+    def _restore_pending_event_to_fifo_head(
+        self,
+        session_key: str,
+        adapter: Any,
+        pending_event: "MessageEvent",
+    ) -> None:
+        """Restore a drained event ahead of any item already promoted.
+
+        The recursion-depth guard may stop before processing ``pending_event``
+        after ``_promote_queued_event`` has staged the following item in the
+        adapter slot. Put the unprocessed event back at the head and move that
+        staged successor to the front of overflow without merging either one.
+        """
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            return
+        staged_successor = pending_slot.pop(session_key, None)
+        pending_slot[session_key] = pending_event
+        if staged_successor is not None and staged_successor is not pending_event:
+            queued_events = getattr(self, "_queued_events", None)
+            if queued_events is None:
+                queued_events = {}
+                self._queued_events = queued_events
+            queued_events.setdefault(session_key, []).insert(0, staged_successor)
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         queued_events = getattr(self, "_queued_events", None) or {}
@@ -6107,10 +6132,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # infrastructure shared with ``/queue`` so each follow-up gets
         # its own turn in arrival order. Photo bursts still merge into
         # the head slot via ``merge_pending_message_event`` (album
-        # semantics); everything else appends to the overflow tail.
+        # semantics), except on adapters whose events are already complete
+        # messages and must retain message IDs and reply-thread provenance.
+        # Everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
+        preserve_media_boundary = bool(
+            getattr(adapter, "preserve_media_message_boundaries", False)
+        )
+        if not preserve_media_boundary and existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -11579,9 +11609,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                self._queue_or_replace_pending_event(_quick_key, event)
                 return None
 
             _telegram_followup_grace = float(
@@ -11625,12 +11653,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                    if (
+                        getattr(adapter, "preserve_media_message_boundaries", False)
+                        and (
+                            event.message_type == MessageType.PHOTO
+                            or bool(getattr(event, "media_urls", None))
+                            or bool(getattr(event, "media_types", None))
+                        )
+                    ):
+                        self._queue_or_replace_pending_event(_quick_key, event)
+                    else:
+                        merge_pending_message_event(
+                            adapter._pending_messages,
+                            _quick_key,
+                            event,
+                            merge_text=True,
+                        )
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
@@ -23377,7 +23415,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._restore_pending_event_to_fifo_head(
+                            session_key,
+                            adapter,
+                            pending_event,
+                        )
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

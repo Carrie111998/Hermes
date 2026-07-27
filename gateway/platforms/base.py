@@ -2566,6 +2566,12 @@ class BasePlatformAdapter(ABC):
     # generic seam; Slack is merely the first consumer).
     supports_inchannel_continuable: bool = False
 
+    # Some platforms deliver native albums as multiple attachment events and
+    # want them merged into one busy-session turn. Platforms whose events are
+    # already complete messages can opt out so message IDs, attachment
+    # provenance, and reply threading remain intact.
+    preserve_media_message_boundaries: bool = False
+
     # Whether a human is interactively present on this platform to answer a
     # "session restored — what next?" prompt.  The startup auto-resume turn
     # (``_schedule_resume_pending_sessions`` → the ``_is_resume_pending``
@@ -5282,6 +5288,34 @@ class BasePlatformAdapter(ABC):
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+
+            # Some adapters deliver each media-bearing event as a complete
+            # native message rather than one fragment of an album. Their
+            # message IDs and attachments must stay together even on this
+            # fallback path (missing/failed gateway busy handler).
+            if self.preserve_media_message_boundaries and (
+                event.message_type == MessageType.PHOTO
+                or bool(getattr(event, "media_urls", None))
+                or bool(getattr(event, "media_types", None))
+            ):
+                runner = getattr(self, "gateway_runner", None)
+                queue_event = getattr(runner, "_queue_or_replace_pending_event", None)
+                if callable(queue_event):
+                    queue_event(session_key, event)
+                elif session_key not in self._pending_messages:
+                    # A gateway-managed adapter normally always has the runner
+                    # helper. If that contract is broken, preserve the first
+                    # complete message and fail closed rather than merging a
+                    # later attachment under the wrong identity.
+                    self._pending_messages[session_key] = event
+                else:
+                    logger.error(
+                        "[%s] Dropping media follow-up for %s because the "
+                        "boundary-preserving FIFO is unavailable",
+                        self.name,
+                        session_key,
+                    )
+                return
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
