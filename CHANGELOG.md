@@ -50,6 +50,10 @@
   waking CEO planning.
 - Governed completed Kanban task results are now append-only; post-handoff CLI
   edits are rejected instead of mutating evidence used by CEO verification.
+- Governed task completion is now authorized again at the database write
+  boundary: direct callers must present the exact worker task and execution
+  contract, and the live grant/mandate projection is revalidated before the
+  task can transition to `done`; rejected attempts are audited.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

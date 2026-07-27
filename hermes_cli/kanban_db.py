@@ -4644,6 +4644,64 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _assert_governed_completion_authority(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Prove the caller still holds the exact grant for a governed task.
+
+    The CLI/tool path performs the same check before invoking this function,
+    but this database primitive is also used directly by integrations and
+    tests.  A governed task must therefore fail closed here as well; knowing
+    a task id is never sufficient authority to close it.
+    """
+    row = conn.execute(
+        "SELECT execution_contract_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["execution_contract_id"]:
+        return True
+
+    contract_id = str(row["execution_contract_id"])
+    if (
+        os.environ.get("HERMES_KANBAN_TASK") != task_id
+        or os.environ.get("HERMES_EXECUTION_CONTRACT_ID") != contract_id
+        or not os.environ.get("HERMES_BUSINESS_AUTHORITY_DB")
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_authority",
+                {"execution_contract_id": contract_id},
+            )
+        return False
+
+    # Re-read the immutable grant and current mandate at the write boundary;
+    # launch-time validation alone is insufficient after revocation, expiry,
+    # or a mandate change during a long-running worker.
+    try:
+        from pathlib import Path
+        from hermes_cli import objectives_db, workforce_delegation
+
+        with objectives_db.connect_closing(
+            Path(os.environ["HERMES_BUSINESS_AUTHORITY_DB"])
+        ) as authority:
+            workforce_delegation.validate_task_result_authority(
+                authority,
+                task_id,
+                board=os.environ.get("HERMES_KANBAN_BOARD"),
+            )
+    except Exception:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_authority",
+                {"execution_contract_id": contract_id},
+            )
+        return False
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4683,6 +4741,9 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    if not _assert_governed_completion_authority(conn, task_id):
+        return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

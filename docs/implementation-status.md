@@ -41,6 +41,11 @@ acceptance evidence.
   can wake CEO planning; board selection is explicit across process boundaries.
 - Completed execution-contract-bound Kanban tasks are append-only; the CLI
   cannot rewrite their result after governed evidence has been recorded.
+- The low-level completion primitive also fails closed for governed tasks:
+  completion requires the exact worker task/contract identity and a fresh
+  grant, revocation, expiry, mandate, and task-contract projection at the
+  write boundary. Unauthorized attempts remain auditable and cannot close the
+  task.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

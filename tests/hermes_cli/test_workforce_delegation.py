@@ -746,6 +746,21 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
             enabled_toolsets=["web"],
             enabled_skills=[],
         )
+    # The low-level completion primitive must not accept a governed task
+    # merely because the caller knows its id.  Removing the worker-bound
+    # identity is an authority failure and leaves the task in flight.
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    with kanban_db.connect_closing() as board:
+        assert kanban_db.complete_task(
+            board, task_id, summary="unauthorized completion attempt"
+        ) is False
+        assert kanban_db.get_task(board, task_id).status != "done"
+        assert board.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? "
+            "AND kind='completion_blocked_authority'",
+            (task_id,),
+        ).fetchone() is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     with kanban_db.connect_closing() as board:
         kanban_db.complete_task(
             board, task_id, summary="Evidence synthesis ready for review"
