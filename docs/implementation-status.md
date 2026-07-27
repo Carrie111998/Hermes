@@ -65,6 +65,8 @@ acceptance evidence.
   interventions.
 - Circuit-breaker recovery probes are serialized as a durable half-open lease;
   concurrent probes fail closed and an expired probe can be reclaimed safely.
+- Circuit-breaker schema checks preserve active authority transactions instead
+  of implicitly committing permit or ledger state.
 - Portfolio child/successor admission and employee grant/revocation admission
   serialize budget and authority checks across concurrent local workers.
 - External action handlers recheck the autonomy kill-switch immediately before
@@ -195,7 +197,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`7fabe92dd94c0aeedfb5193cad505c2861ed4ed9` passed 6 Founder/CEO E2E tests, 48
+`971ea3dfb4a49d92191acee57dbc0308d343828e` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release

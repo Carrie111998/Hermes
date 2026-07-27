@@ -296,3 +296,5 @@ recorded.
   obligation, and control-evidence records append-only.
 - `7fabe92dd94c0aeedfb5193cad505c2861ed4ed9` — serialized circuit-breaker
   recovery probes with a durable half-open lease and safe expiry reclamation.
+- `971ea3dfb4a49d92191acee57dbc0308d343828e` — preserved active authority
+  transactions during circuit-breaker schema checks.

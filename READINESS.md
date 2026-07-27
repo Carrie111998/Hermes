@@ -84,7 +84,7 @@ determination until a newer evidence commit is recorded.
 ## Post-boundary evidence on current main
 
 The exact acceptance command set was rerun against current `main` at baseline
-commit `7fabe92dd94c0aeedfb5193cad505c2861ed4ed9`. This is a separate,
+commit `971ea3dfb4a49d92191acee57dbc0308d343828e`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
