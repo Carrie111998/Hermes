@@ -7,10 +7,13 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from tools.environments.base import (
+    BaseEnvironment,
     _SNAPSHOT_SENSITIVE_ENV_NAME_REGEX,
     _export_dump_excluding_session_vars,
 )
@@ -36,7 +39,11 @@ def test_sensitive_name_regex_contract():
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
-def test_snapshot_excludes_sensitive_names_and_preserves_benign_names(tmp_path):
+@pytest.mark.parametrize("caller_ifs", (None, ":", ","))
+def test_snapshot_excludes_sensitive_names_and_preserves_benign_names(
+    tmp_path,
+    caller_ifs,
+):
     """The real export dump filters sensitive names case-insensitively."""
     sensitive = {
         "CLOUDFLARE_API_TOKEN": "cloudflare-token-value",
@@ -65,11 +72,15 @@ def test_snapshot_excludes_sensitive_names_and_preserves_benign_names(tmp_path):
 
     snapshot = "snapshot.sh"
     dump = _export_dump_excluding_session_vars(shlex.quote(snapshot))
+    ifs_setup = "" if caller_ifs is None else f"IFS={shlex.quote(caller_ifs)}\n"
     proc = subprocess.run(
         [
             shutil.which("bash"),
             "-c",
-            f"set -e\nreadonly READONLY_TOKEN\n{dump}\ncat {shlex.quote(snapshot)}",
+            (
+                f"set -e\n{ifs_setup}readonly READONLY_TOKEN\n{dump}\n"
+                f"cat {shlex.quote(snapshot)}"
+            ),
         ],
         cwd=tmp_path,
         capture_output=True,
@@ -83,3 +94,69 @@ def test_snapshot_excludes_sensitive_names_and_preserves_benign_names(tmp_path):
         assert value not in proc.stdout
     for name in benign:
         assert f" {name}=" in proc.stdout
+
+
+class _ExecutableEnvironment(BaseEnvironment):
+    """Run the production command wrapper against a real Bash process."""
+
+    def __init__(self, tmp_path: Path):
+        self._temp_dir = str(tmp_path)
+        super().__init__(cwd=str(tmp_path), timeout=30)
+
+    def get_temp_dir(self) -> str:
+        return self._temp_dir
+
+    def _run_bash(
+        self,
+        cmd_string: str,
+        *,
+        login: bool = False,
+        timeout: int = 120,
+        stdin_data: str | None = None,
+    ) -> subprocess.Popen:
+        args = [shutil.which("bash")]
+        if login:
+            args.append("-l")
+        args.extend(["-c", cmd_string])
+        return subprocess.Popen(
+            args,
+            cwd=self.cwd,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    def cleanup(self):
+        pass
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="POSIX bash snapshot path required",
+)
+@pytest.mark.parametrize("caller_ifs", (":", ","))
+def test_post_command_snapshot_redacts_sensitive_env_with_altered_ifs(
+    tmp_path: Path,
+    caller_ifs: str,
+):
+    """The production post-command dump must ignore caller-controlled IFS."""
+    env = _ExecutableEnvironment(tmp_path)
+    env.init_session()
+    assert env._snapshot_ready
+
+    name = "ALTERED_IFS_API_TOKEN"
+    value = "altered-ifs-sensitive-value"
+    result = env.execute(
+        f"IFS={shlex.quote(caller_ifs)}; export IFS; "
+        f"export {name}={shlex.quote(value)}"
+    )
+    assert result["returncode"] == 0, result["output"]
+
+    snapshot = Path(env._snapshot_path).read_text()
+    assert name not in snapshot
+    assert value not in snapshot
+
+    follow_up = env.execute(f'printf "%s" "${{{name}:-missing}}"')
+    assert follow_up["returncode"] == 0, follow_up["output"]
+    assert follow_up["output"] == "missing"

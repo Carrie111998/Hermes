@@ -449,9 +449,10 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     The brace-group redirect is expanded in the current shell, keeping both
     expansions consistent.
     """
-    # ${!PREFIX*} and compgen are both available in bash 3.2. Variable names
-    # cannot contain shell word separators, so iterating over compgen's names is
-    # safe. Empty matches are fine because the for-loop simply does not run.
+    # ${!PREFIX*}, compgen, and process substitution are available in bash 3.2.
+    # ``IFS= read -r`` consumes compgen's newline-delimited names without using
+    # the caller's current IFS. Empty matches are fine because the loop simply
+    # does not run.
     sensitive_name_patterns = "|".join(
         f"*{_case_insensitive_shell_glob(part)}*"
         for part in _SNAPSHOT_SENSITIVE_ENV_NAME_PARTS
@@ -460,12 +461,12 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "HERMES_UI_SESSION_ID 2>/dev/null; "
-        "for __hermes_env_name in $(compgen -e); do "
+        "while IFS= read -r __hermes_env_name; do "
         "case \"$__hermes_env_name\" in "
         f"{sensitive_name_patterns}) "
         "export -n \"$__hermes_env_name\" 2>/dev/null || true; "
         "unset \"$__hermes_env_name\" 2>/dev/null || true ;; "
-        "esac; done; unset __hermes_env_name; "
+        "esac; done < <(compgen -e); unset __hermes_env_name; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
