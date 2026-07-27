@@ -5,9 +5,9 @@ import { Input } from '@/components/ui/input'
 import { Tip } from '@/components/ui/tooltip'
 import {
   deleteSession,
-  getHermesConfigRecord,
+  getCharterforgeConfigRecord,
   listAllProfileSessions,
-  saveHermesConfig,
+  saveCharterforgeConfig,
   setSessionArchived
 } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -17,7 +17,7 @@ import { Archive, ArchiveOff, FolderOpen, Loader2, Trash2 } from '@/lib/icons'
 import { notify, notifyError } from '@/store/notifications'
 import { untombstoneSessions } from '@/store/projects'
 import { applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd, setSessions } from '@/store/session'
-import type { HermesConfigRecord, SessionInfo } from '@/types/hermes'
+import type { CharterforgeConfigRecord, SessionInfo } from '@/types/hermes'
 
 import { EmptyState, ListRow, SectionHeading, SettingsContent, SettingsSkeleton, ToggleRow } from './primitives'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
@@ -193,7 +193,7 @@ export function SessionsSettings() {
 function AutoArchiveSetting() {
   const { t } = useI18n()
   const s = t.settings.sessions
-  const [config, setConfig] = useState<HermesConfigRecord | null>(null)
+  const [config, setConfig] = useState<CharterforgeConfigRecord | null>(null)
   const [enabled, setEnabled] = useState(false)
   const [days, setDays] = useState(DEFAULT_AUTO_ARCHIVE_DAYS)
 
@@ -206,7 +206,7 @@ function AutoArchiveSetting() {
 
     let alive = true
 
-    void getHermesConfigRecord()
+    void getCharterforgeConfigRecord()
       .then(record => {
         if (!alive) {
           return
@@ -243,7 +243,7 @@ function AutoArchiveSetting() {
       setConfig(updated)
 
       try {
-        await saveHermesConfig(updated)
+        await saveCharterforgeConfig(updated)
       } catch (err) {
         notifyError(err, s.autoArchiveFailed)
       }
@@ -293,7 +293,7 @@ function AutoArchiveSetting() {
 
 // Lets the user pin the default cwd for new sessions. Without this, packaged
 // builds on Windows used to spawn sessions in the install dir (`win-unpacked`
-// / Program Files), which buried any files Hermes wrote there.
+// / Program Files), which buried any files Charterforge wrote there.
 function DefaultProjectDirSetting() {
   const { t } = useI18n()
   const s = t.settings.sessions

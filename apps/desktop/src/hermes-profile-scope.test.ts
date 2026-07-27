@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
-  checkHermesUpdate,
+  checkCharterforgeUpdate,
   getActionStatus,
   getMemoryProviderConfig,
   getStatus,
   restartGateway,
   saveMemoryProviderConfig,
   setApiRequestProfile,
-  updateHermes
+  updateCharterforge
 } from './hermes'
 
 // Contract: every backend-targeted action helper must carry the active gateway
@@ -51,8 +51,8 @@ describe('backend action helpers are profile-scoped', () => {
 
     void getStatus()
     void restartGateway()
-    void updateHermes()
-    void checkHermesUpdate()
+    void updateCharterforge()
+    void checkCharterforgeUpdate()
     void getActionStatus('gateway-restart')
 
     for (const call of api.mock.calls) {

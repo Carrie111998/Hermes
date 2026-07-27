@@ -10,8 +10,8 @@ import {
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
-  getHermesConfig,
-  getHermesConfigDefaults,
+  getCharterforgeConfig,
+  getCharterforgeConfigDefaults,
   getProfiles,
   getSessionMessages,
   getStatus,
@@ -31,7 +31,7 @@ const emptySessionsResponse = {
   total: 0
 }
 
-describe('Hermes REST helpers', () => {
+describe('Charterforge REST helpers', () => {
   let api: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
@@ -292,8 +292,8 @@ describe('Hermes REST helpers', () => {
     api.mockResolvedValue({})
 
     const bootCalls: [() => Promise<unknown>, string][] = [
-      [getHermesConfig, '/api/config'],
-      [getHermesConfigDefaults, '/api/config/defaults'],
+      [getCharterforgeConfig, '/api/config'],
+      [getCharterforgeConfigDefaults, '/api/config/defaults'],
       [getGlobalModelInfo, '/api/model/info'],
       [() => getGlobalModelOptions(), '/api/model/options?explicit_only=1'],
       [getCronJobs, '/api/cron/jobs']

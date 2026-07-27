@@ -1,7 +1,7 @@
 """Edge adapters for the governed objective runtime.
 
 The core runtime accepts typed proposals and calls registered executors and
-verifiers.  This module connects those contracts to Hermes's auxiliary model
+verifiers.  This module connects those contracts to Charterforge's auxiliary model
 and existing Kanban worker kernel without introducing a new model tool.
 """
 
@@ -80,7 +80,7 @@ Return exactly one JSON object:
 
 Rules:
 - Decompose the complete strategy in tasks, but propose zero or one action:
-  only the next external effect. Hermes observes and replans after verifying it.
+  only the next external effect. Charterforge observes and replans after verifying it.
 - Every reversible action must include an exact compensation contract using an
   available action type, capability, system, and verification method.
 - Copy one exact available action contract. Never substitute its capability,
@@ -158,7 +158,7 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 class AuxiliaryObjectivePlanner:
-    """Structured planning through Hermes's configured auxiliary model."""
+    """Structured planning through Charterforge's configured auxiliary model."""
 
     identity = "employee:ceo"
 

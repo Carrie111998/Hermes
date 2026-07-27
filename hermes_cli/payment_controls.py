@@ -61,7 +61,7 @@ def register_tokenized_instrument(
     """Store only a provider-side opaque identifier, never raw credentials."""
     lower_fields = {str(key).lower() for key in (metadata or {})}
     if lower_fields & FORBIDDEN_CREDENTIAL_FIELDS:
-        raise SpendControlError("raw financial credentials cannot enter Hermes state")
+        raise SpendControlError("raw financial credentials cannot enter Charterforge state")
     if not provider_instrument_id.strip():
         raise ValueError("provider instrument id is required")
     ensure_schema(conn)

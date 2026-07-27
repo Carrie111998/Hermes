@@ -75,7 +75,7 @@ function buildDesktopBackendPath({
   return appendUniquePathEntries([hermesNodeBin, venvBin, currentPath, saneEntries], { delimiter })
 }
 
-function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatform(process.platform) }: any = {}) {
+function normalizeCharterforgeHomeRoot(hermesHome, { pathModule = pathModuleForPlatform(process.platform) }: any = {}) {
   if (!hermesHome) {
     return hermesHome
   }
@@ -126,7 +126,7 @@ export {
   buildDesktopBackendEnv,
   buildDesktopBackendPath,
   delimiterForPlatform,
-  normalizeHermesHomeRoot,
+  normalizeCharterforgeHomeRoot,
   pathEnvKey,
   POSIX_SANE_PATH_ENTRIES
 }

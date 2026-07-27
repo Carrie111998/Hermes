@@ -15,7 +15,7 @@ import { PassThrough } from 'stream'
 
 import { visualOutDir } from './paths.mjs'
 
-import { Box, renderSync, Text } from '@hermes/ink'
+import { Box, renderSync, Text } from '@charterforge/ink'
 import React, { type ReactElement } from 'react'
 
 import { GatewayProvider } from '../../src/app/gatewayContext.js'
@@ -228,7 +228,7 @@ interface Scene {
 }
 
 const setup = (bgHex: string) => {
-  process.env.HERMES_TUI_BACKGROUND = bgHex
+  process.env.CHARTERFORGE_TUI_BACKGROUND = bgHex
   resetOverlayState()
   resetUiState()
 }

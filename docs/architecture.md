@@ -1,0 +1,47 @@
+# Charterforge Architecture
+
+## Control loop
+
+```mermaid
+flowchart LR
+    E[Event or cadence] --> O[Observe authoritative state]
+    O --> P[Founder/CEO proposes]
+    P --> C[Control plane evaluates]
+    C -->|permit| X[Worker executes]
+    C -->|insufficient authority| A[Advisor intervention]
+    X --> V[Independent verifier]
+    V --> S[Commit state transition]
+    S --> O
+```
+
+The model proposes plans and actions. It is not the state machine, policy
+engine, executor, verifier, or ledger.
+
+## Runtime components
+
+| Component | Responsibility |
+|---|---|
+| Objective service | Durable goals, immutable plan versions, actions, permits, results, evidence |
+| Objective runtime | Event claims, cadence, leases, retries, recovery, stop and escalation |
+| Organization database | Founder/CEO, reporting hierarchy, mandates, hiring and offboarding |
+| Delegation control | Exact employee task grants and launch/result validation |
+| Finance and accounting | Capital, reservations, budgets, journals, periods, tax and payment records |
+| Compliance database | Regimes, applicability, obligations, controls, evidence and deadlines |
+| Action adapters | Narrow external execution contracts |
+| Independent verifiers | Read-back of authoritative external or deterministic state |
+| Audit export | Tenant-scoped state and evidence lineage |
+
+SQLite is the implemented authority store in this checkout. Postgres and an
+external event broker remain future deployment work; documentation must not
+describe them as present.
+
+## State boundaries
+
+Conversation history and vector memory are context, not authority. Financial,
+organizational, objective, approval, compliance, and execution state is stored
+in structured databases. External state changes are accepted only after
+read-back or deterministic verification.
+
+The inherited `hermes_cli` package is a compatibility implementation detail.
+The public distribution, command, and new namespace are `charterforge`.
+

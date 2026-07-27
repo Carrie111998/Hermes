@@ -1,4 +1,4 @@
-"""Governed event-driven runtime for persistent Hermes objectives.
+"""Governed event-driven runtime for persistent Charterforge objectives.
 
 This is the narrow operational loop.  Planner, executor, and verifier are
 injected adapters so model inference and external systems remain at the edges;

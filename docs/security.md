@@ -1,0 +1,48 @@
+# Security Model and Threat Model
+
+## Security model
+
+Charterforge separates proposal, policy, execution, verification, and state
+commit. It uses least-privilege permits, payload hashes, idempotency keys,
+resource budgets, immutable evidence, exact employee grants, intervention
+queues, and circuit breakers.
+
+External vendor plugins and payment rails should remain separate packages.
+Credentials must not enter prompts, task grants, audit exports, or authority
+records. Payment integration is non-custodial: providers hold instruments and
+funds; Charterforge stores opaque references and verified state.
+
+Terminal execution can use inherited local, Docker, SSH, Singularity, Modal,
+or Daytona backends. A local terminal is not a sandbox. Production operators
+must select an isolation backend and appropriate egress/secrets controls for
+untrusted code.
+
+## Threats and controls
+
+| Threat | Implemented control | Residual risk |
+|---|---|---|
+| Prompt injection from email/web | External text cannot alter deterministic grants or permits | Model may still propose a harmful in-scope action |
+| Authority expansion | Charter policy, exact payload permit, exact worker surfaces | Misconfigured initial charter remains powerful |
+| Duplicate external action | Idempotency contract and immutable result lineage | Provider must honor or expose idempotency |
+| Runaway loop/cost | Objective/action/token/compute ceilings and circuit breakers | Incorrect ceilings can still waste resources |
+| Concurrent modification | Claims and resource leases | External systems may have weaker concurrency guarantees |
+| False completion | Independent verifier and read-back records | Weak verifier design can accept incomplete reality |
+| Credential disclosure | Secret stores and credential-free planning context | Tool/provider bugs remain possible |
+| Financial loss | Reservations, limits, allowlists, provider verification | Authorized transactions may still be commercially poor |
+| State/database loss | Backup, integrity, recovery snapshots | Single-host SQLite is not high availability |
+| Audit repudiation | Append-only records, hashes, KYA event chain | Host administrator can still replace the whole database |
+
+## Kill switch and revocation
+
+Stopping the runtime must prevent new claims and permits. Charter changes revoke
+stale authority. Offboarding and mandate supersession invalidate task handoff.
+Operators should additionally revoke provider tokens and stop external
+schedulers during a full autonomy shutdown.
+
+## Compliance boundary
+
+The compliance catalog helps track CAN-SPAM, CASL, GDPR, the EU AI Act, SOX,
+PCI DSS, PIPEDA, RPAA, FINTRAC, and other regimes. Catalog presence is not an
+applicability conclusion. Qualified legal, tax, privacy, security, or
+accounting review is still required where the facts demand it.
+

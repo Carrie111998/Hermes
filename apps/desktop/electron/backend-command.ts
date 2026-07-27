@@ -1,4 +1,4 @@
-// Backend subcommand routing for the desktop-managed Hermes process.
+// Backend subcommand routing for the desktop-managed Charterforge process.
 //
 // The desktop app launches its own headless backend via `hermes serve` — it
 // must NEVER depend on or launch the browser `dashboard`. But `serve` is a
@@ -13,7 +13,7 @@
 
 /**
  * Build the canonical headless backend argv (always `serve`).
- * @param {string} [profile] optional Hermes profile to pin via `--profile`.
+ * @param {string} [profile] optional Charterforge profile to pin via `--profile`.
  */
 export function serveBackendArgs(profile?: string) {
   const head = profile ? ['--profile', profile] : []

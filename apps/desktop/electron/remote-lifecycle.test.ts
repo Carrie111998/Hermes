@@ -9,7 +9,7 @@ import {
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,
-  locateHermes,
+  locateCharterforge,
   LOCKFILE_SCHEMA_VERSION,
   lockfilePath,
   openForward,
@@ -78,12 +78,12 @@ function fakeSsh(rules: any[] = []) {
   }
 }
 
-test('locateHermes prefers the explicit profile path when executable', async () => {
+test('locateCharterforge prefers the explicit profile path when executable', async () => {
   const ssh = fakeSsh([[/\[ -x .*\/opt\/hermes/, 'OK']])
-  assert.equal(await locateHermes(ssh, '/opt/hermes'), '/opt/hermes')
+  assert.equal(await locateCharterforge(ssh, '/opt/hermes'), '/opt/hermes')
 })
 
-test('locateHermes throws (no silent fallback) when an EXPLICIT path is not executable', async () => {
+test('locateCharterforge throws (no silent fallback) when an EXPLICIT path is not executable', async () => {
   // command -v WOULD find a different install, but an explicit path must not
   // silently fall back to it — that is the "connected to the wrong hermes" bug.
   const ssh = fakeSsh([
@@ -92,7 +92,7 @@ test('locateHermes throws (no silent fallback) when an EXPLICIT path is not exec
   ])
 
   await assert.rejects(
-    () => locateHermes(ssh, '/bad/path/hermes'),
+    () => locateCharterforge(ssh, '/bad/path/hermes'),
     (err: any) => {
       assert.equal(err.kind, 'hermes-not-found')
       assert.match(err.message, /\/bad\/path\/hermes/)
@@ -102,44 +102,44 @@ test('locateHermes throws (no silent fallback) when an EXPLICIT path is not exec
   )
 })
 
-test('locateHermes falls back to the login-shell command -v probe', async () => {
+test('locateCharterforge falls back to the login-shell command -v probe', async () => {
   const ssh = fakeSsh([
     [/command -v hermes/, '/home/u/.local/bin/hermes\n'],
     [/\[ -x .*\.local\/bin\/hermes/, 'OK']
   ])
 
-  assert.equal(await locateHermes(ssh, ''), '/home/u/.local/bin/hermes')
+  assert.equal(await locateCharterforge(ssh, ''), '/home/u/.local/bin/hermes')
 })
 
-test('locateHermes canonicalizes an installer wrapper to its executable target', async () => {
+test('locateCharterforge canonicalizes an installer wrapper to its executable target', async () => {
   const ssh = fakeSsh([
     [/command -v hermes/, '/home/u/.local/bin/hermes\n'],
     [/\[ -x .*\.local\/bin\/hermes/, 'OK'],
     [/python3 -c/, '/home/u/.hermes/hermes-agent/venv/bin/hermes\n']
   ])
 
-  assert.equal(await locateHermes(ssh, ''), '/home/u/.hermes/hermes-agent/venv/bin/hermes')
+  assert.equal(await locateCharterforge(ssh, ''), '/home/u/.hermes/hermes-agent/venv/bin/hermes')
 })
 
-test('locateHermes falls back to ~/.local/bin/hermes when the login-shell probe misses', async () => {
+test('locateCharterforge falls back to ~/.local/bin/hermes when the login-shell probe misses', async () => {
   // ~/.local/bin is the non-root installer's command location (scripts/install.sh).
   const ssh = fakeSsh([
     [/command -v hermes/, ''],
     [/\[ -x .*\.local\/bin\/hermes/, 'OK']
   ])
 
-  assert.equal(await locateHermes(ssh, ''), '~/.local/bin/hermes')
+  assert.equal(await locateCharterforge(ssh, ''), '~/.local/bin/hermes')
 })
 
-test('locateHermes tries the conventional venv path last', async () => {
+test('locateCharterforge tries the conventional venv path last', async () => {
   const ssh = fakeSsh([[/\[ -x .*venv\/bin\/hermes/, 'OK']])
-  assert.equal(await locateHermes(ssh, ''), '~/.hermes/hermes-agent/venv/bin/hermes')
+  assert.equal(await locateCharterforge(ssh, ''), '~/.hermes/hermes-agent/venv/bin/hermes')
 })
 
-test('locateHermes throws a hermes-not-found error with an install hint', async () => {
+test('locateCharterforge throws a hermes-not-found error with an install hint', async () => {
   const ssh = fakeSsh([]) // nothing is executable
   await assert.rejects(
-    () => locateHermes(ssh, ''),
+    () => locateCharterforge(ssh, ''),
     (err: any) => {
       assert.equal(err.kind, 'hermes-not-found')
       assert.match(err.message, /install/i)
@@ -149,13 +149,13 @@ test('locateHermes throws a hermes-not-found error with an install hint', async 
   )
 })
 
-test('locateHermes uses a login shell for the command -v probe', async () => {
+test('locateCharterforge uses a login shell for the command -v probe', async () => {
   const ssh = fakeSsh([
     [/command -v hermes/, '/x/hermes'],
     [/\[ -x/, 'OK']
   ])
 
-  await locateHermes(ssh, '')
+  await locateCharterforge(ssh, '')
   assert.ok(
     ssh.calls.some(c => /bash -lc/.test(c)),
     'must probe in a login shell (PATH pitfall)'
@@ -277,7 +277,7 @@ test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   assert.match(cmd, /<\/dev\/null/)
   assert.match(cmd, /echo \$!/)
   assert.ok(!cmd.includes('tok_secret_value'), 'token must not appear in spawn command')
-  assert.ok(!cmd.includes('HERMES_DASHBOARD_SESSION_TOKEN'), 'token env var must not appear')
+  assert.ok(!cmd.includes('CHARTERFORGE_DASHBOARD_SESSION_TOKEN'), 'token env var must not appear')
 })
 
 test('buildSpawnCommand always uses serve (legacy dashboard path removed)', () => {
@@ -324,8 +324,8 @@ test('spawnRemoteDashboard always spawns serve (legacy dashboard path removed)',
 })
 
 test('READY_RE accepts both serve and dashboard sentinels', () => {
-  assert.equal(READY_RE.exec('HERMES_BACKEND_READY port=4321')?.[1], '4321')
-  assert.equal(READY_RE.exec('HERMES_DASHBOARD_READY port=8765')?.[1], '8765')
+  assert.equal(READY_RE.exec('CHARTERFORGE_BACKEND_READY port=4321')?.[1], '4321')
+  assert.equal(READY_RE.exec('CHARTERFORGE_DASHBOARD_READY port=8765')?.[1], '8765')
 })
 
 test('spawnRemoteDashboard rejects when no pid is returned', async () => {
@@ -348,7 +348,7 @@ test('spawnRemoteDashboard rejects when no pid is returned', async () => {
 
 test('scrapeReadyPort reads only the named spawn log', async () => {
   const logPath = spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
-  const ssh = fakeSsh([[/cat/, 'some noise\nHERMES_DASHBOARD_READY port=51234\n']])
+  const ssh = fakeSsh([[/cat/, 'some noise\nCHARTERFORGE_DASHBOARD_READY port=51234\n']])
   const port = await scrapeReadyPort(ssh, logPath, { timeoutMs: 1000 })
   assert.equal(port, 51234)
   assert.ok(ssh.calls.every(call => !call.includes('desktop-ssh.log')))
@@ -388,7 +388,7 @@ function connectDeps(ssh, over: any = {}) {
     forward: async () => {},
     cancelForward: async () => {},
     pickLocalPort: async () => 50001,
-    waitForHermes: async () => {},
+    waitForCharterforge: async () => {},
     probeReuseProof: async () => 'authenticated-ok',
     adoptServedToken: async (_baseUrl, spawn) => spawn || 'served-token',
     rememberLog: () => {},
@@ -407,7 +407,7 @@ test('connect() spawns fresh when there is no lockfile, adopts the served token'
     [/printf '%s\\n'/, ''],
     [/setsid/, '777\n'],
     [/kill -0 777/, 'ALIVE'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=51999\n']
+    [/cat .*\.log/, 'CHARTERFORGE_DASHBOARD_READY port=51999\n']
   ])
 
   const result = await connect(connectDeps(ssh, { adoptServedToken: async () => 'the-served-token' }))
@@ -450,15 +450,15 @@ test('connect() respawns when the lockfile hermesPath differs from the resolved 
     [/cat .*lock\.json/, JSON.stringify(lock)],
     [/kill -0/, 'ALIVE'],
     [/print\("OWNED"/, 'FOREIGN\n'],
-    [/--version/, 'Hermes Agent v0.18.2\n'],
+    [/--version/, 'Charterforge v0.18.2\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [/python3 -c/, ''],
     [/setsid/, '890\n'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=52050\n']
+    [/cat .*\.log/, 'CHARTERFORGE_DASHBOARD_READY port=52050\n']
   ])
 
   const result = await connect(
-    connectDeps(ssh, { reuseToken, remoteHermesPath: '/new/hermes', adoptServedToken: async () => 'fresh' })
+    connectDeps(ssh, { reuseToken, remoteCharterforgePath: '/new/hermes', adoptServedToken: async () => 'fresh' })
   )
 
   assert.equal(result.reused, false, 'must respawn, not reuse the old-path dashboard')
@@ -489,7 +489,7 @@ test('connect() respawns when the lockfile protocolVersion is incompatible', asy
     [/python3 -c/, ''],
     [/setsid/, '901\n'],
     [/kill -0 901/, 'ALIVE'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=44100\n']
+    [/cat .*\.log/, 'CHARTERFORGE_DASHBOARD_READY port=44100\n']
   ])
 
   const result = await connect(connectDeps(ssh, { reuseToken, adoptServedToken: async () => 'fresh' }))
@@ -504,13 +504,13 @@ test('connect() fresh spawn writes hermesHome + protocolVersion into the lockfil
     [/uname/, 'Linux\nx86_64'],
     [/\[ -x/, 'OK'],
     [/cat .*lock\.json/, ''], // no lockfile
-    [/HERMES_HOME/, '/home/alice/.hermes\n'],
+    [/CHARTERFORGE_HOME/, '/home/alice/.hermes\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [/python3 -c/, ''],
     [/printf '%s\\n'/, ''],
     [/setsid/, '700\n'],
     [/kill -0 700/, 'ALIVE'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=45500\n'],
+    [/cat .*\.log/, 'CHARTERFORGE_DASHBOARD_READY port=45500\n'],
     [
       /printf '%s' '/,
       c => {
@@ -540,7 +540,7 @@ test('connect() respawns when the lockfile pid is dead (killed dashboard)', asyn
     [/python3 -c/, ''],
     [/setsid/, '888\n'],
     [/kill -0 888/, 'ALIVE'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=42000\n']
+    [/cat .*\.log/, 'CHARTERFORGE_DASHBOARD_READY port=42000\n']
   ])
 
   const result = await connect(connectDeps(ssh, { reuseToken: 't', adoptServedToken: async () => 'fresh' }))
@@ -574,7 +574,7 @@ test('connect() respawns when the dashboard is wedged (alive pid, probe fails)',
     [/python3 -c/, ''],
     [/setsid/, '999\n'],
     [/kill -0 999/, 'ALIVE'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=43000\n']
+    [/cat .*\.log/, 'CHARTERFORGE_DASHBOARD_READY port=43000\n']
   ])
 
   const result = await connect(
@@ -710,7 +710,7 @@ test('expandRemotePath preserves spaces as data', () => {
 test('buildSpawnCommand does not embed the token in the command string', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
   assert.ok(!cmd.includes('super_secret_token_value'), 'token must not appear in the spawn command')
-  assert.ok(!cmd.includes('HERMES_DASHBOARD_SESSION_TOKEN'), 'env var name must not appear')
+  assert.ok(!cmd.includes('CHARTERFORGE_DASHBOARD_SESSION_TOKEN'), 'env var name must not appear')
 })
 
 test('buildSpawnCommand includes --ssh-session-token-file when tokenFilePath is provided', () => {
@@ -974,7 +974,7 @@ test('connect replaces an exact-owned backend only after authenticated stale pro
     [/python3 -c/, ''],
     [/setsid/, '999\n'],
     [/kill -0 999/, 'ALIVE'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=43000\n']
+    [/cat .*\.log/, 'CHARTERFORGE_DASHBOARD_READY port=43000\n']
   ])
 
   const result = await connect(

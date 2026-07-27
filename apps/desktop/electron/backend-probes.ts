@@ -2,7 +2,7 @@
  * backend-probes.ts
  *
  * Cheap "does this candidate backend actually work" checks used by
- * resolveHermesBackend (main.ts). The resolver walks a ladder of
+ * resolveCharterforgeBackend (main.ts). The resolver walks a ladder of
  * candidates -- bootstrap marker, `hermes` on PATH, system Python with
  * hermes_cli installed -- and historically returned the first candidate
  * whose binary existed on disk. That assumption breaks when a user has
@@ -23,7 +23,7 @@
  *   - 5s timeout (a hung interpreter beats forever, but we still give
  *     slow disks / cold caches room to breathe)
  *   - stdio ignored (we only care about exit code; stdout/stderr are
- *     not surfaced to the user, just to recentHermesLog for forensics
+ *     not surfaced to the user, just to recentCharterforgeLog for forensics
  *     via the caller's catch block if it chooses)
  *   - any throw -> false (never propagate -- resolver wants a boolean)
  *
@@ -37,7 +37,7 @@ import { execFileSync } from 'node:child_process'
 const PROBE_TIMEOUT_MS = 5000
 
 /**
- * Return the Python snippet used to verify Hermes can import far enough to
+ * Return the Python snippet used to verify Charterforge can import far enough to
  * launch the CLI. Kept exported for tests so dependency regressions are
  * caught without needing a real broken venv fixture.
  *
@@ -48,10 +48,10 @@ function hermesRuntimeImportProbe() {
 }
 
 /**
- * Return true iff the Hermes runtime import probe exits 0.
+ * Return true iff the Charterforge runtime import probe exits 0.
  *
  * Used to gate the "fallback to system Python with hermes_cli installed"
- * rung of resolveHermesBackend. Without this, a system Python 3.11-3.13
+ * rung of resolveCharterforgeBackend. Without this, a system Python 3.11-3.13
  * registered in PEP 514 makes findSystemPython() succeed regardless of
  * whether hermes_cli has actually been pip-installed into its
  * site-packages -- and the resolver returns a backend that immediately
@@ -65,7 +65,7 @@ function hermesRuntimeImportProbe() {
  * @param {object} [opts.env] - Additional environment for the probe.
  * @returns {boolean}
  */
-function canImportHermesCli(pythonPath: string, opts: { env?: Record<string, string> } = {}) {
+function canImportCharterforgeCli(pythonPath: string, opts: { env?: Record<string, string> } = {}) {
   if (!pythonPath) {
     return false
   }
@@ -101,20 +101,20 @@ function canImportHermesCli(pythonPath: string, opts: { env?: Record<string, str
  * @param {boolean} [opts.shell] - Whether to run through a shell. For
  *   .cmd/.bat shims on Windows execFileSync needs shell:true to find
  *   the cmd interpreter; mirrors the same flag isCommandScript() drives
- *   in resolveHermesBackend.
+ *   in resolveCharterforgeBackend.
  * @returns {boolean}
  */
 /**
  * An explicit desktop backend command is a deployment contract, not a PATH
  * discovery candidate. In particular, the Nix desktop wrapper points this at
- * its immutable, matching Hermes package; it must never fall through to the
+ * its immutable, matching Charterforge package; it must never fall through to the
  * mutable install-script bootstrap path if a best-effort probe is slow.
  */
-function shouldTrustHermesOverride(hermesOverride?: string) {
+function shouldTrustCharterforgeOverride(hermesOverride?: string) {
   return typeof hermesOverride === 'string' && hermesOverride.trim().length > 0
 }
 
-function verifyHermesCli(hermesCommand: string, opts?: { shell?: boolean }) {
+function verifyCharterforgeCli(hermesCommand: string, opts?: { shell?: boolean }) {
   if (!hermesCommand) {
     return false
   }
@@ -133,4 +133,4 @@ function verifyHermesCli(hermesCommand: string, opts?: { shell?: boolean }) {
   }
 }
 
-export { canImportHermesCli, hermesRuntimeImportProbe, PROBE_TIMEOUT_MS, shouldTrustHermesOverride, verifyHermesCli }
+export { canImportCharterforgeCli, hermesRuntimeImportProbe, PROBE_TIMEOUT_MS, shouldTrustCharterforgeOverride, verifyCharterforgeCli }

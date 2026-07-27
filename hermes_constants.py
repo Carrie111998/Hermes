@@ -1,7 +1,10 @@
-"""Shared constants for Hermes Agent.
+"""Shared constants for Charterforge.
 
 Import-safe module with no dependencies — can be imported from anywhere
 without risk of circular imports.
+
+``HERMES_*`` names in this module are legacy compatibility aliases. New
+callers and launchers must use ``CHARTERFORGE_*``.
 """
 
 import os
@@ -43,24 +46,27 @@ def get_hermes_home_override() -> str | None:
 
 
 def _get_platform_default_hermes_home() -> Path:
-    """Return the platform-native default Hermes home path."""
+    """Return the platform-native default Charterforge home path."""
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
         base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-        return base / "hermes"
-    return Path.home() / ".hermes"
+        return base / "charterforge"
+    return Path.home() / ".charterforge"
 
 
 def _hermes_home_from_env() -> Path:
-    """Resolve HERMES_HOME from the process environment only.
+    """Resolve the Charterforge home from the process environment only.
 
-    Reads the ``HERMES_HOME`` env var, falling back to the platform-native
-    default.  Deliberately ignores the context-local override installed by
+    ``CHARTERFORGE_HOME`` is canonical. ``HERMES_HOME`` remains a lower
+    precedence migration alias. Deliberately ignores the context-local override installed by
     :func:`set_hermes_home_override`, so this reflects the process/launch
     scope rather than a per-task profile.  Shared by :func:`get_hermes_home`
     and :func:`get_process_hermes_home` so the two never drift.
     """
-    val = os.environ.get("HERMES_HOME", "").strip()
+    val = (
+        os.environ.get("CHARTERFORGE_HOME", "").strip()
+        or os.environ.get("HERMES_HOME", "").strip()
+    )
     if val:
         return Path(val)
     return _get_platform_default_hermes_home()
@@ -89,11 +95,11 @@ def _warn_profile_fallback_once() -> None:
         # configured, and (b) root-logger propagation would double-emit
         # on consoles where a StreamHandler is already attached.
         msg = (
-            f"[HERMES_HOME fallback] HERMES_HOME is unset but active "
+            f"[CHARTERFORGE_HOME fallback] CHARTERFORGE_HOME is unset but active "
             f"profile is {active!r}. Falling back to {fallback_home}, which "
             f"is the DEFAULT profile — not {active!r}. Any data this "
             f"process writes will land in the wrong profile. The "
-            f"subprocess spawner should pass HERMES_HOME explicitly "
+            f"subprocess spawner should pass CHARTERFORGE_HOME explicitly "
             f"(see issue #18594)."
         )
         try:
@@ -104,10 +110,11 @@ def _warn_profile_fallback_once() -> None:
 
 
 def get_hermes_home() -> Path:
-    """Return the Hermes home directory (default: platform-native path).
+    """Return the Charterforge home directory (legacy function name).
 
     Resolution order: context-local override (see
-    :func:`set_hermes_home_override`) → ``HERMES_HOME`` env var → the
+    :func:`set_hermes_home_override`) → ``CHARTERFORGE_HOME`` env var →
+    legacy ``HERMES_HOME`` → the
     platform-native default.  This is the single source of truth — all other
     copies should import this.
 
@@ -125,10 +132,18 @@ def get_hermes_home() -> Path:
     if override:
         return Path(override)
 
-    if not os.environ.get("HERMES_HOME", "").strip():
+    if not (
+        os.environ.get("CHARTERFORGE_HOME", "").strip()
+        or os.environ.get("HERMES_HOME", "").strip()
+    ):
         _warn_profile_fallback_once()
 
     return _hermes_home_from_env()
+
+
+def get_charterforge_home() -> Path:
+    """Return the canonical Charterforge state directory."""
+    return get_hermes_home()
 
 
 def get_process_hermes_home() -> Path:
@@ -168,7 +183,10 @@ def get_default_hermes_root() -> Path:
     Import-safe — no dependencies beyond stdlib.
     """
     native_home = _get_platform_default_hermes_home()
-    env_home = os.environ.get("HERMES_HOME", "")
+    env_home = (
+        os.environ.get("CHARTERFORGE_HOME", "").strip()
+        or os.environ.get("HERMES_HOME", "").strip()
+    )
     if not env_home:
         return native_home
     env_path = Path(env_home)
@@ -196,7 +214,10 @@ def get_optional_skills_dir(default: Path | None = None) -> Path:
     Packaged installs may ship ``optional-skills`` outside the Python package
     tree and expose it via ``HERMES_OPTIONAL_SKILLS``.
     """
-    override = os.getenv("HERMES_OPTIONAL_SKILLS", "").strip()
+    override = (
+        os.getenv("CHARTERFORGE_OPTIONAL_SKILLS", "").strip()
+        or os.getenv("HERMES_OPTIONAL_SKILLS", "").strip()
+    )
     if override:
         return Path(override)
     if default is not None:
@@ -212,7 +233,10 @@ def get_optional_mcps_dir(default: Path | None = None) -> Path:
     default). Packaged installs may ship ``optional-mcps`` outside the Python
     package tree and expose it via ``HERMES_OPTIONAL_MCPS``.
     """
-    override = os.getenv("HERMES_OPTIONAL_MCPS", "").strip()
+    override = (
+        os.getenv("CHARTERFORGE_OPTIONAL_MCPS", "").strip()
+        or os.getenv("HERMES_OPTIONAL_MCPS", "").strip()
+    )
     if override:
         return Path(override)
     if default is not None:
@@ -228,7 +252,10 @@ def get_bundled_skills_dir(default: Path | None = None) -> Path:
         2. Caller-supplied ``default`` (typically the source-checkout path)
         3. ``<HERMES_HOME>/skills`` last-resort
     """
-    override = os.getenv("HERMES_BUNDLED_SKILLS", "").strip()
+    override = (
+        os.getenv("CHARTERFORGE_BUNDLED_SKILLS", "").strip()
+        or os.getenv("HERMES_BUNDLED_SKILLS", "").strip()
+    )
     if override:
         return Path(override)
     if default is not None:

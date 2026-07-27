@@ -2,14 +2,14 @@
 title: Governed Agentic Business OS
 ---
 
-Hermes can run a persistent business objective loop after `hermes setup agentic`
+Charterforge can run a persistent business objective loop after `charterforge setup agentic`
 establishes a standing operating charter. The human operator is an advisor by
-default. Hermes escalates only when authority, capital, or evidence is
+default. Charterforge escalates only when authority, capital, or evidence is
 insufficient.
 
 Setup also requires an initial business mandate: company name, purpose, desired
 outcome, measurable success criteria, explicit stop conditions, and a maximum
-duration. Hermes creates the solo-founder company, CEO mandate, capital
+duration. Charterforge creates the solo-founder company, CEO mandate, capital
 contribution, accepted objective, and first wake event as a resumable,
 idempotent bootstrap. Incomplete mandates fail before creating business state.
 Rerunning setup repairs missing later stages without duplicating capital or
@@ -28,9 +28,9 @@ idempotency key. The live planning context includes a bounded objective
 portfolio and relationship graph so the CEO can coordinate workstreams across
 cycles.
 
-The initial organization is a solo-founder company with Hermes as CEO. Hiring
+The initial organization is a solo-founder company with Charterforge as CEO. Hiring
 requires backlog and objective evidence, a contractor-versus-FTE determination,
-a reporting line, a mandate, a budget, and a least-privilege Hermes profile.
+a reporting line, a mandate, a budget, and a least-privilege Charterforge profile.
 Capability-gap hiring metrics are derived from organization-bound blocked
 objectives and distinct plan attempts in the authority database; planner claims
 cannot inflate them. Each evaluation is immutable and content-hashed. Only a
@@ -72,14 +72,14 @@ At process launch, the dispatcher supplies that contract ID and the
 authoritative business-state path out of band. The employee worker refuses to
 start if its profile identity, reporting organization, current mandate,
 Kanban task hashes, assignee, tenant, expiry, or binding changed. Task comments
-and external content cannot expand the grant. At result handoff, Hermes checks
+and external content cannot expand the grant. At result handoff, Charterforge checks
 the employee and mandate again; expired, offboarded, superseded, ungranted, or
 forged task results are quarantined in an advisor intervention and never enter
 CEO replanning. Grants and bindings are included in planning posture, authority
 integrity checks, recovery snapshots, and audit exports.
 
 Rerunning reviewed agentic setup does not mutate the CEO's existing mandate.
-If the standing charter changes, Hermes appends a superseding mandate version,
+If the standing charter changes, Charterforge appends a superseding mandate version,
 updates the CEO profile's exact mandate snapshot, and preserves the prior
 version as audit evidence. Both authority expansion and authority reduction use
 this path. A new policy baseline revokes every unconsumed execution permit,
@@ -133,7 +133,7 @@ already terminated creates one advisor intervention instead of disappearing.
 Open and breached commitments appear in the CEO planning context, Business
 dashboard, integrity preflight, recovery snapshots, and audit export.
 
-With `procurement.evaluate` in the charter, Hermes records the comparison as an
+With `procurement.evaluate` in the charter, Charterforge records the comparison as an
 immutable, content-hashed decision using current unreserved treasury and a
 source-evidence reference. A paid software, SaaS, or cloud-service action must
 then cite a `buy` decision for the same organization, objective, currency, and
@@ -143,7 +143,7 @@ an ungoverned software payment is rejected before any payment rail is called.
 
 The same database maintains an immutable double-entry journal, standard chart of
 accounts, receivables, payables, fiscal periods, financial statements, tax
-registrations, effective tax rules, and filing obligations. Hermes fails closed
+registrations, effective tax rules, and filing obligations. Charterforge fails closed
 when no verified jurisdictional tax rule covers a transaction. The software
 does not determine the company's legal entity, nexus, or tax elections; those
 facts must be supplied during setup or by a qualified advisor.
@@ -171,28 +171,28 @@ Fiscal periods, tax rules, obligations, and their event lineage are included in
 the tenant-scoped audit export.
 
 Payment providers are standalone packages exposing the
-`hermes.inbound_payment_rails` and `hermes.outbound_payment_rails` Python
-entry-point contracts. A compatibility `hermes.payment_rails` contract exists
+`charterforge.inbound_payment_rails` and `charterforge.outbound_payment_rails` Python
+entry-point contracts. A compatibility `charterforge.payment_rails` contract exists
 for providers that implement both. This keeps vendor SDKs and credentials out
 of the state machine while allowing real invoice creation, payment read-back,
 and constrained payouts.
 
 The reference implementation is maintained as the independent
-`hermes-stripe-payment-rail` package rather than in this repository. Install it
-into the same Python environment as Hermes and provide `STRIPE_SECRET_KEY`
+`charterforge-stripe-payment-rail` package rather than in this repository. Install it
+into the same Python environment as Charterforge and provide `STRIPE_SECRET_KEY`
 through the deployment secret manager:
 
 ```bash
-python -m pip install /path/to/hermes-stripe-payment-rail
-hermes business payment-rails
+python -m pip install /path/to/charterforge-stripe-payment-rail
+charterforge business payment-rails
 ```
 
 The package uses hosted Stripe Checkout Sessions for inbound payments and
 Stripe Connect Transfers for outbound payments. Checkout payment methods remain
-Stripe-managed rather than being hardcoded. Both directions preserve Hermes'
+Stripe-managed rather than being hardcoded. Both directions preserve Charterforge'
 idempotency key and reconcile through an independent provider GET before the
 ledger treats a payment as externally observed. The rail is installed but not
-admissible until `hermes business provider-verify` records current evidence for
+admissible until `charterforge business provider-verify` records current evidence for
 the exact direction and jurisdiction. Outbound use additionally requires a
 registered `stripe_platform_balance` or `ch_`/`py_` source instrument, exact
 spend controls, a budget reservation, and a verified `acct_` connected-account
@@ -230,7 +230,7 @@ Approaching or overdue tax filings, applicability expiries, control-evidence
 expiries, and regime source reviews emit one deduplicated event to the
 organization's active root objective. Event payloads contain bounded deadline
 metadata, never tax registration numbers or evidence documents. If the
-organization has no active objective capable of owning the issue, Hermes opens
+organization has no active objective capable of owning the issue, Charterforge opens
 an organization-scoped advisor intervention instead of silently losing the
 deadline. Configure the look-ahead window with
 `agentic.compliance.deadline_horizon_days`.
@@ -238,7 +238,7 @@ deadline. Configure the look-ahead window with
 ## Bootstrap email
 
 The default bootstrap decision is AgentMail's free plan via the existing
-`official/email/agentmail` skill. Hermes monitors plan usage. At 80% utilization
+`official/email/agentmail` skill. Charterforge monitors plan usage. At 80% utilization
 it opens a procurement decision; reaching a limit does not authorize a paid
 upgrade. The CEO compares the paid plan, another provider, and a feasible FOSS
 or built alternative against available capital.
@@ -253,7 +253,7 @@ fresh-state requirement, and resource lease. Unknown action types, stale
 observations, active change freezes, and malformed boundary payloads fail
 before execution. Per-objective ceilings bound cycles, actions, input/output
 tokens, and compute cost. Before a CEO planning call crosses the model-provider
-boundary, Hermes conservatively reserves the full output allowance, an
+boundary, Charterforge conservatively reserves the full output allowance, an
 upper-bound input estimate, one cycle, and
 `planner_call_compute_reservation_minor`. Provider failures, invalid model
 responses, and process crashes retain that reservation, so billable failures
@@ -273,7 +273,7 @@ reservation automatically. A paid reconciliation requires provider evidence
 and a provider reference; it posts an idempotent `ai_compute` treasury and
 double-entry accounting expense before releasing unused reservation capacity.
 When auxiliary `auto` routing or fallback makes the billable provider
-ambiguous, Hermes retains the reservation as unreconciled rather than guessing
+ambiguous, Charterforge retains the reservation as unreconciled rather than guessing
 a price or inventing free usage. If a paid compute expense commits immediately
 before its reconciliation lineage, deterministic housekeeping finds the exact
 `compute-settlement:<reservation>` ledger idempotency key and appends the
@@ -287,7 +287,7 @@ intervention for that exact reservation. It remains open until authoritative
 billing or subscription evidence is attached:
 
 ```bash
-hermes business compute-reconcile compute_... \
+charterforge business compute-reconcile compute_... \
   --status provider_confirmed \
   --actual-minor 6 \
   --billing-provider openrouter \
@@ -303,7 +303,7 @@ capital reserved.
 
 When setup explicitly requires approval for an action, escalation does not
 become broad authority. The advisor may approve only the original candidate
-action through `approve_exact_action`. Hermes creates an immutable artifact
+action through `approve_exact_action`. Charterforge creates an immutable artifact
 binding the organization, objective scope, candidate-action contract, payload
 hash, capability, system, target resource, cost, currency, policy version,
 state-evidence hash, advisor evidence, and a maximum one-hour expiry.
@@ -320,8 +320,8 @@ expiry, cross-tenant use, parameter changes, or evidence reuse fail closed.
 Until execution begins, the advisor can revoke both artifact and linked permit:
 
 ```bash
-hermes business approval-list
-hermes business approval-revoke APPROVAL_ID \
+charterforge business approval-list
+charterforge business approval-revoke APPROVAL_ID \
   --reason "relevant external state changed"
 ```
 
@@ -338,7 +338,7 @@ the same tuple again before creating a candidate action, including proposals
 inserted through non-model paths. If the charter admits no complete registered
 contract, worker readiness fails closed without consuming an objective event.
 
-Every production CEO-planner invocation has immutable inference lineage. Hermes
+Every production CEO-planner invocation has immutable inference lineage. Charterforge
 records the exact system and user messages sent to the auxiliary planner, the
 exact raw response, resolved model identifier, token usage, start/finish
 timestamps, parse outcome, and SHA-256 hashes. Provider call failures and
@@ -348,7 +348,7 @@ inference from another objective or one whose response did not parse.
 Deterministic test or policy planners may create plans without pretending that
 an LLM call occurred.
 
-`hermes business audit-export` includes the tenant-scoped inference records and
+`charterforge business audit-export` includes the tenant-scoped inference records and
 their bound immutable plan versions alongside actions, permits, execution
 results, independent verifications, payments, and ledger entries. The package
 hash covers the exact prompt/response lineage, so an auditor can reconstruct
@@ -357,7 +357,7 @@ Planning context is credential-free by construction; provider secrets and
 payment instruments never enter these inference records.
 
 Plans may decompose a long strategy into many tasks, but the default execution
-contract permits only one external effect per cycle. Hermes verifies that
+contract permits only one external effect per cycle. Charterforge verifies that
 effect, observes authoritative state again, and creates a new immutable plan
 version before another effect. A planner that proposes multiple effects from
 one observation is blocked as a contract violation; its task decomposition is
@@ -367,7 +367,7 @@ invented by the planner.
 
 ## Closed-loop strategy measurement
 
-Hermes stores KPI definitions, observations, targets, strategy experiments,
+Charterforge stores KPI definitions, observations, targets, strategy experiments,
 and their evaluations as authoritative business state rather than planner
 prose. Observations are append-only, bound to a contracted verifier, deduplicated
 by a hashed provider source reference, and protected against evidence-changing
@@ -391,7 +391,7 @@ root, the same evidence becomes an organization-scoped advisor intervention.
 The Business dashboard exposes bounded KPI and experiment read-backs without
 raw provider evidence or credentials.
 
-Hermes also materializes immutable outcome attributions from these authoritative
+Charterforge also materializes immutable outcome attributions from these authoritative
 records. This is an evidence-linking layer, not a license for the model to infer
 causality. It accepts only three deterministic relationships: an executed
 action with an independent passing verification, a provider-confirmed payment
@@ -520,7 +520,7 @@ Built-in production criteria include verified revenue, balanced books, and
 completion of all delegated Kanban work. Before consuming an event, the worker
 audits every active objective against its registered objective verifiers.
 Missing, malformed, or unavailable criteria make readiness
-`configuration_blocked`; Hermes does not run indefinitely against a goal it
+`configuration_blocked`; Charterforge does not run indefinitely against a goal it
 cannot prove. Accounting criteria read the immutable journal and trial balance,
 not planner claims or action output.
 
@@ -551,28 +551,28 @@ is inconclusive and blocks progress.
 `reversible` is not accepted as a bare claim in the production charter. Every
 reversible effect must carry an exact compensation action, stable payload
 scope, capability, and verifier. If execution succeeds but verification fails,
-Hermes creates a durable compensation obligation and wake event. Until that
+Charterforge creates a durable compensation obligation and wake event. Until that
 obligation is independently verified, policy denies unrelated actions for the
 objective. Compensation receives its own candidate action, permit, resource
 lease, execution result, and evidence record; it is never an unlogged rollback.
 
-On startup Hermes finds permits consumed without an execution result. If the
+On startup Charterforge finds permits consumed without an execution result. If the
 exact stored action carries a stable provider idempotency key, recovery invokes
 that same adapter and payload under a fresh resource fence; it never asks the
 planner to invent a replacement. Providers must collapse the replay into the
-original operation. Without that guarantee Hermes does not replay the effect:
+original operation. Without that guarantee Charterforge does not replay the effect:
 it opens one reconciliation handoff with choices to read provider state,
 execute an authorized compensation, or abandon the objective.
 
-Use `hermes business autonomy paused --reason "..."` as the master kill switch.
+Use `charterforge business autonomy paused --reason "..."` as the master kill switch.
 This revokes unused permits and active resource leases. `manual` keeps the
 dashboard and evidence available without autonomous execution. Resuming with
-`hermes business autonomy autonomous --reason "..."` creates a new authority
+`charterforge business autonomy autonomous --reason "..."` creates a new authority
 generation; it does not restore old permits.
 
-The dashboard and `hermes business interventions` show exact exception context
+The dashboard and `charterforge business interventions` show exact exception context
 and recorded resolution choices. Resolutions require evidence. Use
-`hermes business audit-export --output audit.json` to produce a tenant-scoped,
+`charterforge business audit-export --output audit.json` to produce a tenant-scoped,
 hash-verifiable package connecting objectives, plans, actions, permits,
 executions, independent verification, payments, and immutable ledger entries.
 
@@ -587,9 +587,9 @@ record. Selecting `abandon` deterministically terminates a blocked objective
 without scheduling more work.
 
 For unattended operation without a messaging gateway, run
-`hermes objectives worker` under systemd, s6, Docker, launchd, or another real
-process supervisor. `hermes objectives worker --once` performs one supervised
-cycle for health checks and job runners. `hermes objectives worker-status`
+`charterforge objectives worker` under systemd, s6, Docker, launchd, or another real
+process supervisor. `charterforge objectives worker --once` performs one supervised
+cycle for health checks and job runners. `charterforge objectives worker-status`
 reports persisted PID, process nonce, heartbeat age, last cycle, errors, and
 graceful stop state. The gateway-embedded runtime registers through the same
 health contract. Multiple workers are safe because durable inbox claims, not a
@@ -599,7 +599,7 @@ Initial agentic setup binds the charter to `agentic.runtime_host`: `gateway`,
 `standalone`, or the migration-only `either` mode. A cycle must prove that the
 current process has a live, organization-scoped worker registration for the
 selected host before it can inspect or mutate business state. Starting
-`hermes objectives worker` under a gateway-only charter, calling the tick
+`charterforge objectives worker` under a gateway-only charter, calling the tick
 function ad hoc, or relying on a stale worker record fails readiness. The
 Business dashboard reports the selected host, expected worker roles, matching
 worker history, and whether a healthy supervisor is currently observed. Worker
@@ -608,7 +608,7 @@ history is included in the tenant-scoped audit package.
 The outer worker supervisor is bounded independently from per-objective retry
 policy. Consecutive systemic tick failures use exponential backoff and reset
 only after a successful cycle. At
-`agentic.security.circuit_breaker_failure_threshold`, Hermes marks the worker
+`agentic.security.circuit_breaker_failure_threshold`, Charterforge marks the worker
 `circuit_open`, creates one `objective_runtime_unhealthy` intervention with the
 last error and failure count, and stops the loop. The standalone worker exits
 non-zero so systemd, Docker, or another process supervisor can apply its own
@@ -647,8 +647,8 @@ reservation-preservation semantics are stored with the immutable result, and
 reconciled executions receive KYA and audit-chain evidence.
 
 Objectives can wake from durable schedules and typed adapter events without a
-chat turn. `hermes objectives subscribe` binds an organization-scoped source
-and event type to an objective. Adapters call `hermes objectives ingest-event`
+chat turn. `charterforge objectives subscribe` binds an organization-scoped source
+and event type to an objective. Adapters call `charterforge objectives ingest-event`
 or the equivalent Python contract with a provider reference, structured
 payload, and adapter authentication evidence; deduplication is per objective
 and immutable provider event identity. A retry with identical hashes is safe;
@@ -677,10 +677,10 @@ operation that claims an inbox event. Events belonging to another organization
 remain pending and unattempted; tenant mismatch is not handled by consuming and
 discarding the event after the fact.
 
-`hermes objectives schedule` creates an interval trigger. After downtime,
-Hermes emits one catch-up event containing the number of missed intervals
+`charterforge objectives schedule` creates an interval trigger. After downtime,
+Charterforge emits one catch-up event containing the number of missed intervals
 instead of creating a planner storm. Terminal objectives are never woken.
-`hermes objectives trigger-status <id> disabled` suspends a schedule or
+`charterforge objectives trigger-status <id> disabled` suspends a schedule or
 subscription without deleting its audit history.
 
 Initial agentic setup creates an idempotent CEO operating-review schedule, so a
@@ -690,14 +690,14 @@ creating a cron job. The default interval is 24 hours and can be changed or
 disabled through `agentic.operating_cadence`. Restart catch-up remains bounded
 to one event regardless of the number of missed intervals.
 
-When the final active root objective satisfies its success criteria, Hermes
+When the final active root objective satisfies its success criteria, Charterforge
 does not interpret that milestone as the end of the company. Closure pauses
 until the CEO creates a governed peer successor with
 `objectives.create_successor`. The successor receives immutable `succeeds`
 lineage, structured completion verifiers, inherited system scope and
 prohibitions, a non-expanding budget, and the transferred CEO review cadence.
 The predecessor may then become verified. If the standing charter does not
-include `objectives.create` on the `objectives` system, Hermes blocks the final
+include `objectives.create` on the `objectives` system, Charterforge blocks the final
 root and opens an advisor intervention rather than inventing authority or
 silently stopping operations. Disabling `agentic.operating_cadence` is the
 explicit opt-out from this continuity rule.
@@ -710,7 +710,7 @@ mandate expires are suspended. The dashboard shows the last maintenance check;
 append-only maintenance records are created only when state changes, avoiding
 an unbounded idle-heartbeat ledger.
 
-Before that maintenance can mutate state, Hermes runs a fail-closed authority
+Before that maintenance can mutate state, Charterforge runs a fail-closed authority
 preflight. It verifies SQLite integrity, foreign keys, the append-only business
 audit hash chain, the active CEO and contiguous immutable employee-mandate
 chains, and
@@ -720,13 +720,13 @@ during setup.
 
 An integrity failure or an unreviewed direct charter edit pauses autonomy,
 revokes live permits and leases, records immutable evidence, and creates one
-deduplicated advisor intervention. Hermes never repairs or re-baselines the
+deduplicated advisor intervention. Charterforge never repairs or re-baselines the
 authority store on its own. Rerunning reviewed agentic setup may append a new
 policy baseline; after a clean preflight, the operator can explicitly resume
 bounded autonomy. Failed integrity posture is visible on the Business
 dashboard and included in the accountant/regulator audit package.
 
-After a successful preflight, Hermes maintains an offline, known-good authority
+After a successful preflight, Charterforge maintains an offline, known-good authority
 snapshot using SQLite's consistent backup API. Each snapshot is bound to the
 organization, integrity-run evidence, database hash, and audit-chain head by a
 hashed manifest. Snapshot creation fails closed when integrity is not ready;
@@ -737,11 +737,11 @@ recovery remains available.
 Recovery is an operator-only edge command, not a model tool:
 
 ```bash
-hermes business recovery-list
-hermes business recovery-verify --snapshot /exact/snapshot.json
-hermes business autonomy paused --reason "prepare offline recovery"
+charterforge business recovery-list
+charterforge business recovery-verify --snapshot /exact/snapshot.json
+charterforge business autonomy paused --reason "prepare offline recovery"
 # stop the supervised objective worker, then:
-hermes business recovery-restore \
+charterforge business recovery-restore \
   --snapshot /exact/snapshot.json \
   --reason "restore reviewed known-good authority" \
   --evidence '{"ticket":"REC-123","reviewed":true}'

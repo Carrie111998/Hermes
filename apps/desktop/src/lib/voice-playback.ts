@@ -1,4 +1,4 @@
-import { resolveGatewayWsUrl } from '@hermes/shared'
+import { resolveGatewayWsUrl } from '@charterforge/shared'
 
 import { speakText } from '@/hermes'
 import {

@@ -1,6 +1,6 @@
 """Deterministic staffing policy for a CEO-first autonomous business.
 
-Hermes starts as a solo founder.  Extra employee agents are organizational
+Charterforge starts as a solo founder.  Extra employee agents are organizational
 cost and coordination surface, so a planner may propose a hire but cannot
 justify one with prose alone.  This module requires measurable evidence of a
 blocking capability gap, sustained capacity pressure, or separation-of-duty

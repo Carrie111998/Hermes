@@ -1,4 +1,4 @@
-"""Operator CLI for Hermes's governed objective authority service."""
+"""Operator CLI for Charterforge's governed objective authority service."""
 
 from __future__ import annotations
 

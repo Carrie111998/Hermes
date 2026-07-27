@@ -75,7 +75,7 @@ def configure_profile(
     terms_version: Optional[str] = None,
 ) -> None:
     if custody_model != "non_custodial":
-        raise ComplianceError("Hermes Business OS must remain non-custodial")
+        raise ComplianceError("Charterforge Business OS must remain non-custodial")
     if not legal_entity_type or legal_entity_type == "unconfigured":
         raise ComplianceError("legal entity type must be configured")
     if not home_jurisdiction:

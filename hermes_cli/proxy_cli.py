@@ -278,7 +278,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         if _sys.stdin.isatty():
             console.print(
                 "[yellow]⚠[/yellow]  --rotate-tokens will invalidate proxy "
-                "tokens in every running Hermes sandbox.  They will start "
+                "tokens in every running Charterforge sandbox.  They will start "
                 "401-ing against upstreams until restarted."
             )
             try:

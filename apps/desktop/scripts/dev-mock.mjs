@@ -204,17 +204,17 @@ async function main() {
 
   const sandbox = createSandbox()
   writeMockConfig(sandbox.hermesHome, mock.url)
-  console.log(`  HERMES_HOME: ${sandbox.hermesHome}`)
+  console.log(`  CHARTERFORGE_HOME: ${sandbox.hermesHome}`)
 
   const electronBin = findElectron()
 
   const env = {
     ...process.env,
-    HERMES_HOME: sandbox.hermesHome,
-    HERMES_DESKTOP_USER_DATA_DIR: sandbox.userDataDir,
-    HERMES_DESKTOP_IGNORE_EXISTING: '1',
-    HERMES_DESKTOP_HERMES_ROOT: REPO_ROOT,
-    HERMES_DESKTOP_APP_NAME: `HermesDevMock-${Date.now()}`,
+    CHARTERFORGE_HOME: sandbox.hermesHome,
+    CHARTERFORGE_DESKTOP_USER_DATA_DIR: sandbox.userDataDir,
+    CHARTERFORGE_DESKTOP_IGNORE_EXISTING: '1',
+    CHARTERFORGE_DESKTOP_CHARTERFORGE_ROOT: REPO_ROOT,
+    CHARTERFORGE_DESKTOP_APP_NAME: `CharterforgeDevMock-${Date.now()}`,
   }
 
   console.log('Launching Electron...')

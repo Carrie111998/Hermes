@@ -10,7 +10,7 @@
  *      relaunch/claim a GUI update; AppImage/.deb/.rpm/dev/unresolved paths land
  *      on the guiSkew terminal state and do NOT claim the GUI was updated.
  *   2. Launch context is replayed on re-exec (args filtered of Electron
- *      internals; HERMES_HOME / HERMES_DESKTOP_* env + cwd preserved) and is
+ *      internals; CHARTERFORGE_HOME / CHARTERFORGE_DESKTOP_* env + cwd preserved) and is
  *      safely shell-quoted.
  *   3. The sandbox preflight: chrome-sandbox must be root-owned + setuid to be
  *      launchable; otherwise the decision degrades to a manual terminal state
@@ -58,10 +58,10 @@ test('resolveUnpackedRelease returns the dir for a binary UNDER release/<plat>-u
 
 test('resolveUnpackedRelease is null for AppImage / .deb / .rpm / dev / unresolved paths', () => {
   // AppImage mount
-  assert.equal(resolveUnpackedRelease('/tmp/.mount_Hermes12345/AppRun', ROOT, 'linux'), null)
+  assert.equal(resolveUnpackedRelease('/tmp/.mount_Charterforge12345/AppRun', ROOT, 'linux'), null)
   // .deb / .rpm system install
   assert.equal(resolveUnpackedRelease('/usr/lib/hermes/hermes', ROOT, 'linux'), null)
-  assert.equal(resolveUnpackedRelease('/opt/Hermes/hermes', ROOT, 'linux'), null)
+  assert.equal(resolveUnpackedRelease('/opt/Charterforge/hermes', ROOT, 'linux'), null)
   // dev electron
   assert.equal(
     resolveUnpackedRelease('/home/u/.hermes/hermes-agent/node_modules/electron/dist/electron', ROOT, 'linux'),
@@ -157,13 +157,13 @@ test('collectRelaunchArgs drops Electron internals, keeps user/launcher args', (
   assert.deepEqual(collectRelaunchArgs(undefined), [])
 })
 
-test('collectRelaunchEnv preserves HERMES_HOME + HERMES_DESKTOP_* + sandbox opt-out only', () => {
+test('collectRelaunchEnv preserves CHARTERFORGE_HOME + CHARTERFORGE_DESKTOP_* + sandbox opt-out only', () => {
   const env = {
-    HERMES_HOME: '/home/u/.hermes',
-    HERMES_DESKTOP_REMOTE_URL: 'http://box:9119',
-    HERMES_DESKTOP_REMOTE_TOKEN: 'secret',
-    HERMES_DESKTOP_HERMES_ROOT: '/home/u/dev/hermes',
-    HERMES_DESKTOP_APP_NAME: 'HermesSandbox',
+    CHARTERFORGE_HOME: '/home/u/.hermes',
+    CHARTERFORGE_DESKTOP_REMOTE_URL: 'http://box:9119',
+    CHARTERFORGE_DESKTOP_REMOTE_TOKEN: 'secret',
+    CHARTERFORGE_DESKTOP_CHARTERFORGE_ROOT: '/home/u/dev/hermes',
+    CHARTERFORGE_DESKTOP_APP_NAME: 'CharterforgeSandbox',
     ELECTRON_DISABLE_SANDBOX: '1', // sandbox opt-out — preserved
     PATH: '/usr/bin', // not preserved
     HOME: '/home/u', // not preserved
@@ -171,11 +171,11 @@ test('collectRelaunchEnv preserves HERMES_HOME + HERMES_DESKTOP_* + sandbox opt-
   }
 
   assert.deepEqual(collectRelaunchEnv(env), {
-    HERMES_HOME: '/home/u/.hermes',
-    HERMES_DESKTOP_REMOTE_URL: 'http://box:9119',
-    HERMES_DESKTOP_REMOTE_TOKEN: 'secret',
-    HERMES_DESKTOP_HERMES_ROOT: '/home/u/dev/hermes',
-    HERMES_DESKTOP_APP_NAME: 'HermesSandbox',
+    CHARTERFORGE_HOME: '/home/u/.hermes',
+    CHARTERFORGE_DESKTOP_REMOTE_URL: 'http://box:9119',
+    CHARTERFORGE_DESKTOP_REMOTE_TOKEN: 'secret',
+    CHARTERFORGE_DESKTOP_CHARTERFORGE_ROOT: '/home/u/dev/hermes',
+    CHARTERFORGE_DESKTOP_APP_NAME: 'CharterforgeSandbox',
     ELECTRON_DISABLE_SANDBOX: '1'
   })
   assert.deepEqual(collectRelaunchEnv(null), {})
@@ -193,9 +193,9 @@ test('shellQuote neutralizes single quotes and metacharacters', () => {
 test('buildRelaunchScript embeds pid/exec/args/env/cwd and is valid bash', () => {
   const script = buildRelaunchScript({
     pid: 4242,
-    execPath: '/home/u/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes',
+    execPath: '/home/u/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Charterforge',
     args: ['hermes://open/agent/42', "--note=it's fine"],
-    env: { HERMES_HOME: '/home/u/.hermes', HERMES_DESKTOP_REMOTE_URL: 'http://box:9119' },
+    env: { CHARTERFORGE_HOME: '/home/u/.hermes', CHARTERFORGE_DESKTOP_REMOTE_URL: 'http://box:9119' },
     cwd: '/home/u/work dir'
   })
 
@@ -205,10 +205,10 @@ test('buildRelaunchScript embeds pid/exec/args/env/cwd and is valid bash', () =>
   assert.match(script, /kill -9 "\$APP_PID"/)
   assert.match(script, /rm -f -- "\$0"/)
   // env exports + cwd restore + args replay are present and quoted.
-  assert.match(script, /export HERMES_HOME='\/home\/u\/\.hermes'/)
-  assert.match(script, /export HERMES_DESKTOP_REMOTE_URL='http:\/\/box:9119'/)
+  assert.match(script, /export CHARTERFORGE_HOME='\/home\/u\/\.hermes'/)
+  assert.match(script, /export CHARTERFORGE_DESKTOP_REMOTE_URL='http:\/\/box:9119'/)
   assert.match(script, /cd '\/home\/u\/work dir'/)
-  assert.match(script, /exec '.*\/linux-unpacked\/Hermes' 'hermes:\/\/open\/agent\/42' '--note=it'\\''s fine'/)
+  assert.match(script, /exec '.*\/linux-unpacked\/Charterforge' 'hermes:\/\/open\/agent\/42' '--note=it'\\''s fine'/)
 
   // It must be syntactically valid bash (`bash -n`). Write to a temp file and lint.
   const tmp = path.join(os.tmpdir(), `hermes-relaunch-test-${Date.now()}.sh`)
@@ -224,7 +224,7 @@ test('buildRelaunchScript embeds pid/exec/args/env/cwd and is valid bash', () =>
 test('buildRelaunchScript with no args/env still lints clean', () => {
   const script = buildRelaunchScript({
     pid: 1,
-    execPath: '/opt/Hermes/Hermes',
+    execPath: '/opt/Charterforge/Charterforge',
     args: [],
     env: {},
     cwd: ''
@@ -240,5 +240,5 @@ test('buildRelaunchScript with no args/env still lints clean', () => {
   }
 
   // exec line has no trailing args.
-  assert.match(script, /exec '\/opt\/Hermes\/Hermes'\n/)
+  assert.match(script, /exec '\/opt\/Charterforge\/Charterforge'\n/)
 })

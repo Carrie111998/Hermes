@@ -1,0 +1,7 @@
+[console_scripts]
+charterforge = charterforge.cli:main
+charterforge-acp = charterforge.acp_entry:main
+charterforge-agent = charterforge.agent_entry:main
+hermes = hermes_cli.main:main
+hermes-acp = acp_adapter.entry:main
+hermes-agent = run_agent:main

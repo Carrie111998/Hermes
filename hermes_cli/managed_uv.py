@@ -1,13 +1,13 @@
-"""Hermes-managed uv and Python runtime repair.
+"""Charterforge-managed uv and Python runtime repair.
 
-Hermes owns its own uv binary at ``$HERMES_HOME/bin/uv`` (or ``uv.exe`` on
+Charterforge owns its own uv binary at ``$HERMES_HOME/bin/uv`` (or ``uv.exe`` on
 Windows).  Every code path that needs uv resolves it from that single location.
 If the binary is missing, ``ensure_uv()`` bootstraps it via the official
 standalone installer with ``UV_UNMANAGED_INSTALL`` / ``UV_INSTALL_DIR`` pointed
 at ``$HERMES_HOME/bin`` so the installer writes directly there — no PATH
 probing, no conda guards, no multi-location resolution chains.
 
-The Python backing the install is different: it is shared by every Hermes
+The Python backing the install is different: it is shared by every Charterforge
 profile because the checkout's ``venv`` is shared.  Runtime repair therefore
 uses an install-scoped store under ``<checkout>/.hermes-runtime/python``. A
 vulnerable interpreter is never reinstalled in place. We provision a new
@@ -49,7 +49,7 @@ _REPAIR_LOCK_NAME = "runtime-repair.lock"
 
 
 def managed_uv_path() -> Path:
-    """Return the path where Hermes keeps *its* uv binary.
+    """Return the path where Charterforge keeps *its* uv binary.
 
     ``$HERMES_HOME/bin/uv`` on POSIX, ``$HERMES_HOME\\bin\\uv.exe`` on
     Windows.  The directory may not exist yet — callers should use
@@ -84,7 +84,7 @@ def managed_python_env(
     install_dir: Path | None = None,
     base_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Return a sanitized environment for Hermes-private uv Python commands."""
+    """Return a sanitized environment for Charterforge-private uv Python commands."""
     target = (
         Path(install_dir)
         if install_dir is not None
@@ -503,7 +503,7 @@ def _attempt_install_generation(
     try:
         python.resolve().relative_to(generation.resolve())
     except (OSError, ValueError):
-        logger.warning("uv resolved Python outside the Hermes generation: %s", python)
+        logger.warning("uv resolved Python outside the Charterforge generation: %s", python)
         _remove_tree(generation, boundary=python_root)
         return None
 
@@ -870,7 +870,7 @@ def _windows_runtime_holders() -> tuple[bool, str]:
         return True, f"could not verify Windows venv holders: {exc}"
     if holders:
         pids = ", ".join(str(item[0]) for item in holders[:6])
-        return True, f"other Hermes processes still hold the venv (PID {pids})"
+        return True, f"other Charterforge processes still hold the venv (PID {pids})"
     return False, ""
 
 
@@ -940,7 +940,7 @@ def repair_vulnerable_runtime(
             )
 
         print(
-            "  ⚠ Hermes venv links SQLite "
+            "  ⚠ Charterforge venv links SQLite "
             f"{current.sqlite_version_string}, which has the WAL-reset bug."
         )
         provisioned = _install_safe_python_generation(
@@ -1002,7 +1002,7 @@ def repair_vulnerable_runtime(
         if backup is not None:
             print(
                 f"  ℹ Previous venv parked at {backup.name}; "
-                "keep it until all older Hermes processes have exited."
+                "keep it until all older Charterforge processes have exited."
             )
         return RuntimeRepairResult(
             "repaired",

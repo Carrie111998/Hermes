@@ -1,8 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { getHermesConfigRecord } from '@/hermes'
+import { getCharterforgeConfigRecord } from '@/hermes'
 import { queryClient, writeCache } from '@/lib/query-client'
-import type { HermesConfigRecord } from '@/types/hermes'
+import type { CharterforgeConfigRecord } from '@/types/hermes'
 
 // One shared cache for the whole profile config record (`GET /api/config`).
 // Every settings surface (MCP, model, config) reads and writes through this key
@@ -11,12 +11,12 @@ import type { HermesConfigRecord } from '@/types/hermes'
 //
 // Distinct from session/hooks/use-hermes-config.ts, which is side-effecting —
 // it pushes personality/cwd/voice/… into the session stores for live chat.
-export const HERMES_CONFIG_KEY = ['hermes-config-record'] as const
+export const CHARTERFORGE_CONFIG_KEY = ['hermes-config-record'] as const
 
 // staleTime 0 → serve cache instantly, background-revalidate on every mount.
-export const useHermesConfigRecord = () =>
-  useQuery({ queryKey: HERMES_CONFIG_KEY, queryFn: getHermesConfigRecord, staleTime: 0 })
+export const useCharterforgeConfigRecord = () =>
+  useQuery({ queryKey: CHARTERFORGE_CONFIG_KEY, queryFn: getCharterforgeConfigRecord, staleTime: 0 })
 
-export const setHermesConfigCache = writeCache<HermesConfigRecord>(HERMES_CONFIG_KEY)
+export const setCharterforgeConfigCache = writeCache<CharterforgeConfigRecord>(CHARTERFORGE_CONFIG_KEY)
 
-export const invalidateHermesConfig = () => queryClient.invalidateQueries({ queryKey: HERMES_CONFIG_KEY })
+export const invalidateCharterforgeConfig = () => queryClient.invalidateQueries({ queryKey: CHARTERFORGE_CONFIG_KEY })

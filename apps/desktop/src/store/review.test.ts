@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
+import type { CharterforgeReviewFile, CharterforgeReviewShipInfo } from '@/global'
 
 import {
   $reviewCommitDefault,
@@ -46,8 +46,8 @@ vi.mock('@/lib/oneshot', () => ({ requestOneShot: (args: unknown) => requestOneS
 // doesn't try to hit the (absent) probe and log.
 vi.mock('./coding-status', () => ({ refreshRepoStatus: vi.fn() }))
 
-function file(path: string, over: Partial<HermesReviewFile> = {}): HermesReviewFile {
-  return { path, status: 'modified', staged: false, added: 1, removed: 0, ...over } as HermesReviewFile
+function file(path: string, over: Partial<CharterforgeReviewFile> = {}): CharterforgeReviewFile {
+  return { path, status: 'modified', staged: false, added: 1, removed: 0, ...over } as CharterforgeReviewFile
 }
 
 type ReviewStub = Record<string, ReturnType<typeof vi.fn>>
@@ -348,7 +348,7 @@ describe('ship flow', () => {
 
   it('createOrOpenPr opens the existing PR without creating a new one', async () => {
     const review = stubReview()
-    $reviewShipInfo.set({ ghReady: true, pr: { url: 'https://example.com/pr/9' } } as HermesReviewShipInfo)
+    $reviewShipInfo.set({ ghReady: true, pr: { url: 'https://example.com/pr/9' } } as CharterforgeReviewShipInfo)
 
     await createOrOpenPr()
 
@@ -373,10 +373,10 @@ describe('ship flow', () => {
 
 describe('refreshShipInfo', () => {
   it('populates ship info from the bridge', async () => {
-    const info: HermesReviewShipInfo = {
+    const info: CharterforgeReviewShipInfo = {
       ghReady: true,
       pr: { url: 'https://example.com/pr/3' }
-    } as HermesReviewShipInfo
+    } as CharterforgeReviewShipInfo
 
     stubReview({ shipInfo: vi.fn(async () => info) })
 
@@ -387,7 +387,7 @@ describe('refreshShipInfo', () => {
 
   it('resets ship info when there is no bridge', async () => {
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
-    $reviewShipInfo.set({ ghReady: true, pr: { url: 'x' } } as HermesReviewShipInfo)
+    $reviewShipInfo.set({ ghReady: true, pr: { url: 'x' } } as CharterforgeReviewShipInfo)
 
     await refreshShipInfo()
 
@@ -400,7 +400,7 @@ describe('refreshShipInfo', () => {
         throw new Error('gh missing')
       })
     })
-    $reviewShipInfo.set({ ghReady: true, pr: { url: 'x' } } as HermesReviewShipInfo)
+    $reviewShipInfo.set({ ghReady: true, pr: { url: 'x' } } as CharterforgeReviewShipInfo)
 
     await refreshShipInfo()
 

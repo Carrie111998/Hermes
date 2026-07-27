@@ -1,9 +1,9 @@
-import { refusalPolicy } from '@hermes/shared/billing-policy'
+import { refusalPolicy } from '@charterforge/shared/billing-policy'
 import {
   driveChargeSettlement,
   SETTLEMENT_POLL_CAP_MS,
   SETTLEMENT_POLL_INTERVAL_MS
-} from '@hermes/shared/charge-settlement'
+} from '@charterforge/shared/charge-settlement'
 import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useRef, useState } from 'react'
 

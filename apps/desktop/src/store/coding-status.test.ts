@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { HermesRepoStatus } from '@/global'
+import type { CharterforgeRepoStatus } from '@/global'
 
 import { $repoStatus, $repoStatusLoading, refreshRepoStatus } from './coding-status'
 import { $currentCwd, $selectedStoredSessionId } from './session'
 
-const sampleStatus: HermesRepoStatus = {
+const sampleStatus: CharterforgeRepoStatus = {
   branch: 'feature/login',
   defaultBranch: 'main',
   detached: false,
@@ -21,7 +21,7 @@ const sampleStatus: HermesRepoStatus = {
   files: []
 }
 
-function stubProbe(impl: (cwd: string) => Promise<HermesRepoStatus | null>) {
+function stubProbe(impl: (cwd: string) => Promise<CharterforgeRepoStatus | null>) {
   ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = { git: { repoStatus: impl } }
 }
 
@@ -77,7 +77,7 @@ describe('refreshRepoStatus', () => {
   })
 
   it('never publishes an old worktree status after the active cwd moves', async () => {
-    let resolveOld!: (status: HermesRepoStatus | null) => void
+    let resolveOld!: (status: CharterforgeRepoStatus | null) => void
     stubProbe(
       () =>
         new Promise(resolve => {
@@ -102,7 +102,7 @@ describe('refreshRepoStatus', () => {
   })
 
   it('runs one probe at a time and coalesces overlap into one trailing refresh', async () => {
-    const resolvers: Array<(status: HermesRepoStatus | null) => void> = []
+    const resolvers: Array<(status: CharterforgeRepoStatus | null) => void> = []
     const calls: string[] = []
     let active = 0
     let maxActive = 0

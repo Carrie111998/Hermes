@@ -1,4 +1,4 @@
-"""Provision approved employee records into least-privilege Hermes profiles."""
+"""Provision approved employee records into least-privilege Charterforge profiles."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def provision_employee_profile(
         no_alias=True,
         no_skills=True,
         description=(
-            f"{employee['title']} in the governed Hermes organization. "
+            f"{employee['title']} in the governed Charterforge organization. "
             f"Mandate: {mandate['purpose']}"
         ),
     )

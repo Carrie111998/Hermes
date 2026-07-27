@@ -1,5 +1,5 @@
 """
-Hermes CLI - Unified command-line interface for Hermes Agent.
+Charterforge CLI - Unified command-line interface for Charterforge.
 
 Provides subcommands for:
 - hermes chat          - Interactive chat (same as ./hermes)

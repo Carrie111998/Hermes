@@ -2,7 +2,7 @@
 
 Employees are not anonymous delegation calls.  They occupy an explicit
 reporting hierarchy, carry time-bounded mandates and capability envelopes, and
-have an auditable employment lifecycle.  Hermes profiles remain the execution
+have an auditable employment lifecycle.  Charterforge profiles remain the execution
 identity; this module is the authoritative organizational identity.
 """
 
@@ -974,7 +974,7 @@ def bootstrap_solo_founder(
     employee_id = propose_employee(
         conn,
         organization_id=org_id,
-        display_name="Hermes",
+        display_name="Charterforge",
         title="Chief Executive Officer",
         level="ceo",
         manager_id=None,

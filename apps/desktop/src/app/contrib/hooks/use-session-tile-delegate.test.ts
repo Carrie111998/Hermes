@@ -1,7 +1,7 @@
 import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type * as HermesModule from '@/hermes'
+import type * as CharterforgeModule from '@/hermes'
 import { setSessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -9,7 +9,7 @@ import type { SessionInfo } from '@/types/hermes'
 import { useSessionTileDelegate } from './use-session-tile-delegate'
 
 vi.mock('@/hermes', async importActual => ({
-  ...(await importActual<typeof HermesModule>()),
+  ...(await importActual<typeof CharterforgeModule>()),
   getSessionMessages: vi.fn(async () => ({ messages: [], session_id: '' }))
 }))
 

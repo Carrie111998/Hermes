@@ -1,4 +1,4 @@
-"""Unified provider-credential lifecycle across every store Hermes reads.
+"""Unified provider-credential lifecycle across every store Charterforge reads.
 
 A provider API key can live in up to THREE stores at once:
 

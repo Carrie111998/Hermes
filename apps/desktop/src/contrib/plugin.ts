@@ -1,6 +1,6 @@
 /**
  * The plugin authoring contract. A plugin is a file that default-exports a
- * `HermesPlugin`; it never touches the registry directly — it receives a
+ * `CharterforgePlugin`; it never touches the registry directly — it receives a
  * scoped `PluginContext` whose `register` auto-tags provenance
  * (`source: 'plugin:<id>'`) and namespaces the contribution id
  * (`<id>:<localId>`), so authors write plain contributions and collisions
@@ -57,7 +57,7 @@ export interface PluginContext {
   i18n: PluginI18n
 }
 
-export interface HermesPlugin {
+export interface CharterforgePlugin {
   /** Stable slug — becomes the `plugin:<id>` source and the id namespace. */
   id: string
   /** Human name for settings / about UI. */

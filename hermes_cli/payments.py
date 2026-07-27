@@ -131,25 +131,38 @@ def _load_rail_group(group: str, expected_type: type) -> dict[str, Any]:
 
 def load_inbound_payment_rails() -> dict[str, InboundPaymentRail]:
     discovered = _load_rail_group(
-        "hermes.inbound_payment_rails", InboundPaymentRail
+        "charterforge.inbound_payment_rails", InboundPaymentRail
     )
-    for name, rail in _load_rail_group("hermes.payment_rails", PaymentRail).items():
-        discovered.setdefault(name, rail)
+    for group, expected_type in (
+        ("charterforge.payment_rails", PaymentRail),
+        ("hermes.inbound_payment_rails", InboundPaymentRail),
+        ("hermes.payment_rails", PaymentRail),
+    ):
+        for name, rail in _load_rail_group(group, expected_type).items():
+            discovered.setdefault(name, rail)
     return discovered
 
 
 def load_outbound_payment_rails() -> dict[str, OutboundPaymentRail]:
     discovered = _load_rail_group(
-        "hermes.outbound_payment_rails", OutboundPaymentRail
+        "charterforge.outbound_payment_rails", OutboundPaymentRail
     )
-    for name, rail in _load_rail_group("hermes.payment_rails", PaymentRail).items():
-        discovered.setdefault(name, rail)
+    for group, expected_type in (
+        ("charterforge.payment_rails", PaymentRail),
+        ("hermes.outbound_payment_rails", OutboundPaymentRail),
+        ("hermes.payment_rails", PaymentRail),
+    ):
+        for name, rail in _load_rail_group(group, expected_type).items():
+            discovered.setdefault(name, rail)
     return discovered
 
 
 def load_payment_rails() -> dict[str, PaymentRail]:
-    """Load legacy dual-direction providers."""
-    return _load_rail_group("hermes.payment_rails", PaymentRail)
+    """Load canonical dual-direction providers plus legacy aliases."""
+    discovered = _load_rail_group("charterforge.payment_rails", PaymentRail)
+    for name, rail in _load_rail_group("hermes.payment_rails", PaymentRail).items():
+        discovered.setdefault(name, rail)
+    return discovered
 
 
 class PaymentService:

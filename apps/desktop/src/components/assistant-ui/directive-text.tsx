@@ -13,13 +13,13 @@ import { useSessionLinkTitle } from '@/lib/session-link-title'
 import { parseSessionRefValue, sessionRefFallbackLabel } from '@/lib/session-refs'
 import { cn } from '@/lib/utils'
 
-const HERMES_REF_TYPES = ['file', 'folder', 'url', 'image', 'tool', 'line', 'terminal', 'session'] as const
-type HermesRefType = (typeof HERMES_REF_TYPES)[number]
+const CHARTERFORGE_REF_TYPES = ['file', 'folder', 'url', 'image', 'tool', 'line', 'terminal', 'session'] as const
+type CharterforgeRefType = (typeof CHARTERFORGE_REF_TYPES)[number]
 
 /** Single source of truth for chip icon glyphs (Tabler outline @ 24×24).
  * Used both by the rendered <DirectiveIcon> and the raw SVG markup the
  * contenteditable composer embeds via `directiveIconSvg`. */
-const ICON_PATHS: Record<HermesRefType, string[]> = {
+const ICON_PATHS: Record<CharterforgeRefType, string[]> = {
   file: [
     'M14 3v4a1 1 0 0 0 1 1h4',
     'M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2',
@@ -52,7 +52,7 @@ const ICON_FALLBACK = ['M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0', 'M16 12v1.5a2.5 2.5
 const SVG_ATTRS =
   'xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"'
 
-const iconPathsFor = (type: string) => ICON_PATHS[type as HermesRefType] ?? ICON_FALLBACK
+const iconPathsFor = (type: string) => ICON_PATHS[type as CharterforgeRefType] ?? ICON_FALLBACK
 
 /** SVG markup string for embedding directly in HTML (composer contenteditable). */
 export function directiveIconSvg(type: string) {
@@ -161,7 +161,7 @@ export const DIRECTIVE_CHIP_CLASS =
  */
 const CANONICAL_DIRECTIVE_RE = /:([\w-]{1,64})\[([^\]\n]{1,1024})\](?:\{name=([^}\n]{1,1024})\})?/g
 
-const HERMES_DIRECTIVE_RE = new RegExp(
+const CHARTERFORGE_DIRECTIVE_RE = new RegExp(
   '@(file|folder|url|image|tool|line|terminal|session):(' +
     '`[^`\\n]+`' +
     '|"[^"\\n]+"' +
@@ -270,14 +270,14 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
       label: match[2] || match[3] || '',
       id: match[3] || match[2] || ''
     })),
-    ...Array.from(text.matchAll(HERMES_DIRECTIVE_RE)).map(match => {
+    ...Array.from(text.matchAll(CHARTERFORGE_DIRECTIVE_RE)).map(match => {
       const id = unwrapRefValue(match[2] || '')
 
       return {
         start: match.index ?? 0,
         end: (match.index ?? 0) + match[0].length,
         type: match[1] || 'file',
-        label: shortLabel(match[1] as HermesRefType, id),
+        label: shortLabel(match[1] as CharterforgeRefType, id),
         id
       }
     }),
@@ -320,7 +320,7 @@ function parseDirectiveText(text: string): Unstable_DirectiveSegment[] {
   return segments
 }
 
-function shortLabel(type: HermesRefType, id: string): string {
+function shortLabel(type: CharterforgeRefType, id: string): string {
   if (type === 'terminal') {
     return id || 'terminal'
   }
@@ -361,7 +361,7 @@ function safeDirectiveSegments(text: string): Unstable_DirectiveSegment[] {
 }
 
 /**
- * Renders text containing Hermes directives (`@file:...`, `@image:...`) as
+ * Renders text containing Charterforge directives (`@file:...`, `@image:...`) as
  * inline chips. Embedded MEDIA images render below as a thumbnail row.
  */
 export function DirectiveContent({ text }: { text: string }) {

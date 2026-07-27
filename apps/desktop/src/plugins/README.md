@@ -1,6 +1,6 @@
 # Bundled plugins
 
-Drop a `<name>/plugin.{ts,tsx}` here that default-exports a `HermesPlugin` and
+Drop a `<name>/plugin.{ts,tsx}` here that default-exports a `CharterforgePlugin` and
 it registers automatically at boot (vite glob in `../contrib/plugins.ts`), with
 the same inventory + live enable/disable contract as runtime plugins.
 
@@ -10,5 +10,5 @@ gateway-pill 1:1 rebuild, the runtime-loader hello world) live in the companion
 repo so the shipped app stays uncluttered.
 
 User- and agent-authored plugins load at runtime from
-`$HERMES_HOME/desktop-plugins/<name>/plugin.js` (the disk door) — see the
+`$CHARTERFORGE_HOME/desktop-plugins/<name>/plugin.js` (the disk door) — see the
 `hermes-desktop-plugins` skill.

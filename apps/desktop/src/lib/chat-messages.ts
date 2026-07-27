@@ -1,5 +1,5 @@
 import type { ThreadMessageLike } from '@assistant-ui/react'
-import type { BillingBlock } from '@hermes/shared'
+import type { BillingBlock } from '@charterforge/shared'
 
 import { extractImageRefs } from '@/lib/embedded-images'
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
@@ -109,7 +109,7 @@ export type GatewayEventPayload = {
   // backend-side and will replay through session.resume's inflight payload.
   recoverable?: boolean
   // Structured billing wall forwarded on message.complete when a turn fails
-  // with FailoverReason.billing (shape mirrors @hermes/shared BillingBlock).
+  // with FailoverReason.billing (shape mirrors @charterforge/shared BillingBlock).
   billing?: BillingBlock
   failure_reason?: string
 }

@@ -17,7 +17,9 @@
 
 set -eu
 
-HERMES_HOME="${HERMES_HOME:-/opt/data}"
+HERMES_HOME="${CHARTERFORGE_HOME:-${HERMES_HOME:-/opt/data}}"
+HERMES_UID="${CHARTERFORGE_UID:-${HERMES_UID:-}}"
+HERMES_GID="${CHARTERFORGE_GID:-${HERMES_GID:-}}"
 INSTALL_DIR="/opt/hermes"
 
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.

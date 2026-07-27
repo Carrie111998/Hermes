@@ -149,11 +149,11 @@ export interface Translations {
     starting: string;
     startedInBackground: string;
     stopped: string;
-    updateHermes: string;
-    updateHermesConfirmMessage?: string;
-    updateHermesConfirmNow?: string;
-    updateHermesConfirmTitle?: string;
-    updatingHermes: string;
+    updateCharterforge: string;
+    updateCharterforgeConfirmMessage?: string;
+    updateCharterforgeConfirmNow?: string;
+    updateCharterforgeConfirmTitle?: string;
+    updatingCharterforge: string;
     waitingForOutput: string;
   };
 

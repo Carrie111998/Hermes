@@ -263,7 +263,7 @@ const CORRECTION_SWITCH_SCRIPT: ScriptedTurn[] = [
 export const CORRECTION_SWITCH_TRIGGER = 'E2E_CORRECTION_SWITCH_TRIGGER'
 
 /**
- * Drives a real code edit followed by two finish attempts. Hermes should add
+ * Drives a real code edit followed by two finish attempts. Charterforge should add
  * its synthetic verify-on-stop continuation after each finish attempt until
  * the bounded verifier gives up. The mock's request capture proves the nudge
  * reached the model; desktop must never render it as chat content.

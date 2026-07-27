@@ -34,19 +34,20 @@ from hermes_cli.config import (
 class TestGetHermesHome:
     def test_default_path(self):
         with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CHARTERFORGE_HOME", None)
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            assert home == Path.home() / ".hermes"
+            assert home == Path.home() / ".charterforge"
 
     def test_env_override(self):
-        with patch.dict(os.environ, {"HERMES_HOME": "/custom/path"}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": "/custom/path"}):
             home = get_hermes_home()
             assert home == Path("/custom/path")
 
 
 class TestEnsureHermesHome:
     def test_creates_subdirs(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             ensure_hermes_home()
             assert (tmp_path / "cron").is_dir()
             assert (tmp_path / "sessions").is_dir()
@@ -54,14 +55,14 @@ class TestEnsureHermesHome:
             assert (tmp_path / "memories").is_dir()
 
     def test_creates_default_soul_md_if_missing(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             ensure_hermes_home()
             soul_path = tmp_path / "SOUL.md"
             assert soul_path.exists()
             assert soul_path.read_text(encoding="utf-8").strip() != ""
 
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"
             soul_path.write_text("custom soul", encoding="utf-8")
             ensure_hermes_home()
@@ -73,7 +74,7 @@ class TestEnsureHermesHome:
         # user persona and should be upgraded in place to DEFAULT_SOUL_MD.
         from hermes_cli.default_soul import DEFAULT_SOUL_MD, _LEGACY_TEMPLATE_SOULS
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"
             soul_path.write_text(_LEGACY_TEMPLATE_SOULS[0] + "\n", encoding="utf-8")
             ensure_hermes_home()
@@ -85,24 +86,24 @@ class TestEnsureHermesHome:
         from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
 
         mixed = _LEGACY_TEMPLATE_SOULS[0] + "\nYou are a helpful pirate."
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"
             soul_path.write_text(mixed, encoding="utf-8")
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == mixed
 
     def test_existing_named_profile_still_bootstraps_subdirs(self, tmp_path):
-        profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+        profile_home = tmp_path / ".charterforge" / "profiles" / "coder"
         profile_home.mkdir(parents=True)
-        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(profile_home)}):
             ensure_hermes_home()
             assert (profile_home / "cron").is_dir()
             assert (profile_home / "sessions").is_dir()
             assert (profile_home / "memories").is_dir()
 
     def test_missing_named_profile_is_not_recreated(self, tmp_path):
-        profile_home = tmp_path / ".hermes" / "profiles" / "coder"
-        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}):
+        profile_home = tmp_path / ".charterforge" / "profiles" / "coder"
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(profile_home)}):
             with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
                 ensure_hermes_home()
         assert not profile_home.exists()
@@ -110,7 +111,7 @@ class TestEnsureHermesHome:
 
 class TestLoadConfigDefaults:
     def test_returns_defaults_when_no_file(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config = load_config()
             assert config["model"] == DEFAULT_CONFIG["model"]
             assert config["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
@@ -120,7 +121,7 @@ class TestLoadConfigDefaults:
             assert config["display"]["interim_assistant_messages"] is True
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config_path = tmp_path / "config.yaml"
             config_path.write_text("max_turns: 42\n")
 
@@ -148,7 +149,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             (tmp_path / "config.yaml").write_text("\tbroken tab indent:\n")
 
             import logging
@@ -175,7 +176,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             (tmp_path / "config.yaml").write_text("\tbroken:\n")
 
             load_config()
@@ -191,7 +192,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             (tmp_path / "config.yaml").write_text("\tbroken:\n")
             load_config()
             capsys.readouterr()  # discard first warning
@@ -213,7 +214,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             broken = "\tmodel: test/custom\nbroken indent:\n"
             (tmp_path / "config.yaml").write_text(broken)
 
@@ -235,7 +236,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             broken = "\tbroken:\n"
             cfg = tmp_path / "config.yaml"
             cfg.write_text(broken)
@@ -257,7 +258,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             real = tmp_path / "real_config.yaml"
             real.write_text("\tbroken:\n")
             link = tmp_path / "config.yaml"
@@ -282,7 +283,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             cfg = tmp_path / "config.yaml"
             cfg.write_text(
                 "model:\n  default: test/custom-model\n"
@@ -312,7 +313,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             cfg = tmp_path / "config.yaml"
             cfg.write_text("model:\n  default: test/first\n")
             assert load_config()["model"]["default"] == "test/first"
@@ -331,7 +332,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             (tmp_path / "config.yaml").write_text("\tbroken:\n")
             # No prior good load for this path in _LAST_EXPANDED_CONFIG_BY_PATH
             cfg_mod._LAST_EXPANDED_CONFIG_BY_PATH.pop(
@@ -347,7 +348,7 @@ class TestLoadConfigParseFailure:
         from hermes_cli import config as cfg_mod
         cfg_mod._CONFIG_PARSE_WARNED.clear()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             cfg = tmp_path / "config.yaml"
             cfg.write_text("model:\n  default: test/custom\n")
             load_config()
@@ -366,7 +367,7 @@ class TestEmptyConfigSections:
     and must not replace the default dict for that section (#58277)."""
 
     def test_null_section_keeps_defaults_in_load_config(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             (tmp_path / "config.yaml").write_text(
                 "model:\n  default: test/custom\n"
                 "terminal:\n"
@@ -402,7 +403,7 @@ class TestSaveAndLoadRoundtrip:
         return fake_open
 
     def test_roundtrip(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config = load_config()
             config["model"] = "test/custom-model"
             config["agent"]["max_turns"] = 42
@@ -421,7 +422,7 @@ class TestSaveAndLoadRoundtrip:
         original = "model: test/original\n"
         config_path.write_text(original, encoding="utf-8")
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             with patch("builtins.open", side_effect=self._deny_config_reads(config_path)):
                 with pytest.raises(RuntimeError, match="Refusing to overwrite"):
                     save_config({"model": "test/replacement"})
@@ -433,7 +434,7 @@ class TestSaveAndLoadRoundtrip:
         original = "model:\n  provider: openrouter\n"
         config_path.write_text(original, encoding="utf-8")
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             with patch("builtins.open", side_effect=self._deny_config_reads(config_path)):
                 with pytest.raises(RuntimeError, match="Refusing to overwrite"):
                     set_config_value("model.provider", "openai")
@@ -469,7 +470,7 @@ class TestSaveAndLoadRoundtrip:
         assert "openrouter" in config_path.read_text(encoding="utf-8")
 
     def test_save_config_normalizes_legacy_root_level_max_turns(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_config({"model": "test/custom-model", "max_turns": 37})
 
             saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -477,7 +478,7 @@ class TestSaveAndLoadRoundtrip:
             assert "max_turns" not in saved
 
     def test_nested_values_preserved(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config = load_config()
             config["terminal"]["timeout"] = 999
             save_config(config)
@@ -486,7 +487,7 @@ class TestSaveAndLoadRoundtrip:
             assert reloaded["terminal"]["timeout"] == 999
 
     def test_write_platform_config_field_coerces_nested_platform_maps(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             (tmp_path / "config.yaml").write_text(
                 "model: test/custom-model\nplatforms: not-a-map\n",
                 encoding="utf-8",
@@ -506,7 +507,7 @@ class TestSaveAndLoadRoundtrip:
 
 class TestSaveEnvValueSecure:
     def test_save_env_value_writes_without_stdout(self, tmp_path, capsys):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_env_value("TENOR_API_KEY", "sk-test-secret")
             captured = capsys.readouterr()
             assert captured.out == ""
@@ -516,7 +517,7 @@ class TestSaveEnvValueSecure:
             assert env_values["TENOR_API_KEY"] == "sk-test-secret"
 
     def test_secure_save_returns_metadata_only(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             result = save_env_value_secure("GITHUB_TOKEN", "ghp_test_secret")
             assert result == {
                 "success": True,
@@ -526,7 +527,7 @@ class TestSaveEnvValueSecure:
             assert "secret" not in str(result).lower()
 
     def test_save_env_value_updates_process_environment(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("TENOR_API_KEY", None)
             save_env_value("TENOR_API_KEY", "sk-test-secret")
             assert os.environ["TENOR_API_KEY"] == "sk-test-secret"
@@ -535,7 +536,7 @@ class TestSaveEnvValueSecure:
         if os.name == "nt":
             return
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_env_value("TENOR_API_KEY", "sk-test-secret")
             env_mode = (tmp_path / ".env").stat().st_mode & 0o777
             assert env_mode == 0o600
@@ -553,7 +554,7 @@ class TestSaveEnvValueSecure:
         env_path.write_text("EXISTING=value\n")
         os.chmod(env_path, 0o640)
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_env_value("TENOR_API_KEY", "sk-test-secret")
 
         env_mode = env_path.stat().st_mode & 0o777
@@ -563,7 +564,7 @@ class TestSaveEnvValueSecure:
         """Regression test for #30355."""
         from dotenv import dotenv_values
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("ANTHROPIC_TOKEN", None)
             token = "sk-ant-oat01-abc#xyz#more"
             save_env_value("ANTHROPIC_TOKEN", token)
@@ -578,7 +579,7 @@ class TestSaveEnvValueSecure:
     def test_save_env_value_hash_value_round_trips_quotes_and_backslashes(self, tmp_path):
         from dotenv import dotenv_values
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("ANTHROPIC_TOKEN", None)
             token = 'abc"def\\ghi#jkl'
             save_env_value("ANTHROPIC_TOKEN", token)
@@ -593,7 +594,7 @@ class TestSaveEnvValueSecure:
     def test_save_env_value_updates_hash_value_with_quotes(self, tmp_path):
         from dotenv import dotenv_values
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("ANTHROPIC_TOKEN", None)
             save_env_value("ANTHROPIC_TOKEN", "old-token")
 
@@ -619,7 +620,7 @@ class TestSaveEnvValueSecure:
         from dotenv import dotenv_values
 
         path = "/Users/paulo/Library/Application Support/hermes/keys/id_ed25519"
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("TERMINAL_SSH_KEY", None)
             save_env_value("TERMINAL_SSH_KEY", path)
 
@@ -654,7 +655,7 @@ class TestSaveEnvValueSecure:
         from dotenv import dotenv_values
 
         value = "left\tright"
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("TABBY_KEY", None)
             save_env_value("TABBY_KEY", value)
 
@@ -685,7 +686,7 @@ class TestSaveEnvValueSecure:
     def test_save_env_value_spaced_path_is_idempotent(self, tmp_path):
         """Saving the same spaced value twice must not grow quotes."""
         path = "/Users/me/Application Support/key"
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("TERMINAL_SSH_KEY", None)
             save_env_value("TERMINAL_SSH_KEY", path)
             first = (tmp_path / ".env").read_text(encoding="utf-8")
@@ -702,7 +703,7 @@ class TestSaveEnvValueSecure:
         from dotenv import dotenv_values
 
         path = "/Users/me/Application Support/key"
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("TERMINAL_SSH_KEY", None)
             save_env_value("TERMINAL_SSH_KEY", path)
             first = (tmp_path / ".env").read_text(encoding="utf-8")
@@ -725,7 +726,7 @@ class TestSaveEnvValueSecure:
         from dotenv import dotenv_values
 
         raw = "line1\nline2\rline3"
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("MULTI_KEY", None)
             save_env_value("MULTI_KEY", raw)
 
@@ -749,7 +750,7 @@ class TestSaveEnvValueSecure:
             "OTHER_KEY=foo123\n",
             encoding="utf-8",
         )
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("NEW_KEY", None)
             os.environ.pop("KEEP_SIMPLE", None)
             save_env_value("NEW_KEY", "bar-simple")
@@ -774,7 +775,7 @@ class TestSaveEnvValueSecure:
             "PLAIN=ok\n"
         )
         env_path.write_text(legacy, encoding="utf-8")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("PLAIN", None)
             save_env_value("PLAIN", "ok2")
 
@@ -795,7 +796,7 @@ class TestSaveEnvValueSecure:
         """
         # User-typed value that already includes surrounding quotes as data.
         raw = '"/Users/me/Application Support/key"'
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}, clear=False):
             os.environ.pop("TERMINAL_SSH_KEY", None)
             save_env_value("TERMINAL_SSH_KEY", raw)
             first = (tmp_path / ".env").read_text(encoding="utf-8")
@@ -817,7 +818,7 @@ class TestRemoveEnvValue:
     def test_removes_key_from_env_file(self, tmp_path):
         env_path = tmp_path / ".env"
         env_path.write_text("KEY_A=value_a\nKEY_B=value_b\nKEY_C=value_c\n")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "KEY_B": "value_b"}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path), "KEY_B": "value_b"}):
             result = remove_env_value("KEY_B")
             assert result is True
             content = env_path.read_text()
@@ -828,21 +829,21 @@ class TestRemoveEnvValue:
     def test_clears_os_environ(self, tmp_path):
         env_path = tmp_path / ".env"
         env_path.write_text("MY_KEY=my_value\n")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "MY_KEY": "my_value"}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path), "MY_KEY": "my_value"}):
             remove_env_value("MY_KEY")
             assert "MY_KEY" not in os.environ
 
     def test_returns_false_when_key_not_found(self, tmp_path):
         env_path = tmp_path / ".env"
         env_path.write_text("OTHER_KEY=value\n")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             result = remove_env_value("MISSING_KEY")
             assert result is False
             # File should be untouched
             assert env_path.read_text() == "OTHER_KEY=value\n"
 
     def test_handles_missing_env_file(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "GHOST_KEY": "ghost"}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path), "GHOST_KEY": "ghost"}):
             result = remove_env_value("GHOST_KEY")
             assert result is False
             # os.environ should still be cleared
@@ -851,7 +852,7 @@ class TestRemoveEnvValue:
     def test_clears_os_environ_even_when_not_in_file(self, tmp_path):
         env_path = tmp_path / ".env"
         env_path.write_text("OTHER=stuff\n")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "ORPHAN_KEY": "orphan"}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path), "ORPHAN_KEY": "orphan"}):
             remove_env_value("ORPHAN_KEY")
             assert "ORPHAN_KEY" not in os.environ
 
@@ -869,7 +870,7 @@ class TestRemoveEnvValue:
         env_path.write_text("KEEP=value\nDROP=gone\n")
         os.chmod(env_path, 0o640)
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "DROP": "gone"}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path), "DROP": "gone"}):
             removed = remove_env_value("DROP")
 
         assert removed is True
@@ -883,7 +884,7 @@ class TestSaveConfigAtomicity:
 
     def test_no_partial_write_on_crash(self, tmp_path):
         """If save_config crashes mid-write, the previous file stays intact."""
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             # Write an initial config
             config = load_config()
             config["model"] = "original-model"
@@ -907,7 +908,7 @@ class TestSaveConfigAtomicity:
 
     def test_no_leftover_temp_files(self, tmp_path):
         """Failed writes must clean up their temp files."""
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config = load_config()
             save_config(config)
 
@@ -923,7 +924,7 @@ class TestSaveConfigAtomicity:
 
     def test_atomic_write_creates_valid_yaml(self, tmp_path):
         """The written file must be valid YAML matching the input."""
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config = load_config()
             config["model"] = "test/atomic-model"
             config["agent"]["max_turns"] = 77
@@ -1046,7 +1047,7 @@ class TestSanitizeEnvLines:
         env_file = tmp_path / ".env"
         env_file.write_text("OPENAI_API_KEY=fixtureGITHUB_TOKEN=inert\n")
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             env = load_env()
 
         assert env == {"OPENAI_API_KEY": "fixtureGITHUB_TOKEN=inert"}
@@ -1058,7 +1059,7 @@ class TestSanitizeEnvLines:
             "ANTHROPIC_API_KEY=sk-antOPENAI_BASE_URL=https://api.openai.com/v1\n"
             "FAL_KEY=existing\n"
         )
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_env_value("MESSAGING_CWD", "/tmp")
 
             content = env_file.read_text()
@@ -1074,7 +1075,7 @@ class TestSanitizeEnvLines:
             "FAL_KEY=good\n"
             "OPENROUTER_API_KEY=valFIRECRAWL_API_KEY=val2\n"
         )
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             fixes = sanitize_env_file()
             assert fixes == 0
 
@@ -1088,7 +1089,7 @@ class TestSanitizeEnvLines:
         """No changes when file is already clean."""
         env_file = tmp_path / ".env"
         env_file.write_text("GOOD_KEY=good\nOTHER_KEY=other\n")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             fixes = sanitize_env_file()
             assert fixes == 0
 
@@ -1215,7 +1216,7 @@ class TestConfigMigrationSecretPrompts:
             lambda name, value: saved.update({name: value}),
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             results = cfg_mod.migrate_config(interactive=True, quiet=True)
 
         assert saved["prompt"] == "  Test API key: "
@@ -1228,19 +1229,19 @@ class TestConfigVersionDetection:
         config_path = tmp_path / "config.yaml"
         config_path.write_text("model: {}\n", encoding="utf-8")
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             assert load_config()["_config_version"] == DEFAULT_CONFIG["_config_version"]
             assert check_config_version() == (0, DEFAULT_CONFIG["_config_version"])
 
     def test_check_config_version_treats_missing_file_as_current(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             latest = DEFAULT_CONFIG["_config_version"]
             assert check_config_version() == (latest, latest)
 
     def test_check_config_version_does_not_migrate_invalid_yaml(self, tmp_path):
         (tmp_path / "config.yaml").write_text("model: [unterminated\n", encoding="utf-8")
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             latest = DEFAULT_CONFIG["_config_version"]
             assert check_config_version() == (latest, latest)
 
@@ -1258,7 +1259,7 @@ class TestAnthropicTokenMigration:
         self._write_config_version(tmp_path, 8)
         (tmp_path / ".env").write_text("ANTHROPIC_TOKEN=old-token\n")
         with patch.dict(os.environ, {
-            "HERMES_HOME": str(tmp_path),
+            "CHARTERFORGE_HOME": str(tmp_path),
             "ANTHROPIC_TOKEN": "old-token",
         }):
             migrate_config(interactive=False, quiet=True)
@@ -1269,7 +1270,7 @@ class TestAnthropicTokenMigration:
         self._write_config_version(tmp_path, 9)
         (tmp_path / ".env").write_text("ANTHROPIC_TOKEN=current-token\n")
         with patch.dict(os.environ, {
-            "HERMES_HOME": str(tmp_path),
+            "CHARTERFORGE_HOME": str(tmp_path),
             "ANTHROPIC_TOKEN": "current-token",
         }):
             migrate_config(interactive=False, quiet=True)
@@ -1306,7 +1307,7 @@ class TestCustomProviderCompatibility:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -1358,7 +1359,7 @@ class TestCustomProviderCompatibility:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             compatible = get_compatible_custom_providers(raw)
@@ -1409,7 +1410,7 @@ class TestCustomProviderCompatibility:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             compatible = get_compatible_custom_providers()
 
         assert len(compatible) == 1
@@ -1454,7 +1455,7 @@ class TestCustomProviderCompatibility:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             compatible = get_compatible_custom_providers()
 
         assert compatible == [
@@ -1491,7 +1492,7 @@ class TestCustomProviderCompatibility:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             compatible = get_compatible_custom_providers()
 
         assert len(compatible) == 1
@@ -1515,7 +1516,7 @@ class TestCustomProviderCompatibility:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             compatible = get_compatible_custom_providers()
 
         assert len(compatible) == 3
@@ -1536,7 +1537,7 @@ class TestInterimAssistantMessageConfig:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             loaded = load_config()
@@ -1574,7 +1575,7 @@ class TestDiscordChannelPromptsConfig:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -1607,7 +1608,7 @@ class TestDiscordChannelPromptsConfig:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -1653,7 +1654,7 @@ class TestEnvWriteDenylist:
 
     @pytest.fixture(autouse=True)
     def _hermes_home(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CHARTERFORGE_HOME", str(tmp_path))
         ensure_hermes_home()
 
     @pytest.mark.parametrize(
@@ -1677,6 +1678,7 @@ class TestEnvWriteDenylist:
             "BROWSER",
             "GIT_SSH_COMMAND",
             "GIT_EXEC_PATH",
+            "CHARTERFORGE_HOME",
             "HERMES_HOME",
             "HERMES_PROFILE",
             "HERMES_CONFIG",
@@ -1761,7 +1763,7 @@ class TestWriteApprovalMigration:
         (tmp_path / "config.yaml").write_text(body)
 
     def test_approve_maps_to_true(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path,
                         "_config_version: 28\nmemory:\n  write_mode: approve\n"
                         "skills:\n  write_mode: approve\n")
@@ -1773,7 +1775,7 @@ class TestWriteApprovalMigration:
             assert "write_mode" not in raw["skills"]
 
     def test_on_and_off_map_to_false(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             # YAML 1.1 parses bare on/off as bools — write_mode could be either
             # the string or the bool; both legacy "not gating" values → False.
             self._write(tmp_path,
@@ -1792,7 +1794,7 @@ class TestWriteApprovalMigration:
             assert loaded["skills"]["write_approval"] is False
 
     def test_unset_key_defaults_to_false(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 28\nmemory:\n  memory_enabled: true\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -1856,7 +1858,7 @@ class TestMigrationWriteInvariant:
             }, sort_keys=False),
             encoding="utf-8",
         )
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             loaded = load_config()
@@ -1900,7 +1902,7 @@ feishu:
   require_mention: true
 """
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_config(
                 {
                     "_config_version": 30,
@@ -1926,7 +1928,7 @@ platforms:
     enabled: true
 """
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_config({"model": {"default": "other-model", "provider": "openrouter"}})
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
 
@@ -1950,7 +1952,7 @@ platforms:
       app_secret: xxx
 """
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config = read_raw_config()
             config.setdefault("agent", {})["verify_on_stop"] = False
             config["_config_version"] = 32
@@ -1980,7 +1982,7 @@ feishu:
   require_mention: true
 """
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
 
@@ -1995,14 +1997,14 @@ class TestVerifyOnStopMigration:
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
 
     def test_auto_sentinel_flipped_to_false(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  verify_on_stop: auto\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert raw["agent"]["verify_on_stop"] is False
 
     def test_missing_key_seeded_false(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  max_turns: 5\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -2010,7 +2012,7 @@ class TestVerifyOnStopMigration:
             assert raw["agent"]["max_turns"] == 5
 
     def test_no_agent_section_seeded_false(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nmodel:\n  provider: openrouter\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -2021,7 +2023,7 @@ class TestVerifyOnStopMigration:
         # as the silent default (config v30). It was never a user choice, so the
         # v31→v32 migration flips it off. v31's block preserved it (the bug this
         # fixes); v32 catches the whole stranded population.
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  verify_on_stop: true\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -2031,7 +2033,7 @@ class TestVerifyOnStopMigration:
         # Teknium's case: a v30 install that already ran the v31 migration kept
         # its baked-in literal `true` (v31 preserved explicit bools). v32 flips
         # it off.
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 31\nagent:\n  verify_on_stop: true\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -2042,7 +2044,7 @@ class TestVerifyOnStopMigration:
         # a deliberate opt-in and must never be flipped.
         from hermes_cli.config import DEFAULT_CONFIG
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
                 f"_config_version: {DEFAULT_CONFIG['_config_version']}\n"
@@ -2053,7 +2055,7 @@ class TestVerifyOnStopMigration:
             assert raw["agent"]["verify_on_stop"] is True
 
     def test_explicit_false_preserved(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  verify_on_stop: false\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -2062,7 +2064,7 @@ class TestVerifyOnStopMigration:
     def test_already_current_version_is_noop(self, tmp_path):
         from hermes_cli.config import DEFAULT_CONFIG
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
                 f"_config_version: {DEFAULT_CONFIG['_config_version']}\n"
@@ -2079,7 +2081,7 @@ class TestDelegationCapUnificationMigration:
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
 
     def test_stale_default_key_removed(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
                 "_config_version: 32\ndelegation:\n  max_async_children: 3\n"
@@ -2092,7 +2094,7 @@ class TestDelegationCapUnificationMigration:
         assert raw["delegation"]["max_concurrent_children"] == 15
 
     def test_raised_async_cap_folded_into_children_cap(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
                 "_config_version: 32\ndelegation:\n  max_async_children: 20\n"
@@ -2104,7 +2106,7 @@ class TestDelegationCapUnificationMigration:
         assert raw["delegation"]["max_concurrent_children"] == 20
 
     def test_higher_children_cap_wins(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
                 "_config_version: 32\ndelegation:\n  max_async_children: 8\n"
@@ -2116,7 +2118,7 @@ class TestDelegationCapUnificationMigration:
         assert raw["delegation"]["max_concurrent_children"] == 15
 
     def test_no_delegation_section_is_noop(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 32\nmodel:\n  provider: openrouter\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -2142,7 +2144,7 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_config(load_config())
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -2162,7 +2164,7 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_config(load_config())
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -2176,7 +2178,7 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_config(load_config())
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -2196,7 +2198,7 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             save_config(load_config())
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -2209,7 +2211,7 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             config = load_config()
             config.setdefault("agent", {})["max_turns"] = DEFAULT_CONFIG["agent"]["max_turns"]
             save_config(config, preserve_keys={("agent", "max_turns")})
@@ -2236,7 +2238,7 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
             encoding="utf-8",
         )
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             raw_paths = _explicit_config_paths(read_raw_config())
 
         assert ("memory", "user_char_limit") in raw_paths
@@ -2257,7 +2259,7 @@ class TestCodexAppServerAutoConfig:
         assert DEFAULT_CONFIG["compression"]["codex_gpt55_autoraise"] is True
 
     def test_preserves_existing_codex_app_server_auto_value(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        with patch.dict(os.environ, {"CHARTERFORGE_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
                 "_config_version: 31\n"
@@ -2326,7 +2328,7 @@ class TestProviderEnabledRuntimeGate:
         }
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.safe_dump(cfg))
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CHARTERFORGE_HOME", str(tmp_path))
         # Bust the in-process config cache so the override picks up.
         from hermes_cli import config as cfg_mod
         cfg_mod._cached_config = None  # type: ignore[attr-defined]
@@ -2350,7 +2352,7 @@ class TestProviderEnabledRuntimeGate:
         }
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.safe_dump(cfg))
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CHARTERFORGE_HOME", str(tmp_path))
         from hermes_cli import config as cfg_mod
         cfg_mod._cached_config = None  # type: ignore[attr-defined]
 
@@ -2372,7 +2374,7 @@ class TestProviderEnabledRuntimeGate:
         }
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.safe_dump(cfg))
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CHARTERFORGE_HOME", str(tmp_path))
         from hermes_cli import config as cfg_mod
         cfg_mod._cached_config = None  # type: ignore[attr-defined]
 

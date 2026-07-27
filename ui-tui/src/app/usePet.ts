@@ -1,4 +1,4 @@
-import { useStdout } from '@hermes/ink'
+import { useStdout } from '@charterforge/ink'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { PetGrid } from '../components/petSprite.js'

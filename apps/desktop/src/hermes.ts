@@ -1,4 +1,4 @@
-import { JsonRpcGatewayClient } from '@hermes/shared'
+import { JsonRpcGatewayClient } from '@charterforge/shared'
 
 import type {
   ActionResponse,
@@ -22,8 +22,8 @@ import type {
   DebugShareResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
-  HermesConfig,
-  HermesConfigRecord,
+  CharterforgeConfig,
+  CharterforgeConfigRecord,
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
@@ -73,7 +73,7 @@ import type {
 // /api/profiles runs list_profiles(), which does a recursive skill-tree walk
 // per profile — so the 15s default (DEFAULT_FETCH_TIMEOUT_MS in hardening.ts)
 // times out a backend that is alive-but-busy, surfacing as a spurious
-// "Timed out connecting to Hermes backend" that hangs the UI (#48504).
+// "Timed out connecting to Charterforge backend" that hangs the UI (#48504).
 //
 // Give the boot burst a generous per-call timeout instead of raising the
 // global default: interactive/runtime calls and the liveness poll (/api/status)
@@ -156,8 +156,8 @@ export type {
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   GatewayReadyPayload,
-  HermesConfig,
-  HermesConfigRecord,
+  CharterforgeConfig,
+  CharterforgeConfigRecord,
   LogsResponse,
   McpCatalogEntry,
   McpCatalogResponse,
@@ -219,13 +219,13 @@ export type {
   WebhooksResponse
 } from '@/types/hermes'
 
-export class HermesGateway extends JsonRpcGatewayClient {
+export class CharterforgeGateway extends JsonRpcGatewayClient {
   constructor() {
     super({
-      closedErrorMessage: 'Hermes gateway connection closed',
-      connectErrorMessage: 'Could not connect to Hermes gateway',
+      closedErrorMessage: 'Charterforge gateway connection closed',
+      connectErrorMessage: 'Could not connect to Charterforge gateway',
       createRequestId: nextId => nextId,
-      notConnectedErrorMessage: 'Hermes gateway is not connected',
+      notConnectedErrorMessage: 'Charterforge gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })
   }
@@ -235,7 +235,7 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // should target. Mirrors $activeGatewayProfile, pushed in from the store via
 // setApiRequestProfile so this module needs no store import (avoids a cycle).
 // Electron main consumes request.profile to pick which backend *process* serves
-// the call; each pooled backend already has its own HERMES_HOME, so no backend
+// the call; each pooled backend already has its own CHARTERFORGE_HOME, so no backend
 // change is needed. Null → primary, so single-profile users are unaffected.
 let _apiProfile: null | string = null
 
@@ -254,7 +254,7 @@ function profileScoped(profile?: null | string): { profile?: string } {
 export interface PluginRestOptions {
   method?: string
   body?: unknown
-  /** Single-file multipart upload (see HermesApiRequest.upload). */
+  /** Single-file multipart upload (see CharterforgeApiRequest.upload). */
   upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
   timeoutMs?: number
 }
@@ -281,7 +281,7 @@ function pluginPathSuffix(caller: string, path: string): string {
  *  declared-capability seam; today the namespace IS the boundary. */
 export async function pluginRest<T>(pluginId: string, path: string, opts: PluginRestOptions = {}): Promise<T> {
   if (!window.hermesDesktop?.api) {
-    throw new Error('Hermes desktop bridge unavailable')
+    throw new Error('Charterforge desktop bridge unavailable')
   }
 
   const suffix = pluginPathSuffix('pluginRest', path)
@@ -678,37 +678,37 @@ export function getLogs(params: {
   })
 }
 
-export function getHermesConfig(profile?: string): Promise<HermesConfig> {
-  return window.hermesDesktop.api<HermesConfig>({
+export function getCharterforgeConfig(profile?: string): Promise<CharterforgeConfig> {
+  return window.hermesDesktop.api<CharterforgeConfig>({
     ...profileScoped(profile),
     path: '/api/config',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
-export function getHermesConfigRecord(): Promise<HermesConfigRecord> {
-  return window.hermesDesktop.api<HermesConfigRecord>({
+export function getCharterforgeConfigRecord(): Promise<CharterforgeConfigRecord> {
+  return window.hermesDesktop.api<CharterforgeConfigRecord>({
     ...profileScoped(),
     path: '/api/config'
   })
 }
 
-export function getHermesConfigDefaults(): Promise<HermesConfigRecord> {
-  return window.hermesDesktop.api<HermesConfigRecord>({
+export function getCharterforgeConfigDefaults(): Promise<CharterforgeConfigRecord> {
+  return window.hermesDesktop.api<CharterforgeConfigRecord>({
     ...profileScoped(),
     path: '/api/config/defaults',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
-export function getHermesConfigSchema(): Promise<ConfigSchemaResponse> {
+export function getCharterforgeConfigSchema(): Promise<ConfigSchemaResponse> {
   return window.hermesDesktop.api<ConfigSchemaResponse>({
     ...profileScoped(),
     path: '/api/config/schema'
   })
 }
 
-export function saveHermesConfig(config: HermesConfigRecord): Promise<{ ok: boolean }> {
+export function saveCharterforgeConfig(config: CharterforgeConfigRecord): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...profileScoped(),
     path: '/api/config',
@@ -969,7 +969,7 @@ export function testMcpServer(name: string): Promise<McpTestResult> {
 }
 
 /** Replace the whole `mcp_servers` map (the mcp.json editor's save). Unlike
- *  `saveHermesConfig`, this REPLACES rather than deep-merges, so deletes,
+ *  `saveCharterforgeConfig`, this REPLACES rather than deep-merges, so deletes,
  *  re-enables (dropping `enabled: false`), and removed nested fields persist. */
 export function saveMcpServers(servers: Record<string, Record<string, unknown>>): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
@@ -1185,7 +1185,7 @@ export function setWebhookEnabled(
   })
 }
 
-// Cron jobs are stored per-profile (<HERMES_HOME>/cron/jobs.json), and the
+// Cron jobs are stored per-profile (<CHARTERFORGE_HOME>/cron/jobs.json), and the
 // backend's list endpoint defaults to 'all'. Pass a concrete profile key to
 // list just that profile's jobs, or 'all' for the unified cross-profile view.
 // Omitting the arg keeps the legacy 'all' default for non-profile callers.
@@ -1465,7 +1465,7 @@ export function restartGateway(): Promise<ActionResponse> {
   })
 }
 
-export function updateHermes(): Promise<ActionResponse> {
+export function updateCharterforge(): Promise<ActionResponse> {
   return window.hermesDesktop.api<ActionResponse>({
     ...profileScoped(),
     path: '/api/hermes/update',
@@ -1476,7 +1476,7 @@ export function updateHermes(): Promise<ActionResponse> {
 /** Query the connected backend's own update state. In remote mode this is the
  *  authoritative source for the backend's behind-count + "what's changed",
  *  distinct from the Electron client clone's git state. */
-export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
+export function checkCharterforgeUpdate(force = false): Promise<BackendUpdateCheckResponse> {
   return window.hermesDesktop.api<BackendUpdateCheckResponse>({
     ...profileScoped(),
     path: `/api/hermes/update/check${force ? '?force=true' : ''}`
@@ -1595,7 +1595,7 @@ export function updateSkillsFromHub(): Promise<ActionResponse> {
 // ---------------------------------------------------------------------------
 // MCP servers — structured list / test / enable toggle / catalog (parity with
 // `hermes mcp` and the dashboard MCP page). Raw JSON editing stays in
-// config.yaml via saveHermesConfig.
+// config.yaml via saveCharterforgeConfig.
 // ---------------------------------------------------------------------------
 
 export function listMcpServers(): Promise<{ servers: McpServerSummary[] }> {

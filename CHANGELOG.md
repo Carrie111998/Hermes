@@ -1,0 +1,34 @@
+# Changelog
+
+All notable independent Charterforge changes are documented here. Upstream
+Hermes Agent history remains available in Git.
+
+## Unreleased
+
+### Added
+
+- Charterforge independent identity, canonical package/CLI/namespace, state
+  root, environment prefix, container/service naming, attribution, and
+  migration documentation.
+- Governed autonomous-company runtime with durable objectives, event-driven
+  progression, deterministic permits, independent verification, recovery, and
+  audit evidence.
+- Founder/CEO organization model with advisor-by-default human role.
+- Solo-founder self-dispatch bound to exact toolset and skill grants.
+- Evidence-based contractor-versus-FTE staffing and enterprise hierarchy.
+- Treasury, accounting, tax-record, compliance, commitment, procurement, and
+  non-custodial payment-rail control surfaces.
+
+### Changed
+
+- Product-specific development is independent and is not intended for
+  submission to the upstream Hermes Agent repository.
+- Legacy Hermes commands, environment variables, paths, and Python modules are
+  migration compatibility surfaces rather than project branding.
+
+### Security
+
+- Governed worker launch and result handoff fail closed when task, mandate,
+  profile, authority, toolset, skill, budget, or expiry evidence differs from
+  the immutable grant.
+
