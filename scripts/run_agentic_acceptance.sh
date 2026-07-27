@@ -19,7 +19,7 @@ uv pip install --python "$artifact_dir/venv/bin/python" \
 docker build --tag charterforge:agentic-acceptance . >/dev/null
 docker run --detach --name "$container_name" \
   -e HERMES_HOME=/opt/data -e CHARTERFORGE_HOME=/opt/data \
-  -v "$state_dir:/opt/data" charterforge:agentic-acceptance sleep infinity >/dev/null
+  -v "$state_dir:/opt/data" charterforge:agentic-acceptance >/dev/null
 
 docker exec "$container_name" python3 \
   /opt/hermes/scripts/agentic_acceptance.py prepare
