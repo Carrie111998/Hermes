@@ -12,6 +12,15 @@ uv run charterforge logs
 Confirm the charter, capital, deadlines, interventions, provider assessments,
 and stop conditions before enabling unattended execution.
 
+For automation and container health checks, use the explicit gate form:
+
+```bash
+uv run charterforge business readiness --check
+```
+
+It emits the same JSON projection and exits `0` only when readiness is true;
+blocked or unconfigured state exits `1` without mutating authority state.
+
 ## Normal escalation
 
 An advisor intervention should include the objective, exact blocker, current

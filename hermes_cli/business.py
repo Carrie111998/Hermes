@@ -30,9 +30,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     parser.add_argument("--db", type=Path)
     sub = parser.add_subparsers(dest="business_command", required=True)
     sub.add_parser("status", help="Show organization, runway, and financial statements")
-    sub.add_parser(
+    readiness = sub.add_parser(
         "readiness",
         help="Show whether autonomous operation is currently admissible (read-only)",
+    )
+    readiness.add_argument(
+        "--check",
+        action="store_true",
+        help="Return non-zero when readiness is blocked (for supervisors/healthchecks)",
     )
     bootstrap = sub.add_parser(
         "bootstrap",
@@ -468,8 +473,9 @@ def business_command(args: argparse.Namespace) -> int:
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0
         if command == "readiness":
-            print(json.dumps(build_business_readiness(conn), indent=2, sort_keys=True))
-            return 0
+            readiness = build_business_readiness(conn)
+            print(json.dumps(readiness, indent=2, sort_keys=True))
+            return 0 if not args.check or readiness.get("ready") else 1
         if command in {"approval-list", "approval-revoke"}:
             from hermes_cli import approval_artifacts
 

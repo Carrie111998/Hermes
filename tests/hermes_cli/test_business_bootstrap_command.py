@@ -151,6 +151,32 @@ def test_business_readiness_is_unconfigured_without_mutation():
     assert readiness["next_step"]["autonomy_started"] is False
 
 
+def test_business_readiness_check_returns_nonzero_when_blocked(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        business,
+        "build_business_readiness",
+        lambda _conn: {"ready": False, "state": "blocked", "blockers": [{"code": "test"}]},
+    )
+    args = _parser().parse_args(
+        ["business", "--db", str(tmp_path / "authority.db"), "readiness", "--check"]
+    )
+    assert business.business_command(args) == 1
+    assert json.loads(capsys.readouterr().out)["ready"] is False
+
+
+def test_business_readiness_check_returns_zero_when_ready(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        business,
+        "build_business_readiness",
+        lambda _conn: {"ready": True, "state": "ready", "blockers": []},
+    )
+    args = _parser().parse_args(
+        ["business", "--db", str(tmp_path / "authority.db"), "readiness", "--check"]
+    )
+    assert business.business_command(args) == 0
+    assert json.loads(capsys.readouterr().out)["ready"] is True
+
+
 def test_business_readiness_reports_authoritative_runtime_blockers(monkeypatch):
     monkeypatch.setattr(
         business,

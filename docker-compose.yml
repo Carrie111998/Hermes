@@ -95,4 +95,10 @@ services:
       - CHARTERFORGE_GID=${CHARTERFORGE_GID:-10000}
       - HERMES_HOME=/opt/data
       - CHARTERFORGE_HOME=/opt/data
+    healthcheck:
+      test: ["CMD-SHELL", "charterforge business readiness --check >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     command: ["objectives", "worker"]
