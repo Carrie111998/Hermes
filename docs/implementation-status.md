@@ -28,6 +28,9 @@ acceptance evidence.
   be amplified through hierarchy or manufactured from a standing mandate.
 - Delegation grants persist the exact action system and target resource, and
   Kanban bindings must match that immutable scope before a worker can launch.
+- Governed browser workers must authorize each browser operation separately
+  against the exact session resource; a navigation grant does not imply click,
+  typing, evaluation, screenshot, or other browser authority.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,

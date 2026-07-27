@@ -1260,6 +1260,33 @@ also passed after this change with image manifest digest
 This proves the local deterministic authority boundary; it does not establish
 production deployment or external-provider authorization.
 
+## Browser interaction authority evidence (dfba76b9a1)
+
+The current tree now applies the same exact-operation contract to browser
+interactions. A governed worker must hold the specific capability (for example
+`browser.type` or `browser.evaluate`) and the exact
+`browser-session:<session>` resource. Browser navigation remains separately
+URL-scoped, so navigation cannot be used to infer interaction authority.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/browser_tool.py tests/tools/test_browser_private_page_action_guard.py
+uv run --extra dev pytest -q \
+  tests/tools/test_browser_private_page_action_guard.py \
+  tests/tools/test_browser_console.py \
+  tests/tools/test_browser_get_images_ssrf.py \
+  tests/tools/test_browser_snapshot_ssrf.py \
+  tests/tools/test_browser_type_redaction.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **79 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:e8a1e5e4d1e375fe1172e92257126337d6748719a15936458370c3ccffec8050`.
+This remains deterministic local-provider evidence and does not establish
+production browser-provider isolation or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
