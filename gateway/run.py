@@ -13208,6 +13208,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
+        _history_media_paths = _collect_history_media_paths(history)
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
