@@ -1180,6 +1180,10 @@ export interface Translations {
     failedUpdate: (name: string) => string
     failedSave: (name: string) => string
     failedClear: (key: string) => string
+    configScope: (profile: string) => string
+    configScopeDefault: string
+    saveScopeTitle: (name: string) => string
+    saveScopeBody: (profile: string) => string
     fieldCopy: Record<string, { label?: string; help?: string; placeholder?: string }>
     platformIntro: Record<string, string>
   }

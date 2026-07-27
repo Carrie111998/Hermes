@@ -1144,6 +1144,11 @@ export const ar = defineLocale({
     failedUpdate: name => `فشل تحديث ${name}`,
     failedSave: name => `فشل حفظ ${name}`,
     failedClear: key => `فشل مسح ${key}`,
+    configScope: profile => `جارٍ الإعداد لملف ${profile}`,
+    configScopeDefault: 'جارٍ الإعداد لملف التعريف الافتراضي',
+    saveScopeTitle: name => `حفظ ${name} لهذا الملف؟`,
+    saveScopeBody: profile =>
+      `سيؤدي هذا إلى كتابة إعدادات المراسلة (config.yaml / .env) لملف ${profile === 'default' ? 'الافتراضي' : `«${profile}»`}. لن يؤثر على ملفات التعريف الأخرى.`,
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'رمز البوت (token)',

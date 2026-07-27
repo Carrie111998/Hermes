@@ -1236,6 +1236,11 @@ export const zhHant = defineLocale({
     failedUpdate: name => `更新 ${name} 失敗`,
     failedSave: name => `儲存 ${name} 失敗`,
     failedClear: key => `清除 ${key} 失敗`,
+    configScope: profile => `正在為設定檔 ${profile} 設定`,
+    configScopeDefault: '正在為預設設定檔設定',
+    saveScopeTitle: name => `為此設定檔儲存 ${name}？`,
+    saveScopeBody: profile =>
+      `這會寫入${profile === 'default' ? '預設' : `「${profile}」`}設定檔的訊息平台設定（config.yaml / .env），不會影響其他設定檔。`,
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'Bot Token',

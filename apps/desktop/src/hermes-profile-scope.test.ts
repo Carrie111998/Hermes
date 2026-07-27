@@ -4,11 +4,14 @@ import {
   checkHermesUpdate,
   getActionStatus,
   getMemoryProviderConfig,
+  getMessagingPlatforms,
   getStatus,
   restartGateway,
   saveMemoryProviderConfig,
   setApiRequestProfile,
-  updateHermes
+  testMessagingPlatform,
+  updateHermes,
+  updateMessagingPlatform
 } from './hermes'
 
 // Contract: every backend-targeted action helper must carry the active gateway
@@ -58,5 +61,22 @@ describe('backend action helpers are profile-scoped', () => {
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('coder')
     }
+  })
+
+  it('forwards the active profile to messaging read + write (Telegram config scoping, #72031)', () => {
+    setApiRequestProfile('casa')
+
+    void getMessagingPlatforms()
+    void updateMessagingPlatform('telegram', { env: { TELEGRAM_BOT_TOKEN: 'x' } })
+    void updateMessagingPlatform('telegram', { enabled: true })
+    void testMessagingPlatform('telegram')
+
+    for (const call of api.mock.calls) {
+      expect(call[0].profile).toBe('casa')
+    }
+
+    // The Telegram token write must reach the profile's backend, not default.
+    const saveCall = api.mock.calls.find(call => call[0].path?.includes('/api/messaging/platforms/telegram'))
+    expect(saveCall?.[0].profile).toBe('casa')
   })
 })

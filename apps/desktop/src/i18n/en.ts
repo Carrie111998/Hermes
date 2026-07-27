@@ -1339,6 +1339,15 @@ export const en: Translations = {
     failedUpdate: name => `Failed to update ${name}`,
     failedSave: name => `Failed to save ${name}`,
     failedClear: key => `Failed to clear ${key}`,
+    // Profile scope indicator + save confirmation (#72031): the Telegram bot
+    // token / platform config is written to the active profile's HERMES_HOME,
+    // so the UI must make that target explicit and confirm before mutating it.
+    configScope: profile => `Configuring for profile: ${profile}`,
+    configScopeDefault: 'Configuring for the default profile',
+    saveScopeTitle: name => `Save ${name} for this profile?`,
+    saveScopeBody: profile =>
+      `This writes the ${profile === 'default' ? 'default' : `“${profile}”`} profile's messaging config (config.yaml / .env). ` +
+      `It will not affect other profiles.`,
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'Bot token',

@@ -1269,6 +1269,11 @@ export const ja = defineLocale({
     failedUpdate: name => `${name} の更新に失敗しました`,
     failedSave: name => `${name} の保存に失敗しました`,
     failedClear: key => `${key} のクリアに失敗しました`,
+    configScope: profile => `プロファイル ${profile} の設定中`,
+    configScopeDefault: 'デフォルトプロファイルの設定中',
+    saveScopeTitle: name => `このプロファイルに ${name} を保存しますか？`,
+    saveScopeBody: profile =>
+      `これは${profile === 'default' ? 'デフォルト' : `「${profile}」`}プロファイルのメッセージング設定（config.yaml / .env）に書き込みます。他のプロファイルには影響しません。`,
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'ボットトークン',

@@ -1533,6 +1533,11 @@ export const zh: Translations = {
     failedUpdate: name => `更新 ${name} 失败`,
     failedSave: name => `保存 ${name} 失败`,
     failedClear: key => `清除 ${key} 失败`,
+    configScope: profile => `正在为配置文件 ${profile} 配置`,
+    configScopeDefault: '正在为默认配置文件配置',
+    saveScopeTitle: name => `为此配置文件保存 ${name}？`,
+    saveScopeBody: profile =>
+      `这将写入${profile === 'default' ? '默认' : `“${profile}”`}配置文件的消息平台配置（config.yaml / .env），不会影响其他配置文件。`,
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'Bot 令牌',
