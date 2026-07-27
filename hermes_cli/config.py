@@ -951,6 +951,12 @@ DEFAULT_CONFIG = {
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
         "gateway_timeout": 1800,
+        # Session stall watchdog (seconds): when a gateway session has a
+        # pending inbound message AND the running agent has not updated its
+        # activity clock for this long, log a WARNING and notify the user to
+        # try /new. Distinct from gateway_timeout (which kills the turn) and
+        # gateway_notify_interval ("still working" heartbeats). 0 = disable.
+        "session_stall_timeout": 300,
         # Graceful drain timeout for gateway stop/restart (seconds).
         # The gateway stops accepting new work, waits for running agents
         # to finish, then interrupts any remaining runs after the timeout.
