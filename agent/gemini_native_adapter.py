@@ -282,8 +282,8 @@ def _translate_tool_result_to_gemini(
     tool_name_by_call_id = tool_name_by_call_id or {}
     tool_call_id = str(message.get("tool_call_id") or "")
     name = str(
-        message.get("name")
-        or tool_name_by_call_id.get(tool_call_id)
+        tool_name_by_call_id.get(tool_call_id)
+        or message.get("name")
         or tool_call_id
         or "tool"
     )
