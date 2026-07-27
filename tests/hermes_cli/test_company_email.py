@@ -289,3 +289,15 @@ def test_autonomous_email_cycle_requires_permit_and_provider_readback(tmp_path):
     ).fetchone()
     assert verification["verdict"] == "pass"
     assert "provider_readback" in verification["evidence_json"]
+
+
+def test_schema_check_does_not_commit_active_authority_transaction():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    company_email.ensure_schema(conn)
+    conn.execute("CREATE TABLE authority_sentinel (value TEXT NOT NULL)")
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO authority_sentinel(value) VALUES ('uncommitted')")
+    company_email.ensure_schema(conn)
+    conn.rollback()
+    assert conn.execute("SELECT * FROM authority_sentinel").fetchall() == []

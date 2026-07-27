@@ -144,6 +144,32 @@ class AgentMailProvider:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    # Email admission and recording run beside permits and audit lineage.
+    # Avoid ``executescript`` while an authority transaction is active because
+    # SQLite would otherwise commit that transaction implicitly.
+    if conn.in_transaction:
+        required_tables = {
+            "company_email_operations",
+            "company_email_suppressions",
+        }
+        required_triggers = {
+            "company_email_operations_immutable_update",
+            "company_email_operations_immutable_delete",
+        }
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        triggers = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        if required_tables <= tables and required_triggers <= triggers:
+            return
     conn.executescript(SCHEMA_SQL)
 
 
