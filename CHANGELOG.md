@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The provider recovery acceptance now covers inbound receivable creation and
+  read-back settlement alongside outbound uncertain-action recovery, proving
+  idempotent bi-directional money movement at the deterministic rail boundary.
 - The current-tree acceptance now asserts that event-driven CEO progress creates
   at least two durable plan versions, proving replanning rather than repeated
   execution of one in-memory plan.

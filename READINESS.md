@@ -318,6 +318,19 @@ settles the payment exactly once. The recorded result was:
 provider recovery acceptance: PASS
 ```
 
+At current-main commit `b62b11b4f6`, the provider recovery acceptance also
+proved the inbound rail contract in the same restarted process boundary:
+
+```text
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 500}
+provider recovery acceptance: PASS
+```
+
+This demonstrates deterministic inbound receivable creation, read-back
+settlement, accounting balance increase, and idempotent retry. It remains local
+non-custodial provider-adapter evidence, not live Stripe, bank, card, or
+stablecoin settlement proof.
+
 Image ID: `sha256:ee59306e2257eb3e2a4267d5146dfa996bba75d36a78d4a51a7b580d4875d278`.
 
 ## Release gates that remain open

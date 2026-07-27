@@ -44,6 +44,9 @@ acceptance evidence.
 - The current-tree acceptance asserts durable plan-version growth across the
   externally triggered and scheduled cycles, making replanning observable in
   authoritative state.
+- The provider recovery acceptance covers both outbound uncertain-action
+  convergence and inbound receivable settlement with accounting balance and
+  idempotent retry assertions.
 - Planner/provider rate-limit failures are classified explicitly, persisted in
   the durable event retry state with bounded backoff, honor SDK attributes,
   `Retry-After`, and rate-limit reset headers, and recover on a later tick
