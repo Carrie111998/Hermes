@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
+import io
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -248,3 +251,110 @@ class TestCheckSystemdTimingAlignment:
         # for whatever unit pytest IS in.  Both are valid; we just ensure
         # the function doesn't raise.
         assert result is None or isinstance(result, dict)
+
+
+# ---------------------------------------------------------------------------
+# check_systemd_timing_alignment — manager selection for system-managed units
+#
+# Regression coverage for: `systemctl show <unit>` NEVER errors for a unit
+# that isn't loaded under the manager you queried — it returns rc=0 plus
+# systemd's compiled-in template defaults (LoadState=not-found,
+# TimeoutStopUSec=1min 30s).  The gateway is frequently installed as a
+# *system*-managed unit (/etc/systemd/system/hermes-gateway-*.service,
+# confirmed live on aerodeck with real TimeoutStopSec overrides), but the
+# lookup queried `--user` first and treated its rc=0 "answer" as real,
+# so it never reached the system manager where the actual override lives.
+# ---------------------------------------------------------------------------
+
+class TestCheckSystemdTimingAlignmentManagerSelection:
+    @staticmethod
+    def _patch_cgroup(monkeypatch, unit_name):
+        """Redirect the hardcoded '/proc/self/cgroup' read to fake content."""
+        cgroup_content = f"0::/system.slice/{unit_name}\n"
+        real_open = builtins.open
+
+        def _opener(path, *args, **kwargs):
+            if str(path) == "/proc/self/cgroup":
+                return io.StringIO(cgroup_content)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(sf, "open", _opener, raising=False)
+
+    def test_uses_real_system_override_not_user_managers_not_found_default(
+        self, monkeypatch
+    ):
+        """The unit is a system-managed unit with a real TimeoutStopSec=240
+        override (mirrors hermes-apiserver-henry.service on aerodeck, which
+        carries a `TimeoutStopSec=240` drop-in). The --user manager doesn't
+        have this unit loaded and reports the generic 90s default with
+        rc=0 — that must be rejected in favour of the system manager's real
+        (loaded) value.
+        """
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        self._patch_cgroup(monkeypatch, "hermes-gateway-henry-chief-of-staff.service")
+
+        def fake_run(cmd, **kwargs):
+            is_user = "--user" in cmd
+            stdout = (
+                "LoadState=not-found\nTimeoutStopUSec=1min 30s\n"
+                if is_user
+                else "LoadState=loaded\nTimeoutStopUSec=4min\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        result = sf.check_systemd_timing_alignment(drain_timeout=180.0)
+
+        assert result is not None
+        assert result["timeout_stop_sec"] == 240.0
+        assert result["mismatch"] is False  # 240s >= 180s + 30s headroom
+
+    def test_genuinely_unmanaged_unit_is_not_falsely_flagged_as_mismatched(
+        self, monkeypatch
+    ):
+        """False-positive control: a unit that is genuinely NOT loaded under
+        either manager (both report LoadState=not-found) must come back
+        `None` ("can't determine") — never a manufactured mismatch built
+        from systemd's generic template default.
+        """
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        self._patch_cgroup(monkeypatch, "totally-unmanaged-process.service")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="LoadState=not-found\nTimeoutStopUSec=1min 30s\n", stderr=""
+            )
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        result = sf.check_systemd_timing_alignment(drain_timeout=180.0)
+
+        assert result is None
+
+    def test_unit_genuinely_loaded_under_user_manager_is_accepted_directly(
+        self, monkeypatch
+    ):
+        """Control: when the --user query genuinely finds the unit loaded
+        with a fine timeout, it's accepted without needlessly falling
+        through to the system manager.
+        """
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        self._patch_cgroup(monkeypatch, "hermes-gateway-desktop-session.service")
+
+        def fake_run(cmd, **kwargs):
+            is_user = "--user" in cmd
+            stdout = (
+                "LoadState=loaded\nTimeoutStopUSec=3min\n"
+                if is_user
+                else "LoadState=not-found\nTimeoutStopUSec=1min 30s\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        result = sf.check_systemd_timing_alignment(drain_timeout=120.0)
+
+        assert result is not None
+        assert result["timeout_stop_sec"] == 180.0
+        assert result["mismatch"] is False
