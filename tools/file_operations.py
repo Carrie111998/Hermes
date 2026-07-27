@@ -1689,7 +1689,11 @@ class ShellFileOperations(FileOperations):
         removed lines are treated as a local precondition; context lines are
         used only to relocate/disambiguate the target and are never written
         back. Adds/deletes/moves are intentionally left to V4A for now.
-        """
+
+ All preconditions are validated before any file is written. If a
+ write fails mid-way, already-written files are rolled back to their
+ original content, preserving all-or-nothing semantics.
+ """
         from tools import verified_patch_core as vp
         from tools.patch_parser import OperationType, parse_v4a_patch
 
@@ -1788,10 +1792,14 @@ class ShellFileOperations(FileOperations):
         combined_diff_parts: List[str] = []
         last_lsp: Optional[str] = None
         last_lint: Optional[Dict[str, Any]] = None
+        written: List[str] = []
         for path, new_content in staged.items():
             content = resolved[path]
             write_result = self.write_file(path, new_content)
             if write_result.error:
+                # Rollback: restore already-written files to original content.
+                for prev_path in written:
+                    self.write_file(prev_path, resolved[prev_path])
                 return PatchResult(error=write_result.error)
             combined_diff_parts.append(self._unified_diff(content, new_content, path))
             lint_result = self._check_lint_delta(
@@ -1801,6 +1809,7 @@ class ShellFileOperations(FileOperations):
                 last_lint = lint_result.to_dict()
             last_lsp = write_result.lsp_diagnostics or last_lsp
             files_modified.append(path)
+            written.append(path)
 
         return PatchResult(
             success=True,
