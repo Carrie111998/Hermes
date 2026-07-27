@@ -856,6 +856,23 @@ This remains deterministic local-provider evidence and does not establish
 production provider credentials, corporate readiness, or legal/compliance
 certification.
 
+After making CEO compatibility alias resolution fail closed on ambiguous
+organization state, the acceptance was rerun on current `main` commit
+`5314c7aa6b74d8db3d61137436a8d2d3419d9a07` with:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+Result: **current-tree agentic acceptance: PASS**. Install/bootstrap,
+readiness gating, bounded CEO execution, process-separated delegation,
+uncertain provider read-back, inbound tax settlement, durable restart
+recovery, and master-stop fencing passed. The acceptance image digest was
+`sha256:ca1ddbd6ddd7620a44b0f57dbbe540ad121233882f8807d2b721329e9b927dd5`.
+This remains deterministic local-provider evidence and does not establish
+production provider credentials, corporate readiness, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
