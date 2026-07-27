@@ -421,6 +421,9 @@ def build_business_readiness(conn) -> dict:
         }
 
     blockers: list[dict[str, Any]] = []
+    from hermes_cli.config import load_config
+
+    charter = load_config().get("agentic") or {}
     autonomy = snapshot.get("autonomy") or {}
     if autonomy.get("mode") != "autonomous":
         blockers.append(
@@ -461,6 +464,31 @@ def build_business_readiness(conn) -> dict:
                 "category": item.get("category"),
             }
         )
+    capabilities = {
+        str(value) for value in (charter.get("allowed_capabilities") or [])
+    }
+    required_directions = set()
+    if "payments.receive" in capabilities:
+        required_directions.add("inbound")
+    if "payments.send" in capabilities:
+        required_directions.add("outbound")
+    if required_directions:
+        rails = payments.payment_rail_status()
+        for direction in sorted(required_directions):
+            available = [
+                item for item in rails.get(direction, []) if item.get("available")
+            ]
+            if not available:
+                blockers.append(
+                    {
+                        "code": "payment_rail_unavailable",
+                        "summary": (
+                            f"No credential-ready {direction} payment rail is available"
+                        ),
+                        "direction": direction,
+                        "discovered": rails.get(direction, []),
+                    }
+                )
     return {
         "ready": not blockers,
         "state": "ready" if not blockers else "blocked",

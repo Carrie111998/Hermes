@@ -13,6 +13,8 @@
   block.
 - Added the read-only `business readiness` projection with explicit blocker
   codes and no implicit autonomy or provider side effects.
+- Readiness now fails closed when a charter declares inbound or outbound
+  payment capabilities without a credential-ready rail in that direction.
 
 ## 0.19.0-agentic-foundation — 2026-07-27
 

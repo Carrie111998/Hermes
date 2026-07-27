@@ -139,3 +139,38 @@ def test_business_readiness_reports_authoritative_runtime_blockers(monkeypatch):
         "runtime_drift_blocked",
         "advisor_intervention_open",
     ]
+
+
+def test_business_readiness_blocks_declared_payments_without_ready_rail(monkeypatch):
+    monkeypatch.setattr(
+        business,
+        "build_business_snapshot",
+        lambda _conn: {
+            "configured": True,
+            "organization": {"id": "org-payments"},
+            "autonomy": {"mode": "autonomous"},
+            "runtime_deployment": {
+                "ready": True,
+                "selected_host": "standalone",
+                "expected_roles": ["objective-runtime"],
+            },
+            "runtime_drift": {"blocked": False},
+            "interventions": [],
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agentic": {"allowed_capabilities": ["payments.receive"]}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.payments.payment_rail_status",
+        lambda: {"inbound": [], "outbound": []},
+    )
+    readiness = business.build_business_readiness(sqlite3.connect(":memory:"))
+    assert readiness["ready"] is False
+    assert readiness["blockers"] == [{
+        "code": "payment_rail_unavailable",
+        "summary": "No credential-ready inbound payment rail is available",
+        "direction": "inbound",
+        "discovered": [],
+    }]
