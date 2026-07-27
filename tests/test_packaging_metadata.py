@@ -71,6 +71,19 @@ _UPDATE_DOWNGRADE_GUARD_FLOORS = {
     "cryptography": (48, 0, 1),
     "starlette": (1, 3, 1),
     "python-multipart": (0, 0, 32),
+    "pillow": (12, 3, 0),
+    "mcp": (1, 28, 1),
+    "httplib2": (0, 32, 0),
+    "pyasn1": (0, 6, 4),
+    "pytest": (9, 0, 3),
+    "setuptools": (83, 0, 0),
+}
+_LOCK_ONLY_SECURITY_FLOORS = {
+    # These transitives already have compatible parent ranges, so a lock
+    # refresh is sufficient; guard the resolved graph without inventing a
+    # direct application dependency.
+    "pydantic-settings": (2, 14, 2),
+    "pygments": (2, 20, 0),
 }
 
 
@@ -180,6 +193,21 @@ def test_update_cve_pins_do_not_downgrade_reviewed_current_versions():
             f"uv.lock resolves {package} version(s) {locked_below_floor} below "
             f"the reviewed anti-downgrade floor {'.'.join(map(str, floor))}; "
             "regenerate uv.lock after bumping the pin"
+        )
+
+
+def test_lock_only_security_floors_remain_patched():
+    """Compatible transitives must not regress when the lock is refreshed."""
+    for package, floor in _LOCK_ONLY_SECURITY_FLOORS.items():
+        versions = _locked_versions(package)
+        assert versions, f"{package} is missing from uv.lock"
+        below_floor = sorted(
+            version for version in versions
+            if _version_tuple(version) < floor
+        )
+        assert not below_floor, (
+            f"uv.lock resolves {package} version(s) {below_floor} below the "
+            f"reviewed security floor {'.'.join(map(str, floor))}"
         )
 
 
