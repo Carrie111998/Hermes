@@ -245,3 +245,6 @@ recorded.
 - `c9a151ab9ec3588336aecd0ff99ccc1d773bb3fc` — bound budget reservation
   retries to the original account, objective, action, amount, and currency,
   rejecting rebinding of an existing spend authorization.
+- `f1ec869d5280f9ba33d5822d4f23e1d655432237` — scoped advisor-intervention
+  action and dedupe replays to their organization, rejecting cross-tenant
+  escalation collisions.
