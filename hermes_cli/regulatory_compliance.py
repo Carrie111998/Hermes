@@ -203,6 +203,11 @@ def assess_applicability(
         raise ValueError("applicability verdict must be applicable or not_applicable")
     if not rationale or not evidence or expires_at <= int(time.time()):
         raise ComplianceGateError("applicability requires rationale, evidence, and expiry")
+    regime = conn.execute(
+        "SELECT status FROM compliance_regimes WHERE id=?", (regime_id,)
+    ).fetchone()
+    if regime is None or str(regime["status"]) != "active":
+        raise ComplianceGateError("applicability requires an active known regime")
     assessment_id = f"applicability_{uuid.uuid4().hex}"
     with conn:
         conn.execute(
@@ -263,6 +268,11 @@ def register_obligation(
 ) -> str:
     if not name or not required_control or not evidence:
         raise ValueError("obligation requires name, control, and source evidence")
+    regime = conn.execute(
+        "SELECT status FROM compliance_regimes WHERE id=?", (regime_id,)
+    ).fetchone()
+    if regime is None or str(regime["status"]) != "active":
+        raise ComplianceGateError("obligation requires an active known regime")
     obligation_id = f"obligation_{uuid.uuid4().hex}"
     with conn:
         conn.execute(

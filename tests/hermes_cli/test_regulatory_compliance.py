@@ -28,6 +28,36 @@ def test_relevant_unassessed_regime_blocks_action():
         )
 
 
+def test_compliance_records_reject_unknown_or_inactive_regimes():
+    conn = connection()
+    future = int(time.time()) + 3600
+    with pytest.raises(compliance.ComplianceGateError, match="active known"):
+        compliance.assess_applicability(
+            conn,
+            organization_id="org_1",
+            regime_id="not-a-regime",
+            verdict="applicable",
+            rationale="unknown source",
+            evidence={"review": "x"},
+            assessed_by="advisor:legal",
+            expires_at=future,
+        )
+    conn.execute(
+        "UPDATE compliance_regimes SET status='retired' WHERE id='casl'"
+    )
+    with pytest.raises(compliance.ComplianceGateError, match="active known"):
+        compliance.register_obligation(
+            conn,
+            organization_id="org_1",
+            regime_id="casl",
+            name="Retired regime obligation",
+            action_tags=[],
+            required_control="control.retired",
+            effective_from=1,
+            evidence={"source": "stale"},
+        )
+
+
 def test_applicable_regime_requires_mapped_control_and_current_evidence():
     conn = connection()
     future = int(time.time()) + 3600
