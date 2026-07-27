@@ -5,7 +5,6 @@ import hashlib
 import logging
 import ntpath
 import os
-import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -35,6 +34,87 @@ def _decode_ssh_output(data: bytes) -> str:
     except (UnicodeDecodeError, LookupError):
         pass
     return data.decode("latin-1")
+
+
+def _quote_pwsh_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _snapshot_mutex_name(snapshot_path: str) -> str:
+    digest = hashlib.sha256(snapshot_path.encode("utf-8")).hexdigest()[:16]
+    return f"HermesSnapshot_{digest}"
+
+
+def _with_snapshot_mutex(mutex_name: str, body: str, *,
+                         on_timeout: str) -> str:
+    return (
+        "$script:__hm=[System.Threading.Mutex]::new("
+        f"$false,{_quote_pwsh_string(mutex_name)});"
+        "$script:__hl=$false;try{try{"
+        "$script:__hl=$script:__hm.WaitOne(5000)"
+        "}catch [System.Threading.AbandonedMutexException]{"
+        "$script:__hl=$true};if($script:__hl){"
+        f"{body}"
+        "}else{"
+        f"{on_timeout}"
+        "}}finally{if($script:__hl){$script:__hm.ReleaseMutex()};"
+        "$script:__hm.Dispose()}"
+    )
+
+
+def _atomic_snapshot_publish(temp_path: str, snapshot_path: str,
+                             mutex_name: str, *,
+                             raise_on_failure: bool) -> str:
+    cleanup = (
+        "Remove-Item -Force -ErrorAction SilentlyContinue "
+        "-LiteralPath $script:__ht"
+    )
+    failure = cleanup
+    timeout_failure = cleanup
+    if raise_on_failure:
+        failure += (
+            "; throw ('failed to publish Hermes environment snapshot: ' + "
+            "$script:__he.Exception.Message)"
+        )
+        timeout_failure += "; throw 'timed out waiting for snapshot lock'"
+
+    publish = (
+        "$script:__ho=$false;for($script:__ha=0;"
+        "$script:__ha -lt 20 -and -not $script:__ho;"
+        "$script:__ha++){try{if([System.IO.File]::Exists($script:__hs)){"
+        "[System.IO.File]::Replace($script:__ht,$script:__hs,"
+        "[System.Management.Automation.Language.NullString]::Value)"
+        "}else{[System.IO.File]::Move($script:__ht,$script:__hs)};"
+        "$script:__ho=$true}catch{$script:__he=$_;"
+        "Start-Sleep -Milliseconds 10}};"
+        f"if(-not $script:__ho){{{failure}}}"
+    )
+    return (
+        f"$script:__ht={temp_path};$script:__hs={snapshot_path};"
+        "$script:__he=$null;" + _with_snapshot_mutex(
+            mutex_name,
+            publish,
+            on_timeout=timeout_failure,
+        )
+    )
+
+
+def _snapshot_write_command(temp_path: str, publish: str, *,
+                            raise_on_failure: bool) -> str:
+    cleanup = (
+        "Remove-Item -Force -ErrorAction SilentlyContinue "
+        f"-LiteralPath {temp_path}"
+    )
+    if raise_on_failure:
+        cleanup += ";throw"
+    return (
+        "try{Get-ChildItem Env:|ForEach-Object{"
+        "$val=$_.Value -replace \"'\",\"''\";"
+        "\"`$env:$($_.Name) = '$val'\"}|"
+        "Set-Content -Encoding UTF8 -ErrorAction Stop "
+        f"-LiteralPath {temp_path};{publish}"
+        f"}}catch{{{cleanup}}}"
+    )
 
 
 class SSHPwshEnvironment(SSHEnvironment):
@@ -265,15 +345,22 @@ class SSHPwshEnvironment(SSHEnvironment):
 
     def _wrap_command(self, command: str, cwd: str) -> str:
         escaped = command.replace("'", "''")
-        _quoted_snap = shlex.quote(self._snapshot_path)
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$PID"
+        _quoted_snap = _quote_pwsh_string(self._snapshot_path)
+        _snap_tmp = f"({_quote_pwsh_string(self._snapshot_path + '.tmp.')} + $PID)"
+        _snapshot_mutex = _snapshot_mutex_name(self._snapshot_path)
 
         parts = []
 
         if self._snapshot_ready:
-            parts.append(f". {_quoted_snap} 2>$null")
+            parts.append(
+                _with_snapshot_mutex(
+                    _snapshot_mutex,
+                    f". {_quoted_snap} 2>$null",
+                    on_timeout="",
+                )
+            )
 
-        parts.append(f"Set-Location -LiteralPath {shlex.quote(cwd)}")
+        parts.append(f"Set-Location -LiteralPath {_quote_pwsh_string(cwd)}")
         parts.append("if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit 126 }")
 
         parts.append(f"Invoke-Expression '{escaped}'")
@@ -281,17 +368,19 @@ class SSHPwshEnvironment(SSHEnvironment):
 
         if self._snapshot_ready:
             # Atomic snapshot replacement (issue #38249): write to a
-            # per-writer temp file, then Move-Item -Force so concurrent
-            # source() calls never read a half-written snapshot.
+            # per-writer temp file, then atomically replace the live file so
+            # concurrent source() calls see the old or new complete snapshot.
             parts.append(
-                "Get-ChildItem Env: | ForEach-Object { "
-                "$val = $_.Value -replace \"'\", \"''\"; "
-                "\"`$env:$($_.Name) = '$val'\" "
-                f"}} | Set-Content -Encoding UTF8 {_snap_tmp}"
-            )
-            parts.append(
-                f"try {{ Move-Item -Force {_snap_tmp} {_quoted_snap} }} "
-                f"catch {{ Remove-Item -Force {_snap_tmp} -ErrorAction SilentlyContinue }}"
+                _snapshot_write_command(
+                    _snap_tmp,
+                    _atomic_snapshot_publish(
+                        _snap_tmp,
+                        _quoted_snap,
+                        _snapshot_mutex,
+                        raise_on_failure=False,
+                    ),
+                    raise_on_failure=False,
+                )
             )
 
         parts.append(
@@ -302,13 +391,22 @@ class SSHPwshEnvironment(SSHEnvironment):
         return "\n".join(parts)
 
     def init_session(self):
-        _quoted_cwd = shlex.quote(self.cwd)
-        _quoted_snap = shlex.quote(self._snapshot_path)
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$PID"
+        _quoted_cwd = _quote_pwsh_string(self.cwd)
+        _quoted_snap = _quote_pwsh_string(self._snapshot_path)
+        _snap_tmp = f"({_quote_pwsh_string(self._snapshot_path + '.tmp.')} + $PID)"
+        _snapshot_mutex = _snapshot_mutex_name(self._snapshot_path)
 
         bootstrap_parts = [
-            f"Get-ChildItem Env: | ForEach-Object {{ $val = $_.Value -replace \"'\", \"''\"; \"`$env:$($_.Name) = '$val'\" }} | Set-Content -Encoding UTF8 {_snap_tmp}",
-            f"Move-Item -Force {_snap_tmp} {_quoted_snap}",
+            _snapshot_write_command(
+                _snap_tmp,
+                _atomic_snapshot_publish(
+                    _snap_tmp,
+                    _quoted_snap,
+                    _snapshot_mutex,
+                    raise_on_failure=True,
+                ),
+                raise_on_failure=True,
+            ),
             f"Set-Location -LiteralPath {_quoted_cwd}",
             f'Write-Output "`n{self._cwd_marker}$((Get-Location).Path){self._cwd_marker}"',
         ]
@@ -319,6 +417,11 @@ class SSHPwshEnvironment(SSHEnvironment):
                                   timeout=self._snapshot_timeout)
             result = self._wait_for_process(proc,
                                             timeout=self._snapshot_timeout)
+            if result.get("returncode") != 0:
+                raise RuntimeError(
+                    "snapshot bootstrap failed with exit code "
+                    f"{result.get('returncode')}"
+                )
             self._snapshot_ready = True
             self._update_cwd(result)
             logger.info(

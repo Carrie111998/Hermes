@@ -1,7 +1,6 @@
 """Tests for PowerShell command wrapping in ssh_pwsh backend."""
 
 import base64
-import shlex
 import shutil
 import subprocess
 from unittest.mock import MagicMock
@@ -10,7 +9,13 @@ import pytest
 
 from tools.environments import ssh as ssh_env
 from tools.environments import ssh_pwsh as ssh_pwsh_env
-from tools.environments.ssh_pwsh import SSHPwshEnvironment
+from tools.environments.ssh_pwsh import (
+    SSHPwshEnvironment,
+    _atomic_snapshot_publish,
+    _quote_pwsh_string,
+    _snapshot_mutex_name,
+    _with_snapshot_mutex,
+)
 
 
 def _mock_completed(stdout=b"", stderr=b"", returncode=0):
@@ -63,6 +68,7 @@ class TestWrapCommand:
         wrapped = env._wrap_command("dir", "C:\\")
         assert ". " in wrapped
         assert "hermes-snap-" in wrapped
+        assert "WaitOne(5000)" in wrapped
 
     def test_no_source_when_snapshot_not_ready(self, env):
         env._snapshot_ready = False
@@ -77,21 +83,25 @@ class TestWrapCommand:
         wrapped = env._wrap_command("dir", "C:\\")
         assert "exit $script:__hermes_ec" in wrapped
 
-    def test_snapshot_update_uses_unique_temp_and_atomic_move(self, env):
+    def test_snapshot_update_uses_unique_temp_and_atomic_publish(self, env):
         env._snapshot_ready = True
 
         wrapped = env._wrap_command("dir", "C:\\")
 
-        temp_path = shlex.quote(env._snapshot_path + ".tmp.")
-        live_path = shlex.quote(env._snapshot_path)
-        assert f"{temp_path}$PID" in wrapped
-        assert f"Move-Item -Force {temp_path}$PID {live_path}" in wrapped
-        assert wrapped.index("Set-Content") < wrapped.index("Move-Item -Force")
+        temp_path = _quote_pwsh_string(env._snapshot_path + ".tmp.")
+        assert f"({temp_path} + $PID)" in wrapped
+        assert "[System.IO.File]::Replace(" in wrapped
+        assert "[System.IO.File]::Move(" in wrapped
+        assert "Start-Sleep -Milliseconds 10" in wrapped
+        assert wrapped.index("Set-Content") < wrapped.index("[System.IO.File]::Replace")
         set_content_lines = [
             line for line in wrapped.splitlines() if "Set-Content" in line
         ]
         assert len(set_content_lines) == 1
-        assert f"Set-Content -Encoding UTF8 {temp_path}$PID" in set_content_lines[0]
+        assert "Set-Content -Encoding UTF8 -ErrorAction Stop" in set_content_lines[0]
+        assert f"-LiteralPath ({temp_path} + $PID)" in set_content_lines[0]
+        encoded = env._encode_pwsh_command(wrapped)
+        assert len("pwsh -NoProfile -EncodedCommand ") + len(encoded) < 8191
 
     def test_session_bootstrap_uses_atomic_snapshot_replacement(
         self, env, monkeypatch
@@ -112,16 +122,49 @@ class TestWrapCommand:
         env.init_session()
 
         bootstrap = captured["command"]
-        temp_path = shlex.quote(env._snapshot_path + ".tmp.")
-        live_path = shlex.quote(env._snapshot_path)
-        assert f"{temp_path}$PID" in bootstrap
-        assert f"Move-Item -Force {temp_path}$PID {live_path}" in bootstrap
-        assert bootstrap.index("Set-Content") < bootstrap.index("Move-Item -Force")
+        temp_path = _quote_pwsh_string(env._snapshot_path + ".tmp.")
+        assert f"({temp_path} + $PID)" in bootstrap
+        assert "[System.IO.File]::Replace(" in bootstrap
+        assert "[System.IO.File]::Move(" in bootstrap
+        assert "Start-Sleep -Milliseconds 10" in bootstrap
+        assert bootstrap.index("Set-Content") < bootstrap.index("[System.IO.File]::Replace")
+
+    def test_session_bootstrap_failure_leaves_snapshot_not_ready(
+        self, env, monkeypatch
+    ):
+        monkeypatch.setattr(env, "_run_bash", lambda *args, **kwargs: MagicMock())
+        monkeypatch.setattr(
+            env,
+            "_wait_for_process",
+            lambda *args, **kwargs: {"output": "", "returncode": 1},
+        )
+        env._snapshot_ready = True
+
+        env.init_session()
+
+        assert env._snapshot_ready is False
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh required")
 def test_concurrent_writers_never_publish_partial_snapshot(tmp_path):
     snapshot = str(tmp_path / "hermes-snapshot.ps1").replace("'", "''")
+    mutex_name = _snapshot_mutex_name(str(tmp_path / "hermes-snapshot.ps1"))
+    publish = _atomic_snapshot_publish(
+        "$temp", "$snapshot", mutex_name, raise_on_failure=True
+    )
+    read_snapshot = _with_snapshot_mutex(
+        mutex_name,
+        """$lines = @(Get-Content -ErrorAction Stop -LiteralPath $snapshot)
+$begin = $lines[0] -replace '^BEGIN-', ''
+$end = $lines[2] -replace '^END-', ''
+if ($lines.Count -ne 3 -or
+    $lines[0] -notmatch '^BEGIN-' -or
+    $lines[2] -notmatch '^END-' -or
+    $begin -ne $end) {
+    throw 'snapshot contained a partial write'
+}""",
+        on_timeout="throw 'snapshot read lock timed out'",
+    )
     script = rf"""
 $ErrorActionPreference = 'Stop'
 $snapshot = '{snapshot}'
@@ -132,36 +175,25 @@ $jobs = 1..4 | ForEach-Object {{
     Start-Job -ScriptBlock {{
         param($snapshot, $writer)
         1..40 | ForEach-Object {{
+{read_snapshot}
             $temp = $snapshot + '.tmp.' + $PID
             @(
                 "BEGIN-$writer-$_",
                 ('x' * 20000),
                 "END-$writer-$_"
             ) | Set-Content -Encoding UTF8 -LiteralPath $temp
-            Move-Item -Force -LiteralPath $temp -Destination $snapshot
+{publish}
             Start-Sleep -Milliseconds 1
         }}
     }} -ArgumentList $snapshot, $writer
 }}
-$valid = $true
-$readCount = 0
-while (@($jobs | Where-Object State -eq 'Running').Count -gt 0) {{
-    $lines = @(Get-Content -LiteralPath $snapshot)
-    $readCount++
-    $begin = $lines[0] -replace '^BEGIN-', ''
-    $end = $lines[2] -replace '^END-', ''
-    if ($lines.Count -ne 3 -or
-        $lines[0] -notmatch '^BEGIN-' -or
-        $lines[2] -notmatch '^END-' -or
-        $begin -ne $end) {{
-        $valid = $false
-        break
-    }}
-}}
 $jobs | Wait-Job | Out-Null
-$jobs | Receive-Job | Out-Null
+$jobs | Receive-Job -ErrorAction Stop | Out-Null
 $jobs | Remove-Job -Force
-if (-not $valid -or $readCount -eq 0) {{ exit 1 }}
+$lines = @(Get-Content -ErrorAction Stop -LiteralPath $snapshot)
+$begin = $lines[0] -replace '^BEGIN-', ''
+$end = $lines[2] -replace '^END-', ''
+if ($lines.Count -ne 3 -or $begin -ne $end) {{ exit 1 }}
 """
 
     result = subprocess.run(
@@ -172,6 +204,100 @@ if (-not $valid -or $readCount -eq 0) {{ exit 1 }}
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh required")
+def test_publish_failure_is_bounded_and_cleans_temp(tmp_path):
+    temp = str(tmp_path / "snapshot.tmp").replace("'", "''")
+    destination = str(tmp_path / "destination").replace("'", "''")
+    (tmp_path / "destination").mkdir()
+
+    for raise_on_failure, expected_code in ((False, 7), (True, 1)):
+        mutex_name = _snapshot_mutex_name(destination)
+        publish = _atomic_snapshot_publish(
+            "$temp",
+            "$snapshot",
+            mutex_name,
+            raise_on_failure=raise_on_failure,
+        )
+        script = rf"""
+$temp = '{temp}'
+$snapshot = '{destination}'
+Set-Content -Encoding UTF8 -LiteralPath $temp -Value 'complete'
+$script:__hermes_ec = 7
+{publish}
+if (${str(raise_on_failure).lower()}) {{ exit 0 }}
+exit $script:__hermes_ec
+"""
+
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.returncode == expected_code, result.stderr
+        assert not (tmp_path / "snapshot.tmp").exists()
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh required")
+def test_publish_lock_timeout_cleans_temp(tmp_path):
+    temp = str(tmp_path / "snapshot.tmp").replace("'", "''")
+    snapshot = str(tmp_path / "snapshot.ps1").replace("'", "''")
+    mutex_name = _snapshot_mutex_name(str(tmp_path / "snapshot.ps1"))
+    publish = _atomic_snapshot_publish(
+        "$temp", "$snapshot", mutex_name, raise_on_failure=True
+    )
+    script = rf"""
+$mutex = [System.Threading.Mutex]::new(
+    $false, {_quote_pwsh_string(mutex_name)}
+)
+$mutex.WaitOne() | Out-Null
+try {{
+    $job = Start-Job -ScriptBlock {{
+        param($temp, $snapshot)
+        Set-Content -Encoding UTF8 -LiteralPath $temp -Value 'complete'
+{publish}
+    }} -ArgumentList '{temp}', '{snapshot}'
+    $job | Wait-Job | Out-Null
+    $state = $job.State
+    $job | Receive-Job -ErrorAction SilentlyContinue | Out-Null
+    $job | Remove-Job -Force
+    Write-Output "STATE=$state TEMP=$(Test-Path -LiteralPath '{temp}')"
+}} finally {{
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
+    Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath '{temp}'
+}}
+"""
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert "STATE=Failed TEMP=False" in result.stdout
+    assert not (tmp_path / "snapshot.tmp").exists()
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh required")
+def test_snapshot_assembly_failure_preserves_user_exit_code(env, tmp_path):
+    env._snapshot_path = str(tmp_path / "missing" / "snapshot.ps1")
+    env._snapshot_ready = True
+    wrapped = env._wrap_command("$global:LASTEXITCODE = 7", str(tmp_path))
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", wrapped],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 7, result.stderr
+    assert not list(tmp_path.glob("**/*.tmp.*"))
 
 
 class TestRunBash:
