@@ -4,10 +4,42 @@ import json
 import pytest
 
 from tools.cronjob_tools import (
+    _authorize_cron_action,
     _scan_cron_prompt,
     check_cronjob_requirements,
     cronjob,
 )
+
+
+def test_cron_authorization_is_operation_and_job_scoped(monkeypatch):
+    calls = []
+
+    def record(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", record
+    )
+
+    _authorize_cron_action("run", job_id="job-123")
+
+    assert calls == [("cron.run", "scheduler", "cron-job:job-123")]
+
+
+def test_cron_mutation_denial_happens_before_job_store(monkeypatch):
+    def reject(*_args, **_kwargs):
+        raise RuntimeError("scheduler authority denied")
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", reject
+    )
+
+    result = json.loads(
+        cronjob(action="create", prompt="Check", schedule="every 1h")
+    )
+
+    assert result["success"] is False
+    assert "scheduler authority denied" in result["error"]
 
 
 # =========================================================================

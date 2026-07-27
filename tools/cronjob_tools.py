@@ -16,6 +16,31 @@ from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
 
+
+def _authorize_cron_action(
+    action: str,
+    *,
+    job_id: Optional[str] = None,
+    name: Optional[str] = None,
+    schedule: Optional[str] = None,
+) -> None:
+    """Authorize one scheduler mutation against one exact job resource."""
+    if action == "list":
+        return
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    canonical_action = "run" if action in {"run_now", "trigger"} else action
+    if job_id:
+        target = f"cron-job:{job_id}"
+    else:
+        seed = str(name or schedule or "").strip()
+        target = f"cron-create:{seed}"
+    authorize_worker_action(
+        capability=f"cron.{canonical_action}",
+        system="scheduler",
+        target_resource=target,
+    )
+
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -688,6 +713,9 @@ def cronjob(
         if normalized == "create":
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
+            _authorize_cron_action(
+                "create", name=name, schedule=schedule,
+            )
             canonical_skills = _canonical_skills(skill, skills)
             _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
@@ -806,6 +834,9 @@ def cronjob(
             )
         # Resolve to canonical ID (supports name-based lookup)
         job_id = job["id"]
+
+        if normalized in {"remove", "pause", "resume", "run", "run_now", "trigger", "update"}:
+            _authorize_cron_action(normalized, job_id=job_id)
 
         if normalized == "remove":
             removed = remove_job(job_id)
