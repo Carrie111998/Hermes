@@ -244,6 +244,65 @@ When the user's distro is **not** Debian/Ubuntu, map to the RHEL/CentOS column. 
 
 ## Phase 3: Score & Report
 
+### Deterministic Scoring Rubric
+
+Each check has an exact, machine-verifiable pass/fail condition. For subjective
+checks (C7, C14, C15), the agent must prompt the user for judgment and record
+the answer as part of the JSON state. This ensures repeated runs on the same
+state produce identical results.
+
+| Check | Weight | Pass condition (exact) | Fail condition |
+|-------|--------|----------------------|----------------|
+| C1 Port | 5 pts | `grep -E '^Port\s+' /etc/ssh/sshd_config` returns a number ≠ 22 | No Port line or Port 22 |
+| C2 PasswordAuth | 5 pts | `grep -E '^PasswordAuthentication\s+'` returns `no` | Returns `yes` or line absent with `yes` override |
+| C3 RootLogin | 5 pts | `grep -E '^PermitRootLogin\s+'` returns `no` | Returns `yes` or `prohibit-password` or absent |
+| C4 Keys | 5 pts | `authorized_keys` exists AND has ≥ 1 line | File missing or empty |
+| C5 Protocol | 5 pts | `grep -E '^Protocol\s+1'` returns no match | Protocol 1 present |
+| C6 Firewall | 9 pts | `ufw status` → `active` OR `firewall-cmd --state` → running OR iptables rules exist | No firewall detected |
+| C7 Open ports | 9 pts | User confirms all exposed ports are expected | Any unexpected port marked by user |
+| C8 Local bind | 7 pts | No WARN for 6379/5432/3306/27017/11211 on 0.0.0.0 | Any WARN |
+| C9 Security updates | 5 pts | Count of pending security updates = 0 | Count > 0 |
+| C10 Shadow | 5 pts | `stat -c '%a' /etc/shadow` = 600 or 640 | Any other value or permission error |
+| C11 Sticky bit | 5 pts | `stat -c '%a' /tmp` starts with `1` | Doesn't start with `1` |
+| C12 npm | 5 pts | Global package count ≤ 10 | Count > 10 |
+| C13 Empty pwd | 7 pts | No output from `/etc/shadow` scan | Any user with empty password (skip if no sudo) |
+| C14 Sudo group | 7 pts | User confirms all sudo members are authorized | Any unauthorized user flagged by user |
+| C15 Failed logins | 6 pts | `lastb` count < 10 | Count ≥ 10 |
+| C16 fail2ban | 4 pts | `systemctl is-active fail2ban` → `active` | Any other status or service not found |
+| C17 Auto-updates | 3 pts | `unattended-upgrades` installed (Debian) or `dnf-automatic` (RHEL) | Neither installed |
+| C18 Logging | 3 pts | `rsyslog` active OR `journalctl -n 1` returns output | Neither works |
+
+**Total possible: 100 pts**
+
+The scoring algorithm:
+```python
+DIMENSIONS = {
+    "SSH Security":       {"weight": 25, "checks": [5, 5, 5, 5, 5]},
+    "Network & Firewall": {"weight": 25, "checks": [9, 9, 7]},
+    "System Hardening":   {"weight": 20, "checks": [5, 5, 5, 5]},
+    "User Privileges":    {"weight": 20, "checks": [7, 7, 6]},
+    "Operational Security":{"weight": 10, "checks": [4, 3, 3]},
+}
+
+composite = 0
+for dim_name, dim in DIMENSIONS.items():
+    raw_score = sum(pts for pts, r in zip(dim["checks"], dim_results[dim_name]) if r == "pass")
+    max_possible = sum(dim["checks"])
+    dim_pct = round(raw_score / max_possible * 100)
+    weighted = dim_pct * dim["weight"] / 100
+    composite += weighted
+composite = round(composite)
+```
+
+For **subjective checks** (C7, C14, C15):
+- The agent must prompt the user with the data
+- Record user's response as the pass/fail value
+- Include the prompt and response in the report for reproducibility
+
+For **unrunnable checks** (C13 without sudo):
+- Record as `unable` — award 0 pts, note in coverage
+- `max_possible` stays unchanged to honestly reflect incomplete coverage
+
 Calculate the composite score:
 
 ```python
