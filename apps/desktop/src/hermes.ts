@@ -445,8 +445,15 @@ export interface SidebarSessionSlice {
 
 /** Which profiles filled their per-profile window in a returned page. The
  *  legacy per-slice endpoint doesn't report this, so derive it from the rows:
- *  a profile at (or over) the cap still has more on disk. */
+ *  a profile at (or over) the cap still has more on disk.
+ *
+ *  The backend combines all profiles' sessions then globally truncates to cap,
+ *  so a single profile's window may be under the cap even when the *total*
+ *  returned rows hit it — meaning every profile in the result is truncated,
+ *  not just the ones whose individual count reached cap. Check the global
+ *  total first. */
 function profilesTruncatedFrom(sessions: SessionInfo[], cap: number): Record<string, boolean> {
+  const globalTruncated = sessions.length >= cap
   const counts = new Map<string, number>()
 
   for (const session of sessions) {
@@ -455,7 +462,7 @@ function profilesTruncatedFrom(sessions: SessionInfo[], cap: number): Record<str
     counts.set(key, (counts.get(key) ?? 0) + 1)
   }
 
-  return Object.fromEntries([...counts].map(([name, count]) => [name, count >= cap]))
+  return Object.fromEntries([...counts].map(([name, count]) => [name, globalTruncated || count >= cap]))
 }
 
 export interface SidebarSessionsResponse {
