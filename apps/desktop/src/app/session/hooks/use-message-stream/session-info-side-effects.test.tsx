@@ -193,6 +193,10 @@ describe('session.info cwd-follow guard', () => {
 
     await mountStream()
 
+    // Prime lastCwdInfoSessionRef with an initial session.info — on a genuine
+    // move the ref was already set by a prior event establishing the session.
+    await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/foo' })
+
     // Genuine move — cwd changes from one non-empty path to another. Must follow.
     await sessionInfo(ACTIVE_SID, { cwd: '/Users/test/projects/bar' })
 
