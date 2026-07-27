@@ -130,6 +130,26 @@ class TestV4aParserParity:
         body = "*** Update File: outside\n*** Begin Patch\n*** End Patch\n"
         assert _extract_file_mutation_targets("patch", {"mode": "patch", "patch": body}) == []
 
+    def test_dispatched_failure_without_targets_fails_closed(self):
+        from agent.file_mutation_verifier import _UNKNOWN_MUTATION_TARGET
+
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
+        verifier.reset_turn(1)
+        body = "*** Update File: outside\n*** Begin Patch\n*** End Patch\n"
+        fail = json.dumps({"error": "Could not apply patch"})
+        verifier.record_tool_outcome(
+            tool_name="patch",
+            effective_args={"mode": "patch", "patch": body},
+            effective_task_id="default",
+            raw_result=fail,
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=True,
+            turn_generation=1,
+        )
+        failed = verifier.finalize_failed_dict()
+        assert _UNKNOWN_MUTATION_TARGET in failed
+        assert "Could not apply patch" in failed[_UNKNOWN_MUTATION_TARGET]["error_preview"]
+
 
 class TestPathSafety:
     @pytest.mark.skipif(__import__("sys").platform != "win32", reason="DOS device paths")

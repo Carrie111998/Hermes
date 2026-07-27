@@ -45,6 +45,9 @@ _GENERIC_FOOTER_FALLBACK = (
     "this turn. Run `git status` or `read_file` to confirm."
 )
 
+# Dispatched failures with no parseable path still fail closed in the footer.
+_UNKNOWN_MUTATION_TARGET = "(unknown file-mutation target)"
+
 _FOOTER_INJECTION_RE = re.compile(
     r"(?im)^\s*(MEDIA:|FILE:|ATTACHMENT:|\!\[).*$"
 )
@@ -184,6 +187,25 @@ class TurnFileMutationVerifier:
             return
         targets = _extract_file_mutation_targets(tool_name, effective_args)
         if not targets:
+            if dispatch is DispatchTriState.DISPATCHED_NO_RESULT:
+                self._upsert_unresolved(
+                    tool_name=tool_name,
+                    raw_path=_UNKNOWN_MUTATION_TARGET,
+                    task_id=effective_task_id,
+                    error_preview="tool dispatch finished without a result",
+                    baseline=None,
+                )
+                return
+            if dispatch is DispatchTriState.DISPATCHED:
+                raw_landed = file_mutation_result_landed(tool_name, raw_result)
+                if model_is_error or not raw_landed:
+                    self._upsert_unresolved(
+                        tool_name=tool_name,
+                        raw_path=_UNKNOWN_MUTATION_TARGET,
+                        task_id=effective_task_id,
+                        error_preview=_extract_error_preview(raw_result),
+                        baseline=None,
+                    )
             return
 
         if dispatch is DispatchTriState.DISPATCHED_NO_RESULT:
@@ -431,7 +453,7 @@ def _path_allowed_for_observation(path: str) -> bool:
     if not path or not isinstance(path, str):
         return False
     p = path.strip()
-    if not p:
+    if not p or p == _UNKNOWN_MUTATION_TARGET:
         return False
     lower = p.lower()
     if lower.startswith("\\\\.\\") or lower.startswith("\\\\?\\"):
