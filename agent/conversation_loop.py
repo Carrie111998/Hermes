@@ -1090,7 +1090,18 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    # ``+ refunded`` is what makes refund() mean anything. The budget is built
+    # as IterationBudget(max_iterations), so both halves of this condition
+    # start equal and advance together; refunding only raised
+    # ``budget.remaining`` while api_call_count kept climbing, so the left half
+    # always hit the wall first and execute_code turns ate the budget anyway.
+    # Bounded by IterationBudget.max_refunds (half the budget), so this cannot
+    # become an unbounded turn.
+    while (
+        (api_call_count < agent.max_iterations + agent.iteration_budget.refunded
+         and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+    ):
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)

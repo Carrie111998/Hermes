@@ -3582,7 +3582,17 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Daemon workers, not the stdlib pool. The inactivity watchdog below
+        # abandons this future on timeout — but a plain ThreadPoolExecutor's
+        # workers are non-daemon AND registered in
+        # concurrent.futures.thread._threads_queues, so `shutdown(wait=False)`
+        # returns immediately while BOTH the interpreter's non-daemon join and
+        # _python_exit still wait for the wedged agent turn. The job was marked
+        # failed and the process then hung on the very thread the watchdog
+        # existed to escape. tools/daemon_pool solves exactly this.
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        _cron_pool = DaemonThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
