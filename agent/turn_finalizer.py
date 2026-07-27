@@ -27,6 +27,12 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 
+# Turn-exit reasons that mean the turn CRASHED rather than finished.
+# Module-level because delegate_tool needs the same list: a crashed child still
+# produces a non-empty apology as its final_response, so anything deriving
+# success from "there is output" reports the crash as a completion.
+CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
+
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
@@ -74,7 +80,6 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
 # Exported as a predicate rather than duplicated at each call site: the finalizer
 # and delegate_tool must agree on what "crashed" means, and two copies of a
 # prefix tuple drift the moment a new exit reason is added.
-_CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
 
 
 def turn_crashed(turn_exit_reason) -> bool:
@@ -84,7 +89,7 @@ def turn_crashed(turn_exit_reason) -> bool:
     failures is an intentional early exit the operator opts into, and it is
     test-locked as a completed turn.
     """
-    return str(turn_exit_reason or "").startswith(_CRASH_EXIT_PREFIXES)
+    return str(turn_exit_reason or "").startswith(CRASH_EXIT_PREFIXES)
 
 
 def finalize_turn(
@@ -214,24 +219,25 @@ def finalize_turn(
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
 
-    # H-01: the outer-loop exception handler (conversation_loop.py:6659-6672)
-    # writes an apology into ``final_response`` and breaks WITHOUT setting
-    # ``failed`` — which is set at exactly one place in that whole loop. A crash
-    # therefore satisfied every clause below and reported success: cron marked
-    # the job "ok" (it only pattern-matches ``max_iterations_reached(``), and
-    # delegate_tool handed the parent ``status="completed"`` for work that never
-    # happened. The finalizer is the single point every break path flows
-    # through, so the correction belongs here rather than in each handler.
+    # A crash exit is NOT a completion. conversation_loop.py:6659-6672 handles
+    # both crash paths by writing an apology into final_response and breaking —
+    # without setting ``failed``. (`failed = True` appears exactly once in that
+    # 6698-line loop, at :1582, for an unrelated Ollama branch.) Every
+    # ingredient of the old expression was therefore satisfied on a crash, and
+    # the turn reported completed=True: cron/scheduler.py marked the job "ok"
+    # and delegate_task handed the parent exit_reason="completed" for work that
+    # died mid-way. cron's own comment assumed run_agent set failed=True here;
+    # it never did.
     #
-    # Scoped to genuine crashes on purpose. ``guardrail_halt`` also arrives
-    # without ``failed``, and the ledger proposed bundling it in, but a hard
-    # stop after N identical tool failures is an intentional early exit that the
-    # operator opts into — it stays "completed" and is test-locked as such.
-    _crashed = turn_crashed(_turn_exit_reason)
+    # Guardrail halts are deliberately NOT included. That path is a bounded,
+    # test-locked stop with its own reporting, and treating it as failure would
+    # change documented behaviour rather than fix a defect.
+    crashed = turn_crashed(_turn_exit_reason)
+
     completed = (
         final_response is not None
         and not failed
-        and not _crashed
+        and not crashed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response

@@ -190,8 +190,17 @@ SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "
     "skill with skill_manage so you can reuse it next time.\n"
-    "When using a skill and finding it outdated, incomplete, or wrong, "
-    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
+    # This block is injected AFTER the identity slot, so it is read as the more
+    # specific and more actionable instruction. It therefore must not contradict
+    # the identity's rules. It previously said "patch it immediately ... don't
+    # wait to be asked", which is a verbatim negation of profiles that classify
+    # skills as procedural memory and require a gated change path (validate →
+    # canary → independent reviewer → rollback, human approval). With no runtime
+    # gate covering skill_manage, the injected text simply won.
+    "When using a skill and finding it outdated, incomplete, or wrong, get it "
+    "fixed rather than working around it — using skill_manage(action='patch') "
+    "where that is appropriate, and following whatever review or approval "
+    "discipline this project or profile defines for changes to skills. "
     "Skills that aren't maintained become liabilities.\n"
     "\n"
     "## Skill Safety Rule\n"

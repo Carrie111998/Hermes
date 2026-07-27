@@ -167,3 +167,73 @@ def test_operator_opt_out_disables_even_a_supported_route():
     """The override must work in both directions, including over Nous Portal."""
     assert _gate("https://inference-api.nousresearch.com/v1", "nous", None) is True
     assert _gate("https://inference-api.nousresearch.com/v1", "nous", False) is False
+
+
+# ── acceptance is not proof of effect ────────────────────────────────────────
+
+def test_opt_in_sending_is_not_reported_as_proof_of_effect():
+    """A route can accept reasoning_effort and ignore it.
+
+    Probing this profile's LiteLLM router (2026-07-27) returned HTTP 200 for
+    every effort level while reasoning-token medians stayed non-monotonic
+    (minimal 56.5 > high 51.0 > control 53.5 > low 37.0, n=4 each) and the
+    control with no field at all already produced reasoning. Reporting "IS
+    sent" without that caveat would recreate the silent over-claim this module
+    exists to prevent.
+    """
+    status = describe(
+        configured="high", supported=True, provider="custom:litellm",
+        base_url="http://127.0.0.1:4000/v1", override=True,
+    )
+    assert status["will_be_sent"] is True
+    assert status["reason"], "opt-in must carry the acceptance-vs-effect caveat"
+    assert "not proof of effect" in status["reason"]
+
+
+def test_auto_detected_route_carries_no_caveat():
+    """Only the operator opt-in path is unverified; auto-detected routes are
+    ones Hermes already knows honor the field."""
+    status = describe(
+        configured="high", supported=True, provider="openrouter",
+        base_url="https://openrouter.ai/api/v1", override=None,
+    )
+    assert status["reason"] is None
+
+
+# ── Bedrock (H-17) ───────────────────────────────────────────────────────────
+
+def test_bedrock_reports_effort_as_not_sent_rather_than_dropping_it_silently():
+    """H-17: the bedrock_converse request builder has no reasoning parameter.
+
+    chat_completion_helpers passes model/messages/tools/max_tokens/region/
+    guardrail_config to the transport and nothing else, and the transport's
+    build_kwargs accepts no reasoning argument, so a configured effort never
+    reaches AWS. That drop is now REPORTED rather than silent.
+
+    Implementing real Bedrock passthrough (additionalModelRequestFields) is
+    deliberately NOT attempted here: it needs AWS credentials and per-model
+    capability data to verify, and inventing a provider parameter is exactly
+    the failure this module exists to prevent.
+    """
+    status = describe(
+        configured="high", supported=False, provider="bedrock",
+        model="anthropic.claude-3-7-sonnet",
+        base_url="bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    assert status["will_be_sent"] is False
+    assert status["effective_effort"] is None, "must not claim an effort AWS never receives"
+    assert status["reason"]
+
+
+def test_bedrock_builder_still_takes_no_reasoning_argument():
+    """Pin the gap so it is caught if upstream adds support and we can drop the
+    'not sent' reporting for this route."""
+    import inspect
+
+    from agent.transports.bedrock import BedrockConverseTransport
+
+    sig = inspect.signature(BedrockConverseTransport.build_kwargs)
+    assert "reasoning_config" not in sig.parameters, (
+        "bedrock build_kwargs now accepts reasoning_config — wire it through and "
+        "stop reporting this route as unsupported"
+    )

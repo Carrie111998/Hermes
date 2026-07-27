@@ -110,7 +110,17 @@ def describe(
         how = "operator opt-in (agent.reasoning_passthrough)" if override is True \
             else "route auto-detected as reasoning-capable"
         status["summary"] = f"reasoning effort {configured!r} IS sent — {how}"
-        status["reason"] = None
+        # Sent is not the same as honored. A route can accept the field and
+        # ignore it: probing this profile's LiteLLM router showed HTTP 200 for
+        # every effort level while reasoning-token counts stayed non-monotonic
+        # (minimal 56.5 > high 51.0 > control 53.5 > low 37.0, medians of 4),
+        # and the control — no field at all — already produced reasoning. Say
+        # so rather than let "sent" be read as "in effect".
+        status["reason"] = (
+            "sent, but acceptance is not proof of effect — a provider may "
+            "accept reasoning_effort and ignore it. Confirm with reasoning "
+            "token counts before relying on the level."
+        ) if override is True else None
         return status
 
     if override is False:

@@ -103,21 +103,20 @@ def _classify_write_denial(path: str) -> Optional[str]:
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
-    # A project .env is read-blocked (get_read_block_error) but was never
-    # write-blocked, so the agent could not READ your secrets but could silently
-    # REPLACE them. "add a STRIPE_KEY to .env" naturally becomes a single
-    # write_file(".env", "STRIPE_KEY=...") that overwrites DATABASE_URL, live
-    # keys and OAuth secrets with one line — while the identical `echo > .env`
-    # in the terminal tool is classified dangerous and gated. Same set, same
-    # answer, both directions.
-    if os.path.basename(resolved).lower() in _BLOCKED_PROJECT_ENV_BASENAMES:
-        return "credential"
-
     if resolved in build_write_denied_paths(home):
         return "credential"
     for prefix in build_write_denied_prefixes(home):
         if resolved.startswith(prefix):
             return "credential"
+
+    # Project-local secret files. These were already blocked for READS
+    # (get_read_block_error), but not for writes — so the agent could
+    # overwrite or delete a .env it is not permitted to open. Being able to
+    # destroy a credential store you cannot read is a strictly worse
+    # asymmetry than either capability alone, and the equivalent terminal
+    # operation is classified dangerous.
+    if os.path.basename(resolved).lower() in _BLOCKED_PROJECT_ENV_BASENAMES:
+        return "credential"
 
     mcp_tokens_dir_name = "mcp-tokens"
 
@@ -136,10 +135,10 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # falsify conversation history and invalidate resume/compression state.
         try:
             if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
-                return True
+                return "credential"
             sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
             if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
-                return True
+                return "credential"
         except Exception:
             pass
         try:

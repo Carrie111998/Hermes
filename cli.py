@@ -7871,6 +7871,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             base_url=_reset_result.base_url,
                             api_mode=_reset_result.api_mode,
                         )
+                        # switch_model re-resolves reasoning_config for the new
+                        # model. The CLI keeps its own copy for display and for
+                        # seeding new sessions, so without this resync the UI
+                        # kept reporting the PREVIOUS effort while the agent was
+                        # already sending a different one — reporting a level
+                        # that is not in effect.
+                        _switched = getattr(self.agent, "reasoning_config", None)
+                        if _switched != self.reasoning_config:
+                            logger.info(
+                                "reasoning_config changed on model switch: %s -> %s",
+                                self.reasoning_config, _switched,
+                            )
+                            self.reasoning_config = _switched
                     self.model = _reset_result.new_model
                     self.provider = _reset_result.target_provider
                     self.requested_provider = _reset_result.target_provider

@@ -157,10 +157,29 @@ class FileStateRegistry:
             stamp = self._reads.get(task_id, {}).get(resolved)
             last_writer = self._last_writer.get(resolved)
 
-        # Case 3: never read AND we have no write record — net-new file or
-        # first touch by this agent.  Let existing _check_sensitive_path
-        # and file-exists logic handle it; nothing to warn about here.
+        # Case 3: never read AND no write record.  This is a net-new file OR a
+        # blind overwrite of existing content — and the two are not the same
+        # thing.  The comment here used to defer to "file-exists logic", but no
+        # such check exists on the write path, so overwriting a file this agent
+        # had never opened produced no warning and a success-shaped result: the
+        # previous content was simply gone.
+        #
+        # Warn, never block.  Writing a brand-new file is the common, correct
+        # case, and a hard block would break it; the signal only needs to reach
+        # the model before it treats a destructive overwrite as routine.  An
+        # empty existing file carries nothing to lose, so it stays silent.
         if stamp is None and last_writer is None:
+            try:
+                if os.path.getsize(resolved) > 0:
+                    return (
+                        f"{resolved} already exists with content and this agent "
+                        "never read it. Writing replaces the file wholesale — "
+                        "read it first if you meant to preserve or edit what is "
+                        "there, or use patch for a targeted change."
+                    )
+            except OSError:
+                # Missing or unreadable — genuinely net-new, nothing to warn about.
+                return None
             return None
 
         try:
