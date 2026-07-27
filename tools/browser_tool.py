@@ -1363,6 +1363,7 @@ _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
 # accidentally reuse an @ref after a reload or tab switch.  The model never
 # supplies or edits the expected page identity.
 _snapshot_ref_contexts: Dict[str, Dict[str, Any]] = {}
+_group_post_composer_contexts: Dict[str, Dict[str, Any]] = {}
 _snapshot_ref_lock = threading.Lock()
 _LOCAL_SUFFIX = "::local"
 
@@ -3026,13 +3027,51 @@ def _run_atomic_ref_action(
         " ",
         str(metadata.get("name") or "").strip(),
     ).casefold()
+    normalized_role = str(metadata.get("role") or "").casefold()
     is_join_button = (
         action == "click"
-        and str(metadata.get("role") or "").casefold() == "button"
+        and normalized_role == "button"
         and normalized_name in {"join group", "加入社團"}
+    )
+    is_group_post_open = (
+        action == "click"
+        and normalized_role == "button"
+        and normalized_name in {
+            "write something...",
+            "write something…",
+            "建立貼文",
+            "寫些什麼⋯⋯",
+        }
+    )
+    is_group_post_media = (
+        action == "click"
+        and normalized_role == "button"
+        and normalized_name in {
+            "photo/video",
+            "相片／影片",
+            "相片/影片",
+        }
+    )
+    is_group_post_submit = (
+        action == "click"
+        and normalized_role == "button"
+        and normalized_name in {"post", "發布"}
+    )
+    is_group_post_fill = (
+        action == "fill"
+        and normalized_role == "textbox"
+        and normalized_name in {
+            "what's on your mind?",
+            "create a public post...",
+            "create a public post…",
+            "建立公開貼文⋯⋯",
+            "在想些什麼？",
+        }
     )
     required_group_id: Optional[str] = None
     reserved_group_id: Optional[str] = None
+    reserved_group_effect: Optional[str] = None
+    group_post_context_action: Optional[str] = None
     if is_facebook_host and is_join_button and group_match is None:
         return json.dumps({
             "success": False,
@@ -3066,6 +3105,9 @@ def _run_atomic_ref_action(
                 ),
             }, ensure_ascii=False)
         allowed_group_ids = _kanban_db.grace_external_group_ids(body)
+        group_posting_allowed = (
+            _kanban_db.grace_allows_facebook_group_posting(body)
+        )
         group_id = group_match.group(1)
         if group_id not in allowed_group_ids:
             return json.dumps({
@@ -3075,48 +3117,107 @@ def _run_atomic_ref_action(
                     "listed in this exact Loop Contract."
                 ),
             }, ensure_ascii=False)
-        if not is_join_button:
+        is_group_post_action = (
+            group_posting_allowed
+            and (
+                is_group_post_open
+                or is_group_post_media
+                or is_group_post_submit
+                or is_group_post_fill
+            )
+        )
+        if not is_join_button and not is_group_post_action:
             return json.dumps({
                 "success": False,
                 "error": (
-                    "Facebook group action blocked: this contract permits only "
-                    "the exact Join group button; posting, sharing, typing, and "
-                    "questionnaire actions remain forbidden."
+                    "Facebook group action blocked: the exact control is not "
+                    "an approved Join action or a whitelisted browser_publish "
+                    "group-post composer action. Sharing, comments, anonymous "
+                    "posts, questionnaires, and other controls remain forbidden."
                 ),
             }, ensure_ascii=False)
         required_group_id = group_id
-        try:
-            with _kanban_db.connect_closing() as reserve_conn:
-                reserve_error = _kanban_db.reserve_external_group_join(
-                    reserve_conn,
-                    kanban_task_id,
-                    group_id,
-                    expected_run_id=_kanban_worker_run_id(),
+        if is_group_post_action:
+            if is_group_post_open:
+                group_post_context_action = "open"
+            else:
+                group_post_context_action = (
+                    "submit" if is_group_post_submit else "compose"
                 )
-        except Exception as exc:
-            reserve_error = (
-                "Facebook group join reservation failed closed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-        if reserve_error:
-            return json.dumps(
-                {"success": False, "error": reserve_error},
-                ensure_ascii=False,
-            )
-        reserved_group_id = group_id
+                with _snapshot_ref_lock:
+                    composer_context = _group_post_composer_contexts.get(
+                        browser_task_id
+                    )
+                expected_context = {
+                    "page_identity": page_identity,
+                    "kanban_task_id": kanban_task_id,
+                    "kanban_run_id": _kanban_worker_run_id(),
+                    "group_id": group_id,
+                }
+                if not composer_context or any(
+                    composer_context.get(key) != value
+                    for key, value in expected_context.items()
+                ):
+                    return json.dumps({
+                        "success": False,
+                        "error": (
+                            "Facebook group post action blocked: no matching "
+                            "composer capability was opened from this exact "
+                            "task/run/group/page load."
+                        ),
+                    }, ensure_ascii=False)
+        if is_join_button or is_group_post_submit:
+            try:
+                with _kanban_db.connect_closing() as reserve_conn:
+                    if is_join_button:
+                        reserve_error = _kanban_db.reserve_external_group_join(
+                            reserve_conn,
+                            kanban_task_id,
+                            group_id,
+                            expected_run_id=_kanban_worker_run_id(),
+                        )
+                        reserved_group_effect = "join"
+                    else:
+                        reserve_error = _kanban_db.reserve_external_group_post(
+                            reserve_conn,
+                            kanban_task_id,
+                            group_id,
+                            expected_run_id=_kanban_worker_run_id(),
+                        )
+                        reserved_group_effect = "post"
+            except Exception as exc:
+                reserve_error = (
+                    "Facebook group external-effect reservation failed closed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if reserve_error:
+                return json.dumps(
+                    {"success": False, "error": reserve_error},
+                    ensure_ascii=False,
+                )
+            reserved_group_id = group_id
 
     def _release_known_pre_dispatch(reason: str) -> None:
-        if not reserved_group_id:
+        if not reserved_group_id or not reserved_group_effect:
             return
         try:
             with _kanban_db.connect_closing() as release_conn:
-                _kanban_db.release_external_group_join_reservation(
-                    release_conn,
-                    kanban_task_id,
-                    reserved_group_id,
-                    expected_run_id=_kanban_worker_run_id(),
-                    reason=reason,
-                )
+                if reserved_group_effect == "join":
+                    _kanban_db.release_external_group_join_reservation(
+                        release_conn,
+                        kanban_task_id,
+                        reserved_group_id,
+                        expected_run_id=_kanban_worker_run_id(),
+                        reason=reason,
+                    )
+                else:
+                    _kanban_db.release_external_group_post_reservation(
+                        release_conn,
+                        kanban_task_id,
+                        reserved_group_id,
+                        expected_run_id=_kanban_worker_run_id(),
+                        reason=reason,
+                    )
         except Exception:
             # Failing closed means preserving join_started so no blind retry
             # can occur when release itself is uncertain.
@@ -3155,6 +3256,9 @@ def _run_atomic_ref_action(
                     expected_name=str(metadata["name"]),
                     required_group_id=required_group_id,
                     captured_session_id=captured_session_id,
+                    require_group_composer=(
+                        group_post_context_action in {"compose", "submit"}
+                    ),
                 )
     except Exception as exc:
         with _snapshot_ref_lock:
@@ -3179,6 +3283,17 @@ def _run_atomic_ref_action(
             "success": False,
             "error": action_result.get("error") or "Guarded browser action failed",
         }, ensure_ascii=False)
+    if group_post_context_action == "open" and required_group_id:
+        with _snapshot_ref_lock:
+            _group_post_composer_contexts[browser_task_id] = {
+                "page_identity": page_identity,
+                "kanban_task_id": kanban_task_id,
+                "kanban_run_id": _kanban_worker_run_id(),
+                "group_id": required_group_id,
+            }
+    elif group_post_context_action == "submit":
+        with _snapshot_ref_lock:
+            _group_post_composer_contexts.pop(browser_task_id, None)
     return json.dumps({
         "success": True,
         "result": action_result.get("result"),
@@ -3473,6 +3588,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     effective_task_id = task_id or "default"
     nav_session_key = _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
+    with _snapshot_ref_lock:
+        _group_post_composer_contexts.pop(nav_session_key, None)
+        _group_post_composer_contexts.pop(effective_task_id, None)
 
     # Always-blocked floor: cloud metadata / IMDS endpoints are denied
     # regardless of backend, hybrid routing, or allow_private_urls.
@@ -5007,6 +5125,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
             _session_last_activity.pop(task_id, None)
         with _snapshot_ref_lock:
             _snapshot_ref_contexts.pop(task_id, None)
+            _group_post_composer_contexts.pop(task_id, None)
 
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.

@@ -793,6 +793,7 @@ class CDPSupervisor:
         required_group_id: Optional[str] = None,
         text: Optional[str] = None,
         captured_session_id: Optional[str] = None,
+        require_group_composer: bool = False,
         timeout: float = 10.0,
     ) -> Dict[str, Any]:
         """Mutate one captured AX node after an in-turn page identity check."""
@@ -830,7 +831,7 @@ class CDPSupervisor:
             {
                 "objectId": object_id,
                 "functionDeclaration": """
-                function(token) {
+                function(token, requireGroupComposer) {
                   const prior = this.__hermesAtomicGuard;
                   if (prior?.observer) prior.observer.disconnect();
                   if (prior?.listener && prior?.eventTypes) {
@@ -857,6 +858,10 @@ class CDPSupervisor:
                   }
                   const wrappingLabel = this.closest?.("label");
                   if (wrappingLabel) targets.push(wrappingLabel);
+                  if (requireGroupComposer) {
+                    const dialog = this.closest?.('[role="dialog"]');
+                    if (dialog) targets.push(dialog);
+                  }
                   for (const target of new Set(targets)) {
                     state.observer.observe(target, {
                       subtree: true,
@@ -871,7 +876,10 @@ class CDPSupervisor:
                   return true;
                 }
                 """,
-                "arguments": [{"value": guard_token}],
+                "arguments": [
+                    {"value": guard_token},
+                    {"value": bool(require_group_composer)},
+                ],
                 "returnByValue": True,
             },
             timeout=timeout,
@@ -958,7 +966,9 @@ class CDPSupervisor:
                 {
                     "objectId": object_id,
                     "functionDeclaration": """
-                    function(expected, token, requiredGroupId) {
+                    function(
+                      expected, token, requiredGroupId, requireGroupComposer
+                    ) {
                       const guard = this.__hermesAtomicGuard;
                       const fail = message => {
                         guard?.observer?.disconnect();
@@ -981,6 +991,28 @@ class CDPSupervisor:
                       ) fail("Captured snapshot node changed after validation");
                       if (identity() !== expected || !this.isConnected) {
                         fail("Protected page load changed before atomic click");
+                      }
+                      if (requireGroupComposer) {
+                        const dialog = this.closest?.('[role="dialog"]');
+                        const dialogText = [
+                          dialog?.getAttribute("aria-label") || "",
+                          dialog?.innerText || ""
+                        ].join(" ").replace(/\\s+/g, " ").toLowerCase();
+                        const createPost = (
+                          dialogText.includes("create post")
+                          || dialogText.includes("建立貼文")
+                        );
+                        const forbiddenMode = (
+                          dialogText.includes("anonymous post")
+                          || dialogText.includes("匿名貼文")
+                          || dialogText.includes("share post")
+                          || dialogText.includes("分享貼文")
+                        );
+                        if (!dialog || !createPost || forbiddenMode) {
+                          fail(
+                            "Target is not the authorized group post composer"
+                          );
+                        }
                       }
                       const rect = this.getBoundingClientRect();
                       const x = rect.left + rect.width / 2;
@@ -1026,6 +1058,7 @@ class CDPSupervisor:
                         {"value": expected_page_identity},
                         {"value": guard_token},
                         {"value": required_group_id},
+                        {"value": bool(require_group_composer)},
                     ],
                     "returnByValue": True,
                     "userGesture": True,
@@ -1052,7 +1085,7 @@ class CDPSupervisor:
                 "result": payload.get("result", {}).get("value"),
             }
         function_declaration = """
-        function(expected, action, text, token) {
+        function(expected, action, text, token, requireGroupComposer) {
           const guard = this.__hermesAtomicGuard;
           const fail = message => {
             guard?.observer?.disconnect();
@@ -1065,6 +1098,26 @@ class CDPSupervisor:
           }
           if (!this.isConnected) {
             fail("Captured snapshot node is detached");
+          }
+          if (requireGroupComposer) {
+            const dialog = this.closest?.('[role="dialog"]');
+            const dialogText = [
+              dialog?.getAttribute("aria-label") || "",
+              dialog?.innerText || ""
+            ].join(" ").replace(/\\s+/g, " ").toLowerCase();
+            const createPost = (
+              dialogText.includes("create post")
+              || dialogText.includes("建立貼文")
+            );
+            const forbiddenMode = (
+              dialogText.includes("anonymous post")
+              || dialogText.includes("匿名貼文")
+              || dialogText.includes("share post")
+              || dialogText.includes("分享貼文")
+            );
+            if (!dialog || !createPost || forbiddenMode) {
+              fail("Target is not the authorized group post composer");
+            }
           }
           if (
             !guard
@@ -1126,6 +1179,7 @@ class CDPSupervisor:
                     {"value": action},
                     {"value": text},
                     {"value": guard_token},
+                    {"value": bool(require_group_composer)},
                 ],
                 "returnByValue": True,
                 "awaitPromise": True,

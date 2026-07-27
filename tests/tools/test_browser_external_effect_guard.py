@@ -383,11 +383,159 @@ def test_grace_ref_click_uses_exact_snapshot_bound_dom_node(
         "expected_name": "Join group",
         "required_group_id": "1703088130054399",
         "captured_session_id": "captured-session",
+        "require_group_composer": False,
     }]
     with kb.connect_closing(db_path) as conn:
         effect = kb.list_external_effects(conn, task_id)[0]
     assert effect["effect_key"] == "group:1703088130054399"
     assert effect["state"] == "join_started"
+
+
+def test_browser_publish_contract_allows_only_group_post_composer_open(
+    monkeypatch, tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    live_url = "https://www.facebook.com/groups/1703088130054399/"
+    page_identity = f"{live_url}|789.0"
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":["facebook group 1703088130054399"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn, body=body)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_page_identity",
+        lambda *_args: (live_url, page_identity, None),
+    )
+    monkeypatch.setitem(
+        browser_tool._snapshot_ref_contexts,
+        "browser-1",
+        {
+            "page_identity": page_identity,
+            "kanban_task_id": task_id,
+            "kanban_run_id": run.current_run_id,
+            "refs": {
+                "e1": {
+                    "role": "button",
+                    "name": "Write something...",
+                    "backend_node_id": 2468,
+                    "captured_session_id": "captured-session",
+                }
+            },
+        },
+    )
+    actions = []
+
+    class FakeSupervisor:
+        def guarded_dom_action(self, **kwargs):
+            actions.append(kwargs)
+            return {"ok": True, "result": {"ok": True}}
+
+    monkeypatch.setattr(
+        browser_supervisor.SUPERVISOR_REGISTRY,
+        "get",
+        lambda _task_id: FakeSupervisor(),
+    )
+
+    result = json.loads(browser_tool.browser_click("@e1", task_id="browser-1"))
+
+    assert result["success"] is True
+    assert actions[0]["required_group_id"] == "1703088130054399"
+    with kb.connect_closing(db_path) as conn:
+        assert kb.list_external_effects(conn, task_id) == []
+    monkeypatch.setitem(
+        browser_tool._snapshot_ref_contexts,
+        "browser-1",
+        {
+            "page_identity": page_identity,
+            "kanban_task_id": task_id,
+            "kanban_run_id": run.current_run_id,
+            "refs": {
+                "e2": {
+                    "role": "button",
+                    "name": "Post",
+                    "backend_node_id": 9753,
+                    "captured_session_id": "captured-session",
+                }
+            },
+        },
+    )
+
+    submitted = json.loads(
+        browser_tool.browser_click("@e2", task_id="browser-1")
+    )
+
+    assert submitted["success"] is True
+    assert actions[1]["require_group_composer"] is True
+    with kb.connect_closing(db_path) as conn:
+        effects = kb.list_external_effects(conn, task_id)
+    assert effects[0]["effect_key"] == "group:1703088130054399"
+    assert effects[0]["state"] == "create_started"
+
+
+def test_browser_publish_contract_rejects_group_comment_fill(
+    monkeypatch, tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    live_url = "https://www.facebook.com/groups/1703088130054399/"
+    page_identity = f"{live_url}|789.0"
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":["facebook group 1703088130054399"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn, body=body)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_page_identity",
+        lambda *_args: (live_url, page_identity, None),
+    )
+    monkeypatch.setitem(
+        browser_tool._snapshot_ref_contexts,
+        "browser-1",
+        {
+            "page_identity": page_identity,
+            "kanban_task_id": task_id,
+            "kanban_run_id": run.current_run_id,
+            "refs": {
+                "e1": {
+                    "role": "textbox",
+                    "name": "Comment as Craig",
+                    "backend_node_id": 2468,
+                    "captured_session_id": "captured-session",
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        browser_supervisor.SUPERVISOR_REGISTRY,
+        "get",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("comment must fail before CDP action")
+        ),
+    )
+
+    result = json.loads(
+        browser_tool.browser_type("@e1", "not allowed", task_id="browser-1")
+    )
+
+    assert result["success"] is False
+    assert "whitelisted browser_publish" in result["error"]
 
 
 def test_grace_ref_click_rejects_group_outside_contract(
@@ -607,6 +755,50 @@ def test_body_note_does_not_expand_structured_group_targets():
     assert kb.grace_external_group_ids(body) == frozenset({
         "1703088130054399",
     })
+
+
+def test_lowercase_group_targets_and_browser_publish_authority_are_accepted():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":["facebook group 1703088130054399"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset({
+        "1703088130054399",
+    })
+    assert kb.grace_allows_facebook_group_posting(body) is True
+
+
+def test_group_post_reservation_is_one_shot(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":["facebook group 1703088130054399"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn, body=body)
+        first = kb.reserve_external_group_post(
+            conn,
+            task_id,
+            "1703088130054399",
+            expected_run_id=run.current_run_id,
+        )
+        second = kb.reserve_external_group_post(
+            conn,
+            task_id,
+            "1703088130054399",
+            expected_run_id=run.current_run_id,
+        )
+        effects = kb.list_external_effects(conn, task_id)
+
+    assert first is None
+    assert "already create_started" in second
+    assert effects[0]["state"] == "create_started"
 
 
 def test_extra_json_fence_makes_group_authority_ambiguous():

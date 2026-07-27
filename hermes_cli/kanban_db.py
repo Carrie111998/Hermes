@@ -328,15 +328,16 @@ _EXTERNAL_CREATE_HOSTS = {
     }),
 }
 _FACEBOOK_GROUP_TARGET_RE = re.compile(
-    r"Facebook Group ([0-9]+)(?:（[^）]+）)?"
+    r"Facebook Group ([0-9]+)(?:（[^）]+）)?",
+    flags=re.IGNORECASE,
 )
 
 
-def grace_external_group_ids(body: str) -> frozenset[str]:
-    """Read numeric Facebook group targets from the compiled JSON contract."""
+def _grace_compiled_contract(body: str) -> Optional[Mapping[str, Any]]:
+    """Return the sole compiled Grace contract, or None when ambiguous."""
     text = str(body or "")
     if _grace_loop_stage_header(text) not in {"execution", "grace_review"}:
-        return frozenset()
+        return None
     fenced_blocks = re.findall(
         r"```json[ \t]*\r?\n(.*?)\r?\n```",
         text,
@@ -345,12 +346,18 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
     # Compiler output owns exactly one JSON fence. Any additional fence makes
     # the authority source ambiguous and therefore fails closed.
     if len(fenced_blocks) != 1:
-        return frozenset()
+        return None
     try:
         contract = json.loads(fenced_blocks[0])
     except (TypeError, ValueError, json.JSONDecodeError):
-        return frozenset()
-    if not isinstance(contract, Mapping):
+        return None
+    return contract if isinstance(contract, Mapping) else None
+
+
+def grace_external_group_ids(body: str) -> frozenset[str]:
+    """Read numeric Facebook group targets from the compiled JSON contract."""
+    contract = _grace_compiled_contract(body)
+    if contract is None:
         return frozenset()
     targets = contract.get("external_targets")
     if not isinstance(targets, list):
@@ -361,9 +368,32 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
         match = _FACEBOOK_GROUP_TARGET_RE.fullmatch(normalized)
         if match is not None:
             group_ids.add(match.group(1))
-        elif normalized.startswith("Facebook Group"):
+        elif normalized.casefold().startswith("facebook group"):
             return frozenset()
     return frozenset(group_ids)
+
+
+def grace_allows_facebook_group_posting(body: str) -> bool:
+    """Return whether the compiled execution contract authorizes group posts."""
+    if _grace_loop_stage_header(str(body or "")) != "execution":
+        return False
+    contract = _grace_compiled_contract(body)
+    if contract is None or not grace_external_group_ids(body):
+        return False
+    authorization = contract.get("authorization")
+    routing = contract.get("routing")
+    if not isinstance(authorization, Mapping) or not isinstance(routing, Mapping):
+        return False
+    resolved = routing.get("resolved")
+    resolved_task_type = (
+        resolved.get("task_type") if isinstance(resolved, Mapping) else None
+    )
+    return (
+        authorization.get("human_approved") is True
+        and str(
+            routing.get("task_type") or resolved_task_type or ""
+        ).strip().casefold() == "browser_publish"
+    )
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -3720,6 +3750,121 @@ def release_external_group_join_reservation(
                 "AND effect_key = ?",
                 (task_id, effect_key),
             )
+        _append_event(
+            conn,
+            task_id,
+            "external_effect_reservation_released",
+            {
+                "platform": "facebook",
+                "effect_key": effect_key,
+                "reason": reason,
+            },
+            run_id=int(expected_run_id),
+        )
+
+
+def reserve_external_group_post(
+    conn: sqlite3.Connection,
+    task_id: str,
+    group_id: str,
+    *,
+    expected_run_id: Optional[int],
+) -> Optional[str]:
+    """Durably reserve one contract-scoped group post before final dispatch."""
+    normalized_group_id = str(group_id or "").strip()
+    if not normalized_group_id.isdigit():
+        return "Facebook group post blocked: group id must be numeric."
+    effect_key = f"group:{normalized_group_id}"
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT body, status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "running"
+            or expected_run_id is None
+            or int(task["current_run_id"] or 0) != int(expected_run_id)
+        ):
+            return (
+                "Facebook group post blocked: caller is not the active "
+                "worker run."
+            )
+        if (
+            normalized_group_id not in grace_external_group_ids(task["body"])
+            or not grace_allows_facebook_group_posting(task["body"])
+        ):
+            return (
+                "Facebook group post blocked: target or browser_publish "
+                "authority is absent from the compiled Loop Contract."
+            )
+        prior = conn.execute(
+            "SELECT state FROM task_external_effects "
+            "WHERE task_id = ? AND platform = 'facebook' AND effect_key = ?",
+            (task_id, effect_key),
+        ).fetchone()
+        if prior is not None:
+            return (
+                "Facebook group post blocked: durable state is already "
+                f"{prior['state']}; reconcile the visible post instead of "
+                "retrying."
+            )
+        _upsert_external_effect(
+            conn,
+            task_id=task_id,
+            platform="facebook",
+            effect_key=effect_key,
+            state="create_started",
+            external_id=normalized_group_id,
+            details={"reservation": "before_final_post_dispatch"},
+            run_id=int(expected_run_id),
+            now=now,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "external_effect_reserved",
+            {
+                "platform": "facebook",
+                "effect_key": effect_key,
+                "state": "create_started",
+                "external_id": normalized_group_id,
+            },
+            run_id=int(expected_run_id),
+        )
+    return None
+
+
+def release_external_group_post_reservation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    group_id: str,
+    *,
+    expected_run_id: Optional[int],
+    reason: str,
+) -> None:
+    """Release a group-post reservation only before dispatch is known to start."""
+    normalized_group_id = str(group_id or "").strip()
+    effect_key = f"group:{normalized_group_id}"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT state, run_id FROM task_external_effects "
+            "WHERE task_id = ? AND platform = 'facebook' AND effect_key = ?",
+            (task_id, effect_key),
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] != "create_started"
+            or expected_run_id is None
+            or int(row["run_id"] or 0) != int(expected_run_id)
+        ):
+            return
+        conn.execute(
+            "DELETE FROM task_external_effects "
+            "WHERE task_id = ? AND platform = 'facebook' AND effect_key = ?",
+            (task_id, effect_key),
+        )
         _append_event(
             conn,
             task_id,
