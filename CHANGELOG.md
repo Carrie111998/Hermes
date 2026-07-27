@@ -61,6 +61,9 @@
 - Discord and Discord-admin REST actions now require operation-specific
   permits bound to a hash of the exact action payload before any external API
   request is sent.
+- Home Assistant service calls now require a `homeassistant.call_service`
+  permit bound to the exact HA instance, service domain/name, entity, and data
+  payload before device state can be changed.
 - Grant admission now requires the delegator employee and mandate to be
   active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority

@@ -1430,6 +1430,29 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production Discord credentials, permissions, or external authorization.
 
+## Home Assistant authority evidence (6b8849a5a0)
+
+`ha_call_service` now authorizes `homeassistant.call_service` against a hash of
+the exact Home Assistant URL, domain, service, entity, and service data before
+the POST request. Existing blocked service domains remain fail-closed, and
+read-only entity/state/service discovery is not conflated with device-control
+authority.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/homeassistant_tool.py tests/tools/test_homeassistant_tool.py
+uv run --extra dev pytest -q tests/tools/test_homeassistant_tool.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **70 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:6f764b88cbc4742ec2f3134e2b724fd43d59c314de642aaf0ef8349b883834f7`.
+This remains deterministic local-provider evidence and does not establish
+production Home Assistant credentials, device safety, or external
+authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
