@@ -13,6 +13,7 @@ def test_inbound_checkout_is_idempotent_and_readback_maps_paid():
             return httpx.Response(200, json={
                 "id": "cs_test_1", "status": "complete", "payment_status": "unpaid",
                 "amount_total": 1000, "currency": "usd", "url": "https://checkout.test/1",
+                "customer_details": {"email": "sensitive@example.com"},
             })
         return httpx.Response(200, json={
             "id": "cs_test_1", "status": "complete", "payment_status": "paid",
@@ -27,6 +28,7 @@ def test_inbound_checkout_is_idempotent_and_readback_maps_paid():
     readback = rail.get_payment(created.reference)
     assert created.reference == "cs_test_1"
     assert created.status == "unpaid"
+    assert "customer_details" not in created.evidence["object"]
     assert readback.status == "succeeded"
     assert requests[0].headers["Idempotency-Key"] == "intent-1"
     assert requests[0].headers["Authorization"] == "Bearer sk_test"
@@ -38,7 +40,7 @@ def test_outbound_requires_connected_account_and_readback_uses_payment_intent():
             assert request.url.path == "/v1/payment_intents/pi_1"
             return httpx.Response(200, json={
                 "id": "pi_1", "status": "succeeded", "amount": 100,
-                "currency": "usd",
+                "currency": "usd", "payment_method": "pm_sensitive",
             })
         return httpx.Response(200, json={"id": "pi_1", "status": "succeeded"})
 
@@ -56,3 +58,4 @@ def test_outbound_requires_connected_account_and_readback_uses_payment_intent():
     assert payment.reference == "pi_1"
     assert payment.status == "succeeded"
     assert rail.get_payment(payment.reference).amount_minor == 100
+    assert "payment_method" not in payment.evidence["object"]

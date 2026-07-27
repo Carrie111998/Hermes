@@ -38,6 +38,15 @@ class StripeRail(PaymentRail):
         return payload
 
     @staticmethod
+    def _safe_object(payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep provider evidence bounded to fields needed for reconciliation."""
+        allowed = {
+            "id", "object", "status", "payment_status", "amount", "amount_total",
+            "currency", "livemode", "created", "transfer_group",
+        }
+        return {key: payload[key] for key in allowed if key in payload}
+
+    @staticmethod
     def _payment(payload: Mapping[str, Any], *, amount_minor: int | None = None,
                  currency: str | None = None) -> ProviderPayment:
         reference = str(payload.get("id") or "")
@@ -56,7 +65,7 @@ class StripeRail(PaymentRail):
             amount_minor=int(amount if amount_minor is None else amount_minor),
             currency=str(resolved_currency if currency is None else currency).upper(),
             payment_url=payload.get("url"),
-            evidence={"provider": "stripe", "object": dict(payload)},
+            evidence={"provider": "stripe", "object": StripeRail._safe_object(payload)},
         )
 
     def create_receivable(self, *, amount_minor: int, currency: str,
@@ -111,5 +120,5 @@ class StripeRail(PaymentRail):
             reference=str(payload["id"]), status="succeeded" if status == "succeeded" else status,
             amount_minor=amount_minor, currency=currency.upper(),
             evidence={"provider": "stripe", "connected_account_id": str(connected),
-                      "object": dict(payload)},
+                      "object": self._safe_object(payload)},
         )
