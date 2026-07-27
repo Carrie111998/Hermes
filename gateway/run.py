@@ -2180,6 +2180,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -2619,6 +2620,36 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     to a placeholder string.
     """
     return adapter.get_pending_message(session_key)
+
+
+async def _run_followup_processing_hook(
+    adapter,
+    event: MessageEvent | None,
+    hook_name: str,
+    *args,
+) -> None:
+    """Fire a platform processing-lifecycle hook for a runner-drained follow-up.
+
+    A message that arrives mid-turn is parked in the adapter's pending slot and
+    drained in-band by ``_run_agent``, never by
+    ``BasePlatformAdapter._process_message_background`` — which owns the only
+    other call site for these hooks.  Without firing them here, the read-receipt
+    reaction every adapter renders from ``on_processing_start`` is silently
+    skipped for queued, interrupting, and steer-demoted messages.
+
+    No-ops unless there is a real inbound platform message to acknowledge:
+    interrupt text and leftover ``/steer`` carry no event at all, and synthetic
+    drains (``/goal`` continuations, wake-ups, CLI hand-offs) carry no
+    ``message_id`` — the same field every adapter's own hook already gates on.
+    """
+    if event is None or adapter is None:
+        return
+    if not getattr(event, "message_id", None):
+        return
+    run_hook = getattr(adapter, "_run_processing_hook", None)
+    if not callable(run_hook):
+        return
+    await run_hook(hook_name, event, *args)
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
@@ -23525,6 +23556,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+                # Acknowledge the follow-up the way an idle-session message is
+                # already acknowledged.  This in-band drain is the only place a
+                # queued/interrupting message ever runs — base.py's
+                # _process_message_background, which owns the sole other call
+                # site for the processing hooks, is never entered for it — so
+                # without this every platform that renders a read receipt from
+                # on_processing_start silently skips mid-turn messages.
+                # Resolve the adapter from the follow-up's OWN source: a
+                # multiplexed gateway can route it to a different profile's
+                # adapter than the turn we are completing, and only that
+                # instance holds the per-message reaction state.  Fired here
+                # rather than below so the cache re-baseline stays adjacent to
+                # the recursive call it exists to protect.
+                _hook_adapter = (
+                    self._adapter_for_source(next_source)
+                    if pending_event is not None
+                    else None
+                )
+                await _run_followup_processing_hook(
+                    _hook_adapter, pending_event, "on_processing_start",
+                )
+
                 # Re-baseline the cached agent's message_count snapshot before
                 # recursing into the in-band queued (/queue) follow-up turn.
                 # The first turn has completed and flushed its own user +
@@ -23541,17 +23594,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                    )
+                except asyncio.CancelledError:
+                    # Matches _process_message_background: a cancelled turn is
+                    # not a failure, and adapters that special-case CANCELLED
+                    # (Telegram clears the marker, Signal leaves it) rely on the
+                    # distinction.  Best-effort — a re-delivered cancellation
+                    # can pre-empt the await, exactly as it can in base.py.
+                    await _run_followup_processing_hook(
+                        _hook_adapter, pending_event, "on_processing_complete",
+                        ProcessingOutcome.CANCELLED,
+                    )
+                    raise
+                except BaseException:
+                    await _run_followup_processing_hook(
+                        _hook_adapter, pending_event, "on_processing_complete",
+                        ProcessingOutcome.FAILURE,
+                    )
+                    raise
+                await _run_followup_processing_hook(
+                    _hook_adapter, pending_event, "on_processing_complete",
+                    ProcessingOutcome.SUCCESS,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
