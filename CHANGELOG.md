@@ -294,3 +294,5 @@ recorded.
   compliance control evidence at admission time.
 - `f8b09c922f523079e0099a5e48efae83bfaf008b` — made compliance applicability,
   obligation, and control-evidence records append-only.
+- `7fabe92dd94c0aeedfb5193cad505c2861ed4ed9` — serialized circuit-breaker
+  recovery probes with a durable half-open lease and safe expiry reclamation.

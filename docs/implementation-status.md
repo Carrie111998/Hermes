@@ -63,6 +63,8 @@ acceptance evidence.
   commit a partial state transition.
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
+- Circuit-breaker recovery probes are serialized as a durable half-open lease;
+  concurrent probes fail closed and an expired probe can be reclaimed safely.
 - Portfolio child/successor admission and employee grant/revocation admission
   serialize budget and authority checks across concurrent local workers.
 - External action handlers recheck the autonomy kill-switch immediately before
@@ -193,7 +195,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`bf5202b9bca5c2cb098bb9bc38d27342a91b2e4a` passed 6 Founder/CEO E2E tests, 48
+`7fabe92dd94c0aeedfb5193cad505c2861ed4ed9` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -210,6 +212,8 @@ It also passed the approval-artifact regression: 9 tests.
 It also passed the company-email regression: 4 tests.
 It also passed the compute-reconciliation regression: 9 tests.
 The finance suite also passed the payment readback convergence regression: 21 tests.
+The circuit-breaker recovery-probe regression passed 3 tests, including
+single-probe admission and expired-probe reclamation.
 The broader current-main regression command across resource budgets, company
 email, approvals, operational control, hiring, portfolio, accounting,
 procurement, metered billing, and usage billing passed **76 tests, 0 failed**.
