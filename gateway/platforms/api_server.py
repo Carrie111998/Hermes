@@ -3544,13 +3544,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         else ""
                     ),
                 )
+                # Report the turn the way the agent actually ended it. Pinning
+                # these to False told an SSE client that a truncated
+                # (output-cap / context-pressure) or user-interrupted turn was
+                # a clean, whole answer; the non-streaming session surfaces
+                # already derive both from the run result.
+                _is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
+                _is_interrupted = (
+                    bool(result.get("interrupted")) if isinstance(result, dict) else False
+                )
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "content": final_response,
                     "completed": True,
-                    "partial": False,
-                    "interrupted": False,
+                    "partial": _is_partial,
+                    "interrupted": _is_interrupted,
                     "runtime": effective_runtime,
                 }))
                 await queue.put(_event_payload("run.completed", {
