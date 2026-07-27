@@ -167,6 +167,33 @@ def create_grant(
     )
     if manager_mandate is None:
         raise DelegationError("delegator has no current mandate")
+    # A subordinate may only sub-delegate authority that was explicitly
+    # delegated to it.  Its standing mandate is not sufficient: mandates can
+    # describe the employee's role, while the execution grant is the narrower
+    # authority actually issued for this task.  The root founder has no parent
+    # grant and is the sole source of initial delegation authority.
+    parent_grants: list[sqlite3.Row] = []
+    if manager_employee_id != str(employee["id"]):
+        manager_row = conn.execute(
+            "SELECT manager_id FROM employees WHERE id=?",
+            (manager_employee_id,),
+        ).fetchone()
+        if manager_row is None:
+            raise DelegationError("delegator employee is missing")
+        if manager_row["manager_id"] is not None:
+            parent_grants = conn.execute(
+                """SELECT * FROM employee_task_grants
+                    WHERE organization_id=? AND employee_id=? AND expires_at>?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM employee_task_grant_revocations r
+                           WHERE r.grant_id=employee_task_grants.id
+                      )""",
+                (organization_id, manager_employee_id, now),
+            ).fetchall()
+            if not parent_grants:
+                raise DelegationError(
+                    "subordinate may delegate only from an active parent grant"
+                )
     if int(mandate["starts_at"]) > now or (
         mandate["expires_at"] is not None and int(mandate["expires_at"]) <= now
     ):
@@ -244,6 +271,51 @@ def create_grant(
     }
     if not resource_scope["system"] or not resource_scope["target_resource"]:
         raise DelegationError("task grant requires an exact resource scope")
+    if parent_grants:
+        parent_capabilities = {
+            item
+            for row in parent_grants
+            for item in json.loads(row["capabilities_json"] or "[]")
+        }
+        parent_systems = {
+            item
+            for row in parent_grants
+            for item in json.loads(row["systems_json"] or "[]")
+        }
+        parent_toolsets = {
+            item
+            for row in parent_grants
+            for item in json.loads(row["toolsets_json"] or "[]")
+        }
+        parent_skills = {
+            item
+            for row in parent_grants
+            for item in json.loads(row["skills_json"] or "[]")
+        }
+        if not set(requested_capabilities).issubset(parent_capabilities):
+            raise DelegationError("task capability exceeds parent grant")
+        if not set(requested_systems).issubset(parent_systems):
+            raise DelegationError("task system exceeds parent grant")
+        if "all" in requested_toolsets or not set(requested_toolsets).issubset(
+            parent_toolsets
+        ):
+            raise DelegationError("task toolset exceeds parent grant")
+        if not set(requested_skills).issubset(parent_skills):
+            raise DelegationError("task skill exceeds parent grant")
+        if not any(
+            json.loads(row["resource_scope_json"] or "{}").get("system")
+            == resource_scope["system"]
+            and json.loads(row["resource_scope_json"] or "{}").get(
+                "target_resource"
+            )
+            == resource_scope["target_resource"]
+            for row in parent_grants
+        ):
+            raise DelegationError("task resource exceeds parent grant")
+        if expires_at > min(int(row["expires_at"]) for row in parent_grants):
+            raise DelegationError("task grant outlives parent grant")
+        if budget_minor > sum(int(row["budget_minor"]) for row in parent_grants):
+            raise DelegationError("task budget exceeds parent grant")
     if budget_minor < 0:
         raise DelegationError("task budget cannot be negative")
     mandate_budget = mandate["budget_minor"]

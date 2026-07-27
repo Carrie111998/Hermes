@@ -215,6 +215,97 @@ def test_solo_founder_can_self_dispatch_only_with_exact_mandate_surface(
         )
 
 
+def test_subordinate_cannot_subdelegate_without_parent_grant(tmp_path, monkeypatch):
+    conn, organization_id, ceo_id, manager_id, _, objective_id, action_id = _company(
+        tmp_path, monkeypatch
+    )
+    manager2_id = organization_db.propose_employee(
+        conn,
+        organization_id=organization_id,
+        display_name="Morgan",
+        title="Research Manager",
+        level="manager",
+        manager_id=ceo_id,
+        proposed_by=f"employee:{ceo_id}",
+        employment_type="agent",
+        annual_cost_minor=75,
+        currency="USD",
+    )
+    organization_db.create_mandate(
+        conn,
+        manager2_id,
+        purpose="Manage bounded research",
+        responsibilities=["research"],
+        decision_rights=["read public sources"],
+        prohibited_actions=["publish", "purchase"],
+        capabilities=["web.read"],
+        systems=["web"],
+        toolsets=["web"],
+        skills=["research"],
+        kpis=["evidence delivered"],
+        escalation={"to": ceo_id},
+        created_by=f"employee:{ceo_id}",
+        budget_minor=100,
+        expires_at=int(time.time()) + 3_600,
+    )
+    organization_db.transition_employee(conn, manager2_id, "approved", actor="control")
+    employee_provisioning.provision_employee_profile(
+        conn, manager2_id, actor="control", profile_name="morgan-manager"
+    )
+    child_id = organization_db.propose_employee(
+        conn,
+        organization_id=organization_id,
+        display_name="Bea",
+        title="Research Assistant",
+        level="individual_contributor",
+        manager_id=manager2_id,
+        proposed_by=f"employee:{ceo_id}",
+        employment_type="contractor",
+        annual_cost_minor=50,
+        currency="USD",
+    )
+    organization_db.create_mandate(
+        conn,
+        child_id,
+        purpose="Perform bounded research",
+        responsibilities=["research"],
+        decision_rights=["read public sources"],
+        prohibited_actions=["publish", "purchase"],
+        capabilities=["web.read"],
+        systems=["web"],
+        toolsets=["web"],
+        skills=["research"],
+        kpis=["evidence delivered"],
+        escalation={"to": ceo_id},
+        created_by=f"employee:{ceo_id}",
+        budget_minor=100,
+        expires_at=int(time.time()) + 3_600,
+    )
+    organization_db.transition_employee(conn, child_id, "approved", actor="control")
+    employee_provisioning.provision_employee_profile(
+        conn, child_id, actor="control", profile_name="bea-research"
+    )
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="active parent grant"
+    ):
+        workforce_delegation.create_grant(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective_id,
+            action_id=action_id,
+            manager_employee_id=manager2_id,
+            assignee_profile="bea-research",
+            title="Nested research",
+            body="Perform only the delegated research task.",
+            capabilities=["web.read"],
+            systems=["web"],
+            toolsets=["web"],
+            skills=["research"],
+            budget_minor=50,
+            expires_at=int(time.time()) + 1_800,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

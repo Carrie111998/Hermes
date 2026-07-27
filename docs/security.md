@@ -20,8 +20,12 @@ permit, and a policy decision within the current objective and charter.
 
 Employee grants apply the same non-amplification rule across the subordinate
 mandate and the delegator mandate, including capabilities, systems, toolsets,
-skills, resource scope, budget, and expiry. Filesystem access is only available through a
-registered typed executor; raw shell access is not implied by a read grant.
+skills, resource scope, budget, and expiry. A non-root manager must also hold
+an active parent grant; a child grant is bounded by that parent grant and
+cannot be created from the manager's broader standing mandate alone. This
+makes delegation transitive without allowing privilege amplification through
+the hierarchy. Filesystem access is only available through a registered typed
+executor; raw shell access is not implied by a read grant.
 
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
