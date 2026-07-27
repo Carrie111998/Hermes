@@ -138,6 +138,32 @@ def test_payment_rails_is_read_only_and_surfaces_unavailable_provider(
     assert output["outbound"] == []
 
 
+def test_payment_rails_check_returns_nonzero_for_unavailable_rail(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hermes_cli.payments.payment_rail_status",
+        lambda: {
+            "inbound": [{"available": False, "name": "stripe"}],
+            "outbound": [],
+        },
+    )
+    args = _parser().parse_args(["business", "payment-rails", "--check"])
+    assert business.business_command(args) == 1
+    assert json.loads(capsys.readouterr().out)["inbound"][0]["available"] is False
+
+
+def test_payment_rails_check_returns_zero_when_discovered_rails_are_ready(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "hermes_cli.payments.payment_rail_status",
+        lambda: {
+            "inbound": [{"available": True, "name": "stripe"}],
+            "outbound": [{"available": True, "name": "stripe"}],
+        },
+    )
+    args = _parser().parse_args(["business", "payment-rails", "--check"])
+    assert business.business_command(args) == 0
+    assert json.loads(capsys.readouterr().out)["outbound"][0]["available"] is True
+
+
 def test_business_readiness_is_unconfigured_without_mutation():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

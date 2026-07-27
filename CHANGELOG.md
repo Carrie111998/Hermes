@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added `business payment-rails --check`, a read-only machine-check contract
+  that returns non-zero when a discovered inbound or outbound rail is
+  unavailable, without attempting money movement.
 - Added an independent GitHub Actions artifact workflow that builds and
   isolated-installs the Charterforge wheel/sdist on pull requests, `main`, and
   version-tag pushes without publishing to an index automatically.

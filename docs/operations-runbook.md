@@ -21,6 +21,15 @@ uv run charterforge business readiness --check
 It emits the same JSON projection and exits `0` only when readiness is true;
 blocked or unconfigured state exits `1` without mutating authority state.
 
+Payment rail credentials can be checked separately:
+
+```bash
+uv run charterforge business payment-rails --check
+```
+
+This preserves the discovered-rail JSON and exits `1` when a discovered rail
+is unavailable; it never creates credentials or attempts a transaction.
+
 ## Normal escalation
 
 An advisor intervention should include the objective, exact blocker, current

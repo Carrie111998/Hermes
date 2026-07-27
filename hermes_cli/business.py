@@ -47,9 +47,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--charter-file", type=Path, required=True,
         help="JSON file containing the non-interactive agentic operating charter",
     )
-    sub.add_parser(
+    payment_rails = sub.add_parser(
         "payment-rails",
         help="Inspect installed payment rails and credential readiness (read-only)",
+    )
+    payment_rails.add_argument(
+        "--check",
+        action="store_true",
+        help="Return non-zero when a discovered rail is unavailable",
     )
     audit = sub.add_parser(
         "audit-export",
@@ -466,8 +471,14 @@ def business_command(args: argparse.Namespace) -> int:
     with db.connect_closing(getattr(args, "db", None)) as conn:
         command = args.business_command
         if command == "payment-rails":
-            print(json.dumps(payments.payment_rail_status(), indent=2, sort_keys=True))
-            return 0
+            status = payments.payment_rail_status()
+            print(json.dumps(status, indent=2, sort_keys=True))
+            unavailable = any(
+                not bool(item.get("available"))
+                for direction in ("inbound", "outbound")
+                for item in status.get(direction, [])
+            )
+            return 0 if not args.check or not unavailable else 1
         if command == "status":
             value = build_business_snapshot(conn)
             print(json.dumps(value, indent=2, sort_keys=True))
