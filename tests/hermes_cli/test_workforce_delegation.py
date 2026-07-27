@@ -498,6 +498,7 @@ def test_charter_revision_revocation_blocks_handoff_and_releases_allocation(
             (revocation["id"],),
         )
 
+
     objective_id = ids[4]
     plan_id = conn.execute(
         "SELECT id FROM plans WHERE objective_id=?", (objective_id,)
@@ -521,6 +522,39 @@ def test_charter_revision_revocation_blocks_handoff_and_releases_allocation(
     )
     assert created is True
     assert replacement != grant_id
+
+
+def test_parent_grant_revocation_fences_descendant_grant(tmp_path, monkeypatch):
+    company = _company(tmp_path, monkeypatch)
+    conn = company[0]
+    organization_id, ceo_id, employee_id, mandate_id, objective_id, _ = company[1:]
+    parent_id, _ = _grant(conn, company[1:])
+    child_id = "taskgrant_synthetic_child"
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        """INSERT INTO employee_task_grants (
+                 id,organization_id,objective_id,action_id,manager_employee_id,
+                 employee_id,assignee_profile,mandate_id,mandate_version,
+                 title_sha256,body_sha256,capabilities_json,systems_json,
+                 toolsets_json,skills_json,resource_scope_json,parent_grant_id,
+                 budget_minor,expires_at,contract_sha256,created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            child_id, organization_id, objective_id, "synthetic-child-action",
+            ceo_id, employee_id, "ada-research", mandate_id, 1, "title", "body",
+            '["web.read"]', '["web"]', '["web"]', '["research"]',
+            '{"system":"web","target_resource":"default"}', parent_id, 1,
+            int(time.time()) + 1_800, "contract", int(time.time()),
+        ),
+    )
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(
+        """INSERT INTO employee_task_grant_revocations
+               (id,grant_id,actor,reason,revoked_at)
+               VALUES (?,?,?,?,?)""",
+        ("taskgrantrev_parent", parent_id, "test", "parent authority revoked", int(time.time())),
+    )
+    assert workforce_delegation.is_revoked(conn, child_id) is True
 
 
 def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(

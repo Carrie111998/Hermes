@@ -730,13 +730,27 @@ def validate_task_result_authority(
 
 def is_revoked(conn: sqlite3.Connection, grant_id: str) -> bool:
     ensure_schema(conn)
-    return (
-        conn.execute(
+    current = str(grant_id)
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            # A corrupted parent chain is not a recoverable authorization
+            # state; fail closed rather than risk traversing an unbounded loop.
+            return True
+        seen.add(current)
+        if conn.execute(
             "SELECT 1 FROM employee_task_grant_revocations WHERE grant_id=?",
-            (grant_id,),
+            (current,),
+        ).fetchone() is not None:
+            return True
+        row = conn.execute(
+            "SELECT parent_grant_id FROM employee_task_grants WHERE id=?",
+            (current,),
         ).fetchone()
-        is not None
-    )
+        if row is None:
+            return False
+        current = str(row["parent_grant_id"] or "")
+    return False
 
 
 @_serialized_grant_mutation

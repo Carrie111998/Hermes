@@ -29,6 +29,9 @@ authorization lineage for audit and restart verification. Filesystem access is
 only available through a registered typed executor; raw shell access is not
 implied by a read grant.
 
+Revocation is transitive: worker launch and result handoff walk the parent
+grant chain, and any revoked ancestor or cyclic chain is treated as revoked.
+
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
 records. Payment integration is non-custodial: providers hold instruments and
