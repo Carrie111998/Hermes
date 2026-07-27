@@ -53,6 +53,23 @@ ahead. Nothing has been pushed.
 | `75bf49c3e` | the parent classifies a crashed child as failed (H-01 completion); CLI reasoning resync (H-18); Bedrock drop reported (H-17) | `agent/turn_finalizer.py`, `tools/delegate_tool.py`, `cli.py` | `tests/agent/test_turn_completion_honesty.py`, contract #13 | upstream propagates crash state to the parent |
 | `0f24558bf`, `4673c6360` | git exit 1 is only "expected" for query subcommands (H-26) | `tools/terminal_tool.py` | `tests/tools/test_exit_code_interpretation.py` | upstream makes the note subcommand-aware |
 | `a800784b4` | Bedrock transport name + harness anchor corrections | — (test-only) | the harness itself (15/15) | never |
+| `5c80e6f1d` | `files_written` no longer always empty; compaction stops naming deleted sections (H-21, H-14) | `tools/file_state.py`, `tools/delegate_tool.py`, `agent/context_compressor.py` | `tests/tools/test_writes_since_filter.py`, `tests/agent/test_compaction_prompt_sections.py` | upstream fixes the filter and the prompt |
+| `5dee6aa46` | prompt precedence stated; inert tool-use enforcement reported (H-08, H-07) | `agent/prompt_builder.py`, `agent/system_prompt.py`, `hermes_cli/doctor.py` | `tests/agent/test_prompt_precedence_and_enforcement.py` | upstream states precedence itself |
+| `dc11cb87e` | transcript kept clean, refunds actually grant iterations, cron turn abandonable (H-02, H-03, H-04) | `agent/chat_completion_helpers.py`, `agent/iteration_budget.py`, `agent/conversation_loop.py`, `cron/scheduler.py` | `tests/agent/test_loop_budget_and_transcript.py` | upstream adopts each |
+
+### Superseded by the peer session — take THEIRS at merge
+
+`4e0a148fc` (runtime guard) is **superseded**. The peer's version in the main
+tree is correct and mine is not: I made vulnerable SQLite advisory on the
+reasoning that the risk is probabilistic, but `hermes-agent/venv` is Python
+3.11.15 — *inside* `requires-python`, so my own Python check waves it through —
+while linking SQLite 3.50.4 against ~10 of 11 already-WAL databases. Warning-only
+left a live corruption path on a runtime the guard itself called supported.
+
+Worse, my `HERMES_SUPPRESS_SQLITE_WARNING` returned True **before probing**, so a
+single cosmetic env var cleared the check entirely. Their split — a cosmetic
+suppressor that cannot clear a real vulnerability, plus a loud, never-silenced
+`HERMES_ALLOW_VULNERABLE_SQLITE` for deliberate acceptance — is the right shape.
 
 **Highest merge sensitivity:** `run_agent.py` (~17.8k lines) and
 `agent/tool_dispatch_helpers.py`. A whole-file conflict resolution on either
