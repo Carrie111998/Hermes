@@ -838,6 +838,18 @@ class ActionExecutorRegistry:
             raise ValueError("action verifier does not match executor contract")
         if action.payload.get("system") != contract.target_system:
             raise ValueError("action system does not match executor contract")
+        # Validate the exact payload and its temporal observation window before
+        # the runtime issues a permit.  The execution path repeats these checks
+        # immediately before the provider call; admission must fail closed too
+        # so malformed or already-stale proposals cannot reserve authority or
+        # budget first.
+        try:
+            validate_payload(action.payload, self._contracts.get(action.action_type))
+            validate_temporal_preconditions(action.payload)
+        except (ExecutionBoundaryError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"action payload violates executor contract: {exc}"
+            ) from exc
 
     def execute(
         self, action_type: str, payload: Mapping[str, Any]

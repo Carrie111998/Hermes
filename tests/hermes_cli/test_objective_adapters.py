@@ -237,6 +237,32 @@ def test_executor_contract_rejects_manually_injected_mismatched_authority():
         )
 
 
+def test_executor_contract_rejects_invalid_payload_before_permit_admission():
+    registry = adapters.ActionExecutorRegistry()
+    registry.register(
+        "market.publish",
+        lambda payload: ExecutionOutcome("succeeded", {}),
+        contract=adapters.PayloadContract(
+            required={"target_resource": str}, optional={}
+        ),
+        required_capability="market.publish",
+        target_system="market",
+        verification_method="market.readback",
+    )
+    with pytest.raises(ValueError, match="payload violates executor contract"):
+        registry.validate_proposal(
+            ActionProposal(
+                action_type="market.publish",
+                payload={"system": "market"},
+                expected_outcome="published",
+                required_capability="market.publish",
+                verification_method="market.readback",
+                risk_class="low",
+                reversible=True,
+            )
+        )
+
+
 def test_objective_verifier_requires_structured_registered_criteria():
     verifier = adapters.IndependentVerifierRegistry()
     action = VerificationOutcome("pass", {"ok": True})

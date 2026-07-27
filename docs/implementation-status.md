@@ -15,6 +15,8 @@ acceptance evidence.
   active runtime.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
+- Registered action payload schemas and temporal observation windows are
+  validated before permit admission and again at the final execution boundary.
 - Hiring materialization rechecks current headcount and payroll limits against
   the immutable decision before adding an employee.
 - Founder/CEO organization bootstrap and versioned mandate.
@@ -133,15 +135,13 @@ external ingress and scheduling, billing, tax/accounting, staffing/workforce,
 runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
-The following are historical focused regression results and capability evidence,
+The following historical focused regression results are contextual evidence,
 not additional claims that the current release boundary covered every listed
-surface: the exact-grant increment passed 281 focused tests. The rebrand and
-migration validation passed 361 focused Python tests, desktop/TUI/web TypeScript
-typechecks, Python compilation, and the implemented `charterforge` help and
-version commands. The independent documentation site prebuild completed, but
-its Docusaurus build was unavailable because the local `docusaurus` executable
-is not installed; no build pass is claimed. The current governed-runtime
-regression sweep covers 20 focused test files and passed 161 tests, including
-objectives, workers, authority, finance, accounting, payments, compliance,
-approvals, workforce, procurement, metrics, commitments, event ingress,
-billing, and audit lineage.
+surface. Their commit pins and reconstructability status are recorded in
+[historical validation evidence](evidence/historical-validation.md): the
+exact-grant increment was reported as 281 focused tests; rebrand and migration
+validation was reported as 361 focused Python tests with desktop/TUI/web
+TypeScript typechecks; and a governed-runtime sweep was reported as 161 tests
+across 20 focused files. The independent documentation site prebuild
+completed, but its Docusaurus build was unavailable because the local
+`docusaurus` executable is not installed; no build pass is claimed.

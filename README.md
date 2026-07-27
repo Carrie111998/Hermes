@@ -109,6 +109,12 @@ before unattended operation.
 
 ## Development validation
 
+Release status is explicit: the controlled Founder/CEO runtime acceptance
+passed at the tagged evidence commit
+`4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe` (`v0.19.0-agentic-foundation`).
+Current `main` contains additional unreleased commits and must not be described
+as having passed that acceptance until a newer evidence boundary is recorded.
+
 Commands actually completed successfully during the autonomous-runtime work:
 
 ```bash

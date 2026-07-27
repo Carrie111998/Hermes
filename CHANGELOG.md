@@ -27,6 +27,8 @@ not a claim of production autonomous-business readiness.
   commands and results recorded in [READINESS.md](READINESS.md). The evidence
   documentation itself was recorded in commit
   `757408d82884afd60651762715c3ef00446bc0c0`.
+- Immutable annotated release tag: `v0.19.0-agentic-foundation` points at the
+  evidence commit above.
 - This SHA is the designated `0.19.0-agentic-foundation` release boundary.
   `main` is ahead of it: the stale-spend-hold escalation
   (`172a515c6b5d7efeef1a4e222c5c35ca46246a0b`) and evidence-bound spend-hold
@@ -35,7 +37,12 @@ not a claim of production autonomous-business readiness.
   included in this release acceptance determination and remain under
   Unreleased.
 
-## Unreleased (post-0.19.0-agentic-foundation)
+### Capability inventory present at the designated boundary
+
+The capability entries below are classified from the commit comparison
+`4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe^..4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe`.
+They were present at the designated release boundary and are part of
+`0.19.0-agentic-foundation`, not Unreleased.
 
 - Added the optional standalone `charterforge-stripe-rail` package for
   idempotent inbound Checkout Sessions, provider read-back verification, and
@@ -81,16 +88,12 @@ not a claim of production autonomous-business readiness.
   initialization path.
 - Runtime-host mismatches and empty action-contract charters now create durable
   advisor handoffs before autonomous operation stops.
-- Housekeeping now escalates stale outbound spend holds without automatically
-  releasing uncertain provider commitments.
-- Spend-hold advisor resolutions are now evidence-bound to durable provider
-  read-back or failed/cancelled settlement evidence.
 - Hardened durable runtime ledgers so schema checks preserve active authority
   transactions across finance, accounting, payments, compliance, approvals,
   event ingress, billing, commitments, metrics, worker state, and audit
   lineage; focused regressions cover rollback preservation.
 
-### Earlier post-boundary capability additions
+### Additional capability inventory at the designated boundary
 
 - Immutable usage metering and governed metered-invoice actions. Prices are
   captured when usage occurs; invoice actions reference exact event IDs and
@@ -147,3 +150,22 @@ not a claim of production autonomous-business readiness.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.
+
+## Unreleased (commits after 0.19.0-agentic-foundation)
+
+This section is derived from `4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe..HEAD`.
+The current branch is ahead of the validated boundary; these changes do not
+inherit the boundary's PASS determination until a newer evidence commit is
+recorded.
+
+- `757408d82884afd60651762715c3ef00446bc0c0` — recorded the release
+  readiness evidence documentation.
+- `172a515c6b5d7efeef1a4e222c5c35ca46246a0b` — escalated stale outbound spend
+  holds without automatically releasing uncertain provider commitments.
+- `5c92744e42878929ed981c81f34b1239c00d992a` — bound spend-hold resolutions to
+  durable provider read-back or failed/cancelled settlement evidence.
+- `e5ee81ded0b18b53453fc15570fafce231bdef75` — clarified release evidence,
+  coverage scope, and the test-provider boundary.
+- The containing documentation/control-boundary commit also adds proposal-time
+  validation of registered action payload schemas and temporal preconditions;
+  its SHA is the final commit that contains this changelog entry.

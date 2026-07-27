@@ -29,6 +29,7 @@ commands are run. The exact evidence commit SHA is recorded here after that
 baseline commit and is immutable for this determination.
 
 - Evidence commit SHA: **4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe**
+- Evidence tag: **v0.19.0-agentic-foundation** (annotated tag at that SHA)
 - Branch: `main`
 - Date: 2026-07-27
 - Repository: independent Charterforge fork; no upstream submission is implied
@@ -75,6 +76,10 @@ The commands above were run from the repository root at commit
 - `git diff --check`: completed successfully with no output.
 - Final observed baseline: `git status --short --branch` reported no working
   tree changes; `git rev-parse HEAD` returned the evidence SHA above.
+
+The current `main` branch is intentionally ahead of this tagged evidence
+commit. Its additional commits are Unreleased and do not inherit this PASS
+determination until a newer evidence commit is recorded.
 
 ## Release gates that remain open
 
