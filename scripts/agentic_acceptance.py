@@ -13,7 +13,13 @@ import sys
 import time
 from pathlib import Path
 
-from hermes_cli import business, config as config_module, objective_worker, objectives_db
+from hermes_cli import (
+    business,
+    config as config_module,
+    objective_triggers,
+    objective_worker,
+    objectives_db,
+)
 from hermes_cli.objective_runtime import (
     ActionProposal,
     ExecutionOutcome,
@@ -224,6 +230,16 @@ def prepare() -> None:
             payload={"source": "current-tree-acceptance"},
             dedupe_key=f"acceptance:{objective.id}",
         )
+        objective_triggers.create_schedule(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective.id,
+            event_type="objective.scheduled-review",
+            interval_seconds=3600,
+            next_fire_at=int(time.time()) - 1,
+            payload={"source": "current-tree-schedule"},
+            idempotency_key="agentic-acceptance-schedule-0001",
+        )
         _metadata_file().write_text(
             json.dumps(
                 {"organization_id": organization_id, "objective_id": objective.id}
@@ -240,8 +256,13 @@ def run_worker() -> None:
     metadata = json.loads(_metadata_file().read_text(encoding="utf-8"))
     conn = objectives_db.connect(_db())
     try:
+        def tick_with_schedule_dispatch():
+            objective_triggers.dispatch_due(conn)
+            return _runtime(conn).tick()
+
         result = objective_worker.run_forever(
-            db_path=_db(), tick=_runtime(conn).tick, max_cycles=4, interval_seconds=1
+            db_path=_db(), tick=tick_with_schedule_dispatch, max_cycles=4,
+            interval_seconds=1,
         )
         assert result == 0, result
         row = conn.execute(
@@ -258,7 +279,17 @@ def run_worker() -> None:
             )
         effects = json.loads(_provider_file().read_text(encoding="utf-8"))["effects"]
         assert list(effects) == ["agentic-acceptance-offer-0001"], effects
-        print(json.dumps({"phase": "run", "objective": "verified", "effects": 1}))
+        scheduled = conn.execute(
+            """SELECT COUNT(*) AS n FROM objective_inbox
+               WHERE objective_id=? AND event_type='objective.scheduled-review'
+                 AND status='completed'""",
+            (metadata["objective_id"],),
+        ).fetchone()["n"]
+        assert scheduled == 1, scheduled
+        print(json.dumps({
+            "phase": "run", "objective": "verified", "effects": 1,
+            "scheduled_events": scheduled,
+        }))
     finally:
         conn.close()
 
