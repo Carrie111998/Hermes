@@ -1,6 +1,4 @@
 import './styles.css'
-// Side-effect: reports in-flight turns to the main process for the quit guard.
-import './store/active-work'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
 // Dev-only render/state churn counters. MUST precede the `react-dom` import

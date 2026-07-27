@@ -16,11 +16,7 @@ import type {
 } from '../../../gatewayTypes.js'
 import { writeClipboardText } from '../../../lib/clipboard.js'
 import { writeOsc52Clipboard } from '../../../lib/osc52.js'
-import {
-  configureDetectedTerminalKeybindings,
-  configureTerminalKeybindings,
-  isRemoteShellSession
-} from '../../../lib/terminalSetup.js'
+import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../../../lib/terminalSetup.js'
 import type { Msg, PanelSection } from '../../../types.js'
 import type { StatusBarMode } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
@@ -405,14 +401,6 @@ export const coreCommands: SlashCommand[] = [
 
       if (!target) {
         return sys('nothing to copy — start a conversation first')
-      }
-
-      const shouldUseTerminalClipboard = isRemoteShellSession(process.env)
-
-      if (shouldUseTerminalClipboard) {
-        writeOsc52Clipboard(target.text)
-
-        return sys('sent OSC52 copy sequence (terminal support required)')
       }
 
       void writeClipboardText(target.text)

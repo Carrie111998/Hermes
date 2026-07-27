@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $rightRailActiveTabId } from '@/store/layout'
-import { $previewTabs, closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
+import { $rightRailActiveTabId, RIGHT_RAIL_PREVIEW_TAB_ID } from '@/store/layout'
+import {
+  $filePreviewTabs,
+  $previewTarget,
+  clearSessionPreviewRegistry,
+  type PreviewTarget,
+  setCurrentSessionPreviewTarget
+} from '@/store/preview'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 
 import { closeActiveTab } from './close-tab'
 
@@ -19,34 +26,40 @@ function fileTarget(path: string): PreviewTarget {
 describe('closeActiveTab', () => {
   beforeEach(() => {
     vi.stubGlobal('document', { activeElement: null })
-    closeRightRail()
+    $activeSessionId.set('session-1')
+    $selectedStoredSessionId.set(null)
     window.localStorage.clear()
+    clearSessionPreviewRegistry()
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
-    closeRightRail()
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    clearSessionPreviewRegistry()
     window.localStorage.clear()
   })
 
   it('closes the active file preview tab (⌘W happy path)', () => {
-    openPreview(fileTarget('/work/notes.md'), 'manual')
+    setCurrentSessionPreviewTarget(fileTarget('/work/notes.md'), 'manual')
 
-    expect($previewTabs.get()).toHaveLength(1)
+    expect($filePreviewTabs.get()).toHaveLength(1)
     expect($rightRailActiveTabId.get()).toBe('file:file:///work/notes.md')
 
     expect(closeActiveTab()).toBe(true)
-    expect($previewTabs.get()).toHaveLength(0)
+    expect($filePreviewTabs.get()).toHaveLength(0)
   })
 
-  it('closes the visible tab when the active selection points at a tab that is gone', () => {
-    // The rail falls back to tabs[0] until React syncs the selection, so ⌘W has
-    // to act on what is actually on screen rather than no-op'ing.
-    openPreview(fileTarget('/work/notes.md'), 'manual')
-    $rightRailActiveTabId.set('file:file:///work/stale.md')
+  it('closes the visible file tab when active selection is a ghost preview', () => {
+    // Active tab id stuck on live-preview after that target was cleared, while
+    // file tabs remain (UI falls back to tabs[0] until React syncs). ⌘W must
+    // close the visible file tab instead of no-op'ing via closeWorkspaceTab().
+    setCurrentSessionPreviewTarget(fileTarget('/work/notes.md'), 'manual')
+    $previewTarget.set(null)
+    $rightRailActiveTabId.set(RIGHT_RAIL_PREVIEW_TAB_ID)
 
-    expect($previewTabs.get()).toHaveLength(1)
+    expect($filePreviewTabs.get()).toHaveLength(1)
     expect(closeActiveTab()).toBe(true)
-    expect($previewTabs.get()).toHaveLength(0)
+    expect($filePreviewTabs.get()).toHaveLength(0)
   })
 })

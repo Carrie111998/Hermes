@@ -1,7 +1,7 @@
 ---
-title: "Plan — Write a markdown plan to .hermes/plans/; no execution"
+title: "Plan — Write a markdown plan to"
 sidebar_label: "Plan"
-description: "Write a markdown plan to .hermes/plans/; no execution"
+description: "Write a markdown plan to"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}

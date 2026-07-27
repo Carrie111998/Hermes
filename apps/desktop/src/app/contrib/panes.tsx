@@ -27,7 +27,8 @@ import { registry } from '@/contrib/registry'
 import { getLogs } from '@/hermes'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
-import { $previewTarget, openPreview } from '@/store/preview'
+import { $openArtifacts } from '@/store/artifacts'
+import { $filePreviewTarget, $previewTarget, setCurrentSessionPreviewTarget } from '@/store/preview'
 import { $currentCwd } from '@/store/session'
 
 // ---------------------------------------------------------------------------
@@ -73,9 +74,11 @@ export const $restartPreviewServer = atom<((url: string, context?: string) => Pr
 
 export function PreviewRailPane() {
   const previewTarget = useStore($previewTarget)
+  const fileTarget = useStore($filePreviewTarget)
+  const openArtifacts = useStore($openArtifacts)
   const restartPreviewServer = useStore($restartPreviewServer)
 
-  if (!previewTarget) {
+  if (!previewTarget && !fileTarget && openArtifacts.length === 0) {
     return (
       <div className="grid h-full place-items-center px-4 text-center">
         <div className="flex flex-col items-center gap-1.5">
@@ -108,7 +111,7 @@ function previewFile(path: string) {
   void normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined)
     .then(target => {
       if (target) {
-        openPreview(target, 'file-browser')
+        setCurrentSessionPreviewTarget(target, 'file-browser', path)
       }
     })
     .catch(() => undefined)

@@ -179,10 +179,7 @@ def _run_helper(
         )
         return None
 
-    # User-configured secret-helper command: runs with the user's full shell
-    # env by design (it may need any credential to resolve the secret).
-    from tools.environments.local import build_subprocess_env
-    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+    env = os.environ.copy()
     env["HERMES_SECRET_KEY"] = secret_key
 
     try:

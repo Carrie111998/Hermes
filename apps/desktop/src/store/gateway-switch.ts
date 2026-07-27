@@ -3,9 +3,8 @@ import { atom } from 'nanostores'
 import { resetLiveRuntimeTracking } from '@/app/contrib/hooks/use-background-sync'
 import { resetSidebarBatchCapability } from '@/hermes'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
-import { clearArtifactRegistry } from '@/store/artifacts'
+import { closeAllArtifactTabs } from '@/store/artifacts'
 import { resetSessionsLimit } from '@/store/layout'
-import { resetLiveSync } from '@/store/live-sync'
 import {
   $unreadFinishedSessionIds,
   setActiveSessionId,
@@ -54,7 +53,6 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // $unreadFinishedSessionIds is separate, so wipe it explicitly.
   clearAllSessionStates()
   resetLiveRuntimeTracking()
-  resetLiveSync()
   $unreadFinishedSessionIds.set([])
   setSessionsLoading(true)
   resetSessionsLimit()
@@ -64,9 +62,9 @@ export function wipeSessionListsForGatewaySwitch(): void {
   setMessages([])
   setFreshDraftReady(true)
 
-  // Artifacts are keyed by sessions on the previous backend, so both the
-  // registry and any rail tab pointing into it go with them.
-  clearArtifactRegistry()
+  // Artifact tabs reference sessions on the previous backend; the registry
+  // itself survives (it's local presentation state) but open tabs must not.
+  closeAllArtifactTabs()
 
   // Narrowed: account/marketplace/onboarding caches are global, not gateway-
   // scoped, so a mode swap must not refetch them.

@@ -1,7 +1,7 @@
 ---
-title: "Inference Sh Cli — Run 150+ AI apps (image, video, LLM) via inference.sh CLI"
+title: "Inference Sh Cli — Run 150+ AI apps (image, video, LLM) via inference"
 sidebar_label: "Inference Sh Cli"
-description: "Run 150+ AI apps (image, video, LLM) via inference.sh CLI"
+description: "Run 150+ AI apps (image, video, LLM) via inference"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}

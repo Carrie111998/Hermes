@@ -48,7 +48,6 @@ import { AlertTriangle } from '@/lib/icons'
 import { requestModelOptions } from '@/lib/model-options'
 import { asText } from '@/lib/text'
 import { $cronFocusJobId, $cronJobs, setCronFocusJobId, setCronJobs, updateCronJobs } from '@/store/cron'
-import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $profileScope, ALL_PROFILES } from '@/store/profile'
 
@@ -64,10 +63,10 @@ import {
   PanelHeader,
   PanelList,
   PanelListRow,
-  type PanelMenuItem,
   PanelMeta,
   PanelPill,
   type PanelPillTone,
+  PanelRowMenu,
   PanelSectionLabel
 } from '../overlays/panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
@@ -502,11 +501,14 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
                 active={selectedJob?.id === job.id}
                 job={job}
                 key={job.id}
-                menuItems={[
-                  { icon: 'edit', label: c.edit, onSelect: () => setEditor({ mode: 'edit', job }) },
-                  { icon: 'trash', label: t.common.delete, onSelect: () => setPendingDelete(job), tone: 'danger' }
-                ]}
-                menuLabel={c.manage}
+                menu={
+                  <PanelRowMenu
+                    items={[
+                      { icon: 'edit', label: c.edit, onSelect: () => setEditor({ mode: 'edit', job }) },
+                      { icon: 'trash', label: t.common.delete, onSelect: () => setPendingDelete(job), tone: 'danger' }
+                    ]}
+                  />
+                }
                 onSelect={() => setSelectedJobId(job.id)}
               />
             ))}
@@ -569,14 +571,12 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
 function CronJobListRow({
   active,
   job,
-  menuItems,
-  menuLabel,
+  menu,
   onSelect
 }: {
   active: boolean
   job: CronJob
-  menuItems?: PanelMenuItem[]
-  menuLabel?: string
+  menu?: React.ReactNode
   onSelect: () => void
 }) {
   const state = jobState(job)
@@ -585,8 +585,7 @@ function CronJobListRow({
     <PanelListRow
       active={active}
       dotClassName={STATE_DOT[state] ?? 'bg-muted-foreground'}
-      menuItems={menuItems}
-      menuLabel={menuLabel}
+      menu={menu}
       onSelect={onSelect}
       rowKey={job.id}
       title={jobTitle(job)}
@@ -673,12 +672,10 @@ function formatRunTime(seconds?: null | number): string {
   return Number.isNaN(date.valueOf()) ? '—' : date.toLocaleString()
 }
 
-// Runs are produced by the background scheduler tick. cron.changed /
-// sessions.changed broadcasts re-load immediately on event-capable backends
-// (the tick dep below), so the poll drops to a slow backstop there; older
-// backends keep the legacy cadence.
+// Runs are produced by the background scheduler tick (no UI signal), so poll
+// while the panel is open + on tab re-focus so a fired run shows up within a few
+// seconds instead of waiting for a reload.
 const RUNS_POLL_INTERVAL_MS = 8000
-const RUNS_BACKSTOP_INTERVAL_MS = 60_000
 
 function CronJobRuns({
   c,
@@ -690,8 +687,6 @@ function CronJobRuns({
   onOpenSession?: (sessionId: string) => void
 }) {
   const [runs, setRuns] = useState<null | SessionInfo[]>(null)
-  const changeEventsAvailable = useStore($changeEventsAvailable)
-  const cronChangeTick = useStore($cronChangeTick)
 
   useEffect(() => {
     let cancelled = false
@@ -711,14 +706,11 @@ function CronJobRuns({
 
     void load()
 
-    const intervalId = window.setInterval(
-      () => {
-        if (document.visibilityState === 'visible') {
-          void load()
-        }
-      },
-      changeEventsAvailable ? RUNS_BACKSTOP_INTERVAL_MS : RUNS_POLL_INTERVAL_MS
-    )
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void load()
+      }
+    }, RUNS_POLL_INTERVAL_MS)
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
@@ -733,8 +725,7 @@ function CronJobRuns({
       window.clearInterval(intervalId)
       document.removeEventListener('visibilitychange', onVisible)
     }
-    // cronChangeTick: a fired run moves jobs.json bookkeeping → reload now.
-  }, [changeEventsAvailable, cronChangeTick, jobId])
+  }, [jobId])
 
   return (
     <div>

@@ -4,7 +4,6 @@ import { createContext, useContext, useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
-import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import {
   DropdownMenuGroup,
   DropdownMenuItem,
@@ -19,6 +18,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { ChevronDown, ChevronRight } from '@/lib/icons'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { currentPickerSelection, displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
@@ -244,26 +244,25 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
           {groups.map(group => {
             const slug = group.provider.slug
 
-            // Collapsed when the user stored it (and not while searching, which
-            // spans every model regardless of collapse state).
-            const collapsed = collapsedProviders.includes(slug) && !search
+            // Collapsed when stored + no active search + not the current provider.
+            const collapsed = collapsedProviders.includes(slug) && !search && slug !== optionsProvider
 
             return (
               <DropdownMenuGroup className="py-0.5" key={slug}>
                 <DropdownMenuItem
-                  className="group/label flex w-full items-center gap-1 px-2 pb-0.5 pt-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary) cursor-pointer !bg-transparent focus:!bg-transparent"
+                  className={cn(dropdownMenuSectionLabel, 'cursor-pointer hover:bg-(--ui-control-active-background)')}
                   onSelect={event => {
                     event.preventDefault()
                     toggleCollapsedProvider(slug)
                   }}
                   textValue=""
                 >
-                  <span className="truncate">{group.provider.name}</span>
-                  <DisclosureCaret
-                    className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition group-hover/label:opacity-100"
-                    open={!collapsed}
-                    size="0.625rem"
-                  />
+                  {collapsed ? (
+                    <ChevronRight className="size-2.5 shrink-0" />
+                  ) : (
+                    <ChevronDown className="size-2.5 shrink-0" />
+                  )}
+                  {group.provider.name}
                 </DropdownMenuItem>
                 {!collapsed &&
                   group.families.map(family => {

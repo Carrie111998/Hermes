@@ -14,7 +14,7 @@ import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 
-import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
+import { SidebarCount, SidebarDateDivider } from './chrome'
 import {
   EnteredProjectContent,
   ProjectOverviewRow,
@@ -56,7 +56,7 @@ function SidebarSectionHeader({
     <>
       {icon}
       <SidebarPanelLabel>{label}</SidebarPanelLabel>
-      {meta && <SidebarSectionMeta>{meta}</SidebarSectionMeta>}
+      {meta && <SidebarCount>{meta}</SidebarCount>}
     </>
   )
 
@@ -109,7 +109,7 @@ interface SidebarSessionsSectionProps {
   // which then passes `projectContent` on the next render. Takes precedence
   // over `tree` / `groups`.
   projectOverview?: SidebarProjectTree[]
-  // Per-project preview rows (from the backend tree), keyed by project id.
+  // Per-project preview rows (from the backend tree), keyed by project path.
   projectOverviewPreviews?: Record<string, SessionInfo[]>
   // True while the backend project tree is loading (overview skeleton).
   projectsLoading?: boolean
@@ -197,14 +197,7 @@ export function SidebarSessionsSection({
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
   const hasProjectOverview = Boolean(projectOverview?.length)
-
-  // Lanes count as content even with no rows left in them: the backend only
-  // emits a lane that has sessions, so a lane surviving with zero rows means
-  // they were filtered out (pinned) — the branch is real and must still render.
-  // A genuinely empty project has no lanes at all and keeps its empty state.
-  const hasProjectContent = Boolean(
-    projectContent && (projectContent.sessionCount > 0 || projectContent.repos.some(repo => repo.groups.length > 0))
-  )
+  const hasProjectContent = Boolean(projectContent && projectContent.sessionCount > 0)
 
   const showEmptyState =
     forceEmptyState || (!hasGroupedSessions && !hasProjectOverview && !hasProjectContent && sessions.length === 0)
@@ -312,45 +305,36 @@ export function SidebarSessionsSection({
   } else if (showEmptyState) {
     inner = emptyState
   } else if (projectOverview?.length) {
-    // The model is already ordered (Home leads; then the default sort groups
-    // explicit-before-auto, with a manual drag-order winning when present).
-    // Render in that order and make rows drag-to-reorder when a handler is
-    // wired — Home stays outside the sortable list, it's a fixture.
-    const home = projectOverview[0]?.isNoProject ? projectOverview[0] : undefined
-    const sortableProjects = home ? projectOverview.slice(1) : projectOverview
-    const projectsDraggable = sortableProjects.length > 1 && !!onReorderProjects
+    // The model is already ordered (default sort groups explicit-before-auto;
+    // a manual drag-order, when present, wins). Render in that order and make
+    // rows drag-to-reorder when a handler is wired.
+    const projectsDraggable = projectOverview.length > 1 && !!onReorderProjects
     const Row = projectsDraggable ? SortableProjectOverviewRow : ProjectOverviewRow
 
-    const projectRow = (project: SidebarProjectTree, Component: typeof ProjectOverviewRow) => (
-      <Component
+    const rows = projectOverview.map(project => (
+      <Row
         activeProjectId={activeProjectId}
         key={project.id}
         onEnter={onEnterProject}
         onNewSession={onNewSessionInWorkspace}
-        previewSessions={projectOverviewPreviews?.[project.id]}
+        previewSessions={project.path ? projectOverviewPreviews?.[project.path] : undefined}
         project={project}
         renderRows={renderRows}
       />
-    )
+    ))
 
-    const rows = sortableProjects.map(project => projectRow(project, Row))
-
-    inner = (
-      <>
-        {home && projectRow(home, ProjectOverviewRow)}
-        {projectsDraggable && onReorderProjects ? (
-          <ReorderableList
-            ids={sortableProjects.map(project => project.id)}
-            onReorder={onReorderProjects}
-            sensors={dndSensors}
-          >
-            {rows}
-          </ReorderableList>
-        ) : (
-          rows
-        )}
-      </>
-    )
+    inner =
+      projectsDraggable && onReorderProjects ? (
+        <ReorderableList
+          ids={projectOverview.map(project => project.id)}
+          onReorder={onReorderProjects}
+          sensors={dndSensors}
+        >
+          {rows}
+        </ReorderableList>
+      ) : (
+        rows
+      )
   } else if (groups?.length) {
     // Profile/source groups never reorder; render them flat with static rows.
     inner = groups.map(group => (

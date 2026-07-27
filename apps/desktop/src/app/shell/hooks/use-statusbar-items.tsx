@@ -14,7 +14,6 @@ import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { resolveVersionStatus } from '@/lib/version-status'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { revealFileInTree } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -219,33 +218,42 @@ export function useStatusbarItems({
       : 'text-destructive hover:text-destructive'
 
   const clientVersionItem = useMemo<StatusbarItem>(() => {
+    const appVersion = desktopVersion?.appVersion
+    const sha = updateStatus?.currentSha?.slice(0, 7) ?? null
+    const behind = updateStatus?.behind ?? 0
     const applying = updateApply.applying || updateApply.stage === 'restart'
+    const remote = connection?.mode === 'remote'
 
-    const status = resolveVersionStatus({
-      applying,
-      applyMessage: updateApply.message,
-      behind: updateStatus?.behind ?? 0,
-      branch: updateStatus?.branch,
-      copy,
-      remote: connection?.mode === 'remote',
-      restarting: updateApply.stage === 'restart',
-      sha: updateStatus?.currentSha?.slice(0, 7) ?? null,
-      target: 'client',
-      version: desktopVersion?.appVersion
-    })
+    const version = appVersion ? `v${appVersion}` : (sha ?? copy.unknown)
+    const base = remote ? copy.clientLabel(appVersion ?? sha ?? copy.unknown) : version
+    const behindHint = !applying && behind > 0 ? ` (+${behind})` : ''
+
+    const label = applying
+      ? `${base} · ${updateApply.stage === 'restart' ? copy.restart : copy.update}`
+      : `${base}${behindHint}`
+
+    const tooltip = [
+      applying ? updateApply.message || copy.updateInProgress : null,
+      !applying && behind > 0 && copy.commitsBehind(behind, updateStatus?.branch ?? '...'),
+      appVersion && copy.desktopVersion(appVersion),
+      sha && copy.commit(sha),
+      updateStatus?.branch && copy.branch(updateStatus.branch)
+    ]
+      .filter(Boolean)
+      .join(' · ')
 
     return {
-      className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
-      detail: status.detail,
-      hidden: status.unknown,
+      className: !applying && behind > 0 ? 'text-primary hover:text-primary' : undefined,
+      detail: appVersion && sha && !applying && !remote ? sha : undefined,
+      hidden: !appVersion && !sha,
       icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
       id: 'version-client',
-      label: status.label,
+      label,
       // Update state is not a preference: hiding it is how a user misses that
       // their client is behind. Listed in the menu, but locked on.
       lockedVisible: true,
       onSelect: () => openUpdateOverlayFor('client'),
-      title: status.tooltip,
+      title: tooltip || undefined,
       toggleLabel: copy.toggleVersion,
       variant: 'action'
     }
@@ -266,29 +274,38 @@ export function useStatusbarItems({
       return null
     }
 
+    const backendVersion = statusSnapshot?.version
+    const behind = backendUpdateStatus?.behind ?? 0
+    const updateAvailable = backendUpdateStatus?.updateAvailable || behind > 0
     const applying = backendUpdateApply.applying || backendUpdateApply.stage === 'restart'
 
-    const status = resolveVersionStatus({
-      applying,
-      applyMessage: backendUpdateApply.message,
-      behind: backendUpdateStatus?.behind ?? 0,
-      copy,
-      remote: true,
-      restarting: backendUpdateApply.stage === 'restart',
-      target: 'backend',
-      updateAvailable: backendUpdateStatus?.updateAvailable,
-      version: statusSnapshot?.version
-    })
+    const base = copy.backendLabel(backendVersion ?? copy.unknown)
+
+    const behindHint =
+      !applying && behind > 0 ? ` (+${behind})` : !applying && updateAvailable ? ` (${copy.update})` : ''
+
+    const label = applying
+      ? `${base} · ${backendUpdateApply.stage === 'restart' ? copy.restart : copy.update}`
+      : `${base}${behindHint}`
+
+    const tooltip = [
+      applying ? backendUpdateApply.message || copy.updateInProgress : null,
+      !applying && behind > 0 && copy.commitsBehind(behind, 'main'),
+      !applying && behind <= 0 && updateAvailable && copy.update,
+      backendVersion && copy.backendVersion(backendVersion)
+    ]
+      .filter(Boolean)
+      .join(' · ')
 
     return {
-      className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
-      hidden: status.unknown,
+      className: !applying && updateAvailable ? 'text-primary hover:text-primary' : undefined,
+      hidden: !backendVersion,
       icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
       id: 'version-backend',
-      label: status.label,
+      label,
       lockedVisible: true,
       onSelect: () => openUpdateOverlayFor('backend'),
-      title: status.tooltip,
+      title: tooltip || undefined,
       toggleLabel: copy.toggleBackendVersion,
       variant: 'action'
     }
@@ -323,7 +340,11 @@ export function useStatusbarItems({
         : cloud
           ? copy.connectionCloud(connection.remoteHost)
           : copy.connectionRemote(connection.remoteHost),
-      // Label already names the host — no "click to manage" tip lecture.
+      title: ssh
+        ? copy.connectionSshTooltip(connection.remoteHost)
+        : cloud
+          ? copy.connectionCloudTooltip(connection.remoteHost)
+          : copy.connectionRemoteTooltip(connection.remoteHost),
       to: `${SETTINGS_ROUTE}?tab=gateway`
     }
   }, [connection?.mode, connection?.remoteHost, connection?.remoteKind, copy])
@@ -357,8 +378,7 @@ export function useStatusbarItems({
         label: copy.gateway,
         menuClassName: 'w-72',
         menuContent: gatewayMenuContent,
-        // Tip only when there's a real status reason — not "gateway status" restating the label.
-        title: inferenceStatus?.reason || undefined,
+        title: inferenceStatus?.reason || copy.gatewayTitle,
         toggleLabel: copy.gateway,
         variant: 'menu'
       },
@@ -426,6 +446,7 @@ export function useStatusbarItems({
         icon: <Clock className="size-3" />,
         id: 'cron',
         label: copy.cron,
+        title: copy.openCron,
         to: CRON_ROUTE,
         toggleLabel: copy.cron,
         variant: 'action'
@@ -434,6 +455,7 @@ export function useStatusbarItems({
         icon: <Globe className="size-3" />,
         id: 'webhooks',
         label: copy.webhooks,
+        title: copy.openWebhooks,
         to: WEBHOOKS_ROUTE,
         toggleLabel: copy.webhooks,
         variant: 'action'
@@ -470,6 +492,7 @@ export function useStatusbarItems({
         icon: <Loader2 className="size-3 animate-spin" />,
         id: 'running-timer',
         label: copy.turnRunning,
+        title: copy.currentTurnElapsed,
         toggleLabel: copy.toggleRunningTimer,
         variant: 'text'
       },
@@ -488,6 +511,7 @@ export function useStatusbarItems({
             sessionId={activeSessionId}
           />
         ),
+        title: copy.openContextUsage,
         toggleLabel: copy.toggleContextUsage,
         variant: 'menu'
       },
@@ -496,6 +520,7 @@ export function useStatusbarItems({
         hidden: !sessionStartedAt,
         id: 'session-timer',
         label: copy.session,
+        title: copy.runtimeSessionElapsed,
         toggleLabel: copy.toggleSessionTimer,
         variant: 'text'
       },

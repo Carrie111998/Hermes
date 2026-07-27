@@ -49,6 +49,7 @@ import {
   PanelListRow,
   PanelMeta,
   PanelPill,
+  PanelRowMenu,
   PanelSectionLabel
 } from '../overlays/panel'
 import { ListRow } from '../settings/primitives'
@@ -386,14 +387,18 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
                   active={selectedSub?.name === sub.name}
                   dotClassName={sub.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/50'}
                   key={sub.name}
-                  menuItems={[
-                    {
-                      icon: sub.enabled ? 'circle-slash' : 'check',
-                      label: sub.enabled ? w.disableRow : w.enableRow,
-                      onSelect: () => void handleToggle(sub.name, !sub.enabled)
-                    },
-                    { icon: 'trash', label: w.delete, onSelect: () => setPendingDelete(sub.name), tone: 'danger' }
-                  ]}
+                  menu={
+                    <PanelRowMenu
+                      items={[
+                        {
+                          icon: sub.enabled ? 'circle-slash' : 'check',
+                          label: sub.enabled ? w.disableRow : w.enableRow,
+                          onSelect: () => void handleToggle(sub.name, !sub.enabled)
+                        },
+                        { icon: 'trash', label: w.delete, onSelect: () => setPendingDelete(sub.name), tone: 'danger' }
+                      ]}
+                    />
+                  }
                   onSelect={() => setSelectedName(sub.name)}
                   title={sub.name}
                 />

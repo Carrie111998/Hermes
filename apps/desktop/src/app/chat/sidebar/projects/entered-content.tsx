@@ -55,12 +55,6 @@ export function EnteredProjectContent({
     return null
   }
 
-  // Home's rows aren't anchored to a folder, so there's no repo or worktree
-  // structure to show — just the chats.
-  if (project.isNoProject) {
-    return <>{renderRows(project.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions)))}</>
-  }
-
   const single = project.repos.length === 1
 
   return (
@@ -138,6 +132,8 @@ function RepoFlatSection({
     group =>
       group.isMain || !dismissedWorktrees.includes(group.id) || (group.path && discoveredWorktreePaths.has(group.path))
   )
+
+  const repoCount = ordered.reduce((sum, group) => sum + group.sessions.length, 0)
 
   // Removal asks how: actually `git worktree remove` it, or just hide the lane
   // and leave the worktree on disk. A dirty worktree escalates to a force prompt
@@ -272,6 +268,7 @@ function RepoFlatSection({
             />
           )
         }
+        count={repoCount}
         emphasis
         icon={<Codicon className="shrink-0 text-(--ui-text-tertiary)" name="repo" size="0.75rem" />}
         label={repo.label}

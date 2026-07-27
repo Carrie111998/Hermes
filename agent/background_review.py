@@ -70,8 +70,8 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         "routed": False,
     }
     try:
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly()
+        from hermes_cli.config import load_config
+        cfg = load_config()
     except Exception:
         return parent
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
