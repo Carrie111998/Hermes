@@ -3861,6 +3861,46 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    def test_records_one_summary_request_attempt(self, agent):
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}],
+            60,
+        )
+
+        assert result == "Summary"
+        assert agent._last_max_iteration_api_calls == 1
+
+    def test_records_retry_after_empty_summary_as_second_request_attempt(self, agent):
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=""),
+            _mock_response(content="Summary"),
+        ]
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}],
+            60,
+        )
+
+        assert result == "Summary"
+        assert agent._last_max_iteration_api_calls == 2
+
+    def test_quiet_mode_suppresses_iteration_warning(self, agent, capsys):
+        agent.quiet_mode = True
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}],
+            60,
+        )
+
+        assert result == "Summary"
+        assert capsys.readouterr().out == ""
+
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
         agent.client.chat.completions.create.return_value = resp

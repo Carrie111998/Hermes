@@ -91,6 +91,7 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    _summary_api_call_count = 0
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -125,9 +126,9 @@ def finalize_turn(
         iteration_limit_fallback = True
         preserved_verification_fallback = True
     elif final_response is None and budget_fallback_eligible:
-        # Budget exhausted — ask the model for a summary via one extra
-        # API call with tools stripped.  _handle_max_iterations injects a
-        # user message and makes a single toolless request.
+        # Budget exhausted — ask the model for a summary with tools stripped.
+        # _handle_max_iterations injects a user message and makes one toolless
+        # request, with one retry when the first summary is empty.
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         agent._emit_status(
             f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
@@ -139,6 +140,9 @@ def finalize_turn(
                 "— requesting summary..."
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
+        _summary_api_call_count = getattr(
+            agent, "_last_max_iteration_api_calls", 0
+        ) or 0
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -189,6 +193,12 @@ def finalize_turn(
                     _kanban_task,
                     exc_info=True,
                 )
+
+    # Keep Kanban's budget_used bound to tool iterations, then include any
+    # post-budget summary requests in the turn's actual provider-call count.
+    if _summary_api_call_count:
+        api_call_count += _summary_api_call_count
+        agent._api_call_count = api_call_count
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
