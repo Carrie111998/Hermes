@@ -31,6 +31,8 @@ implied by a read grant.
 
 Revocation is transitive: worker launch and result handoff walk the parent
 grant chain, and any revoked ancestor or cyclic chain is treated as revoked.
+The authority-integrity scan also rechecks the parent grant's exact scope,
+budget, and expiry rather than trusting the child record alone.
 
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority

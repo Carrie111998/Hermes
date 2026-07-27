@@ -41,6 +41,9 @@
 - Revocation checks now traverse the parent-grant chain and fail closed when
   any ancestor is revoked or the chain is cyclic, fencing descendant workers
   and result handoffs immediately.
+- Authority-integrity verification now independently checks parent-grant
+  expiry, budget, capabilities, systems, toolsets, skills, and exact resource
+  equality, detecting persisted hierarchy expansion or stale parent evidence.
 - Delegation grants now persist the exact action resource scope and reject a
   Kanban binding to a different board; legacy grants without a scope fail closed
   until reissued under a current action contract.

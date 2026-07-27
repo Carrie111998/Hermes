@@ -575,12 +575,38 @@ def verify_grants(conn: sqlite3.Connection, organization_id: str) -> bool:
             if not row["parent_grant_id"]:
                 return False
             parent = conn.execute(
-                """SELECT employee_id FROM employee_task_grants
+                """SELECT * FROM employee_task_grants
                     WHERE id=? AND organization_id=?""",
                 (row["parent_grant_id"], organization_id),
             ).fetchone()
             if parent is None or str(parent["employee_id"]) != str(
                 row["manager_employee_id"]
+            ):
+                return False
+            if is_revoked(conn, str(parent["id"])):
+                return False
+            if int(row["expires_at"]) > int(parent["expires_at"]):
+                return False
+            if int(row["budget_minor"]) > int(parent["budget_minor"]):
+                return False
+            if not set(json.loads(row["capabilities_json"] or "[]")).issubset(
+                set(json.loads(parent["capabilities_json"] or "[]"))
+            ):
+                return False
+            if not set(json.loads(row["systems_json"] or "[]")).issubset(
+                set(json.loads(parent["systems_json"] or "[]"))
+            ):
+                return False
+            if "all" in json.loads(row["toolsets_json"] or "[]") or not set(
+                json.loads(row["toolsets_json"] or "[]")
+            ).issubset(set(json.loads(parent["toolsets_json"] or "[]"))):
+                return False
+            if not set(json.loads(row["skills_json"] or "[]")).issubset(
+                set(json.loads(parent["skills_json"] or "[]"))
+            ):
+                return False
+            if json.loads(row["resource_scope_json"] or "{}") != json.loads(
+                parent["resource_scope_json"] or "{}"
             ):
                 return False
         lineage = conn.execute(
