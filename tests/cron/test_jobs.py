@@ -846,3 +846,50 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+
+# =========================================================================
+# P1a in-band attribution hook (telemetry only, save_jobs()'s caller= param)
+# =========================================================================
+
+class TestSaveJobsAttribution:
+    def _read_attribution_lines(self):
+        import cron.jobs as jobs_mod
+        path = jobs_mod.CRON_DIR / jobs_mod.ATTRIBUTION_LOG_NAME
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_create_job_populates_one_attribution_record(self, tmp_cron_dir):
+        job = create_job(prompt="Check status", schedule="30m")
+        lines = self._read_attribution_lines()
+        assert len(lines) == 1
+        assert lines[0]["caller"] == "create_job"
+        assert lines[0]["job_count"] == 1
+        assert "timestamp" in lines[0]
+
+    def test_multiple_calls_append_not_overwrite(self, tmp_cron_dir):
+        job = create_job(prompt="Check status", schedule="30m")
+        update_job(job["id"], {"name": "Renamed"})
+        remove_job(job["id"])
+        lines = self._read_attribution_lines()
+        assert [l["caller"] for l in lines] == ["create_job", "update_job", "remove_job"]
+
+    def test_attribution_failure_never_blocks_real_write(self, tmp_cron_dir, monkeypatch):
+        import cron.jobs as jobs_mod
+
+        real_open = open
+
+        def failing_open(path, *a, **kw):
+            if str(path).endswith(jobs_mod.ATTRIBUTION_LOG_NAME):
+                raise OSError("disk full (simulated)")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", failing_open)
+        # The real jobs.json write must still succeed even though attribution
+        # logging fails -- telemetry is best-effort, never blocks the source
+        # of truth.
+        job = create_job(prompt="Check status", schedule="30m")
+        assert job["id"]
+        assert get_job(job["id"]) is not None

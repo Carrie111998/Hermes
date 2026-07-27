@@ -36,6 +36,9 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+# P1a in-band attribution hook: telemetry only, best-effort, never blocks the
+# real write. See save_jobs()'s docstring for the hard isolation rule.
+ATTRIBUTION_LOG_NAME = "jobs-write-attribution.jsonl"
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -356,7 +359,7 @@ def load_jobs() -> List[Dict[str, Any]]:
                 jobs = data.get("jobs", [])
                 if jobs:
                     # Auto-repair: rewrite with proper escaping
-                    save_jobs(jobs)
+                    save_jobs(jobs, caller="load_jobs_auto_repair")
                     logger.warning("Auto-repaired jobs.json (had invalid control characters)")
                 return jobs
         except Exception as e:
@@ -367,8 +370,46 @@ def load_jobs() -> List[Dict[str, Any]]:
         raise RuntimeError(f"Failed to read cron database: {e}") from e
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+def _record_attribution(caller: str, job_count: int) -> None:
+    """Append one line to CRON_DIR/ATTRIBUTION_LOG_NAME: telemetry only,
+    best-effort. Reads CRON_DIR at call time (not a precomputed path) so
+    it correctly follows the module attribute a test fixture monkeypatches
+    (see tests/cron/test_jobs.py's tmp_cron_dir fixture) instead of writing
+    to the real ~/.hermes/cron/ during tests.
+
+    P1a HARD RULE: this log must never be consultable by the out-of-band
+    authority projection check (heartbeat_check.py, moltbot repo) to close
+    or suppress a finding -- that check reads jobs.json cold from disk and
+    has zero reference to this file or this function (see
+    tests/test_heartbeat_check.py::TestCronAttributionLogIsolation, a
+    structural grep-based proof, not just this comment). If a finding needs
+    diagnosis, a human reads both records side by side; the system itself
+    never auto-correlates them. Follows the existing hermes-agent idiom for
+    best-effort JSONL side logs (tui_gateway/server.py:_append_spawn_tree_index,
+    gateway/mirror.py:_append_to_jsonl, agent/trajectory.py:save_trajectory):
+    plain append, no lock, never raises -- losing a line here must never
+    block or fail the real jobs.json write.
+    """
+    try:
+        entry = {
+            "timestamp": _hermes_now().isoformat(),
+            "caller": caller,
+            "job_count": job_count,
+        }
+        with open(CRON_DIR / ATTRIBUTION_LOG_NAME, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.debug("jobs-write-attribution append failed: %s", exc)
+
+
+def save_jobs(jobs: List[Dict[str, Any]], caller: str = "unknown"):
+    """Save all jobs to storage.
+
+    caller identifies which function triggered this write (e.g. "create_job",
+    "rewrite_skill_refs") -- recorded to CRON_DIR/ATTRIBUTION_LOG_NAME as telemetry only,
+    after the real write succeeds. See _record_attribution's docstring for
+    the hard isolation rule against the out-of-band authority check.
+    """
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
@@ -384,6 +425,7 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         except OSError:
             pass
         raise
+    _record_attribution(caller, len(jobs))
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -570,7 +612,7 @@ def create_job(
 
     jobs = load_jobs()
     jobs.append(job)
-    save_jobs(jobs)
+    save_jobs(jobs, caller="create_job")
 
     return job
 
@@ -635,7 +677,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
         jobs[i] = updated
-        save_jobs(jobs)
+        save_jobs(jobs, caller="update_job")
         return _apply_skill_fields(jobs[i])
     return None
 
@@ -695,7 +737,7 @@ def remove_job(job_id: str) -> bool:
     original_len = len(jobs)
     jobs = [j for j in jobs if j["id"] != job_id]
     if len(jobs) < original_len:
-        save_jobs(jobs)
+        save_jobs(jobs, caller="remove_job")
         return True
     return False
 
@@ -732,7 +774,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     if times is not None and times > 0 and completed >= times:
                         # Remove the job (limit reached)
                         jobs.pop(i)
-                        save_jobs(jobs)
+                        save_jobs(jobs, caller="mark_job_run")
                         return
                 
                 # Compute next run
@@ -767,7 +809,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
 
-                save_jobs(jobs)
+                save_jobs(jobs, caller="mark_job_run")
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
@@ -796,7 +838,7 @@ def advance_next_run(job_id: str) -> bool:
                 new_next = compute_next_run(job["schedule"], now)
                 if new_next and new_next != job.get("next_run_at"):
                     job["next_run_at"] = new_next
-                    save_jobs(jobs)
+                    save_jobs(jobs, caller="advance_next_run")
                     return True
                 return False
         return False
@@ -899,7 +941,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             due.append(job)
 
     if needs_save:
-        save_jobs(raw_jobs)
+        save_jobs(raw_jobs, caller="_get_due_jobs_locked")
 
     return due
 
@@ -1038,7 +1080,7 @@ def rewrite_skill_refs(
             })
 
         if changed:
-            save_jobs(jobs)
+            save_jobs(jobs, caller="rewrite_skill_refs")
             logger.info(
                 "Curator rewrote skill references in %d cron job(s)", len(rewrites)
             )
