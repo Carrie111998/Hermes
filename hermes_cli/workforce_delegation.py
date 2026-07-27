@@ -262,10 +262,22 @@ def create_grant(
         )
         if allocated + budget_minor > int(mandate_budget):
             raise DelegationError("task grants exceed employee mandate budget")
-    if manager_mandate["budget_minor"] is not None and budget_minor > int(
-        manager_mandate["budget_minor"]
-    ):
-        raise DelegationError("task budget exceeds delegator authority")
+    if manager_mandate["budget_minor"] is not None:
+        manager_budget = int(manager_mandate["budget_minor"])
+        manager_allocated = int(
+            conn.execute(
+                """SELECT COALESCE(SUM(budget_minor), 0) AS n
+                     FROM employee_task_grants
+                    WHERE manager_employee_id=? AND expires_at>?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM employee_task_grant_revocations r
+                           WHERE r.grant_id=employee_task_grants.id
+                      )""",
+                (manager_employee_id, now),
+            ).fetchone()["n"]
+        )
+        if manager_allocated + budget_minor > manager_budget:
+            raise DelegationError("task budget exceeds delegator authority")
     objective = conn.execute(
         """SELECT organization_id,max_spend_minor,permitted_systems_json
              FROM objectives WHERE id=?""",

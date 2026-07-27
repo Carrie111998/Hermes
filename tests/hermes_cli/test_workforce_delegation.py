@@ -233,6 +233,33 @@ def test_grant_rejects_authority_expansion(
         _grant(company[0], company[1:], **{field: value})
 
 
+def test_grant_rejects_cumulative_delegator_budget_expansion(tmp_path, monkeypatch):
+    company = _company(tmp_path, monkeypatch)
+    conn = company[0]
+    ids = company[1:]
+    _grant(conn, ids, budget_minor=400)
+    objective_id = ids[4]
+    plan_id = conn.execute(
+        "SELECT id FROM plans WHERE objective_id=? ORDER BY version DESC LIMIT 1",
+        (objective_id,),
+    ).fetchone()["id"]
+    second_action = objectives_db.propose_action(
+        conn,
+        objective_id=objective_id,
+        plan_id=plan_id,
+        action_type="web.read",
+        payload={"system": "web", "target_resource": "second"},
+        expected_outcome="second bounded read",
+        required_capability="web.read",
+        verification_method="web.read.completed",
+        risk_class="low",
+        reversible=True,
+        proposed_by=f"employee:{ids[1]}",
+    )
+    with pytest.raises(workforce_delegation.DelegationError, match="budget"):
+        _grant(conn, ids, action_id=second_action, budget_minor=200)
+
+
 def test_grant_binding_is_one_to_one_and_profile_snapshot_must_be_current(
     tmp_path, monkeypatch
 ):
