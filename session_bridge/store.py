@@ -8079,6 +8079,127 @@ class SessionBridgeStore:
             raise ValueError("hydration lease has expired")
         return result
 
+    def recover_absent_sidebar_hydration_send(
+        self,
+        *,
+        source_session_id: str,
+        codex_thread_id: str,
+        hydration_marker: str,
+        evidence_digest: str,
+        observed_turn_count: int,
+        now: float,
+    ) -> dict[str, Any]:
+        source_id = _exact_nonempty_text(
+            source_session_id,
+            "hydration recovery source session ID",
+        )
+        thread_id = _exact_nonempty_text(
+            codex_thread_id,
+            "hydration recovery Codex thread ID",
+        )
+        marker = _exact_nonempty_text(
+            hydration_marker,
+            "hydration recovery marker",
+        )
+        evidence = _sha256_text(
+            evidence_digest,
+            "hydration recovery evidence digest",
+        )
+        if type(observed_turn_count) is not int or observed_turn_count != 1:
+            raise ValueError(
+                "hydration recovery requires exactly one observed placeholder turn"
+            )
+        recovered_at = _finite_number(now, "hydration recovery time")
+
+        def _write(conn):
+            job = conn.execute(
+                """SELECT * FROM session_sidebar_hydration_jobs
+                   WHERE source_session_id = ?""",
+                (source_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError("hydration recovery job does not exist")
+            expected = {
+                "codex_thread_id": thread_id,
+                "hydration_marker": marker,
+                "state": SidebarHydrationState.FAILED.value,
+                "error_code": "hydration_send_ambiguous",
+            }
+            if (
+                any(job[key] != value for key, value in expected.items())
+                or job["send_reserved_at"] is None
+                or job["completion_digest"] is not None
+                or job["sent_at"] is not None
+                or job["verified_at"] is not None
+                or job["lease_digest"] is not None
+                or job["lease_expires_at"] is not None
+            ):
+                raise ValueError("hydration recovery job is not exact failed ambiguity")
+
+            state_key = (
+                "session-bridge:sidebar:hydration-absent-recovery:"
+                + str(job["id"])
+            )
+            marker_digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+            snapshot = {
+                "version": 1,
+                "source_session_id": source_id,
+                "codex_thread_id": thread_id,
+                "hydration_marker_digest": marker_digest,
+                "evidence_digest": evidence,
+                "observed_turn_count": observed_turn_count,
+                "recovered_at": recovered_at,
+            }
+            value_json = json.dumps(
+                snapshot,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            try:
+                conn.execute(
+                    """INSERT INTO session_bridge_state (
+                       key, value_json, updated_at
+                       ) VALUES (?, ?, ?)""",
+                    (state_key, value_json, recovered_at),
+                )
+            except sqlite3.IntegrityError:
+                raise ValueError(
+                    "hydration absent-send recovery already exists"
+                ) from None
+
+            cursor = conn.execute(
+                """UPDATE session_sidebar_hydration_jobs
+                      SET state = ?, attempts = 0, next_attempt_at = ?,
+                          lease_digest = NULL, lease_expires_at = NULL,
+                          send_reserved_at = NULL, sent_at = NULL,
+                          verified_at = NULL, completion_digest = NULL,
+                          error_code = NULL, updated_at = ?
+                    WHERE id = ? AND state = ? AND error_code = ?
+                      AND send_reserved_at IS NOT NULL
+                      AND completion_digest IS NULL""",
+                (
+                    SidebarHydrationState.PENDING.value,
+                    recovered_at,
+                    recovered_at,
+                    job["id"],
+                    SidebarHydrationState.FAILED.value,
+                    "hydration_send_ambiguous",
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("hydration recovery compare-and-swap failed")
+            return dict(
+                conn.execute(
+                    """SELECT * FROM session_sidebar_hydration_jobs
+                       WHERE id = ?""",
+                    (job["id"],),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
     def sidebar_hydration_status(self, now: float) -> dict[str, Any]:
         checked_at = _finite_number(now, "hydration status time")
         with self.db._lock:

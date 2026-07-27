@@ -414,7 +414,12 @@ def test_codex_delivery_starts_one_text_turn_and_verifies_hydration_marker() -> 
     marker = "HERMES_SESSION_HYDRATION_V1:canonical.marker"
     message = f"# Imported Claude Code Session\n\nHydration marker: {marker}"
     client = FakeCodexAppServerClient(
-        {"turn/start": [{"turn": {"id": TURN_1}}]},
+        {
+            "thread/resume": [
+                {"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}
+            ],
+            "turn/start": [{"turn": {"id": TURN_1}}],
+        },
         notifications=[_turn_completed()],
     )
     fresh_client = FakeCodexAppServerClient({
@@ -433,8 +438,12 @@ def test_codex_delivery_starts_one_text_turn_and_verifies_hydration_marker() -> 
         deadline=105.0,
     )
 
-    assert [method for method, _params, _timeout in client.calls] == ["turn/start"]
-    assert client.calls[0][1] == {
+    assert [method for method, _params, _timeout in client.calls] == [
+        "thread/resume",
+        "turn/start",
+    ]
+    assert client.calls[0][1] == {"threadId": THREAD_1}
+    assert client.calls[1][1] == {
         "threadId": THREAD_1,
         "input": [{"type": "text", "text": message}],
     }
@@ -446,9 +455,14 @@ def test_codex_delivery_starts_one_text_turn_and_verifies_hydration_marker() -> 
 def test_codex_delivery_converts_post_dispatch_failure_to_turn_ambiguity() -> None:
     marker = "HERMES_SESSION_HYDRATION_V1:canonical.marker"
     message = f"# Imported Claude Code Session\n\nHydration marker: {marker}"
-    client = FakeCodexAppServerClient({
-        "turn/start": [RuntimeError("transport closed after dispatch")],
-    })
+    client = FakeCodexAppServerClient(
+        {
+            "thread/resume": [
+                {"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}
+            ],
+            "turn/start": [RuntimeError("transport closed after dispatch")],
+        }
+    )
     delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
 
     with pytest.raises(NativeTurnAmbiguous):

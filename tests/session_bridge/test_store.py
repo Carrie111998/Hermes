@@ -7220,6 +7220,72 @@ def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) 
     assert status["active_lease"] is False
 
 
+def test_sidebar_hydration_operator_recovers_exact_proven_absent_send(db) -> None:
+    _visible_store, candidate = _visible_sidebar_for_hydration(
+        db,
+        native_id="hydration-proven-absent",
+    )
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "proven-absent-1",
+            "proven-absent-2",
+            "proven-absent-3",
+            "proven-absent-4",
+            "proven-absent-5",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    seeded = _seed_hydration(store, candidate)
+
+    for attempt in range(5):
+        claim = store.claim_sidebar_hydration_jobs(
+            now=125.0 + attempt,
+            limit=1,
+        )[0]
+        if attempt == 0:
+            store.reserve_sidebar_hydration_send(
+                lease_token=claim["lease_token"],
+                now=125.5,
+            )
+        failed = store.fail_sidebar_hydration_job(
+            lease_token=claim["lease_token"],
+            error_code="hydration_send_ambiguous",
+            codex_thread_id=str(seeded["codex_thread_id"]),
+            now=125.75 + attempt,
+        )
+
+    assert failed["state"] == SidebarHydrationState.FAILED.value
+    recovered = store.recover_absent_sidebar_hydration_send(
+        source_session_id=candidate.source_session_id,
+        codex_thread_id=str(seeded["codex_thread_id"]),
+        hydration_marker=str(seeded["hydration_marker"]),
+        evidence_digest="e" * 64,
+        observed_turn_count=1,
+        now=200.0,
+    )
+
+    assert recovered["state"] == SidebarHydrationState.PENDING.value
+    assert recovered["attempts"] == 0
+    assert recovered["send_reserved_at"] is None
+    assert recovered["error_code"] is None
+    evidence = store.get_state(
+        "session-bridge:sidebar:hydration-absent-recovery:"
+        + str(seeded["id"])
+    )
+    assert evidence == {
+        "version": 1,
+        "source_session_id": candidate.source_session_id,
+        "codex_thread_id": seeded["codex_thread_id"],
+        "hydration_marker_digest": hashlib.sha256(
+            str(seeded["hydration_marker"]).encode("utf-8")
+        ).hexdigest(),
+        "evidence_digest": "e" * 64,
+        "observed_turn_count": 1,
+        "recovered_at": 200.0,
+    }
+
+
 def _token_factory(*tokens: str):
     iterator = iter(tokens)
     return lambda: next(iterator)

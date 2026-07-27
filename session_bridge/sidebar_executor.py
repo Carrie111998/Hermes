@@ -459,6 +459,12 @@ class CodexAppServerSidebarDelivery:
             raise ValueError("Codex turn marker is missing or embedded")
         self._ensure_initialized(deadline)
         try:
+            resumed = self._client.request(
+                "thread/resume",
+                {"threadId": wanted},
+                timeout=self._remaining(deadline),
+            )
+            _exact_thread(resumed, wanted)
             response = self._client.request(
                 "turn/start",
                 {
