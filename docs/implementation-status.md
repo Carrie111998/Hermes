@@ -17,6 +17,8 @@ acceptance evidence.
   after cancellation, expiry, or other terminal transitions.
 - Registered action payload schemas and temporal observation windows are
   validated before permit admission and again at the final execution boundary.
+- Runtime construction rejects self-supervising verifier identities; verifier
+  evidence must come from an identity distinct from the planner and executor.
 - Hiring materialization rechecks current headcount and payroll limits against
   the immutable decision before adding an employee.
 - Founder/CEO organization bootstrap and versioned mandate.

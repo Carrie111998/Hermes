@@ -188,6 +188,24 @@ def test_event_loop_executes_and_independently_verifies(tmp_path):
     snapshot = db.objective_snapshot(conn, objective.id)
     assert snapshot["verifications"][0]["verifier"] == "employee:internal-audit"
     assert loop.tick().status == "idle"
+
+
+def test_runtime_rejects_self_supervising_verifier(tmp_path):
+    conn = db.connect(tmp_path / "authority.db")
+
+    class SelfVerifier(Verifier):
+        identity = "employee:ceo"
+
+    with pytest.raises(ValueError, match="must differ"):
+        runtime.ObjectiveRuntime(
+            conn,
+            planner=Planner([]),
+            executor=Executor(),
+            verifier=SelfVerifier(),
+            charter=charter(),
+            policy_version="charter-v1",
+            runtime_id="runtime-self-supervision",
+        )
     conn.close()
 
 

@@ -127,6 +127,15 @@ class ObjectiveRuntime:
         self.planner = planner
         self.executor = executor
         self.verifier = verifier
+        planner_identity = str(getattr(planner, "identity", "") or "").strip()
+        executor_identity = str(getattr(executor, "identity", "") or "").strip()
+        verifier_identity = str(getattr(verifier, "identity", "") or "").strip()
+        if not verifier_identity:
+            raise ValueError("independent verifier must declare an identity")
+        if verifier_identity in {planner_identity, executor_identity}:
+            raise ValueError(
+                "independent verifier identity must differ from planner and executor"
+            )
         self.charter = charter
         self.policy_version = policy_version
         self.runtime_id = runtime_id or f"runtime_{uuid.uuid4().hex}"

@@ -169,3 +169,5 @@ recorded.
 - The containing documentation/control-boundary commit also adds proposal-time
   validation of registered action payload schemas and temporal preconditions;
   its SHA is the final commit that contains this changelog entry.
+- Runtime construction now rejects a verifier that shares the planner or
+  executor identity, preserving an explicit independent-verification boundary.
