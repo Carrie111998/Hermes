@@ -99,6 +99,9 @@ acceptance evidence.
 - Standalone workers enforce the configured deployment role and live worker
   registration even when an embedding supplies a callback; callback injection
   cannot bypass supervised-host boundaries.
+- Standalone workers re-read and revalidate deployment authority before every
+  cycle, so runtime-host changes cannot leave a process operating under stale
+  permissions.
 - Runtime-host mismatches and charters with no registered action contracts also
   persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted
@@ -157,7 +160,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`2caf2de7ed8941d6a542cb38bfbee1afee338bb4` passed 6 Founder/CEO E2E tests, 48
+`4a129bcbb3d09606ce83b577e63a6e601303331b` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release

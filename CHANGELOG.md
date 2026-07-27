@@ -187,8 +187,10 @@ recorded.
   deployment-role and live-host checks even for injected callbacks.
 - `2caf2de7ed8941d6a542cb38bfbee1afee338bb4` — required auditable provider,
   jurisdiction, and registry-reference fields for payment assessments.
+- `4a129bcbb3d09606ce83b577e63a6e601303331b` — revalidated standalone worker
+  deployment authority before every cycle to fence dynamic host changes.
 - Current-main focused acceptance rerun at baseline
-  `2caf2de7ed8941d6a542cb38bfbee1afee338bb4`: 6 Founder/CEO E2E tests, 48
+  `4a129bcbb3d09606ce83b577e63a6e601303331b`: 6 Founder/CEO E2E tests, 48
   objective service/runtime/worker tests, and 21 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
