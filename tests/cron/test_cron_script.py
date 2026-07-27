@@ -9,6 +9,7 @@ Tests cover:
 
 import json
 import os
+import shutil
 import sys
 import textwrap
 from datetime import datetime, timedelta, timezone
@@ -200,6 +201,132 @@ class TestRunJobScript:
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
 
+    @pytest.mark.parametrize("resolver_source", ["configured", "portable"])
+    def test_windows_shell_script_uses_shared_git_bash_resolver(
+        self, cron_env, tmp_path, monkeypatch, resolver_source
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+        from tools.environments import local as local_mod
+
+        script = cron_env / "scripts" / "drift check.sh"
+        script.write_text("printf 'ok\\n'\n")
+
+        system_root = tmp_path / "Windows"
+        system_bash = system_root / "System32" / "bash.exe"
+        local_appdata = tmp_path / "Local App Data"
+        configured_bash = tmp_path / "Configured Git" / "bin" / "bash.exe"
+        portable_bash = local_appdata / "hermes" / "git" / "bin" / "bash.exe"
+        selected_bash = configured_bash if resolver_source == "configured" else portable_bash
+        for executable in (system_bash, selected_bash):
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text("")
+
+        if resolver_source == "configured":
+            monkeypatch.setenv("HERMES_GIT_BASH_PATH", str(configured_bash))
+        else:
+            monkeypatch.delenv("HERMES_GIT_BASH_PATH", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+        monkeypatch.setenv("SystemRoot", str(system_root))
+        monkeypatch.setenv("WINDIR", str(system_root))
+        monkeypatch.setenv("ProgramFiles", str(tmp_path / "Missing Program Files"))
+        monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "Missing Program Files x86"))
+
+        def fake_which(command):
+            return str(system_bash) if command == "bash" else None
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_bash_starts", lambda _candidate: True)
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = _run_job_script(script.name)
+
+        assert success is True
+        assert output == "ok"
+        assert captured["argv"] == [str(selected_bash), str(script.resolve())]
+
+    def test_windows_shell_script_rejects_system32_wsl_launcher(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+        from tools.environments import local as local_mod
+
+        script = cron_env / "scripts" / "probe.sh"
+        script.write_text("printf 'must-not-run\\n'\n")
+
+        system_root = tmp_path / "Windows"
+        system_bash = system_root / "System32" / "bash.exe"
+        system_bash.parent.mkdir(parents=True)
+        system_bash.write_text("")
+
+        monkeypatch.delenv("HERMES_GIT_BASH_PATH", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Empty Local App Data"))
+        monkeypatch.setenv("SystemRoot", str(system_root))
+        monkeypatch.setenv("WINDIR", str(system_root))
+        monkeypatch.setenv("ProgramFiles", str(tmp_path / "Missing Program Files"))
+        monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "Missing Program Files x86"))
+
+        def fake_which(command):
+            return str(system_bash) if command == "bash" else None
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return SimpleNamespace(returncode=0, stdout="must-not-run\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod.shutil, "which", fake_which)
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_bash_starts", lambda _candidate: True)
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = _run_job_script(script.name)
+
+        assert success is False
+        assert "Git Bash not found" in output
+        assert "argv" not in captured
+
+    def test_non_windows_shell_script_preserves_path_bash_lookup(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "probe.sh"
+        script.write_text("printf 'ok\\n'\n")
+        path_bash = "/custom/bin/bash"
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "linux")
+        monkeypatch.setattr(
+            sched_mod.shutil,
+            "which",
+            lambda command: path_bash if command == "bash" else None,
+        )
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = _run_job_script(script.name)
+
+        assert success is True
+        assert output == "ok"
+        assert captured["argv"] == [path_bash, str(script.resolve())]
+
 
 class TestBuildJobPromptWithScript:
     """Test that script output is injected into the prompt."""
@@ -218,6 +345,44 @@ class TestBuildJobPromptWithScript:
         assert "## Script Output" in prompt
         assert "new PR: #123 fix typo" in prompt
         assert "Report any notable changes." in prompt
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-specific bash launcher regression",
+    )
+    def test_registered_shell_script_uses_git_bash_and_injects_stdout_on_windows(
+        self, cron_env, monkeypatch
+    ):
+        """System32's WSL launcher must not consume a native script path as a command."""
+        from cron.jobs import create_job, get_job
+        from cron.scheduler import _build_job_prompt
+
+        git = shutil.which("git")
+        system_bash = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "bash.exe"
+        if not git or not system_bash.is_file():
+            pytest.skip("Git for Windows and the System32 bash launcher are required")
+
+        # Reproduce a normal Windows service PATH: System32 comes before Git's
+        # cmd directory, so shutil.which("bash") finds the legacy WSL launcher.
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join([str(system_bash.parent), str(Path(git).parent)]),
+        )
+        assert Path(shutil.which("bash") or "").resolve() == system_bash.resolve()
+
+        script = cron_env / "scripts" / "drift check.sh"
+        script.write_text("printf 'windows-shell-output\\n'\n")
+        job = create_job(
+            prompt="Summarize the script result.",
+            schedule="every 1h",
+            script=script.name,
+        )
+
+        prompt = _build_job_prompt(get_job(job["id"]))
+
+        assert "## Script Output" in prompt
+        assert "windows-shell-output" in prompt
+        assert "## Script Error" not in prompt
 
     def test_script_error_injected(self, cron_env):
         from cron.scheduler import _build_job_prompt
