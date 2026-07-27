@@ -2622,6 +2622,59 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+def _followup_processing_hooks_apply(adapter, event: MessageEvent | None) -> bool:
+    """Whether a runner-drained follow-up should be bracketed by the hooks.
+
+    Two conditions, both necessary:
+
+    * **A real inbound platform message to acknowledge.** Adapters key their
+      in-progress marker either off ``message_id`` (Slack, Telegram, Feishu,
+      Matrix, Photon) or off the raw envelope — Signal reads
+      ``raw_message["sender"]``/``["timestamp_ms"]`` and never sets
+      ``message_id`` at all, Discord reads ``raw_message`` — so either field
+      means there is something to react to.  Synthetic drains (``/goal``
+      continuations, wake-ups, CLI hand-offs, startup auto-resume) carry
+      neither and must stay silent.
+    * **The adapter overrides ``on_processing_start``.** We *bracket*, so both
+      halves have to belong to us.  An adapter that implements only
+      ``on_processing_complete`` — Google Chat reaps its typing card there,
+      webhook ends its per-delivery session — would otherwise be handed a
+      completion for a turn whose reply has not been delivered yet, because
+      delivery happens after the whole drain chain unwinds back into
+      ``_process_message_background``.
+    """
+    if adapter is None or event is None:
+        return False
+    if not (getattr(event, "message_id", None) or getattr(event, "raw_message", None)):
+        return False
+    start_hook = getattr(type(adapter), "on_processing_start", None)
+    return start_hook is not None and start_hook is not BasePlatformAdapter.on_processing_start
+
+
+def _followup_cancel_outcome(adapter) -> ProcessingOutcome:
+    """Classify a cancelled follow-up exactly as ``_process_message_background``
+    does: only cancels the adapter itself routed (``/stop``, ``/new``,
+    ``/reset``, adapter cleanup) count as CANCELLED; anything else is a failure.
+
+    The distinction is load-bearing rather than cosmetic — Signal and Matrix
+    deliberately leave the in-progress marker in place on CANCELLED, so
+    reporting an *unexpected* cancellation as CANCELLED would strand it.
+    """
+    expected = getattr(adapter, "_expected_cancelled_tasks", None)
+    if expected is None:
+        return ProcessingOutcome.FAILURE
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    if current is None:
+        return ProcessingOutcome.FAILURE
+    try:
+        return ProcessingOutcome.CANCELLED if current in expected else ProcessingOutcome.FAILURE
+    except TypeError:
+        return ProcessingOutcome.FAILURE
+
+
 async def _run_followup_processing_hook(
     adapter,
     event: MessageEvent | None,
@@ -2634,17 +2687,12 @@ async def _run_followup_processing_hook(
     drained in-band by ``_run_agent``, never by
     ``BasePlatformAdapter._process_message_background`` — which owns the only
     other call site for these hooks.  Without firing them here, the read-receipt
-    reaction every adapter renders from ``on_processing_start`` is silently
-    skipped for queued, interrupting, and steer-demoted messages.
+    reaction adapters render from ``on_processing_start`` is silently skipped
+    for queued, interrupting, and steer-demoted messages.
 
-    No-ops unless there is a real inbound platform message to acknowledge:
-    interrupt text and leftover ``/steer`` carry no event at all, and synthetic
-    drains (``/goal`` continuations, wake-ups, CLI hand-offs) carry no
-    ``message_id`` — the same field every adapter's own hook already gates on.
+    See ``_followup_processing_hooks_apply`` for when this is a no-op.
     """
-    if event is None or adapter is None:
-        return
-    if not getattr(event, "message_id", None):
+    if not _followup_processing_hooks_apply(adapter, event):
         return
     run_hook = getattr(adapter, "_run_processing_hook", None)
     if not callable(run_hook):
@@ -23561,7 +23609,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # queued/interrupting message ever runs — base.py's
                 # _process_message_background, which owns the sole other call
                 # site for the processing hooks, is never entered for it — so
-                # without this every platform that renders a read receipt from
+                # without this every adapter that renders a read receipt from
                 # on_processing_start silently skips mid-turn messages.
                 # Resolve the adapter from the follow-up's OWN source: a
                 # multiplexed gateway can route it to a different profile's
@@ -23578,23 +23626,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hook_adapter, pending_event, "on_processing_start",
                 )
 
-                # Re-baseline the cached agent's message_count snapshot before
-                # recursing into the in-band queued (/queue) follow-up turn.
-                # The first turn has completed and flushed its own user +
-                # assistant rows to the SessionDB, so the cross-process
-                # coherence guard (#45966) — which this recursive _run_agent
-                # call re-enters — would otherwise see the grown on-disk count
-                # against the stale build-time snapshot and rebuild the agent
-                # on THIS process's OWN writes, destroying the prompt-cache
-                # prefix #46237 was merged to preserve.  The existing
-                # re-baseline in _handle_message_with_agent only runs after the
-                # whole _run_agent chain unwinds — too late for the in-band
-                # follow-up.  Use the same (session_key, session_id) the
-                # recursive call runs under so the snapshot matches exactly
-                # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
-
+                # Everything from here to the recursion runs inside the try, so
+                # that once the marker is on the message every exit closes it —
+                # including a /stop landing on the re-baseline's DB await, which
+                # would otherwise strand the marker (that helper guards its own
+                # I/O with `except Exception`, which does not catch cancellation).
                 try:
+                    # Re-baseline the cached agent's message_count snapshot
+                    # before recursing into the in-band queued (/queue) follow-up
+                    # turn.  The first turn has completed and flushed its own
+                    # user + assistant rows to the SessionDB, so the
+                    # cross-process coherence guard (#45966) — which this
+                    # recursive _run_agent call re-enters — would otherwise see
+                    # the grown on-disk count against the stale build-time
+                    # snapshot and rebuild the agent on THIS process's OWN
+                    # writes, destroying the prompt-cache prefix #46237 was
+                    # merged to preserve.  The existing re-baseline in
+                    # _handle_message_with_agent only runs after the whole
+                    # _run_agent chain unwinds — too late for the in-band
+                    # follow-up.  Use the same (session_key, session_id) the
+                    # recursive call runs under so the snapshot matches exactly
+                    # what the follow-up's guard will consult.  Fail-safe in
+                    # helper.
+                    await self._refresh_agent_cache_message_count(session_key, session_id)
+
                     followup_result = await self._run_agent(
                         message=next_message,
                         context_prompt=context_prompt,
@@ -23608,14 +23663,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         channel_prompt=next_channel_prompt,
                     )
                 except asyncio.CancelledError:
-                    # Matches _process_message_background: a cancelled turn is
-                    # not a failure, and adapters that special-case CANCELLED
-                    # (Telegram clears the marker, Signal leaves it) rely on the
-                    # distinction.  Best-effort — a re-delivered cancellation
-                    # can pre-empt the await, exactly as it can in base.py.
+                    # Classified the same way _process_message_background does:
+                    # an *expected* cancel (/stop, /new, /reset, cleanup) is
+                    # CANCELLED, anything else is a failure.  Signal and Matrix
+                    # deliberately leave the marker in place on CANCELLED, so
+                    # misclassifying here would strand it.  Best-effort — a
+                    # re-delivered cancellation can pre-empt the await, exactly
+                    # as it can in base.py.
                     await _run_followup_processing_hook(
                         _hook_adapter, pending_event, "on_processing_complete",
-                        ProcessingOutcome.CANCELLED,
+                        _followup_cancel_outcome(_hook_adapter),
                     )
                     raise
                 except BaseException:

@@ -239,3 +239,75 @@ async def test_synthetic_followup_is_not_acknowledged(monkeypatch, tmp_path):
 
     assert adapter.started == []
     assert adapter.completed == []
+
+
+@pytest.mark.asyncio
+async def test_raw_envelope_only_followup_is_acknowledged(monkeypatch, tmp_path):
+    """Signal never sets message_id — its hook keys off the raw envelope
+    (sender + timestamp_ms) — and Discord's reads raw_message. An event
+    carrying only a raw envelope is still a real inbound message."""
+    _TwoTurnAgent.calls = []
+    _install_fake_agent(monkeypatch, tmp_path, _TwoTurnAgent)
+
+    adapter = HookRecordingAdapter()
+    runner = _make_runner(adapter)
+
+    adapter._pending_messages[SESSION_KEY] = MessageEvent(
+        text="signal-shaped follow-up",
+        message_type=MessageType.TEXT,
+        source=_source(),
+        message_id=None,
+        raw_message={"sender": "+15550100", "timestamp_ms": 1700000000000},
+    )
+
+    await runner._run_agent(
+        message="the first turn",
+        context_prompt="",
+        history=[],
+        source=_source(),
+        session_id="sess-hooks-raw",
+        session_key=SESSION_KEY,
+    )
+
+    assert adapter.started == [None]
+    assert adapter.completed == [(None, ProcessingOutcome.SUCCESS)]
+
+
+class CompleteOnlyAdapter(HookRecordingAdapter):
+    """Google Chat and webhook implement on_processing_complete WITHOUT
+    on_processing_start; theirs is end-of-cycle teardown (reap the typing
+    card / end the delivery session), not a reaction."""
+
+    on_processing_start = BasePlatformAdapter.on_processing_start
+
+
+@pytest.mark.asyncio
+async def test_complete_only_adapter_is_left_alone(monkeypatch, tmp_path):
+    """We bracket, so both halves must belong to us. An adapter that only
+    implements the completion half must not be handed a completion here: at
+    this point the follow-up's reply has not been delivered yet, so its
+    teardown would fire against a live turn."""
+    _TwoTurnAgent.calls = []
+    _install_fake_agent(monkeypatch, tmp_path, _TwoTurnAgent)
+
+    adapter = CompleteOnlyAdapter()
+    runner = _make_runner(adapter)
+
+    adapter._pending_messages[SESSION_KEY] = MessageEvent(
+        text="the follow-up",
+        message_type=MessageType.TEXT,
+        source=_source(),
+        message_id="queued-3",
+    )
+
+    result = await runner._run_agent(
+        message="the first turn",
+        context_prompt="",
+        history=[],
+        source=_source(),
+        session_id="sess-hooks-complete-only",
+        session_key=SESSION_KEY,
+    )
+
+    assert result["final_response"] == "done-2"
+    assert adapter.completed == []
