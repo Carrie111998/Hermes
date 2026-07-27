@@ -144,6 +144,40 @@ def test_all_path_drops_workspace_requirement():
     )
 
 
+def test_pronounless_action_announcements_continue_when_opted_in():
+    """#72692: Copilot ACP uses terse log-style action narration."""
+    a = _agent(True, "chat_completions")
+    user = "write the brief and launch the session"
+    msgs = [{"role": "user", "content": user}]
+    announcements = (
+        "Launching it now.",
+        "Brief written. Creating the session now.",
+        "EXIT=1 — checking the actual log.",
+        "Relaunching with corrected arguments.",
+        "Running now (pid 19441, no early exit). Checking the log…",
+    )
+    for announcement in announcements:
+        assert looks_like_codex_intermediate_ack(
+            a, user, announcement, msgs, require_workspace=False
+        ), announcement
+
+
+def test_pronounless_action_guardrails_reject_questions_and_finals():
+    a = _agent(True, "chat_completions")
+    user = "launch the session"
+    msgs = [{"role": "user", "content": user}]
+    final_answers = (
+        "Should I launch it now?",
+        "Nothing to do here.",
+        "Interesting result; no action is needed.",
+        "Done. The deployment succeeded.",
+    )
+    for final in final_answers:
+        assert not looks_like_codex_intermediate_ack(
+            a, user, final, msgs, require_workspace=False
+        ), final
+
+
 # ── detector: guardrails that hold regardless of workspace ───────────────────
 
 

@@ -2990,7 +2990,21 @@ def looks_like_codex_intermediate_ack(
     has_future_ack = bool(
         re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
     )
-    if not has_future_ack:
+    # Some tool-using providers narrate the next action in terse log style
+    # rather than with a first-person lead-in: "Brief written. Creating the
+    # session now." Keep this deliberately narrower than the general action
+    # vocabulary: a present-participle clause must begin the response or follow
+    # a sentence/status delimiter, and questions are never auto-continued.
+    has_pronounless_action = bool(
+        "?" not in assistant_text
+        and re.search(
+            r"(?:^|[.!…—–-]\s+)(?:(?:re)?launching|(?:re)?starting|creating|"
+            r"checking|running|writing|opening|reading|inspecting|reviewing|"
+            r"testing|debugging|searching|fixing)\b",
+            assistant_text,
+        )
+    )
+    if not (has_future_ack or has_pronounless_action):
         return False
 
     action_markers = (
@@ -3030,7 +3044,9 @@ def looks_like_codex_intermediate_ack(
         "path",
     )
 
-    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
+    assistant_mentions_action = has_pronounless_action or any(
+        marker in assistant_text for marker in action_markers
+    )
     if not assistant_mentions_action:
         return False
 
