@@ -866,10 +866,15 @@ class HermesACPAgent(acp.Agent):
             logger.debug("Could not estimate ACP native context usage", exc_info=True)
             used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
 
+        compression_count = max(
+            0,
+            int(getattr(compressor, "compression_count", 0) or 0),
+        )
         return UsageUpdate(
             session_update="usage_update",
             size=max(size, 0),
             used=max(used, 0),
+            field_meta={"hermes": {"compressionCount": compression_count}},
         )
 
     async def _send_usage_update(self, state: SessionState) -> None:

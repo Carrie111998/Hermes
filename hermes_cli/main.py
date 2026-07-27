@@ -2675,6 +2675,7 @@ def cmd_chat(args):
         "worktree": getattr(args, "worktree", False),
         "checkpoints": getattr(args, "checkpoints", False),
         "pass_session_id": getattr(args, "pass_session_id", False),
+        "runtime_status_file": getattr(args, "runtime_status_file", None),
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),

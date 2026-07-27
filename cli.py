@@ -4088,6 +4088,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
+        runtime_status_file: Optional[str] = None,
         ignore_rules: bool = False,
     ):
         """
@@ -4104,9 +4105,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
+            runtime_status_file: Optional local per-agent runtime status snapshot path
         """
         # Initialize Rich console
         self.console = Console()
+        self.runtime_status_file = (
+            os.path.abspath(os.path.expanduser(runtime_status_file))
+            if isinstance(runtime_status_file, str) and runtime_status_file.strip()
+            else None
+        )
         self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
@@ -16738,6 +16745,7 @@ def main(
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
+    runtime_status_file: Optional[str] = None,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
 ):
@@ -16874,6 +16882,7 @@ def main(
         resume=resume,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
+        runtime_status_file=runtime_status_file,
         ignore_rules=ignore_rules,
     )
 

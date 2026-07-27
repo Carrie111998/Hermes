@@ -109,6 +109,55 @@ class TestChatVerboseArg:
         assert "verbose" not in captured
 
 
+class TestRuntimeStatusFilePropagation:
+    """The hidden supervisor path must survive parser and cmd_chat handoff."""
+
+    @pytest.mark.parametrize("argv", [
+        ["--runtime-status-file", "/tmp/runtime-status.json", "chat"],
+        ["chat", "--runtime-status-file", "/tmp/runtime-status.json"],
+    ])
+    def test_flag_is_accepted_on_both_sides_of_chat(self, argv):
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, _chat_parser = build_top_level_parser()
+        args = parser.parse_args(argv)
+
+        assert args.runtime_status_file == "/tmp/runtime-status.json"
+
+    def test_cmd_chat_forwards_runtime_status_file(self, monkeypatch):
+        import types
+
+        import hermes_cli.main as main_mod
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, chat_parser = build_top_level_parser()
+        chat_parser.set_defaults(func=main_mod.cmd_chat)
+        args = parser.parse_args([
+            "chat", "--runtime-status-file", "/tmp/runtime-status.json",
+        ])
+        captured = {}
+        fake_cli = types.ModuleType("cli")
+
+        def fake_main(**kwargs):
+            captured.update(kwargs)
+
+        setattr(fake_cli, "main", fake_main)
+        fake_banner = types.ModuleType("hermes_cli.banner")
+        setattr(fake_banner, "prefetch_update_check", lambda: None)
+        fake_skills_sync = types.ModuleType("tools.skills_sync")
+        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
+
+        monkeypatch.setitem(sys.modules, "cli", fake_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
+        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+        monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+
+        main_mod.cmd_chat(args)
+
+        assert captured["runtime_status_file"] == "/tmp/runtime-status.json"
+
+
 class TestYoloEnvVar:
     """Verify --yolo sets HERMES_YOLO_MODE regardless of flag position.
 
