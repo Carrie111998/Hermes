@@ -91,9 +91,18 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# Windows Python resolves Path.home() through USERPROFILE, while the MSYS
+# shell exposes HOME as /c/Users/<name>. Preserve only these runtime paths;
+# env -i below still excludes credentials and all unrelated environment state.
+TEST_USERPROFILE="${USERPROFILE:-$HOME}"
+TEST_TEMP="${TEMP:-${TMP:-$TEST_USERPROFILE/AppData/Local/Temp}}"
+TEST_TMP="${TMP:-$TEST_TEMP}"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  USERPROFILE="$TEST_USERPROFILE" \
+  TEMP="$TEST_TEMP" \
+  TMP="$TEST_TMP" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

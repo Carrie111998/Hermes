@@ -570,6 +570,26 @@ class TestMarkJobRun:
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
 
+    def test_wrapper_status_is_not_workflow_governance_status(self, tmp_cron_dir):
+        """A completed process can report retained governance blockers.
+
+        Cron persistence stores only wrapper execution status. The structured
+        workflow report remains authoritative for queue-governance state.
+        """
+        job = create_job(prompt="Review pending proposals", schedule="every 1h")
+        report = {
+            "execution_status": "COMPLETED",
+            "governance_status": "PARTIAL",
+            "queue_drained": False,
+        }
+
+        mark_job_run(job["id"], success=report["execution_status"] == "COMPLETED")
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+        assert report["governance_status"] == "PARTIAL"
+        assert report["queue_drained"] is False
+
     def test_repeat_limit_removes_job(self, tmp_cron_dir):
         job = create_job(prompt="Once", schedule="30m", repeat=1)
         mark_job_run(job["id"], success=True)
