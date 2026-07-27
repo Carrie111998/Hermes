@@ -127,6 +127,15 @@ def verify_payment_provider(
 ) -> str:
     if direction not in {"inbound", "outbound"}:
         raise ValueError("payment direction must be inbound or outbound")
+    for label, value in (
+        ("organization_id", organization_id),
+        ("provider", provider),
+        ("jurisdiction", jurisdiction),
+        ("registry_authority", registry_authority),
+        ("registry_reference", registry_reference),
+    ):
+        if not str(value or "").strip():
+            raise ComplianceError(f"provider assessment requires {label}")
     now = int(time.time())
     if verified_at > now:
         raise ComplianceError("provider assessment cannot be future-dated")

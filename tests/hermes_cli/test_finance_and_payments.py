@@ -173,6 +173,27 @@ def test_provider_assessment_rejects_expired_evidence_at_admission(tmp_path):
         )
 
 
+def test_provider_assessment_requires_auditable_registry_reference(tmp_path):
+    conn = objectives_db.connect(tmp_path / "business.db")
+    with pytest.raises(
+        compliance_db.ComplianceError, match="registry_reference"
+    ):
+        compliance_db.verify_payment_provider(
+            conn,
+            organization_id="org_1",
+            provider="fake",
+            direction="inbound",
+            jurisdiction="GLOBAL",
+            registry_authority="test-registry",
+            registry_reference="",
+            aml_screening_delegated=True,
+            sanctions_screening_delegated=True,
+            verified_at=int(time.time()) - 1,
+            expires_at=int(time.time()) + 3_600,
+            evidence={"test": True},
+        )
+
+
 def test_reservations_prevent_oversubscription_and_exact_settlement(treasury):
     conn, account = treasury
     finance_db.seed_initial_capital(
