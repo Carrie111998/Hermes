@@ -215,6 +215,6 @@ recorded.
 - `a497763a54767bc5c577e535e4bfafd531981cd7` — bound automatic objective
   acceptance to the active CEO's canonical employee identity and organization,
   preventing a forgeable `employee:ceo` label from granting standing authority.
-- `7133019789f03c0ae67ba8424038aaed4bda54c` — rejected explicit objective
+- `71330197889f03c0ae67ba8424038aaed4bda54c` — rejected explicit objective
   organization IDs that are not present in the enterprise tenant authority
   store.
