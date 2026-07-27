@@ -156,6 +156,38 @@ def _json(value: Any) -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    # Compliance checks run inside action admission and evidence commits.
+    # Never let ``executescript`` implicitly commit an active authority
+    # transaction when the schema is already initialized.
+    if conn.in_transaction:
+        required_tables = {
+            "compliance_regimes",
+            "compliance_applicability",
+            "compliance_obligations",
+            "compliance_control_evidence",
+        }
+        required_triggers = {
+            "compliance_applicability_immutable_update",
+            "compliance_applicability_immutable_delete",
+            "compliance_obligations_immutable_update",
+            "compliance_obligations_immutable_delete",
+            "compliance_control_evidence_immutable_update",
+            "compliance_control_evidence_immutable_delete",
+        }
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        triggers = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        if required_tables <= tables and required_triggers <= triggers:
+            return
     conn.executescript(SCHEMA_SQL)
 
 

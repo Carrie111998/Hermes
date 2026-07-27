@@ -105,6 +105,16 @@ def test_compliance_evidence_records_are_append_only():
         )
 
 
+def test_schema_check_does_not_commit_active_authority_transaction():
+    conn = connection()
+    conn.execute("CREATE TABLE authority_sentinel (value TEXT NOT NULL)")
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO authority_sentinel(value) VALUES ('uncommitted')")
+    compliance.ensure_schema(conn)
+    conn.rollback()
+    assert conn.execute("SELECT * FROM authority_sentinel").fetchall() == []
+
+
 def test_applicable_regime_requires_mapped_control_and_current_evidence():
     conn = connection()
     future = int(time.time()) + 3600
