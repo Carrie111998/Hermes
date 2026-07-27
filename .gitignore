@@ -185,3 +185,24 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+
+# ---------------------------------------------------------------------------
+# Worker-bridge / agent runtime artifacts.
+#
+# The worker bridge writes a task brief into the repository it is pointed at
+# (".hermes-task-<task-id>.md" — the brief tells the worker "your working
+# directory is <repo>"), and the ULTRA / pipeline runners drop per-run output
+# beside it. When a task targets this checkout, that lands here. These are
+# transient run artifacts, never source.
+#
+# NOTE: this ignores the *scaffolding* only. Files a worker task produces as
+# its actual deliverable still show up untracked on purpose — they need review
+# before they are committed, not silent hiding.
+# ---------------------------------------------------------------------------
+.hermes-task-*.md
+.pipeline/
+.ultra/
+.pytest-tmp-fts-cache/
+
+# Local VS Code bridge token — machine-local credential, must never be committed.
+.vscode-hermes-token
