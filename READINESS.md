@@ -285,6 +285,18 @@ The `plan_versions: 2` result demonstrates that the scheduled event generated
 a new persisted plan version before verification; it is not merely a second
 call against an in-memory plan.
 
+At current-main commit `34458a3942`, the unified acceptance also completed the
+master stop phase:
+
+```text
+{"phase": "stop", "autonomy": "paused", "generation": 2, "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+This proves durable autonomy revocation and worker fail-closed behavior in the
+controlled runtime. It does not claim that external provider credentials or
+third-party workers can be revoked outside the configured control plane.
+
 Current-main workforce coordination evidence at commit `d44d0ad47f` was run
 with:
 

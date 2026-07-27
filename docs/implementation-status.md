@@ -47,6 +47,9 @@ acceptance evidence.
 - The provider recovery acceptance covers both outbound uncertain-action
   convergence and inbound receivable settlement with accounting balance and
   idempotent retry assertions.
+- The unified current-tree acceptance proves the master stop path: autonomy is
+  durably paused, the worker exits fail-closed, and provider state remains
+  unchanged.
 - Planner/provider rate-limit failures are classified explicitly, persisted in
   the durable event retry state with bounded backoff, honor SDK attributes,
   `Retry-After`, and rate-limit reset headers, and recover on a later tick

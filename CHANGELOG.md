@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The unified current-tree acceptance now ends with a master autonomy stop,
+  proving the worker exits in paused mode without producing another provider
+  effect.
 - The provider recovery acceptance now covers inbound receivable creation and
   read-back settlement alongside outbound uncertain-action recovery, proving
   idempotent bi-directional money movement at the deterministic rail boundary.
