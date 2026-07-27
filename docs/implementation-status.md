@@ -50,6 +50,9 @@ acceptance evidence.
   employee grant must match its capabilities, systems, toolsets, skills,
   budget, and expiry exactly; the delegator cannot use a broader mandate to
   issue a different worker authority.
+- File reads and writes performed by governed workers are checked again at
+  execution time against the live grant. A read grant cannot write, and a
+  grant for one canonical local path cannot access another path.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

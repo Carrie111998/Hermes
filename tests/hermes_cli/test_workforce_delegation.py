@@ -768,6 +768,17 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
         )["id"]
         == grant_id
     )
+    workforce_delegation.authorize_worker_action(
+        capability="web.read", system="kanban", target_resource="default"
+    )
+    with pytest.raises(workforce_delegation.DelegationError, match="capability"):
+        workforce_delegation.authorize_worker_action(
+            capability="file.write", system="kanban", target_resource="default"
+        )
+    with pytest.raises(workforce_delegation.DelegationError, match="resource"):
+        workforce_delegation.authorize_worker_action(
+            capability="web.read", system="kanban", target_resource="other"
+        )
     with pytest.raises(
         workforce_delegation.DelegationError, match="capabilities"
     ):

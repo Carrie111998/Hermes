@@ -58,6 +58,9 @@
   action payload: capabilities, systems, toolsets, skills, budget, and expiry
   must match exactly, so a manager cannot broaden or substitute the worker's
   authorized surface while remaining within a broad mandate.
+- Governed file-worker operations now revalidate the live grant at execution
+  time and require exact `file.read` or `file.write` capability, `localhost`
+  system, and canonical target-resource equality before opening the path.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

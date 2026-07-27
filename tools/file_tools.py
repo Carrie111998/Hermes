@@ -1125,6 +1125,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # Governed employee workers must prove the exact read capability and
+        # canonical resource before any file bytes are opened. Interactive
+        # sessions without an execution contract retain the normal file-tool
+        # policy.
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        authorize_worker_action(
+            capability="file.read",
+            system="localhost",
+            target_resource=os.path.realpath(str(_resolved)),
+        )
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
@@ -1601,6 +1612,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = str(_resolve_path_for_task(path, task_id))
         except Exception:
             _resolved = None
+
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        authorize_worker_action(
+            capability="file.write",
+            system="localhost",
+            target_resource=os.path.realpath(_resolved or path),
+        )
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)

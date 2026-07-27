@@ -586,6 +586,56 @@ def worker_scope(conn: sqlite3.Connection, grant_id: str) -> str:
     )
 
 
+def authorize_worker_action(
+    *, capability: str, system: str, target_resource: str,
+) -> None:
+    """Authorize one privileged tool operation against the live worker grant.
+
+    Ungoverned interactive sessions retain their normal tool behavior. Once a
+    worker carries an execution contract, every guarded tool call must prove
+    the exact capability, system, and resource. Callers must name the
+    operation and canonical target; no wildcard or mandate-level inference is
+    accepted.
+    """
+    grant_id = str(os.environ.get("HERMES_EXECUTION_CONTRACT_ID") or "").strip()
+    if not grant_id:
+        return
+    task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    authority_path = str(
+        os.environ.get("HERMES_BUSINESS_AUTHORITY_DB") or ""
+    ).strip()
+    if not task_id or not authority_path:
+        raise DelegationError("governed worker action identity is incomplete")
+    requested_capability = str(capability or "").strip()
+    requested_system = str(system or "").strip()
+    requested_resource = str(target_resource or "").strip()
+    if not requested_capability or not requested_system or not requested_resource:
+        raise DelegationError("worker action requires capability, system, and resource")
+    from pathlib import Path
+    from hermes_cli import objectives_db
+
+    with objectives_db.connect_closing(Path(authority_path)) as authority:
+        validate_task_result_authority(
+            authority,
+            task_id,
+            board=os.environ.get("HERMES_KANBAN_BOARD"),
+        )
+        grant = grant_for_task(authority, task_id)
+        if grant is None or str(grant["id"]) != grant_id:
+            raise DelegationError("worker action contract does not match its task")
+        if requested_capability not in set(grant["capabilities"]):
+            raise DelegationError(
+                f"worker capability {requested_capability!r} is not granted"
+            )
+        scope = grant.get("resource_scope") or {}
+        if str(scope.get("system") or "") != requested_system:
+            raise DelegationError("worker action system exceeds the exact grant scope")
+        if str(scope.get("target_resource") or "") != requested_resource:
+            raise DelegationError(
+                "worker action resource exceeds the exact grant scope"
+            )
+
+
 def grant_for_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | None:
     ensure_schema(conn)
     row = conn.execute(
