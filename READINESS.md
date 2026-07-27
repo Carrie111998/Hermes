@@ -197,6 +197,18 @@ produces an immutable `released` compute reconciliation with zero billable
 cost, leaving no unreconciled reservation for a later retry. This is local
 failure-path evidence; it does not establish live provider billing accuracy.
 
+Interrupted-action restart recovery was separately validated on current `main`
+with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_objective_runtime.py -q
+```
+
+Result: **27 passed, 0 failed**. The uncertain-provider-effect regression closes
+the authority store after the first worker failure, opens a fresh connection,
+and verifies that the restarted runtime reconciles the exact idempotent action
+without replanning or duplicating the provider effect.
+
 ## Current-tree install-to-restart acceptance
 
 The current main branch has a separate, broader acceptance scenario. It is not

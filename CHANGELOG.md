@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Interrupted idempotent action recovery now has an explicit authority-store
+  restart regression: after a worker crash with an uncertain provider effect,
+  a fresh runtime connection resumes reconciliation without replanning or
+  duplicating the provider call.
 - Model-backed planner compute reservations now reconcile as an immutable
   `released` record when an LLM call, response, JSON parse, or typed action
   contract fails before any billable result exists. This prevents rate-limit

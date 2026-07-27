@@ -64,6 +64,9 @@ acceptance evidence.
   from accumulating unreconciled budget reservations.
 - Fail-closed worker cycle reasons are retained in `last_error` for operator
   diagnosis instead of being reduced to a status-only signal.
+- Interrupted idempotent action recovery is tested across an authority-store
+  restart: a fresh runtime resumes from durable permit/action state and does
+  not replan or duplicate an uncertain provider effect.
 - Security-readiness blocks now create deduplicated, organization-scoped
   advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.

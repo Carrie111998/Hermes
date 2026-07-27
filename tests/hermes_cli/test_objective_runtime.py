@@ -266,7 +266,8 @@ def test_runtime_renews_event_and_resource_ownership_during_slow_effect(tmp_path
 def test_interrupted_consumed_permit_replays_only_exact_idempotent_action(
     tmp_path, crash_after_effect
 ):
-    conn = db.connect(tmp_path / "authority.db")
+    db_path = tmp_path / "authority.db"
+    conn = db.connect(db_path)
     objective = accepted_objective(conn)
     db.enqueue_objective_event(
         conn,
@@ -338,6 +339,20 @@ def test_interrupted_consumed_permit_replays_only_exact_idempotent_action(
     assert len(posture) == 1
     assert posture[0]["recovery_stage"] == "effect_outcome_unknown"
     assert posture[0]["has_replay_idempotency_key"] is True
+    # Model a real process/container restart: the next runtime gets a new
+    # authority connection and must recover from the durable permit/action
+    # state rather than relying on the crashed worker's memory.
+    conn.close()
+    conn = db.connect(db_path)
+    loop = runtime.ObjectiveRuntime(
+        conn,
+        planner=planner,
+        executor=executor,
+        verifier=Verifier(),
+        charter=bounded,
+        policy_version="charter-v1",
+        runtime_id="runtime-restarted",
+    )
     assert loop.tick().status == "reconciliation_pending"
     posture = db.in_doubt_executions(conn, objective.organization_id)
     assert len(posture) == 1
