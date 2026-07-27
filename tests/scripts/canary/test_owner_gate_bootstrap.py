@@ -41,6 +41,106 @@ def test_executable_target_sha256_accepts_pinned_python_symlink(
     ) == hashlib.sha256(target.read_bytes()).hexdigest()
 
 
+def test_successor_exact_file_replacement_is_atomic_replay_safe_and_bound(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "etc/executor.json"
+    _secure_test_directory(target.parent)
+    predecessor = b'{"release":"predecessor"}\n'
+    successor = b'{"release":"successor"}\n'
+    target.write_bytes(predecessor)
+    target.chmod(0o444)
+    os.chown(target, os.geteuid(), os.getegid())
+
+    first = bootstrap._replace_exact_predecessor_bytes(
+        target,
+        successor,
+        predecessor,
+        mode=0o444,
+        uid=os.geteuid(),
+        gid=os.getegid(),
+    )
+    replay = bootstrap._replace_exact_predecessor_bytes(
+        target,
+        successor,
+        predecessor,
+        mode=0o444,
+        uid=os.geteuid(),
+        gid=os.getegid(),
+    )
+
+    assert target.read_bytes() == successor
+    assert first == replay
+    assert first["created_by_transaction"] is False
+    assert first["replaced_by_transaction"] is True
+    assert first["predecessor_sha256"] == hashlib.sha256(
+        predecessor
+    ).hexdigest()
+
+    target.chmod(0o644)
+    target.write_bytes(b"unrecognized")
+    target.chmod(0o444)
+    with pytest.raises(
+        bootstrap.OwnerGateBootstrapError,
+        match="owner_gate_bootstrap_successor_file_conflict",
+    ):
+        bootstrap._replace_exact_predecessor_bytes(
+            target,
+            successor,
+            predecessor,
+            mode=0o444,
+            uid=os.geteuid(),
+            gid=os.getegid(),
+        )
+
+
+def test_receipt_key_successor_intent_adopts_only_exact_existing_pair(
+    tmp_path: Path,
+) -> None:
+    layout = bootstrap.InstallLayout(etc_root=tmp_path / "etc")
+    for path in (
+        layout.etc_root / "keys",
+        layout.etc_root / "public",
+    ):
+        _secure_test_directory(path)
+    first = bootstrap.generate_or_verify_receipt_key(
+        layout=layout,
+        _expected_uid=os.geteuid(),
+        _expected_gid=os.getegid(),
+    )
+    predecessor_sha256 = "a" * 64
+    intent = {
+        "schema": "muncho-owner-gate-receipt-key-phase-intent.v2",
+        "predecessor_sha256": predecessor_sha256,
+        "targets": [
+            {
+                "path": first[f"{kind}_key_path"],
+                "created_by_transaction": False,
+                "adopted_from_predecessor": True,
+                "preserve_on_rollback": True,
+            }
+            for kind in ("private", "public")
+        ],
+    }
+
+    adopted = bootstrap.generate_or_verify_receipt_key(
+        layout=layout,
+        transaction_intent=intent,
+        _expected_uid=os.geteuid(),
+        _expected_gid=os.getegid(),
+    )
+
+    assert adopted["schema"] == (
+        "muncho-owner-gate-authority-receipt-key.v2"
+    )
+    assert adopted["created"] is False
+    assert adopted["created_by_transaction"] is False
+    assert adopted["adopted_from_predecessor_sha256"] == (
+        predecessor_sha256
+    )
+    assert adopted["public_key_id"] == first["public_key_id"]
+
+
 def test_activation_evidence_staging_receipt_directory_is_verified(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -601,6 +701,186 @@ def _prepare_rollback_fixture(root: Path) -> tuple[dict, list[dict]]:
         started_at_unix=1_700_000_000,
     )
     return transaction, targets
+
+
+def _prepare_successor_rollback_fixture(
+    root: Path,
+) -> tuple[
+    bootstrap.VerifiedBundle,
+    bootstrap.InstallLayout,
+    dict,
+    list[tuple[Path, bytes, bytes]],
+]:
+    bundle, layout = _rollback_fixture(root)
+    receipts = layout.state_root / "bootstrap-receipts"
+    for path in (
+        receipts,
+        layout.etc_root / "keys",
+        layout.etc_root / "public",
+        layout.state_root / "authority",
+        layout.state_root / "executor",
+        layout.systemd_root,
+    ):
+        _secure_test_directory(path)
+    private_key = Ed25519PrivateKey.generate()
+    private_raw = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_raw = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    private_path = layout.etc_root / "keys/receipt-signing-key.pem"
+    public_path = layout.etc_root / "public/authority-receipt-public.pem"
+    bootstrap._install_exact_bytes(
+        private_path,
+        private_raw,
+        mode=0o400,
+        uid=os.geteuid(),
+        gid=os.getegid(),
+    )
+    bootstrap._install_exact_bytes(
+        public_path,
+        public_raw,
+        mode=0o444,
+        uid=os.geteuid(),
+        gid=os.getegid(),
+    )
+    payloads = [
+        (
+            layout.etc_root / "executor.json",
+            b'{"release":"predecessor"}\n',
+            b'{"release":"successor"}\n',
+        ),
+        (
+            layout.systemd_root / "muncho-test.service",
+            b"[Service]\nExecStart=/bin/true\n",
+            b"[Service]\nExecStart=/bin/false\n",
+        ),
+    ]
+    successor_files = []
+    intent_targets = []
+    for path, predecessor_raw, successor_raw in payloads:
+        physical = bootstrap._install_exact_bytes(
+            path,
+            successor_raw,
+            mode=0o444,
+            uid=os.geteuid(),
+            gid=os.getegid(),
+        )
+        successor_files.append({
+            **physical,
+            "created": False,
+            "created_by_transaction": False,
+            "replaced_by_transaction": True,
+            "predecessor_sha256": hashlib.sha256(
+                predecessor_raw
+            ).hexdigest(),
+        })
+        intent_targets.append({
+            "path": str(path),
+            "predecessor_sha256": hashlib.sha256(
+                predecessor_raw
+            ).hexdigest(),
+            "predecessor_payload_b64url": base64.urlsafe_b64encode(
+                predecessor_raw
+            ).rstrip(b"=").decode("ascii"),
+            "mode": "0444",
+            "uid": os.geteuid(),
+            "gid": os.getegid(),
+            "created_by_transaction": False,
+            "reversible": True,
+        })
+    for path in (
+        layout.state_root / "authority/passkey-v2.sqlite3",
+        layout.state_root / "executor/execution-v2.sqlite3",
+    ):
+        path.write_bytes(b"preserved")
+    release = layout.release_base / bundle.revision
+    _secure_test_directory(release)
+    install_receipt = receipts / f"install-{bundle.revision}.json"
+    install_receipt.write_bytes(b"preserved-install-receipt")
+    predecessor_sha256 = "9" * 64
+    evidence = {
+        bootstrap.INSTALL_PHASES[0]: {"phase": 0},
+        bootstrap.INSTALL_PHASES[1]: {"phase": 1},
+        bootstrap.INSTALL_PHASES[2]: {
+            "schema": "muncho-owner-gate-authority-receipt-key.v2",
+            "private_key_path": str(private_path),
+            "public_key_path": str(public_path),
+            "public_key_sha256": hashlib.sha256(public_raw).hexdigest(),
+            "public_key_id": hashlib.sha256(
+                private_key.public_key().public_bytes_raw()
+            ).hexdigest(),
+            "generated_on_target": True,
+            "created": False,
+            "created_by_transaction": False,
+            "adopted_from_predecessor_sha256": predecessor_sha256,
+        },
+        bootstrap.INSTALL_PHASES[3]: {
+            "schema": "muncho-owner-gate-installed-system-files.v2",
+            "files": successor_files,
+            "executor_hosts": {},
+            "systemd_units_enabled": [],
+            "current_release_selected": False,
+            "activation_seal_created": False,
+            "adopted_from_predecessor_sha256": predecessor_sha256,
+        },
+        bootstrap.INSTALL_PHASES[4]: {
+            "schema": "muncho-owner-gate-canonical-databases-adoption.v1"
+        },
+        bootstrap.INSTALL_PHASES[5]: {
+            "release_path": str(release),
+        },
+        bootstrap.INSTALL_PHASES[6]: {
+            "receipt_path": str(install_receipt),
+        },
+    }
+    context: dict = {}
+    handlers = {
+        phase: lambda selected=phase: dict(evidence[selected])
+        for phase in bootstrap.INSTALL_PHASES
+    }
+    revalidators = {
+        phase: lambda item: dict(item)
+        for phase in bootstrap.INSTALL_PHASES
+    }
+    intents = {
+        phase: (
+            (
+                lambda: {
+                    "schema": (
+                        "muncho-owner-gate-system-files-phase-intent.v2"
+                    ),
+                    "predecessor_sha256": predecessor_sha256,
+                    "targets": intent_targets,
+                }
+            )
+            if phase == bootstrap.INSTALL_PHASES[3]
+            else (
+                lambda selected=phase: {
+                    "schema": "successor-rollback-fixture-noop.v1",
+                    "phase": selected,
+                }
+            )
+        )
+        for phase in bootstrap.INSTALL_PHASES
+    }
+    transaction = bootstrap.run_install_transaction(
+        bundle=bundle,
+        journal_path=(
+            receipts / f"transaction-{bundle.revision}.json"
+        ),
+        handlers=handlers,
+        revalidators=revalidators,
+        expected_uid=os.geteuid(),
+        transaction_context=context,
+        intent_builders=intents,
+        started_at_unix=1_700_000_000,
+    )
+    return bundle, layout, transaction, payloads
 
 
 def _rollback_kill_worker(
@@ -1465,6 +1745,91 @@ def test_fresh_vm_intent_fails_closed_on_unjournaled_managed_target(
         builders[phase]()
 
 
+def test_successor_intents_bind_and_snapshot_exact_predecessor_state(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    layout = bootstrap.InstallLayout(
+        release_base=tmp_path / "releases",
+        current_link=tmp_path / "current",
+        etc_root=tmp_path / "etc",
+        state_root=tmp_path / "state",
+        run_root=tmp_path / "run",
+        systemd_root=tmp_path / "systemd",
+        sysusers_root=tmp_path / "sysusers",
+        tmpfiles_root=tmp_path / "tmpfiles",
+        sudoers_root=tmp_path / "sudoers",
+    )
+    files = []
+    for index, path in enumerate(
+        bootstrap._configuration_target_paths(layout)
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = f"predecessor-{index}\n".encode("ascii")
+        mode = 0o440 if path.parent == layout.sudoers_root else 0o444
+        path.write_bytes(payload)
+        path.chmod(mode)
+        os.chown(path, os.geteuid(), os.getegid())
+        files.append({
+            "path": str(path),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "mode": f"{mode:04o}",
+            "uid": os.geteuid(),
+            "gid": os.getegid(),
+            "created": True,
+            "created_by_transaction": True,
+        })
+    unsigned_predecessor = {
+        "schema": "muncho-owner-gate-predecessor-install.v1",
+        "release_revision": "f" * 40,
+    }
+    projection = {
+        **unsigned_predecessor,
+        "predecessor_sha256": bootstrap.foundation.sha256_json(
+            unsigned_predecessor
+        ),
+    }
+    predecessor = {
+        "projection": projection,
+        "system_evidence": {
+            "schema": "muncho-owner-gate-installed-system-files.v1",
+            "files": files,
+        },
+    }
+    builders = bootstrap._production_phase_intent_builders(
+        bundle=bundle,
+        release=layout.release_base / f".{bundle.revision}.bootstrap",
+        layout=layout,
+        transaction_context={
+            "transaction_id": "c" * 64,
+            "next_prior_head_sha256": "d" * 64,
+        },
+        predecessor=predecessor,
+    )
+
+    runtime = builders[bootstrap.INSTALL_PHASES[0]]()
+    key = builders[bootstrap.INSTALL_PHASES[2]]()
+    system = builders[bootstrap.INSTALL_PHASES[3]]()
+    databases = builders[bootstrap.INSTALL_PHASES[4]]()
+
+    assert runtime["install_mode"] == "successor"
+    assert runtime["predecessor"] == projection
+    assert key["predecessor_sha256"] == projection[
+        "predecessor_sha256"
+    ]
+    assert databases["credential_imported_by_transaction"] is False
+    assert len(system["targets"]) == len(files)
+    for target in system["targets"]:
+        raw = base64.urlsafe_b64decode(
+            target["predecessor_payload_b64url"]
+            + "=" * (-len(target["predecessor_payload_b64url"]) % 4)
+        )
+        assert hashlib.sha256(raw).hexdigest() == target[
+            "predecessor_sha256"
+        ]
+        assert target["created_by_transaction"] is False
+
+
 def test_install_transaction_checks_every_future_managed_target_before_effect(
     tmp_path: Path,
 ) -> None:
@@ -1785,6 +2150,164 @@ def test_canonical_database_bootstrap_is_exact_and_replay_safe(
     assert first["executor_preflight"] == replay["executor_preflight"]
 
 
+def test_successor_database_adoption_preserves_truth_and_credential_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    etc_root = tmp_path / "etc"
+    for path in (
+        state_root / "authority",
+        state_root / "executor",
+        etc_root / "public",
+    ):
+        _secure_test_directory(path)
+    private = Ed25519PrivateKey.generate()
+    public_raw = private.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    public_path = etc_root / "public/authority-receipt-public.pem"
+    public_path.write_bytes(public_raw)
+    public_path.chmod(0o444)
+    credential_id = b"successor-public-credential-id"
+    public_key_cose = b"successor-public-cose-key"
+    user_handle = b"successor-user-handle"
+    migration = {
+        "credential_id_b64url": base64.urlsafe_b64encode(credential_id)
+        .rstrip(b"=")
+        .decode("ascii"),
+        "public_key_cose_b64url": base64.urlsafe_b64encode(public_key_cose)
+        .rstrip(b"=")
+        .decode("ascii"),
+        "expected_user_handle_b64url": base64.urlsafe_b64encode(user_handle)
+        .rstrip(b"=")
+        .decode("ascii"),
+        "envelope_sha256": "d" * 64,
+        "collected_at_unix": 1_700_000_000,
+        "initial_sign_count": 0,
+        "initial_credential_backed_up": True,
+    }
+    predecessor = bootstrap.VerifiedBundle(
+        root=tmp_path,
+        manifest={
+            "release_revision": "a" * 40,
+            "package_sha256": "b" * 64,
+        },
+        authority={},
+        migration=migration,
+    )
+    successor = bootstrap.VerifiedBundle(
+        root=tmp_path,
+        manifest={
+            "release_revision": "c" * 40,
+            "package_sha256": "e" * 64,
+        },
+        authority={},
+        migration={
+            **migration,
+            "envelope_sha256": "f" * 64,
+            "collected_at_unix": 1_800_000_000,
+        },
+    )
+    layout = bootstrap.InstallLayout(
+        release_base=tmp_path / "releases",
+        current_link=tmp_path / "current",
+        etc_root=etc_root,
+        state_root=state_root,
+        run_root=tmp_path / "run",
+        systemd_root=tmp_path / "systemd",
+        sysusers_root=tmp_path / "sysusers",
+        tmpfiles_root=tmp_path / "tmpfiles",
+        sudoers_root=tmp_path / "sudoers",
+    )
+    key_id = hashlib.sha256(
+        private.public_key().public_bytes_raw()
+    ).hexdigest()
+    key_receipt = {
+        "public_key_path": str(public_path),
+        "public_key_id": key_id,
+    }
+    monkeypatch.setattr(
+        bootstrap,
+        "EXPECTED_CREDENTIAL_ID_SHA256",
+        hashlib.sha256(credential_id).hexdigest(),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "EXPECTED_PUBLIC_KEY_SHA256",
+        hashlib.sha256(public_key_cose).hexdigest(),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "EXPECTED_USER_HANDLE_SHA256",
+        hashlib.sha256(user_handle).hexdigest(),
+    )
+    monkeypatch.setattr(bootstrap, "AUTHORITY_UID", os.geteuid())
+    monkeypatch.setattr(bootstrap, "EXECUTOR_UID", os.geteuid())
+    created = bootstrap.bootstrap_and_verify_databases(
+        predecessor,
+        layout=layout,
+        key_receipt=key_receipt,
+        now_unix=1_700_000_001,
+        require_root=False,
+        authority_uid=os.geteuid(),
+        authority_gid=os.getegid(),
+        executor_uid=os.geteuid(),
+        executor_gid=os.getegid(),
+    )
+    predecessor_sha256 = "1" * 64
+    intent = {
+        "schema": "muncho-owner-gate-databases-phase-intent.v2",
+        "predecessor_sha256": predecessor_sha256,
+        "targets": [
+            {
+                "path": str(path),
+                "created_by_transaction": False,
+                "adopted_from_predecessor": True,
+                "preserve_on_rollback": True,
+            }
+            for path in (
+                state_root / "authority/passkey-v2.sqlite3",
+                state_root / "executor/execution-v2.sqlite3",
+            )
+        ],
+        "credential_imported_by_transaction": False,
+        "credential_id_sha256": hashlib.sha256(
+            credential_id
+        ).hexdigest(),
+        "preserve_append_only_truth_on_rollback": True,
+    }
+
+    adopted = bootstrap.bootstrap_and_verify_databases(
+        successor,
+        layout=layout,
+        key_receipt=key_receipt,
+        now_unix=1_800_000_001,
+        require_root=False,
+        authority_uid=os.geteuid(),
+        authority_gid=os.getegid(),
+        executor_uid=os.geteuid(),
+        executor_gid=os.getegid(),
+        transaction_intent=intent,
+    )
+
+    assert adopted["schema"] == (
+        "muncho-owner-gate-canonical-databases-adoption.v1"
+    )
+    assert adopted["credential_record_sha256"] == (
+        created["credential_record_sha256"]
+    )
+    assert adopted["credential_imported_by_transaction"] is False
+    assert adopted["authority_database_created_by_transaction"] is False
+    assert adopted["executor_database_created_by_transaction"] is False
+    assert adopted["adopted_from_predecessor_sha256"] == (
+        predecessor_sha256
+    )
+    assert adopted["authority_preflight"] == created["authority_preflight"]
+    assert adopted["executor_preflight"] == created["executor_preflight"]
+
+
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize(
     "checkpoint",
@@ -2020,6 +2543,56 @@ def test_rollback_strict_load_never_creates_empty_install_transaction(
     assert not (
         receipts / f"transaction-{bundle.revision}.journal"
     ).exists()
+
+
+def test_successor_rollback_restores_predecessor_files_and_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, layout, transaction, payloads = (
+        _prepare_successor_rollback_fixture(tmp_path)
+    )
+    monkeypatch.setattr(
+        bootstrap.foundation,
+        "MUTATION_ENABLE_SEAL",
+        tmp_path / "no-seal",
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_revalidate_committed_phase",
+        lambda _phase, stored, **_kwargs: dict(stored),
+    )
+
+    receipt = bootstrap.rollback_inert_install(
+        bundle.root,
+        layout=layout,
+        _verified_bundle=bundle,
+        _expected_uid=os.geteuid(),
+        _expected_gid=os.getegid(),
+        _require_root=False,
+    )
+    replay = bootstrap.rollback_inert_install(
+        bundle.root,
+        layout=layout,
+        _verified_bundle=bundle,
+        _expected_uid=os.geteuid(),
+        _expected_gid=os.getegid(),
+        _require_root=False,
+    )
+
+    assert receipt == replay
+    assert receipt["schema"] == (
+        "muncho-owner-gate-inert-install-rollback.v3"
+    )
+    assert receipt["transaction_sha256"] == transaction[
+        "transaction_sha256"
+    ]
+    assert receipt["removed_entry_files"] == []
+    assert receipt["restored_entry_files"] == sorted(
+        str(path) for path, _predecessor, _successor in payloads
+    )
+    for path, predecessor, _successor in payloads:
+        assert path.read_bytes() == predecessor
 
 
 @pytest.mark.live_system_guard_bypass
