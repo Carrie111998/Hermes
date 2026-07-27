@@ -70,6 +70,8 @@
 - Governed web search and extraction now require execution-time `web.search`
   or `web.read` authorization with exact query/URL resources; web toolsets no
   longer imply unrestricted external destinations.
+- Governed browser navigation now requires `browser.navigate` and an exact URL
+  resource before any page is opened.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

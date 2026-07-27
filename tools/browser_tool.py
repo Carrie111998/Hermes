@@ -2835,6 +2835,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                      "Secrets must not be sent in URLs.",
         })
 
+    # Governed workers must hold an exact navigation grant. A browser
+    # toolset alone is not authority to visit arbitrary external destinations.
+    from hermes_cli.workforce_delegation import authorize_worker_action
+    authorize_worker_action(
+        capability="browser.navigate",
+        system="browser",
+        target_resource=url,
+    )
+
     # SSRF protection — block private/internal addresses before navigating.
     # Skipped for local backends (Camofox, headless Chromium without a cloud
     # provider) because the agent already has full local network access via
