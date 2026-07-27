@@ -493,12 +493,14 @@ export interface SubagentEventPayload {
   files_written?: string[]
   goal: string
   input_tokens?: number
+  is_error?: boolean
   iteration?: number
   model?: string
   output_tail?: { is_error?: boolean; preview?: string; tool?: string }[]
   output_tokens?: number
   parent_id?: null | string
   reasoning_tokens?: number
+  reason?: string
   status?: SubagentStatus
   subagent_id?: string
   summary?: string
@@ -506,6 +508,8 @@ export interface SubagentEventPayload {
   task_index: number
   text?: string
   tool_count?: number
+  tool_call_id?: string
+  call_id?: string
   tool_name?: string
   tool_preview?: string
   toolsets?: string[]
@@ -626,18 +630,31 @@ export type GatewayEvent =
   | { payload: { name?: string; preview?: string }; session_id?: string; type: 'tool.progress' }
   | { payload: { name?: string }; session_id?: string; type: 'tool.generating' }
   | {
-      payload: { args_text?: string; context?: string; name?: string; tool_id: string; todos?: unknown[] }
+      payload: {
+        args_text?: string
+        context?: string
+        name?: string
+        reason?: string
+        status?: string
+        tool_call_id?: string
+        tool_id: string
+        todos?: unknown[]
+      }
       session_id?: string
       type: 'tool.start'
     }
   | {
       payload: {
+        duration_seconds?: number
         duration_s?: number
         error?: string
         inline_diff?: string
+        is_error?: boolean
         name?: string
         result_text?: string
         summary?: string
+        status?: string
+        tool_call_id?: string
         tool_id: string
         todos?: unknown[]
       }
@@ -669,6 +686,7 @@ export type GatewayEvent =
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.start' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.thinking' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.tool' }
+  | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.tool.completed' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.progress' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.complete' }
   | { payload: { rendered?: string; text?: string }; session_id?: string; type: 'message.delta' }
