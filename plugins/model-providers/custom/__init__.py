@@ -10,7 +10,6 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
     so the endpoint's server default applies)
 """
 
-from tools.tool_backend_helpers import fal_key_is_configured
 from typing import Any
 
 from providers import register_provider
