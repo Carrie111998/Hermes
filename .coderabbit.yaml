@@ -1,1 +1,39 @@
-bGFuZ3VhZ2U6ICJlbi1BVSIKdG9uZV9pbnN0cnVjdGlvbnM6ICJCZSBjb25jaXNlIGFuZCBkaXJlY3QuIEZsYWcgc2VjdXJpdHkgaXNzdWVzIGxpa2UgZXhwb3NlZCBBUEkga2V5cywgbWlzc2luZyAuZ2l0aWdub3JlIGVudHJpZXMsIGFuZCBoYXJkY29kZWQgY3JlZGVudGlhbHMuIEZsYWcgZGF0YSBsb3NzIHJpc2tzLiBTa2lwIHN0eWxlIG5pdHBpY2tzLiIKcmV2aWV3czoKICBwcm9maWxlOiAiYXNzZXJ0aXZlIgogIHJlcXVlc3RfY2hhbmdlc193b3JrZmxvdzogZmFsc2UKICBoaWdoX2xldmVsX3N1bW1hcnk6IHRydWUKICBwb2VtOiBmYWxzZQogIHJldmlld19zdGF0dXM6IHRydWUKICBjb2xsYXBzZV93YWxrdGhyb3VnaDogZmFsc2UKICBhdXRvX3JldmlldzoKICAgIGVuYWJsZWQ6IHRydWUKICAgIGRyYWZ0czogdHJ1ZQogICAgYmFzZV9icmFuY2hlczoKICAgICAgLSBtYWluCiAgICAgIC0gbWFzdGVyCiAgcGF0aF9maWx0ZXJzOgogICAgLSAiISoqLyoubG9jayIKICAgIC0gIiEqKi9ub2RlX21vZHVsZXMvKioiCiAgICAtICIhKiovZGlzdC8qKiIKICAgIC0gIiEqKi9idWlsZC8qKiIKY2hhdDoKICBhdXRvX3JlcGx5OiB0cnVlCmtub3dsZWRnZV9iYXNlOgogIG9wdF9vdXQ6IHRydWUK
+language: "en-US"
+tone_instructions: "Be concise and direct."
+reviews:
+  profile: "assertive"
+  auto_review:
+    enabled: true
+    drafts: true
+    base_branches:
+      - main
+      - master
+  path_instructions:
+    - path: "**"
+      instructions: "Flag security issues: API keys, hardcoded credentials. Flag data loss risks."
+    - path: "**/migrations/**"
+      instructions: "D1 migrations must be additive — no DROP or destructive ALTER."
+  path_filters:
+    - "!**/*.lock"
+    - "!**/pnpm-lock.yaml"
+    - "!**/package-lock.json"
+    - "!**/yarn.lock"
+    - "!**/venv/**"
+    - "!**/.venv/**"
+    - "!**/node_modules/**"
+    - "!**/frameworks/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/__pycache__/**"
+    - "!**/*.pyc"
+  review_status: true
+  poem: false
+  collapse_walkthrough: false
+  sequence_diagrams: false
+  finishing_touches:
+    docstrings:
+      enabled: false
+chat:
+  auto_reply: true
+knowledge_base:
+  opt_out: true
