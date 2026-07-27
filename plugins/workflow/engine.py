@@ -2325,6 +2325,58 @@ class WorkflowEngine:
             )
             return False
 
+    def _review_waiting_loop(self, workflow: "Workflow", states: dict,
+                              implement_nid: str, layer_idx: int):
+        """Poll implement card until it re-blocks 'pending review' or
+        all reviewers reach terminal states. Called from the post-monitor
+        review check when a review iteration just completed."""
+        implement_state = states[implement_nid]
+        max_wait_polls = int((workflow.nodes[implement_nid].timeout_minutes * 120) / self.POLL_INTERVAL)
+        wait_polls = 0
+        while wait_polls < max_wait_polls:
+            time.sleep(self.POLL_INTERVAL)
+            wait_polls += 1
+            # Check if reviewer reached terminal state
+            all_reviewers_done = True
+            for rev_entry in workflow.nodes[implement_nid].reviews:
+                rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                if rev_id and rev_id in states:
+                    if states[rev_id].status not in ("done", "skipped", "failed", "timed_out"):
+                        all_reviewers_done = False
+                        break
+            if all_reviewers_done:
+                print(f"   ✓ All reviewers terminal — advancing to next layer")
+                break
+            # Check if implement re-blocked "pending review"
+            if implement_state.kanban_card_id:
+                try:
+                    card = self.get_card_status(implement_state.kanban_card_id)
+                    card_status = card.get("status", card.get("column", "unknown")).lower()
+                    if card_status == "blocked":
+                        if self._check_pending_review(implement_state.kanban_card_id):
+                            print(f"   📋 {implement_nid} re-blocked pending review — unblocking reviewer")
+                            # Unblock the reviewer
+                            for rev_entry in workflow.nodes[implement_nid].reviews:
+                                rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                                if rev_id and rev_id in states:
+                                    rev_state = states[rev_id]
+                                    if rev_state.kanban_card_id and rev_state.status == "blocked":
+                                        with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                                            kanban_db.unblock_task(_conn, rev_state.kanban_card_id)
+                                        rev_state.status = "ready"
+                                        rev_state.completed_at = None
+                                        rev_state.result = None
+                                        print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
+                            # Advance to next layer so the reviewer
+                            # gets dispatched and monitored.
+                            layer_idx += 1
+                            break
+                except Exception:
+                    pass
+        else:
+            # While loop exited without break — reviewers done
+            pass
+
     # ── Execution ──────────────────────────────────────────────
 
     def execute(self, workflow_name: str, context: dict = None,
@@ -2821,62 +2873,8 @@ class WorkflowEngine:
 
             if has_active_review:
                 print(f"   🔍 has_active_review=True — layer={layer}")
-                # Review loop active — don't re-enter layer dispatch.
-                # Instead, poll the implement card for its next
-                # "pending review" block. The dispatcher handles
-                # claiming and running the card; we just watch for
-                # the block transition.
                 print(f"   🔄 Review loop active — waiting for {layer[0]} to re-block pending review")
-                # Poll implement card until it blocks "pending review"
-                # or all reviewers reach terminal states.
-                implement_nid = layer[0]
-                implement_state = states[implement_nid]
-                # Max wait: 2x the implement node's timeout
-                max_wait_polls = int((workflow.nodes[implement_nid].timeout_minutes * 120) / self.POLL_INTERVAL)
-                wait_polls = 0
-                while wait_polls < max_wait_polls:
-                    time.sleep(self.POLL_INTERVAL)
-                    wait_polls += 1
-                    # Check if reviewer reached terminal state
-                    all_reviewers_done = True
-                    for rev_entry in workflow.nodes[implement_nid].reviews:
-                        rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                        if rev_id and rev_id in states:
-                            if states[rev_id].status not in ("done", "skipped", "failed", "timed_out"):
-                                all_reviewers_done = False
-                                break
-                    if all_reviewers_done:
-                        print(f"   ✓ All reviewers terminal — advancing to next layer")
-                        break
-                    # Check if implement re-blocked "pending review"
-                    if implement_state.kanban_card_id:
-                        try:
-                            card = self.get_card_status(implement_state.kanban_card_id)
-                            card_status = card.get("status", card.get("column", "unknown")).lower()
-                            if card_status == "blocked":
-                                if self._check_pending_review(implement_state.kanban_card_id):
-                                    print(f"   📋 {implement_nid} re-blocked pending review — unblocking reviewer")
-                                    # Unblock the reviewer
-                                    for rev_entry in workflow.nodes[implement_nid].reviews:
-                                        rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                                        if rev_id and rev_id in states:
-                                            rev_state = states[rev_id]
-                                            if rev_state.kanban_card_id and rev_state.status == "blocked":
-                                                with kanban_db.connect_closing(board=self.kanban_board) as _conn:
-                                                    kanban_db.unblock_task(_conn, rev_state.kanban_card_id)
-                                                rev_state.status = "ready"
-                                                rev_state.completed_at = None
-                                                rev_state.result = None
-                                                print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
-                                    # Advance to next layer so the reviewer
-                                    # gets dispatched and monitored.
-                                    layer_idx += 1
-                                    break
-                        except Exception:
-                            pass
-                else:
-                    # While loop exited without break — reviewers done
-                    pass
+                self._review_waiting_loop(workflow, states, layer[0], layer_idx)
                 # Stay in this layer — don't advance
                 # Fall through to post-monitor review check below
                 # instead of continuing, so the check can detect
@@ -2913,7 +2911,19 @@ class WorkflowEngine:
                     if any_active_review:
                         break
             if any_active_review:
-                layer_idx = 0
+                # Enter the review waiting loop directly instead of
+                # going back to layer dispatch (which would re-enter
+                # _monitor_layer and return immediately).
+                implement_nid = None
+                for nid, state in states.items():
+                    node = workflow.nodes.get(nid)
+                    if node and node.reviews and state.status == "ready":
+                        implement_nid = nid
+                        break
+                if implement_nid:
+                    self._review_waiting_loop(
+                        workflow, states, implement_nid, layer_idx
+                    )
                 continue
 
             # Re-check blocked nodes — if their dependencies unblocked,
@@ -3091,60 +3101,8 @@ class WorkflowEngine:
                             break
                 if has_active_review:
                     print(f"   🔍 has_active_review=True — layer={layer}")
-                    # Review loop active — don't re-enter layer dispatch.
-                    # Instead, poll the implement card for its next
-                    # "pending review" block. The dispatcher handles
-                    # claiming and running the card; we just watch for
-                    # the block transition.
                     print(f"   🔄 Review loop active — waiting for {layer[0]} to re-block pending review")
-                    # Poll implement card until it blocks "pending review"
-                    # or all reviewers reach terminal states.
-                    implement_nid = layer[0]
-                    implement_state = states[implement_nid]
-                    # Max wait: 2x the implement node's timeout
-                    max_wait_polls = int((workflow.nodes[implement_nid].timeout_minutes * 120) / self.POLL_INTERVAL)
-                    wait_polls = 0
-                    while wait_polls < max_wait_polls:
-                        time.sleep(self.POLL_INTERVAL)
-                        wait_polls += 1
-                        # Check if reviewer reached terminal state
-                        all_reviewers_done = True
-                        for rev_entry in workflow.nodes[implement_nid].reviews:
-                            rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                            if rev_id and rev_id in states:
-                                if states[rev_id].status not in ("done", "skipped", "failed", "timed_out"):
-                                    all_reviewers_done = False
-                                    break
-                        if all_reviewers_done:
-                            print(f"   ✓ All reviewers terminal — advancing to next layer")
-                            break
-                        # Check if implement re-blocked "pending review"
-                        if implement_state.kanban_card_id:
-                            try:
-                                card = self.get_card_status(implement_state.kanban_card_id)
-                                card_status = card.get("status", card.get("column", "unknown")).lower()
-                                if card_status == "blocked":
-                                    if self._check_pending_review(implement_state.kanban_card_id):
-                                        print(f"   📋 {implement_nid} re-blocked pending review — unblocking reviewer")
-                                        # Unblock the reviewer
-                                        for rev_entry in workflow.nodes[implement_nid].reviews:
-                                            rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                                            if rev_id and rev_id in states:
-                                                rev_state = states[rev_id]
-                                                if rev_state.kanban_card_id and rev_state.status == "blocked":
-                                                    with kanban_db.connect_closing(board=self.kanban_board) as _conn:
-                                                        kanban_db.unblock_task(_conn, rev_state.kanban_card_id)
-                                                    rev_state.status = "ready"
-                                                    rev_state.completed_at = None
-                                                    rev_state.result = None
-                                                    print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
-                                        # Re-enter monitoring loop for this layer
-                                        break
-                            except Exception:
-                                pass
-                    else:
-                        # While loop exited without break — reviewers done
-                        pass
+                    self._review_waiting_loop(workflow, states, layer[0], layer_idx)
                 else:
                     layer_idx += 1
 
