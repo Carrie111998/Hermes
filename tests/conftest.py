@@ -5,11 +5,11 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 1. **No credential env vars.** All provider/credential-shaped env vars
    (ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD, _CREDENTIALS, etc.)
    are unset before every test. Local developer keys cannot leak in.
-2. **Isolated HERMES_HOME.** HERMES_HOME points to a per-test tempdir so
-   code reading ``~/.hermes/*`` via ``get_hermes_home()`` can't see the
-   real one. (We do NOT also redirect HOME — that broke subprocesses in
-   CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
-   ``get_hermes_home()`` is a bug to fix at the callsite.)
+2. **Isolated HERMES_HOME.** HERMES_HOME points to a session tempdir before
+   collection, then a per-test tempdir while each test runs, so imports and
+   test bodies cannot see the real one. (We do NOT also redirect HOME — that
+   broke subprocesses in CI. Code using ``Path.home() / ".hermes"`` instead
+   of the canonical ``get_hermes_home()`` is a bug to fix at the callsite.)
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
@@ -21,11 +21,51 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+# Test modules are imported during collection, before autouse fixtures run.
+# Several CLI modules initialize Hermes file logging at import time, so merely
+# redirecting HERMES_HOME in _hermetic_environment is too late: collection can
+# otherwise attach handlers to the developer's live ~/.hermes/logs.
+#
+# Establish a session-scoped test home before pytest imports any test module.
+# Individual tests still receive their own tmp_path HERMES_HOME below. The
+# optional explicit root exists for live acceptance runs that need to inspect
+# the isolated logs after pytest exits.
+_ORIGINAL_HERMES_HOME = os.environ.get("HERMES_HOME")
+_EXPLICIT_TEST_SESSION_HOME = os.environ.get("HERMES_TEST_SESSION_HOME")
+_REAL_HERMES_HOME = Path(
+    _ORIGINAL_HERMES_HOME or (Path.home() / ".hermes")
+).expanduser().resolve()
+if _EXPLICIT_TEST_SESSION_HOME:
+    _TEST_SESSION_HERMES_HOME = Path(_EXPLICIT_TEST_SESSION_HOME).expanduser().resolve()
+    _REMOVE_TEST_SESSION_HERMES_HOME = False
+else:
+    _TEST_SESSION_HERMES_HOME = Path(
+        tempfile.mkdtemp(prefix="hermes-pytest-session-")
+    ).resolve()
+    _REMOVE_TEST_SESSION_HERMES_HOME = True
+
+if (
+    _TEST_SESSION_HERMES_HOME == _REAL_HERMES_HOME
+    or _TEST_SESSION_HERMES_HOME.is_relative_to(_REAL_HERMES_HOME)
+    or _REAL_HERMES_HOME.is_relative_to(_TEST_SESSION_HERMES_HOME)
+):
+    if _REMOVE_TEST_SESSION_HERMES_HOME:
+        shutil.rmtree(_TEST_SESSION_HERMES_HOME, ignore_errors=True)
+    raise RuntimeError(
+        "HERMES_TEST_SESSION_HOME must be disjoint from the live HERMES_HOME"
+    )
+
+_TEST_SESSION_HERMES_HOME.mkdir(parents=True, exist_ok=True)
+os.environ["HERMES_HOME"] = str(_TEST_SESSION_HERMES_HOME)
+os.environ["HERMES_TEST_SESSION_HOME"] = str(_TEST_SESSION_HERMES_HOME)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -605,6 +645,20 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # suite runs natively there (POSIX keeps the more reliable signal method).
     if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
         config.option.timeout_method = "thread"
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):  # noqa: D401 — pytest hook
+    """Flush collection-time handlers and remove the automatic test log home."""
+    if not _REMOVE_TEST_SESSION_HERMES_HOME:
+        return
+    try:
+        import hermes_logging
+
+        hermes_logging._reset_queued_handlers()
+    except Exception:
+        pass
+    shutil.rmtree(_TEST_SESSION_HERMES_HOME, ignore_errors=True)
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
