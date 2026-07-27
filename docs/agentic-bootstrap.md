@@ -25,8 +25,9 @@ charterforge business readiness
 runtime-worker health, security readiness, drift gates, open advisor
 interventions, and any payment rails declared by the charter all permit
 unattended operation. If the
-charter grants `payments.receive` or `payments.send`, a credential-ready rail
-is required for the corresponding direction. It never enables autonomy or
+charter grants `payments.receive` or `payments.send`, a credential-ready rail,
+a current screened provider assessment, and a non-custodial compliance profile
+are required for the corresponding direction. It never enables autonomy or
 attempts a provider action.
 
 The checked-in example charter admits both supervised gateway and standalone

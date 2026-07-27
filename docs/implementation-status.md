@@ -192,8 +192,9 @@ acceptance evidence.
 - `charterforge business readiness` provides a deterministic, read-only
   projection of bootstrap, autonomy, worker, drift, and advisor-intervention
   blockers. It also blocks a charter that declares payment capabilities when
-  no credential-ready rail exists for the required direction. It does not
-  certify external providers or legal/compliance status.
+  no credential-ready rail, non-custodial profile, or current screened provider
+  assessment exists for the required direction. It does not certify external
+  providers or legal/compliance status.
 - The readiness projection includes the same deterministic security-readiness
   violations used by the worker, including isolation, secret-manager, redaction,
   and non-custodial payment-policy failures, with an explicit no-action boundary.

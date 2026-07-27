@@ -488,6 +488,18 @@ def build_business_readiness(conn) -> dict:
         required_directions.add("outbound")
     if required_directions:
         rails = payments.payment_rail_status()
+        compliance_db.ensure_schema(conn)
+        profile = conn.execute(
+            "SELECT custody_model FROM compliance_profiles WHERE organization_id=?",
+            (snapshot["organization"]["id"],),
+        ).fetchone()
+        if profile is None or profile["custody_model"] != "non_custodial":
+            blockers.append(
+                {
+                    "code": "payment_compliance_profile_missing",
+                    "summary": "Non-custodial payment compliance profile is not configured",
+                }
+            )
         for direction in sorted(required_directions):
             available = [
                 item for item in rails.get(direction, []) if item.get("available")
@@ -501,6 +513,23 @@ def build_business_readiness(conn) -> dict:
                         ),
                         "direction": direction,
                         "discovered": rails.get(direction, []),
+                    }
+                )
+            assessed = conn.execute(
+                """SELECT 1 FROM payment_provider_assessments
+                   WHERE organization_id=? AND direction=? AND status='verified'
+                     AND expires_at>? AND aml_screening_delegated=1
+                     AND sanctions_screening_delegated=1 LIMIT 1""",
+                (snapshot["organization"]["id"], direction, int(time.time())),
+            ).fetchone()
+            if assessed is None:
+                blockers.append(
+                    {
+                        "code": "payment_provider_assessment_missing",
+                        "summary": (
+                            f"No current screened provider assessment exists for {direction} payments"
+                        ),
+                        "direction": direction,
                     }
                 )
     return {

@@ -19,6 +19,8 @@
   violations directly, before a supervisor is started.
 - Standalone CEO Compose supervision now bounds unexpected crash retries at
   five while leaving successful governed stops stopped.
+- Payment readiness now also requires a durable non-custodial compliance profile
+  and current AML/sanctions-screened provider assessment per declared direction.
 
 ## 0.19.0-agentic-foundation — 2026-07-27
 

@@ -134,7 +134,9 @@ def test_business_readiness_reports_authoritative_runtime_blockers(monkeypatch):
         "hermes_cli.business_security.evaluate_security_readiness",
         lambda _config: type("Readiness", (), {"ready": True, "violations": ()})(),
     )
-    readiness = business.build_business_readiness(sqlite3.connect(":memory:"))
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    readiness = business.build_business_readiness(conn)
     assert readiness["ready"] is False
     assert readiness["state"] == "blocked"
     assert [item["code"] for item in readiness["blockers"]] == [
@@ -174,11 +176,12 @@ def test_business_readiness_blocks_declared_payments_without_ready_rail(monkeypa
         "hermes_cli.payments.payment_rail_status",
         lambda: {"inbound": [], "outbound": []},
     )
-    readiness = business.build_business_readiness(sqlite3.connect(":memory:"))
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    readiness = business.build_business_readiness(conn)
     assert readiness["ready"] is False
-    assert readiness["blockers"] == [{
-        "code": "payment_rail_unavailable",
-        "summary": "No credential-ready inbound payment rail is available",
-        "direction": "inbound",
-        "discovered": [],
-    }]
+    assert [item["code"] for item in readiness["blockers"]] == [
+        "payment_compliance_profile_missing",
+        "payment_rail_unavailable",
+        "payment_provider_assessment_missing",
+    ]
