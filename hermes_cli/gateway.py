@@ -2479,7 +2479,7 @@ def _launchd_user_home() -> Path:
 
 
 def get_launchd_plist_path() -> Path:
-    """Return the launchd plist path, scoped per profile.
+    """Return the launchd LaunchAgent plist path, scoped per profile.
 
     Default ``~/.hermes`` → ``ai.hermes.gateway.plist`` (backward compatible).
     Profile ``~/.hermes/profiles/coder`` → ``ai.hermes.gateway-coder.plist``.
@@ -2487,6 +2487,18 @@ def get_launchd_plist_path() -> Path:
     suffix = _profile_suffix()
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+
+
+def get_launchd_daemon_plist_path() -> Path:
+    """Return the launchd LaunchDaemon (system-wide) plist path, scoped per profile.
+
+    ``/Library/LaunchDaemons/ai.hermes.gateway.plist`` (or with profile suffix).
+    Used for service accounts that have no GUI domain (``gui/<uid>``) and
+    therefore cannot use LaunchAgent-based supervision.
+    """
+    suffix = _profile_suffix()
+    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    return Path("/Library/LaunchDaemons") / f"{name}.plist"
 
 
 def _detect_venv_dir() -> Path | None:
@@ -3588,6 +3600,28 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
+def _has_gui_domain() -> bool:
+    """Return True if the current user has a GUI (Aqua) launchd domain.
+
+    Service accounts that never log in have no ``gui/<uid>`` domain.
+    ``launchctl print gui/<uid>`` returns exit 125 when the domain does
+    not exist.  This is the authoritative check for whether a LaunchAgent
+    (which loads only in Aqua/Background sessions) will actually be
+    supervised by launchd.
+    """
+    uid = os.getuid()  # windows-footgun: ok -- POSIX helper, never invoked on Windows
+    try:
+        subprocess.run(
+            ["launchctl", "print", f"gui/{uid}"],
+            check=True,
+            timeout=5,
+            capture_output=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
 # Cached launchd domain result — probing is cheap but should only run once per
 # process invocation (each ``hermes gateway start/stop/status`` call).
 _resolved_launchd_domain: str | None = None
@@ -4054,6 +4088,114 @@ def generate_launchd_plist() -> str:
 """
 
 
+def generate_launchd_daemon_plist() -> str:
+    """Generate a LaunchDaemon plist for running the gateway as a system service.
+
+    Used on macOS when the target user has no GUI domain (service accounts
+    that never log in).  The plist includes a ``UserName`` key so the
+    gateway runs as the correct user, and omits ``LimitLoadToSessionType``
+    so it loads at system boot (LaunchDaemon default).
+
+    Must be written to ``/Library/LaunchDaemons/`` and bootstrapped to the
+    ``system`` domain — requires root privileges.
+    """
+    import pwd
+
+    python_path = get_python_path()
+    working_dir = _stable_service_working_dir()
+    hermes_home = str(get_hermes_home().resolve())
+    log_dir = get_hermes_home() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    label = get_launchd_label()
+    profile_arg = _profile_arg(hermes_home)
+    run_as_user = pwd.getpwuid(os.getuid()).pw_name  # windows-footgun: ok -- macOS helper
+
+    # Build a sane PATH (same logic as generate_launchd_plist)
+    detected_venv = _detect_venv_dir()
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    priority_dirs = _build_service_path_dirs()
+    resolved_node = shutil.which("node")
+    if resolved_node:
+        resolved_node_dir = str(Path(resolved_node).parent)
+        if resolved_node_dir not in priority_dirs:
+            priority_dirs.append(resolved_node_dir)
+    sane_path = ":".join(
+        dict.fromkeys(
+            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
+        )
+    )
+
+    prog_args = [
+        f"<string>{python_path}</string>",
+        "<string>-m</string>",
+        "<string>hermes_cli.main</string>",
+    ]
+    if profile_arg:
+        for part in profile_arg.split():
+            prog_args.append(f"<string>{part}</string>")
+    prog_args.extend(
+        [
+            "<string>gateway</string>",
+            "<string>run</string>",
+            "<string>--replace</string>",
+        ]
+    )
+    prog_args_xml = "\n        ".join(prog_args)
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        {prog_args_xml}
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>{working_dir}</string>
+    
+    <key>UserName</key>
+    <string>{run_as_user}</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{sane_path}</string>
+        <key>VIRTUAL_ENV</key>
+        <string>{venv_dir}</string>
+        <key>HERMES_HOME</key>
+        <string>{hermes_home}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
+         to 30s so a crash-looping gateway can't hammer launchd into a rapid
+         respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain
+         headroom before launchd escalates from SIGTERM to SIGKILL on stop. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>25</integer>
+
+    <key>StandardOutPath</key>
+    <string>{log_dir}/gateway.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/gateway.error.log</string>
+</dict>
+</plist>
+"""
+
+
 def launchd_plist_is_current() -> bool:
     """Check if the installed launchd plist matches the currently generated one."""
     plist_path = get_launchd_plist_path()
@@ -4233,7 +4375,68 @@ def refresh_launchd_plist_if_needed() -> bool:
     return True
 
 
-def launchd_install(force: bool = False):
+def launchd_install(force: bool = False, system: bool = False):
+    """Install gateway as a macOS launchd service.
+
+    For normal interactive accounts, writes a LaunchAgent plist to
+    ``~/Library/LaunchAgents/`` and bootstraps it to the user's launchd
+    domain (``gui/<uid>`` or ``user/<uid>``).
+
+    For service accounts that have no GUI domain (``gui/<uid>`` does not
+    exist), this function installs a LaunchDaemon at
+    ``/Library/LaunchDaemons/`` instead — but only when running as root
+    (``sudo hermes gateway install``).  Without root, the function fails
+    with a clear error message rather than silently falling back to an
+    unsupervised background process (#72790).
+
+    Pass ``system=True`` to force a LaunchDaemon install.
+    """
+    if system or not _has_gui_domain():
+        if os.geteuid() != 0:
+            print(
+                "✗ Cannot install launchd service: this account has no GUI domain\n"
+                "  (it is a service account that never logs in).\n"
+                "  Run with sudo to install a system LaunchDaemon instead:\n"
+                f"    sudo hermes gateway install{' --force' if force else ''}"
+            )
+            sys.exit(1)
+        plist_path = get_launchd_daemon_plist_path()
+        if plist_path.exists() and not force:
+            print(f"Service already installed at: {plist_path}")
+            print("Use --force to reinstall")
+            return
+
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        new_plist = generate_launchd_daemon_plist()
+        if _refuse_temp_home_service_write(new_plist, "launchd daemon plist"):
+            return
+        print(f"Installing launchd system daemon (LaunchDaemon) to: {plist_path}")
+        plist_path.write_text(new_plist, encoding="utf-8")
+
+        try:
+            _launchctl_bootstrap(
+                "system", plist_path, get_launchd_label(), timeout=30
+            )
+        except subprocess.CalledProcessError as e:
+            if not _launchctl_domain_unsupported(e.returncode):
+                raise
+            _launchd_fallback_to_detached(
+                f"launchctl bootstrap system exit {e.returncode}"
+            )
+            return
+
+        print()
+        print("✓ LaunchDaemon installed and loaded! The gateway will auto-start at boot.")
+        _clear_launchd_unsupported_marker()
+        print()
+        print("Next steps:")
+        print("  sudo hermes gateway status             # Check status")
+        from hermes_constants import display_hermes_home as _dhh
+
+        print(f"  tail -f {_dhh()}/logs/gateway.log  # View logs")
+        return
+
+    # Normal LaunchAgent (interactive user account with GUI domain)
     plist_path = get_launchd_plist_path()
 
     if plist_path.exists() and not force:
@@ -6831,7 +7034,7 @@ def _gateway_command_inner(args):
             if start_now:
                 systemd_start(system=system)
         elif is_macos():
-            launchd_install(force)
+            launchd_install(force, system=system)
         elif is_windows():
             from hermes_cli import gateway_windows
 

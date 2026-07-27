@@ -167,7 +167,7 @@ def build_gateway_parser(
     gateway_install.add_argument(
         "--system",
         action="store_true",
-        help="Install as a Linux system-level service (starts at boot)",
+        help="Install as a system-level service (starts at boot; Linux systemd or macOS LaunchDaemon)",
     )
     gateway_install.add_argument(
         "--run-as-user",
