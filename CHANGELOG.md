@@ -179,9 +179,11 @@ recorded.
   until evidence-bearing reaffirmation refreshes the standing objective.
 - `1720b01ade8543326029676e4d142d914ee4bc9f` — required a substantive
   decision basis when resolving stale-intent reaffirmation.
+- `33ca4eae20cd4291381e053de7838b2a107138a3` — rejected future-dated payment
+  provider assessments before rail authorization.
 - Current-main focused acceptance rerun at baseline
-  `1720b01ade8543326029676e4d142d914ee4bc9f`: 6 Founder/CEO E2E tests, 47
-  objective service/runtime/worker tests, and 18 finance/attribution tests
+  `33ca4eae20cd4291381e053de7838b2a107138a3`: 6 Founder/CEO E2E tests, 47
+  objective service/runtime/worker tests, and 19 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
 - The containing documentation/control-boundary commit also adds proposal-time

@@ -84,14 +84,14 @@ determination until a newer evidence commit is recorded.
 ## Post-boundary evidence on current main
 
 The exact acceptance command set was rerun against current `main` at baseline
-commit `1720b01ade8543326029676e4d142d914ee4bc9f`. This is a separate,
+commit `33ca4eae20cd4291381e053de7838b2a107138a3`. This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
 tag above.
 
 - Founder/CEO E2E: **6 passed, 0 failed**.
 - Objective service/runtime/worker sweep: **47 passed, 0 failed** across 3
   files.
-- Finance and outcome-attribution sweep: **18 passed, 0 failed** across 2
+- Finance and outcome-attribution sweep: **19 passed, 0 failed** across 2
   files.
 - Selected runtime compilation: completed successfully.
 - `git diff --check`: completed successfully.

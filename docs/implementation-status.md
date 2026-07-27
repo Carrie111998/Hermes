@@ -90,6 +90,8 @@ acceptance evidence.
   reaffirmation before planning resumes.
 - Reaffirmation resolution requires a substantive decision basis; an arbitrary
   non-empty JSON payload cannot refresh stale intent.
+- Payment-provider assessments reject future-dated verification evidence before
+  a rail can be authorized.
 - Runtime-host mismatches and charters with no registered action contracts also
   persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted
@@ -148,8 +150,8 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`a4ae9be834e76548c96556fd2ecf41cbd2b1c4e1` passed 6 Founder/CEO E2E tests, 45
-objective service/runtime/worker tests, and 18 finance/attribution tests,
+`33ca4eae20cd4291381e053de7838b2a107138a3` passed 6 Founder/CEO E2E tests, 47
+objective service/runtime/worker tests, and 19 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
 boundary or broaden the inventory coverage claim.
