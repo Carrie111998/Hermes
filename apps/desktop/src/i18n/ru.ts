@@ -64,7 +64,7 @@ export const ru: Translations = {
     ready: 'Hermes Desktop готов к работе',
     desktopBootFailedWithMessage: message => `Сбой запуска десктопа: ${message}`,
     steps: {
-      connectingGateway: 'Подключение к локальному шлюзу',
+      connectingGateway: 'Подключение к шлюзу Hermes Desktop',
       loadingSettings: 'Загрузка настроек Hermes',
       loadingSessions: 'Загрузка недавних сессий',
       startingDesktopConnection: 'Запуск десктоп-подключения',
@@ -94,7 +94,7 @@ export const ru: Translations = {
       openLogs: 'Открыть логи',
       repairHint: 'Восстановление перезапускает установщик и может занять несколько минут на новой машине.',
       remoteSignInHint: signInLabel =>
-        `Сначала выйдите из сохранённой удалённой сессии браузера, затем откройте ${signInLabel}. Для встроенного бэкенда используйте локальный шлюз`,
+        `Будет выполнен выход из сохранённой удалённой сессии браузера, затем откроется ${signInLabel}.`,
       signOutAndSignIn: 'Выйти и войти снова',
       remoteFailureHint:
         'Проверьте URL шлюза и выполните вход в разделе «Настройки шлюза» либо переключитесь на локальный шлюз.',
@@ -351,7 +351,8 @@ export const ru: Translations = {
     },
     plugins: {
       title: 'Плагины десктопа',
-      blurb: 'Плагины расширяют интерфейс Hermes Desktop новыми панелями и командами.',
+      blurb:
+        'Расширения интерфейса, загружаемые в это приложение: встроенные в сборку или добавленные в папку desktop-plugins (включая плагины, созданные Hermes). Отключение немедленно выгружает плагин, а настройка сохраняется после перезапуска.',
       count: n =>
         pluralRu(n, {
           one: `Установлен ${n} плагин`,
@@ -368,7 +369,7 @@ export const ru: Translations = {
       kinds: {
         bundled: 'встроенный',
         disk: 'на диске',
-        runtime: 'время выполнения'
+        runtime: 'динамический'
       }
     },
     notifications: {
@@ -917,7 +918,7 @@ export const ru: Translations = {
       cloudOrgRole: role => `Роль: ${role}`,
       cloudLoadingAgents: 'Загрузка ваших агентов…',
       cloudNoAgents: {
-        before: 'Агенты на этом аккаунте не найдены. Создайте в ',
+        before: 'Агенты на этом аккаунте не найдены. Создайте агента на ',
         linkText: 'портале Nous',
         after: ', затем обновите.'
       },
@@ -1214,7 +1215,7 @@ export const ru: Translations = {
       archivedIntro:
         'Архивные чаты скрыты из боковой панели, но сохраняют все сообщения. Ctrl/⌘-клик по чату в боковой панели архивирует его.',
       emptyArchivedTitle: 'Архив пуст',
-      emptyArchivedDesc: 'Архивируйте чат, чтобы скрыть его сюда.',
+      emptyArchivedDesc: 'Архивируйте чат, чтобы он появился здесь.',
       unarchive: 'Вернуть из архива',
       deletePermanently: 'Удалить навсегда',
       messages: count =>
@@ -2085,9 +2086,10 @@ export const ru: Translations = {
     notSet: 'Не задано',
     soulDesc: 'Системный промпт и инструкции персоны этого профиля.',
     soulOptional: 'необязательно',
-    soulPlaceholder: mode => `Системный промпт / персона для этого профиля.\nОставьте пустым для ${mode} по умолчанию.`,
-    soulPlaceholderCloned: 'клонированного',
-    soulPlaceholderEmpty: 'пустого',
+    soulPlaceholder: mode =>
+      `Системный промпт и описание персоны этого профиля.\nОставьте поле пустым, чтобы сохранить ${mode}.`,
+    soulPlaceholderCloned: 'клонированный вариант по умолчанию',
+    soulPlaceholderEmpty: 'пустой вариант по умолчанию',
     unsavedChanges: 'Несохранённые изменения',
     loadingSoul: 'Загрузка SOUL.md...',
     emptySoul: 'Пустой SOUL.md — начните писать персону...',
@@ -2185,7 +2187,7 @@ export const ru: Translations = {
     dayFallback: value => `день ${value}`,
     everyDayAt: time => `Каждый день в ${time}`,
     weekdaysAt: time => `По будням в ${time}`,
-    everyDayOfWeekAt: (day, time) => `Каждый ${day} в ${time}`,
+    everyDayOfWeekAt: (day, time) => `Каждую неделю: ${day}, ${time}`,
     monthlyOnDayAt: (dayOfMonth, time) => `Ежемесячно ${dayOfMonth} числа в ${time}`,
     topOfHour: 'В начале каждого часа',
     everyHourAt: minute => `Каждый час в :${minute}`,
@@ -2287,7 +2289,7 @@ export const ru: Translations = {
     itemsGeneric: 'элементов',
     zero: '0',
     rangeOf: (start, end, total) => `${start}–${end} из ${total}`,
-    goToPage: (itemLabel, page) => `Перейти к ${itemLabel} страница ${page}`,
+    goToPage: (itemLabel, page) => `${itemLabel}: перейти на страницу ${page}`,
     colTitleLink: 'Заголовок ссылки',
     colTitleFile: 'Имя',
     colTitleDefault: 'Заголовок / имя',
@@ -2404,11 +2406,12 @@ export const ru: Translations = {
       startWorkFailed: 'Не удалось создать рабочее дерево',
       convertBranch: 'Преобразовать ветвь…',
       convertBranchTitle: 'Преобразовать ветвь',
-      convertBranchDesc: 'Откройте уже извлечённые ветви или создайте рабочее дерево для свободной ветви.',
+      convertBranchDesc:
+        'Откройте ветви, уже открытые в рабочих деревьях, или создайте рабочее дерево для свободной ветви.',
       convertBranchPlaceholder: 'Поиск ветвей…',
       convertBranchInstead: 'Преобразовать существующую ветвь',
       branchOpenExisting: 'открыть',
-      branchSwitchHome: 'сменить дом',
+      branchSwitchHome: 'переключить основное рабочее дерево',
       branchCreateWorktree: 'новое рабочее дерево',
       branchesLoading: 'Загрузка ветвей…',
       noBranches: 'Ветви не найдены',
@@ -3099,7 +3102,7 @@ export const ru: Translations = {
         loading: 'Загрузка разбивки…',
         percentFull: percent => `${percent}% заполнено`,
         title: 'Использование контекста',
-        tokenSummary: (used, max) => `${used} / ${max} токенов`
+        tokenSummary: (used, max) => `Токены: ${used} / ${max}`
       },
       openContextUsage: 'Открыть разбивку использования контекста',
       session: 'Сессия',
@@ -3246,7 +3249,7 @@ export const ru: Translations = {
       restartFailedTitle: 'Перезапуск предпросмотра не удался',
       restartFailedMessage: 'Hermes не смог перезапустить сервер.',
       stillWorking:
-        'Hermes всё ещё работает, но результат перезапуска ещё не получен. Возможно, команда сервера выполняется в приоритетном режиме.',
+        'Hermes всё ещё работает, но результат перезапуска ещё не получен. Возможно, команда сервера выполняется на переднем плане.',
       workspaceReloading: 'Рабочее пространство изменилось, перезагрузка предпросмотра',
       fileChanged: url => `Файл изменился, перезагрузка предпросмотра: ${url}`,
       filesChanged: (count, url) =>
@@ -3270,7 +3273,8 @@ export const ru: Translations = {
     minimize: 'Свернуть',
     restore: 'Восстановить',
     closeRunningTitle: 'Закрыть вкладку с запущенным процессом?',
-    closeRunningBody: 'В этой вкладке выполняется процесс. При её закрытии процесс будет остановлен.',
+    closeRunningBody:
+      'Этот чат всё ещё работает или ждёт вашего ответа. Закрытие вкладки только скроет её — сессия продолжит работу, и её можно будет снова открыть из боковой панели.',
     closeRunningConfirm: 'Закрыть вкладку',
     closeOthers: 'Закрыть остальные',
     closeToRight: 'Закрыть вкладки справа',
@@ -3391,7 +3395,8 @@ export const ru: Translations = {
       continueLabel: 'Продолжить',
       lateAnswer: (question, choice) => `Re: «${question}» — мой ответ: ${choice}`,
       lateAnswerTip: 'Черновик ответа как следующее сообщение',
-      lateAnswerHint: 'Этот запрос больше не ждёт. Выберите вариант, чтобы отправить ответ следующим сообщением.'
+      lateAnswerHint:
+        'Этот запрос больше не ждёт. Выберите вариант, чтобы добавить ответ в черновик следующего сообщения.'
     },
     tool: {
       code: 'Код',
@@ -3579,7 +3584,7 @@ export const ru: Translations = {
       'Hermes требуется ваш пароль sudo для выполнения привилегированной команды. Он отправляется только в локальный агент.',
     sudoPlaceholder: 'пароль sudo',
     secretTitle: 'Требуется секрет',
-    secretDesc: 'Hermes требуется учётная запись для продолжения.',
+    secretDesc: 'Hermes требуются учётные данные для продолжения.',
     secretPlaceholder: 'значение секрета'
   },
   desktop: {
