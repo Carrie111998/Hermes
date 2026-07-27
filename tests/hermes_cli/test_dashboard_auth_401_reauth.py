@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
-from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
+from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError, Session
 from hermes_cli.dashboard_auth.cookies import (
     SESSION_AT_COOKIE,
     SESSION_PROVIDER_COOKIE,
@@ -253,6 +253,55 @@ class TestTransparentRefreshOnAccessTokenEviction:
             c.startswith(SESSION_RT_COOKIE) or f"-{SESSION_RT_COOKIE}" in c
             for c in set_cookies
         ), f"no rotated RT cookie in {set_cookies!r}"
+
+    def test_stale_parallel_request_reuses_the_just_rotated_session(self, gated_app):
+        """Two requests can leave the browser with the same rotating RT.
+
+        The first response cannot update the second in-flight request's Cookie
+        header. Replaying that old RT against a reuse-detecting provider must
+        reuse the first rotation result instead of calling the provider again
+        and clearing an otherwise healthy browser session.
+        """
+
+        class ReuseDetectingProvider(StubAuthProvider):
+            def __init__(self):
+                super().__init__(default_ttl=900)
+                self.refresh_calls = 0
+
+            def refresh_session(self, *, refresh_token: str):
+                self.refresh_calls += 1
+                if self.refresh_calls > 1:
+                    raise RefreshExpiredError("rotated refresh token replayed")
+
+                return Session(
+                    user_id="stub-user-1",
+                    email="stub@example.test",
+                    display_name="Stub User",
+                    org_id="stub-org-1",
+                    provider=self.name,
+                    expires_at=1_900_000_000,
+                    access_token="rotated-access-token",
+                    refresh_token="rotated-refresh-token",
+                )
+
+        provider = ReuseDetectingProvider()
+        clear_providers()
+        register_provider(provider)
+        first = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+        stale_parallel = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+        first.cookies.set(SESSION_RT_COOKIE, "same-pre-rotation-refresh-token")
+        stale_parallel.cookies.set(SESSION_RT_COOKIE, "same-pre-rotation-refresh-token")
+
+        first_response = first.get("/api/sessions", follow_redirects=False)
+        stale_response = stale_parallel.get("/api/sessions", follow_redirects=False)
+
+        assert first_response.status_code == 200
+        assert stale_response.status_code == 200
+        assert provider.refresh_calls == 1
+        assert any(
+            SESSION_RT_COOKIE in cookie and "rotated-refresh-token" in cookie
+            for cookie in stale_response.headers.get_list("set-cookie")
+        )
 
     def test_provider_hint_routes_refresh_to_token_owner(self, gated_app):
         """A Nous-style RT must not be rejected by Basic just because Basic

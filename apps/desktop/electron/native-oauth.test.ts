@@ -16,10 +16,12 @@ import {
   buildNativeAuthorizeUrl,
   generatePkcePair,
   generateState,
+  mergeRefreshedNativeTokenSet,
   NATIVE_FLOW_ID,
   nativeRefreshUrl,
   nativeTokenUrl,
   parseLoopbackCallback,
+  parseStoredNativeTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   statusSupportsNativeFlow,
@@ -174,6 +176,73 @@ test('parseTokenResponse tolerates an absent refresh token / expiry', () => {
 
   assert.equal(t.refreshToken, '')
   assert.equal(t.expiresAt, 0)
+})
+
+// --- persisted token-set restoration ---
+
+test('parseStoredNativeTokenSet restores the JSON shape encrypted by the desktop', () => {
+  const stored = {
+    accessToken: 'AT-persisted',
+    refreshToken: 'RT-persisted',
+    expiresAt: 1_893_456_000,
+    provider: 'nous',
+    userId: 'u-persisted'
+  }
+
+  const persistedPlaintext = JSON.stringify(stored)
+
+  assert.deepEqual(parseStoredNativeTokenSet(JSON.parse(persistedPlaintext)), stored)
+})
+
+test('parseStoredNativeTokenSet rejects a persisted record without an access token', () => {
+  assert.throws(
+    () =>
+      parseStoredNativeTokenSet({
+        refreshToken: 'RT-persisted',
+        expiresAt: 1_893_456_000,
+        provider: 'nous',
+        userId: 'u-persisted'
+      }),
+    /missing accessToken/i
+  )
+})
+
+test('mergeRefreshedNativeTokenSet preserves the prior refresh token when rotation omits one', () => {
+  const previous = {
+    accessToken: 'AT-old',
+    refreshToken: 'RT-still-live',
+    expiresAt: 1_800_000_000,
+    provider: 'nous',
+    userId: 'u-1'
+  }
+  const refreshed = mergeRefreshedNativeTokenSet(previous, {
+    access_token: 'AT-new',
+    expires_at: 1_900_000_000,
+    provider: 'nous',
+    user_id: 'u-1'
+  })
+
+  assert.equal(refreshed.accessToken, 'AT-new')
+  assert.equal(refreshed.refreshToken, 'RT-still-live')
+})
+
+test('mergeRefreshedNativeTokenSet accepts a rotated refresh token', () => {
+  const previous = {
+    accessToken: 'AT-old',
+    refreshToken: 'RT-old',
+    expiresAt: 1_800_000_000,
+    provider: 'nous',
+    userId: 'u-1'
+  }
+  const refreshed = mergeRefreshedNativeTokenSet(previous, {
+    access_token: 'AT-new',
+    refresh_token: 'RT-new',
+    expires_at: 1_900_000_000,
+    provider: 'nous',
+    user_id: 'u-1'
+  })
+
+  assert.equal(refreshed.refreshToken, 'RT-new')
 })
 
 // --- refresh timing ---
