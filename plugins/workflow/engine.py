@@ -2804,7 +2804,7 @@ class WorkflowEngine:
                         rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
                         if rev_id and rev_id in states:
                             rev_state = states[rev_id]
-                            if rev_state.status in ("running", "blocked"):
+                            if rev_state.status in ("running", "blocked", "ready"):
                                 has_active_review = True
                                 break
                             if rev_state.kanban_card_id:
