@@ -2610,6 +2610,14 @@ class TestExecuteToolCalls:
         assert "API call failed" not in output
         assert "Rate limit reached" not in output
 
+    def test_chat_returns_error_when_result_has_no_final_response(self, agent):
+        with patch.object(
+            agent,
+            "run_conversation",
+            return_value={"completed": False, "failed": True, "error": "Invalid API response"},
+        ):
+            assert agent.chat("hello") == "Invalid API response"
+
 
 class TestRetryAfterCap:
     """#26293: the conversation loop owns rate-limit backoff and honors the
@@ -4802,6 +4810,115 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Here is the partial answer that was stream"
         assert result["api_calls"] == 1  # No retries
+
+    def test_codex_null_summary_error_after_stream_uses_streamed_content(self, agent):
+        """Codex SDK null-summary TypeError after delivery should not abort the turn."""
+        self._setup_agent(agent)
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+
+        class _Transport:
+            def preflight_kwargs(self, kwargs, *, allow_stream=False):
+                return kwargs
+
+            def validate_response(self, response):
+                return True
+
+            def normalize_response(self, response, **kwargs):
+                raise TypeError("'NoneType' object is not iterable")
+
+        def _fake_api_call(*args, **kwargs):
+            agent._current_streamed_assistant_text = "OK"
+            return SimpleNamespace(output=[object()])
+
+        with (
+            patch.object(agent, "_build_api_kwargs", return_value={"model": "gpt-5.3-codex"}),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_interruptible_streaming_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_get_transport", return_value=_Transport()),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "OK"
+        assert result["messages"][-1]["content"] == "OK"
+
+    def test_codex_null_summary_error_uses_response_output_text_without_stream(self, agent):
+        """Quiet Codex calls can recover from response.output_text when no stream text exists."""
+        self._setup_agent(agent)
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+
+        class _Transport:
+            def preflight_kwargs(self, kwargs, *, allow_stream=False):
+                return kwargs
+
+            def validate_response(self, response):
+                return True
+
+            def normalize_response(self, response, **kwargs):
+                raise TypeError("'NoneType' object is not iterable")
+
+        response = SimpleNamespace(output=[object()], output_text="OK")
+
+        with (
+            patch.object(agent, "_build_api_kwargs", return_value={"model": "gpt-5.3-codex"}),
+            patch.object(agent, "_interruptible_api_call", return_value=response),
+            patch.object(agent, "_interruptible_streaming_api_call", return_value=response),
+            patch.object(agent, "_get_transport", return_value=_Transport()),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "OK"
+
+    def test_codex_empty_output_accepts_delivered_stream_text(self, agent):
+        """Codex can return empty output after a successful stream."""
+        self._setup_agent(agent)
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+
+        class _Transport:
+            def preflight_kwargs(self, kwargs, *, allow_stream=False):
+                return kwargs
+
+            def validate_response(self, response):
+                return False
+
+            def normalize_response(self, response, **kwargs):
+                return SimpleNamespace(
+                    content=None,
+                    tool_calls=None,
+                    finish_reason="stop",
+                    reasoning=None,
+                )
+
+        response = SimpleNamespace(output=[], status="completed", incomplete_details=None)
+
+        def _fake_api_call(*args, **kwargs):
+            agent._current_streamed_assistant_text = "OK"
+            return response
+
+        with (
+            patch.object(agent, "_build_api_kwargs", return_value={"model": "gpt-5.3-codex"}),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_interruptible_streaming_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_get_transport", return_value=_Transport()),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "OK"
+        assert result["api_calls"] == 1
 
     def test_partial_stream_recovery_on_empty_stub(self, agent):
         """When stub response has no content but text was streamed, use streamed text."""

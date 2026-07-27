@@ -73,7 +73,8 @@ class TestCodexBuildKwargs:
             model="gpt-5.4", messages=messages, tools=[],
             reasoning_config={"effort": "high"},
         )
-        assert kw.get("reasoning", {}).get("effort") == "high"
+        assert "reasoning" not in kw
+        assert kw.get("include") == []
 
     @pytest.mark.parametrize("effort, wire_effort", [("max", "max"), ("ultra", "max")])
     def test_extended_reasoning_efforts_use_api_wire_value(self, transport, effort, wire_effort):
@@ -537,8 +538,8 @@ class TestCodexBuildKwargs:
             model="gpt-5.4", messages=messages, tools=[],
             reasoning_config={"effort": "minimal"},
         )
-        # "minimal" should be clamped to "low"
-        assert kw.get("reasoning", {}).get("effort") == "low"
+        assert "reasoning" not in kw
+        assert kw.get("include") == []
 
     def test_xai_reasoning_effort_passed(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
