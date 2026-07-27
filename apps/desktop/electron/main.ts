@@ -989,6 +989,10 @@ let mainWindow = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
+// Nonzero while Hermes intentionally tears down its local child. This covers
+// retries, profile switches, updates, and soft connection applies; none should
+// surface a "backend stopped" error to the user.
+let intentionalBackendTeardowns = 0
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -4949,7 +4953,7 @@ function getWindowState(win = mainWindow) {
 function sendBackendExit(payload) {
   // Intentional soft re-home (gateway mode apply) kills the child on purpose —
   // don't surface the "backend stopped" error toast / boot-failure path.
-  if (softRehomeInProgress) {
+  if (softRehomeInProgress || intentionalBackendTeardowns > 0) {
     return
   }
 
@@ -7660,6 +7664,8 @@ async function teardownPrimaryBackendAndWait({ soft = false } = {}) {
   const hermesProcess = backendConnectionState.getProcess()
   const dying = hermesProcess && !hermesProcess.killed ? hermesProcess : null
 
+  intentionalBackendTeardowns += 1
+
   if (soft) {
     softRehomeInProgress = true
   }
@@ -7671,6 +7677,8 @@ async function teardownPrimaryBackendAndWait({ soft = false } = {}) {
     if (soft) {
       softRehomeInProgress = false
     }
+
+    intentionalBackendTeardowns = Math.max(0, intentionalBackendTeardowns - 1)
   }
 }
 
