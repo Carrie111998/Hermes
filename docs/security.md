@@ -24,8 +24,10 @@ skills, resource scope, budget, and expiry. A non-root manager must also hold
 an active parent grant; a child grant is bounded by that parent grant and
 cannot be created from the manager's broader standing mandate alone. This
 makes delegation transitive without allowing privilege amplification through
-the hierarchy. Filesystem access is only available through a registered typed
-executor; raw shell access is not implied by a read grant.
+the hierarchy, and the immutable `parent_grant_id` preserves the exact
+authorization lineage for audit and restart verification. Filesystem access is
+only available through a registered typed executor; raw shell access is not
+implied by a read grant.
 
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
