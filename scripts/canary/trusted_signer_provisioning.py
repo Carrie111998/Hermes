@@ -1581,6 +1581,215 @@ def _verify_receipt(
     return dict(receipt)
 
 
+def _runtime_receipt_identity(path: Path) -> tuple[int, ...]:
+    try:
+        state = path.lstat()
+    except OSError as exc:
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid", exc)
+    if (
+        stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISREG(state.st_mode)
+        or state.st_nlink != 1
+    ):
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+    return (
+        state.st_mode,
+        state.st_uid,
+        state.st_gid,
+        state.st_dev,
+        state.st_ino,
+        state.st_nlink,
+        state.st_size,
+        state.st_mtime_ns,
+        state.st_ctime_ns,
+    )
+
+
+def _validate_historical_runtime_receipt_projection(
+    layout: SignerLayout,
+    raw: bytes,
+) -> None:
+    """Prove a stale public projection has an immutable signed authority copy."""
+
+    if layout.role != "cloud" or layout.runtime_receipt is None:
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+    receipt = _canonical_mapping(
+        raw,
+        code="trusted_signer_runtime_receipt_recovery_invalid",
+    )
+    revision = receipt.get("release_revision")
+    if (
+        receipt.get("role") != "cloud"
+        or not isinstance(revision, str)
+        or _REVISION.fullmatch(revision) is None
+        or revision == layout.release.name
+    ):
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+    historical_layout = cloud_layout(revision)
+    if (
+        historical_layout.runtime_receipt != layout.runtime_receipt
+        or historical_layout.receipt.parent != layout.receipt.parent
+    ):
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+    authority = _validate_release_and_authority(historical_layout)
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(
+            authority["public_raw"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid", exc)
+    checked = _verify_receipt(receipt, public_key=public_key)
+    if (
+        checked.get("release_revision") != revision
+        or checked.get("package_sha256") != authority.get("package_sha256")
+        or checked.get("package_manifest_sha256")
+        != authority.get("manifest_sha256")
+        or checked.get("public_key_id") != authority.get("public_key_id")
+        or checked.get("runtime") != authority.get("runtime")
+    ):
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+    authoritative = _read_regular(
+        historical_layout.receipt,
+        maximum=MAX_JSON_BYTES,
+        uid=historical_layout.receipt_uid,
+        gid=historical_layout.receipt_gid,
+        mode=0o444,
+    )
+    if authoritative != raw:
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+
+
+def _install_runtime_receipt_projection(
+    layout: SignerLayout,
+    receipt: Mapping[str, Any],
+    receipt_raw: bytes,
+    *,
+    public_key: Ed25519PublicKey,
+    after_stage: Callable[[], None] | None = None,
+) -> Mapping[str, Any]:
+    """Publish or recover the one non-authoritative cloud receipt projection.
+
+    An older release's projection may survive a deliberately inert release
+    rollover.  It can be replaced only after both receipts are verified and
+    the historical bytes are proven to have an immutable authoritative copy.
+    The private key, installed public key, config, sudoers, services, and
+    historical receipt are never changed by this path.
+    """
+
+    path = layout.runtime_receipt
+    if (
+        layout.role != "cloud"
+        or path is None
+        or not path.is_absolute()
+        or ".." in path.parts
+        or not isinstance(public_key, Ed25519PublicKey)
+        or foundation.canonical_json_bytes(receipt) != receipt_raw
+    ):
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+    checked = _verify_receipt(receipt, public_key=public_key)
+    authoritative = _read_regular(
+        layout.receipt,
+        maximum=MAX_JSON_BYTES,
+        uid=layout.receipt_uid,
+        gid=layout.receipt_gid,
+        mode=0o444,
+    )
+    if (
+        checked != receipt
+        or checked.get("role") != layout.role
+        or checked.get("release_revision") != layout.release.name
+        or authoritative != receipt_raw
+    ):
+        _stable_error("trusted_signer_runtime_receipt_recovery_invalid")
+    replacement = path.parent / f".{path.name}.muncho-replacement"
+    if not os.path.lexists(path):
+        return _install_exclusive(
+            path,
+            receipt_raw,
+            uid=layout.runtime_receipt_uid,
+            gid=layout.runtime_receipt_gid,
+            mode=layout.runtime_receipt_mode,
+            include_digest=True,
+        )
+    existing = _read_regular(
+        path,
+        maximum=MAX_JSON_BYTES,
+        uid=layout.runtime_receipt_uid,
+        gid=layout.runtime_receipt_gid,
+        mode=layout.runtime_receipt_mode,
+    )
+    if existing == receipt_raw:
+        if os.path.lexists(replacement):
+            staged = _read_regular(
+                replacement,
+                maximum=MAX_JSON_BYTES,
+                uid=layout.runtime_receipt_uid,
+                gid=layout.runtime_receipt_gid,
+                mode=layout.runtime_receipt_mode,
+            )
+            if staged != receipt_raw:
+                _stable_error(
+                    "trusted_signer_runtime_receipt_recovery_invalid"
+                )
+            try:
+                replacement.unlink()
+                _fsync_directory(path.parent)
+            except OSError as exc:
+                _stable_error(
+                    "trusted_signer_runtime_receipt_recovery_failed",
+                    exc,
+                )
+        return _file_evidence(
+            path,
+            uid=layout.runtime_receipt_uid,
+            gid=layout.runtime_receipt_gid,
+            mode=layout.runtime_receipt_mode,
+            include_digest=True,
+        )
+    _validate_historical_runtime_receipt_projection(layout, existing)
+    identity = _runtime_receipt_identity(path)
+    _install_exclusive(
+        replacement,
+        receipt_raw,
+        uid=layout.runtime_receipt_uid,
+        gid=layout.runtime_receipt_gid,
+        mode=layout.runtime_receipt_mode,
+        include_digest=True,
+    )
+    if after_stage is not None:
+        after_stage()
+    observed = _read_regular(
+        path,
+        maximum=MAX_JSON_BYTES,
+        uid=layout.runtime_receipt_uid,
+        gid=layout.runtime_receipt_gid,
+        mode=layout.runtime_receipt_mode,
+    )
+    if observed != existing or _runtime_receipt_identity(path) != identity:
+        _stable_error("trusted_signer_runtime_receipt_recovery_changed")
+    try:
+        os.replace(replacement, path)
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        _stable_error("trusted_signer_runtime_receipt_recovery_failed", exc)
+    published = _read_regular(
+        path,
+        maximum=MAX_JSON_BYTES,
+        uid=layout.runtime_receipt_uid,
+        gid=layout.runtime_receipt_gid,
+        mode=layout.runtime_receipt_mode,
+    )
+    if published != receipt_raw or os.path.lexists(replacement):
+        _stable_error("trusted_signer_runtime_receipt_recovery_failed")
+    return _file_evidence(
+        path,
+        uid=layout.runtime_receipt_uid,
+        gid=layout.runtime_receipt_gid,
+        mode=layout.runtime_receipt_mode,
+        include_digest=True,
+    )
+
+
 def _read_stdin_frame(stdin: BinaryIO) -> bytes:
     raw = stdin.read(MAX_ENVELOPE_BYTES + 1)
     if len(raw) > MAX_ENVELOPE_BYTES:
@@ -1691,13 +1900,11 @@ def provision_signer(
             include_digest=True,
         )
         if layout.runtime_receipt is not None:
-            _install_exclusive(
-                layout.runtime_receipt,
+            _install_runtime_receipt_projection(
+                layout,
+                receipt,
                 receipt_raw,
-                uid=layout.runtime_receipt_uid,
-                gid=layout.runtime_receipt_gid,
-                mode=layout.runtime_receipt_mode,
-                include_digest=True,
+                public_key=private_key.public_key(),
             )
         return _verify_receipt(
             receipt, public_key=Ed25519PublicKey.from_public_bytes(authority["public_raw"])
