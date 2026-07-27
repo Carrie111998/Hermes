@@ -150,6 +150,112 @@ code, kbd, pre, samp, .font-mono, .font-mono-ui {
     overflow-y: auto;
   }
 
+  /*
+   * /chat embeds a full-height xterm TUI. Competing document scroll + shell
+   * overflow-hidden makes finger scrolling and keyboard geometry unreliable
+   * on mobile. When the chat host is active, re-lock the viewport so only
+   * the terminal (and intentional drawers) scroll.
+   */
+  html:has([data-chat-active='true']),
+  html:has([data-chat-active='true']) body,
+  html:has([data-chat-active='true']) #root {
+    min-height: 100vh;
+    min-height: 100dvh;
+    height: 100vh;
+    height: 100dvh;
+    max-height: 100vh;
+    max-height: 100dvh;
+    overflow: hidden;
+  }
+
+  html:has([data-chat-active='true']) .hermes-app-shell {
+    height: 100vh;
+    height: 100dvh;
+    max-height: 100vh;
+    max-height: 100dvh;
+    overflow: hidden;
+  }
+
+  .hermes-chat-xterm-host {
+    min-height: 0;
+    /*
+     * Vertical pans are owned by ChatPage touch handlers → term.scrollLines.
+     * xterm only listens for wheel; `.xterm-screen` sits above the viewport
+     * so native overflow scroll never receives Android finger events.
+     * pan-y advertises vertical intent without claiming horizontal pans.
+     */
+    touch-action: pan-y;
+    overscroll-behavior: contain;
+    /*
+     * Isolate xterm from dashboard theme typography. `html` sets
+     * line-height: 1.55 and letter-spacing tokens that inherit into the
+     * terminal's DOM/char-measure nodes. When cell height is computed from
+     * xterm's own lineHeight option (~1.0–1.2) but glyphs render at 1.55,
+     * streamed assistant rows paint on top of each other on mobile.
+     */
+    line-height: normal;
+    letter-spacing: normal;
+    font-variant-ligatures: none;
+  }
+
+  .hermes-chat-xterm-host .xterm {
+    height: 100%;
+    /* Host isolation only — do not override .xterm-rows / span line-height
+     * or .xterm-screen height. Those are owned by xterm cell metrics; forcing
+     * them made live stream frames clip or paint blank while scrollback
+     * history (replayed on attach) still looked fine. */
+    line-height: normal;
+    letter-spacing: 0;
+  }
+
+  /*
+   * Intended scroll surface remains xterm's viewport (scrollback buffer).
+   * Position is driven via term.scrollLines (wheel + touch), not by hoping
+   * the browser will pan the absolute viewport under the painted screen.
+   * Composer / mobile toolbar are shrink-0 siblings outside this host.
+   */
+  .hermes-chat-xterm-host .xterm-viewport {
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+  }
+
+  /* Let vertical pans pass through the painted layer to our host handlers. */
+  .hermes-chat-xterm-host .xterm-screen,
+  .hermes-chat-xterm-host .xterm-screen canvas {
+    touch-action: pan-y;
+  }
+
+  /* Char measure element only — match terminal cell metrics, not theme. */
+  .hermes-chat-xterm-host .xterm-char-measure-element {
+    line-height: normal;
+    letter-spacing: 0;
+  }
+
+  /*
+   * Mobile-native chat: same scroll surface as desktop (term.scrollLines).
+   * Toolbar + composer live in normal flex flow outside the host so they
+   * never cover transcript cells or each other.
+   */
+  .hermes-chat-xterm-host--mobile-native {
+    touch-action: pan-y;
+  }
+
+  .hermes-chat-mobile-toolbar {
+    flex-shrink: 0;
+    min-height: 44px;
+  }
+
+  .hermes-chat-mobile-composer {
+    flex-shrink: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .hermes-chat-mobile-composer-input {
+    /* 16px minimum avoids iOS focus zoom. */
+    font-size: 16px;
+  }
+
   .hermes-mobile-header {
     min-height: calc(3.5rem + env(safe-area-inset-top, 0px));
     padding-top: calc(0.5rem + env(safe-area-inset-top, 0px));

@@ -13,14 +13,30 @@ describe("shouldTreatInputAsMobileReplacement", () => {
     expect(shouldTreatInputAsMobileReplacement("insertCompositionText", "Kain", false)).toBe(true);
   });
 
-  it("treats multi-character mobile insertText as replacement-like", () => {
-    expect(shouldTreatInputAsMobileReplacement("insertText", "Kain", true)).toBe(true);
+  it("does not treat multi-character insertText as a full-line replacement", () => {
+    // Swipe-typing / multi-char insertText used to open the DEL+retype path and
+    // scramble ordinary mobile input. Only confirmed replacement/composition
+    // inputTypes may arm the window.
+    expect(shouldTreatInputAsMobileReplacement("insertText", "Kain", true)).toBe(false);
+    expect(shouldTreatInputAsMobileReplacement("insertText", "hello world", true)).toBe(false);
     expect(shouldTreatInputAsMobileReplacement("insertText", "K", true)).toBe(false);
     expect(shouldTreatInputAsMobileReplacement("insertText", "Kain", false)).toBe(false);
   });
 });
 
 describe("normalizePtyMobileInput", () => {
+  it("appends ordinary mobile typing without rewriting the line", () => {
+    const a = normalizePtyMobileInput("h", "", false);
+    expect(a.normalized).toBe(false);
+    expect(a.nextLine).toBe("h");
+    expect(a.data).toBe("h");
+
+    const b = normalizePtyMobileInput("ello", "h", false);
+    expect(b.normalized).toBe(false);
+    expect(b.nextLine).toBe("hello");
+    expect(b.data).toBe("ello");
+  });
+
   it("turns a Gboard full-line suggestion into a line replacement", () => {
     const result = normalizePtyMobileInput(
       "hello my name is Kain Kain",
@@ -41,6 +57,14 @@ describe("normalizePtyMobileInput", () => {
     expect(result.data).toBe("\x7f".repeat("hello my name is kain".length) + "hello my name is Kain");
   });
 
+  it("handles composition payloads that complete the tracked prefix", () => {
+    const result = normalizePtyMobileInput("こんにちは", "こんに", true);
+
+    expect(result.normalized).toBe(true);
+    expect(result.nextLine).toBe("こんにちは");
+    expect(result.data).toBe("\x7f".repeat("こんに".length) + "こんにちは");
+  });
+
   it("does not normalize ordinary appends when replacement is not active", () => {
     const result = normalizePtyMobileInput(
       "hello my name is Kain Kain",
@@ -50,6 +74,34 @@ describe("normalizePtyMobileInput", () => {
 
     expect(result.normalized).toBe(false);
     expect(result.nextLine).toBe("hello my name is kainhello my name is Kain Kain");
+  });
+
+  it("does not normalize multi-character insertText that is not a replacement match", () => {
+    // Even if a stale replacement window is still open, an unrelated burst
+    // must append (or track) rather than wipe the composer.
+    const result = normalizePtyMobileInput(
+      "zzzz",
+      "hello my name is kain",
+      true,
+    );
+
+    expect(result.normalized).toBe(false);
+    expect(result.data).toBe("zzzz");
+    expect(result.nextLine).toBe("hello my name is kainzzzz");
+  });
+
+  it("does not rewrite when the tracked line is a stale mismatch", () => {
+    const result = normalizePtyMobileInput(
+      "brand new suggestion text",
+      "completely different tracked line",
+      true,
+    );
+
+    expect(result.normalized).toBe(false);
+    expect(result.data).toBe("brand new suggestion text");
+    expect(result.nextLine).toBe(
+      "completely different tracked linebrand new suggestion text",
+    );
   });
 
   it("does not normalize control input", () => {

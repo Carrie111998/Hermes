@@ -25,8 +25,8 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronUp, Copy, PanelRight, RotateCcw, Send, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
 
@@ -54,6 +54,19 @@ import {
   normalizePtyMobileInput,
   shouldTreatInputAsMobileReplacement,
 } from "@/lib/pty-mobile-input";
+import {
+  advanceMobileScrollGesture,
+  buildMobileComposerSubmitPayload,
+  createMobileGestureState,
+  PTY_CLEAR_COMPOSER,
+  PTY_SUBMIT,
+  shouldSubmitNativeComposerEnter,
+  shouldUseMobileNativeComposer,
+  wheelDeltaToXtermScrollLines,
+  xtermScrollButtonLines,
+  xtermTouchPxPerLine,
+  type MobileGestureState,
+} from "@/lib/pty-mobile-bridge";
 import {
   imageFilesFromTransfer,
   transferMayContainImage,
@@ -153,8 +166,13 @@ function terminalFontSizeForWidth(layoutWidthPx: number): number {
   return 14;
 }
 
-function terminalLineHeightForWidth(layoutWidthPx: number): number {
-  return layoutWidthPx < 1024 ? 1.02 : 1.15;
+function terminalLineHeightForWidth(_layoutWidthPx: number): number {
+  // Keep cells at least as tall as the measured glyph box. Global dashboard
+  // `html { line-height: 1.55 }` used to leak into xterm's DOM renderer;
+  // combined with ~1.02 cell height that made streamed rows paint on top of
+  // each other on mobile. Match HermesConsoleModal's safer density (~1.2).
+  void _layoutWidthPx;
+  return 1.2;
 }
 
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
@@ -204,6 +222,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const connectingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyInputLineRef = useRef("");
   const mobileReplacementInputUntilRef = useRef(0);
+  // True while a mobile IME composition session is open. RESIZE escapes
+  // mid-composition reflow the Ink composer under the caret and scramble
+  // partial grapheme clusters — skip metrics sync until compositionend
+  // or compositioncancel.
+  const imeComposingRef = useRef(false);
+  // Last cols/rows actually sent to the PTY. Avoids spamming identical
+  // RESIZE frames during keyboard visualViewport thrash.
+  const lastSentPtySizeRef = useRef<{ cols: number; rows: number } | null>(
+    null,
+  );
   const [ptyState, setPtyState] =
     useState<PtyConnectionState>("connecting");
   const ptyStateRef = useRef<PtyConnectionState>("connecting");
@@ -232,6 +260,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     blockedInputNoticeRef.current = false;
     ptyInputLineRef.current = "";
     mobileReplacementInputUntilRef.current = 0;
+    imeComposingRef.current = false;
+    lastSentPtySizeRef.current = null;
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
@@ -244,6 +274,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     blockedInputNoticeRef.current = false;
     ptyInputLineRef.current = "";
     mobileReplacementInputUntilRef.current = 0;
+    imeComposingRef.current = false;
+    lastSentPtySizeRef.current = null;
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
@@ -259,6 +291,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     blockedInputNoticeRef.current = false;
     ptyInputLineRef.current = "";
     mobileReplacementInputUntilRef.current = 0;
+    imeComposingRef.current = false;
+    lastSentPtySizeRef.current = null;
     setSearchParams(next, { replace: true });
     setBanner(null);
     setLastCloseCode(null);
@@ -301,6 +335,34 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ? window.matchMedia("(max-width: 1023px)").matches
       : false,
   );
+  const [coarsePointer, setCoarsePointer] = useState(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(pointer: coarse)").matches
+      : false,
+  );
+  const useMobileNativeComposer = shouldUseMobileNativeComposer({
+    narrow,
+    coarsePointer,
+  });
+  const useMobileNativeComposerRef = useRef(useMobileNativeComposer);
+  useEffect(() => {
+    useMobileNativeComposerRef.current = useMobileNativeComposer;
+  }, [useMobileNativeComposer]);
+
+  // Visible native composer (mobile only). Lives outside xterm so the phone
+  // IME / autocorrect / swipe-typing work on a real <textarea>.
+  const [mobileDraft, setMobileDraft] = useState("");
+  const [mobileComposing, setMobileComposing] = useState(false);
+  const mobileDraftRef = useRef("");
+  const mobileComposingRef = useRef(false);
+  const mobileTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Synchronous latch so Enter + Send cannot double-submit one draft.
+  const mobileSendingRef = useRef(false);
+  // Keep the latest send handler reachable from the PTY effect without
+  // re-subscribing the whole terminal mount on every keystroke.
+  const sendMobileDraftRef = useRef<() => boolean>(() => false);
+  // Re-apply xterm helper gate without remounting the PTY when media mode flips.
+  const applyMobileHelperGateRef = useRef<(() => void) | null>(null);
 
   const { theme } = useTheme();
   const terminalBg = theme.terminalBackground ?? DEFAULT_TERMINAL_BACKGROUND;
@@ -367,17 +429,28 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     if (!resumeParam) return;
 
     let cancelled = false;
+    const requestedResume = resumeParam;
 
     api
-      .getSessionLatestDescendant(resumeParam, scopedProfile)
+      .getSessionLatestDescendant(requestedResume, scopedProfile)
       .then((res) => {
-        if (cancelled || !res.session_id || res.session_id === resumeParam) {
+        if (cancelled || !res.session_id || res.session_id === requestedResume) {
           return;
         }
 
-        const next = new URLSearchParams(searchParams);
-        next.set("resume", res.session_id);
-        setSearchParams(next, { replace: true });
+        // Functional update: do NOT depend on the whole searchParams object.
+        // Any other query-key churn (learn=, panel state, etc.) used to
+        // re-fire this effect, rewrite ?resume=, and tear down the live
+        // PTY mid-turn — agent keeps going, chat stream goes dark.
+        setSearchParams(
+          (prev) => {
+            if (prev.get("resume") !== requestedResume) return prev;
+            const next = new URLSearchParams(prev);
+            next.set("resume", res.session_id);
+            return next;
+          },
+          { replace: true },
+        );
       })
       .catch(() => {
         // Best-effort: old servers or missing sessions should not block chat.
@@ -386,7 +459,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, searchParams, setSearchParams]);
+  }, [resumeParam, scopedProfile, setSearchParams]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -395,6 +468,215 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     mql.addEventListener("change", sync);
     return () => mql.removeEventListener("change", sync);
   }, []);
+
+  useEffect(() => {
+    const mql = window.matchMedia("(pointer: coarse)");
+    const sync = () => setCoarsePointer(mql.matches);
+    sync();
+    mql.addEventListener("change", sync);
+    return () => mql.removeEventListener("change", sync);
+  }, []);
+
+  useEffect(() => {
+    mobileDraftRef.current = mobileDraft;
+  }, [mobileDraft]);
+
+  useEffect(() => {
+    mobileComposingRef.current = mobileComposing;
+  }, [mobileComposing]);
+
+  /** Send bytes to the open PTY. Returns false when the socket is not ready. */
+  const sendPtyBytes = useCallback((data: string): boolean => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (shouldBlockPtyInput(ptyStateRef.current)) return false;
+    try {
+      ws.send(data);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  /**
+   * Submit the native mobile composer via three separate PTY writes:
+   *   1) CLEAR (Ctrl+A Ctrl+K)
+   *   2) sanitized body (printable only)
+   *   3) Enter (`\r`) after the same coalesce delay as `/copy` / `/image`
+   *
+   * Why three frames (not CLEAR+body+\r, and not CLEAR+body then \r):
+   * - Trailing `\r` in the same stdin burst as text → Ink paste path
+   *   (`\r`→`\n` insert), so the line never submits.
+   * - CLEAR control bytes glued to the body burst → PRINTABLE/paste
+   *   routing rejects or drops the burst; delayed `\r` then submits an
+   *   empty TUI line (composer clears, nothing executes).
+   *
+   * Only clears the visible textarea after the body write succeeds so a
+   * closed socket never discards typed text.
+   *
+   * LIMITATION (documented, not fixed here): if a TUI overlay currently owns
+   * Ink input focus, the clear/body/submit key stream may land on that
+   * overlay rather than the composer. Dashboard cannot observe Ink focus.
+   */
+  const sendMobileDraft = useCallback((): boolean => {
+    if (mobileSendingRef.current) return false;
+    if (mobileComposingRef.current) return false;
+    const text = mobileDraftRef.current;
+    const payload = buildMobileComposerSubmitPayload(text);
+    if (!payload) return false;
+
+    // Payload is CLEAR + body + SUBMIT — split into three wire frames.
+    const withoutSubmit = payload.endsWith(PTY_SUBMIT)
+      ? payload.slice(0, -PTY_SUBMIT.length)
+      : payload;
+    const body = withoutSubmit.startsWith(PTY_CLEAR_COMPOSER)
+      ? withoutSubmit.slice(PTY_CLEAR_COMPOSER.length)
+      : withoutSubmit;
+    if (!body) return false;
+
+    // TEMP debug — remove after Enter-submit is confirmed end-to-end.
+    const logSubmit = (
+      step: string,
+      detail: Record<string, unknown> = {},
+    ) => {
+      const ws = wsRef.current;
+      console.info(`[mobile-composer] ${step}`, {
+        ptyState: ptyStateRef.current,
+        wsReadyState: ws?.readyState ?? null,
+        wsIsOpen: ws?.readyState === WebSocket.OPEN,
+        bodyLen: body.length,
+        bodyPreview: body.slice(0, 48),
+        ...detail,
+      });
+    };
+
+    mobileSendingRef.current = true;
+
+    // Frame 1: clear TUI composer line only.
+    logSubmit("before clear send", { frame: "clear", bytes: PTY_CLEAR_COMPOSER.length });
+    if (!sendPtyBytes(PTY_CLEAR_COMPOSER)) {
+      logSubmit("after clear send FAILED");
+      mobileSendingRef.current = false;
+      return false;
+    }
+    logSubmit("after clear send ok");
+
+    // Frame 2: printable body on its own tick so CLEAR is not coalesced
+    // into the same Ink keypress/paste burst as the message text.
+    window.setTimeout(() => {
+      logSubmit("before body send", { frame: "body" });
+      if (!sendPtyBytes(body)) {
+        logSubmit("after body send FAILED");
+        mobileSendingRef.current = false;
+        return;
+      }
+      logSubmit("after body send ok");
+      mobileDraftRef.current = "";
+      setMobileDraft("");
+
+      // Frame 3: Enter alone (same 100ms gap as handleCopyLast).
+      // Use wsRef directly so we log the *active* socket at fire time.
+      window.setTimeout(() => {
+        const ws = wsRef.current;
+        logSubmit("before PTY_SUBMIT send", {
+          frame: "submit",
+          submitByte: PTY_SUBMIT.charCodeAt(0),
+        });
+        try {
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            logSubmit("after PTY_SUBMIT send SKIPPED", {
+              reason: "socket-not-open",
+            });
+            return;
+          }
+          if (shouldBlockPtyInput(ptyStateRef.current)) {
+            logSubmit("after PTY_SUBMIT send SKIPPED", {
+              reason: "pty-input-blocked",
+            });
+            return;
+          }
+          ws.send(PTY_SUBMIT);
+          logSubmit("after PTY_SUBMIT send ok");
+        } catch (err) {
+          logSubmit("after PTY_SUBMIT send ERROR", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          mobileSendingRef.current = false;
+        }
+      }, 100);
+    }, 50);
+
+    return true;
+  }, [sendPtyBytes]);
+
+  useEffect(() => {
+    sendMobileDraftRef.current = sendMobileDraft;
+  }, [sendMobileDraft]);
+
+  // When narrow/coarse mode flips without a PTY rebuild, re-apply the
+  // helper-textarea gate and park focus on the native composer if needed.
+  useEffect(() => {
+    applyMobileHelperGateRef.current?.();
+    if (useMobileNativeComposer) {
+      requestAnimationFrame(() => {
+        mobileTextareaRef.current?.focus({ preventScroll: true });
+      });
+    }
+  }, [useMobileNativeComposer]);
+
+  /** Older/Newer on the same xterm scrollback surface as wheel + finger pan. */
+  const scrollTranscriptXterm = useCallback(
+    (direction: "older" | "newer") => {
+      const term = termRef.current;
+      if (!term) return;
+      const lines = xtermScrollButtonLines(direction, term.rows);
+      if (lines) term.scrollLines(lines);
+    },
+    [],
+  );
+
+  const onMobileComposerKeyDown = useCallback(
+    (ev: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (ev.key !== "Enter") return;
+      if (
+        !shouldSubmitNativeComposerEnter({
+          composing: mobileComposingRef.current || ev.nativeEvent.isComposing,
+          shiftKey: ev.shiftKey,
+        })
+      ) {
+        // Shift+Enter: let the textarea insert a newline natively.
+        // Composition Enter: let the IME confirm the candidate.
+        return;
+      }
+      ev.preventDefault();
+      sendMobileDraft();
+    },
+    [sendMobileDraft],
+  );
+
+  const onMobileComposerCompositionStart = useCallback(() => {
+    setMobileComposing(true);
+  }, []);
+
+  const onMobileComposerCompositionEnd = useCallback(() => {
+    setMobileComposing(false);
+  }, []);
+
+  // IME dismissed/aborted without committing. Keep the draft; unlock Send/Enter.
+  // Wired via native addEventListener — React's TextareaHTMLAttributes omit
+  // onCompositionCancel in current @types/react.
+  useEffect(() => {
+    const el = mobileTextareaRef.current;
+    if (!el) return;
+    const onCancel = () => {
+      setMobileComposing(false);
+      // Soft-keyboard geometry often changes on cancel — nudge metrics.
+      syncMetricsRef.current?.();
+    };
+    el.addEventListener("compositioncancel", onCancel);
+    return () => el.removeEventListener("compositioncancel", onCancel);
+  }, [useMobileNativeComposer]);
 
   useEffect(() => {
     const mql = window.matchMedia("(min-width: 1024px)");
@@ -706,16 +988,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     fitRef.current = fit;
     term.loadAddon(fit);
 
-    // Dashboard chat should scroll the browser-side transcript, not send
-    // mouse-wheel protocol bytes through the PTY.
+    // Dashboard chat scrolls the *browser-side* xterm scrollback buffer
+    // (see Terminal scrollback: 5000), not mouse-wheel protocol bytes and
+    // not the TUI's internal Ink ScrollBox. Mobile and desktop share this
+    // path so finger pans / wheel both move one stable transcript viewport.
+    //
+    // xterm only wires wheel into its ScrollableElement; the painted
+    // `.xterm-screen` sits above `.xterm-viewport`, so Android finger pans
+    // never reach native overflow scroll. Touch handlers below mirror the
+    // wheel path via term.scrollLines.
     term.attachCustomWheelEventHandler((ev) => {
-      const delta = ev.deltaY;
-      if (!delta) {
+      const lines = wheelDeltaToXtermScrollLines(ev.deltaY);
+      if (!lines) {
         return false;
       }
 
-      const step = Math.max(1, Math.round(Math.abs(delta) / 50));
-      term.scrollLines(delta > 0 ? step : -step);
+      term.scrollLines(lines);
 
       ev.preventDefault();
       ev.stopPropagation();
@@ -730,40 +1018,75 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     let mobileInputCleanup: (() => void) | null = null;
     term.open(host);
+    lastSentPtySizeRef.current = null;
+    imeComposingRef.current = false;
 
-    const textarea = term.textarea;
-    if (textarea) {
-      textarea.setAttribute("autocomplete", "off");
-      textarea.setAttribute("autocorrect", "off");
-      textarea.setAttribute("autocapitalize", "off");
-      textarea.setAttribute("spellcheck", "false");
-
-      const isMobileLike =
-        typeof navigator !== "undefined" &&
-        /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-      const markReplacementInput = (ev: Event) => {
-        const input = ev as InputEvent;
-        if (
-          shouldTreatInputAsMobileReplacement(
-            input.inputType,
-            input.data,
-            isMobileLike,
-          )
-        ) {
-          mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
+    // Finger pan → xterm scrollback (matches custom wheel handler).
+    // passive:false on touchmove so we can preventDefault once the gesture
+    // locks vertical and stop the locked document from stealing the pan.
+    let touchGesture: MobileGestureState | null = null;
+    const onHostTouchStart = (ev: TouchEvent) => {
+      if (ev.touches.length !== 1) {
+        touchGesture = null;
+        return;
+      }
+      const t = ev.touches[0];
+      touchGesture = createMobileGestureState(t.clientX, t.clientY);
+    };
+    const onHostTouchMove = (ev: TouchEvent) => {
+      if (!touchGesture || ev.touches.length !== 1) return;
+      const t = ev.touches[0];
+      const pxPerLine = xtermTouchPxPerLine(host.clientHeight, term.rows);
+      const result = advanceMobileScrollGesture(
+        touchGesture,
+        t.clientX,
+        t.clientY,
+        { pxPerLine },
+      );
+      touchGesture = result.state;
+      if (result.ignore) return;
+      if (result.state.axis === "vertical") {
+        // Own the gesture so browser document bounce / parent scroll cannot.
+        if (ev.cancelable) ev.preventDefault();
+        if (result.lines !== 0) {
+          term.scrollLines(result.lines);
         }
-      };
-      const markCompositionEnd = () => {
-        mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
-      };
+      }
+    };
+    const onHostTouchEnd = () => {
+      touchGesture = null;
+    };
+    host.addEventListener("touchstart", onHostTouchStart, { passive: true });
+    host.addEventListener("touchmove", onHostTouchMove, { passive: false });
+    host.addEventListener("touchend", onHostTouchEnd, { passive: true });
+    host.addEventListener("touchcancel", onHostTouchEnd, { passive: true });
+    const detachHostTouchScroll = () => {
+      host.removeEventListener("touchstart", onHostTouchStart);
+      host.removeEventListener("touchmove", onHostTouchMove);
+      host.removeEventListener("touchend", onHostTouchEnd);
+      host.removeEventListener("touchcancel", onHostTouchEnd);
+      touchGesture = null;
+    };
 
-      textarea.addEventListener("beforeinput", markReplacementInput, true);
-      textarea.addEventListener("compositionend", markCompositionEnd, true);
-      mobileInputCleanup = () => {
-        textarea.removeEventListener("beforeinput", markReplacementInput, true);
-        textarea.removeEventListener("compositionend", markCompositionEnd, true);
-      };
-    }
+    // When the native mobile composer owns typing, keep xterm's hidden
+    // helper textarea from accepting IME / soft-keyboard input. Focus is
+    // steered to the visible <textarea> instead.
+    const applyMobileHelperTextareaGate = () => {
+      const helper = term.textarea;
+      if (!helper) return;
+      if (useMobileNativeComposerRef.current) {
+        helper.setAttribute("readonly", "true");
+        helper.setAttribute("inputmode", "none");
+        helper.tabIndex = -1;
+        helper.blur();
+      } else {
+        helper.removeAttribute("readonly");
+        helper.setAttribute("inputmode", "text");
+        helper.tabIndex = 0;
+      }
+    };
+    applyMobileHelperGateRef.current = applyMobileHelperTextareaGate;
+    applyMobileHelperTextareaGate();
 
     // WebGL draws from a texture atlas sized with device pixels. On phones and
     // in DevTools device mode that often produces *visually* much larger cells
@@ -811,11 +1134,29 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
 
     let metricsDebounce: ReturnType<typeof setTimeout> | null = null;
+    let viewportMetricsDebounce: ReturnType<typeof setTimeout> | null = null;
+
+    const sendPtyResizeIfChanged = (cols: number, rows: number) => {
+      if (cols <= 0 || rows <= 0) return;
+      const last = lastSentPtySizeRef.current;
+      if (last && last.cols === cols && last.rows === rows) return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      lastSentPtySizeRef.current = { cols, rows };
+      ws.send(`\x1b[RESIZE:${cols};${rows}]`);
+    };
+
     const syncTerminalMetrics = () => {
       // display:none hosts have clientWidth/Height = 0, which fit() turns
       // into a 1x1 terminal.  Skip entirely while hidden; the visibility
       // effect below runs another fit as soon as the tab is shown again.
       if (!host.isConnected || host.clientWidth <= 0 || host.clientHeight <= 0) {
+        return;
+      }
+      // Never reflow / RESIZE while a mobile IME composition is open —
+      // keyboard-driven visualViewport thrash + mid-grapheme RESIZE is a
+      // primary cause of scrambled composer text on phones.
+      if (imeComposingRef.current) {
         return;
       }
       const w = terminalTierWidthPx(host);
@@ -828,6 +1169,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         term.options.fontSize = nextSize;
         term.options.lineHeight = nextLh;
       }
+      const prevCols = term.cols;
+      const prevRows = term.rows;
       try {
         fit.fit();
       } catch {
@@ -840,16 +1183,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           /* ignore */
         }
       }
+      // Only notify the PTY when the grid actually changed (font tier or
+      // container size). Identical RESIZE frames during keyboard animation
+      // force the TUI sticky-scroll path and yank the viewport to bottom.
       if (
-        fontChanged &&
-        wsRef.current &&
-        wsRef.current.readyState === WebSocket.OPEN
+        fontChanged ||
+        term.cols !== prevCols ||
+        term.rows !== prevRows ||
+        !lastSentPtySizeRef.current
       ) {
-        wsRef.current.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+        sendPtyResizeIfChanged(term.cols, term.rows);
       }
     };
     syncMetricsRef.current = syncTerminalMetrics;
 
+    // Layout / window resizes settle quickly; keep a short debounce.
     const scheduleSyncTerminalMetrics = () => {
       if (metricsDebounce) clearTimeout(metricsDebounce);
       metricsDebounce = setTimeout(() => {
@@ -858,20 +1206,103 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }, 60);
     };
 
+    // visualViewport fires repeatedly while the soft keyboard animates.
+    // Use a longer debounce so we fit once against the final geometry.
+    const scheduleSyncTerminalMetricsFromViewport = () => {
+      if (imeComposingRef.current) return;
+      if (viewportMetricsDebounce) clearTimeout(viewportMetricsDebounce);
+      viewportMetricsDebounce = setTimeout(() => {
+        viewportMetricsDebounce = null;
+        syncTerminalMetrics();
+      }, 180);
+    };
+
+    // Wire the helper textarea after metrics schedulers exist so composition
+    // end can request a delayed viewport refit without a TDZ / order issue.
+    const textarea = term.textarea;
+    if (textarea) {
+      textarea.setAttribute("autocomplete", "off");
+      textarea.setAttribute("autocorrect", "off");
+      textarea.setAttribute("autocapitalize", "off");
+      textarea.setAttribute("spellcheck", "false");
+      textarea.setAttribute("enterkeyhint", "send");
+      textarea.setAttribute("inputmode", "text");
+
+      const isMobileLike =
+        typeof navigator !== "undefined" &&
+        /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+      const markReplacementInput = (ev: Event) => {
+        const input = ev as InputEvent;
+        if (
+          shouldTreatInputAsMobileReplacement(
+            input.inputType,
+            input.data,
+            isMobileLike,
+          )
+        ) {
+          mobileReplacementInputUntilRef.current =
+            Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
+        }
+      };
+      const markCompositionStart = () => {
+        imeComposingRef.current = true;
+      };
+      const markCompositionEnd = () => {
+        imeComposingRef.current = false;
+        mobileReplacementInputUntilRef.current =
+          Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
+        // Composition just finished — allow a delayed refit once the
+        // keyboard animation settles, without racing the final grapheme.
+        scheduleSyncTerminalMetricsFromViewport();
+      };
+      // IME dismissed/aborted without committing. Unlock metrics and do
+      // NOT arm the replacement window — canceled composition must not be
+      // treated as a confirmed line rewrite on the next keystroke.
+      const markCompositionCancel = () => {
+        imeComposingRef.current = false;
+        mobileReplacementInputUntilRef.current = 0;
+        scheduleSyncTerminalMetricsFromViewport();
+      };
+
+      textarea.addEventListener("beforeinput", markReplacementInput, true);
+      textarea.addEventListener("compositionstart", markCompositionStart, true);
+      textarea.addEventListener("compositionend", markCompositionEnd, true);
+      textarea.addEventListener(
+        "compositioncancel",
+        markCompositionCancel,
+        true,
+      );
+      mobileInputCleanup = () => {
+        textarea.removeEventListener("beforeinput", markReplacementInput, true);
+        textarea.removeEventListener(
+          "compositionstart",
+          markCompositionStart,
+          true,
+        );
+        textarea.removeEventListener("compositionend", markCompositionEnd, true);
+        textarea.removeEventListener(
+          "compositioncancel",
+          markCompositionCancel,
+          true,
+        );
+      };
+    }
+
     const ro = new ResizeObserver(() => scheduleHostSync());
     ro.observe(host);
 
     window.addEventListener("resize", scheduleSyncTerminalMetrics);
-    window.visualViewport?.addEventListener("resize", scheduleSyncTerminalMetrics);
+    window.visualViewport?.addEventListener(
+      "resize",
+      scheduleSyncTerminalMetricsFromViewport,
+    );
     scheduleHostSync();
     requestAnimationFrame(() => scheduleHostSync());
 
     // Double-rAF authoritative fit.  On the second frame the layout has
     // committed at least once since mount; fit.fit() then reads the
-    // stable container size.  We always send a RESIZE escape afterwards
-    // (even if fit's cols/rows didn't change, so the PTY has the same
-    // dims registered as our JS state — prevents a drift where Ink
-    // thinks the terminal is one col bigger than what's on screen).
+    // stable container size.  RESIZE is sent only when cols/rows differ
+    // from the last frame we already told the PTY about.
     let settleRaf1 = 0;
     let settleRaf2 = 0;
     settleRaf1 = requestAnimationFrame(() => {
@@ -931,7 +1362,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
-      const url = await api.buildWsUrl("/api/pty", params);
+      let url: string;
+      try {
+        url = await api.buildWsUrl("/api/pty", params);
+      } catch (err) {
+        if (unmounting) return;
+        connectInFlightRef.current = false;
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn("[chat] PTY WebSocket URL build failed:", message);
+        setPtyState("closed");
+        setBanner(`Chat connection failed: ${message}`);
+        return;
+      }
+      // Critical: buildWsUrl awaits a ticket/auth hop. If this effect was
+      // cleaned up mid-await (resume rewrite, reconnectNonce, remount), a
+      // stale open would supersede the live attach token (4409), write into
+      // a disposed xterm, and orphan the agent process the user just kicked.
+      if (unmounting) return;
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -952,6 +1399,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }, PTY_CONNECTING_TIMEOUT_MS);
 
     ws.onopen = () => {
+      // Stale socket from a previous effect generation — do not touch React
+      // state or steal resize ownership from the live terminal.
+      if (unmounting || wsRef.current !== ws) {
+        try {
+          ws.close();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
       clearReconnectTimer();
       clearConnectingTimer();
       connectInFlightRef.current = false;
@@ -969,7 +1426,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // out against on its first paint.  The double-rAF block above will
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
-      ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+      // Track via the same gate used by later fits so identical follow-up
+      // frames are suppressed.
+      lastSentPtySizeRef.current = null;
+      sendPtyResizeIfChanged(term.cols, term.rows);
       // One-shot: a ?learn=<text> param (set by the Skills page "Learn a
       // skill" panel) is typed into the composer as a /learn command once the
       // PTY is up. /learn resolves via command.dispatch → a normal agent turn,
@@ -983,7 +1443,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // Delay so Ink's composer has mounted and grabbed focus before input.
         setTimeout(() => {
           try {
-            wsRef.current?.send(cmd + "\r");
+            if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(cmd + "\r");
+            }
           } catch {
             /* PTY not ready / closed — user can retype */
           }
@@ -992,6 +1454,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
 
     ws.onmessage = (ev) => {
+      // Drop frames for superseded sockets so a disposed Terminal is never
+      // written after effect cleanup (silent paint loss / "Grok started but
+      // nothing streams back").
+      if (unmounting || wsRef.current !== ws || termRef.current !== term) {
+        return;
+      }
       if (typeof ev.data === "string") {
         term.write(ev.data);
       } else {
@@ -1000,7 +1468,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
 
     ws.onclose = (ev) => {
-      wsRef.current = null;
+      // Ignore closes from superseded sockets so they cannot clear the live
+      // connecting timer or trigger a second reconnect race.
+      if (wsRef.current !== ws && wsRef.current !== null) {
+        return;
+      }
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
       connectInFlightRef.current = false;
       clearConnectingTimer();
       if (unmounting) {
@@ -1059,7 +1534,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       //   4410 = the agent PROCESS exited (real end) → restart affordance.
       //   4409 = superseded by a newer tab attaching the same token → stay quiet.
       if (ev.code === 4410) {
-        term.write(`\r\n\x1b[90m[session ended]\x1b[0m\r\n`);
+        if (termRef.current === term) {
+          term.write(`\r\n\x1b[90m[session ended]\x1b[0m\r\n`);
+        }
         setPtyState("ended");
         return;
       }
@@ -1078,9 +1555,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // `/exit`, or started a new session). NS-504: surface an explicit
       // restart affordance instead of leaving a dead terminal that only a
       // full page refresh could recover.
-      term.write(
-        `\r\n\x1b[90m[session ended (code ${ev.code})]\x1b[0m\r\n`,
-      );
+      if (termRef.current === term) {
+        term.write(
+          `\r\n\x1b[90m[session ended (code ${ev.code})]\x1b[0m\r\n`,
+        );
+      }
       setPtyState("ended");
     };
 
@@ -1108,11 +1587,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
+        // Mobile-native composer owns printable typing. Drop helper-textarea
+        // keystrokes so the hidden xterm field cannot scramble the TUI line.
+        // Control / CSI sequences (scroll keys we inject, Esc, etc.) still
+        // pass through.
+        if (useMobileNativeComposerRef.current) {
+          // eslint-disable-next-line no-control-regex -- detect printable-only bursts
+          const isPrintableBurst = data.length > 0 && !/[\x00-\x1f\x7f]/.test(data);
+          if (isPrintableBurst) {
+            return;
+          }
+        }
+
         if (
+          wsRef.current !== ws ||
           ws.readyState !== WebSocket.OPEN ||
           shouldBlockPtyInput(ptyStateRef.current)
         ) {
-          if (!blockedInputNoticeRef.current) {
+          if (!blockedInputNoticeRef.current && termRef.current === term) {
             blockedInputNoticeRef.current = true;
             term.write(
               `\r\n\x1b[33m[${PTY_RECONNECT_INPUT_MESSAGE}]\x1b[0m\r\n`,
@@ -1121,26 +1613,44 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
-        const normalized = normalizePtyMobileInput(
-          data,
-          ptyInputLineRef.current,
-          Date.now() <= mobileReplacementInputUntilRef.current,
-        );
-        ptyInputLineRef.current = normalized.nextLine;
-        if (normalized.normalized) {
-          mobileReplacementInputUntilRef.current = 0;
+        // Desktop / non-native path: keep the existing mobile-replacement
+        // normalizer for IMEs that still type into xterm's helper textarea.
+        if (!useMobileNativeComposerRef.current) {
+          const normalized = normalizePtyMobileInput(
+            data,
+            ptyInputLineRef.current,
+            Date.now() <= mobileReplacementInputUntilRef.current,
+          );
+          ptyInputLineRef.current = normalized.nextLine;
+          if (normalized.normalized) {
+            mobileReplacementInputUntilRef.current = 0;
+            const helper = term.textarea;
+            if (helper && helper.value) {
+              helper.value = "";
+            }
+          }
+          ws.send(normalized.data);
+          return;
         }
-        ws.send(normalized.data);
+
+        ws.send(data);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(`\x1b[RESIZE:${cols};${rows}]`);
-        }
+        sendPtyResizeIfChanged(cols, rows);
       });
     })();
 
     term.focus();
+    // After open+focus, re-assert the helper-textarea gate and, on mobile,
+    // move focus into the native composer so the soft keyboard targets it.
+    applyMobileHelperTextareaGate();
+    if (useMobileNativeComposerRef.current) {
+      // Defer so React has committed the composer node.
+      requestAnimationFrame(() => {
+        mobileTextareaRef.current?.focus({ preventScroll: true });
+      });
+    }
 
     return () => {
       unmounting = true;
@@ -1149,19 +1659,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       mobileInputCleanup?.();
+      detachHostTouchScroll();
+      applyMobileHelperGateRef.current = null;
       host.removeEventListener("paste", handleBrowserPaste, true);
       host.removeEventListener("dragover", handleBrowserDragOver, true);
       host.removeEventListener("drop", handleBrowserDrop, true);
       if (metricsDebounce) clearTimeout(metricsDebounce);
+      if (viewportMetricsDebounce) clearTimeout(viewportMetricsDebounce);
       window.removeEventListener("resize", scheduleSyncTerminalMetrics);
       window.visualViewport?.removeEventListener(
         "resize",
-        scheduleSyncTerminalMetrics,
+        scheduleSyncTerminalMetricsFromViewport,
       );
       ro.disconnect();
       if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
       if (settleRaf1) cancelAnimationFrame(settleRaf1);
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
+      imeComposingRef.current = false;
+      lastSentPtySizeRef.current = null;
       clearReconnectTimer();
       clearConnectingTimer();
       connectInFlightRef.current = false;
@@ -1227,9 +1742,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           active !== document.body &&
           host !== null &&
           !host.contains(active);
-        if (!focusIsElsewhereInChatPage) {
-          termRef.current?.focus();
+        if (focusIsElsewhereInChatPage) {
+          return;
         }
+        // Mobile-native composer owns typing; do not yank focus into xterm's
+        // readonly helper textarea (soft-keyboard target + IME state).
+        if (useMobileNativeComposerRef.current) {
+          mobileTextareaRef.current?.focus({ preventScroll: true });
+          return;
+        }
+        termRef.current?.focus();
       });
     });
     return () => {
@@ -1405,12 +1927,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2">
+    <div className="hermes-chat-page flex min-h-0 flex-1 flex-col gap-2">
       <PluginSlot name="chat:top" />
       {mobileModelToolsPortal}
 
       {visibleBanner && (
-        <div className="border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">
+        <div className="shrink-0 border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">
           {visibleBanner}
         </div>
       )}
@@ -1418,7 +1940,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
         <div
           className={cn(
-            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
+            // Open-conversation column: vertical flex. Transcript host is the
+            // only flex-1/min-h-0 child that may shrink; the native composer
+            // (when present) is shrink-0 below it so messages never slide
+            // under the prompt bar.
+            "hermes-chat-conversation relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
             "p-2 sm:p-3",
           )}
           style={{
@@ -1426,10 +1952,142 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
           }}
         >
+          {/* Mobile toolbar: normal-flow row above the transcript so Older/Newer
+              and Copy never cover terminal cells or the composer. Desktop keeps
+              the floating copy control only (no scroll toolbar). */}
+          {useMobileNativeComposer && (
+            <div
+              className={cn(
+                "hermes-chat-mobile-toolbar mb-2 flex shrink-0 items-center gap-1.5",
+              )}
+              style={{ color: terminalFg }}
+            >
+              <Button
+                ghost
+                size="sm"
+                type="button"
+                onClick={() => scrollTranscriptXterm("older")}
+                aria-label="Scroll to older messages"
+                title="Older"
+                className={cn(
+                  "hermes-mobile-touch-target rounded border border-current/30",
+                  "bg-black/40 px-2 py-1 text-xs opacity-90 hover:opacity-100",
+                )}
+                style={{ color: terminalFg }}
+              >
+                <span className="inline-flex items-center gap-1">
+                  <ChevronUp className="h-3.5 w-3.5" />
+                  <span className="hidden min-[360px]:inline">Older</span>
+                </span>
+              </Button>
+              <Button
+                ghost
+                size="sm"
+                type="button"
+                onClick={() => scrollTranscriptXterm("newer")}
+                aria-label="Scroll to newer messages"
+                title="Newer"
+                className={cn(
+                  "hermes-mobile-touch-target rounded border border-current/30",
+                  "bg-black/40 px-2 py-1 text-xs opacity-90 hover:opacity-100",
+                )}
+                style={{ color: terminalFg }}
+              >
+                <span className="inline-flex items-center gap-1">
+                  <ChevronDown className="h-3.5 w-3.5" />
+                  <span className="hidden min-[360px]:inline">Newer</span>
+                </span>
+              </Button>
+              <div className="min-w-0 flex-1" />
+              <Button
+                ghost
+                size="sm"
+                type="button"
+                onClick={handleCopyLast}
+                title="Copy last assistant response as raw markdown"
+                aria-label="Copy last assistant response"
+                className={cn(
+                  "hermes-mobile-touch-target rounded border border-current/30",
+                  "bg-black/40 px-2 py-1 text-xs opacity-90 hover:opacity-100",
+                  "normal-case tracking-normal font-normal",
+                )}
+                style={{ color: terminalFg }}
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <Copy className="h-3 w-3 shrink-0" />
+                  <span className="hidden min-[400px]:inline tracking-wide">
+                    {copyState === "copied" ? "copied" : "copy last response"}
+                  </span>
+                </span>
+              </Button>
+            </div>
+          )}
+
           <div
             ref={hostRef}
-            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+            className={cn(
+              // Sole scroll region for the open conversation. Host clips;
+              // scroll position is driven by term.scrollLines (wheel + touch).
+              "hermes-chat-xterm-host min-h-0 min-w-0 flex-1 overflow-hidden",
+              "[&_.xterm]:h-full",
+              "[&_.xterm-viewport]:!bg-transparent",
+              useMobileNativeComposer && "hermes-chat-xterm-host--mobile-native",
+            )}
           />
+
+          {useMobileNativeComposer && (
+            <div
+              className="hermes-chat-mobile-composer mt-2 flex shrink-0 items-end gap-2"
+              style={{ color: terminalFg }}
+            >
+              <label className="sr-only" htmlFor="hermes-mobile-chat-composer">
+                Message
+              </label>
+              <textarea
+                id="hermes-mobile-chat-composer"
+                ref={mobileTextareaRef}
+                value={mobileDraft}
+                rows={1}
+                enterKeyHint="send"
+                autoComplete="on"
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck
+                inputMode="text"
+                placeholder="Message Hermes…"
+                disabled={shouldBlockPtyInput(ptyState)}
+                onChange={(ev) => setMobileDraft(ev.target.value)}
+                onCompositionStart={onMobileComposerCompositionStart}
+                onCompositionEnd={onMobileComposerCompositionEnd}
+                onKeyDown={onMobileComposerKeyDown}
+                className={cn(
+                  "hermes-chat-mobile-composer-input min-h-[44px] max-h-32 min-w-0 flex-1",
+                  "resize-y rounded-md border border-current/25 bg-black/35",
+                  "px-3 py-2 text-base leading-snug outline-none",
+                  "placeholder:text-current/40 focus:border-current/55",
+                )}
+                style={{ color: terminalFg }}
+              />
+              <Button
+                type="button"
+                onClick={() => {
+                  sendMobileDraft();
+                }}
+                disabled={
+                  shouldBlockPtyInput(ptyState) ||
+                  mobileComposing ||
+                  !mobileDraft.trim()
+                }
+                aria-label="Send message"
+                className={cn(
+                  "hermes-mobile-touch-target shrink-0 rounded-md px-3 py-2",
+                )}
+                prefix={<Send className="h-4 w-4" />}
+              >
+                Send
+              </Button>
+            </div>
+          )}
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
@@ -1470,30 +2128,33 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             </div>
           )}
 
-          <Button
-            ghost
-            onClick={handleCopyLast}
-            title="Copy last assistant response as raw markdown"
-            aria-label="Copy last assistant response"
-            className={cn(
-              "absolute z-10",
-              "normal-case tracking-normal font-normal",
-              "rounded border border-current/30",
-              "bg-black/20",
-              "opacity-70 hover:opacity-100 hover:border-current/60",
-              "transition-opacity duration-150 motion-reduce:transition-none",
-              "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
-              "lg:bottom-4 lg:right-4",
-            )}
-            style={{ color: terminalFg }}
-          >
-            <span className="inline-flex items-center gap-1.5">
-              <Copy className="h-3 w-3 shrink-0" />
-              <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
+          {/* Desktop: floating copy control. Mobile uses the toolbar above. */}
+          {!useMobileNativeComposer && (
+            <Button
+              ghost
+              onClick={handleCopyLast}
+              title="Copy last assistant response as raw markdown"
+              aria-label="Copy last assistant response"
+              className={cn(
+                "absolute z-10",
+                "normal-case tracking-normal font-normal",
+                "rounded border border-current/30",
+                "bg-black/20",
+                "opacity-70 hover:opacity-100 hover:border-current/60",
+                "transition-opacity duration-150 motion-reduce:transition-none",
+                "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
+                "lg:bottom-4 lg:right-4",
+              )}
+              style={{ color: terminalFg }}
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <Copy className="h-3 w-3 shrink-0" />
+                <span className="hidden min-[400px]:inline tracking-wide">
+                  {copyState === "copied" ? "copied" : "copy last response"}
+                </span>
               </span>
-            </span>
-          </Button>
+            </Button>
+          )}
         </div>
 
         {!narrow && (
