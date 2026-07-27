@@ -1097,7 +1097,7 @@ def my_callback(
 import subprocess
 
 def notify_approval(command, description, session_key, **kwargs):
-    title = "Hermes needs approval"
+    title = "IYARI needs approval"
     body = f"{description}: {command[:80]}"
     subprocess.Popen([
         "osascript", "-e",
@@ -1346,7 +1346,7 @@ Each time the event fires, IYARI spawns a subprocess for every matching hook (ma
 ```jsonc
 // Block a pre_tool_call (both shapes accepted; normalised internally):
 {"decision": "block", "reason":  "Forbidden: rm -rf"}   // Claude-Code style
-{"action":   "block", "message": "Forbidden: rm -rf"}   // Hermes-canonical
+{"action":   "block", "message": "Forbidden: rm -rf"}   // IYARI-canonical
 
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}

@@ -138,5 +138,52 @@ enlaces a recursos comunitarios externos como el Discord de Nous).
 - **GRUPO 5 (docs de website/docs/) COMPLETO.** Pendiente futuro: GRUPO 6 = i18n zh-Hans/;
   código `.py` heredado (identity strings ya se tocan en docs, no en código). Revisar si
   procede `userStories.json`/instaladores del home en una pasada de marketing aparte.
+
+## Verificación de cierre GRUPO 5 (post-commit e877ed748)
+
+Tras cerrar GRUPO 5 se corrieron 4 checks de auditoría (residual global, corrupción
+inversa, build, commits/Co-Authored). Resultado y **lote 16** de corrección:
+
+- **Residual**: 2384 "Hermes" brutos en website/, pero 2311 viven en `i18n/zh-Hans/`
+  (GRUPO 6, fuera de alcance, correcto no tocarlo). En `website/docs/` (alcance real):
+  73 "Hermes" (todo intencional: modelo Hermes-2/3/4, clases camelCase HermesCLI/
+  HermesPlugin/HermesACPAgent/HermesTokenStorage/HermesSweEnv/HermesBench —éste último
+  un benchmark externo de Nous, preservado tras confirmarlo con el usuario—, headers
+  X-Hermes-Session-*, flag -HermesHome, tarea HermesGateway, lab-attribution en
+  index.mdx) y 8 "Nous Research" (todas decisiones ya tomadas: lab, Nous Portal/Chat,
+  faq:20). **Sin corrupción inversa** (falsos positivos de regex con 2 URLs en la misma
+  línea, verificado sin duplicación real).
+- **Lote 16 (bug-fix)**: se hallaron ~17 "Hermes" residuales en `user-guide/features/`
+  heredados de los **lotes 1-2** (sesión anterior, antes del criterio actual) — prosa/
+  comentarios de código/ejemplos que nombraban el producto como "Hermes" sin rebrandear
+  (api-server.md, acp.md, browser.md, mcp.md, extending-the-dashboard.md,
+  built-in-plugins.md, kanban-worker-lanes.md → "IYARI Kanban", codex-app-server-runtime.md
+  incl. diagrama ASCII realineado, memory-providers.md, hooks.md, goals.md incl. transcript
+  "Hermes:"→"IYARI:"). Corregidos con el transformador + reversión de headers
+  X-Hermes-Session-Id/Key. **Commit pendiente de push al cierre de esta sesión.**
+- **Build**: `website/` nunca tuvo `node_modules` instalado en este entorno; se usó
+  `pnpm install` (hay `pnpm-lock.yaml`, ahora commiteado). Dos bugs preexistentes de
+  dependencias corregidos (autorizados por el usuario, NO son parte del rebranding):
+  1. `@docusaurus/theme-mermaid` estaba en rango `"^3.9.2"` mientras el resto de
+     `@docusaurus/*` fijan exacto `3.9.2` (Docusaurus exige versión idéntica) → fijado a
+     `"3.9.2"`.
+  2. Tras el fix anterior, `webpack` resolvía a `5.109.0` (más nueva de lo que
+     `@docusaurus/core@3.9.2` espera; su ProgressPlugin no acepta ya la opción
+     `reporter`) → añadido `pnpm.overrides.webpack: "5.95.0"` (el `overrides` raíz
+     preexistente es sintaxis npm, pnpm no lo lee; se dejó intacto sin tocar sus otras
+     2 entradas — no es de esta sesión decidir si migrarlo).
+  - **⚠️ DEUDA PENDIENTE, NO RESUELTA**: tras (1)+(2), el build sigue fallando en SSG
+    (4 de 358 páginas: `/docs/developer-guide/worktree-ui-dev`,
+    `/docs/user-guide/checkpoints-and-rollback`, `/docs/user-guide/messaging/`,
+    `/docs/user-guide/messaging/open-webui`) con
+    `ReactContextError: useColorMode called outside <ColorModeProvider>` dentro de
+    `@docusaurus/theme-mermaid`'s `MermaidRenderer`, pese a que theme-mermaid declara
+    soportar React 19 (`peerDependencies: react ^18||^19`, instalado 19.2.8). Parece bug
+    real de la librería con SSG + React 19, no relacionado con el contenido rebrandeado.
+    El usuario decidió NO seguir investigando en esta sesión — queda como deuda técnica
+    aparte. Próximo paso sugerido: probar downgrade acotado de theme-mermaid o de
+    react/react-dom a una combinación conocida-buena, en una sesión dedicada a infra.
+- **Commits**: 19 commits en el rango `1a8df5d88..main` (todo GRUPO 5), autor único
+  Digital Services LLC, **cero** "Co-Authored" — limpio.
 - Pendiente tras user-guide/: `developer-guide/`, `integrations/`, `docs/` sueltos, `userStories.json`.
 - GRUPO 6 futuro: espejo chino `website/i18n/zh-Hans/` (NO tocar aún).

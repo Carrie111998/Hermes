@@ -116,7 +116,7 @@ If you want to define IYARI manually, add it through VS Code settings under `acp
 ```json
 {
   "acp.agents": {
-    "Hermes Agent": {
+    "IYARI": {
       "command": "hermes",
       "args": ["acp"]
     }

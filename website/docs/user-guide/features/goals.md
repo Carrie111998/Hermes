@@ -177,7 +177,7 @@ Add to `~/.hermes/config.yaml`:
 
 ```yaml
 goals:
-  # Max continuation turns before Hermes auto-pauses and asks you to
+  # Max continuation turns before IYARI auto-pauses and asks you to
   # /goal resume. Default 20. Lower this if you want tighter loops;
   # raise it for long-running refactors.
   max_turns: 20
@@ -203,25 +203,25 @@ You: /goal Create four files /tmp/note_{1..4}.txt, one per turn, each containing
 
   ⊙ Goal set (20-turn budget): Create four files /tmp/note_{1..4}.txt, one per turn, each containing its number as text
 
-Hermes: Creating /tmp/note_1.txt now.
+IYARI: Creating /tmp/note_1.txt now.
   💻 echo "1" > /tmp/note_1.txt   (0.1s)
   I've created /tmp/note_1.txt with the content "1". I'll continue with the remaining files on the next turn as you specified.
 
   ↻ Continuing toward goal (1/20): Only 1 of 4 files has been created; 3 files remain.
 
-Hermes: [Continuing toward your standing goal]
+IYARI: [Continuing toward your standing goal]
   💻 echo "2" > /tmp/note_2.txt   (0.1s)
   Created /tmp/note_2.txt. Two more to go.
 
   ↻ Continuing toward goal (2/20): 2 of 4 files created; 2 remain.
 
-Hermes: [Continuing toward your standing goal]
+IYARI: [Continuing toward your standing goal]
   💻 echo "3" > /tmp/note_3.txt   (0.1s)
   Created /tmp/note_3.txt.
 
   ↻ Continuing toward goal (3/20): 3 of 4 files created; 1 remains.
 
-Hermes: [Continuing toward your standing goal]
+IYARI: [Continuing toward your standing goal]
   💻 echo "4" > /tmp/note_4.txt   (0.1s)
   All four files have been created: /tmp/note_1.txt through /tmp/note_4.txt, each containing its number.
 

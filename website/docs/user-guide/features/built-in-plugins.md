@@ -184,7 +184,7 @@ Session grouping keys off the IYARI session ID (or task ID for sub-agents) via `
 
 ```bash
 hermes plugins list                 # observability/langfuse should show "enabled"
-hermes chat -q "hello"              # check the Langfuse UI for a "Hermes turn" trace
+hermes chat -q "hello"              # check the Langfuse UI for a "IYARI turn" trace
 ```
 
 **Optional tuning** (in `.env`):

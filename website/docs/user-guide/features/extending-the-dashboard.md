@@ -526,7 +526,7 @@ SDK.components.TabsList
 SDK.components.TabsTrigger
 SDK.components.PluginSlot    // render a named slot (useful for nested plugin UIs)
 
-// Hermes API client + raw fetcher
+// IYARI API client + raw fetcher
 SDK.api                      // typed client — getStatus, getSessions, getConfig, ...
 SDK.fetchJSON                // raw fetch for custom endpoints (plugin-registered routes)
 

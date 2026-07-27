@@ -62,7 +62,7 @@ hermes mcp install n8n    # install a catalog entry by name
 The picker shows each entry with its current status:
 
 ```
-n8n          available              Manage and inspect n8n workflows from Hermes
+n8n          available              Manage and inspect n8n workflows from IYARI
 linear       enabled                Linear issue/project management (remote OAuth)
 github       installed (disabled)   GitHub repo + PR tools
 ```
@@ -125,7 +125,7 @@ the hermes-agent repo, so Nous has reviewed each entry before it shipped —
 `transport.command:` invocation.
 
 Manifests live at
-[`optional-mcps/<name>/manifest.yaml`](https://github.com/NousResearch/hermes-agent/tree/main/optional-mcps)
+[`optional-mcps/<name>/manifest.yaml`](https://github.com/digital-services-llc/iyari/tree/main/optional-mcps)
 on GitHub. The picker also prints the manifest's `source:` URL at install
 time so you can quickly verify the upstream repo. The web dashboard's MCP
 page surfaces the same detail per catalog entry — transport, auth type, the
@@ -170,7 +170,7 @@ MCPs are never auto-updated. Re-run `hermes mcp install <name>` to refresh
 after a IYARI update if a manifest version changed.
 
 To add an MCP to the catalog, open a PR against
-[`optional-mcps/`](https://github.com/NousResearch/hermes-agent/tree/main/optional-mcps).
+[`optional-mcps/`](https://github.com/digital-services-llc/iyari/tree/main/optional-mcps).
 
 ## Two kinds of MCP servers
 

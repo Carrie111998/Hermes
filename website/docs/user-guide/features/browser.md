@@ -224,7 +224,7 @@ Then fully restart IYARI so the new config is picked up.
 IYARI reads `browser.camofox.managed_persistence`, **not** a top-level `managed_persistence`. A common mistake is writing:
 
 ```yaml
-# ❌ Wrong — Hermes ignores this
+# ❌ Wrong — IYARI ignores this
 managed_persistence: true
 ```
 
@@ -402,11 +402,11 @@ BROWSERBASE_SESSION_TIMEOUT=1800
 # Inactivity timeout before auto-cleanup in seconds (default: 120)
 BROWSER_INACTIVITY_TIMEOUT=120
 
-# Extra Chromium launch flags (comma- or newline-separated). Hermes auto-injects
+# Extra Chromium launch flags (comma- or newline-separated). IYARI auto-injects
 # `--no-sandbox,--disable-dev-shm-usage` when it detects root or AppArmor-restricted
 # unprivileged user namespaces (Ubuntu 23.10+, DGX Spark, many container images),
 # so most users don't need to set this. Set it manually only if you need a flag
-# Hermes doesn't add automatically; setting it disables the auto-injection.
+# IYARI doesn't add automatically; setting it disables the auto-injection.
 AGENT_BROWSER_ARGS=--no-sandbox
 ```
 

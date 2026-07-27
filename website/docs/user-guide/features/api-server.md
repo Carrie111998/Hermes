@@ -23,7 +23,7 @@ Add to `~/.hermes/.env`:
 ```bash
 API_SERVER_ENABLED=true
 API_SERVER_KEY=change-me-local-dev
-# Optional: only if a browser must call Hermes directly
+# Optional: only if a browser must call IYARI directly
 # API_SERVER_CORS_ORIGINS=http://localhost:3000
 ```
 
