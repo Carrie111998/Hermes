@@ -378,18 +378,29 @@ def mark_completion_delivered(delegation_id: str) -> bool:
             (now, now, delegation_id),
         )
         acked = cur.rowcount == 1
-    if acked:
-        _mark_in_memory_delivered(delegation_id)
+    # Unconditionally: the in-memory dict is the state the prune reads, and it
+    # can diverge from the DB (a durable prune may have dropped the delivered
+    # row while the in-memory record survives). Gating on the DB rowcount left
+    # such records 'pending' forever — uncapped retention under the pending
+    # budget and never eligible for the delivered cap.
+    _mark_in_memory_delivered(delegation_id)
     return acked
 
 
 def _mark_in_memory_delivered(delegation_id: str) -> None:
     """Update the in-memory record's delivery_state so prune doesn't
-    discard an undelivered result."""
+    discard an undelivered result, then enforce the delivered cap.
+
+    Pruning here (not only in the completion finalizers) means a burst that
+    completed as pending cannot retain more than ``_MAX_RETAINED_COMPLETED``
+    delivered records until some later completion happens to run the prune —
+    acknowledgement itself converges the cap.
+    """
     with _records_lock:
         record = _records.get(delegation_id)
         if record is not None:
             record["delivery_state"] = "delivered"
+            _prune_completed_locked()
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -494,8 +505,13 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (now, now, delegation_id, claim_id),
         )
         acked = cur.rowcount == 1
-    if acked:
-        _mark_in_memory_delivered(delegation_id)
+    # Unconditionally, as in mark_completion_delivered: this runs only after
+    # the completion event was actually injected into the consumer's queue.
+    # rowcount==0 here means the durable row was already delivered, dropped,
+    # pruned, or claimed over — none of which change the fact that THIS
+    # consumer received the payload, so the in-memory record must not stay
+    # 'pending' (it would be retained forever and shield the delivered cap).
+    _mark_in_memory_delivered(delegation_id)
     return acked
 
 
