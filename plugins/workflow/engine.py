@@ -2946,10 +2946,22 @@ class WorkflowEngine:
                         for rev_entry in node.reviews:
                             rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
                             if rev_id and rev_id in states:
-                                rev_status = states[rev_id].status
-                                if rev_status in ("running", "blocked"):
+                                rev_state = states[rev_id]
+                                # Check in-memory state first, then fall back
+                                # to actual kanban card status for accuracy.
+                                if rev_state.status in ("running", "blocked"):
                                     has_active_review = True
                                     break
+                                # Fallback: check actual kanban card status
+                                if rev_state.kanban_card_id:
+                                    try:
+                                        card = self.get_card_status(rev_state.kanban_card_id)
+                                        card_status = card.get("status", "").lower()
+                                        if card_status in ("running", "blocked", "ready"):
+                                            has_active_review = True
+                                            break
+                                    except Exception:
+                                        pass
                         if has_active_review:
                             break
                 if has_active_review:
