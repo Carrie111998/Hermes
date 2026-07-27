@@ -151,6 +151,28 @@ def test_provider_assessment_rejects_future_dated_evidence(tmp_path):
         )
 
 
+def test_provider_assessment_rejects_expired_evidence_at_admission(tmp_path):
+    conn = objectives_db.connect(tmp_path / "business.db")
+    now = int(time.time())
+    with pytest.raises(
+        compliance_db.ComplianceError, match="already expired"
+    ):
+        compliance_db.verify_payment_provider(
+            conn,
+            organization_id="org_1",
+            provider="fake",
+            direction="outbound",
+            jurisdiction="GLOBAL",
+            registry_authority="test-registry",
+            registry_reference="expired-assessment",
+            aml_screening_delegated=True,
+            sanctions_screening_delegated=True,
+            verified_at=now - 60,
+            expires_at=now - 1,
+            evidence={"test": True},
+        )
+
+
 def test_reservations_prevent_oversubscription_and_exact_settlement(treasury):
     conn, account = treasury
     finance_db.seed_initial_capital(

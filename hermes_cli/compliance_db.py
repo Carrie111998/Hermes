@@ -130,6 +130,8 @@ def verify_payment_provider(
     now = int(time.time())
     if verified_at > now:
         raise ComplianceError("provider assessment cannot be future-dated")
+    if expires_at <= now:
+        raise ComplianceError("provider assessment is already expired")
     if expires_at <= verified_at or not evidence:
         raise ComplianceError("provider assessment requires current external evidence")
     assessment_id = f"assessment_{uuid.uuid4().hex}"
