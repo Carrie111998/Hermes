@@ -525,6 +525,109 @@ async def test_append_speech_without_first_audio_fails_for_classic_fallback(
 
 
 @pytest.mark.asyncio
+async def test_append_speech_waits_for_audible_pcm_instead_of_silence(
+    monkeypatch,
+):
+    """Sink-accepted WebRTC silence must not complete first-audio readiness."""
+
+    import agent.transports.codex_realtime_voice as realtime_module
+
+    monkeypatch.setattr(realtime_module, "SPEECH_FIRST_AUDIO_TIMEOUT", 0.2)
+    pcm_out: list[bytes] = []
+    client = FakeClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v3"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "answer"},
+        },
+    ])
+    peer = FakePeer()
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        client_factory=lambda **kwargs: client,
+        peer_factory=lambda: peer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+        on_output_pcm=lambda pcm: pcm_out.append(pcm) or True,
+    )
+    await session.start()
+
+    append_task = asyncio.create_task(session.append_speech("Hermes antwoord"))
+    for _ in range(100):
+        if session._speech_gate:
+            break
+        await asyncio.sleep(0.001)
+    assert session._speech_gate is True
+    assert peer.on_pcm is not None
+
+    silence = b"\x00" * 3840
+    peer.on_pcm(silence)
+    await asyncio.sleep(0.01)
+    assert append_task.done() is False
+    assert session._speech_last_pcm_at is None
+
+    audible = np.full(1920, 2048, dtype=np.int16).tobytes()
+    peer.on_pcm(audible)
+    try:
+        assert await append_task is True
+    finally:
+        await session.stop()
+
+    assert pcm_out == [silence, audible]
+
+
+@pytest.mark.asyncio
+async def test_append_speech_with_only_silence_fails_for_classic_fallback(
+    monkeypatch,
+):
+    import agent.transports.codex_realtime_voice as realtime_module
+
+    monkeypatch.setattr(realtime_module, "SPEECH_FIRST_AUDIO_TIMEOUT", 0.02)
+    pcm_out: list[bytes] = []
+    errors: list[str] = []
+    client = FakeClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v3"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "answer"},
+        },
+    ])
+    peer = FakePeer()
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        client_factory=lambda **kwargs: client,
+        peer_factory=lambda: peer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+        on_output_pcm=lambda pcm: pcm_out.append(pcm) or True,
+        on_error=errors.append,
+    )
+    await session.start()
+
+    append_task = asyncio.create_task(session.append_speech("Hermes antwoord"))
+    for _ in range(100):
+        if session._speech_gate:
+            break
+        await asyncio.sleep(0.001)
+    assert peer.on_pcm is not None
+    silence = b"\x00" * 3840
+    peer.on_pcm(silence)
+
+    try:
+        with pytest.raises(CodexRealtimeUnavailable, match="produced no audio"):
+            await append_task
+    finally:
+        await session.stop()
+
+    assert pcm_out == [silence]
+    assert errors == ["Codex realtime speech produced no audio"]
+
+
+@pytest.mark.asyncio
 async def test_append_speech_rejected_by_output_sink_fails_for_classic_fallback(
     monkeypatch,
 ):

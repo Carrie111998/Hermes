@@ -916,6 +916,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
+    VOICE_MIXER_DRAIN_START_TIMEOUT = 1.0
+    VOICE_MIXER_DRAIN_MIN_READS = 3
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -3813,7 +3815,38 @@ class DiscordAdapter(BasePlatformAdapter):
         if vc.is_playing():
             vc.stop()
         vc.play(mixer, after=_after)
-        self._voice_mixers[guild_id] = mixer
+        # Do not call this output path ready merely because discord.py accepted
+        # ``play()``. A voice reconnect can leave AudioPlayer flags set while
+        # the sender no longer drains the mapped source. Require several real
+        # reads from the concrete player before publishing the mixer. Keep the
+        # source provisional so concurrent consumers cannot accept PCM early.
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self.VOICE_MIXER_DRAIN_START_TIMEOUT
+        )
+        try:
+            while mixer.read_count < self.VOICE_MIXER_DRAIN_MIN_READS:
+                if (
+                    not vc.is_connected()
+                    or not vc.is_playing()
+                    or vc.source is not mixer
+                    or asyncio.get_running_loop().time() >= deadline
+                ):
+                    raise RuntimeError(
+                        "Discord voice mixer sender did not begin draining"
+                    )
+                await asyncio.sleep(0.01)
+            if (
+                not vc.is_connected()
+                or not vc.is_playing()
+                or vc.source is not mixer
+                or not mixer.output_is_draining()
+            ):
+                raise RuntimeError("Discord voice mixer sender stopped during startup")
+            self._voice_mixers[guild_id] = mixer
+        except BaseException:
+            self._discard_voice_mixer(guild_id, mixer, vc=vc, stop_player=True)
+            raise
         logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
 
     async def play_ack_in_voice(self, guild_id: int, phrase: Optional[str] = None) -> bool:
@@ -3872,6 +3905,35 @@ class DiscordAdapter(BasePlatformAdapter):
                     except OSError:
                         pass
 
+    def _discard_voice_mixer(
+        self,
+        guild_id: int,
+        mixer: Any,
+        *,
+        vc: Any = None,
+        stop_player: bool = False,
+    ) -> None:
+        """Discard one exact mixer without disturbing a replacement source."""
+
+        mixers = getattr(self, "_voice_mixers", None)
+        if isinstance(mixers, dict) and mixers.get(guild_id) is mixer:
+            mixers.pop(guild_id, None)
+        voice_client = vc
+        if voice_client is None:
+            voice_clients = getattr(self, "_voice_clients", None)
+            if isinstance(voice_clients, dict):
+                voice_client = voice_clients.get(guild_id)
+        if stop_player and voice_client is not None:
+            try:
+                if voice_client.source is mixer and voice_client.is_playing():
+                    voice_client.stop()
+            except Exception:
+                pass
+        try:
+            mixer.cleanup()
+        except Exception:
+            pass
+
     def voice_mixer_active(self, guild_id: int) -> bool:
         """True when the mapped mixer is the live Discord playback source."""
         mixers = getattr(self, "_voice_mixers", None)
@@ -3887,17 +3949,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 and vc.is_playing()
                 and vc.source is mixer
             )
+            drain_check = getattr(mixer, "output_is_draining", None)
+            if active and callable(drain_check):
+                active = bool(drain_check())
         except Exception:
             active = False
         if not active:
             # A Discord AudioPlayer can terminate while the adapter still owns
-            # its old mixer object. Never accept PCM into that dead source.
-            if isinstance(mixers, dict) and mixers.get(guild_id) is mixer:
-                mixers.pop(guild_id, None)
-            try:
-                mixer.cleanup()
-            except Exception:
-                pass
+            # its old mixer object. Never accept PCM into that dead source, and
+            # stop the exact zombie player so classic fallback cannot wait on
+            # its stale ``is_playing()`` flag for PLAYBACK_TIMEOUT seconds.
+            self._discard_voice_mixer(
+                guild_id, mixer, vc=vc, stop_player=True
+            )
         return active
 
     async def ensure_realtime_voice_output(self, guild_id: int) -> bool:

@@ -32,6 +32,8 @@ REALTIME_CHANNELS = 1
 REALTIME_FRAME_SAMPLES = 480  # 20 ms at 24 kHz
 SPEECH_FIRST_AUDIO_TIMEOUT = 5.0
 SPEECH_AUDIO_IDLE_TIMEOUT = 0.75
+SPEECH_AUDIBLE_PEAK_MIN = 64
+SPEECH_AUDIBLE_RMS_MIN = 8.0
 
 _SPEECH_INTERFACE_PROMPT = (
     "You are a low-latency speech interface for another assistant. "
@@ -116,6 +118,21 @@ def discord_pcm_to_realtime(pcm: bytes) -> bytes:
     mono_48k = (stereo[:, 0] + stereo[:, 1]) // 2
     mono_24k = (mono_48k[0::2] + mono_48k[1::2]) // 2
     return np.clip(mono_24k, -32768, 32767).astype(np.int16).tobytes()
+
+
+def _pcm_is_audible(pcm: bytes) -> bool:
+    """Reject WebRTC silence/dither as proof that speech output started."""
+
+    usable = len(pcm) - (len(pcm) % 2)
+    if usable < 2:
+        return False
+    np = _require_numpy()
+    samples = np.frombuffer(pcm[:usable], dtype=np.int16).astype(np.int32)
+    peak = int(np.max(np.abs(samples)))
+    if peak < SPEECH_AUDIBLE_PEAK_MIN:
+        return False
+    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+    return rms >= SPEECH_AUDIBLE_RMS_MIN
 
 
 class _AiortcOutgoingAudioTrack:
@@ -638,12 +655,18 @@ class CodexRealtimeSession:
         if self._speech_gate:
             if not self._emit_output_pcm(pcm):
                 return
+            # The negotiated track emits zero PCM before synthesized speech.
+            # Deliver those timing frames downstream, but do not suppress
+            # classic fallback or claim output readiness until the accepted
+            # signal is actually audible.
+            if not _pcm_is_audible(pcm):
+                return
             now = time.monotonic()
             first_pcm = self._speech_last_pcm_at is None
             self._speech_last_pcm_at = now
             if first_pcm and self._speech_started_at is not None:
                 logger.info(
-                    "Codex realtime speech audio started after %.3fs",
+                    "Codex realtime audible speech started after %.3fs",
                     now - self._speech_started_at,
                 )
             self._wake_speech_start_waiter()

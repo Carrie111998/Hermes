@@ -44,6 +44,7 @@ the mixer's output cannot echo back into transcription.
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 import discord
@@ -74,6 +75,7 @@ FRAME_LENGTH_MS = 20
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_LENGTH_MS // 1000   # 960
 FRAME_SIZE = SAMPLES_PER_FRAME * CHANNELS * SAMPLE_WIDTH    # 3840 bytes
 SILENCE_FRAME = b"\x00" * FRAME_SIZE
+OUTPUT_DRAIN_STALL_SECONDS = 0.5
 
 
 class MixerChild:
@@ -251,6 +253,12 @@ class VoiceMixer(discord.AudioSource):
         self._duck_release_frames = max(1, duck_release_ms // FRAME_LENGTH_MS)
         self._duck_release_left = 0
         self._closed = False
+        # ``VoiceClient.is_playing()`` only exposes AudioPlayer flags. After a
+        # Discord voice reconnect those flags can remain true while the sender
+        # no longer polls this source. Track actual ``read()`` calls so the
+        # adapter can distinguish a live drain from a zombie player.
+        self._read_count = 0
+        self._last_read_at: Optional[float] = None
         # Tracks whether speech is currently active, for external callers that
         # want to avoid double-ducking or know when a reply is mid-flight.
         self._speech_active = False
@@ -357,6 +365,23 @@ class VoiceMixer(discord.AudioSource):
     # AudioSource interface — called from discord.py's sender thread
     # ------------------------------------------------------------------
 
+    @property
+    def read_count(self) -> int:
+        with self._lock:
+            return self._read_count
+
+    def output_is_draining(
+        self, *, max_stall_seconds: float = OUTPUT_DRAIN_STALL_SECONDS
+    ) -> bool:
+        """Whether Discord's sender has polled this source recently."""
+
+        with self._lock:
+            last_read_at = self._last_read_at
+        return bool(
+            last_read_at is not None
+            and time.monotonic() - last_read_at <= max_stall_seconds
+        )
+
     def read(self) -> bytes:
         """Return one 20 ms mixed PCM frame (always FRAME_SIZE bytes).
 
@@ -365,6 +390,8 @@ class VoiceMixer(discord.AudioSource):
         want the mixer to run continuously for the lifetime of the connection.
         """
         with self._lock:
+            self._read_count += 1
+            self._last_read_at = time.monotonic()
             if self._closed:
                 return SILENCE_FRAME
 
