@@ -464,9 +464,27 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
         workforce_delegation.validate_worker_launch(
             enabled_toolsets=["web"],
             enabled_skills=["research"],
+            enabled_capabilities=["web.read"],
+            enabled_systems=["web"],
         )["id"]
         == grant_id
     )
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="capabilities"
+    ):
+        workforce_delegation.validate_worker_launch(
+            enabled_toolsets=["web"],
+            enabled_skills=["research"],
+            enabled_capabilities=["web.read", "email.send"],
+            enabled_systems=["web"],
+        )
+    with pytest.raises(workforce_delegation.DelegationError, match="systems"):
+        workforce_delegation.validate_worker_launch(
+            enabled_toolsets=["web"],
+            enabled_skills=["research"],
+            enabled_capabilities=["web.read"],
+            enabled_systems=["web", "payments"],
+        )
     with pytest.raises(
         workforce_delegation.DelegationError, match="exact task grant"
     ):

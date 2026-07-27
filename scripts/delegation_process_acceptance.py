@@ -41,7 +41,10 @@ from pathlib import Path
 from hermes_cli import kanban_db, workforce_delegation
 
 grant = workforce_delegation.validate_worker_launch(
-    enabled_toolsets=["terminal"], enabled_skills=["security.audit"]
+    enabled_toolsets=["terminal"],
+    enabled_skills=["security.audit"],
+    enabled_capabilities=["security.audit"],
+    enabled_systems=["security"],
 )
 with kanban_db.connect_closing(board=os.environ["HERMES_DELEGATION_BOARD"]) as board:
     task_id = os.environ["HERMES_KANBAN_TASK"]

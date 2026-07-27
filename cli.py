@@ -16588,6 +16588,12 @@ def main(
                 validate_worker_launch(
                     enabled_toolsets=cli.enabled_toolsets,
                     enabled_skills=cli.preloaded_skills,
+                    enabled_capabilities=json.loads(
+                        os.environ.get("HERMES_EXECUTION_CAPABILITIES", "null")
+                    ),
+                    enabled_systems=json.loads(
+                        os.environ.get("HERMES_EXECUTION_SYSTEMS", "null")
+                    ),
                 )
             except Exception as exc:
                 print(

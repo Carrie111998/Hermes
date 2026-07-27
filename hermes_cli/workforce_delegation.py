@@ -531,6 +531,8 @@ def validate_worker_launch(
     *,
     enabled_toolsets: list[str],
     enabled_skills: list[str],
+    enabled_capabilities: list[str] | None = None,
+    enabled_systems: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Fail closed when a spawned employee worker cannot prove its task grant."""
     grant_id = str(os.environ.get("HERMES_EXECUTION_CONTRACT_ID") or "").strip()
@@ -581,6 +583,22 @@ def validate_worker_launch(
             raise DelegationError(
                 "worker skills do not match the exact task grant"
             )
+        if enabled_capabilities is not None:
+            actual_capabilities = sorted(
+                set(str(item) for item in enabled_capabilities)
+            )
+            if actual_capabilities != sorted(
+                set(str(item) for item in grant["capabilities"])
+            ):
+                raise DelegationError(
+                    "worker capabilities do not match the exact task grant"
+                )
+        if enabled_systems is not None:
+            actual_systems = sorted(set(str(item) for item in enabled_systems))
+            if actual_systems != sorted(set(str(item) for item in grant["systems"])):
+                raise DelegationError(
+                    "worker systems do not match the exact task grant"
+                )
         scope = worker_scope(conn, grant_id)
     with kanban_db.connect_closing() as board:
         task = kanban_db.get_task(board, task_id)

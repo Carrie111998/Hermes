@@ -8908,6 +8908,12 @@ def _default_spawn(
             )
         worker_toolsets = sorted(set(str(item) for item in grant["toolsets"]))
         worker_skills = sorted(set(str(item) for item in grant["skills"]))
+        env["HERMES_EXECUTION_CAPABILITIES"] = json.dumps(
+            sorted(set(str(item) for item in grant["capabilities"]))
+        )
+        env["HERMES_EXECUTION_SYSTEMS"] = json.dumps(
+            sorted(set(str(item) for item in grant["systems"]))
+        )
     else:
         worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
         worker_skills = task.skills or []
