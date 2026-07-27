@@ -1,6 +1,6 @@
 ---
 name: linux-security-guardian
-description: Lightweight Linux server security health check — scored audit across SSH, firewall, hardening, user privileges, and ops.
+description: Linux server security audit with scored report
 version: 1.0.1
 author: ligl0325
 license: MIT
@@ -92,7 +92,7 @@ The agent will automatically:
 
 | Check | Pass | Fail | Fix |
 |-------|------|------|-----|
-| Firewall active | ufw/iptables/firewalld active | No firewall | `sudo ufw enable` or equivalent |
+| Firewall active | `ufw status` / `firewall-cmd --state` / `iptables -L -n` shows active | No firewall active | `sudo ufw enable` / `sudo systemctl enable --now firewalld` / `sudo systemctl enable --now iptables` |
 | Minimal open ports | Only necessary ports open | Unexpected listeners | `sudo ufw deny <port>` or equivalent |
 | Services bound locally | DB/cache on 127.0.0.1 | Services on 0.0.0.0 | Config bind address |
 
@@ -110,7 +110,7 @@ The agent will automatically:
 
 | Check | Pass | Fail | Fix |
 |-------|------|------|-----|
-| System updates | `apt list --upgradable` empty or equivalent | Pending updates | `sudo apt update && sudo apt upgrade -y` or equivalent |
+| System updates | `apt list --upgradable` / `dnf check-update` / `pacman -Qu` empty or equivalent | Pending updates | `sudo apt update && sudo apt upgrade -y` / `sudo dnf upgrade` / `sudo pacman -Syu` |
 | Shadow permissions | `/etc/shadow` 600/640 | Too permissive | `sudo chmod 640 /etc/shadow` |
 | /tmp sticky bit | Sticky bit set | Missing | `sudo chmod +t /tmp` |
 | npm global packages | No known malicious packages | Blocklisted package found | `npm uninstall -g <pkg>` |
@@ -144,7 +144,7 @@ The agent will automatically:
 | Check | Pass | Fail | Fix |
 |-------|------|------|-----|
 | fail2ban running | `systemctl is-active fail2ban` = active | Not running | `sudo systemctl enable --now fail2ban` |
-| Auto-updates | `unattended-upgrades` configured | Not configured | `sudo apt install unattended-upgrades` or equivalent |
+| Auto-updates | `unattended-upgrades` / `dnf-automatic` configured | Not configured | `sudo apt install unattended-upgrades` / `sudo dnf install dnf-automatic && sudo systemctl enable --now dnf-automatic` |
 | Logging active | rsyslog/journald running | Logging stopped | `sudo systemctl start rsyslog` |
 
 **Scoring rubric**:
@@ -256,9 +256,9 @@ To ensure consistent reports across runs, follow this exact sequence:
    ```
 
 7. **Score calculation**:
-   - Compute a raw total from rubric points across all five categories
-     (SSH max 25, Network max 25, System max 20, User max 20, Ops max 10)
-   - Scale to a 0–100 scale: `raw_total * 100 / 100`
+   - For each category, compute a **category percentage**: `category_raw / category_max * 100`
+   - Apply category weights: SSH 25%, Network 25%, System 20%, User 20%, Ops 10%
+   - Final score = `(SSH_pct * 0.25) + (Network_pct * 0.25) + (System_pct * 0.20) + (User_pct * 0.20) + (Ops_pct * 0.10)`
    - Round to nearest integer
 
 ## Verification
