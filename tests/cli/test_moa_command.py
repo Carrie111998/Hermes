@@ -5,11 +5,11 @@ from cli import HermesCLI
 from hermes_cli.moa_config import decode_moa_turn
 
 
-def _make_cli():
+def _make_cli(default_preset="default"):
     cli = HermesCLI.__new__(HermesCLI)
     cli.config = {
         "moa": {
-            "default_preset": "default",
+            "default_preset": default_preset,
             "presets": {
                 "default": {
                     "reference_models": [{"provider": "openai-codex", "model": "gpt-5.5"}],
@@ -91,8 +91,9 @@ class TestNormalizeMoaModel:
     def test_bare_moa_maps_to_default_preset(self):
         from cli import _normalize_moa_model
 
-        with patch("hermes_cli.config.load_config", return_value=_make_cli().config):
-            assert _normalize_moa_model("  MOA  ") == ("moa", "default")
+        config = _make_cli(default_preset="review").config
+        with patch("hermes_cli.config.load_config", return_value=config):
+            assert _normalize_moa_model("  MOA  ") == ("moa", "review")
 
     def test_empty_moa_prefix_is_not_treated_as_virtual(self):
         from cli import _normalize_moa_model
@@ -128,8 +129,9 @@ class TestBareMoaModelSwitch:
     def test_bare_moa_reuses_default_preset_when_already_on_moa(self):
         from hermes_cli.model_switch import switch_model
 
+        config = _make_cli(default_preset="review").config
         with (
-            patch("hermes_cli.config.load_config", return_value=_make_cli().config),
+            patch("hermes_cli.config.load_config", return_value=config),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
                 return_value={
@@ -144,7 +146,7 @@ class TestBareMoaModelSwitch:
             result = switch_model(
                 "moa",
                 "moa",
-                "review",
+                "default",
                 current_base_url="moa://local",
                 current_api_key="moa-virtual-provider",
                 is_global=True,
@@ -152,5 +154,5 @@ class TestBareMoaModelSwitch:
 
         assert result.success is True, result.error_message
         assert result.target_provider == "moa"
-        assert result.new_model == "default"
+        assert result.new_model == "review"
         assert result.is_global is True
