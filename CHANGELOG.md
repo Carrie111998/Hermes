@@ -221,3 +221,6 @@ recorded.
 - `dee2818df7f12949911e87419b33545c350080ce` — required provider payment
   read-backs to carry a non-empty reference/status and valid amount/currency
   fields before settlement or receipt recording.
+- `1e82c8b137b7830534cd0dbb7e5a144877a8be5c` — bound payment idempotency
+  retries to the original intent parameters, rejecting amount, party, tenant,
+  direction, or purpose drift.
