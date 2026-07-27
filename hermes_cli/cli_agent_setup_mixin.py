@@ -14,6 +14,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from rich.markup import escape as _escape
@@ -47,7 +48,11 @@ class CLIAgentSetupMixin:
             _primary_exc = exc
 
         # Primary provider auth failed — try fallback providers before giving up.
-        if runtime is None and _primary_exc is not None:
+        if (
+            runtime is None
+            and _primary_exc is not None
+            and os.environ.get("HERMES_DISABLE_PROVIDER_FALLBACK") != "1"
+        ):
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []

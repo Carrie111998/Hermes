@@ -4129,10 +4129,46 @@ CREATE TABLE IF NOT EXISTS qualification_intake (
     source           TEXT NOT NULL,
     session_id       TEXT,
     attachments_json TEXT NOT NULL DEFAULT '[]',
+    idempotency_digest TEXT,
     status           TEXT NOT NULL DEFAULT 'pending'
-                         CHECK (status IN ('pending', 'qualified', 'rejected', 'overridden')),
+                         CHECK (status IN (
+                             'pending', 'running', 'needs_clarification',
+                             'attention_required', 'qualified', 'rejected', 'overridden'
+                         )),
+    current_run_id   INTEGER,
+    claim_lock       TEXT,
+    claim_expires    INTEGER,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS qualification_intake_runs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id        TEXT NOT NULL,
+    profile          TEXT NOT NULL,
+    provider         TEXT,
+    model            TEXT,
+    effort           TEXT,
+    surface          TEXT NOT NULL DEFAULT 'work_inbox_intake',
+    status           TEXT NOT NULL,
+    claim_lock       TEXT,
+    claim_expires    INTEGER,
+    worker_pid       INTEGER,
+    last_heartbeat_at INTEGER,
+    validation_attempts INTEGER NOT NULL DEFAULT 0,
+    started_at       INTEGER NOT NULL,
+    ended_at         INTEGER,
+    outcome          TEXT,
+    error            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS qualification_intake_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id        TEXT NOT NULL,
+    run_id           INTEGER,
+    kind             TEXT NOT NULL,
+    payload_json     TEXT,
+    created_at       INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS work_contracts (
@@ -4267,6 +4303,10 @@ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_qualification_intake_status
     ON qualification_intake(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_qualification_intake_runs
+    ON qualification_intake_runs(intake_id, id);
+CREATE INDEX IF NOT EXISTS idx_qualification_intake_events
+    ON qualification_intake_events(intake_id, id);
 CREATE INDEX IF NOT EXISTS idx_work_contracts_digest ON work_contracts(digest);
 CREATE INDEX IF NOT EXISTS idx_qualification_decisions_intake
     ON qualification_intake_decisions(intake_id, id);
@@ -4306,6 +4346,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS qualification_intake_status_requires_decision
 BEFORE UPDATE OF status ON qualification_intake
 WHEN NEW.status IS NOT OLD.status
+ AND NEW.status IN ('qualified', 'rejected', 'overridden')
  AND COALESCE(
      (SELECT decision FROM qualification_intake_decisions
       WHERE intake_id = OLD.id ORDER BY id DESC LIMIT 1),
@@ -4313,6 +4354,13 @@ WHEN NEW.status IS NOT OLD.status
  ) != NEW.status
 BEGIN
     SELECT RAISE(ABORT, 'qualification status requires an append-only decision');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_intake_no_terminal_reopen
+BEFORE UPDATE OF status ON qualification_intake
+WHEN OLD.status IN ('qualified', 'rejected', 'overridden')
+ AND NEW.status NOT IN ('qualified', 'rejected', 'overridden')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal qualification intake cannot be reopened');
 END;
 CREATE TRIGGER IF NOT EXISTS board_governance_no_direct_update
 BEFORE UPDATE ON board_governance
@@ -5675,8 +5723,162 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    _migrate_qualification_intake_lifecycle(conn)
     _ensure_qualification_boundary_objects(conn)
     _rebuild_drifted_tables(conn)
+
+
+def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
+    """Add the direct-PO lease lifecycle without losing immutable intake data."""
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'qualification_intake'"
+    ).fetchone()
+    if row is None:
+        return
+    table_sql = str(row["sql"] or "")
+    cols = {
+        str(item["name"])
+        for item in conn.execute("PRAGMA table_info(qualification_intake)")
+    }
+    required = {
+        "idempotency_digest",
+        "current_run_id",
+        "claim_lock",
+        "claim_expires",
+    }
+    legacy_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'qualification_intake_legacy'"
+    ).fetchone() is not None
+    if legacy_exists and required <= cols and "needs_clarification" in table_sql:
+        try:
+            conn.executescript(
+                """
+                BEGIN IMMEDIATE;
+                INSERT OR IGNORE INTO qualification_intake (
+                    id, raw_request, source, session_id, attachments_json,
+                    status, created_at, updated_at
+                )
+                SELECT id, raw_request, source, session_id, attachments_json,
+                       status, created_at, updated_at
+                FROM qualification_intake_legacy;
+                DROP TABLE qualification_intake_legacy;
+                COMMIT;
+                """
+            )
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        legacy_exists = False
+    if not required <= cols or "needs_clarification" not in table_sql:
+        try:
+            conn.executescript(
+                """
+            BEGIN IMMEDIATE;
+            DROP TRIGGER IF EXISTS qualification_intake_immutable_fields;
+            DROP TRIGGER IF EXISTS qualification_intake_no_delete;
+            DROP TRIGGER IF EXISTS qualification_intake_status_requires_decision;
+            DROP TRIGGER IF EXISTS qualification_intake_no_terminal_reopen;
+            DROP TRIGGER IF EXISTS strict_requalification_intake_service_insert;
+            DROP INDEX IF EXISTS idx_qualification_intake_status;
+            ALTER TABLE qualification_intake RENAME TO qualification_intake_legacy;
+            CREATE TABLE qualification_intake (
+                id TEXT PRIMARY KEY,
+                raw_request TEXT NOT NULL,
+                source TEXT NOT NULL,
+                session_id TEXT,
+                attachments_json TEXT NOT NULL DEFAULT '[]',
+                idempotency_digest TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN (
+                        'pending', 'running', 'needs_clarification',
+                        'attention_required', 'qualified', 'rejected', 'overridden'
+                    )),
+                current_run_id INTEGER,
+                claim_lock TEXT,
+                claim_expires INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO qualification_intake (
+                id, raw_request, source, session_id, attachments_json,
+                status, created_at, updated_at
+            )
+            SELECT id, raw_request, source, session_id, attachments_json,
+                   status, created_at, updated_at
+            FROM qualification_intake_legacy;
+            DROP TABLE qualification_intake_legacy;
+            COMMIT;
+            """
+            )
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+    try:
+        conn.executescript(
+            """
+        BEGIN IMMEDIATE;
+        CREATE INDEX IF NOT EXISTS idx_qualification_intake_status
+            ON qualification_intake(status, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_qualification_intake_idempotency
+            ON qualification_intake(idempotency_digest)
+            WHERE idempotency_digest IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_qualification_intake_runs
+            ON qualification_intake_runs(intake_id, id);
+        CREATE INDEX IF NOT EXISTS idx_qualification_intake_events
+            ON qualification_intake_events(intake_id, id);
+
+        DROP TRIGGER IF EXISTS qualification_intake_immutable_fields;
+        CREATE TRIGGER qualification_intake_immutable_fields
+        BEFORE UPDATE ON qualification_intake
+        WHEN NEW.id IS NOT OLD.id
+          OR NEW.raw_request IS NOT OLD.raw_request
+          OR NEW.source IS NOT OLD.source
+          OR NEW.session_id IS NOT OLD.session_id
+          OR NEW.attachments_json IS NOT OLD.attachments_json
+          OR NEW.idempotency_digest IS NOT OLD.idempotency_digest
+          OR NEW.created_at IS NOT OLD.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'qualification intake provenance is immutable');
+        END;
+        DROP TRIGGER IF EXISTS qualification_intake_no_delete;
+        CREATE TRIGGER qualification_intake_no_delete
+        BEFORE DELETE ON qualification_intake BEGIN
+            SELECT RAISE(ABORT, 'qualification intake provenance is immutable');
+        END;
+        DROP TRIGGER IF EXISTS qualification_intake_status_requires_decision;
+        CREATE TRIGGER qualification_intake_status_requires_decision
+        BEFORE UPDATE OF status ON qualification_intake
+        WHEN NEW.status IS NOT OLD.status
+         AND NEW.status IN ('qualified', 'rejected', 'overridden')
+         AND COALESCE(
+             (SELECT decision FROM qualification_intake_decisions
+              WHERE intake_id = OLD.id ORDER BY id DESC LIMIT 1),
+             ''
+         ) != NEW.status
+        BEGIN
+            SELECT RAISE(ABORT, 'qualification status requires an append-only decision');
+        END;
+        DROP TRIGGER IF EXISTS qualification_intake_no_terminal_reopen;
+        CREATE TRIGGER qualification_intake_no_terminal_reopen
+        BEFORE UPDATE OF status ON qualification_intake
+        WHEN OLD.status IN ('qualified', 'rejected', 'overridden')
+         AND NEW.status NOT IN ('qualified', 'rejected', 'overridden')
+        BEGIN
+            SELECT RAISE(ABORT, 'terminal qualification intake cannot be reopened');
+        END;
+        COMMIT;
+        """
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
@@ -6278,33 +6480,81 @@ def create_qualification_intake(
         raise ValueError("raw_request is required")
     if not isinstance(source, str) or not source.strip():
         raise ValueError("source is required")
+    normalized_source = source.strip()
     attachments_json = json.dumps(
-        list(attachments), ensure_ascii=False, separators=(",", ":")
+        list(attachments), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    digest_input = json.dumps(
+        {
+            "raw_request": raw_request,
+            "source": normalized_source,
+            "session_id": session_id,
+            "attachments": json.loads(attachments_json),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    # A session identifier supplies the retry boundary. Without one, two
+    # identical human submissions may be intentional and must remain distinct.
+    idempotency_digest = (
+        hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+        if session_id
+        else None
     )
     now = int(time.time()) if created_at is None else int(created_at)
     for attempt in range(2):
         intake_id = _new_qualification_intake_id()
         try:
             with write_txn(conn):
+                existing = (
+                    conn.execute(
+                        "SELECT id FROM qualification_intake "
+                        "WHERE idempotency_digest = ?",
+                        (idempotency_digest,),
+                    ).fetchone()
+                    if idempotency_digest is not None
+                    else None
+                )
+                if existing is not None:
+                    return str(existing["id"])
                 conn.execute(
                     """
                     INSERT INTO qualification_intake (
                         id, raw_request, source, session_id, attachments_json,
-                        status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                        idempotency_digest, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                     """,
                     (
                         intake_id,
                         raw_request,
-                        source.strip(),
+                        normalized_source,
                         session_id,
                         attachments_json,
+                        idempotency_digest,
                         now,
                         now,
                     ),
                 )
+                append_qualification_intake_event(
+                    conn,
+                    intake_id=intake_id,
+                    kind="submitted",
+                    payload={"source": normalized_source},
+                    created_at=now,
+                )
             return intake_id
         except sqlite3.IntegrityError:
+            existing = (
+                conn.execute(
+                    "SELECT id FROM qualification_intake WHERE idempotency_digest = ?",
+                    (idempotency_digest,),
+                ).fetchone()
+                if idempotency_digest is not None
+                else None
+            )
+            if existing is not None:
+                return str(existing["id"])
             if attempt:
                 raise
     raise RuntimeError("unreachable")
@@ -6349,6 +6599,578 @@ def list_qualification_intakes(
             (status,),
         ).fetchall()
     return [_qualification_intake_dict(row) for row in rows]
+
+
+def _qualification_intake_run_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
+
+
+def claim_qualification_intake(
+    conn: sqlite3.Connection,
+    intake_id: str,
+    *,
+    profile: str,
+    runtime_identity: dict[str, Any],
+    lease_seconds: int = 300,
+    now: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Claim one pending intake and create its immutable runtime attempt."""
+
+    if not profile or not profile.strip():
+        raise ValueError("profile is required")
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    started = int(time.time()) if now is None else int(now)
+    claim_lock = secrets.token_urlsafe(24)
+    claim_expires = started + int(lease_seconds)
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM qualification_intake WHERE id = ?", (intake_id,)
+        ).fetchone()
+        if current is None:
+            raise ValueError(f"unknown qualification intake: {intake_id}")
+        if current["status"] != "pending":
+            return None
+        cursor = conn.execute(
+            """
+            INSERT INTO qualification_intake_runs (
+                intake_id, profile, provider, model, effort, surface, status,
+                claim_lock, claim_expires, last_heartbeat_at, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                intake_id,
+                profile.strip(),
+                runtime_identity.get("provider"),
+                runtime_identity.get("model"),
+                runtime_identity.get("effort"),
+                runtime_identity.get("surface") or "work_inbox_intake",
+                claim_lock,
+                claim_expires,
+                started,
+                started,
+            ),
+        )
+        run_id = int(cursor.lastrowid)
+        updated = conn.execute(
+            """
+            UPDATE qualification_intake
+               SET status = 'running', current_run_id = ?, claim_lock = ?,
+                   claim_expires = ?, updated_at = ?
+             WHERE id = ? AND status = 'pending' AND current_run_id IS NULL
+            """,
+            (run_id, claim_lock, claim_expires, started, intake_id),
+        )
+        if updated.rowcount != 1:
+            conn.execute(
+                "UPDATE qualification_intake_runs "
+                "SET status = 'released', ended_at = ?, outcome = 'claim_lost' "
+                "WHERE id = ?",
+                (started, run_id),
+            )
+            return None
+        append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            run_id=run_id,
+            kind="claimed",
+            payload={
+                "profile": profile.strip(),
+                "provider": runtime_identity.get("provider"),
+                "model": runtime_identity.get("model"),
+                "effort": runtime_identity.get("effort"),
+            },
+            created_at=started,
+        )
+    return get_qualification_intake_run(conn, run_id)
+
+
+def get_qualification_intake_run(
+    conn: sqlite3.Connection, run_id: int
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM qualification_intake_runs WHERE id = ?", (int(run_id),)
+    ).fetchone()
+    return _qualification_intake_run_dict(row) if row else None
+
+
+def set_qualification_intake_worker_pid(
+    conn: sqlite3.Connection,
+    *,
+    intake_id: str,
+    run_id: int,
+    claim_lock: str,
+    worker_pid: int,
+) -> bool:
+    with write_txn(conn):
+        updated = conn.execute(
+            """
+            UPDATE qualification_intake_runs
+               SET worker_pid = ?
+             WHERE id = ? AND intake_id = ? AND status = 'running'
+               AND claim_lock = ?
+            """,
+            (int(worker_pid), int(run_id), intake_id, claim_lock),
+        )
+    return updated.rowcount == 1
+
+
+def heartbeat_qualification_intake(
+    conn: sqlite3.Connection,
+    *,
+    intake_id: str,
+    run_id: int,
+    claim_lock: str,
+    lease_seconds: int = 300,
+    now: Optional[int] = None,
+) -> bool:
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    heartbeat = int(time.time()) if now is None else int(now)
+    expires = heartbeat + int(lease_seconds)
+    with write_txn(conn):
+        updated = conn.execute(
+            """
+            UPDATE qualification_intake_runs
+               SET claim_expires = ?, last_heartbeat_at = ?
+             WHERE id = ? AND intake_id = ? AND status = 'running'
+               AND claim_lock = ?
+            """,
+            (expires, heartbeat, int(run_id), intake_id, claim_lock),
+        )
+        if updated.rowcount != 1:
+            return False
+        current = conn.execute(
+            """
+            UPDATE qualification_intake
+               SET claim_expires = ?, updated_at = ?
+             WHERE id = ? AND status = 'running'
+               AND current_run_id = ? AND claim_lock = ?
+            """,
+            (expires, heartbeat, intake_id, int(run_id), claim_lock),
+        )
+        if current.rowcount != 1:
+            raise RuntimeError("intake claim changed during heartbeat")
+        return True
+
+
+_QUALIFICATION_FAILURE_OUTCOMES = {
+    "spawn_failed",
+    "reclaimed",
+    "crashed",
+    "provider_failed",
+    "protocol_violation",
+}
+
+
+def fail_qualification_intake_run(
+    conn: sqlite3.Connection,
+    *,
+    intake_id: str,
+    run_id: int,
+    claim_lock: str,
+    outcome: str,
+    error: Optional[str] = None,
+    failure_limit: int = 2,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Close one failed attempt and return its retry/attention intake state."""
+
+    if outcome not in _QUALIFICATION_FAILURE_OUTCOMES:
+        raise ValueError("invalid qualification failure outcome")
+    if int(failure_limit) < 1:
+        raise ValueError("failure_limit must be positive")
+    ended = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock "
+            "FROM qualification_intake WHERE id = ?",
+            (intake_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["status"] != "running"
+            or current["current_run_id"] != int(run_id)
+            or current["claim_lock"] != claim_lock
+        ):
+            return None
+        updated = conn.execute(
+            """
+            UPDATE qualification_intake_runs
+               SET status = 'completed', ended_at = ?, outcome = ?, error = ?,
+                   claim_lock = NULL, claim_expires = NULL
+             WHERE id = ? AND intake_id = ? AND status = 'running'
+               AND claim_lock = ?
+            """,
+            (ended, outcome, error, int(run_id), intake_id, claim_lock),
+        )
+        if updated.rowcount != 1:
+            return None
+        placeholders = ",".join("?" for _ in _QUALIFICATION_FAILURE_OUTCOMES)
+        failure_count = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM qualification_intake_runs "
+                f"WHERE intake_id = ? AND outcome IN ({placeholders})",
+                (intake_id, *sorted(_QUALIFICATION_FAILURE_OUTCOMES)),
+            ).fetchone()[0]
+        )
+        next_status = (
+            "attention_required"
+            if failure_count >= int(failure_limit)
+            else "pending"
+        )
+        conn.execute(
+            """
+            UPDATE qualification_intake
+               SET status = ?, current_run_id = NULL, claim_lock = NULL,
+                   claim_expires = NULL, updated_at = ?
+             WHERE id = ? AND current_run_id = ? AND claim_lock = ?
+            """,
+            (next_status, ended, intake_id, int(run_id), claim_lock),
+        )
+        append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            run_id=int(run_id),
+            kind=(
+                "attention_required"
+                if next_status == "attention_required"
+                else "claim_released"
+            ),
+            payload={
+                "outcome": outcome,
+                "error": error,
+                "failure_count": failure_count,
+            },
+            created_at=ended,
+        )
+    return next_status
+
+
+def _qualification_worker_pid_alive(pid: int) -> bool:
+    from gateway.status import _pid_exists
+
+    return _pid_exists(int(pid))
+
+
+def recover_stale_qualification_intakes(
+    conn: sqlite3.Connection,
+    *,
+    failure_limit: int = 2,
+    lease_seconds: int = 300,
+    max_runtime_seconds: int = 15 * 60,
+    now: Optional[int] = None,
+    pid_alive: Optional[Callable[[int], bool]] = None,
+) -> dict[str, int]:
+    """Reclaim expired or dead direct-PO attempts without creating cards."""
+
+    if int(lease_seconds) < 1 or int(max_runtime_seconds) < 1:
+        raise ValueError("lease and max runtime must be positive")
+    timestamp = int(time.time()) if now is None else int(now)
+    alive = pid_alive or _qualification_worker_pid_alive
+    rows = conn.execute(
+        """
+        SELECT q.id AS intake_id, q.current_run_id, q.claim_lock,
+               q.claim_expires, r.worker_pid, r.started_at
+          FROM qualification_intake q
+          JOIN qualification_intake_runs r ON r.id = q.current_run_id
+         WHERE q.status = 'running' AND r.status = 'running'
+        """
+    ).fetchall()
+    counts = {"retried": 0, "attention_required": 0}
+    for row in rows:
+        expired = (
+            row["claim_expires"] is not None
+            and int(row["claim_expires"]) < timestamp
+        )
+        worker_pid = row["worker_pid"]
+        worker_alive = (
+            worker_pid is not None and alive(int(worker_pid))
+        )
+        runtime_exceeded = (
+            timestamp - int(row["started_at"]) > int(max_runtime_seconds)
+        )
+        if expired and worker_alive and not runtime_exceeded:
+            extended_expires = timestamp + int(lease_seconds)
+            try:
+                with write_txn(conn):
+                    run_update = conn.execute(
+                        "UPDATE qualification_intake_runs "
+                        "SET claim_expires = ? "
+                        "WHERE id = ? AND intake_id = ? AND status = 'running' "
+                        "AND claim_lock = ?",
+                        (
+                            extended_expires,
+                            int(row["current_run_id"]),
+                            str(row["intake_id"]),
+                            str(row["claim_lock"]),
+                        ),
+                    )
+                    if run_update.rowcount != 1:
+                        raise RuntimeError(
+                            "intake run claim changed during lease extension"
+                        )
+                    intake_update = conn.execute(
+                        "UPDATE qualification_intake "
+                        "SET claim_expires = ?, updated_at = ? "
+                        "WHERE id = ? AND status = 'running' "
+                        "AND current_run_id = ? AND claim_lock = ?",
+                        (
+                            extended_expires,
+                            timestamp,
+                            str(row["intake_id"]),
+                            int(row["current_run_id"]),
+                            str(row["claim_lock"]),
+                        ),
+                    )
+                    if intake_update.rowcount != 1:
+                        raise RuntimeError(
+                            "intake claim changed during lease extension"
+                        )
+                    append_qualification_intake_event(
+                        conn,
+                        intake_id=str(row["intake_id"]),
+                        run_id=int(row["current_run_id"]),
+                        kind="claim_extended",
+                        payload={
+                            "claim_expires": extended_expires,
+                            "worker_pid": int(worker_pid),
+                        },
+                        created_at=timestamp,
+                    )
+            except RuntimeError:
+                logger.warning(
+                    "qualification intake claim changed during lease extension",
+                    exc_info=True,
+                )
+            continue
+        dead = worker_pid is not None and not worker_alive
+        if not expired and not dead and not runtime_exceeded:
+            continue
+        error = (
+            "worker exceeded maximum intake runtime"
+            if runtime_exceeded
+            else "worker exited or claim heartbeat expired"
+        )
+        status = fail_qualification_intake_run(
+            conn,
+            intake_id=str(row["intake_id"]),
+            run_id=int(row["current_run_id"]),
+            claim_lock=str(row["claim_lock"]),
+            outcome="reclaimed",
+            error=error,
+            failure_limit=1 if runtime_exceeded else failure_limit,
+            now=timestamp,
+        )
+        if status == "pending":
+            counts["retried"] += 1
+        elif status == "attention_required":
+            counts["attention_required"] += 1
+    return counts
+
+
+def append_qualification_intake_event(
+    conn: sqlite3.Connection,
+    *,
+    intake_id: str,
+    kind: str,
+    payload: Optional[dict[str, Any]] = None,
+    run_id: Optional[int] = None,
+    created_at: Optional[int] = None,
+) -> int:
+    if not kind or not kind.strip():
+        raise ValueError("event kind is required")
+    timestamp = int(time.time()) if created_at is None else int(created_at)
+    payload_json = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if payload is not None
+        else None
+    )
+    with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM qualification_intake WHERE id = ?", (intake_id,)
+        ).fetchone() is None:
+            raise ValueError(f"unknown qualification intake: {intake_id}")
+        if run_id is not None and conn.execute(
+            "SELECT 1 FROM qualification_intake_runs "
+            "WHERE id = ? AND intake_id = ?",
+            (int(run_id), intake_id),
+        ).fetchone() is None:
+            raise ValueError("intake run does not belong to intake")
+        cursor = conn.execute(
+            """
+            INSERT INTO qualification_intake_events (
+                intake_id, run_id, kind, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (intake_id, run_id, kind.strip(), payload_json, timestamp),
+        )
+    return int(cursor.lastrowid)
+
+
+def list_qualification_intake_events(
+    conn: sqlite3.Connection, intake_id: str
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM qualification_intake_events "
+        "WHERE intake_id = ? ORDER BY id",
+        (intake_id,),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        payload = None
+        if row["payload_json"] is not None:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                payload = None
+        result.append(
+            {
+                "id": row["id"],
+                "intake_id": row["intake_id"],
+                "run_id": row["run_id"],
+                "kind": row["kind"],
+                "payload": payload,
+                "created_at": row["created_at"],
+            }
+        )
+    return result
+
+
+def finish_qualification_intake_run(
+    conn: sqlite3.Connection,
+    *,
+    intake_id: str,
+    run_id: int,
+    claim_lock: str,
+    intake_status: str,
+    outcome: str,
+    error: Optional[str] = None,
+    now: Optional[int] = None,
+) -> bool:
+    if intake_status not in {
+        "pending",
+        "needs_clarification",
+        "attention_required",
+        "rejected",
+        "qualified",
+    }:
+        raise ValueError("invalid intake completion status")
+    ended = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        intake_row = conn.execute(
+            "SELECT status, current_run_id, claim_lock "
+            "FROM qualification_intake WHERE id = ?",
+            (intake_id,),
+        ).fetchone()
+        if (
+            intake_row is None
+            or intake_row["current_run_id"] != int(run_id)
+            or intake_row["claim_lock"] != claim_lock
+            or intake_row["status"] not in {"running", intake_status}
+        ):
+            return False
+        updated = conn.execute(
+            """
+            UPDATE qualification_intake_runs
+               SET status = 'completed', ended_at = ?, outcome = ?, error = ?,
+                   claim_lock = NULL, claim_expires = NULL
+             WHERE id = ? AND intake_id = ? AND status = 'running'
+               AND claim_lock = ?
+            """,
+            (ended, outcome, error, int(run_id), intake_id, claim_lock),
+        )
+        if updated.rowcount != 1:
+            return False
+        current = conn.execute(
+            """
+            UPDATE qualification_intake
+               SET status = ?, current_run_id = NULL, claim_lock = NULL,
+                   claim_expires = NULL, updated_at = ?
+             WHERE id = ? AND current_run_id = ? AND claim_lock = ?
+            """,
+            (intake_status, ended, intake_id, int(run_id), claim_lock),
+        )
+        if current.rowcount != 1:
+            raise RuntimeError("intake claim changed during completion")
+    return True
+
+
+def retry_qualification_intake(
+    conn: sqlite3.Connection, intake_id: str, *, now: Optional[int] = None
+) -> bool:
+    timestamp = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM qualification_intake WHERE id = ?",
+            (intake_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown qualification intake: {intake_id}")
+        if row["status"] != "attention_required":
+            raise ValueError("intake must be attention_required before retry")
+        if row["current_run_id"] is not None:
+            raise ValueError("cannot retry an intake with an active run")
+        updated = conn.execute(
+            "UPDATE qualification_intake SET status = 'pending', updated_at = ? "
+            "WHERE id = ? AND status = 'attention_required'",
+            (timestamp, intake_id),
+        )
+        if updated.rowcount == 1:
+            append_qualification_intake_event(
+                conn,
+                intake_id=intake_id,
+                kind="retry_scheduled",
+                payload={"from_status": "attention_required"},
+                created_at=timestamp,
+            )
+    return updated.rowcount == 1
+
+
+def respond_to_qualification_clarification(
+    conn: sqlite3.Connection,
+    intake_id: str,
+    *,
+    source: str,
+    response: str,
+    session_id: Optional[str] = None,
+    attachments: Iterable[dict[str, Any]] = (),
+    now: Optional[int] = None,
+) -> bool:
+    """Append a same-source clarification response and reopen the inert intake."""
+
+    exact_response = str(response or "").strip()
+    if not exact_response:
+        raise ValueError("clarification response is required")
+    timestamp = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT source, status FROM qualification_intake WHERE id = ?",
+            (intake_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown qualification intake: {intake_id}")
+        if row["source"] != source:
+            raise PermissionError("clarification source does not match intake")
+        if row["status"] != "needs_clarification":
+            raise ValueError("intake is not waiting for clarification")
+        append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="clarification_response",
+            payload={
+                "response": exact_response,
+                "session_id": session_id,
+                "attachments": list(attachments),
+            },
+            created_at=timestamp,
+        )
+        updated = conn.execute(
+            "UPDATE qualification_intake SET status = 'pending', updated_at = ? "
+            "WHERE id = ? AND status = 'needs_clarification'",
+            (timestamp, intake_id),
+        )
+    return updated.rowcount == 1
 
 
 def record_qualification_decision(
@@ -6408,6 +7230,21 @@ def record_qualification_decision(
         conn.execute(
             "UPDATE qualification_intake SET status = ?, updated_at = ? WHERE id = ?",
             (decision, now, intake_id),
+        )
+        append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind={
+                "qualified": "qualified_materialized",
+                "rejected": "explicitly_rejected",
+                "overridden": "override_materialized",
+            }[decision],
+            payload={
+                "actor_profile": actor_profile.strip(),
+                "reason": reason,
+                "contract_id": contract_id,
+            },
+            created_at=now,
         )
     return int(cursor.lastrowid)
 
@@ -8064,7 +8901,11 @@ def claim_task(
     release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
         candidate = conn.execute(
-            "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+            "SELECT t.work_item_kind, t.workflow_template_id, t.current_step_key, "
+            "       json_extract(w.canonical_json, '$.po_evidence.surface') "
+            "           AS qualification_surface "
+            "FROM tasks t LEFT JOIN work_contracts w ON w.id = t.work_contract_id "
+            "WHERE t.id = ?", (task_id,)
         ).fetchone()
         if candidate is not None and candidate["work_item_kind"] == "epic":
             return None
@@ -8088,7 +8929,21 @@ def claim_task(
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
-        if any(not _dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks) for p in parents):
+        architecture_assessment = (
+            candidate is not None
+            and candidate["workflow_template_id"] == "product"
+            and candidate["current_step_key"] == "architecture"
+            and candidate["qualification_surface"] == "work_inbox_intake"
+        )
+        if (
+            not architecture_assessment
+            and any(
+                not _dependency_parent_satisfied(
+                    p, release_measure_unblocks=release_measure_unblocks
+                )
+                for p in parents
+            )
+        ):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -10317,7 +11172,24 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             )
             for parent in parents
         )
-        new_status = "todo" if has_undone_parent else "ready"
+        task_scope = conn.execute(
+            "SELECT t.current_step_key, "
+            "json_extract(w.canonical_json, '$.po_evidence.surface') "
+            "AS qualification_surface "
+            "FROM tasks t LEFT JOIN work_contracts w ON w.id = t.work_contract_id "
+            "WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+        architecture_assessment = (
+            task_scope is not None
+            and task_scope["current_step_key"] == "architecture"
+            and task_scope["qualification_surface"] == "work_inbox_intake"
+        )
+        new_status = (
+            "todo"
+            if has_undone_parent and not architecture_assessment
+            else "ready"
+        )
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -13106,6 +13978,28 @@ def handoff(
             if cur.rowcount != 1:
                 raise RuntimeError("handoff run ownership changed")
             _sync_legacy_status(conn, task_id, meta)
+            if next_step == "development":
+                release_measure_unblocks = (
+                    _product_release_measure_unblocks_dependents(meta)
+                )
+                parents = conn.execute(
+                    "SELECT p.status, p.workflow_template_id, p.current_step_key "
+                    "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                    "WHERE l.child_id = ?",
+                    (task_id,),
+                ).fetchall()
+                if any(
+                    not _dependency_parent_satisfied(
+                        parent,
+                        release_measure_unblocks=release_measure_unblocks,
+                    )
+                    for parent in parents
+                ):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'todo' "
+                        "WHERE id = ? AND status = 'ready'",
+                        (task_id,),
+                    )
             run_id = _end_run(
                 conn,
                 task_id,
@@ -16064,9 +16958,16 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
-def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
-    """Resolve the fixed profile runtime selected for this dispatched run."""
-    if not task.assignee:
+def resolve_profile_runtime_identity(
+    profile_name: str,
+    *,
+    provider_override: Optional[str] = None,
+    model_override: Optional[str] = None,
+    source: str = "dispatcher",
+    surface: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Resolve provider, model, and effective effort from one named profile."""
+    if not profile_name:
         return None
     try:
         from hermes_constants import (
@@ -16077,7 +16978,7 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
         from hermes_cli.config import load_config
         from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
-        profile = normalize_profile_name(task.assignee)
+        profile = normalize_profile_name(profile_name)
         profile_home = resolve_profile_env(profile)
         token = set_hermes_home_override(profile_home)
         try:
@@ -16088,10 +16989,10 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
         if not isinstance(model_config, dict):
             model_config = {"default": model_config}
         provider = str(
-            task.provider_override or model_config.get("provider") or ""
+            provider_override or model_config.get("provider") or ""
         ).strip().lower()
         model = str(
-            task.model_override
+            model_override
             or model_config.get("default")
             or model_config.get("model")
             or ""
@@ -16122,20 +17023,30 @@ def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
             "provider": provider,
             "model": model,
             "effort": effort,
-            "surface": (
-                "claude-cli" if provider == "claude-cli" else "hermes-primary"
-            ),
-            "source": "dispatcher",
+            "surface": surface
+            or ("claude-cli" if provider == "claude-cli" else "hermes-primary"),
+            "source": source,
             "version": 1,
         }
     except Exception as exc:
         _log.warning(
             "kanban worker: could not resolve canonical runtime identity for "
             "profile=%r (%s)",
-            task.assignee,
+            profile_name,
             exc,
         )
         return None
+
+
+def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
+    """Resolve the fixed profile runtime selected for this dispatched run."""
+    if not task.assignee:
+        return None
+    return resolve_profile_runtime_identity(
+        task.assignee,
+        provider_override=task.provider_override,
+        model_override=task.model_override,
+    )
 
 
 def _stamp_run_executor_identity(

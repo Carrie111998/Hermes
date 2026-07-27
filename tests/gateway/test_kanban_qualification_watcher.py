@@ -100,6 +100,36 @@ def test_rejected_intake_is_counted_without_human_notification_side_effects():
     assert conn.events == []
 
 
+def test_default_watcher_routes_pending_record_through_direct_intake_router(
+    monkeypatch,
+):
+    from hermes_cli import kanban_po_intake
+
+    conn = _Conn(count=0)
+    conn.pending = [
+        {
+            "id": "qi_new",
+            "raw_request": '{"kind":"task_create","request":{"title":"New"}}',
+        }
+    ]
+    observed = []
+    monkeypatch.setattr(
+        kanban_po_intake,
+        "route_pending_intake",
+        lambda selected, *, board, intake: observed.append(
+            (selected, board, intake["id"])
+        )
+        or {"status": "running"},
+    )
+
+    result = _process_pending_qualification_intakes(
+        _Kb, conn, board="strict", per_tick=3
+    )
+
+    assert result["attempted"] == 1
+    assert observed == [(conn, "strict", "qi_new")]
+
+
 def test_new_intake_emits_process_local_wake_after_durable_write(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     observed = []

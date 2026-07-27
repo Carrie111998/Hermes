@@ -186,6 +186,57 @@ def test_task_scoped_claude_roles_expose_both_agent_memory_tools(
     assert "kanban_resolve" not in names
 
 
+def test_model_tool_cache_separates_task_and_work_inbox_surfaces(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_product_owner")
+    monkeypatch.setenv("HERMES_PROFILE", "productowner")
+
+    import tools.kanban_tools  # ensure registered
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setattr(
+        "tools.kanban_tools._is_delegated_child_context",
+        lambda: False,
+    )
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    task_names = {
+        item["function"]["name"]
+        for item in get_tool_definitions(
+            enabled_toolsets=["kanban"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        if item.get("type") == "function"
+    }
+    assert "kanban_complete" in task_names
+    assert "work_inbox_decide" not in task_names
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setenv("HERMES_WORK_INBOX_INTAKE", "qi_one")
+    monkeypatch.setenv("HERMES_WORK_INBOX_RUN_ID", "7")
+    monkeypatch.setenv("HERMES_WORK_INBOX_CLAIM_LOCK", "claim")
+    monkeypatch.setenv("HERMES_MCP_CAPABILITY_SET", "product-owner-intake")
+    invalidate_check_fn_cache()
+    intake_names = {
+        item["function"]["name"]
+        for item in get_tool_definitions(
+            enabled_toolsets=["kanban"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        if item.get("type") == "function"
+    }
+
+    assert "work_inbox_decide" in intake_names
+    assert not any(name.startswith("kanban_") for name in intake_names)
+
+
 def test_review_target_is_visible_only_to_task_scoped_reviewer(
     monkeypatch, tmp_path,
 ):

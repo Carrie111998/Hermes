@@ -243,6 +243,38 @@ class TestCapabilitySets:
         )
         assert "kanban_list" not in selected
 
+    def test_product_owner_intake_capability_is_intake_only(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        selected = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner-intake"}
+        )
+        assert selected == (
+            "work_inbox_show",
+            "work_inbox_decide",
+            "work_inbox_heartbeat",
+            "work_inbox_agent_memory_recall",
+            "work_inbox_agent_memory_write",
+        )
+        assert not any(name.startswith("kanban_") for name in selected)
+
+    def test_capability_selection_does_not_leak_between_runs(self):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        task_tools = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner"}
+        )
+        intake_tools = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner-intake"}
+        )
+        task_tools_again = m.selected_tool_names(
+            {"HERMES_MCP_CAPABILITY_SET": "product-owner"}
+        )
+
+        assert task_tools_again == task_tools
+        assert intake_tools == m.PRODUCT_OWNER_INTAKE_TOOLS
+        assert set(task_tools).isdisjoint(intake_tools)
+
     def test_reviewer_capabilities_are_read_and_lifecycle_only(self):
         from agent.transports import hermes_tools_mcp_server as m
 
@@ -293,6 +325,58 @@ class TestCapabilitySets:
         server = m._build_server()
 
         assert server._tool_manager._tools == {}
+
+    def test_real_intake_server_registers_all_tools_with_nested_decision_schema(
+        self, monkeypatch, tmp_path,
+    ):
+        from agent.transports import hermes_tools_mcp_server as m
+        from model_tools import _clear_tool_defs_cache
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_PROFILE", "productowner")
+        monkeypatch.setenv("HERMES_WORK_INBOX_INTAKE", "qi_one")
+        monkeypatch.setenv("HERMES_WORK_INBOX_RUN_ID", "7")
+        monkeypatch.setenv("HERMES_WORK_INBOX_CLAIM_LOCK", "claim")
+        monkeypatch.setenv(
+            "HERMES_MCP_CAPABILITY_SET", "product-owner-intake"
+        )
+        monkeypatch.setattr(
+            "tools.kanban_tools._is_delegated_child_context",
+            lambda: False,
+        )
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+
+        server = m._build_server()
+        registered = server._tool_manager._tools
+
+        assert set(registered) == set(m.PRODUCT_OWNER_INTAKE_TOOLS)
+        decision = registered["work_inbox_decide"].parameters
+        assert decision["properties"]["disposition"]["enum"] == [
+            "accepted",
+            "needs_clarification",
+            "rejected",
+        ]
+        proposal = next(
+            item
+            for item in decision["properties"]["proposal"]["anyOf"]
+            if item.get("type") == "object"
+        )
+        assert set(proposal["required"]) == {
+            "work",
+            "routing",
+            "handover",
+            "rules",
+            "classification",
+            "stories",
+        }
+        assert set(proposal["properties"]["routing"]["required"]) == {
+            "entry_phase",
+            "assignee",
+            "epic_id",
+            "dependencies",
+        }
 
 
 class TestMain:
