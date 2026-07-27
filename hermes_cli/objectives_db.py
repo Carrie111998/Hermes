@@ -783,6 +783,7 @@ def reaffirm_objective(
     """Refresh standing intent without changing plan or execution authority."""
     now = _now()
     with conn:
+        _assert_employee_actor_scope(conn, objective_id, actor)
         row = conn.execute(
             "SELECT status,expires_at FROM objectives WHERE id=?",
             (objective_id,),
@@ -820,6 +821,7 @@ def transition_objective(
     if next_status not in OBJECTIVE_STATUSES:
         raise ObjectiveStateError(f"unknown objective status: {next_status}")
     with conn:
+        _assert_employee_actor_scope(conn, objective_id, actor)
         row = conn.execute(
             "SELECT status, expires_at, version FROM objectives WHERE id = ?",
             (objective_id,),
@@ -1416,6 +1418,31 @@ def _has_passing_current_plan_verification(
         (objective_id, objective_id),
     ).fetchone()
     return row is not None
+
+
+def _assert_employee_actor_scope(
+    conn: sqlite3.Connection, objective_id: str, actor: str
+) -> None:
+    """Reject employee identities attempting to mutate another organization."""
+    if not actor.startswith("employee:"):
+        return
+    employee_id = actor.split(":", 1)[1].strip()
+    if not employee_id:
+        raise ObjectiveStateError("employee actor identity is empty")
+    objective = conn.execute(
+        "SELECT organization_id FROM objectives WHERE id=?", (objective_id,)
+    ).fetchone()
+    employee = conn.execute(
+        "SELECT organization_id,status FROM employees WHERE id=?", (employee_id,)
+    ).fetchone()
+    if employee is not None and (
+        objective is None
+        or str(employee["organization_id"]) != str(objective["organization_id"])
+        or str(employee["status"]) not in {"proposed", "active", "on_leave"}
+    ):
+        raise ObjectiveStateError(
+            "employee actor is not authorized for objective organization"
+        )
 
 
 def enqueue_objective_event(
