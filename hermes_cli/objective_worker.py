@@ -367,6 +367,12 @@ def run_forever(
                         consecutive_failures = heartbeat(
                             conn, worker_id, cycle_status="worker_error", error=str(exc)
                         )
+                        from hermes_cli import operational_control
+
+                        if operational_control.autonomy_state(conn)["mode"] != "autonomous":
+                            shutdown_reason = "autonomy_paused"
+                            heartbeat(conn, worker_id, cycle_status="paused")
+                            break
                         if consecutive_failures >= failure_threshold:
                             open_worker_circuit(
                                 conn,

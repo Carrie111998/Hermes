@@ -46,6 +46,32 @@ def test_worker_exits_when_autonomy_is_paused(tmp_path):
     assert worker["stop_reason"] == "autonomy_paused"
 
 
+def test_worker_exits_when_autonomy_is_revoked_during_failure(tmp_path):
+    path = tmp_path / "authority.db"
+    calls = []
+
+    def tick():
+        calls.append(True)
+        conn = objectives_db.connect(path)
+        try:
+            operational_control.set_autonomy_mode(
+                conn, mode="paused", actor="human:advisor", reason="emergency stop"
+            )
+        finally:
+            conn.close()
+        raise RuntimeError("provider call interrupted")
+
+    assert objective_worker.run_forever(
+        db_path=path, interval_seconds=900, tick=tick, max_cycles=10
+    ) == 0
+    conn = objectives_db.connect(path)
+    worker = objective_worker.worker_health(conn)[0]
+    assert calls == [True]
+    assert worker["status"] == "stopped"
+    assert worker["stop_reason"] == "autonomy_paused"
+    assert worker["consecutive_failures"] == 0
+
+
 def test_stale_running_worker_is_reported_unhealthy(tmp_path, monkeypatch):
     conn = objectives_db.connect(tmp_path / "authority.db")
     worker_id = objective_worker.register_worker(conn, worker_id="worker_test")

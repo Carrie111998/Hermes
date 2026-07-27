@@ -11,6 +11,9 @@
   reuse.
 - Paused/manual autonomy now causes the supervised objective worker to exit with
   a durable `autonomy_paused` stop reason instead of polling indefinitely.
+- Worker exception handling now checks the persisted autonomy mode, so a
+  provider failure caused by an in-flight emergency stop cannot trigger retry
+  loops.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.
