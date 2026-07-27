@@ -410,6 +410,8 @@ def run_forever(
         "runtime_drift_blocked",
     }
     with objectives_db.connect_closing(db_path) as conn:
+        from hermes_cli import operational_control
+
         reconcile_stale_workers(
             conn,
             stale_after_seconds=max(60, int(interval_seconds * 3)),
@@ -429,6 +431,11 @@ def run_forever(
                         break
                     consecutive_failures = 0
                     try:
+                        # Keep the supervisor itself as a final authority
+                        # boundary.  The default tick_once path performs the
+                        # same check, but alternate/injected callbacks must not
+                        # be able to begin work after an operator pause.
+                        operational_control.assert_autonomous(conn)
                         outcome = tick()
                         heartbeat_keeper.assert_healthy()
                         status = str(getattr(outcome, "status", "unknown"))
@@ -454,8 +461,6 @@ def run_forever(
                             shutdown_reason = "worker_lease_lost"
                             exit_code = 1
                             break
-                        from hermes_cli import operational_control
-
                         if operational_control.autonomy_state(conn)["mode"] != "autonomous":
                             shutdown_reason = "autonomy_paused"
                             heartbeat(conn, worker_id, cycle_status="paused")

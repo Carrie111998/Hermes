@@ -69,6 +69,8 @@ acceptance evidence.
   invoking provider side effects.
 - Standalone objective workers fail closed and stop durably when autonomy is
   disabled or runtime/security/integrity gates block execution.
+- The worker supervisor checks the durable autonomy mode before invoking any
+  tick callback, including alternate or injected integrations.
 - Supervisor startup reconciles expired worker heartbeats into durable `stale`
   stop states instead of leaving dead workers marked `running`, and emits a
   deduplicated advisor intervention with restart/diagnose/manual options.

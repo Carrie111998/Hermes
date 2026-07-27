@@ -101,6 +101,29 @@ def test_worker_exits_when_autonomy_is_disabled(tmp_path):
     assert worker["stop_reason"] == "runtime_blocked:disabled"
 
 
+def test_worker_checks_autonomy_before_injected_callback(tmp_path):
+    path = tmp_path / "authority.db"
+    conn = objectives_db.connect(path)
+    operational_control.set_autonomy_mode(
+        conn, mode="paused", actor="advisor", reason="emergency stop"
+    )
+    conn.close()
+    calls = []
+
+    def tick():
+        calls.append(True)
+        return SimpleNamespace(status="idle")
+
+    assert objective_worker.run_forever(
+        db_path=path, interval_seconds=0.01, tick=tick, max_cycles=3
+    ) == 0
+    conn = objectives_db.connect(path)
+    worker = objective_worker.worker_health(conn)[0]
+    assert calls == []
+    assert worker["status"] == "stopped"
+    assert worker["stop_reason"] == "autonomy_paused"
+
+
 def test_worker_exits_when_autonomy_is_revoked_during_failure(tmp_path):
     path = tmp_path / "authority.db"
     calls = []

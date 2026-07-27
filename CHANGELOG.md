@@ -177,3 +177,5 @@ recorded.
   its SHA is the final commit that contains this changelog entry.
 - Runtime construction now rejects a verifier that shares the planner or
   executor identity, preserving an explicit independent-verification boundary.
+- The supervised worker now checks the durable autonomy kill switch before
+  invoking any tick callback, including alternate worker integrations.
