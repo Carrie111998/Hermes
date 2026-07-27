@@ -447,3 +447,39 @@ a named owner.
 | `aa0c686b1` | H-01 | the crash-patch rationale had gone stale after the 160-commit merge — three claims in it were false | `agent/turn_finalizer.py` (comment) | n/a — documentation | the comment stops describing the code |
 | `5cdd0c3ad`, `83bdb0566`, `8b1c27e4b` | — | peer-session integration merges, no independent behaviour | — | — | — |
 | `6a9c6695b` | — | this ledger section and the Step-8 header rewrite | `PATCH_LEDGER.md`, test header | n/a — documentation | — |
+
+## Failure classification — `tests/gateway/` (measured, not assumed)
+
+A full `tests/gateway/` run at the integration tip reports **74 failed, 11446
+passed, 23 skipped, 1 xfailed**, across 23 files. None of the four suites this
+work changed appear in it. But `gateway/run.py` is imported almost everywhere,
+so "I didn't touch that file" is not proof. Measured instead:
+
+`git archive refs/backup/pre-integration-audit-20260727` was extracted read-only
+to a scratch tree and the same failing files were run on both trees.
+
+| | pre-integration (`bdac397c3`) | integration tip |
+|---|---|---|
+| 22 tracked failing files | **43 failed**, 988 passed | **43 failed**, 988 passed |
+| new failures at HEAD | — | **none** |
+| failures fixed | — | none |
+
+The failure name sets are identical — `comm` reports zero entries on both sides.
+
+The 23rd file, `tests/gateway/test_worker_bridge_ultra.py`, contributes 18 and is
+**untracked**: it does not exist at the pre-integration tip and is in no commit,
+so it cannot have been affected by this work. Its failures are arithmetic inside
+the test.
+
+The remainder of the 74 (74 − 43 − 18 = 13) appear only when the whole directory
+runs together, not when the same files run in a smaller group — cross-file
+pollution, the same condition that aborts a whole-repo `pytest tests/` with 50
+collection errors.
+
+**The count is not a stable signal.** Two runs of identical code, overlapping in
+time, reported 75/11445 and 74/11446. At least one test in this directory is
+order- or contention-sensitive. Compare failure *sets* between trees, as above;
+do not compare counts between runs.
+
+Every remaining `tests/gateway/` failure is therefore pre-existing or
+environment-invalid. None is attributable to this integration.
