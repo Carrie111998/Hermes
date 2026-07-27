@@ -119,17 +119,14 @@ class TestExtractErrorPreview:
 
 
 def _bare_agent() -> AIAgent:
-    """Skip __init__ and only attach the per-turn state dict.
+    """Skip __init__ and only attach the per-turn state dict."""
+    from agent.file_mutation_verifier import TurnFileMutationVerifier
 
-    AIAgent.__init__ takes ~60 parameters and touches network, auth, and
-    the filesystem.  For these tests we only need the two methods —
-    ``_record_file_mutation_result`` and ``_format_file_mutation_failure_footer``.
-    Using ``object.__new__`` mirrors the gateway-test pattern documented in
-    the agent pitfalls list.
-    """
     agent = object.__new__(AIAgent)
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    agent._file_mutation_verifier = TurnFileMutationVerifier()
+    agent._file_mutation_verifier.reset_turn(1)
     return agent
 
 

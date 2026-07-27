@@ -1106,6 +1106,12 @@ def build_turn_context(
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    from agent.file_mutation_verifier import TurnFileMutationVerifier
+
+    agent._file_mutation_verifier = TurnFileMutationVerifier()
+    agent._file_mutation_verifier.reset_turn(
+        generation=getattr(agent, "_user_turn_count", 0) or 0,
+    )
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
 
