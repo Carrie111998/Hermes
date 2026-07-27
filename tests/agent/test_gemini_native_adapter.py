@@ -288,6 +288,89 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
     assert response.choices[0].message.content == "hello"
 
 
+def test_native_client_uses_x_api_key_for_non_google_native_gateway(monkeypatch):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    recorded = {}
+
+    class DummyHTTP:
+        def post(self, url, json=None, headers=None, timeout=None):
+            recorded["url"] = url
+            recorded["headers"] = headers
+            return DummyResponse(
+                payload={
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "hello"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 1,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 2,
+                    },
+                }
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.Client",
+        lambda *a, **k: DummyHTTP(),
+    )
+
+    client = GeminiNativeClient(
+        api_key="gateway-key",
+        base_url="https://gateway.example.com/v1beta",
+    )
+    response = client.chat.completions.create(
+        model="google/gemini-2.5-flash",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+
+    assert (
+        recorded["url"]
+        == "https://gateway.example.com/v1beta/models/gemini-2.5-flash:generateContent"
+    )
+    assert recorded["headers"]["x-api-key"] == "gateway-key"
+    assert "x-goog-api-key" not in recorded["headers"]
+    assert response.choices[0].message.content == "hello"
+
+
+def test_native_client_does_not_add_default_auth_when_headers_provide_auth():
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    client = GeminiNativeClient(
+        api_key="gateway-key",
+        base_url="https://gateway.example.com/v1beta",
+        default_headers={"Authorization": "Bearer proxy-token"},
+    )
+
+    headers = client._headers()
+
+    assert headers["Authorization"] == "Bearer proxy-token"
+    assert "x-api-key" not in headers
+    assert "x-goog-api-key" not in headers
+
+
+@pytest.mark.parametrize(
+    "base_url, expected",
+    [
+        ("https://generativelanguage.googleapis.com/v1beta", True),
+        ("https://generativelanguage.googleapis.com/v1beta/openai", False),
+        ("https://generativelanguage.googleapis.com.evil.test/v1", False),
+        ("https://gateway.example.com/v1beta", True),
+        ("https://gateway.example.com/v1", False),
+    ],
+)
+def test_is_native_gemini_base_url(base_url, expected):
+    from agent.gemini_native_adapter import is_native_gemini_base_url
+
+    assert is_native_gemini_base_url(base_url) is expected
+
+
 @pytest.mark.parametrize("model, expected", [
     ("google/gemini-2.0-flash", "gemini-2.0-flash"),
     ("gemini/gemini-3-pro-preview", "gemini-3-pro-preview"),

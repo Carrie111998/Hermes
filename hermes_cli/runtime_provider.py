@@ -632,6 +632,64 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
+def _resolve_configured_api_key_provider_override(
+    requested_provider: str,
+    *,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    provider = _normalize_custom_provider_name(requested_provider or "")
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if not pconfig or pconfig.auth_type != "api_key":
+        return None
+
+    config = load_config()
+    providers = config.get("providers") if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        return None
+    entry = providers.get(provider)
+    if not isinstance(entry, dict):
+        return None
+
+    from hermes_cli.config import is_provider_enabled
+
+    if not is_provider_enabled(entry):
+        return None
+
+    base_url = (
+        (explicit_base_url or "").strip()
+        or str(entry.get("api") or entry.get("url") or entry.get("base_url") or "").strip()
+    ).rstrip("/")
+    if not base_url:
+        return None
+
+    key_env = str(entry.get("key_env", "") or "").strip()
+    api_key = (
+        (explicit_api_key or "").strip()
+        or (_getenv(key_env, "").strip() if key_env else "")
+        or str(entry.get("api_key", "") or "").strip()
+    )
+    if not api_key:
+        creds = resolve_api_key_provider_credentials(provider)
+        api_key = creds.get("api_key", "")
+
+    result = {
+        "provider": provider,
+        "api_mode": _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
+        or _detect_api_mode_for_url(base_url)
+        or "chat_completions",
+        "base_url": base_url,
+        "api_key": api_key,
+        "source": f"providers.{provider}",
+        "requested_provider": requested_provider,
+    }
+    if entry.get("default_model") or entry.get("model"):
+        result["model"] = entry.get("default_model") or entry.get("model")
+    _lift_extra_headers(entry, result)
+    _lift_max_output_tokens(entry, result)
+    return result
+
+
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
@@ -1663,6 +1721,14 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    configured_builtin = _resolve_configured_api_key_provider_override(
+        requested_provider,
+        explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+    )
+    if configured_builtin:
+        return configured_builtin
 
     if requested_provider == "moa":
         return {

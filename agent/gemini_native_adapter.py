@@ -24,6 +24,7 @@ import time
 import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -64,9 +65,26 @@ def is_native_gemini_base_url(base_url: str) -> bool:
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if not normalized:
         return False
-    if "generativelanguage.googleapis.com" not in normalized:
+    try:
+        parsed = urlparse(normalized)
+    except Exception:
         return False
-    return not normalized.endswith("/openai")
+    if parsed.hostname == "generativelanguage.googleapis.com":
+        return not parsed.path.rstrip("/").endswith("/openai")
+    return parsed.path.rstrip("/").endswith("/v1beta")
+
+
+def _is_google_ai_studio_base_url(base_url: str) -> bool:
+    try:
+        parsed = urlparse(str(base_url or "").strip().lower())
+        return parsed.hostname == "generativelanguage.googleapis.com"
+    except Exception:
+        return False
+
+
+def _has_auth_header(headers: Dict[str, str]) -> bool:
+    auth_headers = {"authorization", "x-api-key", "x-goog-api-key"}
+    return bool(auth_headers & {str(key).lower() for key in headers})
 
 
 def probe_gemini_tier(
@@ -953,17 +971,24 @@ class GeminiNativeClient:
         self.close()
 
     def _headers(self) -> Dict[str, str]:
+        default_headers = dict(self._default_headers)
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "x-goog-api-key": self.api_key,
             # Include Hermes client context following Gemini's partner
             # integration guidance.
             # See https://ai.google.dev/gemini-api/docs/partner-integration
             "User-Agent": f"hermes-agent/{_HERMES_VERSION} (gemini-native)",
             "X-Goog-Api-Client": f"hermes-agent/{_HERMES_VERSION}",
         }
-        headers.update(self._default_headers)
+        if not _has_auth_header(default_headers):
+            auth_header = (
+                "x-goog-api-key"
+                if _is_google_ai_studio_base_url(self.base_url)
+                else "x-api-key"
+            )
+            headers[auth_header] = self.api_key
+        headers.update(default_headers)
         return headers
 
     @staticmethod

@@ -120,6 +120,35 @@ class TestGeminiCredentials:
         assert result["api_key"] == "google-key"
         assert result["base_url"] == "https://generativelanguage.googleapis.com/v1beta"
 
+    def test_runtime_gemini_honors_providers_override(self, monkeypatch):
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setenv("ENTERPRISE_GEMINI_KEY", "gateway-key")
+        monkeypatch.setattr(
+            rp,
+            "load_config",
+            lambda: {
+                "providers": {
+                    "gemini": {
+                        "name": "Enterprise Gemini",
+                        "base_url": "https://gateway.example.com/v1beta",
+                        "key_env": "ENTERPRISE_GEMINI_KEY",
+                        "api_mode": "chat_completions",
+                        "extra_headers": {"CF-Access-Client-Id": "client-id"},
+                    }
+                }
+            },
+        )
+
+        result = rp.resolve_runtime_provider(requested="gemini")
+
+        assert result["provider"] == "gemini"
+        assert result["api_mode"] == "chat_completions"
+        assert result["api_key"] == "gateway-key"
+        assert result["base_url"] == "https://gateway.example.com/v1beta"
+        assert result["extra_headers"] == {"CF-Access-Client-Id": "client-id"}
+        assert result["source"] == "providers.gemini"
+
 
 # ── Model Catalog ──
 
@@ -234,6 +263,23 @@ class TestGeminiAgentInit:
             )
         mock_openai.assert_called_once()
 
+    def test_gemini_custom_v1beta_base_url_uses_native_client(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "gateway-key")
+        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
+             patch("run_agent.OpenAI") as mock_openai, \
+             patch("run_agent.ContextCompressor") as mock_compressor:
+            mock_client.return_value = MagicMock()
+            mock_compressor.return_value = MagicMock(context_length=1048576, threshold_tokens=524288)
+            from run_agent import AIAgent
+            AIAgent(
+                model="gemini-2.5-flash",
+                provider="gemini",
+                api_key="gateway-key",
+                base_url="https://gateway.example.com/v1beta",
+            )
+        assert mock_client.called
+        mock_openai.assert_not_called()
+
     def test_gemini_openai_compat_base_url_keeps_openai_client(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSy_REAL_KEY")
         with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
@@ -270,6 +316,17 @@ class TestGeminiAgentInit:
             from agent.auxiliary_client import resolve_provider_client
             resolve_provider_client("gemini")
         mock_openai.assert_called_once()
+
+    def test_gemini_resolve_provider_client_uses_native_for_custom_v1beta(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "gateway-key")
+        monkeypatch.setenv("GEMINI_BASE_URL", "https://gateway.example.com/v1beta")
+        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client.return_value = MagicMock()
+            from agent.auxiliary_client import resolve_provider_client
+            resolve_provider_client("gemini")
+        assert mock_client.called
+        mock_openai.assert_not_called()
 
 
 # ── models.dev Integration ──
