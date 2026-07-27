@@ -58,6 +58,45 @@ class TriggerError(ValueError):
     pass
 
 
+AUTHENTICATION_MAX_AGE_SECONDS = 300
+AUTHENTICATION_MAX_FUTURE_SKEW_SECONDS = 30
+
+
+def _validate_authentication_freshness(
+    authentication_evidence: Mapping[str, Any], *, now: Optional[int] = None
+) -> None:
+    """Reject replayable authentication evidence outside its freshness window.
+
+    Provider adapters may expose their signed timestamp under one of the
+    conventional names below. Evidence without a timestamp remains accepted
+    for compatibility with local adapters, but any supplied timestamp is
+    strictly typed and bounded before the event can wake an objective.
+    """
+    raw_timestamp = next(
+        (
+            authentication_evidence.get(name)
+            for name in ("signed_timestamp", "authenticated_at", "timestamp")
+            if authentication_evidence.get(name) is not None
+        ),
+        None,
+    )
+    if raw_timestamp is None:
+        return
+    if isinstance(raw_timestamp, bool):
+        raise TriggerError("external event authentication timestamp is invalid")
+    try:
+        signed_at = int(raw_timestamp)
+    except (TypeError, ValueError) as exc:
+        raise TriggerError(
+            "external event authentication timestamp is invalid"
+        ) from exc
+    current = int(time.time()) if now is None else int(now)
+    if signed_at > current + AUTHENTICATION_MAX_FUTURE_SKEW_SECONDS:
+        raise TriggerError("external event authentication timestamp is in the future")
+    if current - signed_at > AUTHENTICATION_MAX_AGE_SECONDS:
+        raise TriggerError("external event authentication evidence is stale")
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     if conn.in_transaction:
         columns = {
@@ -163,6 +202,7 @@ def route_external_event(
         raise TriggerError(
             "external event requires an adapter-validated authentication marker"
         )
+    _validate_authentication_freshness(authentication_evidence)
     if (
         conn.execute(
             "SELECT 1 FROM organizations WHERE id=?", (organization_id,)

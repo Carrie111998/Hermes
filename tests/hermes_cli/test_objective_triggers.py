@@ -124,6 +124,34 @@ def test_external_event_with_unvalidated_evidence_is_rejected(company):
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("signed_timestamp", int(time.time()) + 120, "in the future"),
+        ("authenticated_at", int(time.time()) - 301, "stale"),
+        ("timestamp", "not-a-timestamp", "timestamp is invalid"),
+    ],
+)
+def test_external_event_rejects_invalid_authentication_freshness(
+    company, field, value, message
+):
+    conn, organization_id, _ = company
+    with pytest.raises(objective_triggers.TriggerError, match=message):
+        objective_triggers.route_external_event(
+            conn,
+            organization_id=organization_id,
+            source_type="crm",
+            event_type="lead.changed",
+            source_reference=f"freshness-{field}",
+            payload={"lead_id": "freshness"},
+            authentication_evidence={
+                "method": "provider_hmac",
+                "signature_validated": True,
+                field: value,
+            },
+        )
+
+
 def test_external_events_do_not_wake_terminal_objectives(company):
     conn, organization_id, objective_id = company
     objective_triggers.subscribe(

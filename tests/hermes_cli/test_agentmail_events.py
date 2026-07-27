@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -70,7 +71,7 @@ def test_authenticated_inbound_email_wakes_subscribed_objective_once(tmp_path):
         expected_inbox_id="ceo@agentmail.to",
         payload=_payload(),
         svix_id="delivery_1",
-        svix_timestamp="1000",
+        svix_timestamp=str(int(time.time())),
     )
     replay = agentmail_events.route_authenticated_event(
         conn,
@@ -78,7 +79,7 @@ def test_authenticated_inbound_email_wakes_subscribed_objective_once(tmp_path):
         expected_inbox_id="ceo@agentmail.to",
         payload=_payload(),
         svix_id="delivery_1",
-        svix_timestamp="1000",
+        svix_timestamp=str(int(time.time())),
     )
 
     assert first == replay
@@ -112,7 +113,7 @@ def test_provider_event_identity_cannot_be_reused_with_changed_content(tmp_path)
         expected_inbox_id="ceo@agentmail.to",
         payload=_payload(content="Original customer request"),
         svix_id="delivery_original",
-        svix_timestamp="1000",
+        svix_timestamp=str(int(time.time())),
     )
     with pytest.raises(
         agentmail_events.AgentMailEventError, match="different content"
@@ -123,7 +124,7 @@ def test_provider_event_identity_cannot_be_reused_with_changed_content(tmp_path)
             expected_inbox_id="ceo@agentmail.to",
             payload=_payload(content="Altered customer request"),
             svix_id="delivery_replay",
-            svix_timestamp="1001",
+            svix_timestamp=str(int(time.time())),
         )
     assert conn.execute("SELECT COUNT(*) FROM objective_inbox").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM external_content").fetchone()[0] == 1
@@ -138,7 +139,7 @@ def test_prompt_injection_email_is_quarantined_without_blocking_webhook(tmp_path
         expected_inbox_id="ceo@agentmail.to",
         payload=_payload(content=body),
         svix_id="delivery_2",
-        svix_timestamp="1000",
+        svix_timestamp=str(int(time.time())),
     )
 
     assert len(event_ids) == 1
@@ -192,6 +193,6 @@ def test_inbound_email_cannot_cross_tenant_inbox_binding(tmp_path):
             expected_inbox_id="ceo@agentmail.to",
             payload=_payload(inbox="attacker@agentmail.to"),
             svix_id="delivery_3",
-            svix_timestamp="1000",
+            svix_timestamp=str(int(time.time())),
         )
     assert conn.execute("SELECT COUNT(*) FROM objective_inbox").fetchone()[0] == 0
