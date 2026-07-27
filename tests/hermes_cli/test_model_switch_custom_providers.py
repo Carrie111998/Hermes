@@ -1879,3 +1879,69 @@ def test_same_provider_named_provider_does_not_force_session_url(
     )
     assert result.base_url == "https://api.opencode-go.com/v2"
     assert result.api_key == "sk-rotated"
+
+
+def test_same_provider_named_custom_adopts_rotated_config_creds(
+    tmp_path, monkeypatch
+):
+    """Named custom:* same-provider /model must re-resolve config rotation.
+
+    Unlike bare custom, custom:relay has a durable config identity. Stale
+    session URL/key must not pin over a rotated configured endpoint/key.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        "custom_providers:\n"
+        "- name: relay\n"
+        "  base_url: https://replacement.example/v1\n"
+        "  api_key: rotated-config-key\n"
+        "  model: model-a\n"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    captured: dict = {}
+    from hermes_cli.runtime_provider import resolve_runtime_provider as _real_resolve
+
+    def _spy_resolve(**kwargs):
+        captured.update(kwargs)
+        return _real_resolve(**kwargs)
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _spy_resolve
+    )
+
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom:relay",
+        current_model="model-a",
+        current_api_key="old-session-key",
+        current_base_url="https://retired.example/v1",
+        custom_providers=[
+            {
+                "name": "relay",
+                "base_url": "https://replacement.example/v1",
+                "api_key": "rotated-config-key",
+                "model": "model-a",
+            }
+        ],
+    )
+
+    assert result.success is True
+    assert "explicit_base_url" not in captured or captured.get("explicit_base_url") in (
+        None,
+        "",
+    )
+    assert "explicit_api_key" not in captured or captured.get("explicit_api_key") in (
+        None,
+        "",
+    )
+    assert result.base_url.rstrip("/") == "https://replacement.example/v1"
+    assert result.api_key == "rotated-config-key"

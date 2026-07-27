@@ -1445,12 +1445,10 @@ def switch_model(
             # session endpoint on a same-provider /model switch. Pass the
             # session URL/key as explicit so resolution stays on this endpoint
             # (credential pool can still rotate keys for that URL). Named
-            # providers (OpenCode, etc.) omit these so base_url tweaks still run.
+            # custom:* providers and built-ins (OpenCode, etc.) omit these so
+            # config endpoint/key rotation and base_url tweaks still run.
             _same_provider_kwargs: dict = {}
-            if (
-                current_provider in {"custom", "local"}
-                or str(current_provider).startswith("custom:")
-            ) and current_base_url:
+            if current_provider in {"custom", "local"} and current_base_url:
                 _same_provider_kwargs["explicit_base_url"] = current_base_url
                 if current_api_key:
                     _same_provider_kwargs["explicit_api_key"] = current_api_key
