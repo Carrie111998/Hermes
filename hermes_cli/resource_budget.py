@@ -73,6 +73,11 @@ DEFAULT_LIMITS = {
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction and conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='objective_resource_usage'"
+    ).fetchone():
+        return
     conn.executescript(SCHEMA_SQL)
 
 

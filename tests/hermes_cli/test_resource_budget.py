@@ -11,6 +11,21 @@ from hermes_cli import (
 )
 
 
+def test_schema_reads_preserve_active_authority_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    resource_budget.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO objective_resource_usage "
+        "(objective_id, cycles, actions, input_tokens, output_tokens, "
+        "estimated_compute_cost_minor, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("obj_txn", 1, 0, 0, 0, 0, 1),
+    )
+    assert resource_budget.usage(conn, "obj_txn")["cycles"] == 1
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_objective_compute_ceiling_is_durable_and_fail_closed(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")
     limits = {
