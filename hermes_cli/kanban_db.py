@@ -5819,8 +5819,10 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
                 conn.rollback()
             raise
 
-    conn.executescript(
-        """
+    try:
+        conn.executescript(
+            """
+        BEGIN IMMEDIATE;
         CREATE INDEX IF NOT EXISTS idx_qualification_intake_status
             ON qualification_intake(status, created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_qualification_intake_idempotency
@@ -5870,8 +5872,13 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'terminal qualification intake cannot be reopened');
         END;
+        COMMIT;
         """
-    )
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
@@ -6876,10 +6883,23 @@ def recover_stale_qualification_intakes(
             row["claim_expires"] is not None
             and int(row["claim_expires"]) < timestamp
         )
-        dead = (
-            row["worker_pid"] is not None
-            and not alive(int(row["worker_pid"]))
+        worker_pid = row["worker_pid"]
+        worker_alive = (
+            worker_pid is not None and alive(int(worker_pid))
         )
+        if expired and worker_alive:
+            try:
+                heartbeat_qualification_intake(
+                    conn,
+                    intake_id=str(row["intake_id"]),
+                    run_id=int(row["current_run_id"]),
+                    claim_lock=str(row["claim_lock"]),
+                    now=timestamp,
+                )
+            except RuntimeError:
+                pass
+            continue
+        dead = worker_pid is not None and not worker_alive
         if not expired and not dead:
             continue
         status = fail_qualification_intake_run(

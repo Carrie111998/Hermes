@@ -57,9 +57,9 @@ def dispatch_product_owner_intake(
     phase_assignees = (
         (metadata.get("qualification") or {}).get("phase_assignees") or {}
     )
-    profile = str(
-        phase_assignees.get("backlog") or PRODUCT_OWNER_PROFILE
-    ).strip()
+    profile = str(phase_assignees.get("backlog") or "").strip()
+    if not profile:
+        raise RuntimeError("board policy has no Product Owner backlog phase")
     identity = kanban_db.resolve_profile_runtime_identity(
         profile,
         source="work_inbox_intake",
@@ -270,14 +270,13 @@ def heartbeat_product_owner_intake(
     )
     if not ok:
         raise ValueError("Work Inbox intake heartbeat lost its claim")
-    if note:
-        kanban_db.append_qualification_intake_event(
-            conn,
-            intake_id=intake_id,
-            run_id=int(run["id"]),
-            kind="heartbeat",
-            payload={"note": str(note)},
-        )
+    kanban_db.append_qualification_intake_event(
+        conn,
+        intake_id=intake_id,
+        run_id=int(run["id"]),
+        kind="heartbeat",
+        payload={"note": str(note)} if note else None,
+    )
     return {"status": "running", "intake_id": intake_id, "run_id": run["id"]}
 
 
@@ -443,14 +442,11 @@ def decide_product_owner_intake(
             "next_role": phase_assignees.get(next_phase),
         }
     else:
-        decision.setdefault(
-            "entry_assessment",
-            {
-                "reason": "Epic container has no executable phase",
-                "skipped_phases": [],
-                "evidence": [],
-            },
-        )
+        decision["entry_assessment"] = {
+            "reason": "Epic container has no executable phase",
+            "skipped_phases": [],
+            "evidence": [],
+        }
     try:
         validated = kanban_qualifier.validate_decision(
             conn,

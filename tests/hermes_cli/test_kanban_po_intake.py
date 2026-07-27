@@ -84,6 +84,45 @@ def _proposal():
     }
 
 
+def test_work_inbox_decision_tool_publishes_complete_proposal_shape():
+    from tools.kanban_tools import WORK_INBOX_DECIDE_SCHEMA
+
+    proposal = WORK_INBOX_DECIDE_SCHEMA["parameters"]["properties"]["proposal"]
+    assert set(proposal["required"]) == {
+        "work",
+        "routing",
+        "handover",
+        "rules",
+        "classification",
+        "stories",
+    }
+    assert set(proposal["properties"]["work"]["required"]) == {
+        "item_kind",
+        "work_type",
+        "title",
+        "outcome",
+        "scope",
+        "out_of_scope",
+    }
+    assert set(proposal["properties"]["routing"]["required"]) == {
+        "entry_phase",
+        "assignee",
+        "epic_id",
+        "dependencies",
+    }
+    assert set(proposal["properties"]["handover"]["required"]) == {
+        "deliverables",
+        "required_evidence",
+        "done_when",
+        "next_phase",
+        "next_role",
+    }
+    assert set(proposal["properties"]["rules"]["required"]) == {
+        "allowed",
+        "forbidden",
+    }
+
+
 def test_new_work_launches_configured_product_owner_without_waiting(
     tmp_path, monkeypatch
 ):
@@ -112,6 +151,15 @@ def test_new_work_launches_configured_product_owner_without_waiting(
         kb,
         "resolve_profile_runtime_identity",
         lambda profile, **kwargs: identity,
+    )
+    monkeypatch.setattr(
+        kb,
+        "read_board_metadata",
+        lambda _board: {
+            "qualification": {
+                "phase_assignees": {"backlog": "productowner"}
+            }
+        },
     )
     spawned = []
 

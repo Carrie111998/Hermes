@@ -363,6 +363,51 @@ def test_same_credential_can_answer_clarification_and_retry_attention(
         ] == "retry_scheduled"
 
 
+def test_clarification_question_is_redacted_before_external_status_response(
+    app_client, strict_board, strong_secret, monkeypatch,
+):
+    headers = {"Authorization": f"Bearer {strong_secret}"}
+    submitted = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {"functional_intent": {"title": "Clarify safely"}},
+        },
+    )
+    intake_id = submitted.json()["intake_id"]
+    with kb.connect(board=strict_board) as conn:
+        conn.execute(
+            "UPDATE qualification_intake SET status = 'needs_clarification' "
+            "WHERE id = ?",
+            (intake_id,),
+        )
+        kb.append_qualification_intake_event(
+            conn,
+            intake_id=intake_id,
+            kind="clarification_requested",
+            payload={"question": "Use private-token to choose the tenant"},
+        )
+    monkeypatch.setattr(
+        sys.modules["hermes_dashboard_plugin_kanban"],
+        "redact_sensitive_text",
+        lambda value, **_kwargs: str(value).replace(
+            "private-token", "«redacted»"
+        ),
+    )
+
+    status = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers=headers,
+    )
+
+    assert status.status_code == 200
+    assert status.json()["question"] == "Use «redacted» to choose the tenant"
+    assert "private-token" not in status.text
+
+
 def test_clarification_response_cannot_cross_intake_source(
     app_client, strict_board, strong_secret,
 ):

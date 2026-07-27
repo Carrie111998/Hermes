@@ -868,7 +868,9 @@ def get_work_inbox_status(
             "items": _materialized_intake_items(conn, intake_id),
         }
         if question is not None:
-            response["question"] = question
+            response["question"] = redact_sensitive_text(
+                str(question), force=True
+            )
         if latest_run is not None:
             response["run_id"] = latest_run["id"]
         return response

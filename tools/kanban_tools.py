@@ -3575,6 +3575,135 @@ WORK_INBOX_HEARTBEAT_SCHEMA = {
     },
 }
 
+_WORK_INBOX_STRING_LIST_SCHEMA = {
+    "type": "array",
+    "items": {"type": "string"},
+}
+
+WORK_INBOX_PROPOSAL_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Complete semantic Product Decision. Hermes supplies trusted PO evidence, "
+        "entry routing, skipped-phase evidence, and issuer identity."
+    ),
+    "properties": {
+        "work": {
+            "type": "object",
+            "properties": {
+                "item_kind": {"type": "string", "enum": ["card", "epic"]},
+                "work_type": {"type": "string"},
+                "title": {"type": "string"},
+                "outcome": {"type": "string"},
+                "scope": _WORK_INBOX_STRING_LIST_SCHEMA,
+                "out_of_scope": _WORK_INBOX_STRING_LIST_SCHEMA,
+            },
+            "required": [
+                "item_kind",
+                "work_type",
+                "title",
+                "outcome",
+                "scope",
+                "out_of_scope",
+            ],
+            "additionalProperties": False,
+        },
+        "routing": {
+            "type": "object",
+            "properties": {
+                "entry_phase": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Use null for an Epic; Hermes replaces card routing "
+                        "with the board Architecture phase."
+                    ),
+                },
+                "assignee": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Use null for an Epic; Hermes supplies the card assignee."
+                    ),
+                },
+                "epic_id": {"type": ["string", "null"]},
+                "dependencies": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": [
+                "entry_phase",
+                "assignee",
+                "epic_id",
+                "dependencies",
+            ],
+            "additionalProperties": False,
+        },
+        "handover": {
+            "type": "object",
+            "properties": {
+                "deliverables": _WORK_INBOX_STRING_LIST_SCHEMA,
+                "required_evidence": _WORK_INBOX_STRING_LIST_SCHEMA,
+                "done_when": _WORK_INBOX_STRING_LIST_SCHEMA,
+                "next_phase": {"type": ["string", "null"]},
+                "next_role": {"type": ["string", "null"]},
+            },
+            "required": [
+                "deliverables",
+                "required_evidence",
+                "done_when",
+                "next_phase",
+                "next_role",
+            ],
+            "additionalProperties": False,
+        },
+        "rules": {
+            "type": "object",
+            "properties": {
+                "allowed": _WORK_INBOX_STRING_LIST_SCHEMA,
+                "forbidden": _WORK_INBOX_STRING_LIST_SCHEMA,
+            },
+            "required": ["allowed", "forbidden"],
+            "additionalProperties": False,
+        },
+        "classification": _WORK_INBOX_STRING_LIST_SCHEMA,
+        "stories": {
+            "type": "array",
+            "description": "Empty for a card; required decomposition for an Epic.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "outcome": {"type": "string"},
+                    "scope": _WORK_INBOX_STRING_LIST_SCHEMA,
+                    "out_of_scope": _WORK_INBOX_STRING_LIST_SCHEMA,
+                    "done_when": _WORK_INBOX_STRING_LIST_SCHEMA,
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 0},
+                    },
+                },
+                "required": [
+                    "title",
+                    "outcome",
+                    "scope",
+                    "out_of_scope",
+                    "done_when",
+                    "depends_on",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": [
+        "work",
+        "routing",
+        "handover",
+        "rules",
+        "classification",
+        "stories",
+    ],
+    "additionalProperties": False,
+}
+
 WORK_INBOX_DECIDE_SCHEMA = {
     "name": "work_inbox_decide",
     "description": (
@@ -3590,7 +3719,7 @@ WORK_INBOX_DECIDE_SCHEMA = {
             },
             "reason": {"type": "string"},
             "question": {"type": "string"},
-            "proposal": {"type": "object"},
+            "proposal": WORK_INBOX_PROPOSAL_SCHEMA,
         },
         "required": ["disposition", "reason"],
     },
