@@ -388,10 +388,10 @@ def _maybe_apply_moa_cache_control(
 
     Reuses the SAME policy function as the main agent loop
     (``anthropic_prompt_cache_policy``) resolved against the slot's own
-    provider/base_url/api_mode/model, and the SAME breakpoint layout
-    (``apply_anthropic_cache_control``, system_and_3). This keeps advisor and
-    aggregator calls decorated exactly like an acting agent on that provider
-    would be — no MoA-specific caching logic to drift.
+    provider/base_url/api_mode/model and shared marker helper
+    (``apply_anthropic_cache_control``). MoA has no per-session static prefix,
+    so it uses the helper's legacy system-and-3 fallback without carrying a
+    separate caching strategy.
 
     Returns the messages unchanged on any resolution error or when the
     policy says the route doesn't honor markers.
@@ -480,10 +480,11 @@ def _run_reference(
             reserve_output_tokens=max_tokens,
             context_length_cache=context_length_cache,
         )
-        # Apply the same Anthropic-style prompt-caching decoration the main
-        # agent loop applies (system_and_3 breakpoints). The advisory view is
-        # append-only across iterations (new turns append before the trailing
-        # synthetic marker), so on cache-honoring routes (Claude via
+        # Apply the Anthropic-style prompt-caching decoration used by the main
+        # agent loop. This fixed reference prompt has no session-specific
+        # prefix split, so the helper uses its legacy system-and-3 fallback.
+        # The advisory view is append-only across iterations (new turns append
+        # before the trailing synthetic marker), so on cache-honoring routes (Claude via
         # OpenRouter/native, MiniMax, Qwen/DashScope) iteration N+1's prefix
         # replays iteration N's cached prefix. Without this, Claude advisors
         # served ZERO cache reads across an entire benchmark run (measured:
@@ -1336,6 +1337,63 @@ def _attach_reference_guidance(agg_messages: list[dict[str, Any]], guidance: str
     agg_messages.append({"role": "user", "content": guidance})
 
 
+def peel_reference_guidance(
+    messages: list[dict[str, Any]],
+    guidance: Any,
+) -> list[dict[str, Any]]:
+    """Remove reference guidance previously attached by ``_attach_reference_guidance``.
+
+    Exact inverse of the three attach shapes above (string merge, trailing
+    text part, appended user message) — kept adjacent so the two evolve
+    together; a drifting separator or shape would make the peel silently
+    no-op and let a cache breakpoint land on the turn-varying guidance
+    block (the bug class #72626 fixes).
+
+    Used by the failover redecoration chokepoint: redecoration must run on
+    the base transcript so the last cache breakpoint does not land on the
+    guidance; callers then rebase via ``rebase_prepared_request``.
+
+    Returns a new list (input list and its messages are not mutated).
+    """
+    if not guidance or not messages:
+        return messages
+    guidance_text = str(guidance)
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return messages
+    content = last.get("content")
+    if content == guidance_text:
+        # Attach shape (c): guidance was appended as its own user message.
+        return list(messages[:-1])
+    suffix = "\n\n" + guidance_text
+    if isinstance(content, str) and content.endswith(suffix):
+        # Attach shape (a): merged into a trailing string user turn.
+        peeled = dict(last)
+        peeled["content"] = content[: -len(suffix)]
+        return [*messages[:-1], peeled]
+    if isinstance(content, list) and content:
+        last_part = content[-1]
+        if isinstance(last_part, dict) and last_part.get("type", "text") == "text":
+            text = last_part.get("text") or ""
+            if text == suffix or text == guidance_text:
+                # Attach shape (b): guidance rode as its own trailing part.
+                peeled = dict(last)
+                peeled["content"] = list(content[:-1])
+                if not peeled["content"]:
+                    # The guidance part was the only content — mirror the
+                    # string shape (c) and drop the whole message rather
+                    # than leaving an empty-content user turn behind.
+                    return list(messages[:-1])
+                return [*messages[:-1], peeled]
+            if text.endswith(suffix):
+                new_part = dict(last_part)
+                new_part["text"] = text[: -len(suffix)]
+                peeled = dict(last)
+                peeled["content"] = [*content[:-1], new_part]
+                return [*messages[:-1], peeled]
+    return messages
+
+
 class MoAChatCompletions:
     """OpenAI-chat-compatible facade where the aggregator is the acting model."""
 
@@ -1703,14 +1761,16 @@ class MoAChatCompletions:
         reference_outputs: list[tuple[str, str, Any]] = []
         ref_messages = _reference_messages(messages)
 
-        # Fan-out cadence. "per_iteration" (default): advisors re-run whenever
-        # the advisory view changes — i.e. every tool iteration, since the
-        # view grows with each tool result. "user_turn": advisors run ONCE per
-        # user turn; subsequent tool iterations reuse that turn's advice and
-        # the aggregator acts alone (the original MoA shape: synthesize at the
-        # start, then let the acting model work). Implemented by hashing only
-        # the prefix up to the LAST USER message so mid-turn growth doesn't
-        # change the signature — iteration 2+ becomes a cache HIT.
+        # Fan-out cadence. "user_turn" (default — cheapest cadence, #67199):
+        # advisors run ONCE per user turn; subsequent tool iterations reuse
+        # that turn's advice and the aggregator acts alone (the original MoA
+        # shape: synthesize at the start, then let the acting model work).
+        # Implemented by hashing only the prefix up to the LAST USER message
+        # so mid-turn growth doesn't change the signature — iteration 2+
+        # becomes a cache HIT. "per_iteration": advisors re-run whenever the
+        # advisory view changes — i.e. every tool iteration, since the view
+        # grows with each tool result; advice tracks live task state at the
+        # cost of multiplying advisor latency/spend by tool-loop depth.
         # "every_n:<N>" (N >= 2): the middle ground (issue #63393 — advisor
         # fan-out multiplies latency/cost by the tool-iteration count).
         # Advisors run on iteration 1 of a user turn and then every Nth tool
@@ -1720,7 +1780,7 @@ class MoAChatCompletions:
         # refreshed against the very latest tool results). The iteration
         # counter is scoped per user turn and resets on a new user message,
         # so every turn starts with fresh advice.
-        fanout_mode = str(preset.get("fanout") or "per_iteration").strip().lower()
+        fanout_mode = str(preset.get("fanout") or "user_turn").strip().lower()
         every_n = 0
         if fanout_mode.startswith("every_n:"):
             try:
@@ -1728,8 +1788,8 @@ class MoAChatCompletions:
             except (TypeError, ValueError):
                 every_n = 0
             if every_n < 2:
-                # Unparseable / degenerate cadence degrades to the default,
-                # mirroring _coerce_fanout's tolerant-read contract.
+                # every_n:1 semantically IS per-iteration; degrade there,
+                # mirroring _coerce_fanout's collapse of degenerate N.
                 fanout_mode = "per_iteration"
         sig_messages = ref_messages
         turn_prefix = ref_messages
