@@ -8,10 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.session_activity import ActivityProvenance, build_activity_snapshot
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session_stall import (
     format_session_stall_notification,
-    resolve_session_idle_seconds,
+    resolve_session_idle_seconds_from_activity,
     should_clear_session_stall_notification,
     should_emit_session_stall_notification,
 )
@@ -29,15 +30,32 @@ class _FakeAdapter:
 
 
 class _FakeAgent:
-    def __init__(self, last_activity_ts: float):
+    """Exposes the shared #72039 activity snapshot as the sole progress source."""
+
+    def __init__(
+        self,
+        last_activity_ts: float,
+        *,
+        description: str = "api call",
+        provenance: ActivityProvenance = ActivityProvenance.UNKNOWN,
+    ):
         self._last_activity_ts = last_activity_ts
+        self._last_activity_desc = description
+        self._last_activity_provenance = provenance
 
     def get_activity_summary(self):
-        elapsed = time.time() - self._last_activity_ts
-        return {
-            "last_activity_ts": self._last_activity_ts,
-            "seconds_since_activity": elapsed,
-        }
+        return build_activity_snapshot(
+            last_activity_at=self._last_activity_ts,
+            last_activity_description=self._last_activity_desc,
+            last_activity_provenance=self._last_activity_provenance,
+        )
+
+
+class _AgentWithoutSummary:
+    """Agent with a raw clock but no shared summary consumer API."""
+
+    def __init__(self, last_activity_ts: float):
+        self._last_activity_ts = last_activity_ts
 
 
 def test_should_emit_requires_pending_and_idle():
@@ -98,15 +116,28 @@ def test_format_session_stall_notification_minutes():
     assert format_session_stall_notification(30).count("1 min ago") == 1
 
 
-def test_resolve_session_idle_seconds_prefers_activity_clock():
+def test_resolve_idle_uses_shared_activity_snapshot_only():
     now = 1_000_000.0
-    idle = resolve_session_idle_seconds(
+    snap = build_activity_snapshot(
+        last_activity_at=now - 120,
+        last_activity_description="tool: terminal",
+        last_activity_provenance=ActivityProvenance.UNKNOWN,
         now=now,
-        last_activity_ts=now - 120,
-        turn_started_ts=now - 999,
-        pending_event_ts=now - 50,
     )
-    assert idle == 120.0
+    assert resolve_session_idle_seconds_from_activity(snap, now=now) == 120.0
+    assert resolve_session_idle_seconds_from_activity(None, now=now) is None
+    assert resolve_session_idle_seconds_from_activity({}, now=now) is None
+
+
+def test_resolve_idle_prefers_seconds_since_activity_field():
+    idle = resolve_session_idle_seconds_from_activity(
+        {
+            "seconds_since_activity": 42.5,
+            "last_activity_at": 1.0,  # must be ignored when seconds present
+        },
+        now=999.0,
+    )
+    assert idle == 42.5
 
 
 def _runner_for_stall(adapter: _FakeAdapter) -> GatewayRunner:
@@ -118,7 +149,9 @@ def _runner_for_stall(adapter: _FakeAdapter) -> GatewayRunner:
     r._running_agents_ts = {}
     r._queued_events = {}
     r._session_stall_notified = {}
-    r._thread_metadata_for_source = lambda source, *a, **k: {"thread_id": getattr(source, "thread_id", None)}
+    r._thread_metadata_for_source = lambda source, *a, **k: {
+        "thread_id": getattr(source, "thread_id", None)
+    }
     return r
 
 
@@ -190,7 +223,8 @@ async def test_check_session_stalls_clears_latch_when_pending_drains():
 
 
 @pytest.mark.asyncio
-async def test_check_session_stalls_uses_turn_start_for_pending_sentinel():
+async def test_check_session_stalls_skips_pending_sentinel_without_activity():
+    """Pending construction has no shared activity snapshot — no parallel clocks."""
     adapter = _FakeAdapter()
     runner = _runner_for_stall(adapter)
     session_key = "agent:main:telegram:dm:5"
@@ -199,8 +233,23 @@ async def test_check_session_stalls_uses_turn_start_for_pending_sentinel():
     runner._running_agents_ts[session_key] = time.time() - 90
 
     sent = await runner._check_session_stalls(60)
-    assert sent == 1
-    assert len(adapter.sent) == 1
+    assert sent == 0
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_ignores_raw_clock_without_summary():
+    """Do not fall back to agent._last_activity_ts outside get_activity_summary()."""
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:raw"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _AgentWithoutSummary(time.time() - 999)
+    runner._running_agents_ts[session_key] = time.time() - 999
+
+    sent = await runner._check_session_stalls(60)
+    assert sent == 0
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
@@ -247,6 +296,27 @@ async def test_check_session_stalls_scans_profile_adapters():
 
     assert await runner._check_session_stalls(60) == 1
     assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_check_session_stalls_logs_compression_provenance(caplog):
+    """Provenance from the shared contract stays visible in stall diagnostics."""
+    import logging
+
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    session_key = "agent:main:telegram:dm:compress"
+    adapter._pending_messages[session_key] = _pending_event()
+    runner._running_agents[session_key] = _FakeAgent(
+        time.time() - 120,
+        description="compressing context",
+        provenance=ActivityProvenance.AGENT_COMPRESSION,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert await runner._check_session_stalls(60) == 1
+    assert any("agent.compression" in r.message for r in caplog.records)
+    assert any("compressing context" in r.message for r in caplog.records)
 
 
 def test_session_stall_timeout_in_default_config():

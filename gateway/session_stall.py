@@ -1,15 +1,26 @@
-"""Gateway session stall detection helpers (#72016 item 2).
+"""Gateway session stall notification policy (#72016 item 2).
 
-A session is "stalled with pending inbound" when the user has a queued follow-up
-message while the running agent has not touched its activity clock for longer
-than ``agent.session_stall_timeout``. This is distinct from ``gateway_timeout``
-(which kills the in-flight turn) and ``gateway_notify_interval`` (periodic
-"still working" heartbeats during healthy long runs).
+Consumes the shared activity observation contract from
+``agent.session_activity`` / ``AIAgent.get_activity_summary()``
+(#72039) as the **single progress source**. This module owns only the
+notify-once policy for "pending inbound + stale progress"; it does not
+invent a parallel progress clock from turn-start or inbound event
+timestamps.
+
+Boundaries (keep separate):
+- ``gateway/shutdown_watchdog.py`` — process / event-loop liveness
+- ``gateway/delivery_ledger.py`` — outbound delivery obligations
+- Pending inbound here is a stall *policy gate* (queued follow-up exists),
+  not an outbound obligation and not a progress timestamp.
+
+Notification / timeout / kill / retry policy stay in their own components;
+the shared contract remains observation-only (timestamp + bounded
+description + provenance).
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 
 def should_emit_session_stall_notification(
@@ -56,28 +67,49 @@ def format_session_stall_notification(idle_seconds: float) -> str:
     )
 
 
-def resolve_session_idle_seconds(
+def resolve_session_idle_seconds_from_activity(
+    activity: Optional[Mapping[str, Any]],
     *,
-    now: float,
-    last_activity_ts: Optional[float] = None,
-    turn_started_ts: Optional[float] = None,
-    pending_event_ts: Optional[float] = None,
+    now: Optional[float] = None,
 ) -> Optional[float]:
-    """Pick the best available activity clock and return idle seconds.
+    """Idle seconds from a shared activity snapshot only (#72039 contract).
 
-    Preference order mirrors the issue's ``last_activity_at`` intent:
-    1. Agent ``_last_activity_ts`` (API/tool/compaction progress)
-    2. Turn start timestamp (agent still pending construction)
-    3. Pending inbound event timestamp (last resort)
+    Prefers ``seconds_since_activity`` when present and finite; otherwise
+    derives from ``last_activity_at`` / ``last_activity_ts``. Returns
+    ``None`` when there is no usable progress timestamp — callers must
+    not fall back to turn-start or pending-inbound clocks.
     """
-    for ts in (last_activity_ts, turn_started_ts, pending_event_ts):
-        if ts is None:
-            continue
+    if not activity:
+        return None
+
+    elapsed = activity.get("seconds_since_activity")
+    if elapsed is not None:
         try:
-            idle = float(now) - float(ts)
+            idle = float(elapsed)
         except (TypeError, ValueError):
-            continue
-        if idle < 0:
-            return 0.0
-        return idle
-    return None
+            idle = None
+        else:
+            if idle < 0:
+                return 0.0
+            return idle
+
+    ts = activity.get("last_activity_at")
+    if ts is None:
+        ts = activity.get("last_activity_ts")
+    if ts is None:
+        return None
+    try:
+        when = float(ts)
+    except (TypeError, ValueError):
+        return None
+
+    if now is None:
+        import time as _time
+
+        clock = float(_time.time())
+    else:
+        clock = float(now)
+    idle = clock - when
+    if idle < 0:
+        return 0.0
+    return idle

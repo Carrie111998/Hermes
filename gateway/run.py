@@ -9182,43 +9182,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 seen.add(aid)
                 yield adapter
 
-    def _session_idle_seconds_for_stall(
-        self, session_key: str, pending_event: Any, *, now: Optional[float] = None
-    ) -> Optional[float]:
-        """Resolve idle seconds for stall detection from agent / turn clocks."""
-        from gateway.session_stall import resolve_session_idle_seconds
+    def _session_activity_for_stall(self, session_key: str) -> Optional[dict]:
+        """Return the shared activity snapshot for stall progress (#72039).
 
-        now_ts = time.time() if now is None else float(now)
-        last_activity_ts = None
+        Single progress source: ``AIAgent.get_activity_summary()`` /
+        ``agent.session_activity``. No turn-start or pending-inbound clocks.
+        """
         agent = (getattr(self, "_running_agents", None) or {}).get(session_key)
-        if agent is not None and agent is not _AGENT_PENDING_SENTINEL:
-            if hasattr(agent, "get_activity_summary"):
-                try:
-                    summary = agent.get_activity_summary()
-                    last_activity_ts = summary.get("last_activity_ts")
-                except Exception:
-                    last_activity_ts = None
-            if last_activity_ts is None:
-                last_activity_ts = getattr(agent, "_last_activity_ts", None)
-
-        turn_started_ts = (getattr(self, "_running_agents_ts", None) or {}).get(
-            session_key
-        )
-
-        pending_event_ts = None
-        ts = getattr(pending_event, "timestamp", None)
-        if ts is not None:
-            try:
-                pending_event_ts = float(ts.timestamp()) if hasattr(ts, "timestamp") else float(ts)
-            except (TypeError, ValueError, OSError):
-                pending_event_ts = None
-
-        return resolve_session_idle_seconds(
-            now=now_ts,
-            last_activity_ts=last_activity_ts,
-            turn_started_ts=turn_started_ts,
-            pending_event_ts=pending_event_ts,
-        )
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return None
+        if not hasattr(agent, "get_activity_summary"):
+            return None
+        try:
+            summary = agent.get_activity_summary()
+        except Exception:
+            return None
+        return summary if isinstance(summary, dict) else None
 
     async def _check_session_stalls(self, timeout_seconds: float) -> int:
         """Scan pending inbound sessions and notify once per stall episode.
@@ -9227,6 +9206,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.session_stall import (
             format_session_stall_notification,
+            resolve_session_idle_seconds_from_activity,
             should_clear_session_stall_notification,
             should_emit_session_stall_notification,
         )
@@ -9262,10 +9242,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         for session_key, (adapter, pending_event) in list(candidates.items()):
             has_pending = pending_event is not None
+            activity = (
+                self._session_activity_for_stall(session_key) if has_pending else None
+            )
             idle_seconds = (
-                self._session_idle_seconds_for_stall(
-                    session_key, pending_event, now=now
-                )
+                resolve_session_idle_seconds_from_activity(activity, now=now)
                 if has_pending
                 else None
             )
@@ -9288,13 +9269,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if idle_seconds is None:
                 continue
             mins = max(1, int(idle_seconds // 60))
+            activity = activity or {}
             logger.warning(
                 "Session stall detected: session=%s idle=%.0fs "
-                "(timeout=%.0fs, ~%d min); pending inbound present",
+                "(timeout=%.0fs, ~%d min); pending inbound present "
+                "| last_activity=%s | provenance=%s",
                 session_key,
                 idle_seconds,
                 timeout_seconds,
                 mins,
+                activity.get("last_activity_desc")
+                or activity.get("last_activity_description")
+                or "unknown",
+                activity.get("provenance")
+                or activity.get("last_activity_provenance")
+                or "unknown",
             )
             source = getattr(pending_event, "source", None)
             chat_id = getattr(source, "chat_id", None) if source is not None else None
@@ -9334,7 +9323,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return sent
 
     async def _session_stall_watcher(self, interval: float = 30.0):
-        """Periodic pending-inbound + stale-activity stall watchdog (#72016)."""
+        """Periodic pending-inbound + stale-activity stall watchdog (#72016).
+
+        Progress comes only from ``get_activity_summary()`` (#72039).
+        Pending inbound is a notify policy gate, not a progress clock.
+        Notify-only: does not kill the turn (contrast ``gateway_timeout`` /
+        ``shutdown_watchdog``).
+        """
         # Short initial delay so startup reconnect noise does not false-fire.
         await asyncio.sleep(min(30.0, max(1.0, float(interval))))
         while self._running:
