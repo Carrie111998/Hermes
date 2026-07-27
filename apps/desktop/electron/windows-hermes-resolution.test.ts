@@ -21,6 +21,7 @@ function functionBody(source: string, declaration: string) {
   const fnStart = source.indexOf(declaration)
   assert.notEqual(fnStart, -1, `${declaration} must exist`)
   const fnEnd = source.indexOf('\nfunction ', fnStart + 1)
+
   return source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd)
 }
 
