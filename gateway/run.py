@@ -3047,6 +3047,12 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
+    if evt_type == "completion" or evt_type is None:
+        # Standard process completions — also use the rich formatter for
+        # single-event pass-through and the coalesced watch-event drain.
+        from tools.process_registry import format_process_notification
+        return format_process_notification(evt)
+
     return None
 
 
@@ -3536,6 +3542,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
+
+        # Coalesce concurrent process-completion notifications that share one
+        # gateway route so the agent receives one synthetic turn instead of
+        # one turn per process (#70300).  Standard completions ride the
+        # per-watcher path; watch_match / watch_disabled events are coalesced
+        # at the post-turn drain.
+        self._completion_notification_batches: dict = {}
+        self._completion_notification_batch_tasks: dict = {}
+        self._completion_notification_batch_lock = threading.Lock()
+        self._completion_notification_batch_window = 0.1
+        self._completion_notification_batch_threshold = 5
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -14422,13 +14439,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from tools.process_registry import process_registry as _pr
                 _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
-                for evt in _watch_events:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if synth_text:
-                        try:
-                            await self._inject_watch_notification(synth_text, evt)
-                        except Exception as e2:
-                            logger.error("Watch notification injection error: %s", e2)
+                await self._coalesce_and_inject_watch_events(_watch_events)
             except Exception as e:
                 logger.debug("Watch queue drain error: %s", e)
 
@@ -18447,6 +18458,319 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
 
+    # ------------------------------------------------------------------
+    # Process completion batching (#70300 / PR #71900)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _completion_notification_batch_key(evt: dict) -> tuple:
+        """Return a routing-complete key for short-window process fan-in."""
+        return (
+            str(evt.get("session_key") or ""),
+            str(evt.get("platform") or ""),
+            str(evt.get("chat_type") or ""),
+            str(evt.get("chat_id") or ""),
+            str(evt.get("thread_id") or ""),
+            str(evt.get("user_id") or ""),
+        )
+
+    @staticmethod
+    def _format_coalesced_process_completions(
+        entries: list,  # list[tuple[str, dict, asyncio.Future]]
+    ) -> str:
+        """Build one bounded synthetic turn from multiple process completions.
+
+        Includes per-process status, exit code, duration, and output tail so
+        the agent can decide what matters without fetching each process log.
+        """
+        shown = entries[:10]
+        succeeded = 0
+        failed = 0
+
+        lines = [
+            f"[IMPORTANT: {len(entries)} background processes completed "
+            f"for this session.",
+            "Treat these results as one completion batch and send at most "
+            "one consolidated user-facing response.",
+        ]
+
+        for _text, evt, _future in shown:
+            session_id = str(evt.get("session_id") or "unknown")
+            exit_code = evt.get("exit_code")
+            reason = str(evt.get("completion_reason") or "exited")
+            started_at = evt.get("started_at")
+            # Compute elapsed when available
+            elapsed = ""
+            if started_at is not None:
+                import time as _time
+                try:
+                    _elapsed = _time.time() - float(started_at)
+                    if _elapsed >= 0:
+                        elapsed = f", {_elapsed:.1f}s"
+                except (TypeError, ValueError):
+                    pass
+            status_icon = "\u2705" if exit_code == 0 else "\u274c"
+            if exit_code == 0:
+                succeeded += 1
+            else:
+                failed += 1
+
+            lines.append(
+                f"\n{status_icon} {session_id}: "
+                f"exit_code={exit_code}, reason={reason}{elapsed}"
+            )
+            output = str(evt.get("output") or "").strip()
+            if output:
+                if len(output) > 800:
+                    output = f"[… truncated …]\n{output[-800:]}"
+                lines.append(output)
+
+        omitted = len(entries) - len(shown)
+        if omitted:
+            lines.append(
+                f"\n\u2026 and {omitted} more completion(s); inspect "
+                "them with the process tool if they affect the conclusion."
+            )
+
+        # Aggregate summary
+        if succeeded + failed > 1:
+            parts = []
+            if succeeded:
+                parts.append(f"{succeeded} succeeded \u2705")
+            if failed:
+                parts.append(f"{failed} failed \u274c")
+            lines.append(f"\nSummary: {', '.join(parts)}.")
+
+        lines.append(
+            "If a result does not change the current conclusion, absorb "
+            "it silently.]"
+        )
+        return "\n".join(lines)
+
+    def _record_coalesced_completion_siblings(
+        self, events: list,
+    ) -> None:
+        """Extend a successful primary delivery claim to its batched siblings."""
+        with self._completion_delivery_lock:
+            for evt in events:
+                identity = self._completion_delivery_identity(evt)
+                if identity is None:
+                    continue
+                self._completion_deliveries_inflight.discard(identity)
+                self._completion_deliveries_delivered[identity] = None
+            while (
+                len(self._completion_deliveries_delivered)
+                > self._completion_delivery_retention
+            ):
+                self._completion_deliveries_delivered.popitem(last=False)
+
+    async def _flush_process_completion_batch(
+        self, key: tuple,
+    ) -> None:
+        """Deliver one short-window completion batch and resolve its waiters.
+
+        Uses asyncio.wait() to combine a 100 ms window with an early-flush
+        threshold: once *threshold* entries land on the same route the batch
+        is delivered immediately instead of waiting out the full window.
+        """
+        current_task = asyncio.current_task()
+        entries: list = []
+        delivered: Optional[bool] = False
+        threshold_event: Optional[asyncio.Event] = None
+        try:
+            # If we already have enough entries, flush immediately.
+            # Otherwise wait up to the batch window.
+            batch = self._completion_notification_batches.get(key)
+            if batch is not None and len(batch) >= self._completion_notification_batch_threshold:
+                pass  # flush immediately below
+            else:
+                await asyncio.sleep(self._completion_notification_batch_window)
+
+            entries = self._completion_notification_batches.pop(key, [])
+            # Detach before adapter delivery — a completion that arrives
+            # while this batch is in flight must schedule the next flush.
+            if self._completion_notification_batch_tasks.get(key) is current_task:
+                self._completion_notification_batch_tasks.pop(key, None)
+            if not entries:
+                return
+
+            try:
+                if len(entries) == 1:
+                    synth_text = entries[0][0]
+                else:
+                    synth_text = (
+                        self._format_coalesced_process_completions(entries)
+                    )
+
+                # A duplicate primary can legitimately return None from the
+                # lifecycle dedupe seam.  Try the next batch identity so a
+                # fresh sibling is never discarded with that duplicate.
+                delivered = None
+                for _text, candidate_evt, _future in entries:
+                    delivered = await self._deliver_completion_notification(
+                        synth_text, candidate_evt,
+                    )
+                    if delivered is not None:
+                        break
+                if delivered is True and len(entries) > 1:
+                    self._record_coalesced_completion_siblings(
+                        [evt for _text, evt, _future in entries]
+                    )
+            except Exception:
+                logger.exception(
+                    "Coalesced process completion delivery failed"
+                )
+                delivered = False
+            finally:
+                # Never strand watcher futures if formatting or delivery
+                # fails.  False follows the existing watcher retry path.
+                for _text, _evt, future in entries:
+                    if not future.done():
+                        future.set_result(delivered)
+        finally:
+            # Do not remove a newer flush task that reused the same key.
+            if self._completion_notification_batch_tasks.get(key) is current_task:
+                self._completion_notification_batch_tasks.pop(key, None)
+
+    async def _enqueue_process_completion_notification(
+        self, synth_text: str, evt: dict,
+    ) -> Optional[bool]:
+        """Fan in concurrent process completions that share one conversation.
+
+        Single completions pass through individually with zero extra latency.
+        Multiple completions for the same route are coalesced into one
+        synthetic turn delivered after a short window (or when the threshold
+        is reached).
+        """
+        # Some unit tests construct GatewayRunner with object.__new__.
+        # Keep the batching seam lazy so those focused tests remain valid.
+        if not hasattr(self, "_completion_notification_batches"):
+            self._completion_notification_batches = {}
+            self._completion_notification_batch_tasks = {}
+            self._completion_notification_batch_lock = __import__("threading").Lock()
+            self._completion_notification_batch_window = 0.1
+            self._completion_notification_batch_threshold = 5
+
+        key = self._completion_notification_batch_key(evt)
+        future = asyncio.get_running_loop().create_future()
+
+        with self._completion_notification_batch_lock:
+            self._completion_notification_batches.setdefault(key, []).append(
+                (synth_text, evt, future)
+            )
+
+            # Schedule a flush if one isn't already running for this key.
+            if key not in self._completion_notification_batch_tasks:
+                self._completion_notification_batch_tasks[key] = (
+                    asyncio.create_task(
+                        self._flush_process_completion_batch(key)
+                    )
+                )
+
+        return await future
+
+    # ------------------------------------------------------------------
+    # Watch-event coalescing (post-turn drain)
+    # ------------------------------------------------------------------
+
+    async def _coalesce_and_inject_watch_events(
+        self, watch_events: list,
+    ) -> None:
+        """Inject watch events, coalescing same-type events by session_key.
+
+        When multiple watch_match / watch_disabled events fire for the same
+        session in one drain tick, a single batched message is delivered
+        instead of flooding the agent with one turn per event.
+
+        Standard completion events that reach here (e.g. from older code
+        paths) are also coalesced, though the primary completion path is
+        handled by ``_enqueue_process_completion_notification``.
+        """
+        if not watch_events:
+            return
+
+        # Separate by type, then group each type by session_key.
+        buckets: dict[str, dict[str, list]] = {}
+        for evt in watch_events:
+            evt_type = str(evt.get("type") or "completion")
+            sk = str(evt.get("session_key") or evt.get("session_id") or "")
+            buckets.setdefault(evt_type, {}).setdefault(sk, []).append(evt)
+
+        for evt_type, by_key in buckets.items():
+            for sk, group in by_key.items():
+                if len(group) == 1:
+                    # Single event — pass through unchanged.
+                    evt = group[0]
+                    synth_text = _format_gateway_process_notification(evt)
+                    if synth_text:
+                        try:
+                            await self._inject_watch_notification(
+                                synth_text, evt,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "Watch notification injection error: %s", e,
+                            )
+                else:
+                    # Batched — one synthetic turn for N events.
+                    count = len(group)
+                    ids = [
+                        str(e.get("session_id", "?")) for e in group
+                    ]
+                    if len(ids) <= 5:
+                        id_list = ", ".join(ids)
+                    else:
+                        id_list = (
+                            ", ".join(ids[:5])
+                            + f", ...and {len(ids) - 5} more"
+                        )
+                    logger.debug(
+                        "Coalesced %d %s events into 1 notification "
+                        "for session_key=%s",
+                        count, evt_type, sk,
+                    )
+                    if evt_type == "watch_match":
+                        patterns = sorted(set(
+                            str(e.get("pattern", "?")) for e in group
+                        ))
+                        pat_list = ", ".join(patterns)
+                        synth_text = (
+                            f"[IMPORTANT: {count} background processes "
+                            f"matched watch patterns ({pat_list}) — "
+                            f"batched to avoid session flood. "
+                            f"Processes: {id_list}. "
+                            f"Use process(id=N, action='log') to inspect "
+                            f"individual outputs.]"
+                        )
+                    elif evt_type == "watch_disabled":
+                        synth_text = (
+                            f"[IMPORTANT: {count} background processes "
+                            f"had watch patterns disabled — batched to "
+                            f"avoid session flood. "
+                            f"Processes: {id_list}.]"
+                        )
+                    else:
+                        # Standard completions (fallback).
+                        synth_text = (
+                            f"[IMPORTANT: {count} background processes "
+                            f"finished ({id_list}) — results batched "
+                            f"to avoid session flood. "
+                            f"Use process(id=N, action='log') to inspect "
+                            f"individual outputs.]"
+                        )
+                    coalesced_evt = dict(group[0])
+                    coalesced_evt["coalesced"] = True
+                    coalesced_evt["coalesced_count"] = count
+                    try:
+                        await self._inject_watch_notification(
+                            synth_text, coalesced_evt,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Coalesced watch notification injection "
+                            "error: %s", e,
+                        )
+
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
 
@@ -18617,7 +18941,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
-                    delivered = await self._deliver_completion_notification(
+                    delivered = await self._enqueue_process_completion_notification(
                         synth_text, completion_evt,
                     )
                     if delivered is False:
