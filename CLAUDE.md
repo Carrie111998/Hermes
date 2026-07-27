@@ -305,6 +305,12 @@ Hallazgos de auditoría previos al lote 1 (aplican a todo GRUPO 6):
   `Anthropic（由 Nous Research 改编）`×7, `Hermes Agent + Nous Research`) — transformación
   normal, coincide exacto con `Digital Services LLC` ya commiteado en inglés. 2 headings
   cambiaron, sin anchors internos. Build limpio: 98/98 warnings idénticos a la baseline.
+- Lote 10 (este commit): `skills/optional/{mcp,migration,mlops}` = 31 (parte 2 de
+  `optional/`). 1 `Nous Research` en `migration-openclaw-migration.md` (fila de autor
+  `Hermes Agent (Nous Research)`, verificado contra inglés `IYARI (Digital Services
+  LLC)` ya commiteado) — transformación normal. 2 headings cambiaron, sin anchors
+  internos. Residual post-transform: cero (ni siquiera `HERMES_HOME`). Build limpio:
+  98/98 warnings idénticos a la baseline.
 
 ## Auto-aprobación delegada (GRUPO 6)
 
