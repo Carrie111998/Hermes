@@ -3800,16 +3800,26 @@ def reserve_external_group_post(
                 "authority is absent from the compiled Loop Contract."
             )
         prior = conn.execute(
-            "SELECT state FROM task_external_effects "
+            "SELECT state, details FROM task_external_effects "
             "WHERE task_id = ? AND platform = 'facebook' AND effect_key = ?",
             (task_id, effect_key),
         ).fetchone()
         if prior is not None:
-            return (
-                "Facebook group post blocked: durable state is already "
-                f"{prior['state']}; reconcile the visible post instead of "
-                "retrying."
+            try:
+                prior_details = json.loads(prior["details"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                prior_details = {}
+            retryable_failed_probe = (
+                prior["state"] == "failed"
+                and prior_details.get("posting_status")
+                == "not_created_guarded_ref_unavailable"
             )
+            if not retryable_failed_probe:
+                return (
+                    "Facebook group post blocked: durable state is already "
+                    f"{prior['state']}; reconcile the visible post instead of "
+                    "retrying."
+                )
         _upsert_external_effect(
             conn,
             task_id=task_id,
@@ -3817,7 +3827,15 @@ def reserve_external_group_post(
             effect_key=effect_key,
             state="create_started",
             external_id=normalized_group_id,
-            details={"reservation": "before_final_post_dispatch"},
+            details={
+                "reservation": "before_final_post_dispatch",
+                "prior_state": prior["state"] if prior is not None else None,
+                "prior_posting_status": (
+                    prior_details.get("posting_status")
+                    if prior is not None
+                    else None
+                ),
+            },
             run_id=int(expected_run_id),
             now=now,
         )

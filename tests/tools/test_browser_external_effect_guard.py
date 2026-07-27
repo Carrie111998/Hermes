@@ -801,6 +801,77 @@ def test_group_post_reservation_is_one_shot(tmp_path):
     assert effects[0]["state"] == "create_started"
 
 
+def test_group_post_retry_only_accepts_proven_guarded_ref_failure(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":["facebook group 1703088130054399"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn, body=body)
+        kb.record_external_effect(
+            conn,
+            task_id,
+            platform="facebook",
+            effect_key="group:1703088130054399",
+            state="failed",
+            details={
+                "posting_status": "not_created_guarded_ref_unavailable",
+            },
+            expected_run_id=run.current_run_id,
+        )
+        retry = kb.reserve_external_group_post(
+            conn,
+            task_id,
+            "1703088130054399",
+            expected_run_id=run.current_run_id,
+        )
+        effect = kb.list_external_effects(conn, task_id)[0]
+
+    assert retry is None
+    assert effect["state"] == "create_started"
+    assert effect["details"]["prior_state"] == "failed"
+    assert (
+        effect["details"]["prior_posting_status"]
+        == "not_created_guarded_ref_unavailable"
+    )
+
+
+def test_group_post_retry_rejects_failed_listing_route(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"authorization":{"human_approved":true},'
+        '"external_targets":["facebook group 1703088130054399"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn, body=body)
+        kb.record_external_effect(
+            conn,
+            task_id,
+            platform="facebook",
+            effect_key="group:1703088130054399",
+            state="failed",
+            details={"posting_status": "not_created_listing_route_forbidden"},
+            expected_run_id=run.current_run_id,
+        )
+        retry = kb.reserve_external_group_post(
+            conn,
+            task_id,
+            "1703088130054399",
+            expected_run_id=run.current_run_id,
+        )
+        effect = kb.list_external_effects(conn, task_id)[0]
+
+    assert "durable state is already failed" in retry
+    assert effect["state"] == "failed"
+
+
 def test_extra_json_fence_makes_group_authority_ambiguous():
     body = (
         "GRACE_LOOP_CONTRACT_STAGE: execution\n"
