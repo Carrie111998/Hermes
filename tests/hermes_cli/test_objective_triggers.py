@@ -146,6 +146,31 @@ def test_external_events_do_not_wake_terminal_objectives(company):
     assert conn.execute("SELECT COUNT(*) FROM objective_inbox").fetchone()[0] == 0
 
 
+def test_terminal_objectives_reject_new_trigger_admission(company):
+    conn, organization_id, objective_id = company
+    objectives_db.transition_objective(
+        conn, objective_id, "cancelled", actor="advisor", reason="stop"
+    )
+    with pytest.raises(objective_triggers.TriggerError, match="terminal"):
+        objective_triggers.subscribe(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective_id,
+            source_type="crm",
+            event_type="lead.changed",
+        )
+    with pytest.raises(objective_triggers.TriggerError, match="terminal"):
+        objective_triggers.create_schedule(
+            conn,
+            organization_id=organization_id,
+            objective_id=objective_id,
+            event_type="objective.tick",
+            interval_seconds=60,
+            next_fire_at=int(time.time()) + 60,
+            payload={},
+        )
+
+
 def test_external_receipt_redacts_credential_like_ingress_fields(company):
     conn, organization_id, objective_id = company
     objective_triggers.subscribe(

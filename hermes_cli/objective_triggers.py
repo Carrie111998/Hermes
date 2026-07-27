@@ -84,6 +84,20 @@ def _objective_org(conn: sqlite3.Connection, objective_id: str) -> str:
     return str(row["organization_id"])
 
 
+def _ensure_objective_accepts_triggers(
+    conn: sqlite3.Connection, objective_id: str
+) -> None:
+    row = conn.execute(
+        "SELECT status FROM objectives WHERE id=?", (objective_id,)
+    ).fetchone()
+    if row is None:
+        raise TriggerError(f"objective not found: {objective_id}")
+    if str(row["status"]) in objectives_db.TERMINAL_OBJECTIVE_STATUSES:
+        raise TriggerError(
+            f"cannot create triggers for terminal objective ({row['status']})"
+        )
+
+
 def subscribe(
     conn: sqlite3.Connection,
     *,
@@ -95,6 +109,7 @@ def subscribe(
     ensure_schema(conn)
     if _objective_org(conn, objective_id) != organization_id:
         raise TriggerError("subscription objective belongs to another organization")
+    _ensure_objective_accepts_triggers(conn, objective_id)
     if not source_type.strip() or not event_type.strip():
         raise TriggerError("source_type and event_type are required")
     subscription_id = f"subscription_{uuid.uuid4().hex}"
@@ -322,6 +337,7 @@ def create_schedule(
     ensure_schema(conn)
     if _objective_org(conn, objective_id) != organization_id:
         raise TriggerError("schedule objective belongs to another organization")
+    _ensure_objective_accepts_triggers(conn, objective_id)
     if interval_seconds <= 0:
         raise TriggerError("schedule interval must be positive")
     if idempotency_key is not None:
