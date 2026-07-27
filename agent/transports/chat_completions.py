@@ -112,6 +112,15 @@ def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
     return normalized.endswith("/openai")
 
 
+def _is_native_gemini_base_url(base_url: Any) -> bool:
+    normalized = str(base_url or "").strip().rstrip("/").lower()
+    if not normalized:
+        return False
+    if "generativelanguage.googleapis.com" not in normalized:
+        return False
+    return not normalized.endswith("/openai")
+
+
 def _model_consumes_thought_signature(model: Any) -> bool:
     """True when the outgoing model is a Gemini family model that requires
     ``extra_content`` (thought_signature) to be replayed on tool calls.
@@ -635,11 +644,7 @@ class ChatCompletionsTransport(ProviderTransport):
             # Gemini base_url — typical when only Google credentials are set and
             # a fallback/aux call lands on Gemini. The native client only reads
             # thinking_config from extra_body, so drop everything else here.
-            try:
-                from agent.gemini_native_adapter import is_native_gemini_base_url
-                _native_gemini = is_native_gemini_base_url(params.get("base_url"))
-            except Exception:
-                _native_gemini = False
+            _native_gemini = _is_native_gemini_base_url(params.get("base_url"))
             if _native_gemini:
                 extra_body = {
                     k: v for k, v in extra_body.items()

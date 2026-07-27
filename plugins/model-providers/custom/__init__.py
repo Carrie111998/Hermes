@@ -10,15 +10,54 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
     so the endpoint's server default applies)
 """
 
+from tools.tool_backend_helpers import fal_key_is_configured
 from typing import Any
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
+# Hostnames / URL patterns that do NOT support OpenRouter-style routing
+_NON_ROUTING_HOSTMARKERS = (
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "ollama",
+    "llamacpp",
+    "llama.cpp",
+    "vllm",
+)
+
+def _endpoint_supports_provider_routing(base_url: str | None) ->bool:
+    """conservative check: only hosted (non-local) endpoints get routing fields"""
+    if not base_url: return False
+    normalized = base_url.strip().lower()
+    for marker in _NON_ROUTING_HOSTMARKERS:
+        if marker in normalized:
+            return False
+    return True
+
 
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
+    def build_extra_body(
+        self, 
+        *,
+        session_id: str | None = None, 
+        **context: Any
+    ) -> dict[str, Any]:
+        """
+        Include provider routing preferences for custom providers
+        """
+        extra_body: dict[str, Any] = {}
+        provider_prefs = context.get("provider_preferences")
+        base_url = context.get("base_url")
+
+        if provider_prefs and _endpoint_supports_provider_routing(base_url):
+            extra_body["provider"] = provider_prefs 
+        return extra_body
+
+    
     def build_api_kwargs_extras(
         self,
         *,
@@ -53,6 +92,7 @@ class CustomProfile(ProviderProfile):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
+                top_level["reasoning_effort"] = "none"
                 extra_body["think"] = False
             elif _effort:
                 top_level["reasoning_effort"] = _effort

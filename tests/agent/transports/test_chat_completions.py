@@ -307,6 +307,34 @@ class TestChatCompletionsBuildKwargs:
         kw = transport.build_kwargs(model="gpt-4o", messages=msgs, tools=tools)
         assert kw["tools"] == tools
 
+    def test_custom_provider_gets_provider_pref(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o", messages=msgs,
+            provider_profile=profile,
+            provider_preferences={"only": ["openai"]},
+            base_url = "https://api.polza.ai/v1",
+        )
+        assert kw["extra_body"]["provider"] == {"only": ["openai"]}
+
+    def test_custom_provider_no_prefs_no_provider_key(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+
+        result = profile.build_extra_body(session_id=None)
+        assert isinstance(result, dict), f"Expected dict, got {type(result)}"
+        assert result == {}
+        
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            provider_profile=profile,
+        )
+        assert "provider" not in (kw.get("extra_body") or {})
+
     def test_openrouter_provider_prefs(self, transport):
         from providers import get_provider_profile
         profile = get_provider_profile("openrouter")
@@ -315,6 +343,7 @@ class TestChatCompletionsBuildKwargs:
             model="gpt-4o", messages=msgs,
             provider_profile=profile,
             provider_preferences={"only": ["openai"]},
+            is_openrouter=True
         )
         assert kw["extra_body"]["provider"] == {"only": ["openai"]}
 
