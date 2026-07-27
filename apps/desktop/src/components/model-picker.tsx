@@ -1,8 +1,13 @@
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import {
+  modelOptionsQueryKey,
+  readModelOptionsCache,
+  requestModelOptions,
+  writeModelOptionsCache
+} from '@/lib/model-options'
 import { modelSearchText } from '@/lib/model-search-text'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
@@ -55,10 +60,18 @@ export function ModelPickerDialog({
   // it and do a plain substring filter that preserves array order — matching
   // the `hermes model` CLI picker, which shows the curated list verbatim.
   const [search, setSearch] = useState('')
+  const cachedModelOptions = useMemo(() => readModelOptionsCache(profile, sessionId), [profile, sessionId])
 
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(profile, sessionId),
-    queryFn: () => requestModelOptions({ gateway: gw, sessionId }),
+    queryFn: async () => {
+      const next = await requestModelOptions({ gateway: gw, sessionId })
+      writeModelOptionsCache(profile, sessionId, next)
+
+      return next
+    },
+    initialData: cachedModelOptions?.data,
+    initialDataUpdatedAt: cachedModelOptions?.updatedAt,
     enabled: open
   })
 
