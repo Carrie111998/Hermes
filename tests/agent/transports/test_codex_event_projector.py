@@ -123,6 +123,35 @@ class TestCommandExecutionProjection:
         b = p2.project(COMMAND_EXEC_COMPLETED).messages
         assert a[0]["tool_calls"][0]["id"] == b[0]["tool_calls"][0]["id"]
 
+    def test_oversized_output_respects_configured_projection_cap(
+        self, monkeypatch
+    ) -> None:
+        """Codex-projected output must not bypass Hermes' tool-output cap.
+
+        Projected rows land at the newest edge of the transcript, where
+        compaction intentionally protects recent messages. Persisting an
+        unbounded command result there can make the session impossible to
+        compact.
+        """
+        monkeypatch.setattr(
+            "tools.tool_output_limits.get_max_bytes",
+            lambda: 100,
+        )
+        item = {
+            **COMMAND_EXEC_COMPLETED["params"]["item"],
+            "aggregatedOutput": "A" * 1000,
+        }
+        notification = {
+            "method": "item/completed",
+            "params": {**COMMAND_EXEC_COMPLETED["params"], "item": item},
+        }
+
+        tool_message = CodexEventProjector().project(notification).messages[1]
+
+        assert len(tool_message["content"]) < 250
+        assert "OUTPUT TRUNCATED" in tool_message["content"]
+        assert "900 chars omitted" in tool_message["content"]
+
 
 class TestAgentMessageProjection:
     """assistant text → final_text + assistant message."""
@@ -209,8 +238,35 @@ class TestMcpToolCallProjection:
         msgs = CodexEventProjector().project(
             {"method": "item/completed", "params": {"item": item}}
         ).messages
-        assert msgs[0]["tool_calls"][0]["function"]["name"] == "mcp.obsidian.search_notes"
+        function_name = msgs[0]["tool_calls"][0]["function"]["name"]
+        assert function_name == "mcp__obsidian__search_notes"
+        assert function_name.replace("_", "").isalnum()
         assert "found" in msgs[1]["content"]
+
+    def test_mcp_identifiers_fit_codex_responses_constraints(self) -> None:
+        item = {
+            "type": "mcpToolCall",
+            "id": "item-" + ("x" * 100),
+            "server": "hermes-tools",
+            "tool": "skill.view",
+            "status": "completed",
+            "arguments": {},
+            "result": {"ok": True},
+            "error": None,
+        }
+
+        messages = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+        tool_call = messages[0]["tool_calls"][0]
+
+        assert len(tool_call["id"]) <= 64
+        assert all(ch.isalnum() or ch in "_-" for ch in tool_call["id"])
+        assert all(
+            ch.isalnum() or ch in "_-"
+            for ch in tool_call["function"]["name"]
+        )
+        assert messages[1]["tool_call_id"] == tool_call["id"]
 
     def test_mcp_error_surfaced(self) -> None:
         item = {

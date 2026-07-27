@@ -619,6 +619,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    developer_instructions: str = "",
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -679,6 +680,7 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            developer_instructions=developer_instructions,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -760,9 +762,18 @@ def run_codex_app_server_turn(
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
-    # is exactly what curator.py / sessions DB expect.
-    if turn.projected_messages:
-        messages.extend(turn.projected_messages)
+    # is exactly what curator.py / sessions DB expect. Codex also projects a
+    # userMessage for the current input, but the standard run_conversation
+    # entry path already appended and flushed that user turn before this early
+    # return. Drop projected user rows here so every native turn is persisted
+    # exactly once rather than doubling context one request at a time.
+    projected_messages = [
+        msg
+        for msg in (turn.projected_messages or [])
+        if not (isinstance(msg, dict) and msg.get("role") == "user")
+    ]
+    if projected_messages:
+        messages.extend(projected_messages)
 
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose

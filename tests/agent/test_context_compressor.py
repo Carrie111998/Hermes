@@ -2793,6 +2793,41 @@ class TestTokenBudgetTailProtection:
         tail_size = len(messages) - cut
         assert tail_size >= 3, f"Tail is only {tail_size} messages, min should be 3"
 
+    def test_oversized_tool_result_in_protected_head_is_hard_capped(
+        self, budget_compressor, monkeypatch
+    ):
+        """A previously persisted bypass must remain recoverable.
+
+        The live failure placed a 1MB Codex-projected result immediately after
+        the compaction summary, inside the protected head. Normal middle/tail
+        pruning cannot touch that position, so the hard output cap must apply
+        before boundary protection.
+        """
+        monkeypatch.setattr(
+            "tools.tool_output_limits.get_max_bytes",
+            lambda: 100,
+        )
+        messages = [
+            {"role": "assistant", "content": "compaction summary"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_oversized",
+                "content": "X" * 10_000,
+            },
+            {"role": "assistant", "content": "continuing"},
+            {"role": "user", "content": "next"},
+        ]
+
+        pruned, count = budget_compressor._prune_old_tool_results(
+            messages,
+            protect_tail_count=20,
+            protect_tail_tokens=budget_compressor.tail_token_budget,
+        )
+
+        assert count == 1
+        assert len(pruned[1]["content"]) < 250
+        assert "OUTPUT TRUNCATED" in pruned[1]["content"]
+
     def test_tiny_budget_preserves_bounded_recent_turns(self, budget_compressor):
         """A token-exhausted tail must preserve more than just the latest ask.
 

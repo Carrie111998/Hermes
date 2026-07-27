@@ -108,3 +108,26 @@ def get_max_lines() -> int:
 def get_max_line_length() -> int:
     """Shortcut for file-ops callers that only need the per-line cap."""
     return get_tool_output_limits()["max_line_length"]
+
+
+def truncate_tool_output(output: Any, max_chars: int | None = None) -> str:
+    """Bound a tool result while preserving diagnostically useful head/tail.
+
+    ``max_bytes`` is historically measured with ``len(str)`` throughout
+    Hermes, so ``max_chars`` preserves that established behavior. The helper
+    is shared by native tools, Codex event projection, and compaction recovery
+    so no ingestion path can create an uncompressible protected-tail result.
+    """
+    if not isinstance(output, str):
+        output = str(output or "")
+    limit = max_chars if isinstance(max_chars, int) and max_chars > 0 else get_max_bytes()
+    if len(output) <= limit:
+        return output
+    head_chars = int(limit * 0.4)
+    tail_chars = limit - head_chars
+    omitted = len(output) - limit
+    notice = (
+        f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+        f"out of {len(output)} total] ...\n\n"
+    )
+    return output[:head_chars] + notice + output[-tail_chars:]

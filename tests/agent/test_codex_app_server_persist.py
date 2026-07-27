@@ -161,6 +161,69 @@ def test_codex_turn_persists_each_message_exactly_once():
         shutil.rmtree(tmp)
 
 
+def _make_turn_with_projected_user():
+    """Model a real app-server turn, which echoes the inbound user item."""
+    turn = _make_turn()
+    turn.projected_messages = [
+        {"role": "user", "content": "USER_TURN"},
+        *turn.projected_messages,
+    ]
+    return turn
+
+
+def test_codex_turn_drops_projected_copy_of_inbound_user_message():
+    """Codex's userMessage event is an echo, not a second user turn.
+
+    The inbound turn is already appended and flushed before the native runtime
+    starts. Persisting the projected echo doubles every user request and
+    accelerates context growth on long sessions.
+    """
+    tmp = tempfile.mkdtemp(prefix="codex_projected_user_")
+    try:
+        db = SessionDB(Path(tmp) / "state.db")
+        sid = "sess-codex-projected-user"
+        db.create_session(session_id=sid, source="cli", model="codex")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id=sid,
+        )
+        agent._session_db_created = True
+        agent._codex_session = MagicMock()
+        agent._codex_session.run_turn.return_value = (
+            _make_turn_with_projected_user()
+        )
+        agent.tool_progress_callback = None
+
+        user_msg = {"role": "user", "content": "USER_TURN"}
+        messages = [user_msg]
+        agent._flush_messages_to_session_db(messages)
+
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="USER_TURN",
+            original_user_message="USER_TURN",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+        assert result["agent_persisted"] is True
+        assert [
+            msg["content"] for msg in result["messages"]
+            if msg.get("role") == "user"
+        ] == ["USER_TURN"]
+        rows = db.get_messages(sid, include_inactive=True)
+        assert [row["content"] for row in rows].count("USER_TURN") == 1
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp)
+
+
 class TestGatewayPersistedResolution:
     """The gateway default must preserve standard-runtime skip-db behaviour."""
 

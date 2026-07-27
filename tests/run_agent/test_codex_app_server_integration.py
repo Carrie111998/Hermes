@@ -71,6 +71,20 @@ class TestApiModeAccepted:
         agent = _make_codex_agent()
         assert agent.api_mode == "codex_app_server"
 
+    def test_codex_app_server_needs_no_hermes_openai_credentials(self):
+        agent = run_agent.AIAgent(
+            api_key="",
+            base_url="",
+            provider="openai-codex",
+            api_mode="codex_app_server",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        assert agent.client is None
+        assert agent._client_kwargs == {}
+
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
@@ -782,8 +796,12 @@ class TestCodexToolProgressBridge:
         agent.tool_progress_callback = lambda kind, name, preview, args: events.append(
             (kind, name, preview))
         with patch.object(agent, "_spawn_background_review", return_value=None):
-            agent.run_conversation("run the tests")
+            agent.run_conversation(
+                "run the tests",
+                system_message="HERMES_SCOPED_SYSTEM_PROMPT",
+            )
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
+        assert "HERMES_SCOPED_SYSTEM_PROMPT" in captured_init["developer_instructions"]
         assert ("tool.started", "exec_command", "pytest") in events
 

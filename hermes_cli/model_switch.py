@@ -1060,6 +1060,7 @@ def switch_model(
     resolved_alias = ""
     new_model = raw_input.strip()
     target_provider = current_provider
+    selected_pdef: Optional[ProviderDef] = None
     resolved_moa_preset = False
 
     # =================================================================
@@ -1096,6 +1097,7 @@ def switch_model(
                 error_message=_switch_err,
             )
 
+        selected_pdef = pdef
         target_provider = pdef.id
         if target_provider == "moa" and not new_model:
             try:
@@ -1357,6 +1359,43 @@ def switch_model(
     # =================================================================
     # COMMON PATH: Resolve credentials, normalize, get metadata
     # =================================================================
+
+    # Reject forbidden OpenRouter families before credentials, persistence, or
+    # in-session state can be touched.  Reuse the runtime gate so the CLI,
+    # gateway, and picker paths enforce one exact family policy.
+    candidate_base_url = current_base_url
+    if selected_pdef is not None and selected_pdef.base_url:
+        candidate_base_url = selected_pdef.base_url
+    if resolved_alias:
+        _ensure_direct_aliases()
+        _direct_alias = DIRECT_ALIASES.get(resolved_alias)
+        if _direct_alias is not None and _direct_alias.base_url:
+            candidate_base_url = _direct_alias.base_url
+    try:
+        from hermes_cli.runtime_provider import (
+            AuthError,
+            _assert_openrouter_model_allowed,
+        )
+
+        _assert_openrouter_model_allowed(
+            requested_provider=target_provider,
+            explicit_base_url=candidate_base_url,
+            model_cfg={
+                "provider": target_provider,
+                "base_url": candidate_base_url,
+                "default": new_model,
+            },
+            target_model=new_model,
+        )
+    except AuthError as exc:
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=get_label(target_provider),
+            is_global=is_global,
+            error_message=str(exc),
+        )
 
     provider_changed = target_provider != current_provider
     provider_label = get_label(target_provider)

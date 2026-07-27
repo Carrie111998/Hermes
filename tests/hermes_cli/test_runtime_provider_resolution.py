@@ -301,6 +301,40 @@ def test_resolve_runtime_provider_codex(monkeypatch):
     assert resolved["requested_provider"] == "openai-codex"
 
 
+def test_resolve_runtime_provider_codex_app_server_uses_cli_auth_not_hermes_auth(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "openai_runtime": "codex_app_server",
+            "default": "gpt-5.6-sol",
+        },
+    )
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("Hermes OAuth must not be resolved for codex_app_server")
+
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _unexpected)
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("P", (), {"has_credentials": lambda self: False})(),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved == {
+        "provider": "openai-codex",
+        "api_mode": "codex_app_server",
+        "base_url": "",
+        "api_key": "",
+        "source": "codex-cli-app-server",
+        "requested_provider": "openai-codex",
+    }
+
+
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
     monkeypatch.setattr(
@@ -563,6 +597,57 @@ def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
     assert resolved["base_url"] == "https://openrouter.ai/api/v1"
     assert resolved["source"] == "manual"
     assert resolved.get("credential_pool") is not None
+
+
+def test_resolve_runtime_provider_openrouter_blocks_forbidden_model_families(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: type("P", (), {"has_credentials": lambda self: False})())
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+
+    for forbidden in (
+        "openai/gpt-5.3-codex",
+        "anthropic/claude-sonnet-4.6",
+        "claude-sonnet-4.6",
+        "bm_fable",
+    ):
+        monkeypatch.setattr(
+            rp,
+            "_get_model_config",
+            lambda forbidden=forbidden: {
+                "provider": "openai-api",
+                "base_url": "https://openrouter.ai/api/v1",
+                "default": forbidden,
+            },
+        )
+        with pytest.raises(rp.AuthError) as exc:
+            rp.resolve_runtime_provider(requested=None)
+        assert getattr(exc.value, "code", "") == "disallowed_openrouter_model"
+
+
+def test_resolve_runtime_provider_openrouter_allows_non_forbidden_models(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: type("P", (), {"has_credentials": lambda self: False})())
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-api",
+            "base_url": "https://openrouter.ai/api/v1",
+            "default": "google/gemini-2.5-pro",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested=None)
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == "sk-or-test"
 
 
 def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeypatch):

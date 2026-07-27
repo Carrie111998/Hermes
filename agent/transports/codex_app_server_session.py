@@ -278,6 +278,7 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -291,6 +292,11 @@ class CodexAppServerSession:
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
                 "workspace-write",
             )
+        )
+        self._developer_instructions = (
+            developer_instructions.strip()
+            if isinstance(developer_instructions, str)
+            else ""
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
@@ -343,6 +349,12 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._developer_instructions:
+            # Hermes owns the conversational identity and operating contract;
+            # Codex is the scoped execution backend. Passing the complete
+            # Hermes system prompt at thread creation keeps that identity
+            # local to Hermes instead of relying on global ~/.codex guidance.
+            params["developerInstructions"] = self._developer_instructions
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's

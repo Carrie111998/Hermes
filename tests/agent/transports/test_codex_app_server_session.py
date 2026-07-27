@@ -173,6 +173,18 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+        assert "developerInstructions" not in params
+
+    def test_thread_start_passes_scoped_developer_instructions(self):
+        client = FakeClient()
+        s = make_session(
+            client,
+            developer_instructions="You are Aurelian Hermes.",
+        )
+        s.ensure_started()
+        method, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert method == "thread/start"
+        assert params["developerInstructions"] == "You are Aurelian Hermes."
 
     def test_close_idempotent(self):
         client = FakeClient()

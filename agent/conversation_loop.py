@@ -1213,11 +1213,19 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        codex_developer_instructions = active_system_prompt or ""
+        if agent.ephemeral_system_prompt:
+            codex_developer_instructions = (
+                codex_developer_instructions
+                + "\n\n"
+                + agent.ephemeral_system_prompt
+            ).strip()
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
+            developer_instructions=codex_developer_instructions,
             should_review_memory=_should_review_memory,
         )
 

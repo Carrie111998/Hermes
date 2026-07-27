@@ -11,7 +11,7 @@ Codex emits items with a discriminator field `type`:
   - reasoning           → stashed in the assistant's "reasoning" field
   - commandExecution    → assistant tool_call(name="exec") + tool result
   - fileChange          → assistant tool_call(name="apply_patch") + tool result
-  - mcpToolCall         → assistant tool_call(name=f"mcp.{server}.{tool}") + tool result
+  - mcpToolCall         → assistant tool_call(name=f"mcp__{server}__{tool}") + tool result
   - dynamicToolCall     → assistant tool_call(name=tool) + tool result
   - plan/hookPrompt/collabAgentToolCall → recorded as opaque assistant notes
 
@@ -30,8 +30,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+
+_CODEX_IDENTIFIER_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def _sanitize_codex_identifier(value: Any, *, fallback: str) -> str:
+    """Return a Responses-compatible function/call identifier component."""
+    sanitized = _CODEX_IDENTIFIER_RE.sub("_", str(value or "")).strip("_")
+    return sanitized or fallback
 
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
@@ -39,17 +49,37 @@ def _deterministic_call_id(item_type: str, item_id: str) -> str:
 
     Uses the codex item id directly when present (already a uuid); falls back
     to a content hash so replay produces the same id across sessions and
-    prefix caches stay valid. See AGENTS.md Pitfall #16 (deterministic IDs in
-    tool call history)."""
-    if item_id:
-        return f"codex_{item_type}_{item_id}"
-    digest = hashlib.sha256(f"{item_type}".encode()).hexdigest()[:16]
-    return f"codex_{item_type}_{digest}"
+    prefix caches stay valid. Codex Responses caps call IDs at 64 characters
+    and accepts only ``[a-zA-Z0-9_-]``; long MCP server/tool names otherwise
+    poison every later request that replays the persisted history.
+    See AGENTS.md Pitfall #16 (deterministic IDs in tool call history)."""
+    safe_type = _sanitize_codex_identifier(item_type, fallback="tool")
+    safe_item_id = _sanitize_codex_identifier(item_id, fallback="")
+    if safe_item_id:
+        candidate = f"codex_{safe_type}_{safe_item_id}"
+        if len(candidate) <= 64:
+            return candidate
+    digest_source = f"{item_type}\0{item_id}".encode("utf-8", errors="replace")
+    digest = hashlib.sha256(digest_source).hexdigest()[:24]
+    return f"codex_{safe_type[:28]}_{digest}"
 
 
 def _format_tool_args(d: dict) -> str:
     """Format a dict as JSON the way Hermes' existing tool_calls path does."""
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
+
+
+def _bounded_tool_output(content: Any) -> str:
+    """Apply Hermes' configured output cap to Codex-projected tool results.
+
+    Codex executes outside ``terminal_tool``, so its completed-item events do
+    not pass through the normal truncation seam. The projected result is still
+    Hermes transcript content and must obey the same bound before it reaches
+    the protected recent tail or durable session storage.
+    """
+    from tools.tool_output_limits import truncate_tool_output
+
+    return truncate_tool_output(content)
 
 
 @dataclass
@@ -166,6 +196,7 @@ class CodexEventProjector:
         exit_code = item.get("exitCode")
         if exit_code is not None and exit_code != 0:
             output = f"[exit {exit_code}]\n{output}"
+        output = _bounded_tool_output(output)
         tool_msg = {
             "role": "tool",
             "tool_call_id": call_id,
@@ -231,7 +262,10 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": f"mcp.{server}.{tool}",
+                        "name": _sanitize_codex_identifier(
+                            f"mcp__{server}__{tool}",
+                            fallback="mcp_unknown",
+                        ),
                         "arguments": _format_tool_args(args),
                     },
                 }
@@ -248,6 +282,7 @@ class CodexEventProjector:
             content = json.dumps(result, ensure_ascii=False)[:4000]
         else:
             content = ""
+        content = _bounded_tool_output(content)
         tool_msg = {
             "role": "tool",
             "tool_call_id": call_id,
@@ -273,7 +308,10 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": tool,
+                        "name": _sanitize_codex_identifier(
+                            tool,
+                            fallback="unknown",
+                        ),
                         "arguments": _format_tool_args(args),
                     },
                 }
@@ -288,6 +326,7 @@ class CodexEventProjector:
         else:
             success = item.get("success")
             content = f"success={success}"
+        content = _bounded_tool_output(content)
         tool_msg = {
             "role": "tool",
             "tool_call_id": call_id,

@@ -2459,6 +2459,26 @@ class ContextCompressor(ContextEngine):
         result = [m.copy() for m in messages]
         pruned = 0
 
+        # Phase 0: enforce the configured hard cap on EVERY textual tool
+        # result, including protected head/tail messages. Protection means
+        # "preserve recent semantic context"; it must not exempt a result that
+        # entered through a path which bypassed the normal tool-output limit.
+        # Without this recovery seam, one historical 1MB projected command
+        # result in the protected head can make every future compaction a
+        # guaranteed no-op.
+        from tools.tool_output_limits import truncate_tool_output
+
+        for i, msg in enumerate(result):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            bounded = truncate_tool_output(content)
+            if bounded != content:
+                result[i] = {**msg, "content": bounded}
+                pruned += 1
+
         # Build index: tool_call_id -> (tool_name, arguments_json)
         call_id_to_tool: Dict[str, tuple] = {}
         for msg in result:
