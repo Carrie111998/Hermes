@@ -16,6 +16,8 @@
   loops.
 - Durable audit and planner-lineage records now redact credential-like fields
   before persistence while preserving ordinary response evidence unchanged.
+- External event receipts now redact credential-like payload and authentication
+  fields before durable storage and CEO-planner routing.
 - Added an optional immutable runtime baseline that pauses autonomous cycles on
   charter, schema, package, or Python-runtime drift until a human rebaselines
   explicitly.

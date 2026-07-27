@@ -97,6 +97,39 @@ def test_external_event_without_authentication_evidence_is_rejected(company):
         )
 
 
+def test_external_receipt_redacts_credential_like_ingress_fields(company):
+    conn, organization_id, objective_id = company
+    objective_triggers.subscribe(
+        conn,
+        organization_id=organization_id,
+        objective_id=objective_id,
+        source_type="crm",
+        event_type="lead.changed",
+    )
+    objective_triggers.route_external_event(
+        conn,
+        organization_id=organization_id,
+        source_type="crm",
+        event_type="lead.changed",
+        source_reference="lead-secret-1",
+        payload={"lead_id": "lead-1", "api_key": "sk_live_secret"},
+        authentication_evidence={
+            "method": "provider_hmac",
+            "key_id": "crm-1",
+            "token": "provider-secret",
+        },
+    )
+    receipt = conn.execute(
+        "SELECT payload_sha256, authentication_evidence_json "
+        "FROM external_event_receipts"
+    ).fetchone()
+    event = conn.execute("SELECT payload_json FROM objective_inbox").fetchone()
+    assert "sk_live_secret" not in event["payload_json"]
+    assert "provider-secret" not in receipt["authentication_evidence_json"]
+    assert "[REDACTED]" in event["payload_json"]
+    assert "[REDACTED]" in receipt["authentication_evidence_json"]
+
+
 def test_schedule_restart_catchup_emits_one_event_and_skips_storm(company):
     conn, organization_id, objective_id = company
     schedule_id = objective_triggers.create_schedule(

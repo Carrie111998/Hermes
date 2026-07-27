@@ -10,6 +10,7 @@ import uuid
 from typing import Any, Mapping, Optional
 
 from hermes_cli import external_content, objectives_db
+from hermes_cli.audit_redaction import sanitize
 
 
 SCHEMA_SQL = """
@@ -136,7 +137,9 @@ def route_external_event(
         is None
     ):
         raise TriggerError("external event organization is not configured")
-    payload_json = json.dumps(dict(payload), separators=(",", ":"), sort_keys=True)
+    safe_payload = sanitize(dict(payload))
+    safe_authentication = sanitize(dict(authentication_evidence))
+    payload_json = json.dumps(safe_payload, separators=(",", ":"), sort_keys=True)
     digest = hashlib.sha256(payload_json.encode()).hexdigest()
     content_digest = (
         hashlib.sha256(content.encode()).hexdigest()
@@ -179,7 +182,7 @@ def route_external_event(
                     digest,
                     content_digest,
                     json.dumps(
-                        dict(authentication_evidence),
+                        safe_authentication,
                         separators=(",", ":"),
                         sort_keys=True,
                     ),
@@ -211,9 +214,9 @@ def route_external_event(
             "source_reference": source_reference,
             "payload_sha256": digest,
             "trust": "adapter_authenticated_data",
-            "authentication_evidence": dict(authentication_evidence),
+            "authentication_evidence": safe_authentication,
         },
-        "data": dict(payload),
+        "data": safe_payload,
     }
     quarantined_item: Optional[dict[str, Any]] = None
     if content is not None:

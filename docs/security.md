@@ -14,6 +14,9 @@ funds; Charterforge stores opaque references and verified state.
 Durable business-audit payloads and planner lineage redact credential-like
 fields before hashing and persistence; ordinary non-sensitive planner response
 text remains byte-for-byte evidence.
+Authenticated external-event receipts apply the same redaction to adapter
+payloads and authentication evidence before durable storage or CEO-planner
+context; provider adapters remain responsible for cryptographic verification.
 When `agentic.security.require_runtime_baseline` is enabled, each unattended
 cycle also compares the non-secret charter, authority-store schema, Python
 runtime, and dependency-lock/package identity with a human-accepted baseline.

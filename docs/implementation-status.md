@@ -10,6 +10,8 @@
 - Treasury, budgets, reservations, double-entry accounting, fiscal periods,
   tax records, payment intents, and verification.
 - Compliance inventory, obligations, deadlines, evidence, and audit export.
+- Authenticated external-event receipts with idempotent provenance and
+  credential-redacted ingress envelopes.
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
 - Optional fail-closed runtime drift detection with immutable human-accepted
