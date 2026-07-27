@@ -20,8 +20,11 @@
  * actually works.
  *
  * Both probes are deliberately fast and forgiving:
- *   - 5s timeout (a hung interpreter beats forever, but we still give
- *     slow disks / cold caches room to breathe)
+ *   - 30s timeout (a hung interpreter beats forever, but cold Windows
+ *     imports regularly need >5s — see #72632/#72707: a healthy venv
+ *     import took ~4.3s cold and `hermes --version` ~10.5s, so the old
+ *     5s bound false-negatived a usable active runtime into
+ *     bootstrap-needed → hermes-setup.exe --update)
  *   - stdio ignored (we only care about exit code; stdout/stderr are
  *     not surfaced to the user, just to recentHermesLog for forensics
  *     via the caller's catch block if it chooses)
@@ -34,7 +37,11 @@
 
 import { execFileSync } from 'node:child_process'
 
-const PROBE_TIMEOUT_MS = 5000
+// Floor must clear measured cold Windows import / --version times from
+// #72632 reproduction (~4.3s import, ~10.5s --version). Under AV/load the
+// same probes stretch further; 30s stays well under install timeouts while
+// stopping false "no Hermes install found" recovery loops (#72707).
+const PROBE_TIMEOUT_MS = 30_000
 
 /**
  * Return the Python snippet used to verify Hermes can import far enough to
