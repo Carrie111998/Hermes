@@ -21,6 +21,13 @@
 - Added an optional immutable runtime baseline that pauses autonomous cycles on
   charter, schema, package, or Python-runtime drift until a human rebaselines
   explicitly.
+- External-content ingestion and authenticated event fan-out now collapse
+  concurrent duplicate deliveries into one durable receipt and wakeup.
+- Portfolio and workforce authority admission now serialize local concurrent
+  budget checks; external handlers perform a final autonomy-state check before
+  side effects.
+- Stripe webhook ingress now rejects missing or malformed positive
+  amount/currency evidence before routing.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.

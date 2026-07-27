@@ -26,6 +26,9 @@
 - Compliance inventory, obligations, deadlines, evidence, and audit export.
 - Authenticated external-event receipts with idempotent provenance and
   credential-redacted ingress envelopes.
+- Concurrent authenticated deliveries converge to one immutable receipt and
+  one objective inbox wakeup; duplicate external-content inserts collapse to
+  the existing immutable item.
 - External event routing now requires an explicit adapter-validated
   authentication marker before waking objectives.
 - External subscriptions and schedules no longer wake terminal objectives.
@@ -33,6 +36,10 @@
   objectives.
 - Recovery snapshots, leases, retries, circuit breakers, stop reasons, and
   interventions.
+- Portfolio child/successor admission and employee grant/revocation admission
+  serialize budget and authority checks across concurrent local workers.
+- External action handlers recheck the autonomy kill-switch immediately before
+  invoking provider side effects.
 - Standalone objective workers fail closed and stop durably when autonomy is
   disabled or runtime/security/integrity gates block execution.
 - Optional fail-closed runtime drift detection with immutable human-accepted
@@ -53,7 +60,8 @@
   HTTP Stripe Checkout/read-back rail and a narrowly scoped Connected Account
   outbound path. It is not installed by the core runtime; live settlement
   still requires separate installation, credentials, provider assessment, and
-  jurisdictional compliance evidence.
+  jurisdictional compliance evidence. Webhook admission rejects missing or
+  malformed positive amount/currency facts.
 - AgentMail configuration exists; provider availability and plan terms are
   external facts.
 - Compliance tracking exists; legal applicability is not autonomously proven.
