@@ -133,6 +133,7 @@ def invoice_context(
     customer_ref: str,
     currency: str,
     event_ids: Iterable[str],
+    existing_payment_intent_id: str | None = None,
 ) -> dict[str, Any]:
     ensure_schema(conn)
     ids = list(dict.fromkeys(str(value) for value in event_ids))
@@ -153,7 +154,7 @@ def invoice_context(
             raise ValueError("usage events must belong to the invoice organization and customer")
         if row["currency"] != normalized_currency:
             raise ValueError("metered invoice cannot mix currencies")
-        if row["allocated_payment_intent_id"]:
+        if row["allocated_payment_intent_id"] and row["allocated_payment_intent_id"] != existing_payment_intent_id:
             raise ValueError("usage event is already allocated to an invoice")
     return {
         "customer_ref": customer_ref,

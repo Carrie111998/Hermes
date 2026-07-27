@@ -1464,12 +1464,19 @@ def register_payment_adapters(
             embedded_customer_ref = customer.get("customer_ref") or customer.get("id")
             if embedded_customer_ref is not None and str(embedded_customer_ref) != customer_ref:
                 raise ValueError("customer_ref does not match the customer payload")
+            existing_intent = authority_conn.execute(
+                "SELECT id FROM payment_intents WHERE idempotency_key=?",
+                (str(payload["idempotency_key"]),),
+            ).fetchone()
             context = usage_billing.invoice_context(
                 authority_conn,
                 organization_id=organization_id,
                 customer_ref=customer_ref,
                 currency=currency,
                 event_ids=payload["usage_event_ids"],
+                existing_payment_intent_id=(
+                    str(existing_intent["id"]) if existing_intent else None
+                ),
             )
             intent = service.create_receivable(
                 organization_id=organization_id,
@@ -1483,6 +1490,8 @@ def register_payment_adapters(
                 idempotency_key=str(payload["idempotency_key"]),
                 objective_id=str(payload["_governance_objective_id"]),
             )
+            if int(intent["amount_minor"]) != int(context["amount_minor"]):
+                raise ValueError("idempotent metered invoice amount does not match usage events")
             usage_billing.allocate_events(
                 authority_conn,
                 event_ids=context["event_ids"],

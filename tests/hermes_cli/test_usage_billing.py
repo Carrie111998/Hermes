@@ -59,6 +59,11 @@ def test_invoice_context_and_allocation_prevent_double_billing(tmp_path):
             conn, organization_id="org", customer_ref="customer-1", currency="USD",
             event_ids=[first["id"]],
         )
+    allowed = usage_billing.invoice_context(
+        conn, organization_id="org", customer_ref="customer-1", currency="USD",
+        event_ids=[first["id"]], existing_payment_intent_id="pi-1",
+    )
+    assert allowed["amount_minor"] == 20
     usage_billing.allocate_events(conn, event_ids=context["event_ids"], payment_intent_id="pi-1")
     with pytest.raises(ValueError, match="another invoice"):
         usage_billing.allocate_events(conn, event_ids=[first["id"]], payment_intent_id="pi-2")

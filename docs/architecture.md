@@ -60,3 +60,7 @@ normal inbound payment intent, and atomically records immutable allocations so
 retries cannot bill an event twice. Provider read-back remains the independent
 completion check. Tax-bearing metered invoices are blocked unless a verified
 tax rule is supplied through the existing accounting controls.
+
+Recovery retries are bound to the original payment-intent idempotency key. An
+already allocated event may be replayed only for that same intent; any attempt
+to attach it to a different invoice is rejected.
