@@ -266,3 +266,5 @@ recorded.
   fulfillment to the organization executing the governed action.
 - `8585dd47dd030f0ad225fc0ceab6093617008828` — bound tax filing and payment
   mutations to the organization executing the governed accounting action.
+- `2853b1e45660d00be27c50b4f22c0caf7eabd49b` — bound fiscal-period closure to
+  the organization executing the governed accounting action.
