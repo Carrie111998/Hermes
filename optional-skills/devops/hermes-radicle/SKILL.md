@@ -3,7 +3,7 @@ name: hermes-radicle
 description: "Use this skill when working with Radicle repositories for peer-to-peer Git collaboration — `rad init`, `rad clone`, patches, issues, node ops, sync, remotes, and session repo detection."
 version: 1.0.0
 author: Joey Stanford
-license: MIT
+license: CC-BY-SA-4.0
 compatibility: "Radicle installed and `rad auth` complete; Radicle node running (`rad node start`). Optional: `gh` CLI for GitHub mirroring."
 triggers:
   - radicle
