@@ -59,6 +59,9 @@ these artifacts.
 
 - **Process crash:** lease expiry permits safe reclaim; external actions still
   require idempotent read-back.
+- **Lost lifecycle wake:** housekeeping requeues accepted/planned objectives
+  that have no pending or processing event, fenced by objective version; blocked
+  objectives remain stopped until an advisor resolves their intervention.
 - **Rate limit:** bounded exponential backoff; do not rewrite integrations.
 - **Repeated task failure:** circuit breaker and advisor intervention.
 - **State drift:** compare configuration, package lock, schema, profiles, and
@@ -66,4 +69,3 @@ these artifacts.
 - **Conflicting workers:** claims and resource leases select one writer.
 - **Accounting interruption:** reconcile provider records before posting or
   reversing journal entries.
-

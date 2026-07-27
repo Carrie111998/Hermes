@@ -31,4 +31,5 @@ Hermes Agent history remains available in Git.
 - Governed worker launch and result handoff fail closed when task, mandate,
   profile, authority, toolset, skill, budget, or expiry evidence differs from
   the immutable grant.
-
+- Housekeeping repairs lost wake events for active accepted/planned objectives
+  using versioned idempotency fences, without reviving blocked objectives.

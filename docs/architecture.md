@@ -22,7 +22,7 @@ engine, executor, verifier, or ledger.
 | Component | Responsibility |
 |---|---|
 | Objective service | Durable goals, immutable plan versions, actions, permits, results, evidence |
-| Objective runtime | Event claims, cadence, leases, retries, recovery, stop and escalation |
+| Objective runtime | Event claims, cadence, lost-wakeup repair, leases, retries, recovery, stop and escalation |
 | Organization database | Founder/CEO, reporting hierarchy, mandates, hiring and offboarding |
 | Delegation control | Exact employee task grants and launch/result validation |
 | Finance and accounting | Capital, reservations, budgets, journals, periods, tax and payment records |
@@ -42,6 +42,10 @@ organizational, objective, approval, compliance, and execution state is stored
 in structured databases. External state changes are accepted only after
 read-back or deterministic verification.
 
+Housekeeping repairs a narrowly defined failure window: if an accepted or
+planned objective has no pending or processing inbox event, it emits one
+versioned reconciliation wake. The versioned dedupe key makes this safe across
+worker restarts without reviving blocked or terminal objectives.
+
 The inherited `hermes_cli` package is a compatibility implementation detail.
 The public distribution, command, and new namespace are `charterforge`.
-
