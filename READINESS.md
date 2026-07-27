@@ -777,6 +777,18 @@ approval, event, AgentMail, maintenance, and bootstrap suites. Result:
 **99 passed, 0 failed**. This confirms production resolution paths provide
 tenant scope while legacy objective-only stores remain non-crashing.
 
+Master-stop delegation fencing was validated on current `main` commit
+`13c80a421b062c15511784eeefeb8d17e63a7f25` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_operational_control.py
+```
+
+Result: **25 passed, 0 failed**. Pausing autonomy revokes active employee
+grants and blocks delegated result handoff through the autonomy boundary.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
