@@ -285,17 +285,33 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     screen.write_bytes(b"png")
     monkeypatch.setenv("CODEX_THREAD_ID", "maker-thread")
     monkeypatch.setenv("MARSHAL_SESSION_ID", "maker-thread")
-    seen = {}
+    seen = {"argv": [], "env": [], "prompts": []}
 
     def command(argv, **kwargs):
-        seen["argv"] = argv
-        seen["env"] = kwargs["env"]
+        seen["argv"].append(argv)
+        seen["env"].append(kwargs["env"])
+        seen["prompts"].append(kwargs["input"])
         output = Path(argv[argv.index("--output-last-message") + 1])
-        output.write_text(json.dumps(judgment("ignored-model-value")))
+        schema = Path(argv[argv.index("--output-schema") + 1]).name
+        if schema == "naive-judge-schema.json":
+            output.write_text(
+                json.dumps(
+                    {
+                        "source_to_page": "pass",
+                        "page_to_source": "fail",
+                        "manager_readability": "unsure",
+                        "summary": "cold manager read",
+                    }
+                )
+            )
+            checker = "fresh-naive-checker"
+        else:
+            output.write_text(json.dumps({"checks": judgment()["checks"]}))
+            checker = "fresh-registry-checker"
         return subprocess.CompletedProcess(
             argv,
             0,
-            json.dumps({"type": "thread.started", "thread_id": "fresh-checker"}) + "\n",
+            json.dumps({"type": "thread.started", "thread_id": checker}) + "\n",
             "",
         )
 
@@ -311,12 +327,17 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
         core.load_registry(),
         "maker-thread",
     )
-    assert result["checker_session_id"] == "fresh-checker"
-    assert "CODEX_THREAD_ID" not in seen["env"]
-    assert "MARSHAL_SESSION_ID" not in seen["env"]
+    assert result["checker_session_id"] == "fresh-registry-checker"
+    assert result["summary"] == "cold manager read"
+    assert len(seen["argv"]) == 2
+    assert "registry=" not in seen["prompts"][0]
+    assert "checklist" in seen["prompts"][0]
+    assert "registry=" in seen["prompts"][1]
+    assert all("CODEX_THREAD_ID" not in env for env in seen["env"])
+    assert all("MARSHAL_SESSION_ID" not in env for env in seen["env"])
     image_args = [
-        seen["argv"][index + 1]
-        for index, value in enumerate(seen["argv"])
+        seen["argv"][0][index + 1]
+        for index, value in enumerate(seen["argv"][0])
         if value == "-i"
     ]
     assert str(source_image) in image_args

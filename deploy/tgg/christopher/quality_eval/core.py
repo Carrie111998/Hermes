@@ -24,6 +24,8 @@ ROOT = Path(__file__).resolve().parents[4]
 DEPLOY_DIR = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = DEPLOY_DIR / "quality-checks.yaml"
 JUDGE_SCHEMA_PATH = Path(__file__).with_name("judge-schema.json")
+NAIVE_JUDGE_SCHEMA_PATH = Path(__file__).with_name("naive-judge-schema.json")
+REGISTRY_JUDGE_SCHEMA_PATH = Path(__file__).with_name("registry-judge-schema.json")
 FIXTURE_DIR = ROOT / "tests/fixtures/clients/tgg/output-quality"
 DEFAULT_STATE_DIR = Path.home() / ".marshal/state/tgg-output-quality-eval"
 PORTAL_BASE = "https://systems.papercut-labs.com/tgg"
@@ -576,22 +578,30 @@ class Judge:
         registry: Registry,
         maker_session_id: str,
     ) -> dict[str, Any]:
-        prompt = (
+        naive_prompt = (
             "This is a bounded evaluation task, not repository development or durable-memory work. "
             "Return only the requested judgment JSON. You are an independent vision quality checker. "
-            "Read the source bundle and accessibility "
-            "snapshots named below and inspect both attached screenshots. Check both directions: every "
+            "Take the cold stance of a TGG manager seeing this page for the first time. Do not use, "
+            "infer, or search for a checklist. Read the source bundle and accessibility snapshots "
+            "named below and inspect both attached screenshots. Judge the general quality bar in both directions: every "
             "page claim must trace to source, every source fact must be represented, and the page must "
-            "read sensibly to a TGG manager. Run every registry check exactly once, using each "
-            "registry check id verbatim. A check whose triggering source fact is absent is unsure, not "
-            "pass. Use unsure whenever "
-            "evidence is insufficient; never silently pass uncertainty.\n"
+            "read sensibly to a TGG manager. Use unsure whenever evidence is insufficient; never "
+            "silently pass uncertainty.\n"
+            f"source_bundle={bundle_path}\ncase_snapshot={captures['snapshot']}\n"
+            f"portal_snapshot={captures['portal_snapshot']}\n"
+        )
+        registry_prompt = (
+            "This is the second, regression-floor pass. Return only the requested judgment JSON. "
+            "Read the source bundle, accessibility snapshots, screenshots, and named registry. Run "
+            "every registry check exactly once using its id verbatim. A check whose triggering source "
+            "fact is absent is unsure, not pass. Never silently pass uncertainty.\n"
             f"source_bundle={bundle_path}\ncase_snapshot={captures['snapshot']}\n"
             f"portal_snapshot={captures['portal_snapshot']}\nregistry={REGISTRY_PATH}\n"
         )
         if self.command_argv:
             request = {
-                "prompt": prompt,
+                "prompt": naive_prompt,
+                "registry_prompt": registry_prompt,
                 "bundle_path": str(bundle_path),
                 "captures": captures,
                 "registry": [item.__dict__ for item in registry.checks],
@@ -607,7 +617,6 @@ class Judge:
             return validate_judgment(value, registry, maker_session_id)
 
         with tempfile.TemporaryDirectory(prefix="tgg-output-judge-") as tmp:
-            output = Path(tmp) / "result.json"
             try:
                 source_bundle = json.loads(bundle_path.read_text())
             except (OSError, json.JSONDecodeError) as exc:
@@ -620,31 +629,15 @@ class Judge:
                 and Path(item["local_path"]).is_file()
             ][:20]
             if source_images:
-                prompt += (
+                attachment_note = (
                     "\nAttachment order: image 1 is the rendered case page; image 2 is the portal "
                     "case list; subsequent images are retained source media in this exact order:\n"
                     + "\n".join(f"- {path}" for path in source_images)
                     + "\nUse the bundle's retained_media mapping to correlate each source image. "
                     "If more source media is referenced than attached, mark affected checks unsure.\n"
                 )
-            argv = [
-                "codex",
-                "exec",
-                "--json",
-                "--sandbox",
-                "read-only",
-                "--output-schema",
-                str(JUDGE_SCHEMA_PATH),
-                "--output-last-message",
-                str(output),
-                "-i",
-                captures["screenshot"],
-                "-i",
-                captures["portal_screenshot"],
-            ]
-            for source_image in source_images:
-                argv.extend(["-i", source_image])
-            argv.append("-")
+                naive_prompt += attachment_note
+                registry_prompt += attachment_note
             # `codex exec` inherits CODEX_THREAD_ID in managed sessions and
             # otherwise resumes the maker's thread. Remove only session
             # bindings so the checker is a genuinely fresh vision seat while
@@ -660,24 +653,54 @@ class Judge:
                 "CLAUDE_CODE_CHILD_SESSION",
             ):
                 checker_env.pop(key, None)
-            result = self.command(argv, input=prompt, capture_output=True, env=checker_env)
-            if result.returncode:
-                raise EvalError(f"vision judge failed: {result.stderr.strip()}")
-            checker_id = None
-            for line in result.stdout.splitlines():
+
+            def run_pass(prompt: str, schema: Path, output_name: str) -> tuple[dict[str, Any], str]:
+                output = Path(tmp) / output_name
+                argv = [
+                    "codex", "exec", "--json", "--sandbox", "read-only",
+                    "--output-schema", str(schema),
+                    "--output-last-message", str(output),
+                    "-i", captures["screenshot"],
+                    "-i", captures["portal_screenshot"],
+                ]
+                for source_image in source_images:
+                    argv.extend(["-i", source_image])
+                argv.append("-")
+                result = self.command(argv, input=prompt, capture_output=True, env=checker_env)
+                if result.returncode:
+                    raise EvalError(f"vision judge failed: {result.stderr.strip()}")
+                checker_id = None
+                for line in result.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "thread.started":
+                        checker_id = event.get("thread_id")
+                if not checker_id:
+                    raise EvalError("vision judge did not expose its checker session id")
                 try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") == "thread.started":
-                    checker_id = event.get("thread_id")
-            if not checker_id:
-                raise EvalError("vision judge did not expose its checker session id")
-            try:
-                value = json.loads(output.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
-                raise EvalError("vision judge did not write strict JSON") from exc
-            value["checker_session_id"] = checker_id
+                    value = json.loads(output.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise EvalError("vision judge did not write strict JSON") from exc
+                return value, str(checker_id)
+
+            naive, naive_checker = run_pass(
+                naive_prompt, NAIVE_JUDGE_SCHEMA_PATH, "naive.json"
+            )
+            registry_result, registry_checker = run_pass(
+                registry_prompt, REGISTRY_JUDGE_SCHEMA_PATH, "registry.json"
+            )
+            if maker_session_id in {naive_checker, registry_checker}:
+                raise EvalError("checker session equals maker session")
+            value = {
+                "checker_session_id": registry_checker,
+                "source_to_page": naive["source_to_page"],
+                "page_to_source": naive["page_to_source"],
+                "manager_readability": naive["manager_readability"],
+                "summary": naive["summary"],
+                "checks": registry_result["checks"],
+            }
             return validate_judgment(value, registry, maker_session_id)
 
 
