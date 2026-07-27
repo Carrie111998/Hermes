@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -1303,6 +1304,19 @@ def test_rate_limited_planner_recovers_after_durable_backoff_without_duplicate_a
         "SELECT status FROM objective_inbox WHERE id=?", (event_id,)
     ).fetchone()["status"] == "completed"
     conn.close()
+
+
+def test_rate_limit_retry_hint_accepts_provider_headers():
+    error = RuntimeError("provider throttled")
+    error.response = SimpleNamespace(headers={"Retry-After": "7"})
+
+    assert runtime._rate_limit_retry_after(error) == 7
+
+    reset = str(int(time.time()) + 9)
+    error.response = SimpleNamespace(
+        headers={"x-ratelimit-reset-requests": reset}
+    )
+    assert 0 <= runtime._rate_limit_retry_after(error) <= 9
 
 
 def test_multiple_effects_from_one_observation_are_preserved_but_not_executed(

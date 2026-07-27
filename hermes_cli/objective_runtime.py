@@ -11,6 +11,7 @@ import json
 import sqlite3
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
@@ -28,7 +29,13 @@ from hermes_cli import objectives_db as db
 
 
 def _rate_limit_retry_after(exc: BaseException) -> int | None:
-    """Extract a bounded provider retry hint without coupling to one SDK."""
+    """Extract a provider retry hint without coupling to one SDK.
+
+    Providers expose this as an SDK attribute, a ``Retry-After`` header (either
+    seconds or an HTTP date), or a rate-limit reset epoch.  Returning ``None``
+    means no structured hint was available; callers still apply their normal
+    bounded exponential retry policy.
+    """
     candidates: list[Any] = []
     for source in (exc, getattr(exc, "response", None)):
         if source is None:
@@ -39,15 +46,41 @@ def _rate_limit_retry_after(exc: BaseException) -> int | None:
         headers = getattr(source, "headers", None)
         if headers:
             try:
-                value = headers.get("retry-after") or headers.get("Retry-After")
+                normalized = {
+                    str(key).lower(): value for key, value in headers.items()
+                }
+                value = normalized.get("retry-after")
+                if value is None:
+                    reset = next(
+                        (
+                            normalized.get(key)
+                            for key in (
+                                "x-ratelimit-reset",
+                                "x-ratelimit-reset-requests",
+                                "x-ratelimit-reset-tokens",
+                            )
+                            if normalized.get(key) is not None
+                        ),
+                        None,
+                    )
+                    if reset is not None:
+                        candidates.append(max(0, float(reset) - time.time()))
             except AttributeError:
                 value = None
             if value is not None:
                 candidates.append(value)
     for value in candidates:
         try:
-            seconds = int(float(value))
-        except (TypeError, ValueError):
+            try:
+                seconds = int(float(value))
+            except (TypeError, ValueError):
+                seconds = max(
+                    0,
+                    int(
+                        parsedate_to_datetime(str(value)).timestamp() - time.time()
+                    ),
+                )
+        except (TypeError, ValueError, OverflowError, OSError):
             continue
         if seconds >= 0:
             return seconds
