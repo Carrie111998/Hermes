@@ -170,6 +170,36 @@ scripts/run_tests.sh -q -j 4 \
 Result: **23 passed, 0 failed**. This focused ingress regression is supporting
 evidence, not an expansion of the release-gate capability inventory.
 
+## Current-tree install-to-restart acceptance
+
+The current main branch has a separate, broader acceptance scenario. It is not
+retroactively attributed to the tagged release boundary. At commit
+`5b44c5dcd5`, from the repository root, run:
+
+```bash
+scripts/run_agentic_acceptance.sh
+```
+
+This single command builds and installs the wheel, builds a Docker image,
+bootstraps a fresh state volume, records blocked readiness, satisfies the
+required local controls, starts the bounded CEO worker, executes one objective,
+restarts the container, and verifies durable recovery with idempotent replay.
+The exact result was:
+
+```text
+{"phase": "prepare", "initial_readiness": "blocked"}
+{"phase": "prepare", "ready": true, "runtime_active": false}
+{"phase": "run", "objective": "verified", "effects": 1}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+The image ID was
+`sha256:4e417ea577b3aa2b5c4d3f2effdf4b50e3db375d86ff3f2e48a4fe882c72c930`.
+The provider boundary is a deterministic file-backed test adapter; this is
+controlled runtime evidence and not proof of live provider credentials,
+production deployment, or legal/tax readiness.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

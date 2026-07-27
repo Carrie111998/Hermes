@@ -125,3 +125,35 @@ duplicates. The persistence contract is covered by
 
 This is local bootstrap evidence, not proof of legal formation, production
 provider readiness, container-registry publication, or high availability.
+
+## Current-tree Founder/CEO acceptance
+
+The single current-tree acceptance scenario is the decisive bounded runtime
+proof. It builds and installs the wheel, starts a fresh container, demonstrates
+blocked readiness before controls are satisfied, applies the test charter and
+required local controls, starts the CEO worker, executes one bounded objective,
+restarts the container, and verifies the durable objective state without a
+duplicate provider effect:
+
+```bash
+scripts/run_agentic_acceptance.sh
+```
+
+Run on 2026-07-27 at commit `5b44c5dcd5` (the current-tree acceptance harness
+commit). Result:
+
+```text
+Charterforge v0.19.0 (2026.7.20)
+{"phase": "prepare", "initial_readiness": "blocked"}
+{"phase": "prepare", "ready": true, "runtime_active": false}
+{"phase": "run", "objective": "verified", "effects": 1}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+The image was built locally as `charterforge:agentic-acceptance` with image
+ID `sha256:4e417ea577b3aa2b5c4d3f2effdf4b50e3db375d86ff3f2e48a4fe882c72c930`.
+The provider is a deterministic file-backed test adapter mounted in the
+temporary state volume; no Stripe, AgentMail, network endpoint, or production
+credential is used. This proves the controlled restart/idempotency contract,
+not production deployment or live payment capability.

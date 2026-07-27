@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added `scripts/run_agentic_acceptance.sh`, a current-tree install-to-restart
+  Founder/CEO acceptance scenario with durable recovery and zero duplicate
+  provider effects; evidence is recorded in `docs/agentic-bootstrap.md` and
+  remains distinct from the tagged `0.19.0-agentic-foundation` boundary.
 - `business payment-rails` now performs credential-safe, read-only payment-rail
   discovery and reports unavailable optional providers without implying
   settlement readiness.

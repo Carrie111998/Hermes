@@ -128,6 +128,13 @@ not launch general-purpose execution. Exact capabilities, systems, toolsets,
 skills, budgets, prohibited actions, and resource ceilings should be selected
 before unattended operation.
 
+To run the complete current-tree install/bootstrap/readiness/worker/restart
+acceptance proof:
+
+```bash
+scripts/run_agentic_acceptance.sh
+```
+
 ## Development validation
 
 Release status is explicit: the controlled Founder/CEO runtime acceptance
