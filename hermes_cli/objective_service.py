@@ -229,12 +229,35 @@ def tick_once(
 
     readiness = evaluate_security_readiness(config)
     if not readiness.ready:
-        return CycleOutcome(
-            None,
-            None,
-            "security_blocked",
-            "; ".join(readiness.violations),
-        )
+        reason = "; ".join(readiness.violations)
+        # Security readiness is checked before the normal runtime transaction,
+        # but a fail-closed stop must still leave an actionable advisor record.
+        # Keep this path durable and deduplicated without granting any bypass.
+        with db.connect_closing(db_path) as conn:
+            from hermes_cli import organization_db
+
+            ceo = organization_db.active_ceo(conn)
+            organization_id = (
+                str(ceo["organization_id"]) if ceo is not None else "__unscoped__"
+            )
+            _raise_readiness_intervention(
+                conn,
+                organization_id=organization_id,
+                category="security_readiness_blocked",
+                summary="Autonomous operation is blocked by security readiness checks",
+                context={
+                    "violations": list(readiness.violations),
+                    "authority_boundary": "No action was attempted",
+                },
+                options=[
+                    {"id": "configure_isolation", "label": "Configure an approved isolated execution backend"},
+                    {"id": "configure_secrets", "label": "Configure an approved external secret manager"},
+                    {"id": "review_security", "label": "Review security policy and remain paused"},
+                    {"id": "manual", "label": "Remain in manual operation"},
+                ],
+                dedupe_key=f"readiness:security:{organization_id}",
+            )
+        return CycleOutcome(None, None, "security_blocked", reason)
     with db.connect_closing(db_path) as conn:
         from hermes_cli import authority_integrity
         from hermes_cli import operational_control

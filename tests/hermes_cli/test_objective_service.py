@@ -18,6 +18,25 @@ def test_disabled_service_does_not_open_runtime_store(monkeypatch):
     assert outcome.status == "disabled"
 
 
+def test_security_block_creates_deduplicated_advisor_handoff(tmp_path, monkeypatch):
+    database = tmp_path / "security-readiness.db"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agentic": {"enabled": True}},
+    )
+
+    first = objective_service.tick_once(db_path=database)
+    second = objective_service.tick_once(db_path=database)
+
+    assert first.status == second.status == "security_blocked"
+    conn = db.connect(database)
+    interventions = operational_control.list_interventions(conn)
+    assert len(interventions) == 1
+    assert interventions[0]["category"] == "security_readiness_blocked"
+    assert interventions[0]["context"]["authority_boundary"] == "No action was attempted"
+    assert interventions[0]["context"]["violations"]
+
+
 def test_missing_ceo_authority_creates_deduplicated_advisor_handoff(
     tmp_path, monkeypatch
 ):
