@@ -1156,6 +1156,27 @@ toolset ordering is now persisted before subprocess verification. This is
 deterministic local-provider evidence and does not establish production
 filesystem access, provider credentials, or legal/compliance certification.
 
+The governed patch-write bypass closure was validated on current `main` commit
+`a324305f32eaf7e6c26bfe77f25902a92c77b885` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_agentic_business_e2e.py \
+  tests/tools/test_file_tools.py
+uv run --extra dev ruff check tools/file_tools.py scripts/delegation_process_acceptance.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **75 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The process-separated subordinate now rejects direct writes,
+retargeted reads, and patch replacement under its read-only grant. The
+acceptance image manifest digest was
+`sha256:4b7ca9cc25747eaaf83245bdfaed5e6354cbce830aa28bd12ea1ac57758d837d`.
+This remains deterministic local-provider evidence and does not establish
+production filesystem access, provider credentials, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

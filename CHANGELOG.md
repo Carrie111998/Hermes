@@ -90,6 +90,11 @@
   and wakes the CEO only after that evidence-bearing task completion.
 - Canonical toolset ordering is now persisted in delegation grants, preventing
   valid multi-toolset grants from failing integrity verification after restart.
+- Governed `patch_tool` writes now pass through the same exact `file.write`
+  authorization boundary as `write_file_tool`; empty or unresolved patch
+  targets fail closed for contracted workers.
+- The process-separated acceptance now proves that a read-only worker cannot
+  bypass write authority through patch replacement.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

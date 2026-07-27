@@ -75,6 +75,8 @@ acceptance evidence.
 - The installed process-separated acceptance carries that proof through the
   subordinate environment and durable CEO handoff; grant integrity remains
   stable for multi-toolset contracts after persistence.
+- Patch replacement is governed as a write at its own tool boundary, closing
+  the alternate file-edit path for read-only workers.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;
