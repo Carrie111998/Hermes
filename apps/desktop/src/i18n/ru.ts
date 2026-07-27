@@ -292,6 +292,9 @@ export const ruOverrides = {
       'view.closeTab': 'Закрыть вкладку',
       'view.reopenTab': 'Открыть закрытую вкладку',
       'view.flipPanes': 'Поменять стороны панелей',
+      'view.findInPage': 'Найти на странице',
+      'view.findNext': 'Следующее совпадение',
+      'view.findPrevious': 'Предыдущее совпадение',
       'appearance.toggleMode': 'Переключить светлую / тёмную тему',
       'profile.default': 'Переключиться на профиль по умолчанию',
       'profile.switch.1': 'Переключиться на профиль 1',
@@ -327,6 +330,11 @@ export const ruOverrides = {
       'composer.history': 'Перебор истории / всплывающих окон',
       'composer.cancel': 'Закрыть окно · отменить запуск'
     }
+  },
+
+  findInPage: {
+    next: 'Следующее совпадение',
+    previous: 'Предыдущее совпадение'
   },
 
   language: {
@@ -571,6 +579,16 @@ export const ruOverrides = {
       keepAwakeTitle: 'Не переводить компьютер в режим сна',
       keepAwakeDesc:
         'Не переводить компьютер в режим сна, чтобы длительные и ночные задачи не прерывались. Экран при этом может затемняться.'
+    },
+    quickEntry: {
+      enabledTitle: 'Быстрый ввод',
+      enabledDesc:
+        'Открывает небольшое поле ввода поверх любого приложения по глобальному сочетанию клавиш, чтобы отправить запрос без открытия окна Hermes.',
+      shortcutTitle: 'Сочетание клавиш для быстрого ввода',
+      shortcutDesc: 'Требуется хотя бы одна клавиша-модификатор, например CommandOrControl+Shift+Space.',
+      active: 'Сочетание клавиш активно.',
+      takenBy: 'Это сочетание уже используется другим приложением. Выберите другое.',
+      invalidShortcut: 'Недопустимое сочетание. Добавьте хотя бы одну клавишу-модификатор.'
     },
     credentials: {
       pasteKey: 'Вставить ключ',
@@ -1799,6 +1817,29 @@ export const ruOverrides = {
     copyPath: 'Копировать путь'
   },
 
+  artifactCard: {
+    kind: { code: 'Код', html: 'Интерактивная страница', svg: 'Графика' },
+    generating: lines => `Создание… ${countRu(lines, 'строка', 'строки', 'строк')}`,
+    versionBadge: count => countRu(count, 'версия', 'версии', 'версий'),
+    open: 'Открыть'
+  },
+
+  artifactPane: {
+    tabFallback: 'Артефакт',
+    modePreview: 'ПРЕДПРОСМОТР',
+    modeSource: 'ИСХОДНЫЙ КОД',
+    versionOf: (current, total) => `Версия ${current} из ${total}`,
+    olderVersion: 'Предыдущая версия',
+    newerVersion: 'Следующая версия',
+    latest: 'Последняя',
+    copyContent: 'Копировать содержимое',
+    download: 'Скачать',
+    openInBrowser: 'Открыть в браузере',
+    openInBrowserFailed: 'Не удалось открыть в браузере',
+    missingTitle: 'Артефакт недоступен',
+    missingBody: 'Этого артефакта больше нет в локальном реестре.'
+  },
+
   sidebar: {
     nav: {
       'new-session': 'Новая сессия',
@@ -2075,6 +2116,10 @@ export const ruOverrides = {
   statusStack: {
     agents: 'Агенты',
     background: count => `Фоновые задачи: ${count}`,
+    goalActive: 'Цель активна',
+    goalDone: 'Цель достигнута',
+    goalPaused: 'Цель приостановлена',
+    goalWaiting: 'Цель ожидает продолжения',
     subagents: count => countRu(count, 'субагент', 'субагента', 'субагентов'),
     todos: (done, total) => `Задачи: ${done}/${total}`,
     running: 'Выполняется',
@@ -2450,6 +2495,16 @@ export const ruOverrides = {
       gatewayOffline: 'офлайн',
       gatewayRestarting: 'перезапуск…',
       gatewayTitle: 'Статус шлюза инференса Hermes',
+      customizeTitle: 'Показывать в строке состояния',
+      toggleApprovalMode: 'Подтверждения',
+      toggleBackendVersion: 'Версия бэкенда',
+      toggleCommandCenter: 'Центр управления',
+      toggleContextUsage: 'Индикатор контекста',
+      toggleRunningTimer: 'Таймер текущего хода',
+      toggleSessionTimer: 'Таймер сессии',
+      toggleTerminal: 'Терминал',
+      toggleVersion: 'Версия и обновления',
+      toggleWorkspace: 'Рабочая область',
       agents: 'Агенты',
       closeAgents: 'Закрыть агентов',
       openAgents: 'Открыть агентов',

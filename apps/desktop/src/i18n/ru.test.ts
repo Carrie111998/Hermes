@@ -53,6 +53,10 @@ describe('Russian locale', () => {
     expect(ru.desktop.skillCommandsAvailable(5)).toBe('Доступно 5 команд навыков.')
     expect(ru.desktop.skillCommandsAvailable(11)).toBe('Доступно 11 команд навыков.')
     expect(ru.desktop.skillCommandsAvailable(21)).toBe('Доступна 21 команда навыка.')
+    expect(ru.artifactCard.generating(11)).toBe('Создание… 11 строк')
+    expect(ru.artifactCard.generating(21)).toBe('Создание… 21 строка')
+    expect(ru.artifactCard.versionBadge(12)).toBe('12 версий')
+    expect(ru.artifactCard.versionBadge(22)).toBe('22 версии')
   })
 
   it('keeps pending actions compatible with their rendered status', () => {
