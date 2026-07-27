@@ -80,6 +80,14 @@ The compliance catalog helps track CAN-SPAM, CASL, GDPR, the EU AI Act, SOX,
 PCI DSS, PIPEDA, RPAA, FINTRAC, and other regimes. Catalog presence is not an
 applicability conclusion. Qualified legal, tax, privacy, security, or
 accounting review is still required where the facts demand it.
+
+When `compliance.require_action_context` is enabled, every action permit must
+carry organization-bound compliance context: jurisdictions, activities, data
+classes, and relevant entity attributes. Action admission evaluates the
+applicable regimes and fails closed (or escalates) when applicability,
+obligation, or control evidence is missing, stale, ambiguous, or failed. The
+top-level readiness projection consumes these subsystem findings; it does not
+reimplement action-specific regulatory policy.
 # Event ingress authentication boundary
 
 Objective wake-ups from external systems are accepted only when the adapter

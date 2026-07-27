@@ -81,6 +81,10 @@ acceptance evidence.
 - Compliance applicability, obligations, and control evidence use explicit
   supersession lineage; attempts to branch from an old record are rejected,
   and ambiguous current leaves fail closed during action authorization.
+- Readiness consumes compliance findings without duplicating action-specific
+  regime evaluation; `compliance.require_action_context` keeps the
+  jurisdiction, activity, data-class, and entity gate authoritative at permit
+  admission.
 - Payment-provider assessments use the same append-only supersession model;
   readiness excludes superseded records and provider authorization evaluates
   only the current screened assessment.
