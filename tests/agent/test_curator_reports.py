@@ -7,6 +7,8 @@ the standard log dir, not inside the user's ``skills/`` data directory.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,6 +82,32 @@ def test_write_run_report_creates_both_files(curator_env):
 
     # The directory name is a timestamp under logs/curator/
     assert run_dir.parent == curator._reports_root()
+
+
+def test_write_run_report_creates_private_artifacts_under_umask_022(curator_env):
+    """Curator telemetry stays owner-only even under the common 0022 umask."""
+    curator = curator_env["curator"]
+
+    previous_umask = os.umask(0o022)
+    try:
+        run_dir = curator._write_run_report(
+            started_at=datetime.now(timezone.utc),
+            elapsed_seconds=1.0,
+            auto_counts={"checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0},
+            auto_summary="no changes",
+            before_report=[],
+            before_names=set(),
+            after_report=[],
+            llm_meta=_make_llm_meta(),
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert run_dir is not None
+    assert stat.S_IMODE(curator._reports_root().stat().st_mode) == 0o700
+    assert stat.S_IMODE(run_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((run_dir / "run.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((run_dir / "REPORT.md").stat().st_mode) == 0o600
 
 
 def test_run_json_has_expected_shape(curator_env):

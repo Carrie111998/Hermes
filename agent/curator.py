@@ -590,10 +590,25 @@ def _reports_root() -> Path:
     """
     root = get_hermes_home() / "logs" / "curator"
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
     except OSError as e:
         logger.debug("Curator reports dir create failed: %s", e)
     return root
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    """Write text with owner-only permissions regardless of process umask."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            f.write(content)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _needle_in_path_component(needle: str, path: str) -> bool:
@@ -1110,7 +1125,8 @@ def _write_run_report(
     """
     root = _reports_root()
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
     except Exception as e:
         logger.debug("Curator report dir create failed: %s", e)
         return None
@@ -1123,7 +1139,7 @@ def _write_run_report(
         suffix += 1
         run_dir = root / f"{stamp}-{suffix}"
     try:
-        run_dir.mkdir(parents=True, exist_ok=False)
+        run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
     except Exception as e:
         logger.debug("Curator run dir create failed: %s", e)
         return None
@@ -1256,9 +1272,9 @@ def _write_run_report(
 
     # run.json — machine-readable, full fidelity
     try:
-        (run_dir / "run.json").write_text(
+        _write_private_text(
+            run_dir / "run.json",
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
     except Exception as e:
         logger.debug("Curator run.json write failed: %s", e)
@@ -1266,7 +1282,7 @@ def _write_run_report(
     # REPORT.md — human-readable
     try:
         md = _render_report_markdown(payload)
-        (run_dir / "REPORT.md").write_text(md, encoding="utf-8")
+        _write_private_text(run_dir / "REPORT.md", md)
     except Exception as e:
         logger.debug("Curator REPORT.md write failed: %s", e)
 
@@ -1274,9 +1290,9 @@ def _write_run_report(
     # keep run dirs uncluttered for the common no-op case.
     try:
         if int(cron_rewrites.get("jobs_updated", 0)) > 0:
-            (run_dir / "cron_rewrites.json").write_text(
+            _write_private_text(
+                run_dir / "cron_rewrites.json",
                 json.dumps(cron_rewrites, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
             )
     except Exception as e:
         logger.debug("Curator cron_rewrites.json write failed: %s", e)
