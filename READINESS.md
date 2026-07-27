@@ -468,6 +468,37 @@ commit `b587ca533a9a5f0f8d1518d0d963395fbe108e9a` on 2026-07-27. It returned
 succeeded with `duplicate_provider_calls: 0` and `duplicate_effects: 0`.
 Image manifest: `sha256:4f6bfd947234c853b0f1bad3a1467318d58529f3ed15b2b1e4e77c4ce1e7260a`.
 
+The complete acceptance was rerun against current `main` commit
+`dce3949fea0f0ffe9edc4cbd9e956dae76a14694` after transitive delegation
+enforcement. The exact command was:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+It passed installation, bootstrap, blocked-to-ready readiness, bounded CEO
+execution, scheduled replanning, process-separated delegation, uncertain
+provider read-back, inbound tax-bearing settlement, durable restart recovery,
+and master stop:
+
+```text
+{"phase": "prepare", "initial_readiness": "blocked"}
+{"phase": "prepare", "ready": true, "runtime_active": false}
+{"phase": "run", "objective": "verified", "effects": 1, "scheduled_events": 1, "plan_versions": 2}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+{"phase": "ceo", "event": "kanban.task.done", "objective": "verified"}
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}
+{"phase": "stop", "autonomy": "paused", "generation": 2, "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+The resulting local image manifest was
+`sha256:b7b611baf4b9b7466bfde4b2e5a2d61b2672ef15a3d02e3ea63c43293ac5c499`.
+This remains deterministic local-provider evidence and does not establish
+production deployment, live payment credentials, or legal/compliance
+readiness.
+
 After exact capability/system launch-surface enforcement, the installed
 acceptance was rerun from commit `a1251763116dd951e6f3ab2303032ce2956ccb90`
 on 2026-07-27. It returned `current-tree agentic acceptance: PASS`; the

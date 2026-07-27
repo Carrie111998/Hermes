@@ -31,6 +31,10 @@
 - Delegation grants now fail closed when any capability, system, toolset, skill,
   budget, or expiry would exceed the current delegator mandate, in addition to
   the subordinate mandate and objective scope.
+- Non-root managers must now hold an active parent grant before sub-delegating;
+  child grants are bounded by that parent grant's capabilities, systems,
+  toolsets, skills, exact resource, budget, and expiry, preventing transitive
+  privilege amplification through the reporting hierarchy.
 - Delegation grants now persist the exact action resource scope and reject a
   Kanban binding to a different board; legacy grants without a scope fail closed
   until reissued under a current action contract.
