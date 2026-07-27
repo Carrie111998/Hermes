@@ -410,7 +410,8 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
 
     # --- Aggregators: need vendor/model format ---
     if provider in _AGGREGATOR_PROVIDERS:
-        return _prepend_vendor(name)
+        stripped = _strip_matching_provider_prefix(name, provider)
+        return _prepend_vendor(stripped)
 
     # --- OpenCode Zen / OpenCode Go: flat-namespace resellers.
     #     Their /v1/models API returns bare IDs only (no vendor prefix), and
