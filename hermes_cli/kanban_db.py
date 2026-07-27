@@ -302,6 +302,12 @@ _EXTERNAL_EFFECT_STATES = frozenset({
     "existing",
     "created",
     "verified",
+    "not_joined_verified",
+    "join_started",
+    "joined",
+    "pending_approval",
+    "needs_questions",
+    "failed",
 })
 _EXTERNAL_CREATE_HOSTS = {
     "facebook": frozenset({
@@ -321,6 +327,43 @@ _EXTERNAL_CREATE_HOSTS = {
         "seller.shopee.com.mx",
     }),
 }
+_FACEBOOK_GROUP_TARGET_RE = re.compile(
+    r"Facebook Group ([0-9]+)(?:（[^）]+）)?"
+)
+
+
+def grace_external_group_ids(body: str) -> frozenset[str]:
+    """Read numeric Facebook group targets from the compiled JSON contract."""
+    text = str(body or "")
+    if _grace_loop_stage_header(text) not in {"execution", "grace_review"}:
+        return frozenset()
+    fenced_blocks = re.findall(
+        r"```json[ \t]*\r?\n(.*?)\r?\n```",
+        text,
+        flags=re.DOTALL,
+    )
+    # Compiler output owns exactly one JSON fence. Any additional fence makes
+    # the authority source ambiguous and therefore fails closed.
+    if len(fenced_blocks) != 1:
+        return frozenset()
+    try:
+        contract = json.loads(fenced_blocks[0])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return frozenset()
+    if not isinstance(contract, Mapping):
+        return frozenset()
+    targets = contract.get("external_targets")
+    if not isinstance(targets, list):
+        return frozenset()
+    group_ids: set[str] = set()
+    for target in targets:
+        normalized = str(target or "").strip()
+        match = _FACEBOOK_GROUP_TARGET_RE.fullmatch(normalized)
+        if match is not None:
+            group_ids.add(match.group(1))
+        elif normalized.startswith("Facebook Group"):
+            return frozenset()
+    return frozenset(group_ids)
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -1287,19 +1330,20 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
--- Durable external-effect ledger for one exact Grace execution card.  A card
--- represents one target per platform, making (task_id, platform) the
--- idempotency boundary for draft/create operations and correction retries.
+-- Durable external-effect ledger for one exact Grace execution card.  The
+-- effect_key distinguishes multiple objects on one platform while "create"
+-- remains the idempotency boundary for draft/create correction retries.
 CREATE TABLE IF NOT EXISTS task_external_effects (
     task_id       TEXT NOT NULL,
     platform      TEXT NOT NULL,
+    effect_key    TEXT NOT NULL DEFAULT 'create',
     state         TEXT NOT NULL,
     external_id   TEXT,
     details       TEXT,
     run_id        INTEGER,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
-    PRIMARY KEY (task_id, platform)
+    PRIMARY KEY (task_id, platform, effect_key)
 );
 
 -- Subscription from a gateway source (platform + chat + thread) to a
@@ -2005,6 +2049,76 @@ def init_db(
     return path
 
 
+def _migrate_external_effect_keys(conn: sqlite3.Connection) -> None:
+    """Rebuild the external-effect ledger with a per-object effect key."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Inspect only after acquiring the writer lock. A second process may
+        # have completed this rebuild while this connection was waiting.
+        info = conn.execute(
+            "PRAGMA table_info(task_external_effects)"
+        ).fetchall()
+        if not info:
+            conn.execute("COMMIT")
+            return
+        pk_columns = [
+            row["name"]
+            for row in sorted(
+                (row for row in info if int(row["pk"] or 0) > 0),
+                key=lambda row: int(row["pk"]),
+            )
+        ]
+        if (
+            "effect_key" in {row["name"] for row in info}
+            and pk_columns == ["task_id", "platform", "effect_key"]
+        ):
+            conn.execute("COMMIT")
+            return
+        conn.execute(
+            "ALTER TABLE task_external_effects "
+            "RENAME TO task_external_effects_legacy"
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_external_effects (
+                task_id       TEXT NOT NULL,
+                platform      TEXT NOT NULL,
+                effect_key    TEXT NOT NULL DEFAULT 'create',
+                state         TEXT NOT NULL,
+                external_id   TEXT,
+                details       TEXT,
+                run_id        INTEGER,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL,
+                PRIMARY KEY (task_id, platform, effect_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO task_external_effects (
+                task_id, platform, effect_key, state, external_id, details,
+                run_id, created_at, updated_at
+            )
+            SELECT task_id, platform, 'create', state, external_id, details,
+                   run_id, created_at, updated_at
+              FROM task_external_effects_legacy
+            """
+        )
+        conn.execute("DROP TABLE task_external_effects_legacy")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_effects_state "
+            "ON task_external_effects(task_id, state)"
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2322,6 +2436,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                         "WHERE id = ?",
                         (int(time.time()), cur.lastrowid),
                     )
+
+    _migrate_external_effect_keys(conn)
 
     # One-shot event-kind rename pass. The old names ("ready", "priority",
     # "spawn_auto_blocked") still worked but were awkward on the wire;
@@ -3263,7 +3379,7 @@ def list_external_effects(
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT task_id, platform, state, external_id, details, run_id,
+        SELECT task_id, platform, effect_key, state, external_id, details, run_id,
                created_at, updated_at
           FROM task_external_effects
          WHERE task_id = ?
@@ -3282,6 +3398,7 @@ def list_external_effects(
         effects.append({
             "task_id": row["task_id"],
             "platform": row["platform"],
+            "effect_key": row["effect_key"],
             "state": row["state"],
             "external_id": row["external_id"],
             "details": details,
@@ -3302,14 +3419,15 @@ def _upsert_external_effect(
     details: Optional[Mapping[str, Any]],
     run_id: Optional[int],
     now: int,
+    effect_key: str = "create",
 ) -> None:
     conn.execute(
         """
         INSERT INTO task_external_effects (
-            task_id, platform, state, external_id, details, run_id,
+            task_id, platform, effect_key, state, external_id, details, run_id,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(task_id, platform) DO UPDATE SET
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, platform, effect_key) DO UPDATE SET
             state       = excluded.state,
             external_id = COALESCE(excluded.external_id,
                                    task_external_effects.external_id),
@@ -3321,6 +3439,7 @@ def _upsert_external_effect(
         (
             task_id,
             platform,
+            effect_key,
             state,
             external_id,
             json.dumps(details, ensure_ascii=False, sort_keys=True)
@@ -3338,6 +3457,7 @@ def record_external_effect(
     *,
     platform: str,
     state: str,
+    effect_key: str = "create",
     external_id: Optional[str] = None,
     details: Optional[Mapping[str, Any]] = None,
     expected_run_id: Optional[int] = None,
@@ -3349,14 +3469,37 @@ def record_external_effect(
     """
     normalized_platform = str(platform or "").strip().lower()
     normalized_state = str(state or "").strip().lower()
+    normalized_effect_key = str(effect_key or "").strip()
     if normalized_platform not in _EXTERNAL_CREATE_HOSTS:
         raise ValueError(
             f"platform must be one of {sorted(_EXTERNAL_CREATE_HOSTS)}"
         )
     if normalized_state not in _EXTERNAL_EFFECT_STATES - {"create_started"}:
         raise ValueError(
-            "state must be absent_verified, existing, created, or verified"
+            "state is not a supported external-effect state"
         )
+    if not normalized_effect_key:
+        raise ValueError("effect_key must be non-empty")
+    if normalized_effect_key == "create" and normalized_state not in {
+        "absent_verified", "existing", "created", "verified",
+    }:
+        raise ValueError(
+            "the create effect_key only accepts create reconciliation states"
+        )
+    scoped_group_match = re.fullmatch(
+        r"group:([0-9]+)",
+        normalized_effect_key,
+    )
+    if normalized_effect_key != "create":
+        if normalized_platform != "facebook" or scoped_group_match is None:
+            raise ValueError(
+                "object-scoped effects require facebook and group:<numeric-id>"
+            )
+        group_id = scoped_group_match.group(1)
+        if external_id is not None and str(external_id).strip() != group_id:
+            raise ValueError(
+                "group effect external_id must match its effect_key"
+            )
     now = int(time.time())
     with write_txn(conn):
         task = conn.execute(
@@ -3365,6 +3508,14 @@ def record_external_effect(
         ).fetchone()
         if task is None:
             raise ValueError(f"unknown task {task_id}")
+        if (
+            scoped_group_match is not None
+            and scoped_group_match.group(1)
+            not in grace_external_group_ids(task["body"])
+        ):
+            raise ValueError(
+                "group effect is not listed in the compiled Loop Contract"
+            )
         current_run_id = task["current_run_id"]
         if (
             _grace_loop_stage_header(task["body"]) == "execution"
@@ -3386,8 +3537,8 @@ def record_external_effect(
             )
         prior = conn.execute(
             "SELECT state, run_id FROM task_external_effects "
-            "WHERE task_id = ? AND platform = ?",
-            (task_id, normalized_platform),
+            "WHERE task_id = ? AND platform = ? AND effect_key = ?",
+            (task_id, normalized_platform, normalized_effect_key),
         ).fetchone()
         correction_exists = conn.execute(
             "SELECT 1 FROM task_events "
@@ -3422,6 +3573,7 @@ def record_external_effect(
             details=details,
             run_id=int(current_run_id) if current_run_id is not None else None,
             now=now,
+            effect_key=normalized_effect_key,
         )
         _append_event(
             conn,
@@ -3429,6 +3581,7 @@ def record_external_effect(
             "external_effect_recorded",
             {
                 "platform": normalized_platform,
+                "effect_key": normalized_effect_key,
                 "state": normalized_state,
                 "external_id": str(external_id).strip() if external_id else None,
             },
@@ -3436,8 +3589,148 @@ def record_external_effect(
         )
     return next(
         effect for effect in list_external_effects(conn, task_id)
-        if effect["platform"] == normalized_platform
+        if (
+            effect["platform"] == normalized_platform
+            and effect["effect_key"] == normalized_effect_key
+        )
     )
+
+
+def reserve_external_group_join(
+    conn: sqlite3.Connection,
+    task_id: str,
+    group_id: str,
+    *,
+    expected_run_id: Optional[int],
+) -> Optional[str]:
+    """Durably reserve one contract-scoped group before pointer dispatch."""
+    normalized_group_id = str(group_id or "").strip()
+    if not normalized_group_id.isdigit():
+        return "Facebook group join blocked: group id must be numeric."
+    effect_key = f"group:{normalized_group_id}"
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT body, status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "running"
+            or expected_run_id is None
+            or int(task["current_run_id"] or 0) != int(expected_run_id)
+        ):
+            return (
+                "Facebook group join blocked: caller is not the active "
+                "worker run."
+            )
+        if normalized_group_id not in grace_external_group_ids(task["body"]):
+            return (
+                "Facebook group join blocked: target is not in the current "
+                "compiled Loop Contract."
+            )
+        prior = conn.execute(
+            "SELECT state FROM task_external_effects "
+            "WHERE task_id = ? AND platform = 'facebook' AND effect_key = ?",
+            (task_id, effect_key),
+        ).fetchone()
+        if prior is not None and prior["state"] != "not_joined_verified":
+            return (
+                "Facebook group join blocked: durable state is already "
+                f"{prior['state']}; reconcile the visible membership state "
+                "instead of retrying."
+            )
+        _upsert_external_effect(
+            conn,
+            task_id=task_id,
+            platform="facebook",
+            effect_key=effect_key,
+            state="join_started",
+            external_id=normalized_group_id,
+            details={
+                "reservation": "before_pointer_dispatch",
+                "prior_state": (
+                    prior["state"] if prior is not None else None
+                ),
+            },
+            run_id=int(expected_run_id),
+            now=now,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "external_effect_reserved",
+            {
+                "platform": "facebook",
+                "effect_key": effect_key,
+                "state": "join_started",
+                "external_id": normalized_group_id,
+            },
+            run_id=int(expected_run_id),
+        )
+    return None
+
+
+def release_external_group_join_reservation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    group_id: str,
+    *,
+    expected_run_id: Optional[int],
+    reason: str,
+) -> None:
+    """Release a join reservation only when dispatch provably never started."""
+    normalized_group_id = str(group_id or "").strip()
+    effect_key = f"group:{normalized_group_id}"
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT state, run_id, details FROM task_external_effects "
+            "WHERE task_id = ? AND platform = 'facebook' AND effect_key = ?",
+            (task_id, effect_key),
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] != "join_started"
+            or expected_run_id is None
+            or int(row["run_id"] or 0) != int(expected_run_id)
+        ):
+            return
+        try:
+            details = json.loads(row["details"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            details = {}
+        prior_state = details.get("prior_state")
+        if prior_state == "not_joined_verified":
+            _upsert_external_effect(
+                conn,
+                task_id=task_id,
+                platform="facebook",
+                effect_key=effect_key,
+                state="not_joined_verified",
+                external_id=normalized_group_id,
+                details={"reservation_released": reason},
+                run_id=int(expected_run_id),
+                now=now,
+            )
+        else:
+            conn.execute(
+                "DELETE FROM task_external_effects "
+                "WHERE task_id = ? AND platform = 'facebook' "
+                "AND effect_key = ?",
+                (task_id, effect_key),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "external_effect_reservation_released",
+            {
+                "platform": "facebook",
+                "effect_key": effect_key,
+                "reason": reason,
+            },
+            run_id=int(expected_run_id),
+        )
 
 
 def reserve_external_create(
@@ -3487,7 +3780,7 @@ def reserve_external_create(
             return "External create blocked: worker run is not active."
         effect = conn.execute(
             "SELECT state, run_id, external_id FROM task_external_effects "
-            "WHERE task_id = ? AND platform = ?",
+            "WHERE task_id = ? AND platform = ? AND effect_key = 'create'",
             (task_id, platform),
         ).fetchone()
         if effect is not None and effect["state"] in {
@@ -3574,7 +3867,7 @@ def bind_external_create_page(
             return "External create page binding blocked: caller is not the active worker run."
         effect = conn.execute(
             "SELECT state, run_id, external_id FROM task_external_effects "
-            "WHERE task_id = ? AND platform = ?",
+            "WHERE task_id = ? AND platform = ? AND effect_key = 'create'",
             (task_id, platform),
         ).fetchone()
         if (
@@ -3625,7 +3918,7 @@ def release_external_create_reservation(
     with txn:
         effect = conn.execute(
             "SELECT state, run_id, details FROM task_external_effects "
-            "WHERE task_id = ? AND platform = ?",
+            "WHERE task_id = ? AND platform = ? AND effect_key = 'create'",
             (task_id, platform),
         ).fetchone()
         details: dict[str, Any] = {}
@@ -3645,7 +3938,7 @@ def release_external_create_reservation(
             return
         conn.execute(
             "DELETE FROM task_external_effects "
-            "WHERE task_id = ? AND platform = ?",
+            "WHERE task_id = ? AND platform = ? AND effect_key = 'create'",
             (task_id, platform),
         )
         _append_event(
@@ -3689,7 +3982,7 @@ def external_create_mutation_guard(
         return None
     effect = conn.execute(
         "SELECT state, run_id, details FROM task_external_effects "
-        "WHERE task_id = ? AND platform = ?",
+        "WHERE task_id = ? AND platform = ? AND effect_key = 'create'",
         (task_id, platform),
     ).fetchone()
     details: dict[str, Any] = {}
@@ -5089,11 +5382,41 @@ def complete_task(
                     raise ValueError(
                         "external effect platform must be facebook or shopee"
                     )
-                if state not in {"existing", "created", "verified"}:
+                if state not in {
+                    "existing", "created", "verified", "joined",
+                    "pending_approval",
+                }:
                     raise ValueError(
-                        "completion external effect state must be existing, "
-                        "created, or verified"
+                        "completion external effect state is not terminal"
                     )
+                effect_key = str(
+                    raw_effect.get("effect_key") or "create"
+                ).strip()
+                if not effect_key:
+                    raise ValueError(
+                        "completion external effect_key must be non-empty"
+                    )
+                if effect_key == "create" and state not in {
+                    "existing", "created", "verified",
+                }:
+                    raise ValueError(
+                        "join completion states require an object-scoped effect_key"
+                    )
+                group_match = re.fullmatch(r"group:([0-9]+)", effect_key)
+                effect_external_id = (
+                    str(raw_effect.get("external_id") or "").strip() or None
+                )
+                if effect_key != "create":
+                    if platform != "facebook" or group_match is None:
+                        raise ValueError(
+                            "object-scoped completion effects require facebook "
+                            "and group:<numeric-id>"
+                        )
+                    group_id = group_match.group(1)
+                    if effect_external_id is not None and effect_external_id != group_id:
+                        raise ValueError(
+                            "group completion external_id must match effect_key"
+                        )
                 details = raw_effect.get("details")
                 if details is not None and not isinstance(details, Mapping):
                     raise ValueError(
@@ -5101,10 +5424,9 @@ def complete_task(
                     )
                 external_effect_records.append({
                     "platform": platform,
+                    "effect_key": effect_key,
                     "state": state,
-                    "external_id": (
-                        str(raw_effect.get("external_id") or "").strip() or None
-                    ),
+                    "external_id": effect_external_id,
                     "details": details,
                 })
         if cleaned_artifacts:
@@ -5114,6 +5436,23 @@ def complete_task(
             )
 
     with write_txn(conn):
+        if external_effect_records:
+            fresh_scope = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            fresh_group_ids = grace_external_group_ids(
+                fresh_scope["body"] if fresh_scope is not None else ""
+            )
+            for effect in external_effect_records:
+                if effect["effect_key"] == "create":
+                    continue
+                group_id = effect["effect_key"].split(":", 1)[1]
+                if group_id not in fresh_group_ids:
+                    raise ValueError(
+                        "group completion effect is not listed in the "
+                        "current compiled Loop Contract"
+                    )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5178,6 +5517,7 @@ def complete_task(
                 details=effect["details"],
                 run_id=run_id,
                 now=now,
+                effect_key=effect["effect_key"],
             )
             _append_event(
                 conn,
@@ -5185,6 +5525,7 @@ def complete_task(
                 "external_effect_recorded",
                 {
                     "platform": effect["platform"],
+                    "effect_key": effect["effect_key"],
                     "state": effect["state"],
                     "external_id": effect["external_id"],
                     "source": "kanban_complete",

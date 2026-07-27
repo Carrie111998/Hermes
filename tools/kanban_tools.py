@@ -732,6 +732,7 @@ def _handle_external_effect(args: dict, **kw) -> str:
                 tid,
                 platform=str(args.get("platform") or ""),
                 state=str(args.get("state") or ""),
+                effect_key=str(args.get("effect_key") or "create"),
                 external_id=args.get("external_id"),
                 details=args.get("details"),
                 expected_run_id=_worker_run_id(tid),
@@ -1365,11 +1366,27 @@ KANBAN_EXTERNAL_EFFECT_SCHEMA = {
                     "existing",
                     "created",
                     "verified",
+                    "not_joined_verified",
+                    "join_started",
+                    "joined",
+                    "pending_approval",
+                    "needs_questions",
+                    "failed",
                 ],
                 "description": (
                     "Observed state. absent_verified unlocks one create route "
-                    "for this correction run; terminal states block duplicates."
+                    "for this correction run. Join states require a non-create "
+                    "effect_key scoped to one exact group."
                 ),
+            },
+            "effect_key": {
+                "type": "string",
+                "description": (
+                    "Stable object key within the platform. Defaults to create "
+                    "for product/draft idempotency; use group:<group_id> for "
+                    "Facebook membership effects."
+                ),
+                "default": "create",
             },
             "external_id": {
                 "type": "string",

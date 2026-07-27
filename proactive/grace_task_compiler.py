@@ -36,7 +36,8 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "Before completion, provide every required verification item and evidence.",
             "For each external draft/object you find or create, call kanban_external_effect "
             "immediately after readback. Also include the same records in "
-            "kanban_complete metadata.external_effects using platform, state, external_id "
+            "kanban_complete metadata.external_effects using platform, effect_key, "
+            "state, external_id "
             "(when available), and details. This durable ledger is the create-idempotency gate.",
             "When every deliverable and verification item is complete, call kanban_complete "
             "even if Grace or KJ must still review or approve a later public/external action. "
