@@ -3023,7 +3023,7 @@ def check_terminal_requirements() -> bool:
             return os.getenv("DAYTONA_API_KEY") is not None
 
         elif env_type == "tenki":
-            if importlib.util.find_spec("tenki_sandbox") is None:
+            if importlib.util.find_spec("tenki") is None:
                 try:
                     from tools.lazy_deps import ensure as _lazy_ensure
 
@@ -3031,15 +3031,15 @@ def check_terminal_requirements() -> bool:
                     importlib.invalidate_caches()
                 except Exception as exc:
                     logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1 (%s)",
+                        "tenki is required for Tenki terminal backend: "
+                        "pip install 'tenki>=0.5.1,<0.7' (%s)",
                         exc,
                     )
                     return False
-                if importlib.util.find_spec("tenki_sandbox") is None:
+                if importlib.util.find_spec("tenki") is None:
                     logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1"
+                        "tenki is required for Tenki terminal backend: "
+                        "pip install 'tenki>=0.5.1,<0.7'"
                     )
                     return False
             try:

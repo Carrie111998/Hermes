@@ -147,9 +147,9 @@ def resolve_tenki_api_endpoint(explicit: str = "") -> str:
 
 
 def resolve_tenki_workspace_id(explicit: str = "") -> str:
-    """Resolve the Tenki workspace id. Scope-aware; workspace/project decide
-    where sandboxes are created, so a multiplexed profile must not silently
-    borrow the machine-global workspace of another tenant."""
+    """Resolve the Tenki workspace id. Scope-aware; the workspace decides where
+    sandboxes are created, so a multiplexed profile must not silently borrow
+    the machine-global workspace of another tenant."""
     explicit = _string(explicit)
     if explicit:
         return explicit
@@ -160,21 +160,6 @@ def resolve_tenki_workspace_id(explicit: str = "") -> str:
     if not _global_credential_fallback_allowed():
         return ""
     return _first_string(load_tenki_cli_config(), ("current_workspace_id", "workspace_id", "workspace"))
-
-
-def resolve_tenki_project_id(explicit: str = "") -> str:
-    """Resolve the Tenki project id. Scope-aware for the same reason as
-    :func:`resolve_tenki_workspace_id`."""
-    explicit = _string(explicit)
-    if explicit:
-        return explicit
-    for env_name in ("TENKI_PROJECT_ID", "TENKI_PROJECT"):
-        value = _scoped_env(env_name)
-        if value:
-            return value
-    if not _global_credential_fallback_allowed():
-        return ""
-    return _first_string(load_tenki_cli_config(), ("current_project_id", "project_id", "project"))
 
 
 def resolve_tenki_auth_token(explicit: str = "") -> str:

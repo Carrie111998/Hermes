@@ -1393,13 +1393,13 @@ def setup_terminal_backend(config: dict):
         print_info("Requires Tenki CLI login or TENKI_AUTH_TOKEN/TENKI_API_KEY.")
 
         try:
-            __import__("tenki_sandbox")
+            __import__("tenki")
         except ImportError:
             print_info("Installing Tenki SDK...")
             import subprocess
 
             uv_bin = shutil.which("uv")
-            package = "tenki-sandbox==0.1.1"
+            package = "tenki>=0.5.1,<0.7"
             if uv_bin:
                 result = subprocess.run(
                     [uv_bin, "pip", "install", "--python", sys.executable, package],
@@ -1415,27 +1415,23 @@ def setup_terminal_backend(config: dict):
             if result.returncode == 0:
                 print_success("Tenki SDK installed")
             else:
-                print_warning("Install failed — run manually: pip install tenki-sandbox==0.1.1")
+                print_warning("Install failed — run manually: pip install 'tenki>=0.5.1,<0.7'")
                 if result.stderr:
                     print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
 
         from tools.tenki_config import (
             has_tenki_auth,
             resolve_tenki_api_endpoint,
-            resolve_tenki_project_id,
             resolve_tenki_workspace_id,
         )
 
         terminal = config.setdefault("terminal", {})
         endpoint = resolve_tenki_api_endpoint(terminal.get("tenki_api_endpoint", ""))
         workspace_id = resolve_tenki_workspace_id(terminal.get("tenki_workspace_id", ""))
-        project_id = resolve_tenki_project_id(terminal.get("tenki_project_id", ""))
 
         terminal["tenki_api_endpoint"] = endpoint
         if workspace_id:
             terminal["tenki_workspace_id"] = workspace_id
-        if project_id:
-            terminal["tenki_project_id"] = project_id
         terminal.setdefault("tenki_image", "")
         terminal.setdefault("tenki_name_prefix", "hermes")
         terminal.setdefault("tenki_allow_inbound", False)
@@ -1453,7 +1449,6 @@ def setup_terminal_backend(config: dict):
 
         print_info(f"  Endpoint:  {endpoint}")
         print_info(f"  Workspace: {workspace_id or '(not found; run tenki login)'}")
-        print_info(f"  Project:   {project_id or '(not found; run tenki login)'}")
         if has_tenki_auth():
             print_info("  Tenki auth: already configured")
         else:

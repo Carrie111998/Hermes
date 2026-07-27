@@ -143,22 +143,41 @@ def _last_started_command(sandbox: _FakeSandbox) -> str:
 
 
 class _FakeSnapshotNotFoundError(Exception):
-    """Mirrors tenki_sandbox.SnapshotNotFoundError for the fake SDK."""
+    """Mirrors tenki.SnapshotNotFoundError for the fake SDK."""
 
 
-class _FakeRegistryArtifactNotFoundError(Exception):
-    """Mirrors tenki_sandbox.RegistryArtifactNotFoundError for the fake SDK."""
+class _FakeRegistryImageNotFoundError(Exception):
+    """Mirrors tenki.RegistryImageNotFoundError for the fake SDK.
+
+    Named ``RegistryArtifactNotFoundError`` before tenki 0.5.
+    """
 
 
 class _FakeSnapshotNotDurableError(Exception):
-    """Mirrors tenki_sandbox.SnapshotNotDurableError for the fake SDK."""
+    """Mirrors tenki.SnapshotNotDurableError for the fake SDK."""
 
 
 class _FakeInvalidStateError(Exception):
-    """Mirrors tenki_sandbox.InvalidStateError for the fake SDK."""
+    """Mirrors tenki.InvalidStateError for the fake SDK."""
+
+
+# Sentinel so the fake records exactly which kwargs the environment passed,
+# rather than the defaults it didn't.
+_UNSET = object()
+
+# Kwargs that tenki's Sandbox.create pops into the Client it builds instead of
+# forwarding to Client.create.
+_CLIENT_ONLY_KWARGS = ("auth_token", "base_url", "gateway_url", "cookie_name", "timeout")
 
 
 class _FakeSandboxFactory:
+    """Mirrors ``tenki.Sandbox``.
+
+    ``create`` is a bare ``**kwargs`` passthrough — exactly like the real SDK's
+    — that pops the client-construction kwargs and forwards the rest to
+    ``Client.create``, which is the thing that actually validates names.
+    """
+
     created_kwargs: list[dict] = []
     failed_kwargs: list[dict] = []
     sandboxes: list[_FakeSandbox] = []
@@ -172,6 +191,11 @@ class _FakeSandboxFactory:
 
     @classmethod
     def create(cls, **kwargs):
+        client_kwargs = {key: kwargs.pop(key) for key in _CLIENT_ONLY_KWARGS if key in kwargs}
+        return _FakeClient(**client_kwargs).create(**kwargs)
+
+    @classmethod
+    def _record_and_build(cls, kwargs: dict):
         if kwargs.get("snapshot_id") in cls.fail_snapshot_ids:
             cls.failed_kwargs.append(kwargs)
             raise cls.snapshot_error(cls.snapshot_error_msg)
@@ -192,16 +216,44 @@ class _FakeClient:
         self.kwargs = kwargs
         self.snapshots = SimpleNamespace(wait_durable=lambda *_args, **_kwargs: None)
 
-    def create(self, **kwargs):
-        return _FakeSandboxFactory.create(**kwargs)
+    # The parameter list mirrors tenki 0.5's Client.create and deliberately has
+    # NO **kwargs catch-all: a name the SDK dropped (project_id, removed in 0.5)
+    # raises TypeError here exactly as it would against the real client, so the
+    # environment's create-kwarg filtering is genuinely under test.
+    def create(
+        self,
+        *,
+        workspace_id=_UNSET,
+        name=_UNSET,
+        wait=_UNSET,
+        timeout=_UNSET,
+        allow_inbound=_UNSET,
+        allow_outbound=_UNSET,
+        max_duration=_UNSET,
+        idle_timeout_minutes=_UNSET,
+        pause_retention=_UNSET,
+        cpu_cores=_UNSET,
+        memory_mb=_UNSET,
+        disk_size_gb=_UNSET,
+        metadata=_UNSET,
+        tags=_UNSET,
+        env=_UNSET,
+        ssh_authorized_keys=_UNSET,
+        snapshot_id=_UNSET,
+        image=_UNSET,
+        sticky=_UNSET,
+    ):
+        passed = {
+            key: value
+            for key, value in locals().items()
+            if key != "self" and value is not _UNSET
+        }
+        # In the real SDK the client kwargs live on the client; merge them so
+        # tests can assert against the whole create call in one dict.
+        return _FakeSandboxFactory._record_and_build({**self.kwargs, **passed})
 
-    def list(self, **_kwargs):
-        return list(self.listed_sandboxes)
-
-    def list_project(self, *_args, **_kwargs):
-        return list(self.listed_sandboxes)
-
-    def list_workspace(self, *_args, **_kwargs):
+    # tenki 0.5 folded list_project/list_workspace into list(workspace_id=...).
+    def list(self, *, workspace_id=None, tags=None, sticky=None):
         return list(self.listed_sandboxes)
 
     def close(self):
@@ -209,7 +261,7 @@ class _FakeClient:
 
 
 def _install_fake_tenki(monkeypatch):
-    module = types.ModuleType("tenki_sandbox")
+    module = types.ModuleType("tenki")
     _FakeSandboxFactory.created_kwargs = []
     _FakeSandboxFactory.failed_kwargs = []
     _FakeSandboxFactory.sandboxes = []
@@ -221,10 +273,10 @@ def _install_fake_tenki(monkeypatch):
     module.Client = _FakeClient
     module.Sandbox = _FakeSandboxFactory
     module.SnapshotNotFoundError = _FakeSnapshotNotFoundError
-    module.RegistryArtifactNotFoundError = _FakeRegistryArtifactNotFoundError
+    module.RegistryImageNotFoundError = _FakeRegistryImageNotFoundError
     module.SnapshotNotDurableError = _FakeSnapshotNotDurableError
     module.InvalidStateError = _FakeInvalidStateError
-    monkeypatch.setitem(sys.modules, "tenki_sandbox", module)
+    monkeypatch.setitem(sys.modules, "tenki", module)
 
 
 def _clear_tenki_auth_env(monkeypatch):
@@ -284,7 +336,6 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
             [
                 "api_endpoint: https://api.tenki.test",
                 "current_workspace_id: ws-123",
-                "current_project_id: prj-456",
                 "auth_token: tok-secret",
             ]
         ),
@@ -307,7 +358,6 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
     # The control-plane credential is used host-side to create the sandbox...
     assert kwargs["base_url"] == "https://api.tenki.test"
     assert kwargs["workspace_id"] == "ws-123"
-    assert kwargs["project_id"] == "prj-456"
     assert kwargs["auth_token"] == "cookie:tok-secret"
     # ...but is NEVER injected into the model-controlled guest environment
     # (an empty env is omitted from the create kwargs entirely).
@@ -316,7 +366,6 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
     assert "TENKI_API_KEY" not in guest_env
     assert "TENKI_API_ENDPOINT" not in guest_env
     assert "TENKI_WORKSPACE_ID" not in guest_env
-    assert "TENKI_PROJECT_ID" not in guest_env
     assert kwargs["allow_inbound"] is False
     assert kwargs["allow_outbound"] is True
     assert kwargs["cpu_cores"] == 1
@@ -1408,3 +1457,81 @@ def test_tenki_bulk_upload_targets_one_sandbox_when_cancel_races(monkeypatch, tm
     # The untar and the cleanup both reference the tar this sandbox received.
     assert any(f"tar xf {shlex.quote(remote_tar)}" in cmd for cmd in commands)
     assert any(f"rm -f {shlex.quote(remote_tar)}" in cmd for cmd in commands)
+
+
+def test_tenki_create_kwargs_filters_names_the_installed_sdk_dropped(monkeypatch, tmp_path):
+    """``Sandbox.create`` is a bare ``**kwargs`` passthrough, so the accepted
+    set has to be read off ``Client.create`` — the real validator. Filtering
+    against the passthrough accepts every name, and one the SDK has dropped
+    (``project_id``, gone in 0.5) reaches the client as an unexpected keyword
+    and kills sandbox creation with a TypeError."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("TENKI_API_KEY", "sk-test-key")
+
+    # A deliberately narrow client: no cpu_cores/memory_mb/disk_size_gb/
+    # allow_*/max_duration/idle_timeout_minutes/pause_retention, and no
+    # **kwargs to swallow them.
+    def narrow_create(self, *, name=None, image=None, env=None, metadata=None, tags=None, wait=True):
+        return _FakeSandboxFactory._record_and_build(
+            {"name": name, "image": image, "env": env, "metadata": metadata, "tags": tags, "wait": wait}
+        )
+
+    monkeypatch.setattr(_FakeClient, "create", narrow_create)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(
+        task_id="narrow-sdk",
+        image="base-image",
+        cpu=2,
+        memory=2048,
+        idle_timeout=120,
+        pause_retention=60,
+    )
+
+    kwargs = _FakeSandboxFactory.created_kwargs[0]
+    assert kwargs["image"] == "base-image"
+    for dropped in (
+        "cpu_cores",
+        "memory_mb",
+        "disk_size_gb",
+        "allow_inbound",
+        "allow_outbound",
+        "max_duration",
+        "idle_timeout_minutes",
+        "pause_retention",
+    ):
+        assert dropped not in kwargs
+    env.cleanup()
+
+
+def test_snapshot_unrecoverable_resolves_renamed_registry_error(monkeypatch):
+    """tenki 0.5 renamed RegistryArtifactNotFoundError to
+    RegistryImageNotFoundError. Importing the whole set in one statement made a
+    single rename drop the isinstance check for every class in it."""
+    _install_fake_tenki(monkeypatch)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    # 0.5 name, exported by the installed SDK.
+    assert TenkiEnvironment._snapshot_unrecoverable(_FakeRegistryImageNotFoundError("gone")) is True
+    assert TenkiEnvironment._snapshot_unrecoverable(_FakeSnapshotNotFoundError("gone")) is True
+    assert TenkiEnvironment._snapshot_unrecoverable(_FakeSnapshotNotDurableError("nope")) is True
+
+    # Pre-0.5 name: absent from a 0.5 SDK's exports, so only the MRO name
+    # fallback can classify it. Getting this wrong silently boots a base image.
+    class RegistryArtifactNotFoundError(Exception):
+        pass
+
+    assert TenkiEnvironment._snapshot_unrecoverable(RegistryArtifactNotFoundError("gone")) is True
+
+    # Transient failures must keep the snapshot pointer for a later retry.
+    assert TenkiEnvironment._snapshot_unrecoverable(RuntimeError("network blip")) is False
+    assert TenkiEnvironment._snapshot_unrecoverable(_FakeInvalidStateError("workspace suspended")) is False
+    # ...but an InvalidStateError that names the snapshot is unrecoverable.
+    assert TenkiEnvironment._snapshot_unrecoverable(_FakeInvalidStateError("snapshot is not durable")) is True

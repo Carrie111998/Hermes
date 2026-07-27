@@ -204,7 +204,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
     "terminal.daytona": ("daytona==0.155.0",),
-    "terminal.tenki": ("tenki-sandbox==0.1.1",),
+    "terminal.tenki": ("tenki>=0.5.1,<0.7",),  # renamed from `tenki-sandbox` in 0.5
 
     # ─── Skills ────────────────────────────────────────────────────────────
     "skill.google_workspace": (

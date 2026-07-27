@@ -69,7 +69,7 @@ class TestTerminalRequirements:
         original_find_spec = terminal_tool_module.importlib.util.find_spec
 
         def fake_find_spec(name):
-            if name == "tenki_sandbox":
+            if name == "tenki":
                 return object()
             return original_find_spec(name)
 

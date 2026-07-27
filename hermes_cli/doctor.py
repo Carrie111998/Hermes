@@ -1561,13 +1561,11 @@ def run_doctor(args):
             from hermes_cli.config import load_config_readonly
             from tools.tenki_config import (
                 has_tenki_auth,
-                resolve_tenki_project_id,
                 resolve_tenki_workspace_id,
             )
         except Exception:
             load_config_readonly = lambda: {}  # noqa: E731
             has_tenki_auth = lambda: False  # noqa: E731
-            resolve_tenki_project_id = lambda _explicit="": ""  # noqa: E731
             resolve_tenki_workspace_id = lambda _explicit="": ""  # noqa: E731
         terminal_cfg = load_config_readonly().get("terminal", {})
         if not isinstance(terminal_cfg, dict):
@@ -1586,24 +1584,21 @@ def run_doctor(args):
         workspace_id = resolve_tenki_workspace_id(
             os.getenv("TERMINAL_TENKI_WORKSPACE_ID") or terminal_cfg.get("tenki_workspace_id", "")
         )
-        project_id = resolve_tenki_project_id(
-            os.getenv("TERMINAL_TENKI_PROJECT_ID") or terminal_cfg.get("tenki_project_id", "")
-        )
-        if workspace_id and project_id:
-            check_ok("Tenki workspace/project", "(configured)")
+        if workspace_id:
+            check_ok("Tenki workspace", "(configured)")
         else:
             check_warn(
-                "Tenki workspace/project not configured",
+                "Tenki workspace not configured",
                 "(optional for sessions; required for volume-backed workflows)",
             )
 
-        if importlib.util.find_spec("tenki_sandbox") is not None:
-            check_ok("tenki-sandbox SDK", "(installed)")
+        if importlib.util.find_spec("tenki") is not None:
+            check_ok("tenki SDK", "(installed)")
         else:
             _fail_and_issue(
-                "tenki-sandbox SDK not installed",
-                "(pip install tenki-sandbox==0.1.1)",
-                "Install Tenki SDK: pip install tenki-sandbox==0.1.1",
+                "tenki SDK not installed",
+                "(pip install 'tenki>=0.5.1,<0.7')",
+                "Install Tenki SDK: pip install 'tenki>=0.5.1,<0.7'",
                 issues,
             )
 

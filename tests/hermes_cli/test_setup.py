@@ -506,7 +506,7 @@ def test_tenki_setup_switch_resets_inherited_persistent_container(monkeypatch):
             return choices.index("Tenki Agent - Tenki cloud sandbox")
         raise AssertionError(f"Unexpected prompt_choice call: {question}")
 
-    monkeypatch.setitem(sys.modules, "tenki_sandbox", types.ModuleType("tenki_sandbox"))
+    monkeypatch.setitem(sys.modules, "tenki", types.ModuleType("tenki"))
     monkeypatch.setenv("TENKI_AUTH_TOKEN", "tok")
     monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
     monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: "")

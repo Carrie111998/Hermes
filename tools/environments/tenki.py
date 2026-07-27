@@ -32,7 +32,6 @@ from tools.environments.file_sync import (
 from tools.tenki_config import (
     resolve_tenki_api_endpoint,
     resolve_tenki_auth_token,
-    resolve_tenki_project_id,
     resolve_tenki_workspace_id,
 )
 
@@ -151,6 +150,16 @@ def _supports_any_kwargs(sig: inspect.Signature | None) -> bool:
     if sig is None:
         return True
     return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
+
+
+def _named_parameters(sig: inspect.Signature) -> set[str]:
+    """Explicitly named parameters, ignoring ``self``/``*args``/``**kwargs``."""
+    return {
+        name
+        for name, param in sig.parameters.items()
+        if name != "self"
+        and param.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+    }
 
 
 def _add_supported(
@@ -288,7 +297,6 @@ class TenkiEnvironment(BaseEnvironment):
         task_id: str = "default",
         api_endpoint: str = "",
         workspace_id: str = "",
-        project_id: str = "",
         name_prefix: str = "hermes",
         allow_inbound: bool = False,
         allow_outbound: bool = True,
@@ -309,7 +317,7 @@ class TenkiEnvironment(BaseEnvironment):
         except Exception as exc:
             raise ImportError(str(exc))
 
-        from tenki_sandbox import Client, Sandbox
+        from tenki import Client, Sandbox
 
         self._Client = Client
         self._Sandbox = Sandbox
@@ -337,7 +345,6 @@ class TenkiEnvironment(BaseEnvironment):
         self._disk = disk
         self._api_endpoint = resolve_tenki_api_endpoint(api_endpoint)
         self._workspace_id = resolve_tenki_workspace_id(workspace_id)
-        self._project_id = resolve_tenki_project_id(project_id)
         self._auth_token = resolve_tenki_auth_token()
         self._name_prefix = _safe_name(name_prefix, fallback="hermes", max_len=28)
         self._allow_inbound = allow_inbound
@@ -366,10 +373,35 @@ class TenkiEnvironment(BaseEnvironment):
         self.init_session()
 
     def _sandbox_create_signature(self) -> inspect.Signature | None:
-        try:
-            return inspect.signature(self._Sandbox.create)
-        except (TypeError, ValueError):
-            return None
+        """Signature that actually validates the sandbox create kwargs.
+
+        ``Sandbox.create`` is a bare ``**kwargs`` passthrough: it pops the
+        client-construction kwargs and forwards everything else to
+        ``Client.create``. Introspecting it therefore accepts *every* name and
+        filters nothing, so a kwarg the SDK has dropped (``project_id``, gone
+        in tenki 0.5) sails through and only fails as a ``TypeError`` at call
+        time. ``Client.create`` is the real validator in both paths, so prefer
+        it and fall back to ``Sandbox.create`` only if it can't be introspected.
+        """
+        candidates = (
+            getattr(self._Client, "create", None),
+            getattr(self._Sandbox, "create", None),
+        )
+        fallback: inspect.Signature | None = None
+        for target in candidates:
+            if target is None:
+                continue
+            try:
+                sig = inspect.signature(target)
+            except (TypeError, ValueError):
+                continue
+            # A pure **kwargs passthrough names nothing it accepts; keep it only
+            # as a last resort so _add_supported still degrades to "send it".
+            if _supports_any_kwargs(sig) and not _named_parameters(sig):
+                fallback = fallback or sig
+                continue
+            return sig
+        return fallback
 
     def _create_kwargs(self) -> dict[str, Any]:
         sig = self._sandbox_create_signature()
@@ -400,9 +432,14 @@ class TenkiEnvironment(BaseEnvironment):
         if pause_retention is not None:
             _add_supported(kwargs, sig, ("pause_retention",), pause_retention)
         _add_supported(kwargs, sig, ("workspace_id",), self._workspace_id)
-        _add_supported(kwargs, sig, ("project_id",), self._project_id)
-        _add_supported(kwargs, sig, ("base_url", "api_endpoint"), self._api_endpoint)
-        _add_supported(kwargs, sig, ("auth_token", "api_key"), self._auth_token)
+        # Client-construction kwargs, NOT sandbox kwargs: Sandbox.create pops
+        # these into the Client it builds, so they never appear in the
+        # create-signature we filter against. The persistent path builds its own
+        # client and strips them again in _create_sandbox_from_kwargs.
+        if self._api_endpoint:
+            kwargs["base_url"] = self._api_endpoint
+        if self._auth_token:
+            kwargs["auth_token"] = self._auth_token
         _add_supported(kwargs, sig, ("env",), self._sandbox_env())
         _add_supported(
             kwargs,
@@ -546,17 +583,31 @@ class TenkiEnvironment(BaseEnvironment):
             return metadata.get("hermes_task_id") == self._task_id
         return True
 
+    def _list_kwargs(self, client: Any) -> dict[str, Any]:
+        """Kwargs for the sandbox listing used to re-attach a persistent sandbox.
+
+        tenki 0.5 folded the old ``list_project`` / ``list_workspace`` helpers
+        into ``Client.list``, which takes the workspace as a keyword. Older SDK
+        builds don't accept it, so scope the listing only when the installed
+        signature says it will be honored.
+        """
+        kwargs: dict[str, Any] = {"tags": ["hermes-agent"]}
+        if not self._workspace_id:
+            return kwargs
+        try:
+            sig = inspect.signature(client.list)
+        except (TypeError, ValueError):
+            return kwargs
+        if "workspace_id" in sig.parameters or _supports_any_kwargs(sig):
+            kwargs["workspace_id"] = self._workspace_id
+        return kwargs
+
     def _find_persistent_sandbox(self):
         if not self._persistent:
             return None
         client = self._create_client()
         try:
-            if self._project_id and hasattr(client, "list_project"):
-                candidates = client.list_project(self._project_id, tags=["hermes-agent"])
-            elif self._workspace_id and hasattr(client, "list_workspace"):
-                candidates = client.list_workspace(self._workspace_id, tags=["hermes-agent"])
-            else:
-                candidates = client.list(tags=["hermes-agent"])
+            candidates = client.list(**self._list_kwargs(client))
         except Exception as exc:
             logger.debug("Tenki: could not list persistent sandboxes: %s", exc)
             return None
@@ -661,9 +712,12 @@ class TenkiEnvironment(BaseEnvironment):
     # only unrecoverable when its message points at the snapshot itself
     # (handled by message inspection below); a bare InvalidStateError stays
     # transient so an unrelated precondition can't destroy a valid pointer.
+    # ``RegistryArtifactNotFoundError`` was renamed ``RegistryImageNotFoundError``
+    # in tenki 0.5; both names are listed so either SDK generation resolves.
     _UNRECOVERABLE_SNAPSHOT_ERRORS = frozenset({
         "SnapshotNotFoundError",          # snapshot is gone
-        "RegistryArtifactNotFoundError",  # backing artifact is gone
+        "RegistryImageNotFoundError",     # backing image is gone (0.5+)
+        "RegistryArtifactNotFoundError",  # same, pre-0.5 name
         "SnapshotNotDurableError",        # explicitly never reached durability
     })
 
@@ -688,25 +742,38 @@ class TenkiEnvironment(BaseEnvironment):
             msg = str(e).lower()
             return "snapshot" in msg or "durable" in msg
 
+        # Resolve each class independently: a single `from tenki import (...)`
+        # of all four fails outright when one has been renamed (as
+        # RegistryArtifactNotFoundError was in 0.5), silently dropping the
+        # isinstance check for the classes that *are* present.
+        sdk: Any = None
         try:
-            from tenki_sandbox import (
-                InvalidStateError,
-                RegistryArtifactNotFoundError,
-                SnapshotNotDurableError,
-                SnapshotNotFoundError,
-            )
+            import tenki
 
-            if isinstance(
-                exc,
-                (SnapshotNotFoundError, RegistryArtifactNotFoundError, SnapshotNotDurableError),
-            ):
-                return True
-            if _is_snapshot_specific_invalid_state(exc, InvalidStateError):
-                return True
-            return False
+            sdk = tenki
         except Exception:
             pass
-        # Name-based fallback for SDK builds that don't export every class.
+
+        if sdk is not None:
+            unrecoverable = tuple(
+                cls_obj
+                for cls_obj in (
+                    getattr(sdk, name, None) for name in cls._UNRECOVERABLE_SNAPSHOT_ERRORS
+                )
+                if isinstance(cls_obj, type) and issubclass(cls_obj, BaseException)
+            )
+            if unrecoverable and isinstance(exc, unrecoverable):
+                return True
+            invalid_state_cls = getattr(sdk, "InvalidStateError", None)
+            if (
+                isinstance(invalid_state_cls, type)
+                and issubclass(invalid_state_cls, BaseException)
+                and _is_snapshot_specific_invalid_state(exc, invalid_state_cls)
+            ):
+                return True
+
+        # Name-based fallback for SDK builds that don't export every class, and
+        # for a subclass the installed SDK no longer exports under its own name.
         for typ in type(exc).__mro__:
             if typ.__name__ in cls._UNRECOVERABLE_SNAPSHOT_ERRORS:
                 return True
