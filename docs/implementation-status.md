@@ -193,7 +193,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`c0823e1173584cb09aeb84beb666ae7fbff68a61` passed 6 Founder/CEO E2E tests, 48
+`5175dfd8294fdeae725a7b800fa42ddd698d45f6` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
