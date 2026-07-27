@@ -658,6 +658,17 @@ This remains deterministic local-provider evidence and does not establish
 production deployment, live payment credentials, or legal/compliance
 readiness.
 
+Parent-grant revocation propagation was validated on current `main` commit
+`e7901a02a6cc06cb11862be9e0aebebde192d1f0` with:
+
+```sh
+uv run --extra dev pytest -q tests/hermes_cli/test_workforce_delegation.py
+```
+
+Result: **14 passed, 0 failed**. The suite now proves that a revoked parent
+grant fences descendant authorization, including worker/result authority
+checks, and that malformed cyclic grant chains fail closed.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
