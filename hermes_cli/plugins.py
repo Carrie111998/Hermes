@@ -2103,6 +2103,7 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    modified_args: Optional[Dict[str, Any]] = None
 
 
 def set_thread_tool_whitelist(
@@ -2156,7 +2157,10 @@ def _get_pre_tool_call_directive_details(
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return fmt.format(tool_name=tool_name)
+        return _PreToolCallDirective(
+            action="block",
+            message=fmt.format(tool_name=tool_name),
+        )
 
     hook_results = invoke_hook(
         "pre_tool_call",
@@ -2176,6 +2180,17 @@ def _get_pre_tool_call_directive_details(
     for result in hook_results:
         if not isinstance(result, dict):
             continue
+        # "modify" action — transform tool_input before dispatch.
+        # Processed before the block/approve gate so modify directives
+        # are visible even when a later hook blocks. First modifier wins
+        # (shallow merge over original args).
+        if result.get("action") == "modify":
+            partial = result.get("args")
+            if isinstance(partial, dict) and partial:
+                merged = dict(args) if isinstance(args, dict) else {}
+                merged.update(partial)
+                modified_args = merged
+            continue
         action = result.get("action")
         if action not in ("block", "approve"):
             continue
@@ -2189,9 +2204,12 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        return _PreToolCallDirective(
+            action=action, message=message, rule_key=rule_key,
+            modified_args=modified_args,
+        )
 
-    return _PreToolCallDirective()
+    return _PreToolCallDirective(modified_args=modified_args)
 
 
 def get_pre_tool_call_directive(
@@ -2293,6 +2311,59 @@ def resolve_pre_tool_block(
                 or f"BLOCKED: plugin approval required for {tool_name}"
             )
     return None
+
+
+def _dispatch_pre_tool_call_hooks(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Invoke ``pre_tool_call`` hooks once and process all response types.
+
+    Returns a ``(block_message, modified_args)`` tuple:
+    - ``block_message`` — the first block/approve directive's resolved message
+      (or ``None`` when the call may proceed).  Uses the same approval-gate
+      logic as :func:`resolve_pre_tool_block`.
+    - ``modified_args`` — merged args from the first ``modify`` directive
+      (or ``None`` when no hook requested modification).
+
+    This is the single invocation point for ``pre_tool_call`` hooks.
+    Callers that only need block detection should keep using
+    :func:`get_pre_tool_call_block_message` or
+    :func:`resolve_pre_tool_block` for backward compat.
+    Callers that also need input transformation should call this
+    function and apply ``modified_args`` if not ``None``.
+    """
+    details = _get_pre_tool_call_directive_details(
+        tool_name, args, task_id=task_id, session_id=session_id,
+        tool_call_id=tool_call_id, turn_id=turn_id,
+        api_request_id=api_request_id, middleware_trace=middleware_trace,
+    )
+    block_msg: Optional[str] = None
+    if details.action == "block":
+        block_msg = details.message
+    elif details.action == "approve":
+        try:
+            from tools.approval import request_tool_approval
+            result = request_tool_approval(
+                tool_name,
+                details.message or "",
+                rule_key=details.rule_key or tool_name,
+            )
+        except Exception:
+            block_msg = f"BLOCKED: plugin approval gate failed for {tool_name}"
+        else:
+            if not result.get("approved"):
+                block_msg = str(
+                    result.get("message")
+                    or f"BLOCKED: plugin approval required for {tool_name}"
+                )
+    return (block_msg, details.modified_args)
 
 
 def get_pre_verify_continue_message(

@@ -2489,8 +2489,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
         try:
-            from hermes_cli.plugins import get_pre_tool_call_block_message
-            block_message = get_pre_tool_call_block_message(
+            from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+            block_message, modified_args = _dispatch_pre_tool_call_hooks(
                 function_name, function_args, task_id=effective_task_id or "",
             )
             if modified_args is not None:

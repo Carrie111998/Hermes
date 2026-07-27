@@ -1,4 +1,3 @@
-import logging
 import os
 import sys
 
@@ -408,29 +407,6 @@ def main():
     # gate inside ensure_mcp_discovery_started keeps the ~200ms MCP SDK
     # import cost entirely off the path for users with no mcp_servers.
     ensure_mcp_discovery_started()
-
-    # Discover Python plugins before shell hooks so plugin block decisions
-    # take precedence in tie cases (mirrors gateway/run.py startup sequence).
-    try:
-        from hermes_cli.plugins import discover_plugins
-        discover_plugins()
-    except Exception:
-        logger.debug("plugin discovery failed at tui_gateway startup", exc_info=True)
-
-    # Register declarative shell hooks from cli-config.yaml so pre_tool_call,
-    # post_tool_call, etc. fire during TUI tool dispatch — matches what the
-    # CLI and messaging gateway already do.  TUI has no TTY, so consent must
-    # come from --accept-hooks, HERMES_ACCEPT_HOOKS, or hooks_auto_accept in
-    # config; register_from_config resolves that itself.  Failures must never
-    # block TUI startup.
-    try:
-        from hermes_cli.config import load_config
-        from agent.shell_hooks import register_from_config
-        register_from_config(load_config(), accept_hooks=False)
-    except Exception:
-        logger.debug(
-            "shell-hook registration failed at tui_gateway startup", exc_info=True
-        )
 
     if not write_json({
         "jsonrpc": "2.0",

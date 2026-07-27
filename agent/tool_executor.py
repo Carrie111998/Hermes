@@ -480,8 +480,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
         else:
             try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
+                from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+                block_message, modified_args = _dispatch_pre_tool_call_hooks(
                     function_name, function_args, task_id=effective_task_id or "",
                 )
                 if modified_args is not None:
@@ -1142,16 +1142,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        # Check plugin hooks for a block directive before executing.
+        # Check plugin hooks for block/modify directives before executing.
         _block_msg: Optional[str] = None
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
         else:
             try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
+                from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+                _block_msg, _modified_args = _dispatch_pre_tool_call_hooks(
                     function_name, function_args, task_id=effective_task_id or "",
                 )
+                if _modified_args is not None:
+                    function_args = _modified_args
             except Exception:
                 pass
 
