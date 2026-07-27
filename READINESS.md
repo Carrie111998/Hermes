@@ -200,6 +200,27 @@ The provider boundary is a deterministic file-backed test adapter; this is
 controlled runtime evidence and not proof of live provider credentials,
 production deployment, or legal/tax readiness.
 
+## Interrupted provider-action evidence
+
+The current tree also proves the ambiguous mid-flight payment case. At commit
+`8abc8dde89`, run:
+
+```bash
+scripts/run_provider_recovery_acceptance.sh
+```
+
+The provider effect is recorded before the response is lost; the local intent
+is durably marked `uncertain`; after container restart, provider read-back
+settles the payment exactly once. The recorded result was:
+
+```text
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1}
+provider recovery acceptance: PASS
+```
+
+Image ID: `sha256:ee59306e2257eb3e2a4267d5146dfa996bba75d36a78d4a51a7b580d4875d278`.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

@@ -14,6 +14,9 @@
   container entrypoint before the worker/restart assertions.
 - The example solo-founder charter now explicitly grants bounded successor
   objective authority (`objectives.create` on the `objectives` system).
+- Added an interrupted-provider acceptance scenario proving uncertain intent
+  recovery, read-back settlement, and zero duplicate provider calls after a
+  container restart.
 - `business payment-rails` now performs credential-safe, read-only payment-rail
   discovery and reports unavailable optional providers without implying
   settlement readiness.

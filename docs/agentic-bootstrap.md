@@ -158,3 +158,27 @@ temporary state volume; no Stripe, AgentMail, network endpoint, or production
 credential is used. The container uses its real image entrypoint and
 supervised startup path. This proves the controlled restart/idempotency
 contract, not production deployment or live payment capability.
+
+## Interrupted provider-action acceptance
+
+The harder financial recovery case is covered separately. The deterministic
+rail durably records a successful provider effect, then raises an uncertain
+response before local settlement. A new process and restarted container use
+only provider read-back to converge the intent, reservation, spend hold, and
+ledger, and retrying the same idempotency key does not call the provider again:
+
+```bash
+scripts/run_provider_recovery_acceptance.sh
+```
+
+Run on 2026-07-27 at commit `8abc8dde89`. Result:
+
+```text
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1}
+provider recovery acceptance: PASS
+```
+
+Image ID: `sha256:ee59306e2257eb3e2a4267d5146dfa996bba75d36a78d4a51a7b580d4875d278`.
+This is a deterministic local provider boundary, not live payment-provider
+evidence.

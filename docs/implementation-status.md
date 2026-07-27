@@ -41,6 +41,9 @@ acceptance evidence.
 - Outbound spend controls atomically reserve per-instrument daily velocity
   before provider calls and retain pending holds until read-back settles or
   releases them.
+- Outbound payment intents are durable before the provider call; a lost
+  response becomes an explicit uncertain state that can only converge through
+  provider read-back, never blind replay.
 - Housekeeping escalates stale outbound spend holds with a deduplicated advisor
   intervention and never releases an uncertain provider hold automatically.
 - Spend-hold intervention resolution is evidence-bound: succeeded durable
