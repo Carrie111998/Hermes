@@ -1057,6 +1057,17 @@ def issue_permit(
             raise PermitError("action belongs to a superseded plan")
         if capability != action["required_capability"]:
             raise PermitError("permit capability does not match proposed action")
+        action_payload = json.loads(action["payload_json"])
+        action_target = str(action_payload.get("target_resource") or "").strip()
+        requested_target = (
+            str(target_resource).strip() if target_resource is not None else ""
+        )
+        if action_target and requested_target and requested_target != action_target:
+            raise PermitError("permit target resource does not match action scope")
+        if action_target:
+            # Persist the exact immutable action scope even when callers omit the
+            # redundant argument; execution remains bound to the payload hash.
+            target_resource = action_target
         if expires_at <= _now():
             raise PermitError("permit expiry must be in the future")
         permit_id = _new_id("permit")

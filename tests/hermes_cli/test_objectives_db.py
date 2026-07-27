@@ -157,7 +157,11 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
         created_by="planner",
     )
     odb.transition_objective(conn, objective.id, "planned", actor="control")
-    payload = {"path": "/tmp/artifact", "sha256": "abc"}
+    payload = {
+        "path": "/tmp/artifact",
+        "target_resource": "/tmp/artifact",
+        "sha256": "abc",
+    }
     action_id = odb.propose_action(
         conn,
         objective_id=objective.id,
@@ -171,6 +175,16 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
         reversible=True,
         proposed_by="planner",
     )
+    with pytest.raises(odb.PermitError, match="target resource"):
+        odb.issue_permit(
+            conn,
+            action_id,
+            capability="filesystem.write",
+            issued_to="worker-1",
+            policy_version="test-v1",
+            target_resource="/tmp/not-the-artifact",
+            expires_at=int(time.time()) + 60,
+        )
     permit_id = odb.issue_permit(
         conn,
         action_id,

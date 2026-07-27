@@ -13,6 +13,9 @@ acceptance evidence.
   actions cannot regain execution authority.
 - Permit consumption rejects permits whose policy version is stale for the
   active runtime.
+- Permit resource scope is derived from the immutable action payload; an
+  explicitly supplied target must match exactly, preventing path/resource
+  retargeting between authorization and execution.
 - Delegation is authority-monotone: grants are bounded by the current
   delegator mandate as well as the subordinate mandate, objective scope,
   budget, and expiry; privilege cannot be amplified through hierarchy.

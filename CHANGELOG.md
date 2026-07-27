@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Permit records now derive and persist the exact target resource from the
+  immutable action payload; callers attempting to retarget a permit are
+  rejected, and delegator budget enforcement remains cumulative across active
+  grants.
 - Added a process-separated delegation acceptance gate: the Founder/CEO creates
   a grant-bound Kanban task, a fresh subordinate Python process validates the
   exact profile/mandate/toolset/skill grant, records evidence in the task run,
