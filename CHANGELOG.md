@@ -239,3 +239,6 @@ recorded.
 - `4bd0ccefb7be7c87c6c57479ce323be382c25e0f` — bound child and successor
   objective relationship retries to immutable request fingerprints, failing
   closed for unbound legacy rows or changed decomposition inputs.
+- `0e22898814e8b2d61345e6c1088031a0856d6481` — bound FTE/contractor hiring
+  decision retries to the original organization, staffing case, policy, and
+  evaluator identity, rejecting idempotency-key drift.
