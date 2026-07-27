@@ -224,6 +224,10 @@ _FEISHU_WEBHOOK_MAX_BODY_BYTES = 1 * 1024 * 1024   # 1 MB body limit
 _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS = 60            # sliding window for rate limiter
 _FEISHU_WEBHOOK_RATE_LIMIT_MAX = 120               # max requests per window per IP — matches openclaw
 _FEISHU_WEBHOOK_RATE_MAX_KEYS = 4096               # max tracked keys (prevents unbounded growth)
+
+# Module-level so all adapter instances (including bare __new__ senders) share
+# one queue for atomic peer-registry writes.
+_PEER_REGISTRY_LOCK = threading.Lock()
 _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request body
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
@@ -575,8 +579,11 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _build_markdown_post_payload(content: str) -> str:
-    rows = _build_markdown_post_rows(content)
+def _build_markdown_post_payload(
+    content: str,
+    peer_mentions: Optional[Dict[str, str]] = None,
+) -> str:
+    rows = _build_markdown_post_rows(content, peer_mentions=peer_mentions)
     return json.dumps(
         {
             "zh_cn": {
@@ -587,19 +594,97 @@ def _build_markdown_post_payload(content: str) -> str:
     )
 
 
-def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
+def _build_markdown_post_rows(
+    content: str,
+    *,
+    peer_mentions: Optional[Dict[str, str]] = None,
+) -> List[List[Dict[str, str]]]:
     """Build Feishu post rows while isolating fenced code blocks.
 
     Feishu's `md` renderer can swallow trailing content when a fenced code block
     appears inside one large markdown element. Split the reply at real fence
     lines so prose before/after the code block remains visible while code stays
     in a dedicated row.
+
+    When ``peer_mentions`` is a non-empty name→open_id map, ``@<name>`` tokens
+    matching a known peer are converted to ``{tag:"at", user_id: open_id}``
+    elements alongside the ``md``/``text`` segments — never replacing the
+    markdown route, only inserting mention elements between markdown runs.
     """
     if not content:
         return [[{"tag": "md", "text": ""}]]
     if "```" not in content:
-        return [[{"tag": "md", "text": content}]]
+        return [_mention_aware_row(content, peer_mentions, default_tag="md")]
+    if not peer_mentions:
+        # Fast path: no peer registry → unchanged behavior.
+        return _split_rows_at_code_fences(content)
 
+    # Code fences AND peer mentions both present: walk fences, then inject
+    # mentions into each PROSE run only (code blocks are left untouched so the
+    # fence-isolation guarantee still holds and @-tokens in code stay literal).
+    rows: List[List[Dict[str, str]]] = []
+    prose_buf: List[str] = []
+    code_buf: List[str] = []
+    in_code_block = False
+
+    def _flush_prose() -> None:
+        nonlocal prose_buf
+        if not prose_buf:
+            return
+        segment = "\n".join(prose_buf)
+        if segment.strip():
+            row = _mention_aware_row(segment, peer_mentions, default_tag="md")
+            if row:
+                rows.append(row)
+        prose_buf = []
+
+    def _flush_code() -> None:
+        nonlocal code_buf
+        if not code_buf:
+            return
+        segment = "\n".join(code_buf)
+        if segment.strip():
+            rows.append([{"tag": "md", "text": segment}])
+        code_buf = []
+
+    for raw_line in content.splitlines():
+        stripped_line = raw_line.strip()
+        is_fence = bool(
+            _MARKDOWN_FENCE_CLOSE_RE.match(stripped_line)
+            if in_code_block
+            else _MARKDOWN_FENCE_OPEN_RE.match(stripped_line)
+        )
+
+        if is_fence:
+            if not in_code_block:
+                _flush_prose()
+                prose_buf = []
+            else:
+                # The closing fence line belongs with the code block.
+                code_buf.append(raw_line)
+                _flush_code()
+                code_buf = []
+            if not in_code_block:
+                # Opening fence: this line begins a code block — emit with code.
+                code_buf.append(raw_line)
+            in_code_block = not in_code_block
+            continue
+
+        if in_code_block:
+            code_buf.append(raw_line)
+        else:
+            prose_buf.append(raw_line)
+
+    # End of input: flush whichever buffer has trailing content.
+    if in_code_block:
+        _flush_code()  # unterminated fence — treat its content as code
+    else:
+        _flush_prose()
+    return rows or [_mention_aware_row(content, peer_mentions, default_tag="md")]
+
+
+def _split_rows_at_code_fences(content: str) -> List[List[Dict[str, str]]]:
+    """Original _build_markdown_post_rows behavior — no peer-mention injection."""
     rows: List[List[Dict[str, str]]] = []
     current: List[str] = []
     in_code_block = False
@@ -634,6 +719,45 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
+
+
+_PEER_MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_\u4e00-\u9fff]+)")
+
+
+def _mention_aware_row(
+    segment: str,
+    peer_mentions: Optional[Dict[str, str]],
+    *,
+    default_tag: str,
+) -> List[Dict[str, str]]:
+    """One post row: default_tag elements split by ``{tag:"at"}`` for known peers.
+
+    ``default_tag`` is ``"md"`` for markdown prose and would be ``"text"`` for
+    plain text (currently only md is used; text path goes through a separate
+    payload). Unknown @names stay in the prose — only registry hits become
+    ``at`` elements.
+    """
+    if not peer_mentions:
+        return [{ "tag": default_tag, "text": segment }]
+
+    hits = [
+        (m.start(), m.end(), m.group(1))
+        for m in _PEER_MENTION_RE.finditer(segment)
+        if m.group(1) in peer_mentions
+    ]
+    if not hits:
+        return [{ "tag": default_tag, "text": segment }]
+
+    row: List[Dict[str, str]] = []
+    last = 0
+    for start, end, name in hits:
+        if start > last:
+            row.append({"tag": default_tag, "text": segment[last:start]})
+        row.append({"tag": "at", "user_id": peer_mentions[name]})
+        last = end
+    if last < len(segment):
+        row.append({"tag": default_tag, "text": segment[last:]})
+    return row
 
 
 def parse_feishu_post_payload(
@@ -1442,9 +1566,6 @@ class FeishuAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 8000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
     CHAT_LOCK_MAX_SIZE: int = 1000
-
-    # Class-level: name→open_id map shared across adapter instances for outbound @mention conversion.
-    _peer_bot_mentions: Dict[str, str] = {}
     # Threshold for detecting Feishu client-side message splits.
     # When a chunk is near the ~4096-char practical limit, a continuation
     # is almost certain.
@@ -1481,6 +1602,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
+        # Peer-bot registry state (file-backed). Lock is module-level so bare
+        # instances created via __new__ (test fixtures, transient senders)
+        # share it without each needing __init__ to run.
+        self._peer_registry_cache: Optional[Dict[str, str]] = None
+        self._peer_registry_mtime: float = 0.0
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
@@ -3804,6 +3930,7 @@ class FeishuAdapter(BasePlatformAdapter):
             mentions=getattr(message, "mentions", None),
             bot=self._bot_identity(),
         )
+        self._harvest_peer_mentions(normalized.mentions)
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id,
             normalized=normalized,
@@ -4259,6 +4386,7 @@ class FeishuAdapter(BasePlatformAdapter):
             mentions=mentions,
             bot=self._bot_identity(),
         )
+        self._harvest_peer_mentions(normalized.mentions)
         if normalized.text_content:
             return normalized.text_content
         placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
@@ -4396,6 +4524,7 @@ class FeishuAdapter(BasePlatformAdapter):
             mentions=getattr(message, "mentions", None),
             bot=self._bot_identity(),
         )
+        self._harvest_peer_mentions(normalized.mentions)
         return self._post_mentions_bot(normalized.mentions)
 
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
@@ -4476,7 +4605,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         )
                     self._bot_name = bot_name
                 if open_id and bot_name:
-                    FeishuAdapter._peer_bot_mentions[bot_name] = open_id
+                    self._record_peer_mention(bot_name, open_id)
         except Exception:
             logger.debug(
                 "[Feishu] /bot/v3/info probe failed during hydration",
@@ -4574,16 +4703,90 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
 
     # =========================================================================
+    # Peer-bot mention registry — file-backed name→open_id map
+    #
+    # Two sources: _hydrate_bot_identity (self) and inbound
+    # normalize_feishu_message (peers observed in any chat). File-backed so
+    # the standalone/cron send path (transient adapter, no hydration) can
+    # also resolve peer mentions.
+    # =========================================================================
+
+    def _peer_registry_path(self) -> Path:
+        # Scope by app_id so multiplex profiles don't cross-contaminate.
+        suffix = f"_{self._app_id}" if getattr(self, "_app_id", "") else ""
+        return get_hermes_home() / f"feishu_peer_bots{suffix}.json"
+
+    def _load_peer_registry(self) -> Dict[str, str]:
+        """Read the registry, refreshing when file mtime changes. Never raises."""
+        path = self._peer_registry_path()
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            self._peer_registry_cache = {}
+            self._peer_registry_mtime = 0.0
+            return {}
+        except OSError:
+            return self._peer_registry_cache or {}
+
+        if (
+            getattr(self, "_peer_registry_cache", None) is not None
+            and mtime == getattr(self, "_peer_registry_mtime", 0.0)
+        ):
+            return self._peer_registry_cache or {}
+
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            registry = {
+                str(k): str(v)
+                for k, v in (raw or {}).items()
+                if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+            }
+        except (OSError, json.JSONDecodeError):
+            logger.debug(
+                "[Feishu] Failed to load peer-bot registry from %s", path, exc_info=True
+            )
+            return self._peer_registry_cache or {}
+        self._peer_registry_cache = registry
+        self._peer_registry_mtime = mtime
+        return registry
+
+    def _record_peer_mention(self, name: str, open_id: str) -> None:
+        name = (name or "").strip()
+        open_id = (open_id or "").strip()
+        if not name or not open_id:
+            return
+        with _PEER_REGISTRY_LOCK:
+            registry = dict(self._load_peer_registry())
+            if registry.get(name) == open_id:
+                return
+            registry[name] = open_id
+            path = self._peer_registry_path()
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_json_write(path, registry, indent=None)
+                self._peer_registry_cache = registry
+                self._peer_registry_mtime = path.stat().st_mtime
+            except OSError:
+                logger.warning(
+                    "[Feishu] Failed to persist peer-bot registry to %s",
+                    path,
+                    exc_info=True,
+                )
+
+    def _harvest_peer_mentions(self, mentions: Sequence[FeishuMentionRef]) -> None:
+        for ref in mentions or []:
+            if ref.is_all or ref.is_self:
+                continue
+            if ref.name and ref.open_id:
+                self._record_peer_mention(ref.name, ref.open_id)
+
+    # =========================================================================
     # Outbound payload construction and send pipeline
     # =========================================================================
 
     def _build_outbound_payload(
         self, content: str, *, prefer_post: bool = False,
     ) -> tuple[str, str]:
-        if FeishuAdapter._peer_bot_mentions:
-            converted = self._try_mention_post(content)
-            if converted:
-                return converted
         # Empirically (issue #52786), current Feishu clients render markdown
         # tables inside ``post``-type ``md`` elements natively. The previous
         # table-downgrade branch forced any table-containing message to
@@ -4595,30 +4798,16 @@ class FeishuAdapter(BasePlatformAdapter):
         # markdown document: when a long markdown reply is split at
         # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
         # mis-classify a plain-prose chunk as ``text``. See #26841.
-        if prefer_post or _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
+        peer_registry = self._load_peer_registry()
+        # A plain-prose chunk that @-mentions a known peer still needs the post
+        # path so the <at> element can ride in the post structure.
+        has_known_mention = bool(peer_registry) and any(
+            m.group(1) in peer_registry for m in _PEER_MENTION_RE.finditer(content)
+        )
+        if prefer_post or _MARKDOWN_HINT_RE.search(content) or has_known_mention:
+            return "post", _build_markdown_post_payload(content, peer_registry)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
-
-    _MENTION_RE = re.compile(r'@([A-Za-z][A-Za-z0-9_\u4e00-\u9fff]+)')
-
-    def _try_mention_post(self, content: str) -> Optional[tuple[str, str]]:
-        """Build a post payload with <at> elements for known peer bot names."""
-        registry = FeishuAdapter._peer_bot_mentions
-        matches = list(self._MENTION_RE.finditer(content))
-        hits = [(m.start(), m.end(), m.group(1)) for m in matches if m.group(1) in registry]
-        if not hits:
-            return None
-        row: list[dict] = []
-        last = 0
-        for start, end, name in hits:
-            if start > last:
-                row.append({"tag": "text", "text": content[last:start]})
-            row.append({"tag": "at", "user_id": registry[name]})
-            last = end
-        if last < len(content):
-            row.append({"tag": "text", "text": content[last:]})
-        return "post", json.dumps({"zh_cn": {"content": [row]}}, ensure_ascii=False)
 
     async def _send_uploaded_file_message(
         self,
@@ -5093,7 +5282,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return SimpleNamespace(request_body=request_body)
 
     def _build_post_payload(self, content: str) -> str:
-        return _build_markdown_post_payload(content)
+        return _build_markdown_post_payload(content, self._load_peer_registry())
 
     def _build_media_post_payload(self, *, caption: str, media_tag: Dict[str, str]) -> str:
         payload = json.loads(self._build_post_payload(caption))
