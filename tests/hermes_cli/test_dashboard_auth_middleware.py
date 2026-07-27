@@ -142,6 +142,14 @@ def test_gated_static_asset_path_is_public(gated_app):
     assert r.status_code == 404
 
 
+def test_gated_home_screen_icon_path_is_public(gated_app):
+    """iPadOS must fetch the touch icon without a dashboard session cookie."""
+    r = gated_app.get("/apple-touch-icon.png", follow_redirects=False)
+    # 404 means no icon is configured but the public static route was reached.
+    # A 302 would send iPadOS to login and prevent Home Screen icon capture.
+    assert r.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # OAuth round trip
 # ---------------------------------------------------------------------------

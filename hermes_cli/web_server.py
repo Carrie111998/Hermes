@@ -18749,6 +18749,85 @@ def _render_active_theme_bootstrap_css() -> str:
         return ""
 
 
+_WEB_APP_ICON_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _resolve_web_app_icon(profile: Optional[str] = None) -> Optional[tuple[bytes, str, str]]:
+    """Return the configured profile web-app icon or ``None``.
+
+    Safari reads ``apple-touch-icon`` while adding the Dashboard to the Home
+    Screen. The resulting request has no filename chosen by the browser, so
+    resolve the configured profile asset here instead of exposing a generic
+    file-serving route. Absolute values are accepted only when they still live
+    within the active profile home; symlinks and ``..`` traversal are therefore
+    rejected after ``resolve()``.
+
+    The returned bytes are a bounded, descriptor-verified snapshot rather than
+    a pathname. This prevents a local file replacement between validation and
+    response delivery from exposing bytes outside the profile home. The third
+    tuple item is a stable content version used in the document link to bypass
+    stale icon fetches during a fresh Home Screen install.
+    """
+    try:
+        with _config_profile_scope(profile):
+            config = load_config() or {}
+            if not isinstance(config, dict):
+                return None
+            display = config.get("display") or {}
+            if not isinstance(display, dict):
+                return None
+            raw_path = display.get("web_app_icon")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                return None
+
+            home = get_hermes_home().expanduser().resolve(strict=True)
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = home / candidate
+            candidate = candidate.resolve(strict=True)
+            if not candidate.is_relative_to(home):
+                return None
+
+            # lstat refuses a final-component symlink. Re-resolving after the
+            # lstat catches a replaced parent directory before the open. The
+            # descriptor inode/device check below closes the remaining window
+            # between those checks and opening the file.
+            file_stat = candidate.lstat()
+            if not stat.S_ISREG(file_stat.st_mode):
+                return None
+            if candidate.resolve(strict=True) != candidate:
+                return None
+            if file_stat.st_size <= 0 or file_stat.st_size > _WEB_APP_ICON_MAX_BYTES:
+                return None
+            with candidate.open("rb") as handle:
+                opened_stat = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or (opened_stat.st_dev, opened_stat.st_ino)
+                    != (file_stat.st_dev, file_stat.st_ino)
+                ):
+                    return None
+                icon_bytes = handle.read(_WEB_APP_ICON_MAX_BYTES + 1)
+            if (
+                len(icon_bytes) != file_stat.st_size
+                or len(icon_bytes) > _WEB_APP_ICON_MAX_BYTES
+            ):
+                return None
+            if icon_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                media_type = "image/png"
+            elif icon_bytes.startswith(b"\xff\xd8\xff"):
+                media_type = "image/jpeg"
+            else:
+                return None
+            return icon_bytes, media_type, (
+                f"{file_stat.st_mtime_ns:x}-{file_stat.st_size:x}"
+            )
+    except (HTTPException, OSError, RuntimeError, TypeError, ValueError):
+        # The icon is cosmetic. A malformed, disappearing, or inaccessible
+        # setting must not prevent the Dashboard itself from loading.
+        return None
+
+
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
@@ -18782,7 +18861,7 @@ def mount_spa(application: FastAPI):
 
     _index_path = WEB_DIST / "index.html"
 
-    def _serve_index(prefix: str = ""):
+    def _serve_index(prefix: str = "", profile: Optional[str] = None):
         """Return index.html with the session token + base-path injected.
 
         ``prefix`` is the normalised ``X-Forwarded-Prefix`` (e.g. ``/hermes``)
@@ -18834,6 +18913,17 @@ def mount_spa(application: FastAPI):
             html = html.replace('href="/fonts/', f'href="{prefix}/fonts/')
             html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
             html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
+        web_app_icon = _resolve_web_app_icon(profile)
+        if web_app_icon:
+            _, _, icon_version = web_app_icon
+            profile_query = (
+                f"&profile={urllib.parse.quote(profile, safe='')}" if profile else ""
+            )
+            icon_link = (
+                '<link rel="apple-touch-icon" '
+                f'href="{prefix}/apple-touch-icon.png?v={icon_version}{profile_query}" />'
+            )
+            html = html.replace("</head>", f"{icon_link}</head>", 1)
         # Theme flash mitigation: when the active theme is a user theme
         # (``HERMES_HOME/dashboard-themes/<name>.yaml``), inject a minimal
         # critical-CSS block so the first paint uses the target palette.
@@ -18873,11 +18963,25 @@ def mount_spa(application: FastAPI):
                 css = css.replace(f"url('{asset_dir}", f"url('{prefix}{asset_dir}")
         return Response(content=css, media_type="text/css")
 
+    @application.get("/apple-touch-icon.png", include_in_schema=False)
+    async def serve_web_app_icon(profile: Optional[str] = None):
+        """Serve the configured profile image for Safari Home Screen installs."""
+        web_app_icon = _resolve_web_app_icon(profile)
+        if not web_app_icon:
+            return JSONResponse({"detail": "Web app icon not configured"}, status_code=404)
+        icon_bytes, media_type, _ = web_app_icon
+        return Response(
+            content=icon_bytes,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
+
     application.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+        profile = (request.query_params.get("profile") or "").strip() or None
         # An unmatched /api/* path is a missing/renamed endpoint, NOT a
         # client-side route. Falling through to index.html here returns
         # `<!doctype html>` with status 200, which makes JSON clients (the
@@ -18898,7 +19002,7 @@ def mount_spa(application: FastAPI):
             and file_path.is_file()
         ):
             return FileResponse(file_path)
-        return _serve_index(prefix)
+        return _serve_index(prefix, profile)
 
 
 # ---------------------------------------------------------------------------

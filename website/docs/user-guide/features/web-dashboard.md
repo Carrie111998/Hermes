@@ -41,6 +41,38 @@ hermes dashboard --host 0.0.0.0
 hermes dashboard --no-open
 ```
 
+## iPad and iPhone Home Screen icon
+
+Safari can add the Dashboard to the Home Screen as a web app. Set
+`display.web_app_icon` to a PNG or JPEG inside the active profile's Hermes
+home to give that installed icon a profile-specific identity:
+
+```yaml
+# ~/.hermes/config.yaml for the default profile
+display:
+  web_app_icon: reference-images/amanda-icon.jpg
+```
+
+The image must be at most 5 MiB and live inside that profile's Hermes home.
+Relative paths are recommended: the default profile resolves them from
+`~/.hermes`, while a named profile resolves them from
+`$HOME/.hermes/profiles/<profile>`. Paths that leave the profile home, including
+through symlinks, are ignored.
+
+The touch-icon endpoint is a public static asset, like `/favicon.ico`, so
+choose an image you are comfortable exposing to anyone who can reach the
+Dashboard hostname. It never exposes a file outside the active profile home.
+
+You can set the same value in **Config → display → web_app_icon**. For a named
+profile, select it in the dashboard first; its `?profile=` URL is retained in
+the icon request so its own configured image is used.
+
+After setting or changing the image, open the dashboard in **Safari**, use
+**Share → Add to Home Screen**, and launch it from the new icon. iPadOS captures
+the Home Screen icon at installation time, so delete the prior shortcut and add
+it again when you change the image. This changes the installed web-app icon;
+the generic Hermes browser-tab favicon is intentionally unchanged.
+
 ## Managing multiple profiles
 
 The dashboard is a **machine-level** management surface: one server manages
