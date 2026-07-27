@@ -218,6 +218,15 @@ def build_business_snapshot(conn) -> dict:
             "reason": "solo-founder organization has not been initialized",
             "objectives": [],
             "exceptions": [],
+            "next_step": {
+                "action": "review_and_bootstrap_charter",
+                "command": (
+                    "charterforge business bootstrap "
+                    "--charter-file examples/agentic-charter.json"
+                ),
+                "authority": "advisor must review and provide an enabled charter",
+                "autonomy_started": False,
+            },
         }
     organization_id = ceo["organization_id"]
     from hermes_cli.objective_worker import worker_health

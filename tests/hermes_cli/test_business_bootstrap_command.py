@@ -1,5 +1,6 @@
 import argparse
 import json
+import sqlite3
 
 import pytest
 
@@ -51,3 +52,19 @@ def test_business_bootstrap_rejects_disabled_charter(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="enabled charter"):
         business.business_command(args)
+
+
+def test_unconfigured_snapshot_exposes_safe_first_run_handoff():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    snapshot = business.build_business_snapshot(conn)
+    assert snapshot["configured"] is False
+    assert snapshot["next_step"] == {
+        "action": "review_and_bootstrap_charter",
+        "command": (
+            "charterforge business bootstrap "
+            "--charter-file examples/agentic-charter.json"
+        ),
+        "authority": "advisor must review and provide an enabled charter",
+        "autonomy_started": False,
+    }
