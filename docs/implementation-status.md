@@ -193,7 +193,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`b8b9285e6573097a327daf1bdd30bb64e1e22cae` passed 6 Founder/CEO E2E tests, 48
+`2a45edea8560c084c09b3ef62de82bdc904b192b` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release
@@ -229,6 +229,7 @@ External and scheduled objective wakeups now pass organization scope into the
 event inbox boundary.
 Employee identities are organization-scoped for objective reaffirmation and
 transitions when present in the employee directory.
+The same employee scope applies to plan creation and action proposals.
 
 Authenticated external-event ingress has a separate focused regression at the
 same current-main baseline: 23 tests passed, including rejection of malformed,

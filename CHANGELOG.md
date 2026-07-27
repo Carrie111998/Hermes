@@ -282,3 +282,5 @@ recorded.
   objective wakeups to their organization at enqueue time.
 - `b8b9285e6573097a327daf1bdd30bb64e1e22cae` — scoped employee actors to their
   organization for objective lifecycle mutations.
+- `2a45edea8560c084c09b3ef62de82bdc904b192b` — extended employee actor scope
+  checks to plan creation and action proposals.
