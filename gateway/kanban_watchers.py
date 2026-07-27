@@ -994,10 +994,42 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
+        # Top-level safety net (#72396): the dispatcher watcher runs as a
+        # supervised asyncio task, and on Windows (especially under pythonw.exe
+        # / Scheduled Tasks) an unhandled exception here can vanish the entire
+        # gateway process with zero trace.  This guard ensures any unexpected
+        # failure is logged and the singleton lock is released before the task
+        # exits.
+        try:
+            await self._kanban_dispatcher_loop(_kb, kanban_cfg)
+        except asyncio.CancelledError:
+            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            self._kanban_dispatcher_lock_handle = None
+            raise
+        except Exception:
+            logger.exception(
+                "kanban dispatcher: unhandled error — releasing lock and exiting; "
+                "the gateway will continue but kanban dispatch will be disabled "
+                "until restart."
+            )
+            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            self._kanban_dispatcher_lock_handle = None
+            # Return cleanly so _spawn_supervised sees a normal exit (no
+            # exception) and does not busy-restart a watcher that keeps
+            # failing at the same point.
+            return
+
+    async def _kanban_dispatcher_loop(
+        self, _kb: object, kanban_cfg: dict,
+    ) -> None:
+        """Body of the embedded kanban dispatcher watcher.
+
+        Separated from ``_kanban_dispatcher_watcher`` so that the outer
+        method can wrap the entire body in a single try/except that
+        guarantees the singleton lock is released on any failure path
+        (issue #72396).
+        """
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
-        # new profile gateway (or a same-profile restart race) can silently
-        # start a second dispatcher; concurrent dispatchers double reclaim
-        # frequency, double claim-attempt events, and — with
         # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
         # index pages. The lock lives at the machine-global kanban root
         # (shared across profiles by design), so it serialises ALL gateways.
@@ -1135,7 +1167,18 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
-        await asyncio.sleep(5)
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.debug("kanban dispatcher: cancelled during startup delay")
+            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            self._kanban_dispatcher_lock_handle = None
+            raise
+        except Exception:
+            logger.exception("kanban dispatcher: error during startup delay")
+            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            self._kanban_dispatcher_lock_handle = None
+            return
 
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —
