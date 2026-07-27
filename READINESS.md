@@ -1177,6 +1177,27 @@ This remains deterministic local-provider evidence and does not establish
 production filesystem access, provider credentials, or legal/compliance
 certification.
 
+The governed file-search boundary was validated on current `main` commit
+`6485b3aaea03ea16e7ff5d7fbda2b4edbae795a2` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_agentic_business_e2e.py \
+  tests/tools/test_file_tools.py
+uv run --extra dev ruff check tools/file_tools.py scripts/delegation_process_acceptance.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **75 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The process-separated subordinate now rejects unauthorized search in
+addition to direct writes and patch replacement. The acceptance image manifest
+digest was
+`sha256:884f33fbe9fe0630dadff95e33eade4b0e281b50a3f4c82297f3e6a858018322`.
+This remains deterministic local-provider evidence and does not establish
+production filesystem access, provider credentials, or legal/compliance
+certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

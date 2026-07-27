@@ -77,6 +77,9 @@ acceptance evidence.
   stable for multi-toolset contracts after persistence.
 - Patch replacement is governed as a write at its own tool boundary, closing
   the alternate file-edit path for read-only workers.
+- File search and enumeration are separately governed by exact
+  `file.search`/canonical-root authority; a single-file read grant cannot
+  expand into a search surface.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

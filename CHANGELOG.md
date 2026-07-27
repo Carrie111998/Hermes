@@ -95,6 +95,11 @@
   targets fail closed for contracted workers.
 - The process-separated acceptance now proves that a read-only worker cannot
   bypass write authority through patch replacement.
+- Governed `search_tool` access now requires an explicit `file.search` grant
+  bound to the exact canonical search root; `file.read` no longer implies
+  directory enumeration or content search.
+- The process-separated acceptance now records rejection of unauthorized file
+  search in addition to direct writes and patch replacement.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy
