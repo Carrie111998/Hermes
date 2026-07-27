@@ -1,8 +1,10 @@
 ---
 name: api-failure-investigation
-description: Systematic approach to diagnose API connectivity issues through endpoint matrix testing, avoiding infinite retry loops and token waste.
+description: Diagnose API failures via endpoint matrix testing.
 version: 1.0.0
 author: Hermes Agent
+contributor:
+  author: liguolin (ligl0325)
 license: MIT
 metadata:
   hermes:
@@ -13,6 +15,7 @@ metadata:
 # API Failure Investigation
 
 ## When to Use
+
 When API calls repeatedly fail and you need to determine:
 - Whether endpoints are actually available
 - Root cause (wrong URL, auth issues, service down, version mismatch)
@@ -24,13 +27,27 @@ When API calls repeatedly fail and you need to determine:
 - User frustration from prolonged troubleshooting
 - Guessing without evidence
 
-## Principles
-1. **Test antes de commit** - Verify endpoint availability with minimal requests first
-2. **Pattern before persistence** - If 3+ endpoints fail the same way, service is likely unavailable
-3 **Document every attempt** - Keep clear record of what was tested and results
-4. **Token-conscious investigation** - Short timeouts, small payloads, abort early on systematic failure
+## Prerequisites
 
-## Steps
+- API base URL and endpoint documentation
+- Authentication credentials (API key, token, etc.)
+- Network access to the target service
+- `curl`, `httpie`, or Python `requests` for testing
+
+## How to Run
+
+1. Load this skill in a Hermes session
+2. Provide the API base URL and authentication details
+3. Follow the Procedure below to test endpoints systematically
+
+## Quick Reference
+
+1. Test minimal endpoints with GET first
+2. If 3+ endpoints fail the same way, service is likely down
+3. **Document every attempt** — keep clear record of what was tested
+4. Use short timeouts and small payloads to conserve tokens
+
+## Procedure
 
 ### Phase 1: Environment & Configuration Check
 ```python
@@ -61,7 +78,7 @@ For each endpoint with GET (or HEAD):
 - Request with authentication headers
 - Short timeout (10s)
 - Record: status code, response body (first 200 chars), latency
-- **Stop after first successful response** - base path found
+- **Stop after first successful response** — base path found
 
 **Analysis:**
 - 200 → Endpoint exists, proceed to Phase 4
@@ -91,39 +108,15 @@ Based on evidence:
 - **Timeout:** Service down or network issue → Check service status
 
 ## Pitfalls
+
 - ❌ Don't keep retrying same failing endpoint hoping for different result
 - ❌ Don't test large payloads before endpoint confirmed
 - ❌ Don't assume "temporary glitch" without evidence
 - ✅ Do mask credentials in logs
 - ✅ Do provide user with clear verdict and next steps
 
-## Integration with systematic-debugging
-- Use systematic-debugging Phase 1 to gather error logs and evidence
-- This skill provides specific API testing methodology
-- Combine: understand error → test hypothesis with endpoint matrix
+## Verification
 
-## Example Output Format
-```
-=== API Endpoint Test Results ===
-Base URL: https://api.example.com
-Auth: headers present (masked)
-
-GET /
-  Status: 200
-  Body: HTML landing page
-
-GET /api/v1/upload
-  Status: 404
-  Body: {"error":"Not Found"}
-
-GET /v1/upload
-  Status: 404
-  Body: {"error":"Not Found"}
-
-Conclusion: All API paths return 404. Root path works but API service appears unavailable. Recommend: contact API provider to confirm endpoint URLs and service status.
-```
-
-## Success Criteria
 - All reasonable endpoints tested (≤10)
 - Results documented with status codes
 - Clear root cause hypothesis
