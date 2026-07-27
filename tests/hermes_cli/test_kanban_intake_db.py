@@ -177,6 +177,149 @@ def test_intake_submission_is_durable_and_inert(conn):
     }
 
 
+def test_identical_intake_submission_is_idempotent(conn):
+    kwargs = {
+        "raw_request": '{"kind":"task_create","request":{"title":"One"}}',
+        "source": "codex",
+        "session_id": "session-123",
+        "attachments": [{"name": "brief.pdf", "digest": "abc"}],
+    }
+
+    first = kb.create_qualification_intake(conn, **kwargs, created_at=100)
+    second = kb.create_qualification_intake(conn, **kwargs, created_at=101)
+
+    assert second == first
+    assert conn.execute("SELECT COUNT(*) FROM qualification_intake").fetchone()[0] == 1
+
+
+def test_intake_run_claim_heartbeat_events_and_explicit_retry(conn):
+    intake_id = kb.create_qualification_intake(
+        conn, raw_request="assess this", source="chat", created_at=100
+    )
+    runtime = {
+        "profile": "productowner",
+        "provider": "claude-cli",
+        "model": "claude-opus-5",
+        "effort": "high",
+        "surface": "work_inbox_intake",
+    }
+
+    run = kb.claim_qualification_intake(
+        conn,
+        intake_id,
+        profile="productowner",
+        runtime_identity=runtime,
+        lease_seconds=30,
+        now=110,
+    )
+
+    assert run["status"] == "running"
+    assert run["claim_expires"] == 140
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == "running"
+    assert (
+        kb.claim_qualification_intake(
+            conn,
+            intake_id,
+            profile="productowner",
+            runtime_identity=runtime,
+            lease_seconds=30,
+            now=111,
+        )
+        is None
+    )
+    assert kb.heartbeat_qualification_intake(
+        conn,
+        intake_id=intake_id,
+        run_id=run["id"],
+        claim_lock=run["claim_lock"],
+        lease_seconds=30,
+        now=120,
+    )
+    assert kb.get_qualification_intake_run(conn, run["id"])["claim_expires"] == 150
+
+    event_id = kb.append_qualification_intake_event(
+        conn,
+        intake_id=intake_id,
+        run_id=run["id"],
+        kind="clarification_requested",
+        payload={"question": "Which customer?"},
+        created_at=125,
+    )
+    kb.finish_qualification_intake_run(
+        conn,
+        intake_id=intake_id,
+        run_id=run["id"],
+        claim_lock=run["claim_lock"],
+        intake_status="needs_clarification",
+        outcome="needs_clarification",
+        now=126,
+    )
+
+    assert kb.list_qualification_intake_events(conn, intake_id) == [
+        {
+            "id": event_id,
+            "intake_id": intake_id,
+            "run_id": run["id"],
+            "kind": "clarification_requested",
+            "payload": {"question": "Which customer?"},
+            "created_at": 125,
+        }
+    ]
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == "needs_clarification"
+    assert kb.get_qualification_intake_run(conn, run["id"])["status"] == "completed"
+
+    with pytest.raises(ValueError, match="attention_required"):
+        kb.retry_qualification_intake(conn, intake_id, now=130)
+
+    conn.execute(
+        "UPDATE qualification_intake SET status = 'attention_required' WHERE id = ?",
+        (intake_id,),
+    )
+    assert kb.retry_qualification_intake(conn, intake_id, now=131)
+    assert kb.get_qualification_intake(conn, intake_id)["status"] == "pending"
+
+
+def test_legacy_intake_schema_migrates_without_losing_rows(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE qualification_intake (
+            id TEXT PRIMARY KEY,
+            raw_request TEXT NOT NULL,
+            source TEXT NOT NULL,
+            session_id TEXT,
+            attachments_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'qualified', 'rejected', 'overridden')),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO qualification_intake
+        VALUES ('qi_legacy', 'original', 'chat', NULL, '[]', 'pending', 10, 10);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    kb.init_db(db_path)
+    migrated = kb.connect(db_path)
+    try:
+        row = kb.get_qualification_intake(migrated, "qi_legacy")
+        assert row["raw_request"] == "original"
+        run = kb.claim_qualification_intake(
+            migrated,
+            "qi_legacy",
+            profile="productowner",
+            runtime_identity={"provider": "claude-cli", "model": "opus", "effort": "high"},
+            now=20,
+        )
+        assert run is not None
+        assert kb.get_qualification_intake(migrated, "qi_legacy")["status"] == "running"
+    finally:
+        migrated.close()
+
+
 @pytest.mark.parametrize("decision", ["qualified", "rejected", "overridden"])
 def test_terminal_intake_records_remain_queryable_with_append_only_audit(conn, decision):
     intake_id = kb.create_qualification_intake(
