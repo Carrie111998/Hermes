@@ -542,7 +542,11 @@ def resolve_intervention(
             from hermes_cli import external_content, objectives_db
 
             external_content.approve_quarantined_content(
-                conn, content_id, reviewer=actor, evidence=evidence
+                conn,
+                content_id,
+                organization_id=str(row["organization_id"]),
+                reviewer=actor,
+                evidence=evidence,
             )
             envelope = external_content.context_envelope(conn, content_id)
             objectives_db.enqueue_objective_event(

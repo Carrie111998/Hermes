@@ -128,13 +128,15 @@ def approve_quarantined_content(
     conn: sqlite3.Connection,
     content_id: str,
     *,
+    organization_id: str,
     reviewer: str,
     evidence: Any,
 ) -> None:
     if not evidence:
         raise ValueError("quarantine release requires review evidence")
     current = conn.execute(
-        "SELECT status FROM external_content WHERE id=?", (content_id,)
+        "SELECT status FROM external_content WHERE id=? AND organization_id=?",
+        (content_id, organization_id),
     ).fetchone()
     if current is None:
         raise ExternalContentError("content does not exist")
