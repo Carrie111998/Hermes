@@ -44,6 +44,8 @@
 - The independent package-artifact workflow now exercises
   `scripts/install-charterforge.sh` against the built wheel in a fresh isolated
   environment before uploading artifacts.
+- Independent container CI now validates both Linux and Windows Compose
+  deployment definitions before building the Charterforge image.
 - Authority-integrity verification now independently checks parent-grant
   expiry, budget, capabilities, systems, toolsets, skills, and exact resource
   equality, detecting persisted hierarchy expansion or stale parent evidence.
