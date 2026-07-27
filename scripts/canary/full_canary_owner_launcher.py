@@ -4644,6 +4644,47 @@ class TrustedGcloudExecutable:
             "owner_support_wheels": _owner_support_wheel_receipt_values(),
         }
 
+    def _validate_sdk_repair_binding(self) -> Mapping[str, Any]:
+        """Bind a post-bootstrap bytecode repair to the current SDK tree."""
+
+        if (
+            self._release_sha is None
+            or self._launcher_sha256 is None
+            or self._sdk_publication_fingerprint is None
+            or self._publication_intent is None
+        ):
+            raise OwnerLauncherError("trusted_runtime_release_unbound")
+        home = _canonical_owner_home()
+        try:
+            repair_intent = _validate_trusted_sdk_bytecode_repair_intent(
+                _trusted_sdk_bytecode_repair_intent_path(
+                    home,
+                    self._release_sha,
+                ),
+                release_sha=self._release_sha,
+                launcher_sha256=self._launcher_sha256,
+                destination=self._sdk_root,
+                publication_tree=self._sdk_publication_fingerprint,
+                publication_intent=self._publication_intent,
+            )
+            return _validate_trusted_sdk_bytecode_repair_receipt(
+                _trusted_sdk_bytecode_repair_receipt_path(
+                    home,
+                    self._release_sha,
+                ),
+                release_sha=self._release_sha,
+                launcher_sha256=self._launcher_sha256,
+                destination=self._sdk_root,
+                publication_tree=self._sdk_publication_fingerprint,
+                publication_intent=self._publication_intent,
+                sdk_tree=self._sdk_fingerprint,
+                repair_intent_sha256=str(repair_intent["intent_sha256"]),
+            )
+        except OwnerLauncherError:
+            raise OwnerLauncherError(
+                "trusted_runtime_bootstrap_receipt_invalid"
+            ) from None
+
     def _validate_bootstrap_receipt(self) -> tuple[Any, ...]:
         fingerprint, payload = _read_pinned_regular_file(
             self._bootstrap_receipt_path(),
@@ -4671,13 +4712,40 @@ class TrustedGcloudExecutable:
         unsigned.pop("receipt_sha256", None)
         if (
             set(value) != expected_keys
-            or any(value.get(key) != item for key, item in expected.items())
             or type(created) is not int
             or created < 0
             or not isinstance(receipt_sha, str)
             or receipt_sha != _sha256(_canonical_bytes(unsigned))
         ):
             raise OwnerLauncherError("trusted_runtime_bootstrap_receipt_invalid")
+        mismatched = {
+            key for key, item in expected.items() if value.get(key) != item
+        }
+        sdk_tree_fields = {
+            "sdk_tree_entries",
+            "sdk_tree_bytes",
+            "sdk_tree_sha256",
+        }
+        if mismatched - sdk_tree_fields:
+            raise OwnerLauncherError("trusted_runtime_bootstrap_receipt_invalid")
+        if mismatched:
+            repair = self._validate_sdk_repair_binding()
+            original_entries = value.get("sdk_tree_entries")
+            original_bytes = value.get("sdk_tree_bytes")
+            original_sha256 = value.get("sdk_tree_sha256")
+            if (
+                type(original_entries) is not int
+                or type(original_bytes) is not int
+                or not isinstance(original_sha256, str)
+                or _SHA256.fullmatch(original_sha256) is None
+                or original_entries != self._sdk_fingerprint[0]
+                or original_bytes != self._sdk_fingerprint[1]
+                or original_sha256 == self._sdk_fingerprint[2]
+                or int(repair["repaired_at_unix"]) < created
+            ):
+                raise OwnerLauncherError(
+                    "trusted_runtime_bootstrap_receipt_invalid"
+                )
         return fingerprint
 
     def trusted_command_prefix(self) -> tuple[str, ...]:
