@@ -75,3 +75,22 @@ services:
       - CHARTERFORGE_GID=${CHARTERFORGE_GID:-10000}
     # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
     command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+
+  # Optional standalone Founder/CEO supervisor. Use this profile when the
+  # charter sets `runtime_host: "standalone"`; the gateway then remains an
+  # interface/ingress service and does not compete for objective leases.
+  ceo-worker:
+    profiles: ["agentic"]
+    image: charterforge
+    container_name: charterforge-ceo-worker
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    volumes:
+      - ~/.charterforge:/opt/data
+    environment:
+      - CHARTERFORGE_UID=${CHARTERFORGE_UID:-10000}
+      - CHARTERFORGE_GID=${CHARTERFORGE_GID:-10000}
+      - HERMES_HOME=/opt/data
+      - CHARTERFORGE_HOME=/opt/data
+    command: ["objectives", "worker"]

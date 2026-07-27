@@ -42,6 +42,26 @@ The example deliberately starts with a USD 10.00 capital seed, a low-risk
 market capability, and no payment-provider credentials. Replace the charter
 with an advisor-reviewed file before enabling real external systems.
 
+## Compose deployment
+
+The repository's `docker-compose.yml` includes an opt-in `agentic` profile for
+the standalone Founder/CEO supervisor. Set the charter's `runtime_host` to
+`standalone`, bootstrap the mounted `~/.charterforge` state, and then start the
+profile:
+
+```bash
+CHARTERFORGE_UID=$(id -u) CHARTERFORGE_GID=$(id -g) \
+  docker compose --profile agentic up -d --build
+docker compose --profile agentic ps
+docker compose --profile agentic logs --tail=100 ceo-worker
+```
+
+The worker and gateway share the same durable state volume. Runtime leases and
+host policy prevent a gateway worker from competing with this supervisor; do
+not run the profile with a charter that selects `runtime_host: "gateway"`.
+This is a deployment contract, not proof of provider credentials, isolation
+readiness, or production availability.
+
 ## Container smoke contract
 
 The image build and supervised entrypoint were exercised locally on 2026-07-27

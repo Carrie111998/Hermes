@@ -89,6 +89,11 @@ Local artifact installation is also supported after building the package; see
 [packaging](docs/packaging.md) for the verified wheel, CLI, and independent
 installer smoke commands.
 
+For a persistent container deployment, use the documented Compose profile in
+[agentic bootstrap](docs/agentic-bootstrap.md). The `agentic` profile runs the
+standalone Founder/CEO supervisor against the mounted Charterforge state; it
+does not establish production provider or compliance readiness.
+
 Do not use the upstream Hermes installer and assume it installs Charterforge.
 That installer targets the upstream distribution.
 
