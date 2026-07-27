@@ -1338,6 +1338,11 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         # The input itself fits — this is purely an output-cap error, so reduce
         # max_tokens and retry; do NOT compress.
         "range of max_tokens should be" in error_lower
+    ) or (
+        # OpenAI-compatible relays (e.g. DeepSeek, Novita):
+        #   "max_tokens (98304) exceeds model's maximum output tokens (65536)"
+        "exceeds" in error_lower
+        and "maximum output tokens" in error_lower
     )
     if not is_output_cap_error:
         return None
@@ -1350,6 +1355,18 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     )
     if _m_range:
         _cap = int(_m_range.group(1))
+        if _cap >= 1:
+            return _cap
+
+    # OpenAI-compatible relay form: "max_tokens (98304) exceeds model's
+    # maximum output tokens (65536)".  The parenthesised value after
+    # "maximum output tokens" is the provider's real output cap.
+    _m_exceeds = re.search(
+        r'maximum\s+output\s+tokens\s*\(\s*(\d+)\s*\)',
+        error_lower,
+    )
+    if _m_exceeds:
+        _cap = int(_m_exceeds.group(1))
         if _cap >= 1:
             return _cap
 

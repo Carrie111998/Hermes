@@ -85,6 +85,25 @@ class TestParseDashScopeOutputCap:
         assert parse_available_output_tokens_from_error(msg) == 32768
 
 
+class TestParseOpenAICompatibleRelayOutputCap:
+    """OpenAI-compatible relays (e.g. DeepSeek, Novita) reject oversized
+    max_tokens with: 'max_tokens (N) exceeds model's maximum output tokens (M)'."""
+
+    def test_deepseek_exceeds_format(self):
+        msg = ("API call failed after 3 retries: [400]: max_tokens (98304) "
+               "exceeds model's maximum output tokens (65536) for model "
+               "deepseek-v4-flash")
+        assert parse_available_output_tokens_from_error(msg) == 65536
+
+    def test_exceeds_format_case_insensitive(self):
+        msg = "Max_Tokens (100000) EXCEEDS Model's Maximum Output Tokens (32768)"
+        assert parse_available_output_tokens_from_error(msg) == 32768
+
+    def test_exceeds_format_small_cap(self):
+        msg = "max_tokens (9999) exceeds model's maximum output tokens (4096)"
+        assert parse_available_output_tokens_from_error(msg) == 4096
+
+
 class TestIsOutputCapError:
     """`is_output_cap_error` is the broader yes/no gate that keeps an
     output-cap 400 out of the compression death-loop even when we can't parse
