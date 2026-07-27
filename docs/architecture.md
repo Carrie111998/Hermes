@@ -44,6 +44,9 @@ employee, so an older positive decision cannot bypass intervening budget use.
 SQLite is the implemented authority store in this checkout. Postgres and an
 external event broker remain future deployment work; documentation must not
 describe them as present.
+Authority connections use WAL, foreign-key enforcement, a 30-second busy
+timeout, and `synchronous=FULL` for durable commits and bounded concurrent
+worker coordination.
 
 ## State boundaries
 

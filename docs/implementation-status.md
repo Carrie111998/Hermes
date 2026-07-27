@@ -42,6 +42,8 @@
 ## Partial
 
 - The authority store is SQLite, not Postgres.
+- Authority SQLite connections enforce foreign keys, WAL, full synchronous
+  durability, and a bounded busy timeout.
 - Event scheduling is implemented in-process; Kafka/RabbitMQ are not bundled.
 - The inherited UI and internal code still contain legacy identifiers where
   changing them would break migration or require a separate subsystem rewrite.

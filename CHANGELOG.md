@@ -51,6 +51,8 @@ Hermes Agent history remains available in Git.
   from being reactivated by late events.
 - Durable inbox claims now apply the same terminal-objective fence to internal
   worker, compliance, and maintenance events.
+- Authority-store connections now explicitly use full synchronous durability
+  and a bounded busy timeout alongside WAL and foreign-key enforcement.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.

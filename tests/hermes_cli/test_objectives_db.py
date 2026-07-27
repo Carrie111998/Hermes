@@ -69,6 +69,13 @@ def test_objective_completion_is_fail_closed_without_verification(conn):
     assert verified.status == "verified"
 
 
+def test_authority_store_uses_durable_and_concurrent_safe_pragmas(conn):
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 30_000
+
+
 def test_replan_invalidates_older_passing_verification(conn):
     objective = _accepted_objective(conn)
     plan_v1 = odb.create_plan(
