@@ -47,6 +47,8 @@ Hermes Agent history remains available in Git.
   organization-owned jurisdiction-matched tax rule and record the gross intent.
 - External subscriptions now skip terminal objectives, preventing stale goals
   from being reactivated by late events.
+- Durable inbox claims now apply the same terminal-objective fence to internal
+  worker, compliance, and maintenance events.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.

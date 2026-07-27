@@ -253,6 +253,30 @@ def test_permit_consumption_rejects_stale_policy_version(conn):
         )
 
 
+def test_claim_skips_events_for_terminal_objectives(conn):
+    objective = _accepted_objective(conn)
+    plan_id = odb.create_plan(
+        conn, objective.id, assumptions=[], tasks=[], dependencies=[], risks=[], created_by="ceo"
+    )
+    odb.transition_objective(conn, objective.id, "planned", actor="ceo")
+    odb.transition_objective(conn, objective.id, "authorized", actor="ceo")
+    odb.transition_objective(conn, objective.id, "executing", actor="ceo")
+    odb.transition_objective(conn, objective.id, "completed", actor="ceo")
+    odb.record_verification(
+        conn, objective_id=objective.id, plan_id=plan_id, verifier="test",
+        method="fixture", verdict="pass",
+        evidence=verification_evidence.build(
+            observer="test", source_kind="deterministic_check",
+            source_reference="fixture", facts={"ok": True},
+        ),
+    )
+    odb.transition_objective(conn, objective.id, "verified", actor="ceo")
+    odb.enqueue_objective_event(
+        conn, objective_id=objective.id, event_type="late.event", payload={}
+    )
+    assert odb.claim_objective_event(conn, runtime_id="runtime") is None
+
+
 def test_expired_objective_cannot_continue(conn):
     objective = odb.create_objective(
         conn,

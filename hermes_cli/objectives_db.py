@@ -44,6 +44,10 @@ OBJECTIVE_STATUSES = frozenset(
     }
 )
 
+TERMINAL_OBJECTIVE_STATUSES = (
+    "closed", "cancelled", "expired", "abandoned", "superseded", "verified",
+)
+
 _TRANSITIONS = {
     "proposed": {"accepted", "cancelled", "expired", "superseded"},
     "accepted": {"planned", "cancelled", "expired", "superseded"},
@@ -1430,6 +1434,7 @@ def claim_objective_event(
         params: list[Any] = [ts]
         if organization_id is not None:
             params.append(organization_id)
+        params.extend(TERMINAL_OBJECTIVE_STATUSES)
         params.extend((ts, ts, ts, ts))
         row = conn.execute(
             f"""
@@ -1437,6 +1442,7 @@ def claim_objective_event(
             JOIN objectives AS objective ON objective.id = inbox.objective_id
              WHERE inbox.available_at <= ?
                {organization_clause}
+               AND objective.status NOT IN ({','.join('?' for _ in TERMINAL_OBJECTIVE_STATUSES)})
                AND (
                     inbox.status = 'pending'
                     OR (

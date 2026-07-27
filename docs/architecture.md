@@ -51,6 +51,8 @@ read-back or deterministic verification.
 External subscriptions and schedules join the objective lifecycle before
 emitting wake events. Terminal objectives are never reactivated by late
 external deliveries or missed schedule intervals.
+The durable inbox claim query applies the same terminal-state fence to all
+internal events, including worker, compliance, and maintenance emissions.
 
 Housekeeping repairs a narrowly defined failure window: if an accepted or
 planned objective has no pending or processing inbox event, it emits one
