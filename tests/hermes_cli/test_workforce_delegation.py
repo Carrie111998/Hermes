@@ -194,6 +194,57 @@ def test_grant_must_match_explicit_subordinate_contract(tmp_path, monkeypatch):
     assert row["worker_resource_scope_json"] == (
         '{"system":"web","target_resource":"/tmp/allowed-evidence.txt"}'
     )
+
+    # The worker permit is an operation-and-resource capability, not a broad
+    # mandate.  Prove the concrete boundary at the live tool authorization
+    # chokepoint: the exact read is allowed, a sibling resource is not, and a
+    # write cannot be inferred from a read grant.
+    board_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board_path))
+    scope = workforce_delegation.worker_scope(conn, grant_id)
+    with kanban_db.connect_closing() as board:
+        task_id = kanban_db.create_task(
+            board,
+            title="Interview synthesis",
+            body=scope
+            + "\n\n## Assigned work\n"
+            + "Summarize independently sourced customer evidence.",
+            assignee="ada-research",
+            tenant=ids[0],
+            execution_contract_id=grant_id,
+        )
+    workforce_delegation.bind_task(
+        conn, grant_id=grant_id, task_id=task_id, board="default"
+    )
+    monkeypatch.setenv("HERMES_EXECUTION_CONTRACT_ID", grant_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv(
+        "HERMES_BUSINESS_AUTHORITY_DB", str(tmp_path / "hermes" / "objectives.db")
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "ada-research")
+
+    workforce_delegation.authorize_worker_action(
+        capability="web.read",
+        system="web",
+        target_resource="/tmp/allowed-evidence.txt",
+    )
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="resource exceeds"
+    ):
+        workforce_delegation.authorize_worker_action(
+            capability="web.read",
+            system="web",
+            target_resource="/tmp/not-allowed-evidence.txt",
+        )
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="capability .* not granted"
+    ):
+        workforce_delegation.authorize_worker_action(
+            capability="file.write",
+            system="web",
+            target_resource="/tmp/allowed-evidence.txt",
+        )
+
     with pytest.raises(
         workforce_delegation.DelegationError,
         match="skill does not match the immutable delegation contract",
