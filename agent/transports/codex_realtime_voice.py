@@ -302,7 +302,9 @@ class AiortcRealtimePeer:
         except Exception as exc:
             # MediaStreamError is the normal remote-track EOF during teardown.
             # Outside teardown it means speech output is gone, so fail over.
-            logger.debug("Codex realtime remote audio ended: %s", exc)
+            logger.debug(
+                "Codex realtime remote audio ended: %s", safe_realtime_error(exc)
+            )
             if not self._closing:
                 self._notify_failure("WebRTC remote audio ended")
 
@@ -722,15 +724,13 @@ class CodexRealtimeSession:
             )
         self._speech_generation += 1
         generation = self._speech_generation
-        self._speech_gate = True
-        self._speech_started_at = time.monotonic()
-        self._speech_last_pcm_at = None
-        # Fail closed if WebRTC output never starts or never becomes idle.
-        gate_timeout = min(180.0, max(10.0, len(cleaned) / 8.0))
+        # Do not trust any remote PCM until app-server has accepted this exact
+        # Hermes-authored speech request. Opening the gate before the JSON-RPC
+        # acknowledgement can expose delayed or unsolicited provider audio.
+        self._speech_gate = False
         self._cancel_speech_watchdog()
-        self._speech_watchdog_task = asyncio.create_task(
-            self._watch_speech_gate(generation, gate_timeout)
-        )
+        self._speech_started_at = None
+        self._speech_last_pcm_at = None
         try:
             await asyncio.to_thread(
                 self._client.request,
@@ -739,10 +739,23 @@ class CodexRealtimeSession:
                 15,
             )
         except Exception as exc:
-            self._speech_gate = False
-            self._fail(f"Codex realtime speech failed: {exc}")
+            safe_reason = safe_realtime_error(f"Codex realtime speech failed: {exc}")
+            self._fail(safe_reason)
             self._schedule_stop()
-            raise
+            raise CodexRealtimeUnavailable(safe_reason) from None
+        if not self._active:
+            return False
+        if generation != self._speech_generation:
+            raise CodexRealtimeStaleSpeech(
+                "Hermes reply was superseded while realtime speech was starting"
+            )
+        self._speech_gate = True
+        self._speech_started_at = time.monotonic()
+        # Fail closed if WebRTC output never starts or never becomes idle.
+        gate_timeout = min(180.0, max(10.0, len(cleaned) / 8.0))
+        self._speech_watchdog_task = asyncio.create_task(
+            self._watch_speech_gate(generation, gate_timeout)
+        )
         return True
 
     async def stop(self) -> None:
@@ -770,8 +783,11 @@ class CodexRealtimeSession:
                         {"threadId": self._thread_id},
                         10,
                     )
-                except Exception:
-                    logger.debug("Codex realtime stop request failed", exc_info=True)
+                except Exception as exc:
+                    logger.debug(
+                        "Codex realtime stop request failed: %s",
+                        safe_realtime_error(exc),
+                    )
             await self._close_resources()
 
     async def _close_resources(self) -> None:
@@ -783,10 +799,16 @@ class CodexRealtimeSession:
         if peer is not None:
             try:
                 await peer.close()
-            except Exception:
-                logger.debug("Codex realtime WebRTC close failed", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Codex realtime WebRTC close failed: %s",
+                    safe_realtime_error(exc),
+                )
         if client is not None:
             try:
                 await asyncio.to_thread(client.close)
-            except Exception:
-                logger.debug("Codex realtime app-server close failed", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Codex realtime app-server close failed: %s",
+                    safe_realtime_error(exc),
+                )

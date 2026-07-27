@@ -15986,6 +15986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 from agent.transports.codex_realtime_voice import (
                     CodexRealtimeStaleSpeech,
+                    safe_realtime_error,
                 )
 
                 fallback_to_classic = realtime_manager.classic_fallback_enabled(
@@ -16013,15 +16014,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Suppressing stale Codex realtime voice reply after barge-in"
                     )
                     return
-                except Exception:
+                except Exception as exc:
                     logger.warning(
-                        "Codex realtime speech failed (%s)",
+                        "Codex realtime speech failed (%s): %s",
                         (
                             "using classic TTS fallback"
                             if fallback_to_classic
                             else "classic TTS fallback disabled"
                         ),
-                        exc_info=True,
+                        safe_realtime_error(exc),
                     )
                 if not fallback_to_classic:
                     return

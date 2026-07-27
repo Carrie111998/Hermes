@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import threading
 
 import numpy as np
 import pytest
@@ -392,14 +393,74 @@ async def test_remote_close_reports_failure_and_closes_resources():
 
 
 @pytest.mark.asyncio
-async def test_append_speech_failure_reports_provider_failure_and_closes():
-    class BrokenSpeechClient(FakeClient):
+async def test_append_speech_drops_pcm_until_request_is_acknowledged():
+    class BlockingSpeechClient(FakeClient):
+        def __init__(self, notifications):
+            super().__init__(notifications)
+            self.append_started = threading.Event()
+            self.release_append = threading.Event()
+
         def request(self, method: str, params: dict, timeout: float = 30.0):
             if method == "thread/realtime/appendSpeech":
-                raise RuntimeError("speech backend unavailable")
+                self.append_started.set()
+                self.release_append.wait(timeout=5.0)
+            return super().request(method, params, timeout)
+
+    pcm_out: list[bytes] = []
+    client = BlockingSpeechClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v3"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "answer"},
+        },
+    ])
+    peer = FakePeer()
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        client_factory=lambda **kwargs: client,
+        peer_factory=lambda: peer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+        on_output_pcm=pcm_out.append,
+    )
+    await session.start()
+
+    append_task = asyncio.create_task(session.append_speech("Hermes antwoord"))
+    assert await asyncio.to_thread(client.append_started.wait, 5.0)
+    assert peer.on_pcm is not None
+    peer.on_pcm(b"pre-ack")
+    pcm_before_ack = list(pcm_out)
+    client.release_append.set()
+    assert await append_task is True
+
+    assert pcm_before_ack == []
+    peer.on_pcm(b"accepted")
+    assert pcm_out == [b"accepted"]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_append_speech_failure_reports_provider_failure_and_closes():
+    class BrokenSpeechClient(FakeClient):
+        def __init__(self, notifications):
+            super().__init__(notifications)
+            self.append_started = threading.Event()
+            self.release_append = threading.Event()
+
+        def request(self, method: str, params: dict, timeout: float = 30.0):
+            if method == "thread/realtime/appendSpeech":
+                self.append_started.set()
+                self.release_append.wait(timeout=5.0)
+                raise RuntimeError(
+                    "speech backend unavailable at "
+                    "https://user:secret@example.test/realtime, request id: deadbeef"
+                )
             return super().request(method, params, timeout)
 
     errors: list[str] = []
+    pcm_out: list[bytes] = []
     client = BrokenSpeechClient([
         {
             "method": "thread/realtime/started",
@@ -416,18 +477,67 @@ async def test_append_speech_failure_reports_provider_failure_and_closes():
         client_factory=lambda **kwargs: client,
         peer_factory=lambda: peer,
         binary_checker=lambda *_args: (True, "0.145.0"),
+        on_output_pcm=pcm_out.append,
         on_error=errors.append,
     )
     await session.start()
 
+    append_task = asyncio.create_task(session.append_speech("Hermes antwoord"))
+    assert await asyncio.to_thread(client.append_started.wait, 5.0)
+    assert peer.on_pcm is not None
+    peer.on_pcm(b"pre-failure")
+    pcm_before_failure = list(pcm_out)
+    client.release_append.set()
     with pytest.raises(RuntimeError, match="speech backend unavailable"):
-        await session.append_speech("Hermes antwoord")
+        await append_task
     await asyncio.sleep(0.05)
 
+    assert pcm_before_failure == []
+    assert pcm_out == []
     assert session.active is False
-    assert errors == ["Codex realtime speech failed: speech backend unavailable"]
+    assert len(errors) == 1
+    assert "speech backend unavailable" in errors[0]
+    assert "secret" not in errors[0]
+    assert "deadbeef" not in errors[0]
     assert peer.closed is True
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stop_request_failure_logs_only_sanitized_metadata(caplog):
+    class BrokenStopClient(FakeClient):
+        def request(self, method: str, params: dict, timeout: float = 30.0):
+            if method == "thread/realtime/stop":
+                raise RuntimeError(
+                    "stop failed at https://user:secret@example.test/realtime, "
+                    "request id: deadbeef"
+                )
+            return super().request(method, params, timeout)
+
+    client = BrokenStopClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v3"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "answer"},
+        },
+    ])
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        client_factory=lambda **kwargs: client,
+        peer_factory=FakePeer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+    )
+    await session.start()
+    caplog.set_level("DEBUG", logger="agent.transports.codex_realtime_voice")
+
+    await session.stop()
+
+    assert "stop failed" in caplog.text
+    assert "secret" not in caplog.text
+    assert "deadbeef" not in caplog.text
 
 
 @pytest.mark.asyncio

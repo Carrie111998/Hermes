@@ -505,7 +505,7 @@ class TestSendVoiceReply:
 
     @pytest.mark.asyncio
     async def test_realtime_speech_failure_stays_silent_when_classic_fallback_is_disabled(
-        self, runner
+        self, runner, caplog
     ):
         from gateway.config import Platform
 
@@ -518,7 +518,12 @@ class TestSendVoiceReply:
         manager = MagicMock()
         manager.is_active.return_value = True
         manager.classic_fallback_enabled.return_value = False
-        manager.append_speech = AsyncMock(side_effect=RuntimeError("speech failed"))
+        manager.append_speech = AsyncMock(
+            side_effect=RuntimeError(
+                "speech failed at https://user:secret@example.test/realtime, "
+                "request id: deadbeef"
+            )
+        )
         runner._codex_realtime_voice = manager
 
         with patch("tools.tts_tool.text_to_speech_tool") as local_tts:
@@ -528,6 +533,8 @@ class TestSendVoiceReply:
             adapter, 111, "Hoi Maikel", transcript_generation=None
         )
         local_tts.assert_not_called()
+        assert "secret" not in caplog.text
+        assert "deadbeef" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_removed_no_fallback_realtime_session_does_not_leak_local_tts(
