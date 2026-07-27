@@ -1,10 +1,12 @@
 import argparse
 import json
 import sqlite3
+import time
 
 import pytest
 
 from hermes_cli import business
+from hermes_cli import compliance_db
 
 
 def _parser():
@@ -185,3 +187,66 @@ def test_business_readiness_blocks_declared_payments_without_ready_rail(monkeypa
         "payment_rail_unavailable",
         "payment_provider_assessment_missing",
     ]
+
+
+def test_business_readiness_rejects_assessment_for_different_ready_rail(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.payments.payment_rail_status",
+        lambda: {
+            "inbound": [{
+                "name": "stripe",
+                "rail_name": "stripe",
+                "available": True,
+            }],
+            "outbound": [],
+        },
+    )
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    compliance_db.configure_profile(
+        conn,
+        organization_id="org-payments",
+        legal_entity_type="corporation",
+        home_jurisdiction="CA-ON",
+    )
+    compliance_db.verify_payment_provider(
+        conn,
+        organization_id="org-payments",
+        provider="different-rail",
+        direction="inbound",
+        jurisdiction="GLOBAL",
+        registry_authority="test-registry",
+        registry_reference="different-rail-inbound",
+        aml_screening_delegated=True,
+        sanctions_screening_delegated=True,
+        verified_at=int(time.time()) - 1,
+        expires_at=int(time.time()) + 3600,
+        evidence={"test": True},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agentic": {"allowed_capabilities": ["payments.receive"]}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.business_security.evaluate_security_readiness",
+        lambda _config: type("Readiness", (), {"ready": True, "violations": ()})(),
+    )
+    monkeypatch.setattr(
+        business,
+        "build_business_snapshot",
+        lambda _conn: {
+            "configured": True,
+            "organization": {"id": "org-payments"},
+            "autonomy": {"mode": "autonomous"},
+            "runtime_deployment": {"ready": False},
+            "runtime_drift": {"blocked": False},
+            "interventions": [],
+        },
+    )
+    readiness = business.build_business_readiness(conn)
+    assessment_blocker = next(
+        item for item in readiness["blockers"]
+        if item["code"] == "payment_provider_assessment_missing"
+    )
+    assert assessment_blocker["available_providers"] == ["stripe"]
+    assert assessment_blocker["assessed_providers"] == ["different-rail"]

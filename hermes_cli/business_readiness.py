@@ -112,6 +112,11 @@ def payment_findings(
         )
     for direction in sorted(directions):
         available = [item for item in rails.get(direction, []) if item.get("available")]
+        available_providers = {
+            str(item.get("rail_name") or item.get("name") or "").strip()
+            for item in available
+            if str(item.get("rail_name") or item.get("name") or "").strip()
+        }
         if not available:
             findings.append(
                 ReadinessFinding(
@@ -120,19 +125,32 @@ def payment_findings(
                     {"direction": direction, "discovered": rails.get(direction, [])},
                 )
             )
-        assessed = conn.execute(
-            """SELECT 1 FROM payment_provider_assessments
+        assessed_rows = conn.execute(
+            """SELECT provider FROM payment_provider_assessments
                WHERE organization_id=? AND direction=? AND status='verified'
                  AND expires_at>? AND aml_screening_delegated=1
-                 AND sanctions_screening_delegated=1 LIMIT 1""",
+                 AND sanctions_screening_delegated=1""",
             (organization_id, direction, int(time.time())),
-        ).fetchone()
-        if assessed is None:
+        ).fetchall()
+        assessed_providers = {
+            str(row["provider"]).strip()
+            for row in assessed_rows
+            if str(row["provider"]).strip()
+        }
+        provider_match = (
+            not available_providers
+            or bool(available_providers & assessed_providers)
+        )
+        if not assessed_rows or not provider_match:
             findings.append(
                 ReadinessFinding(
                     "payment_provider_assessment_missing",
                     f"No current screened provider assessment exists for {direction} payments",
-                    {"direction": direction},
+                    {
+                        "direction": direction,
+                        "available_providers": sorted(available_providers),
+                        "assessed_providers": sorted(assessed_providers),
+                    },
                 )
             )
     return findings

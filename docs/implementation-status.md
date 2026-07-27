@@ -148,6 +148,9 @@ acceptance evidence.
   admission; only currently valid assessments can enter the authorization set.
 - Provider assessments require non-empty auditable provider, jurisdiction, and
   registry-reference fields before entering the authorization set.
+- Payment readiness binds a screened assessment to the credential-ready rail
+  discovered for the declared direction; an assessment for a different
+  provider cannot certify that rail.
 - Standalone workers enforce the configured deployment role and live worker
   registration even when an embedding supplies a callback; callback injection
   cannot bypass supervised-host boundaries.
