@@ -38,6 +38,25 @@ from tools.delegate_tool import (
 )
 
 
+def test_governed_delegate_task_requires_exact_workforce_permit(monkeypatch):
+    calls = []
+
+    def reject(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+        raise RuntimeError("delegation authority denied")
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", reject
+    )
+    monkeypatch.setenv("HERMES_EXECUTION_CONTRACT_ID", "grant-1")
+
+    result = json.loads(delegate_task(goal="bounded child work", parent_agent=object()))
+
+    assert "governed delegation authorization denied" in result["error"]
+    assert calls[0][0:2] == ("work.delegate", "delegation")
+    assert calls[0][2].startswith("delegation-goal:")
+
+
 def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
     parent = MagicMock()

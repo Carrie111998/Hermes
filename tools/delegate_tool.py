@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import hashlib
 import json
 import logging
 
@@ -2454,6 +2455,38 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    # Governed workforce employees must use an immutable task grant for
+    # delegation. The legacy conversational fan-out path only intersects
+    # toolsets; allowing it inside a worker contract could create a child with
+    # authority that was never recorded in the company hierarchy. Bind the
+    # permit to the exact requested delegation payload so it cannot be reused
+    # for another objective.
+    if str(os.environ.get("HERMES_EXECUTION_CONTRACT_ID") or "").strip():
+        payload = {
+            "goal": goal,
+            "context": context,
+            "tasks": tasks,
+            "role": role,
+        }
+        delegation_resource = (
+            "delegation-goal:"
+            + hashlib.sha256(
+                json.dumps(
+                    payload, sort_keys=True, separators=(",", ":"), default=str
+                ).encode()
+            ).hexdigest()
+        )
+        from hermes_cli.workforce_delegation import authorize_worker_action
+
+        try:
+            authorize_worker_action(
+                capability="work.delegate",
+                system="delegation",
+                target_resource=delegation_resource,
+            )
+        except Exception as exc:
+            return tool_error(f"governed delegation authorization denied: {exc}")
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
