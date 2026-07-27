@@ -60,10 +60,10 @@ export function modelOptionsQueryKey(profile: null | string | undefined, session
   return ['model-options', profileKey, sessionId || 'global'] as const
 }
 
-function modelOptionsCacheEntryKey(profile: null | string | undefined, sessionId?: null | string): string {
+function modelOptionsCacheEntryKey(profile: null | string | undefined): string {
   const profileKey = (profile ?? '').trim() || 'default'
 
-  return `${profileKey}:${sessionId || 'global'}`
+  return profileKey
 }
 
 /**
@@ -82,7 +82,8 @@ export function readModelOptionsCache(
       return undefined
     }
 
-    const entry = (JSON.parse(raw) as ModelOptionsCache)[modelOptionsCacheEntryKey(profile, sessionId)]
+    const cache = JSON.parse(raw) as ModelOptionsCache
+    const entry = cache[modelOptionsCacheEntryKey(profile)] ?? cache[`${modelOptionsCacheEntryKey(profile)}:global`]
 
     if (!entry || !Array.isArray(entry.data?.providers) || !Number.isFinite(entry.updatedAt)) {
       return undefined
@@ -103,7 +104,7 @@ export function writeModelOptionsCache(
   try {
     const raw = localStorage.getItem(MODEL_OPTIONS_CACHE_KEY)
     const cache: ModelOptionsCache = raw ? (JSON.parse(raw) as ModelOptionsCache) : {}
-    const key = modelOptionsCacheEntryKey(profile, sessionId)
+    const key = modelOptionsCacheEntryKey(profile)
     cache[key] = { data, updatedAt: Date.now() }
 
     const recent = Object.entries(cache)
