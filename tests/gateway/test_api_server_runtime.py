@@ -311,6 +311,21 @@ async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_conte
             return None
 
         async def _run_agent_bridge(self, **kwargs):
+            agent = SimpleNamespace(
+                tools=[],
+                valid_tool_names=set(),
+                model="configured-model",
+                _primary_runtime={
+                    "model": "configured-model",
+                    "compressor_model": "configured-model",
+                },
+                _fallback_chain=[],
+                _fallback_model=None,
+                _fallback_index=0,
+                _fallback_activated=False,
+            )
+            kwargs["agent_configurator"](agent)
+            captured["force_native_vision"] = agent._runtime_force_native_vision
             captured["user_message"] = kwargs["user_message"]
             return {"final_response": "seen"}, {"total_tokens": 1}
 
@@ -354,6 +369,7 @@ async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_conte
         assert isinstance(content, list)
         assert content[0] == {"type": "text", "text": "describe it"}
         assert content[-1]["image_url"]["url"] == f"data:image/png;base64,{encoded}"
+        assert captured["force_native_vision"] is True
     finally:
         await client.close()
 

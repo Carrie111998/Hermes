@@ -139,6 +139,14 @@ class TestPrepareMessagesForNonVision:
 
 
 class TestModelSupportsVision:
+    def test_trusted_runtime_attachment_forces_native_vision(self):
+        agent = _make_agent()
+        agent.provider = "custom"
+        agent.model = "xai/grok-4.5"
+        agent._runtime_force_native_vision = True
+        with patch("agent.models_dev.get_model_capabilities", return_value=None):
+            assert agent._model_supports_vision() is True
+
     def test_missing_provider_or_model_returns_false(self):
         agent = _make_agent()
         agent.provider = ""

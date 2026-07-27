@@ -947,6 +947,10 @@ class APIServerRuntimeMixin:
             if len(normalized_messages) != len(messages):
                 raise ValueError("messages must contain only objects")
             attachments = body.get("attachments")
+            has_image_attachment = any(
+                isinstance(item, dict) and item.get("media_type") == "image"
+                for item in (attachments if isinstance(attachments, list) else [])
+            )
             has_video_attachment = any(
                 isinstance(item, dict) and item.get("media_type") == "video"
                 for item in (attachments if isinstance(attachments, list) else [])
@@ -1033,6 +1037,11 @@ class APIServerRuntimeMixin:
             agent._cached_system_prompt = instructions
             agent._build_system_prompt = lambda _system_message=None: instructions
             agent._resume_from_tool_results = resuming
+            # The Orchestrator already validated and materialized these image
+            # assets. Its model catalog can lag newly deployed multimodal
+            # aliases, so do not replace trusted pixels with an auxiliary
+            # vision description merely because models.dev lacks the alias.
+            agent._runtime_force_native_vision = has_image_attachment
             # Runtime bridge runs park on media generation for well over the
             # default 5m prompt-cache TTL, so a resume repays the full 13-14k
             # token system prefix at uncached price. Pin the 1h tier (the

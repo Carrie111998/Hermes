@@ -4534,6 +4534,8 @@ class AIAgent:
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
         """
+        if getattr(self, "_runtime_force_native_vision", False):
+            return True
         try:
             from hermes_cli.config import load_config
             from agent.image_routing import _lookup_supports_vision
