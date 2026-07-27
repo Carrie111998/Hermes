@@ -6351,6 +6351,7 @@ class TestCompressionFallbackContextFilter:
             "L3 bug: main chain returned the first reachable candidate "
             "without screening by context window.")
         assert model == "huge-1m"
+        assert label == "fallback_providers[1](p-large)"
 
     # ── L4: unknown context passthrough ────────────────────────────────
 
@@ -6625,3 +6626,78 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+class TestRichFallbackRouteHeaders:
+    def test_sync_candidate_applies_and_merges_route_headers(self):
+        import agent.auxiliary_client as ac
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        client = MagicMock()
+        client.base_url = "https://fallback.example/v1"
+        client.chat.completions.create.return_value = response
+        route = {"extra_headers": {"X-Route": "fallback"}}
+
+        with patch.object(ac, "_fallback_entry_settings", return_value=route), patch.object(
+            ac,
+            "_build_call_kwargs",
+            return_value={"extra_headers": {"X-Base": "base"}},
+        ):
+            result = ac._call_fallback_candidate_sync(
+                client,
+                "fallback-model",
+                "fallback_providers[0](custom)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=0.2,
+                max_tokens=100,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is response
+        assert client.chat.completions.create.call_args.kwargs["extra_headers"] == {
+            "X-Base": "base",
+            "X-Route": "fallback",
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_candidate_applies_and_merges_route_headers(self):
+        import agent.auxiliary_client as ac
+
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        client = MagicMock()
+        client.base_url = "https://fallback.example/v1"
+        client.chat.completions.create = AsyncMock(return_value=response)
+        route = {"extra_headers": {"X-Route": "fallback"}}
+
+        with patch.object(ac, "_fallback_entry_settings", return_value=route), patch.object(
+            ac,
+            "_build_call_kwargs",
+            return_value={"extra_headers": {"X-Base": "base"}},
+        ):
+            result = await ac._call_fallback_candidate_async(
+                client,
+                "fallback-model",
+                "fallback_providers[0](custom)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=0.2,
+                max_tokens=100,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is response
+        assert client.chat.completions.create.call_args.kwargs["extra_headers"] == {
+            "X-Base": "base",
+            "X-Route": "fallback",
+        }

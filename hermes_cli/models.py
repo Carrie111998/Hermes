@@ -3377,22 +3377,41 @@ def ensure_lmstudio_model_loaded(
     api_key: Optional[str],
     target_context_length: int,
     timeout: float = 120.0,
+    *,
+    transition_policy: Optional[str] = None,
+    require_context_minimum: bool = False,
 ) -> Optional[int]:
-    """Ensure LM Studio has ``model`` loaded with at least ``target_context_length``.
+    """Ensure LM Studio has ``model`` loaded at the required context length.
 
-    No-op when an instance is already loaded with sufficient context. Otherwise
-    POSTs ``/api/v1/models/load`` to (re)load with the target context, capped
-    at the model's ``max_context_length``. Returns the resolved loaded context
-    length, or ``None`` when the probe / load failed.
+    ``transition_policy="sequential"`` is an explicit opt-in for memory-bound
+    hosts: loaded LLM instances are unloaded through LM Studio's documented
+    ``POST /api/v1/models/unload`` endpoint before the target is loaded. Loaded
+    embedding models are unrelated and are never evicted. Unload requests use a
+    short bounded timeout; model loads retain the caller's longer bounded timeout.
+
+    Existing callers retain the historical best-effort behavior: context is
+    clamped to the model maximum and older servers need not echo load config.
+    Rich fallback routes set ``require_context_minimum`` (and sequential routes
+    imply it), making the configured context a verified minimum contract.
     """
     server_root = _lmstudio_server_root(base_url)
     if not server_root:
         return None
+    if isinstance(target_context_length, bool) or target_context_length <= 0:
+        raise ValueError("target_context_length must be a positive integer")
+
+    policy = str(transition_policy or "").strip().lower()
+    if policy not in {"", "sequential"}:
+        raise ValueError(f"Unsupported LM Studio model transition policy: {transition_policy!r}")
+    strict_context = require_context_minimum or policy == "sequential"
 
     headers = _lmstudio_request_headers(api_key)
-
     try:
-        raw_models = _lmstudio_fetch_raw_models(api_key=api_key, base_url=base_url, timeout=10)
+        raw_models = _lmstudio_fetch_raw_models(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=min(10.0, max(1.0, timeout)),
+        )
     except Exception:
         raw_models = None
     if raw_models is None:
@@ -3410,18 +3429,79 @@ def ensure_lmstudio_model_loaded(
 
     max_ctx = target_entry.get("max_context_length")
     if isinstance(max_ctx, int) and max_ctx > 0:
+        if strict_context and max_ctx < target_context_length:
+            raise RuntimeError(
+                f"LM Studio model {model!r} supports at most {max_ctx:,} context tokens; "
+                f"the fallback route requires {target_context_length:,}"
+            )
         target_context_length = min(target_context_length, max_ctx)
 
+    loaded_contexts: list[int] = []
     for inst in target_entry.get("loaded_instances") or []:
         cfg = inst.get("config") if isinstance(inst, dict) else None
         loaded_ctx = cfg.get("context_length") if isinstance(cfg, dict) else None
-        if isinstance(loaded_ctx, int) and loaded_ctx >= target_context_length:
-            return loaded_ctx
+        if isinstance(loaded_ctx, int):
+            loaded_contexts.append(loaded_ctx)
+    sufficient_loaded_context = next(
+        (value for value in loaded_contexts if value >= target_context_length),
+        None,
+    )
 
-    body = json.dumps({
+    if policy == "sequential":
+        unload_headers = dict(headers)
+        unload_headers["Content-Type"] = "application/json"
+        unload_timeout = min(30.0, max(1.0, float(timeout)))
+        conflicting_instances: list[str] = []
+        for raw in raw_models:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("type") or "").strip().lower() == "embedding":
+                continue
+            raw_is_target = raw is target_entry
+            if raw_is_target and sufficient_loaded_context is not None:
+                continue
+            for inst in raw.get("loaded_instances") or []:
+                if not isinstance(inst, dict):
+                    continue
+                instance_id = str(inst.get("id") or inst.get("instance_id") or "").strip()
+                if instance_id and instance_id not in conflicting_instances:
+                    conflicting_instances.append(instance_id)
+
+        for instance_id in conflicting_instances:
+            unload_request = urllib.request.Request(
+                server_root + "/api/v1/models/unload",
+                data=json.dumps({"instance_id": instance_id}).encode(),
+                headers=unload_headers,
+                method="POST",
+            )
+            try:
+                with _urlopen_model_catalog_request(
+                    unload_request,
+                    timeout=unload_timeout,
+                ) as resp:
+                    resp.read()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"LM Studio failed to unload conflicting model instance "
+                    f"{instance_id!r} before loading {model!r}: {exc}"
+                ) from exc
+
+    if sufficient_loaded_context is not None:
+        return sufficient_loaded_context
+
+    load_payload: dict[str, Any] = {
         "model": model,
         "context_length": target_context_length,
-    }).encode()
+    }
+    if strict_context:
+        load_payload["echo_load_config"] = True
+    if policy == "sequential":
+        # LM Studio's native API otherwise defaults to parallel=4, unlike the
+        # CLI's historical default of one prediction. Sequential fallback is
+        # explicitly the memory-bounded policy, so keep both model residency
+        # and KV-cache concurrency bounded.
+        load_payload["parallel"] = 1
+    body = json.dumps(load_payload).encode()
     load_headers = dict(headers)
     load_headers["Content-Type"] = "application/json"
     try:
@@ -3432,10 +3512,31 @@ def ensure_lmstudio_model_loaded(
             method="POST",
         )
         with _urlopen_model_catalog_request(load_request, timeout=timeout) as resp:
-            resp.read()
-    except Exception:
+            response_body = resp.read()
+            payload = json.loads(response_body.decode() or "{}") if strict_context else {}
+    except Exception as exc:
+        if policy == "sequential":
+            raise RuntimeError(f"LM Studio failed to load model {model!r}: {exc}") from exc
         return None
-    return target_context_length
+
+    load_config = payload.get("load_config") if isinstance(payload, dict) else None
+    loaded_context = load_config.get("context_length") if isinstance(load_config, dict) else None
+    if not strict_context:
+        return target_context_length
+    if not isinstance(loaded_context, int) or loaded_context < target_context_length:
+        reported = loaded_context if isinstance(loaded_context, int) else "unknown"
+        raise RuntimeError(
+            f"LM Studio loaded {model!r} with context {reported}, below the "
+            f"required {target_context_length:,}"
+        )
+    if policy == "sequential":
+        loaded_parallel = load_config.get("parallel") if isinstance(load_config, dict) else None
+        if loaded_parallel != 1:
+            raise RuntimeError(
+                f"LM Studio loaded {model!r} with parallel={loaded_parallel!r}; "
+                "sequential fallback requires parallel=1"
+            )
+    return loaded_context
 
 
 def lmstudio_model_reasoning_options(

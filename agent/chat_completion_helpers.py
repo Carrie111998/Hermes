@@ -15,6 +15,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -44,6 +45,7 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_MISSING_RUNTIME_VALUE = object()
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -1574,6 +1576,92 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
+def _snapshot_fallback_runtime(agent) -> dict[str, Any]:
+    """Capture every mutable runtime field touched during fallback activation."""
+    deep_attrs = {"request_overrides", "reasoning_config"}
+    shallow_attrs = {"_client_kwargs", "_transport_cache"}
+    attrs = (
+        "model",
+        "provider",
+        "requested_provider",
+        "base_url",
+        "api_mode",
+        "api_key",
+        "client",
+        "_anthropic_client",
+        "_anthropic_api_key",
+        "_anthropic_base_url",
+        "_is_anthropic_oauth",
+        "_client_kwargs",
+        "_use_prompt_caching",
+        "_use_native_cache_layout",
+        "_credential_pool",
+        "_credential_pool_entry_id",
+        "_config_context_length",
+        "max_tokens",
+        "request_overrides",
+        "reasoning_config",
+        "_cached_system_prompt",
+        "_pending_fallback_notice",
+        "_fallback_activated",
+        "_transport_cache",
+    )
+    snapshot: dict[str, Any] = {}
+    for attr in attrs:
+        value = getattr(agent, attr, _MISSING_RUNTIME_VALUE)
+        if value is not _MISSING_RUNTIME_VALUE and attr in deep_attrs:
+            value = copy.deepcopy(value)
+        elif value is not _MISSING_RUNTIME_VALUE and attr in shallow_attrs:
+            value = dict(value) if isinstance(value, dict) else value
+        snapshot[attr] = value
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor_attrs = (
+            "model",
+            "base_url",
+            "api_key",
+            "provider",
+            "api_mode",
+            "context_length",
+            "threshold_tokens",
+        )
+        snapshot["__compressor__"] = {
+            attr: getattr(compressor, attr, _MISSING_RUNTIME_VALUE)
+            for attr in compressor_attrs
+        }
+    return snapshot
+
+
+def _restore_fallback_runtime(agent, snapshot: dict[str, Any]) -> None:
+    """Restore a failed activation without rebuilding clients or prompts."""
+    for attr, value in snapshot.items():
+        if attr == "__compressor__":
+            continue
+        if value is _MISSING_RUNTIME_VALUE:
+            try:
+                delattr(agent, attr)
+            except AttributeError:
+                pass
+            continue
+        if attr in {"request_overrides", "reasoning_config"}:
+            value = copy.deepcopy(value)
+        elif attr in {"_client_kwargs", "_transport_cache"}:
+            value = dict(value)
+        setattr(agent, attr, value)
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        for attr, value in snapshot.get("__compressor__", {}).items():
+            if value is _MISSING_RUNTIME_VALUE:
+                try:
+                    delattr(compressor, attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(compressor, attr, value)
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -1671,28 +1759,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    activation_snapshot = _snapshot_fallback_runtime(agent)
     try:
         from agent.auxiliary_client import resolve_provider_client
-        # Pass base_url and api_key from fallback config so custom
-        # endpoints (e.g. Ollama Cloud) resolve correctly instead of
-        # falling through to OpenRouter defaults.
-        fb_base_url_hint = (fb.get("base_url") or "").strip() or None
-        fb_api_key_hint = (fb.get("api_key") or "").strip() or None
-        if not fb_api_key_hint:
-            # key_env and api_key_env are both documented aliases (see
-            # _normalize_custom_provider_entry in hermes_cli/config.py).
-            fb_key_env = (fb.get("key_env") or fb.get("api_key_env") or "").strip()
-            if fb_key_env:
-                fb_api_key_hint = os.getenv(fb_key_env, "").strip() or None
-        # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
-        # when no explicit key is in the fallback config. Host match
-        # (not substring) — see GHSA-76xc-57q6-vm5m.
-        if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
-            fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+        from hermes_cli.fallback_config import resolve_fallback_runtime
+
+        fb_runtime = resolve_fallback_runtime(fb)
+        fb_provider = str(fb_runtime.get("provider") or fb_provider).strip().lower()
+        fb_model = str(fb_runtime.get("model") or fb_model).strip()
+        fb_base_url_hint = str(fb_runtime.get("base_url") or "").strip() or None
+        fb_api_key_hint = fb_runtime.get("api_key") or None
+        fb_api_mode_hint = str(fb_runtime.get("api_mode") or "").strip() or None
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
-            explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint)
+            explicit_base_url=fb_base_url_hint or "",
+            explicit_api_key=str(fb_api_key_hint or ""),
+            api_mode=fb_api_mode_hint or "",
+        )
         if fb_client is None:
             logger.warning(
                 "Fallback to %s failed: provider not configured",
@@ -1709,43 +1792,80 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        # Trust the canonical runtime's API mode. Legacy providers that are
+        # only known to the downstream client router keep the established
+        # provider/URL/model inference path.
+        fb_api_mode = fb_api_mode_hint or "chat_completions"
+        # The constructed client's endpoint is the transport source of truth.
+        # Some first-party OAuth routers intentionally ignore an explicit route
+        # URL; pairing their token/headers with the untrusted hint here would
+        # leak credentials when request-local clients are rebuilt.
         fb_base_url = str(fb_client.base_url)
-        _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
-            fb_api_mode = "codex_responses"
-        elif (
-            fb_provider == "anthropic"
-            or fb_base_url.rstrip("/").lower().endswith("/anthropic")
-            or base_url_hostname(fb_base_url) == "api.anthropic.com"
-        ):
-            # Custom providers (e.g. cron-anthropic) point at the native
-            # api.anthropic.com host with no "/anthropic" path suffix, so the
-            # name/suffix checks above miss them and they default to
-            # chat_completions → POST /v1/chat/completions → 404. Match the
-            # host the same way determine_api_mode() and _detect_api_mode_for_url()
-            # do on the primary path. (#32243, #49247)
-            fb_api_mode = "anthropic_messages"
-        elif _fb_is_azure:
-            # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
-            # support the Responses API. Stay on chat_completions.
-            fb_api_mode = "chat_completions"
-        elif agent._is_direct_openai_url(fb_base_url):
-            fb_api_mode = "codex_responses"
-        elif agent._provider_model_requires_responses_api(
+        if not fb_api_mode_hint:
+            _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
+            if fb_provider == "openai-codex":
+                fb_api_mode = "codex_responses"
+            elif (
+                fb_provider == "anthropic"
+                or fb_base_url.rstrip("/").lower().endswith("/anthropic")
+                or base_url_hostname(fb_base_url) == "api.anthropic.com"
+            ):
+                fb_api_mode = "anthropic_messages"
+            elif _fb_is_azure:
+                fb_api_mode = "chat_completions"
+            elif agent._is_direct_openai_url(fb_base_url):
+                fb_api_mode = "codex_responses"
+            elif agent._provider_model_requires_responses_api(
+                fb_model,
+                provider=fb_provider,
+            ):
+                fb_api_mode = "codex_responses"
+            elif fb_provider == "bedrock" or (
+                base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
+                and base_url_host_matches(fb_base_url, "amazonaws.com")
+            ):
+                fb_api_mode = "bedrock_converse"
+
+        route_context_length = fb_runtime.get("context_length")
+        if not isinstance(route_context_length, int) or route_context_length <= 0:
+            route_context_length = None
+
+        # Resolve and, for LM Studio, validate the target before mutating the
+        # live agent. A load/unload failure can then advance the chain without
+        # leaking partial provider or request state from this candidate.
+        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+
+        fb_context_length = get_model_context_length(
             fb_model,
+            base_url=fb_base_url,
+            api_key=fb_api_key_hint if isinstance(fb_api_key_hint, str) else "",
             provider=fb_provider,
+            config_context_length=route_context_length,
+            custom_providers=getattr(agent, "_custom_providers", None),
+        )
+        transition_policy = fb_runtime.get("model_transition_policy")
+        if fb_provider == "lmstudio" and (
+            (getattr(agent, "lmstudio_load_mode", "explicit") or "explicit").strip().lower()
+            != "jit"
+            or transition_policy == "sequential"
         ):
-            # GPT-5.x models usually need Responses API, but keep
-            # provider-specific exceptions like Copilot gpt-5-mini on
-            # chat completions.
-            fb_api_mode = "codex_responses"
-        elif fb_provider == "bedrock" or (
-            base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
-            and base_url_host_matches(fb_base_url, "amazonaws.com")
-        ):
-            fb_api_mode = "bedrock_converse"
+            from hermes_cli.models import ensure_lmstudio_model_loaded
+
+            load_target = max(route_context_length or 0, MINIMUM_CONTEXT_LENGTH)
+            loaded_context = ensure_lmstudio_model_loaded(
+                fb_model,
+                fb_base_url,
+                fb_api_key_hint,
+                load_target,
+                timeout=float(fb_runtime.get("request_timeout_seconds") or 120.0),
+                transition_policy=transition_policy,
+                require_context_minimum=True,
+            )
+            if loaded_context is None:
+                raise RuntimeError(
+                    f"LM Studio could not load fallback model {fb_model!r} "
+                    f"with at least {load_target:,} context tokens"
+                )
 
         old_model = agent.model
         old_provider = agent.provider
@@ -1753,12 +1873,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.
-        agent._config_context_length = None
+        agent._config_context_length = route_context_length
         agent.model = fb_model
         agent.provider = fb_provider
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        primary_runtime = getattr(agent, "_primary_runtime", {}) or {}
+        if "max_output_tokens" in fb_runtime:
+            agent.max_tokens = fb_runtime["max_output_tokens"]
+        elif "max_tokens" in primary_runtime:
+            agent.max_tokens = primary_runtime["max_tokens"]
+        if "request_overrides" in fb_runtime:
+            agent.request_overrides = copy.deepcopy(fb_runtime["request_overrides"])
+        elif "request_overrides" in primary_runtime:
+            agent.request_overrides = copy.deepcopy(primary_runtime["request_overrides"])
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -1786,9 +1915,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 agent._credential_pool_entry_id = None
         if getattr(agent, "_credential_pool", None) is None:
             try:
-                from agent.credential_pool import load_pool
+                fallback_pool = fb_runtime.get("credential_pool")
+                if fallback_pool is None:
+                    from agent.credential_pool import load_pool
 
-                fallback_pool = load_pool(fb_provider)
+                    fallback_pool = load_pool(fb_provider)
                 if fallback_pool and fallback_pool.has_credentials():
                     agent._credential_pool = fallback_pool
                     logger.info(
@@ -1804,7 +1935,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
-        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+        _fb_timeout = fb_runtime.get("request_timeout_seconds")
+        if _fb_timeout is None:
+            _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
@@ -1813,8 +1946,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = fb_base_url
+            anthropic_kwargs = {}
+            if isinstance(_fb_timeout, (int, float)):
+                anthropic_kwargs["timeout"] = _fb_timeout
             agent._anthropic_client = build_anthropic_client(
-                effective_key, agent._anthropic_base_url, timeout=_fb_timeout,
+                effective_key,
+                agent._anthropic_base_url,
+                **anthropic_kwargs,
             )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
             agent.client = None
@@ -1834,6 +1972,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_headers = getattr(fb_client, "_custom_headers", None)
             if not fb_headers:
                 fb_headers = getattr(fb_client, "default_headers", None)
+            route_headers = fb_runtime.get("extra_headers")
+            if isinstance(route_headers, dict):
+                merged_headers = dict(fb_headers or {})
+                merged_headers.update(route_headers)
+                fb_headers = merged_headers
             agent._client_kwargs = {
                 "api_key": fb_client.api_key,
                 "base_url": fb_base_url,
@@ -1841,8 +1984,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             }
             if _fb_timeout is not None:
                 agent._client_kwargs["timeout"] = _fb_timeout
+            if _fb_timeout is not None or route_headers:
                 # Rebuild the shared OpenAI client so the configured
-                # timeout takes effect on the very next fallback request,
+                # timeout / headers take effect on the very next fallback request,
                 # not only after a later credential-rotation rebuild.
                 agent._replace_primary_openai_client(reason="fallback_timeout_apply")
 
@@ -1859,9 +2003,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             )
         )
 
-        # LM Studio: preload before probing the fallback's context length.
-        agent._ensure_lmstudio_runtime_loaded()
-
         # Update context compressor limits for the fallback model.
         # Without this, compression decisions use the primary model's
         # context window (e.g. 200K) instead of the fallback's (e.g. 32K),
@@ -1870,18 +2011,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (model.context_length in config.yaml) is respected — without this,
         # the fallback activation drops to 128K even when config says 204800.
         if hasattr(agent, 'context_compressor') and agent.context_compressor:
-            from agent.model_metadata import get_model_context_length
-            # ``agent.api_key`` may be callable (Entra ID); the
-            # context-length resolver expects a string for live
-            # probes. Foundry typically resolves via config/static
-            # catalogs anyway, so coerce defensively.
-            _fb_ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
-            fb_context_length = get_model_context_length(
-                agent.model, base_url=agent.base_url,
-                api_key=_fb_ctx_api_key, provider=agent.provider,
-                config_context_length=getattr(agent, "_config_context_length", None),
-                custom_providers=getattr(agent, "_custom_providers", None),
-            )
             agent.context_compressor.update_model(
                 model=agent.model,
                 context_length=fb_context_length,
@@ -1942,6 +2071,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _reset_stale_streak(agent)
         return True
     except Exception as e:
+        _restore_fallback_runtime(agent, activation_snapshot)
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)

@@ -1195,6 +1195,82 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_explicit_primary_retains_rich_profile_fallback_chain(self, tmp_path):
+        rich_chain = [
+            {
+                "provider": "lmstudio",
+                "model": "large-local",
+                "base_url": "http://localhost:1234/v1",
+                "context_length": 65_536,
+                "max_output_tokens": 16_384,
+                "extra_body": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+                "model_transition_policy": "sequential",
+            },
+            {
+                "provider": "lmstudio",
+                "model": "small-local",
+                "base_url": "http://localhost:1234/v1",
+                "context_length": 65_536,
+            },
+        ]
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: profile-primary\n"
+            "  provider: openrouter\n"
+            "fallback_providers:\n"
+            "  - provider: lmstudio\n"
+            "    model: large-local\n"
+            "    base_url: http://localhost:1234/v1\n"
+            "    context_length: 65536\n"
+            "    max_output_tokens: 16384\n"
+            "    extra_body:\n"
+            "      temperature: 1.0\n"
+            "      top_p: 0.95\n"
+            "      top_k: 20\n"
+            "    model_transition_policy: sequential\n"
+            "  - provider: lmstudio\n"
+            "    model: small-local\n"
+            "    base_url: http://localhost:1234/v1\n"
+            "    context_length: 65536\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "explicit-primary",
+            "name": "explicit primary",
+            "prompt": "hello",
+            "provider": "openai-codex",
+            "model": "gpt-primary",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://primary.invalid/v1",
+                     "provider": "openai-codex",
+                     "api_mode": "codex_responses",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "openai-codex"
+        assert kwargs["model"] == "gpt-primary"
+        assert kwargs["fallback_model"] == rich_chain
+
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
         For cron, that abnormal-empty explainer must be treated as empty so it

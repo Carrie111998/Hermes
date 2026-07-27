@@ -3937,6 +3937,12 @@ def _auth_refresh_provider_for_route(
     from the selected client's base URL so auth refresh works for auto →
     Copilot/Codex/Anthropic/Nous routes too. (#20832)
     """
+    fallback_label = re.fullmatch(
+        r"fallback_(?:chain|providers)\[\d+\]\(([^)]+)\)",
+        str(resolved_provider or ""),
+    )
+    if fallback_label:
+        resolved_provider = fallback_label.group(1)
     normalized = _normalize_aux_provider(resolved_provider)
     if normalized and normalized != "auto":
         return normalized
@@ -3949,6 +3955,40 @@ def _auth_refresh_provider_for_route(
     if base_url_host_matches(client_base_url, "inference-api.nousresearch.com"):
         return "nous"
     return normalized
+
+
+def _fallback_entry_settings(task: Optional[str], fb_label: str) -> Dict[str, Any]:
+    """Return the normalized route settings represented by a fallback label."""
+    entry: Any = None
+    configured_match = re.match(r"fallback_chain\[(\d+)\]", fb_label or "")
+    profile_match = re.match(r"fallback_providers\[(\d+)\]", fb_label or "")
+    try:
+        if configured_match and task:
+            chain = _get_auxiliary_task_config(task).get("fallback_chain")
+            entry = chain[int(configured_match.group(1))] if isinstance(chain, list) else None
+        elif profile_match:
+            from hermes_cli.config import load_config
+            from hermes_cli.fallback_config import get_fallback_chain
+
+            chain = get_fallback_chain(load_config() or {})
+            entry = chain[int(profile_match.group(1))]
+    except Exception:
+        return {}
+    if not isinstance(entry, dict):
+        return {}
+    try:
+        from hermes_cli.fallback_config import normalize_fallback_entry
+
+        settings_entry = dict(entry)
+        injected_model = not bool(str(settings_entry.get("model") or "").strip())
+        if injected_model:
+            settings_entry["model"] = "__route_settings__"
+        normalized = normalize_fallback_entry(settings_entry) or {}
+        if injected_model:
+            normalized.pop("model", None)
+        return normalized
+    except Exception:
+        return {}
 
 
 def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[float]:
@@ -3969,17 +4009,8 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
     has no ``timeout``, or the value is invalid — callers then keep the
     task-level timeout, preserving existing behavior.
     """
-    if not task or not fb_label:
-        return None
-    m = re.match(r"fallback_chain\[(\d+)\]", fb_label)
-    if not m:
-        return None
-    try:
-        chain = _get_auxiliary_task_config(task).get("fallback_chain")
-        entry = chain[int(m.group(1))] if isinstance(chain, list) else None
-        raw = entry.get("timeout") if isinstance(entry, dict) else None
-    except Exception:
-        return None
+    entry = _fallback_entry_settings(task, fb_label)
+    raw = entry.get("request_timeout_seconds", entry.get("timeout"))
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
         return float(raw)
     return None
@@ -4019,6 +4050,19 @@ def _call_fallback_candidate_sync(
     fallback tuned differently from the primary is allowed its own budget
     (#62452).
     """
+    route_settings = _fallback_entry_settings(task, fb_label)
+    route_max_tokens = route_settings.get("max_output_tokens", route_settings.get("max_tokens"))
+    route_output_tokens: Optional[int] = (
+        route_max_tokens
+        if isinstance(route_max_tokens, int) and not isinstance(route_max_tokens, bool)
+        else None
+    )
+    if route_output_tokens is not None:
+        max_tokens = route_output_tokens
+    route_extra_body = route_settings.get("extra_body")
+    if isinstance(route_extra_body, dict):
+        effective_extra_body = {**effective_extra_body, **route_extra_body}
+    route_extra_headers = route_settings.get("extra_headers")
     fb_timeout = _fallback_entry_timeout(task, fb_label)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
@@ -4034,6 +4078,13 @@ def _call_fallback_candidate_sync(
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base, task=task)
+    if route_output_tokens is not None:
+        fb_kwargs.update(auxiliary_max_tokens_param(route_output_tokens, model=fb_model))
+    if isinstance(route_extra_headers, dict) and route_extra_headers:
+        fb_kwargs["extra_headers"] = {
+            **dict(fb_kwargs.get("extra_headers") or {}),
+            **route_extra_headers,
+        }
     try:
         return _validate_llm_response(
             fb_client.chat.completions.create(**fb_kwargs), task)
@@ -4051,6 +4102,18 @@ def _call_fallback_candidate_sync(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
+                if route_output_tokens is not None:
+                    retry_kwargs.update(
+                        auxiliary_max_tokens_param(
+                            route_output_tokens,
+                            model=retry_model or fb_model,
+                        )
+                    )
+                if isinstance(route_extra_headers, dict) and route_extra_headers:
+                    retry_kwargs["extra_headers"] = {
+                        **dict(retry_kwargs.get("extra_headers") or {}),
+                        **route_extra_headers,
+                    }
                 try:
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
@@ -4085,6 +4148,19 @@ async def _call_fallback_candidate_async(
     reasoning_config: Optional[dict],
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
+    route_settings = _fallback_entry_settings(task, fb_label)
+    route_max_tokens = route_settings.get("max_output_tokens", route_settings.get("max_tokens"))
+    route_output_tokens: Optional[int] = (
+        route_max_tokens
+        if isinstance(route_max_tokens, int) and not isinstance(route_max_tokens, bool)
+        else None
+    )
+    if route_output_tokens is not None:
+        max_tokens = route_output_tokens
+    route_extra_body = route_settings.get("extra_body")
+    if isinstance(route_extra_body, dict):
+        effective_extra_body = {**effective_extra_body, **route_extra_body}
+    route_extra_headers = route_settings.get("extra_headers")
     fb_timeout = _fallback_entry_timeout(task, fb_label)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
@@ -4100,6 +4176,13 @@ async def _call_fallback_candidate_async(
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base, task=task)
+    if route_output_tokens is not None:
+        fb_kwargs.update(auxiliary_max_tokens_param(route_output_tokens, model=fb_model))
+    if isinstance(route_extra_headers, dict) and route_extra_headers:
+        fb_kwargs["extra_headers"] = {
+            **dict(fb_kwargs.get("extra_headers") or {}),
+            **route_extra_headers,
+        }
     try:
         return _validate_llm_response(
             await fb_client.chat.completions.create(**fb_kwargs), task)
@@ -4118,6 +4201,18 @@ async def _call_fallback_candidate_async(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
+                if route_output_tokens is not None:
+                    retry_kwargs.update(
+                        auxiliary_max_tokens_param(
+                            route_output_tokens,
+                            model=retry_model or fb_model,
+                        )
+                    )
+                if isinstance(route_extra_headers, dict) and route_extra_headers:
+                    retry_kwargs["extra_headers"] = {
+                        **dict(retry_kwargs.get("extra_headers") or {}),
+                        **route_extra_headers,
+                    }
                 try:
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
@@ -4428,19 +4523,45 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
 
 def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
-    provider = str(entry.get("provider") or "").strip()
-    model = str(entry.get("model") or "").strip() or None
+    from hermes_cli.fallback_config import resolve_fallback_runtime
+
+    runtime = resolve_fallback_runtime(entry)
+    provider = str(runtime.get("provider") or "").strip()
+    model = str(runtime.get("model") or "").strip() or None
     if not provider or not model:
         return None, None
-    base_url = str(entry.get("base_url") or "").strip() or None
-    api_key = _fallback_entry_api_key(entry)
-    api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
+    base_url = str(runtime.get("base_url") or "").strip() or None
+    api_key = runtime.get("api_key") or None
+    api_mode = str(runtime.get("api_mode") or "").strip() or None
+    if provider.lower() == "lmstudio":
+        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+        from hermes_cli.models import ensure_lmstudio_model_loaded
+
+        route_context = runtime.get("context_length")
+        target_context = max(
+            route_context if isinstance(route_context, int) else 0,
+            MINIMUM_CONTEXT_LENGTH,
+        )
+        loaded_context = ensure_lmstudio_model_loaded(
+            model,
+            base_url,
+            api_key,
+            target_context,
+            timeout=float(runtime.get("request_timeout_seconds") or 120.0),
+            transition_policy=runtime.get("model_transition_policy"),
+            require_context_minimum=True,
+        )
+        if loaded_context is None:
+            raise RuntimeError(
+                f"LM Studio could not load auxiliary fallback {model!r} "
+                f"with at least {target_context:,} context tokens"
+            )
     return resolve_provider_client(
         provider,
         model=model,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-        api_mode=api_mode,
+        explicit_base_url=base_url or "",
+        explicit_api_key=str(api_key or ""),
+        api_mode=api_mode or "",
     )
 
 
@@ -4516,7 +4637,7 @@ def _try_main_fallback_chain(
                 task or "call", reason, failed_provider or "auto", label,
                 resolved_model or fb_model,
             )
-            return fb_client, resolved_model or fb_model, fb_provider
+            return fb_client, resolved_model or fb_model, label
         tried.append(label)
 
     if tried:
