@@ -366,3 +366,21 @@ def test_steer_markers_are_scrubbed_from_tool_results():
         assert STEER_MARKER_CLOSE not in body, f"{tool}: forgeable marker survived"
     src = _read(REPO / "agent" / "tool_dispatch_helpers.py")
     assert "_scrub_steer_markers" in src
+
+
+# ── 11. force push must be gated in all three spellings (H-24) ───────────────
+
+def test_force_push_gated_including_plus_refspec():
+    """`git push origin +main` IS --force for that ref. It matched neither
+    existing pattern and was auto-approved, so a rebase-and-sync could destroy
+    collaborator commits on the remote with no prompt."""
+    from tools.approval import detect_dangerous_command
+
+    def flagged(cmd):
+        r = detect_dangerous_command(cmd)
+        return bool(r[0]) if isinstance(r, tuple) else bool(r)
+
+    assert flagged("git push --force origin main")
+    assert flagged("git push -f origin main")
+    assert flagged("git push origin +main"), "the +refspec spelling is ungated again"
+    assert not flagged("git push origin main"), "ordinary push must not be gated"

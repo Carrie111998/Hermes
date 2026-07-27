@@ -105,6 +105,12 @@ def _unscrub_steer_markers(src: str) -> str:
                 "    wrapped = _maybe_wrap_untrusted(name, content)")
 
 
+def _ungate_plus_refspec_push(src: str) -> str:
+    """Upstream drops the +refspec pattern; force push auto-approves again."""
+    target = next(l for l in src.split(chr(10)) if "via +refspec" in l)
+    return _sub(src, target, "")
+
+
 SCENARIOS: List[Scenario] = [
     Scenario("drop-user_message-kwarg",
              "upstream refactors the hook call; feedback-gate silently stops firing",
@@ -139,6 +145,9 @@ SCENARIOS: List[Scenario] = [
     Scenario("unscrub-steer-markers",
              "merge drops the scrub; tool output can forge operator authority again",
              REPO / "agent" / "tool_dispatch_helpers.py", _unscrub_steer_markers),
+    Scenario("ungate-plus-refspec-push",
+             "merge drops the +refspec pattern; force push auto-approves again",
+             REPO / "tools" / "approval.py", _ungate_plus_refspec_push),
 ]
 
 
