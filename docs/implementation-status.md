@@ -88,6 +88,8 @@ acceptance evidence.
   dispatch. Proposed objectives from outside that authority scope create a
   durable acceptance handoff; evidence-bearing advisor acceptance transitions
   them to `accepted` and emits a fresh wake event.
+- Explicit organization-bound objective admission rejects unknown tenant IDs
+  when the enterprise organization authority schema is present.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
@@ -163,7 +165,7 @@ runtime-drift enforcement, live payment rails, or every other item in the
 inventory below.
 
 A separate post-boundary rerun at baseline commit
-`a497763a54767bc5c577e535e4bfafd531981cd7` passed 6 Founder/CEO E2E tests, 48
+`7133019789f03c0ae67ba8424038aaed4bda54c` passed 6 Founder/CEO E2E tests, 48
 objective service/runtime/worker tests, and 21 finance/attribution tests,
 plus selected module compilation and `git diff --check`. This supports the
 bounded tested runtime on current `main`; it does not change the tagged release

@@ -31,6 +31,10 @@ does not require a routine advisor dispatch. Objectives originating outside
 that CEO authority scope remain proposed and create an evidence-bearing
 `objective_acceptance_required` advisor handoff.
 
+When the enterprise organization schema is present, explicit objective
+organization IDs must resolve to an existing organization before admission;
+unknown tenant IDs are rejected.
+
 Each objective carries a durable `reaffirmed_at` timestamp. When
 `agentic.reaffirmation_ttl_seconds` elapses, the runtime blocks the objective
 and opens an `objective_reaffirmation_required` advisor handoff. Execution
