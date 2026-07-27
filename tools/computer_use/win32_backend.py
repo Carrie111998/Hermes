@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from tools.computer_use.backend import ComputerUseBackend, CaptureResult, ActionResult, UIElement
+
 # ---------------------------------------------------------------------------
 # Import GA's ljqCtrl (proven physical ops)
 # ---------------------------------------------------------------------------
