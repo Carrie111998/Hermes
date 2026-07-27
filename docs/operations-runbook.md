@@ -29,6 +29,10 @@ issue a narrowly bound approval through the supported control surface.
 5. Record the incident and exact last known remote commit.
 6. Resume only after integrity, authority, and provider read-back checks pass.
 
+When authority mode becomes `paused` or `manual`, the governed worker records
+`autonomy_paused` and exits its execution loop. A process supervisor may
+restart it only after the operator explicitly resumes autonomous mode.
+
 ## Backup
 
 Use the implemented backup command:

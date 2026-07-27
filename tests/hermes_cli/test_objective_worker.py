@@ -27,6 +27,25 @@ def test_supervised_worker_persists_cycle_and_graceful_stop(tmp_path):
     assert workers[0]["stop_reason"] == "supervisor_exit"
 
 
+def test_worker_exits_when_autonomy_is_paused(tmp_path):
+    path = tmp_path / "authority.db"
+    calls = []
+
+    def tick():
+        calls.append(True)
+        return SimpleNamespace(status="paused")
+
+    assert objective_worker.run_forever(
+        db_path=path, interval_seconds=900, tick=tick, max_cycles=10
+    ) == 0
+    conn = objectives_db.connect(path)
+    worker = objective_worker.worker_health(conn)[0]
+    assert calls == [True]
+    assert worker["status"] == "stopped"
+    assert worker["last_cycle_status"] == "paused"
+    assert worker["stop_reason"] == "autonomy_paused"
+
+
 def test_stale_running_worker_is_reported_unhealthy(tmp_path, monkeypatch):
     conn = objectives_db.connect(tmp_path / "authority.db")
     worker_id = objective_worker.register_worker(conn, worker_id="worker_test")

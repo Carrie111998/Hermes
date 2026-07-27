@@ -9,6 +9,8 @@
 - Enforced objective-level cumulative spend ceilings inside the atomic treasury
   reservation transaction, including concurrent workers and released-budget
   reuse.
+- Paused/manual autonomy now causes the supervised objective worker to exit with
+  a durable `autonomy_paused` stop reason instead of polling indefinitely.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.

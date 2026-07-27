@@ -360,6 +360,9 @@ def run_forever(
                         consecutive_failures = heartbeat(
                             conn, worker_id, cycle_status=status
                         )
+                        if status == "paused":
+                            shutdown_reason = "autonomy_paused"
+                            break
                     except Exception as exc:
                         consecutive_failures = heartbeat(
                             conn, worker_id, cycle_status="worker_error", error=str(exc)
