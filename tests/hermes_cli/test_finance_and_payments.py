@@ -648,6 +648,7 @@ def test_business_can_pay_only_against_exact_reservation(treasury):
     payment_event = accounting_db.record_tax_payment(
         conn,
         obligation,
+        organization_id="org_1",
         paid_at=220,
         payment_intent_id=result["id"],
         evidence={"provider_readback_id": result["provider_readback_id"]},

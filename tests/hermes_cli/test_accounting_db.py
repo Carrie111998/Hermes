@@ -273,12 +273,14 @@ def test_tax_obligation_requires_covered_registration_and_retries_exactly(conn):
     filing_event = accounting_db.record_tax_filing(
         conn,
         obligation,
+        organization_id="org_1",
         filed_at=300,
         evidence={"authority_receipt": "CRA:filed"},
     )
     assert accounting_db.record_tax_filing(
         conn,
         obligation,
+        organization_id="org_1",
         filed_at=300,
         evidence={"retry": True},
     ) == filing_event
@@ -301,6 +303,7 @@ def test_tax_obligation_requires_covered_registration_and_retries_exactly(conn):
     paid_event = accounting_db.record_tax_payment(
         conn,
         zero_obligation,
+        organization_id="org_1",
         paid_at=320,
         payment_intent_id="not_required:zero_balance",
         evidence={"authority_balance": "zero"},
@@ -308,6 +311,7 @@ def test_tax_obligation_requires_covered_registration_and_retries_exactly(conn):
     assert accounting_db.record_tax_payment(
         conn,
         zero_obligation,
+        organization_id="org_1",
         paid_at=320,
         payment_intent_id="not_required:zero_balance",
         evidence={"retry": True},
@@ -315,6 +319,40 @@ def test_tax_obligation_requires_covered_registration_and_retries_exactly(conn):
     assert conn.execute(
         "SELECT status FROM tax_obligations WHERE id=?", (zero_obligation,)
     ).fetchone()["status"] == "paid"
+
+
+def test_tax_mutations_are_bound_to_organization(conn):
+    registration = accounting_db.configure_tax_registration(
+        conn,
+        organization_id="org_1",
+        jurisdiction="CA-ON",
+        tax_type="sales",
+        filing_frequency="quarterly",
+        effective_from=1,
+        evidence={"source": "test"},
+    )
+    obligation = accounting_db.record_tax_obligation(
+        conn,
+        organization_id="org_1",
+        registration_id=registration,
+        period_start=400,
+        period_end=499,
+        due_at=550,
+        amount_minor=0,
+        currency="CAD",
+        evidence={"workpaper": "cross-tenant"},
+    )
+    with pytest.raises(KeyError, match="tax obligation not found"):
+        accounting_db.record_tax_filing(
+            conn,
+            obligation,
+            organization_id="org_2",
+            filed_at=600,
+            evidence={"authority_receipt": "wrong-tenant"},
+        )
+    assert conn.execute(
+        "SELECT status FROM tax_obligations WHERE id=?", (obligation,)
+    ).fetchone()["status"] == "accrued"
 
 
 def test_existing_fiscal_period_schema_migrates_before_contract_trigger():

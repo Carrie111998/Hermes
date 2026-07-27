@@ -1861,6 +1861,7 @@ def register_accounting_adapters(
             event_id = accounting_db.record_tax_filing(
                 authority_conn,
                 obligation_id,
+                organization_id=organization_id,
                 filed_at=int(payload["filed_at"]),
                 evidence=dict(payload["evidence"]),
             )
@@ -1882,6 +1883,7 @@ def register_accounting_adapters(
             event_id = accounting_db.record_tax_payment(
                 authority_conn,
                 obligation_id,
+                organization_id=organization_id,
                 paid_at=int(payload["paid_at"]),
                 payment_intent_id=str(payload["payment_intent_id"]),
                 evidence=dict(payload["evidence"]),

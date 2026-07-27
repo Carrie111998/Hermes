@@ -629,6 +629,7 @@ def record_tax_filing(
     conn: sqlite3.Connection,
     obligation_id: str,
     *,
+    organization_id: str,
     filed_at: int,
     evidence: Any,
 ) -> str:
@@ -637,7 +638,8 @@ def record_tax_filing(
     if filed_at <= 0 or not evidence:
         raise AccountingError("tax filing requires time and authority evidence")
     obligation = conn.execute(
-        "SELECT * FROM tax_obligations WHERE id=?", (obligation_id,)
+        "SELECT * FROM tax_obligations WHERE id=? AND organization_id=?",
+        (obligation_id, organization_id),
     ).fetchone()
     if obligation is None:
         raise KeyError(f"tax obligation not found: {obligation_id}")
@@ -671,6 +673,7 @@ def record_tax_payment(
     conn: sqlite3.Connection,
     obligation_id: str,
     *,
+    organization_id: str,
     paid_at: int,
     payment_intent_id: str,
     evidence: Any,
@@ -682,7 +685,8 @@ def record_tax_payment(
             "tax payment requires time, payment reference, and provider evidence"
         )
     obligation = conn.execute(
-        "SELECT * FROM tax_obligations WHERE id=?", (obligation_id,)
+        "SELECT * FROM tax_obligations WHERE id=? AND organization_id=?",
+        (obligation_id, organization_id),
     ).fetchone()
     if obligation is None:
         raise KeyError(f"tax obligation not found: {obligation_id}")
