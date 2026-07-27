@@ -226,6 +226,79 @@ def test_compliance_supersession_requires_same_scope_and_reason():
             expires_at=future,
             supersedes_id=prior,
         )
+
+
+def test_compliance_supersession_cannot_branch_from_an_old_record():
+    conn = connection()
+    future = int(time.time()) + 3600
+    prior = compliance.assess_applicability(
+        conn,
+        organization_id="org_1",
+        regime_id="casl",
+        verdict="not_applicable",
+        rationale="Initial review",
+        evidence={"review": "r1"},
+        assessed_by="advisor:legal",
+        expires_at=future,
+    )
+    compliance.assess_applicability(
+        conn,
+        organization_id="org_1",
+        regime_id="casl",
+        verdict="applicable",
+        rationale="Scope changed",
+        evidence={"review": "r2"},
+        assessed_by="advisor:legal",
+        expires_at=future,
+        supersedes_id=prior,
+        supersession_reason="New commercial activity",
+    )
+    with pytest.raises(compliance.ComplianceGateError, match="current record"):
+        compliance.assess_applicability(
+            conn,
+            organization_id="org_1",
+            regime_id="casl",
+            verdict="not_applicable",
+            rationale="Attempted branch",
+            evidence={"review": "r3"},
+            assessed_by="advisor:legal",
+            expires_at=future,
+            supersedes_id=prior,
+            supersession_reason="Conflicting interpretation",
+        )
+
+    evidence = compliance.record_control_evidence(
+        conn,
+        organization_id="org_1",
+        control_name="email.consent",
+        verifier="control:test",
+        verdict="pass",
+        evidence={"check": "ok"},
+        expires_at=future,
+    )
+    compliance.record_control_evidence(
+        conn,
+        organization_id="org_1",
+        control_name="email.consent",
+        verifier="control:test",
+        verdict="fail",
+        evidence={"check": "revoked"},
+        expires_at=future,
+        supersedes_id=evidence,
+        supersession_reason="Consent revoked",
+    )
+    with pytest.raises(compliance.ComplianceGateError, match="current record"):
+        compliance.record_control_evidence(
+            conn,
+            organization_id="org_1",
+            control_name="email.consent",
+            verifier="control:test",
+            verdict="pass",
+            evidence={"check": "reinstated"},
+            expires_at=future,
+            supersedes_id=evidence,
+            supersession_reason="Attempted branch",
+        )
 def test_schema_check_does_not_commit_active_authority_transaction():
     conn = connection()
     conn.execute("CREATE TABLE authority_sentinel (value TEXT NOT NULL)")

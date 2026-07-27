@@ -67,6 +67,9 @@ acceptance evidence.
 - Interrupted idempotent action recovery is tested across an authority-store
   restart: a fresh runtime resumes from durable permit/action state and does
   not replan or duplicate an uncertain provider effect.
+- Compliance applicability, obligations, and control evidence use explicit
+  supersession lineage; attempts to branch from an old record are rejected,
+  and ambiguous current leaves fail closed during action authorization.
 - Security-readiness blocks now create deduplicated, organization-scoped
   advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.

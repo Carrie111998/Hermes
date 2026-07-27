@@ -326,6 +326,13 @@ def assess_applicability(
             raise ComplianceGateError(
                 "applicability supersession must reference the same organization and regime"
             )
+        if conn.execute(
+            "SELECT 1 FROM compliance_applicability WHERE supersedes_id=? LIMIT 1",
+            (supersedes_id,),
+        ).fetchone() is not None:
+            raise ComplianceGateError(
+                "applicability supersession must reference the current record"
+            )
         if not str(supersession_reason or "").strip():
             raise ComplianceGateError("applicability supersession requires a reason")
     assessment_id = f"applicability_{uuid.uuid4().hex}"
@@ -384,6 +391,13 @@ def record_control_evidence(
         ):
             raise ComplianceGateError(
                 "control supersession must reference the same organization and control"
+            )
+        if conn.execute(
+            "SELECT 1 FROM compliance_control_evidence WHERE supersedes_id=? LIMIT 1",
+            (supersedes_id,),
+        ).fetchone() is not None:
+            raise ComplianceGateError(
+                "control supersession must reference the current record"
             )
         if not str(supersession_reason or "").strip():
             raise ComplianceGateError("control supersession requires a reason")
@@ -449,6 +463,13 @@ def register_obligation(
             raise ComplianceGateError(
                 "obligation supersession must reference the same organization and regime"
             )
+        if conn.execute(
+            "SELECT 1 FROM compliance_obligations WHERE supersedes_id=? LIMIT 1",
+            (supersedes_id,),
+        ).fetchone() is not None:
+            raise ComplianceGateError(
+                "obligation supersession must reference the current record"
+            )
         if not str(supersession_reason or "").strip():
             raise ComplianceGateError("obligation supersession requires a reason")
     obligation_id = f"obligation_{uuid.uuid4().hex}"
@@ -490,13 +511,18 @@ def authorize_action(
                    SELECT 1 FROM compliance_applicability newer
                     WHERE newer.supersedes_id = compliance_applicability.id
                  )
-               ORDER BY assessed_at DESC LIMIT 1""",
+               ORDER BY assessed_at DESC""",
             (organization_id, regime["id"], now),
-        ).fetchone()
-        if assessment is None:
+        ).fetchall()
+        if not assessment:
             raise ComplianceGateError(
                 f"{regime['name']} applicability has not been assessed"
             )
+        if len(assessment) > 1:
+            raise ComplianceGateError(
+                f"{regime['name']} applicability has ambiguous current authority"
+            )
+        assessment = assessment[0]
         if assessment["verdict"] == "not_applicable":
             decisions.append({"regime": regime["id"], "verdict": "not_applicable"})
             continue
@@ -520,17 +546,27 @@ def authorize_action(
             if tags and not _intersects(tags, context.get("activities")):
                 continue
             evidence = conn.execute(
-                """SELECT id FROM compliance_control_evidence
+                """SELECT id, verdict FROM compliance_control_evidence
                    WHERE organization_id = ? AND control_name = ?
-                     AND verdict = 'pass' AND expires_at > ?
+                     AND expires_at > ?
                      AND NOT EXISTS (
                        SELECT 1 FROM compliance_control_evidence newer
                         WHERE newer.supersedes_id = compliance_control_evidence.id
                      )
-                   ORDER BY verified_at DESC LIMIT 1""",
+                   ORDER BY verified_at DESC""",
                 (organization_id, obligation["required_control"], now),
-            ).fetchone()
-            if evidence is None:
+            ).fetchall()
+            if not evidence or len(evidence) > 1:
+                if len(evidence) > 1:
+                    raise ComplianceGateError(
+                        "required control has ambiguous current evidence: "
+                        f"{obligation['required_control']}"
+                    )
+                raise ComplianceGateError(
+                    f"required control has no current passing evidence: "
+                    f"{obligation['required_control']}"
+                )
+            if evidence[0]["verdict"] != "pass":
                 raise ComplianceGateError(
                     f"required control has no current passing evidence: "
                     f"{obligation['required_control']}"

@@ -408,6 +408,17 @@ The resulting local image manifest was
 This is deterministic local-provider evidence; production providers,
 high-availability deployment, and legal/compliance readiness remain open.
 
+Compliance lineage was separately validated with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_regulatory_compliance.py -q
+```
+
+Result: **10 passed, 0 failed**. Applicability and control evidence remain
+immutable, supersession must target the current leaf with an explicit reason,
+and ambiguous branching records fail closed rather than being silently
+selected as authoritative.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

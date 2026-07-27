@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Compliance supersession now rejects branching from an already superseded
+  assessment or control record, and current-authority projections fail closed
+  on ambiguous legacy branches instead of silently selecting one interpretation.
 - Reran the complete current-tree install-to-master-stop acceptance on the
   current branch, including scheduled replanning, uncertain provider
   read-back, inbound tax-bearing settlement, and durable autonomy revocation;
