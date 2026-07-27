@@ -77,3 +77,7 @@ these artifacts.
 - **Conflicting workers:** claims and resource leases select one writer.
 - **Accounting interruption:** reconcile provider records before posting or
   reversing journal entries.
+- **Recovery unavailable:** the supervised objective worker stops on a
+  `recovery_blocked` result; repair or replace the known-good authority
+  snapshot/storage and resolve the recovery intervention before resuming
+  autonomy.

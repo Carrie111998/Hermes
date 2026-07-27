@@ -408,6 +408,11 @@ def run_forever(
         "runtime_host_blocked",
         "integrity_blocked",
         "runtime_drift_blocked",
+        # Recovery storage/authority failures are a global safety stop.  Do
+        # not keep polling or attempting new work while recovery evidence is
+        # unavailable; an advisor must repair or explicitly keep the runtime
+        # stopped first.
+        "recovery_blocked",
     }
     with objectives_db.connect_closing(db_path) as conn:
         from hermes_cli import operational_control
