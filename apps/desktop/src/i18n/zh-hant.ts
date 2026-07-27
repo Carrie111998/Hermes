@@ -2237,6 +2237,7 @@ export const zhHant = defineLocale({
     remotePickerSelect: '選擇資料夾',
     folderTip: cwd => `${cwd} — 點擊以變更資料夾`,
     openFolder: '開啟資料夾',
+    navigateUp: '前往上層資料夾',
     refreshTree: '重新整理檔案樹',
     collapseAll: '收合所有資料夾',
     previewUnavailable: '預覽不可用',

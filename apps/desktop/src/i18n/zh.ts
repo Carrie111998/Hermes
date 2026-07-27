@@ -2617,6 +2617,7 @@ export const zh: Translations = {
     remotePickerSelect: '选择文件夹',
     folderTip: cwd => `${cwd} — 点击更改文件夹`,
     openFolder: '打开文件夹',
+    navigateUp: '转到上级文件夹',
     refreshTree: '刷新文件树',
     collapseAll: '折叠所有文件夹',
     previewUnavailable: '预览不可用',

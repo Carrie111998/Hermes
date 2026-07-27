@@ -2310,6 +2310,7 @@ export const ja = defineLocale({
     remotePickerSelect: 'フォルダーを選択',
     folderTip: cwd => `${cwd} — クリックしてフォルダーを変更`,
     openFolder: 'フォルダーを開く',
+    navigateUp: '親フォルダーに移動',
     refreshTree: 'ツリーを更新',
     collapseAll: 'すべてのフォルダーを折りたたむ',
     previewUnavailable: 'プレビューは利用できません',
