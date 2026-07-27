@@ -427,6 +427,16 @@ The resulting local image manifest was
 This is deterministic local-provider evidence; production providers,
 high-availability deployment, and legal/compliance readiness remain open.
 
+The committed container acceptance was rerun from `9a5370b45c4c3378d97415a76d480f99461134c4` on 2026-07-27. In addition to the existing install, restart, uncertain-provider, accounting, and stop phases, it proved the installed process-separated delegation phase:
+
+```text
+{"phase": "ceo", "grant": "taskgrant_dcd0e0e81ca944138ac4c999cce90ac2", "task": "t_a354cfc6"}
+{"phase": "subordinate", "grant_id": "taskgrant_dcd0e0e81ca944138ac4c999cce90ac2", "task_id": "t_a354cfc6", "evidence_recorded": true}
+{"phase": "ceo", "event": "kanban.task.done", "objective": "verified"}
+```
+
+Image manifest: `sha256:92e65135599ec03c747539b51bc4b5ca9bf1f406c50a97faf758366e46cf33dc`. The provider boundaries remain deterministic local adapters.
+
 Compliance lineage was separately validated with:
 
 ```sh

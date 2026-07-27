@@ -158,8 +158,8 @@ The single current-tree acceptance scenario is the decisive bounded runtime
 proof. It builds and installs the wheel, starts a fresh container, demonstrates
 blocked readiness before controls are satisfied, applies the test charter and
 required local controls, starts the CEO worker, executes one bounded objective,
-restarts the container, and verifies the durable objective state without a
-duplicate provider effect:
+restarts the container, proves process-separated delegation, and verifies the
+durable objective state without a duplicate provider effect:
 
 ```bash
 scripts/run_agentic_acceptance.sh
@@ -233,3 +233,33 @@ The local image manifest was
 `sha256:2c0a6169eade11f87005dd89e4482dfa77e213ba16366c04a167b5c6d0a8f73d`.
 The providers remain deterministic local test adapters; this is not live
 payment, email, or production deployment evidence.
+
+## Latest container acceptance record
+
+The acceptance harness was rerun from commit
+`9a5370b45c4c3378d97415a76d480f99461134c4` on 2026-07-27:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+The installed image completed the delegation phase in a separate subordinate
+process:
+
+```text
+{"phase": "ceo", "grant": "taskgrant_dcd0e0e81ca944138ac4c999cce90ac2", "task": "t_a354cfc6"}
+{"phase": "subordinate", "grant_id": "taskgrant_dcd0e0e81ca944138ac4c999cce90ac2", "task_id": "t_a354cfc6", "evidence_recorded": true}
+{"phase": "ceo", "event": "kanban.task.done", "objective": "verified"}
+```
+
+The complete run also passed uncertain provider read-back and master stop:
+
+```text
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}
+{"phase": "stop", "autonomy": "paused", "generation": 2, "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+Image manifest: `sha256:92e65135599ec03c747539b51bc4b5ca9bf1f406c50a97faf758366e46cf33dc`.
+This remains deterministic local-provider evidence, not production deployment
+or live payment evidence.
