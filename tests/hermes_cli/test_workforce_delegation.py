@@ -790,3 +790,9 @@ def test_spawned_worker_proves_exact_grant_and_rejects_task_tampering(
             enabled_toolsets=["web"],
             enabled_skills=["research"],
         )
+    with pytest.raises(
+        workforce_delegation.DelegationError, match="no longer matches"
+    ):
+        workforce_delegation.validate_task_result_authority(
+            conn, task_id, board="default"
+        )
