@@ -1,0 +1,42 @@
+{
+  "name": "brace-expansion",
+  "version": "5.0.8",
+  "description": "Hermes compatibility adapter for the patched brace-expansion 5.0.8 implementation",
+  "private": true,
+  "type": "module",
+  "main": "./legacy.cjs",
+  "module": "./dist/esm/index.js",
+  "types": "./legacy.d.cts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./legacy.d.cts",
+        "default": "./legacy.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "legacy.cjs",
+    "legacy.d.cts",
+    "LICENSE",
+    "README.md",
+    "UPSTREAM_SHA256SUMS"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "20 || >=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juliangruber/brace-expansion.git"
+  },
+  "dependencies": {
+    "balanced-match": "^4.0.2"
+  }
+}
