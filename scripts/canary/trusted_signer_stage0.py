@@ -66,6 +66,18 @@ def _fsync_directory(path: Path) -> None:
             os.close(descriptor)
 
 
+def _lock_parent_is_trusted(state: os.stat_result) -> bool:
+    """Accept the exact Debian 12 /run/lock mode without widening the lock."""
+
+    return (
+        not stat.S_ISLNK(state.st_mode)
+        and stat.S_ISDIR(state.st_mode)
+        and state.st_uid == 0
+        and state.st_gid == 0
+        and stat.S_IMODE(state.st_mode) in {0o755, 0o775, 0o1777}
+    )
+
+
 @contextmanager
 def _stage0_lock(path: Path = HOST_STAGE0_LOCK) -> Any:
     descriptor: int | None = None
@@ -83,11 +95,7 @@ def _stage0_lock(path: Path = HOST_STAGE0_LOCK) -> Any:
         state = os.fstat(descriptor)
         parent = path.parent.lstat()
         if (
-            stat.S_ISLNK(parent.st_mode)
-            or not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != 0
-            or parent.st_gid != 0
-            or stat.S_IMODE(parent.st_mode) not in {0o755, 0o775}
+            not _lock_parent_is_trusted(parent)
             or not stat.S_ISREG(state.st_mode)
             or state.st_nlink != 1
             or state.st_uid != 0
