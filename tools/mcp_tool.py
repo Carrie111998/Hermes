@@ -5133,6 +5133,60 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
         return strip_nullable_unions(node, keep_nullable_hint=True)
 
+    def _coerce_enum_types(node):
+        """Coerce enum values to match their declared type.
+
+        Moonshot / Kimi strictly validates that ``enum`` array elements
+        match the property's ``type``.  MCP servers commonly produce
+        ``enum: ["10", "20"]`` on an ``integer`` property, which OpenAI
+        and Anthropic tolerate but Kimi rejects with
+        ``<At path '...enum': not a valid integer>``.
+
+        This repair is a JSON Schema sanity fix: if ``type`` says
+        ``integer``, enum values should be ints, not strings; if ``type``
+        says ``number``, they should be floats/ints, not strings.
+        """
+        if isinstance(node, list):
+            return [_coerce_enum_types(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        repaired = {k: _coerce_enum_types(v) for k, v in node.items()}
+
+        enum_vals = repaired.get("enum")
+        type_str = repaired.get("type")
+        if isinstance(enum_vals, list) and isinstance(type_str, str):
+            if type_str == "integer":
+                fixed = []
+                for v in enum_vals:
+                    if isinstance(v, int):
+                        fixed.append(v)
+                    elif isinstance(v, str):
+                        try:
+                            fixed.append(int(v))
+                        except (ValueError, TypeError):
+                            fixed.append(v)
+                    else:
+                        fixed.append(v)
+                if fixed != enum_vals:
+                    repaired["enum"] = fixed
+            elif type_str == "number":
+                fixed = []
+                for v in enum_vals:
+                    if isinstance(v, (int, float)):
+                        fixed.append(v)
+                    elif isinstance(v, str):
+                        try:
+                            fixed.append(float(v))
+                        except (ValueError, TypeError):
+                            fixed.append(v)
+                    else:
+                        fixed.append(v)
+                if fixed != enum_vals:
+                    repaired["enum"] = fixed
+
+        return repaired
+
     def _repair_object_shape(node):
         """Recursively repair object-shaped nodes: fill type, prune required."""
         if isinstance(node, list):
@@ -5173,6 +5227,7 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
     normalized = _rewrite_local_refs(schema)
     normalized = _strip_nullable_union(normalized)
+    normalized = _coerce_enum_types(normalized)
     normalized = _repair_object_shape(normalized)
 
     # Ensure top-level is a well-formed object schema

@@ -1675,6 +1675,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 "vc.bot.meeting_invited_v1",
                 self._on_meeting_invited_event,
             )
+            .register_p2_customized_event(
+                "user_status_change",
+                lambda data: None,  # ponytail: no-op, suppress "processor not found" ERROR spam (56/day)
+            )
             .build()
         )
 
@@ -4384,13 +4388,12 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
-        raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
-            return True
+        # @_all (Feishu @所有人) does NOT count as mentioning the bot.
+        # Only check mentions array for bot's open_id.
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
             return True
+        raw_content = getattr(message, "content", "") or ""
         normalized = normalize_feishu_message(
             message_type=getattr(message, "message_type", "") or "",
             raw_content=raw_content,
