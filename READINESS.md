@@ -1136,6 +1136,26 @@ filesystem access; a retargeted read and a write attempt were rejected by the
 same live worker contract. This remains deterministic local authority-store
 evidence and does not establish production host-filesystem access.
 
+The process-separated delegation acceptance was extended on current `main`
+commit `c198a88f4315ed66dcf5e2ea699b546359fd33f3` with:
+
+```sh
+scripts/delegation_process_acceptance.py
+scripts/run_agentic_acceptance.sh
+```
+
+The installed subordinate now invokes the real `read_file_tool` and
+`write_file_tool` entry points under its exact grant, rejects a retargeted read
+and write attempt, records `file_tool_boundary: pass`, and then completes the
+Kanban task so a fresh CEO runtime can verify the parent objective. The full
+current-tree acceptance result was **PASS**. Its image manifest digest was
+`sha256:d1299bc9d6732c390d9b3d8c3f239991e01831d87777a286fc611e03be8ae700`.
+
+The run also exposed and closed a durable grant-integrity defect: canonical
+toolset ordering is now persisted before subprocess verification. This is
+deterministic local-provider evidence and does not establish production
+filesystem access, provider credentials, or legal/compliance certification.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

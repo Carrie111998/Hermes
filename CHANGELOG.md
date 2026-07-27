@@ -85,6 +85,11 @@
 - The same regression now invokes the real `read_file_tool` and
   `write_file_tool` entry points, proving the exact grant is enforced before
   filesystem access rather than only by a direct policy-unit call.
+- The installed process-separated delegation acceptance now executes the real
+  file tools in the subordinate process, records a `file_tool_boundary` pass,
+  and wakes the CEO only after that evidence-bearing task completion.
+- Canonical toolset ordering is now persisted in delegation grants, preventing
+  valid multi-toolset grants from failing integrity verification after restart.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

@@ -72,6 +72,9 @@ acceptance evidence.
   a write capability cannot be inferred from the read grant.
 - The proof exercises the actual file-tool entry points, so the execution
   boundary cannot bypass the grant by calling a tool directly.
+- The installed process-separated acceptance carries that proof through the
+  subordinate environment and durable CEO handoff; grant integrity remains
+  stable for multi-toolset contracts after persistence.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;
