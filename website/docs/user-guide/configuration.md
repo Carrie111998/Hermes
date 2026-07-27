@@ -1529,7 +1529,7 @@ display:
   spinner_token_flow: true # CLI only: append live cumulative turn tokens to the spinner timer
   runtime_footer:         # Gateway: append a runtime-context footer to final replies
     enabled: false
-    fields: ["model", "context_pct", "cwd"]
+    fields: ["model", "duration", "context_pct", "cwd"]
   file_mutation_verifier: true    # Append an advisory footer when write_file/patch calls failed this turn
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
   language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
@@ -1631,21 +1631,26 @@ Focus view is **display-only**. It never edits conversation history, the system 
 
 ### Runtime-metadata footer (gateway only)
 
-When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The current footer can show the model, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
+When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The footer can show the model, response duration, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "context_pct", "cwd"]   # supported fields: model, context_pct, cwd
+    fields: ["model", "duration", "ctx", "cwd_label"]
 ```
+
+Supported fields are `model`, `duration`, `context_pct`, and `cwd`. Use `ctx`
+instead of `context_pct` to render a labeled value such as `ctx 68%`; use
+`cwd_label` instead of `cwd` to render `cwd ~/project`. Unknown fields and
+fields whose runtime value is unavailable are skipped.
 
 The `/footer` slash command toggles this at runtime in any session.
 
-Example footer appended to a Telegram/Discord/Slack reply:
+Example footer appended to a gateway reply:
 
 ```
-— claude-opus-4.7 · 12 tool calls · 2m 14s · $0.042
+claude-opus-4.7 · 2m14s · ctx 68% · cwd ~/project
 ```
 
 Only the **final** message of a turn gets the footer; interim updates stay clean.

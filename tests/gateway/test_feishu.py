@@ -1538,6 +1538,82 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(follow_up_event.media_types, ["image/png"])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_concurrent_image_then_text_preserves_recent_media_order(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        async def scenario():
+            adapter = FeishuAdapter(PlatformConfig())
+            download_started = asyncio.Event()
+            allow_download = asyncio.Event()
+
+            async def delayed_download(*, message_id, image_key):
+                self.assertEqual((message_id, image_key), ("om_image", "img_123"))
+                download_started.set()
+                await allow_download.wait()
+                return "/tmp/feishu-image.png", "image/png"
+
+            adapter._download_feishu_image = AsyncMock(side_effect=delayed_download)
+            adapter._dispatch_inbound_event = AsyncMock()
+            adapter.get_chat_info = AsyncMock(return_value={"name": "TileTrace 项目", "type": "group"})
+            adapter._resolve_sender_profile = AsyncMock(
+                return_value={
+                    "user_id": "ou_user",
+                    "user_name": "韩泽北",
+                    "user_id_alt": None,
+                }
+            )
+            sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+
+            def message(message_type, content, message_id):
+                return SimpleNamespace(
+                    message_type=message_type,
+                    content=content,
+                    message_id=message_id,
+                    chat_id="oc_chat",
+                    thread_id=None,
+                    root_id=None,
+                    parent_id=None,
+                    upper_message_id=None,
+                    mentions=[],
+                )
+
+            image_task = asyncio.create_task(
+                adapter._process_inbound_message(
+                    data={},
+                    message=message("image", '{"image_key":"img_123"}', "om_image"),
+                    sender_id=sender_id,
+                    chat_type="group",
+                    message_id="om_image",
+                )
+            )
+            await download_started.wait()
+
+            text_task = asyncio.create_task(
+                adapter._process_inbound_message(
+                    data={},
+                    message=message("text", '{"text":"你看得到图片内容吗"}', "om_text"),
+                    sender_id=sender_id,
+                    chat_type="group",
+                    message_id="om_text",
+                )
+            )
+            await asyncio.sleep(0)
+
+            self.assertFalse(text_task.done())
+            adapter._dispatch_inbound_event.assert_not_awaited()
+
+            allow_download.set()
+            await asyncio.gather(image_task, text_task)
+
+            dispatched = [call.args[0] for call in adapter._dispatch_inbound_event.await_args_list]
+            self.assertEqual([event.message_id for event in dispatched], ["om_image", "om_text"])
+            self.assertEqual(dispatched[1].media_urls, ["/tmp/feishu-image.png"])
+            self.assertEqual(dispatched[1].media_types, ["image/png"])
+
+        asyncio.run(scenario())
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_audio_message_downloads_and_caches(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter

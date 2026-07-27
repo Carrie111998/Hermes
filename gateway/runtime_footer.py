@@ -1,6 +1,7 @@
 """Gateway runtime-metadata footer.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
+Renders a compact footer showing runtime state (model, duration, context %,
+cwd) and
 appends it to the FINAL message of an agent turn when enabled.  Off by default
 to keep replies minimal.
 
@@ -9,7 +10,7 @@ Config (``~/.hermes/config.yaml``)::
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
+        fields: [model, duration, context_pct, cwd]  # order shown; drop any to hide
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -115,7 +116,8 @@ def format_runtime_footer(
     Fields are skipped silently when their underlying data is missing — a
     partially-populated footer is better than a line with ``?%`` or empty slots.
 
-    Supported fields: ``model``, ``context_pct``, ``cwd``, ``duration``.
+    Supported fields: ``model``, ``duration``, ``context_pct`` (or labeled
+    alias ``ctx``), and ``cwd`` (or labeled alias ``cwd_label``).
     """
     parts: list[str] = []
     for field in fields:

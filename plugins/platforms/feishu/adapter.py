@@ -1497,7 +1497,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_inbound_lock = threading.Lock()
         self._pending_drain_scheduled = False
         self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
-        self._chat_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()  # chat_id → lock (per-chat serial processing, LRU-bounded)
+        self._chat_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()  # chat_id → lock (per-chat agent dispatch, LRU-bounded)
+        self._inbound_intake_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()  # chat_id → lock (media extraction/cache ordering, LRU-bounded)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
@@ -3070,6 +3071,34 @@ class FeishuAdapter(BasePlatformAdapter):
     # Per-chat serialization and typing indicator
     # =========================================================================
 
+    def _get_inbound_intake_lock(self, chat_id: str) -> asyncio.Lock:
+        """Return the per-chat lock that preserves inbound cache ordering.
+
+        Feishu SDK callbacks are submitted to the event loop independently.  A
+        media event may therefore still be downloading when a following text
+        event starts.  This lock serializes extraction, recent-media cache
+        mutation/lookups, and normalization in callback arrival order, before
+        the separate agent-dispatch lock is involved.
+        """
+        lock_map = getattr(self, "_inbound_intake_locks", None)
+        if lock_map is None:
+            lock_map = collections.OrderedDict()
+            self._inbound_intake_locks = lock_map
+        lock = lock_map.get(chat_id)
+        if lock is not None:
+            lock_map.move_to_end(chat_id)
+            return lock
+        if len(lock_map) >= self.CHAT_LOCK_MAX_SIZE:
+            for key in list(lock_map):
+                if not lock_map[key].locked():
+                    lock_map.pop(key)
+                    break
+            # If every lock is active, grow temporarily rather than evicting a
+            # live lock and allowing two intake paths for the same chat.
+        lock = asyncio.Lock()
+        lock_map[chat_id] = lock
+        return lock
+
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         """Return (creating if needed) the per-chat asyncio.Lock for serial message processing.
 
@@ -3285,6 +3314,36 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id: str,
         is_bot: bool = False,
     ) -> None:
+        """Process one inbound callback in per-chat arrival order.
+
+        The lock starts before media extraction so a text follow-up cannot read
+        recent-media state while an earlier image callback is still downloading.
+        Agent dispatch has its own lock and may continue asynchronously after
+        this intake phase.
+        """
+        chat_id = getattr(message, "chat_id", "") or ""
+        async with self._get_inbound_intake_lock(chat_id):
+            normalized = await self._normalize_inbound_message_serialized(
+                data=data,
+                message=message,
+                sender_id=sender_id,
+                chat_type=chat_type,
+                message_id=message_id,
+                is_bot=is_bot,
+            )
+        if normalized is not None:
+            await self._dispatch_inbound_event(normalized)
+
+    async def _normalize_inbound_message_serialized(
+        self,
+        *,
+        data: Any,
+        message: Any,
+        sender_id: Any,
+        chat_type: str,
+        message_id: str,
+        is_bot: bool = False,
+    ) -> Optional[MessageEvent]:
         text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
 
         if inbound_type == MessageType.TEXT:
@@ -3378,7 +3437,7 @@ class FeishuAdapter(BasePlatformAdapter):
             channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
-        await self._dispatch_inbound_event(normalized)
+        return normalized
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
         """Apply Feishu-specific burst protection before entering the base adapter."""
