@@ -735,6 +735,18 @@ selection, budget and headcount enforcement, hierarchical provisioning,
 build/FOSS/buy ordering, procurement idempotency, and governed adapter
 execution/read-back.
 
+Compose deployment definitions were validated on current `main` commit
+`a692fdc52d38d94e3e867c1b5bb703a701c1fa50` with:
+
+```sh
+docker compose config --quiet
+docker compose -f docker-compose.windows.yml config --quiet
+```
+
+Both commands passed. This validates Compose configuration syntax and
+interpolation only; it does not establish a production deployment or external
+service availability.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
