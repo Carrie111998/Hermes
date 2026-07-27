@@ -1775,6 +1775,27 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production multi-tenant read isolation or external authorization.
 
+## Kanban orchestrator authority evidence (dddf88097b)
+
+Orchestrator-only Kanban actions now require exact permits. `kanban.list` binds
+filters, tenant, archive mode, limit, and board; `kanban.unblock` binds the
+exact task and board. A governed orchestrator cannot replay a grant with a
+broader query or a different lifecycle target.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/kanban_tools.py tests/tools/test_kanban_tools.py
+uv run --extra dev pytest -q tests/tools/test_kanban_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **129 Kanban regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:a46eeca5239c5426c1310ded5db9cd8d0f9ba4a56d2838c2da2220e761cfed6b`.
+This remains deterministic local-provider evidence and does not establish
+production multi-tenant orchestration or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

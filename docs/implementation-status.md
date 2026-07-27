@@ -81,6 +81,8 @@ acceptance evidence.
   expected-run checks.
 - Kanban task and attachment reads are governed by exact task/board scope,
   preventing workers from inspecting unrelated durable work state.
+- Orchestrator Kanban list and unblock actions are governed by exact query or
+  task/board scope before board discovery or lifecycle changes.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Orchestrator-only Kanban list and unblock actions now require exact permits
+  bound to filters/limits/tenant/archive mode or task/board target,
+  respectively.
 - Kanban full-task inspection and attachment listing now require exact
   task/board read permits, preventing cross-task disclosure of bodies,
   comments, runs, events, and artifact metadata.
