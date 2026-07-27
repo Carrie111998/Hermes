@@ -35,6 +35,9 @@
   child grants are bounded by that parent grant's capabilities, systems,
   toolsets, skills, exact resource, budget, and expiry, preventing transitive
   privilege amplification through the reporting hierarchy.
+- Non-root managers can no longer manufacture delegation authority by
+  self-dispatching from a standing mandate; self-assigned grants also require
+  an active parent grant from the manager above them.
 - Grant admission now requires the delegator employee and mandate to be
   active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority

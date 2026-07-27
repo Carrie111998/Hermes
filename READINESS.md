@@ -1241,6 +1241,25 @@ This remains deterministic local-provider evidence and does not establish
 production media isolation, provider credentials, or legal/compliance
 certification.
 
+## Delegator-authority monotonicity evidence (82e4d3b87e)
+
+The current tree also rejects a non-root employee that attempts to create a
+grant assigned to itself without an active parent grant. This closes the
+self-dispatch route by which a subordinate could otherwise convert its
+standing mandate into new delegation authority. The focused regression run
+was:
+
+```sh
+uv run --extra dev pytest -q tests/hermes_cli/test_workforce_delegation.py
+uv run --extra dev ruff check hermes_cli/workforce_delegation.py tests/hermes_cli/test_workforce_delegation.py
+```
+
+Results: **17 tests passed and ruff passed**. The full current-tree acceptance
+also passed after this change with image manifest digest
+`sha256:5461cb687ad66f361930c16165220a883c768dc9bb656a674b4fdf9c4da64597`.
+This proves the local deterministic authority boundary; it does not establish
+production deployment or external-provider authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

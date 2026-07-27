@@ -24,7 +24,8 @@ acceptance evidence.
 - Delegation is authority-monotone: grants are bounded by the current
   delegator mandate as well as the subordinate mandate, objective scope,
   budget, and expiry; non-root managers must additionally delegate only from
-  an active parent grant, so privilege cannot be amplified through hierarchy.
+  an active parent grant, including when self-dispatching, so privilege cannot
+  be amplified through hierarchy or manufactured from a standing mandate.
 - Delegation grants persist the exact action system and target resource, and
   Kanban bindings must match that immutable scope before a worker can launch.
 - Grant admission requires the delegator employee and mandate to be active at
