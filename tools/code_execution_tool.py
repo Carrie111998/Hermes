@@ -30,6 +30,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 
 import base64
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -1206,6 +1207,32 @@ def execute_code(
     Returns:
         JSON string with execution results.
     """
+    # Governed workers must authorize the exact script before any sandbox
+    # availability check or child process is started. The digest is part of
+    # the resource contract, so changing even one byte requires a new permit;
+    # code execution is never inferred from terminal or file capabilities.
+    try:
+        from hermes_cli.workforce_delegation import authorize_worker_action
+
+        authorize_worker_action(
+            capability="code.execute",
+            system="localhost",
+            target_resource=(
+                "code:"
+                + hashlib.sha256((code or "").encode("utf-8")).hexdigest()
+            ),
+        )
+    except Exception as exc:
+        if os.environ.get("HERMES_EXECUTION_CONTRACT_ID"):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": str(exc),
+                    "tool_calls_made": 0,
+                    "duration_seconds": 0,
+                },
+                ensure_ascii=False,
+            )
     if not SANDBOX_AVAILABLE:
         return json.dumps({
             "error": "execute_code sandbox is unavailable in this environment. "

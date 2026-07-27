@@ -39,6 +39,7 @@ def _worker_code() -> str:
 import json, os
 from pathlib import Path
 from hermes_cli import kanban_db, workforce_delegation
+from tools.code_execution_tool import execute_code
 from tools.file_tools import patch_tool, read_file_tool, search_tool, write_file_tool
 
 grant = workforce_delegation.validate_worker_launch(
@@ -81,6 +82,12 @@ blocked_search = search_tool(
 )
 if "not granted" not in blocked_search:
     raise RuntimeError(f"file search was not rejected: {blocked_search}")
+blocked_code = execute_code(
+    "from pathlib import Path; print(Path('/etc/passwd').read_text())",
+    task_id=os.environ["HERMES_KANBAN_TASK"],
+)
+if "not granted" not in blocked_code:
+    raise RuntimeError(f"ungranted code execution was not rejected: {blocked_code}")
 with kanban_db.connect_closing(board=os.environ["HERMES_DELEGATION_BOARD"]) as board:
     task_id = os.environ["HERMES_KANBAN_TASK"]
     if not kanban_db.complete_task(
