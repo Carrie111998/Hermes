@@ -81,7 +81,8 @@ const RUSSIAN_FUNCTION_COPY_CASES: RussianFunctionCopyCase[] = [
   {
     path: 'boot.failure.remoteSignInHint',
     args: ['Войти в Hermes Cloud'],
-    expected: 'Будет выполнен выход из сохранённой удалённой сессии браузера, затем откроется Войти в Hermes Cloud.'
+    expected:
+      'Будет выполнен выход из сохранённой удалённой сессии браузера, затем откроется Войти в Hermes Cloud. Чтобы переключиться на встроенный бэкенд, используйте локальный шлюз.'
   },
   {
     path: 'profiles.soulPlaceholder',
