@@ -393,7 +393,7 @@ def test_authority_contracts_and_evidence_are_database_immutable(conn):
         conn, permit_id, action_id=action_id, organization_id="__unscoped__", payload=payload, executor="worker",
     )
     result_id = odb.record_execution_result(
-        conn, action_id=action_id, permit_id=permit_id, executor="worker",
+        conn, action_id=action_id, permit_id=permit_id, executor="worker", organization_id="__unscoped__",
         status="succeeded", result={"provider_id": "change-1"},
         started_at=int(time.time()),
     )

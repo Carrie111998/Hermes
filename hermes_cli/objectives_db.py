@@ -1233,6 +1233,7 @@ def record_execution_result(
     action_id: str,
     permit_id: str,
     executor: str,
+    organization_id: str,
     status: str,
     result: Any,
     started_at: int,
@@ -1253,6 +1254,12 @@ def record_execution_result(
         ).fetchone()
         if action is None or permit is None:
             raise KeyError("action or permit not found")
+        objective = conn.execute(
+            "SELECT organization_id FROM objectives WHERE id=?",
+            (action["objective_id"],),
+        ).fetchone()
+        if objective is None or str(objective["organization_id"]) != organization_id:
+            raise PermitError("execution result organization does not match objective")
         if permit["action_id"] != action_id or permit["issued_to"] != executor:
             raise PermitError("execution result does not match permit")
         if permit["consumed_at"] is None or action["status"] != "executing":

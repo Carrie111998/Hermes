@@ -111,6 +111,7 @@ def _verified_action(conn, objective_id: str) -> tuple[str, str]:
         action_id=action_id,
         permit_id=permit_id,
         executor="worker",
+        organization_id=organization_id,
         status="succeeded",
         result={"provider_id": "change-1"},
         started_at=int(time.time()),

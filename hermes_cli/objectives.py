@@ -340,11 +340,20 @@ def objectives_command(args: argparse.Namespace) -> int:
             )
             _print({"permit_id": args.permit_id, "status": "consumed"}, as_json=True)
         elif command == "record-result":
+            organization = conn.execute(
+                """SELECT o.organization_id FROM objectives o
+                   JOIN candidate_actions a ON a.objective_id=o.id
+                   WHERE a.id=?""",
+                (args.action_id,),
+            ).fetchone()
+            if organization is None:
+                raise KeyError("action objective not found")
             result_id = db.record_execution_result(
                 conn,
                 action_id=args.action_id,
                 permit_id=args.permit_id,
                 executor=args.executor,
+                organization_id=str(organization["organization_id"]),
                 status=args.status,
                 result=_json_value(args.result, label="result"),
                 started_at=args.started_at,

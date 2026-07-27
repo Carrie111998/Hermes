@@ -697,6 +697,9 @@ class ObjectiveRuntime:
                 action_id=action_id,
                 permit_id=str(permit["id"]),
                 executor=self.executor.identity,
+                organization_id=db.get_objective(
+                    self.conn, objective_id
+                ).organization_id,
                 status=execution.status,
                 result=execution.result,
                 started_at=int(permit["consumed_at"]),
@@ -1608,6 +1611,9 @@ class ObjectiveRuntime:
                 action_id=action_id,
                 permit_id=permit_id,
                 executor=self.executor.identity,
+                organization_id=db.get_objective(
+                    self.conn, objective_id
+                ).organization_id,
                 status=execution.status,
                 result=execution.result,
                 started_at=started,
