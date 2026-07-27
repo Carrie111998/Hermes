@@ -1,8 +1,13 @@
 # Charterforge Stripe rail
 
-This is an optional standalone payment rail. Install it into the same
-environment as Charterforge with `pip install -e packages/charterforge-stripe-rail`
-and provide the secret-only `STRIPE_SECRET_KEY` environment variable.
+This is an optional standalone payment rail. From the Charterforge checkout,
+install the core and rail into the same environment:
+
+```bash
+pip install -e . -e packages/charterforge-stripe-rail
+```
+
+Then provide the secret-only `STRIPE_SECRET_KEY` environment variable.
 
 The rail creates Stripe Checkout Sessions for inbound receivables and reads
 them back for verification. Outbound payments require both an explicit Stripe

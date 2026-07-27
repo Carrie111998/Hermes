@@ -31,9 +31,10 @@ Payment tools must remain non-custodial and use opaque provider identifiers.
 They must not accept raw PANs, bank credentials, private keys, or seed phrases.
 
 The repository's reference Stripe rail lives in
-`packages/charterforge-stripe-rail/`, outside the core package. Install it
-explicitly with `pip install -e packages/charterforge-stripe-rail` and set the
-secret-only `STRIPE_SECRET_KEY`. It creates inbound Checkout Sessions and
+`packages/charterforge-stripe-rail/`, outside the core package. Install the
+checkout and rail together with `pip install -e . -e
+packages/charterforge-stripe-rail`, then set the secret-only
+`STRIPE_SECRET_KEY`. It creates inbound Checkout Sessions and
 verifies them by read-back. Its outbound path requires an exact Connected
 Account and payment-method identifier; arbitrary vendor payouts are rejected.
 
