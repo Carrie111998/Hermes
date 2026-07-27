@@ -858,6 +858,20 @@ class ActionExecutorRegistry:
             )
         if self._authority_conn is None:
             return handler(payload)
+        from hermes_cli import operational_control
+
+        # Recheck the kill-switch at the last deterministic boundary before
+        # invoking an external handler.  Permit issuance and lease acquisition
+        # can race with an operator pause; no new side effect should begin
+        # after the pause has committed.
+        operational_control.ensure_schema(self._authority_conn)
+        try:
+            operational_control.assert_autonomous(self._authority_conn)
+        except operational_control.AutonomyRevokedError as exc:
+            return ExecutionOutcome(
+                status="failed",
+                result={"error": f"autonomy execution is paused: {exc}"},
+            )
         from hermes_cli import operation_circuit_breaker as breaker
 
         operation_key = f"{action_type}:{payload.get('system', '')}"

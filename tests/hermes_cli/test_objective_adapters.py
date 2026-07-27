@@ -6,7 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import accounting_db, finance_db, objectives_db, organization_db
+from hermes_cli import (
+    accounting_db,
+    finance_db,
+    objectives_db,
+    operational_control,
+    organization_db,
+)
 from hermes_cli import objective_adapters as adapters
 from hermes_cli import verification_evidence
 from hermes_cli.objective_runtime import (
@@ -185,6 +191,27 @@ def test_unknown_executor_fails_closed():
     outcome = registry.execute("shell.unrestricted", {"system": "host"})
     assert outcome.status == "failed"
     assert "no executor" in outcome.result["error"]
+
+
+def test_executor_rechecks_autonomy_before_external_handler(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    operational_control.ensure_schema(conn)
+    called = []
+    registry = adapters.ActionExecutorRegistry(authority_conn=conn)
+    registry.register(
+        "test.external",
+        lambda payload: (called.append(payload) or ExecutionOutcome("succeeded", {})),
+        required_capability="test.external",
+        target_system="test",
+        verification_method="test.readback",
+    )
+    operational_control.set_autonomy_mode(
+        conn, mode="paused", actor="advisor", reason="emergency stop"
+    )
+    outcome = registry.execute("test.external", {"system": "test"})
+    assert outcome.status == "failed"
+    assert "paused" in outcome.result["error"]
+    assert called == []
 
 
 def test_executor_contract_rejects_manually_injected_mismatched_authority():
