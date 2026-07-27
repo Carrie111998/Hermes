@@ -18,6 +18,7 @@ protection — do not "fix" the test, restore the behaviour.
 from __future__ import annotations
 
 import inspect
+import os
 import re
 import sqlite3
 import sys
@@ -257,3 +258,89 @@ def test_plugin_hook_dispatch_still_exists():
 
     assert hasattr(plugin_mod, "invoke_hook"), "hermes_cli.plugins.invoke_hook is gone"
     assert callable(plugin_mod.invoke_hook)
+
+
+# ── 8. vulnerable SQLite must GATE, not merely warn ──────────────────────────
+# Added after the guard shipped advisory-only. hermes-agent/venv is Python
+# 3.11.15 -- inside requires-python, so the Python half passes it -- linking
+# SQLite 3.50.4 against ~10 already-WAL databases. An upstream merge that
+# restores "advisory" reopens a live corruption path on a runtime the guard
+# itself calls supported, and nothing else would notice.
+
+def test_vulnerable_sqlite_gates_startup():
+    from hermes_cli import runtime_guard as rg
+
+    calls = {}
+    rg_enforce_src = _read(REPO / "hermes_cli" / "runtime_guard.py")
+    assert "check_sqlite" in rg_enforce_src
+
+    # enforce() must fail when the SQLite half fails, independent of Python.
+    import io as _io
+    orig_py, orig_sq = rg.check_python, rg.check_sqlite
+    try:
+        rg.check_python = lambda **k: True
+        rg.check_sqlite = lambda **k: False
+        try:
+            rg.enforce(exit_on_failure=True, stream=_io.StringIO())
+        except SystemExit as exc:
+            calls["exit"] = exc.code
+    finally:
+        rg.check_python, rg.check_sqlite = orig_py, orig_sq
+
+    assert calls.get("exit") == 1, (
+        "vulnerable SQLite no longer gates startup -- it is advisory again"
+    )
+
+
+def test_sqlite_suppressor_cannot_clear_a_real_vulnerability():
+    """The cosmetic silencer must never double as a safety override."""
+    from hermes_cli import runtime_guard as rg
+    import io as _io
+
+    assert hasattr(rg, "ALLOW_VULNERABLE_SQLITE_ENV"), (
+        "the explicit accept-the-risk override was removed"
+    )
+    orig = rg._sqlite_vulnerable
+    old_suppress = os.environ.get(rg.SUPPRESS_SQLITE_WARNING_ENV)
+    old_allow = os.environ.get(rg.ALLOW_VULNERABLE_SQLITE_ENV)
+    try:
+        rg._sqlite_vulnerable = lambda: (True, "3.50.4")
+        os.environ[rg.SUPPRESS_SQLITE_WARNING_ENV] = "1"
+        os.environ.pop(rg.ALLOW_VULNERABLE_SQLITE_ENV, None)
+        assert rg.check_sqlite(stream=_io.StringIO()) is False, (
+            "SUPPRESS_SQLITE_WARNING bypasses the vulnerability check again"
+        )
+    finally:
+        rg._sqlite_vulnerable = orig
+        for k, v in ((rg.SUPPRESS_SQLITE_WARNING_ENV, old_suppress),
+                     (rg.ALLOW_VULNERABLE_SQLITE_ENV, old_allow)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ── 9. a crashed turn must not report completed (H-01) ───────────────────────
+
+def test_crashed_turn_is_not_reported_completed():
+    from agent.turn_finalizer import turn_crashed
+
+    assert turn_crashed("local_processing_error(TypeError: x)") is True
+    assert turn_crashed("error_near_max_iterations(502)") is True
+    # deliberate early exit, not a crash -- must stay completable
+    assert turn_crashed("guardrail_halt") is False
+    assert turn_crashed("text_response(finish_reason=stop)") is False
+
+    src = _read(REPO / "agent" / "turn_finalizer.py")
+    assert "not _crashed" in src, (
+        "finalize_turn no longer excludes crashes from completed -- cron will "
+        "mark crashed jobs ok again"
+    )
+
+
+def test_delegate_tool_does_not_report_a_crashed_child_completed():
+    src = _read(REPO / "tools" / "delegate_tool.py")
+    assert "turn_crashed" in src, "delegate_tool stopped consulting the predicate"
+    assert src.index("elif child_crashed:") < src.index(
+        "elif summary and not _empty_sentinel:"
+    ), "the crash check no longer precedes the summary-presence branch"
