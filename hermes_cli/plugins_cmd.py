@@ -389,6 +389,46 @@ def _prompt_plugin_env_vars(manifest: dict, console) -> None:
     console.print()
 
 
+def _plugin_requires_env(source: str, locator: Optional[str]) -> list:
+    """Best-effort ``requires_env`` for a plugin, for post-enable prompting.
+
+    ``locator`` is the discovery ``dir`` field: a filesystem directory for
+    bundled/user plugins (read its ``plugin.yaml``) or a dotted module path for
+    entrypoint plugins (read a module-level ``REQUIRES_ENV``). Never raises.
+    """
+    if not locator:
+        return []
+    try:
+        if source == "entrypoint":
+            import importlib
+
+            mod = importlib.import_module(locator.split(":", 1)[0])
+            return list(getattr(mod, "REQUIRES_ENV", None) or [])
+        return list(_read_manifest(Path(locator)).get("requires_env") or [])
+    except Exception as e:
+        logger.debug("requires_env lookup failed (%s): %s", locator, e)
+        return []
+
+
+def _prompt_requires_env_for_key(key: str, console) -> None:
+    """After enabling ``key``, prompt for any secrets it declares that aren't
+    set yet (saved to ~/.hermes/.env). Resolves the plugin's ``requires_env``
+    from its manifest/entry-point module. No-op when nothing is missing; never
+    blocks enabling on error."""
+    try:
+        source = ""
+        locator = None
+        for _n, _v, _d, src, dpath, k in _discover_all_plugins():
+            if k == key:
+                source, locator = src, dpath
+                break
+        req = _plugin_requires_env(source, locator)
+        if req:
+            _prompt_plugin_env_vars({"name": key, "requires_env": req}, console)
+    except Exception as e:
+        logger.debug("requires_env prompt skipped for %s: %s", key, e)
+
+
 def _display_after_install(plugin_dir: Path, identifier: str) -> None:
     """Show after-install.md if it exists, otherwise a default message."""
     from rich.console import Console
@@ -890,6 +930,10 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         )
     else:
         console.print(f"[dim]Plugin '{key}' is already enabled.[/dim]")
+
+    # Prompt for any secrets the plugin declares (e.g. COMPRESR_API_KEY) that
+    # aren't set yet, saving them to ~/.hermes/.env. No-op if none are missing.
+    _prompt_requires_env_for_key(key, console)
 
     # Built-in tool override is a privileged grant. Bundled plugins ship with
     # Hermes core and are trusted; every other source needs operator opt-in.
@@ -1677,6 +1721,10 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
             f"\n[green]\u2713[/green] General plugins: {len(new_enabled)} enabled, "
             f"{len(plugin_keys) - len(new_enabled)} disabled."
         )
+        # Prompt for secrets of plugins just switched on (e.g. COMPRESR_API_KEY).
+        for i in chosen:
+            if i not in plugin_selected and 0 <= i < len(plugin_keys):
+                _prompt_requires_env_for_key(plugin_keys[i], console)
     elif n_plugins > 0:
         console.print("\n[dim]General plugins unchanged.[/dim]")
 
@@ -1740,6 +1788,10 @@ def _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
         if new_enabled != prev_enabled or new_disabled != disabled:
             _save_enabled_set(new_enabled)
             _save_disabled_set(new_disabled)
+            # Prompt for secrets of plugins just switched on.
+            for i in chosen:
+                if i not in plugin_selected and 0 <= i < len(plugin_keys):
+                    _prompt_requires_env_for_key(plugin_keys[i], console)
 
     # Provider categories
     if categories:
