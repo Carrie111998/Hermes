@@ -3072,117 +3072,35 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
-                # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
-                if initial_status == "blocked":
-                    task_status = "blocked"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
-                    task_status = "triage"
-                else:
-                    task_status = "ready"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
-                        rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
-                            parents,
-                        ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
-                # Even in triage mode we still need to validate parent ids
-                # so the eventual link rows don't dangle.
-                if triage and parents:
-                    missing = _find_missing_parents(conn, parents)
-                    if missing:
-                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-
-                # Project-linked worktree: a fresh worktree dir under the repo
-                # plus a deterministic branch (project slug + task id). Together
-                # these kill the random ``wt/<task-id>`` worker fallback and the
-                # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
-                            project_repo, ".worktrees", task_id
-                        )
-                    if not branch_name:
-                        # _pdb was imported above when project_obj was resolved.
-                        try:
-                            branch_name = _pdb.branch_name_for(
-                                project_obj, task_id, title=title or ""
-                            )
-                        except Exception:
-                            branch_name = None
-
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        title.strip(),
-                        body,
-                        assignee,
-                        task_status,
-                        priority,
-                        created_by,
-                        now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
-                        project_id,
-                        tenant,
-                        idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        int(max_retries) if max_retries is not None else None,
-                        model_override,
-                        provider_override,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
-                        session_id,
-                    ),
-                )
-                for pid in parents:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
-                    )
-                _append_event(
+                _create_task_locked(
                     conn,
-                    task_id,
-                    "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
-                        "project_id": project_id,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
-                        "provider_override": provider_override,
-                    },
+                    task_id=task_id,
+                    now=now,
+                    title=title,
+                    body=body,
+                    assignee=assignee,
+                    priority=priority,
+                    created_by=created_by,
+                    workspace_kind=workspace_kind,
+                    workspace_path=workspace_path,
+                    branch_name=branch_name,
+                    project_id=project_id,
+                    project_obj=project_obj,
+                    project_repo=project_repo,
+                    tenant=tenant,
+                    idempotency_key=idempotency_key,
+                    max_runtime_seconds=max_runtime_seconds,
+                    skills_list=skills_list,
+                    max_retries=max_retries,
+                    model_override=model_override,
+                    provider_override=provider_override,
+                    goal_mode=goal_mode,
+                    goal_max_turns=goal_max_turns,
+                    session_id=session_id,
+                    parents=parents,
+                    triage=triage,
+                    initial_status=initial_status,
                 )
-                _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3190,6 +3108,159 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def _create_task_locked(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    now: int,
+    title: str,
+    body: Optional[str],
+    assignee: Optional[str],
+    priority: int,
+    created_by: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    branch_name: Optional[str],
+    project_id: Optional[str],
+    project_obj: Any,
+    project_repo: Optional[str],
+    tenant: Optional[str],
+    idempotency_key: Optional[str],
+    max_runtime_seconds: Optional[int],
+    skills_list: Optional[list[str]],
+    max_retries: Optional[int],
+    model_override: Optional[str],
+    provider_override: Optional[str],
+    goal_mode: bool,
+    goal_max_turns: Optional[int],
+    session_id: Optional[str],
+    parents: Iterable[str],
+    triage: bool,
+    initial_status: str,
+) -> None:
+    """Insert one task (+ its parent links, created-event, inherited subs).
+
+    Transaction-internal helper: **the caller must already hold an open write
+    transaction** (``write_txn``). It opens no ``BEGIN`` of its own, so it can
+    be composed inside a larger outer transaction (e.g. the review-required
+    effect reconciler) with no nested-BEGIN. The public :func:`create_task`
+    wrapper is behavior-unchanged: it resolves projects/skills/idempotency and
+    the id-collision retry loop around this helper exactly as before.
+    """
+    parents = tuple(parents)
+    # Determine task status from parent status, unless the caller
+    # parks it directly in blocked for human-ops review or in
+    # triage for a specifier.
+    if initial_status == "blocked":
+        task_status = "blocked"
+        if parents:
+            missing = _find_missing_parents(conn, parents)
+            if missing:
+                raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+    elif triage:
+        task_status = "triage"
+    else:
+        task_status = "ready"
+        if parents:
+            missing = _find_missing_parents(conn, parents)
+            if missing:
+                raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+            # If any parent is not yet done, we're todo.
+            rows = conn.execute(
+                "SELECT status FROM tasks WHERE id IN "
+                "(" + ",".join("?" * len(parents)) + ")",
+                parents,
+            ).fetchall()
+            if any(r["status"] != "done" for r in rows):
+                task_status = "todo"
+    # Even in triage mode we still need to validate parent ids
+    # so the eventual link rows don't dangle.
+    if triage and parents:
+        missing = _find_missing_parents(conn, parents)
+        if missing:
+            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+
+    # Project-linked worktree: a fresh worktree dir under the repo
+    # plus a deterministic branch (project slug + task id). Together
+    # these kill the random ``wt/<task-id>`` worker fallback and the
+    # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
+    if project_obj is not None and workspace_kind == "worktree":
+        if project_repo and not workspace_path:
+            workspace_path = os.path.join(
+                project_repo, ".worktrees", task_id
+            )
+        if not branch_name:
+            from hermes_cli import projects_db as _pdb
+            try:
+                branch_name = _pdb.branch_name_for(
+                    project_obj, task_id, title=title or ""
+                )
+            except Exception:
+                branch_name = None
+
+    conn.execute(
+        """
+        INSERT INTO tasks (
+            id, title, body, assignee, status, priority,
+            created_by, created_at, workspace_kind, workspace_path,
+            branch_name, project_id, tenant, idempotency_key,
+            max_runtime_seconds,
+            skills, max_retries, model_override, provider_override,
+            goal_mode, goal_max_turns, session_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            title.strip(),
+            body,
+            assignee,
+            task_status,
+            priority,
+            created_by,
+            now,
+            workspace_kind,
+            workspace_path,
+            branch_name,
+            project_id,
+            tenant,
+            idempotency_key,
+            int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+            json.dumps(skills_list) if skills_list is not None else None,
+            int(max_retries) if max_retries is not None else None,
+            model_override,
+            provider_override,
+            1 if goal_mode else 0,
+            int(goal_max_turns) if goal_max_turns is not None else None,
+            session_id,
+        ),
+    )
+    for pid in parents:
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (pid, task_id),
+        )
+    _append_event(
+        conn,
+        task_id,
+        "created",
+        {
+            "assignee": assignee,
+            "status": task_status,
+            "parents": list(parents),
+            "tenant": tenant,
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+            "branch_name": branch_name,
+            "project_id": project_id,
+            "skills": list(skills_list) if skills_list else None,
+            "goal_mode": bool(goal_mode) or None,
+            "model_override": model_override,
+            "provider_override": provider_override,
+        },
+    )
+    _inherit_notify_subs(conn, task_id, parents, created_at=now)
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -3403,31 +3474,56 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
-        missing = _find_missing_parents(conn, [parent_id, child_id])
-        if missing:
-            raise ValueError(f"unknown task(s): {', '.join(missing)}")
-        if _would_cycle(conn, parent_id, child_id):
-            raise ValueError(
-                f"linking {parent_id} -> {child_id} would create a cycle"
-            )
+        _link_tasks_locked(conn, parent_id=parent_id, child_id=child_id)
+
+
+def _link_tasks_locked(
+    conn: sqlite3.Connection, *, parent_id: str, child_id: str
+) -> None:
+    """Add a parent→child dependency edge. Transaction-internal helper.
+
+    **The caller must already hold an open write transaction.** It opens no
+    ``BEGIN`` of its own so it composes inside a larger outer transaction (e.g.
+    the review-required effect reconciler re-parenting downstream cards under
+    the authoritative review card) with no nested-BEGIN. Public
+    :func:`link_tasks` is the behavior-unchanged wrapper.
+    """
+    if parent_id == child_id:
+        raise ValueError("a task cannot depend on itself")
+    missing = _find_missing_parents(conn, [parent_id, child_id])
+    if missing:
+        raise ValueError(f"unknown task(s): {', '.join(missing)}")
+    if _would_cycle(conn, parent_id, child_id):
+        raise ValueError(
+            f"linking {parent_id} -> {child_id} would create a cycle"
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        (parent_id, child_id),
+    )
+    # If child was ready but parent is not yet done, demote child to todo.
+    parent_status = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+    ).fetchone()["status"]
+    if parent_status != "done":
         conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, child_id),
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+            (child_id,),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
-        _append_event(
-            conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
-        )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
+    _append_event(
+        conn, child_id, "linked",
+        {"parent": parent_id, "child": child_id},
+    )
+    _inherit_notify_subs(conn, child_id, (parent_id,))
+
+
+def _link_exists(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    """True if a parent→child dependency edge already exists."""
+    row = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ? LIMIT 1",
+        (parent_id, child_id),
+    ).fetchone()
+    return row is not None
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -4689,6 +4785,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    review_required: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4717,8 +4814,25 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    ``review_required`` is an optional, schema-validated ``review_required``
+    effect payload (see :mod:`hermes_cli.kanban_effects`). When ``None`` this
+    function behaves byte-for-byte as before (R02). When present it is
+    validated up-front (an invalid payload raises before any state change —
+    R03) and, if the repository-only effect schema is installed on this board,
+    a durable source/outbox effect record is persisted inside the SAME
+    completion transaction (R01). On a normal (default-off) board with no
+    effect tables the validated payload is a safe no-op — the feature is not
+    live.
     """
     now = int(time.time())
+
+    # Validate the optional review-required effect payload BEFORE mutating any
+    # state, so an invalid payload is a clean no-op rejection (R03).
+    review_payload = None
+    if review_required is not None:
+        from hermes_cli import kanban_effects as _kfx
+        review_payload = _kfx.validate_review_required(review_required)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4848,6 +4962,18 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        # Persist the review-required effect source/outbox record in the SAME
+        # completion transaction (repository-only, default-off). No-op unless
+        # the effect schema was explicitly installed on this board (R01).
+        if review_payload is not None:
+            from hermes_cli import kanban_effects as _kfx
+            _kfx.record_effect_locked(
+                conn,
+                source_task_id=task_id,
+                source_transition=_kfx.TRANSITION_COMPLETE,
+                payload=review_payload,
+                now=now,
+            )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5469,6 +5595,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    review_required: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5501,6 +5628,27 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Validate the optional review-required effect payload BEFORE mutating any
+    # state (R03). Absent payload preserves existing behavior exactly (R02).
+    review_payload = None
+    if review_required is not None:
+        from hermes_cli import kanban_effects as _kfx
+        review_payload = _kfx.validate_review_required(review_required)
+
+    def _record_block_effect() -> None:
+        """Persist the review-required effect in the SAME block transaction
+        (R01). No-op unless the effect schema is installed (default-off)."""
+        if review_payload is None:
+            return
+        from hermes_cli import kanban_effects as _kfx
+        _kfx.record_effect_locked(
+            conn,
+            source_task_id=task_id,
+            source_transition=_kfx.TRANSITION_BLOCK,
+            payload=review_payload,
+            now=int(time.time()),
+        )
+
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -5552,6 +5700,7 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
+            _record_block_effect()
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
@@ -5665,6 +5814,7 @@ def block_task(
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
+        _record_block_effect()
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
