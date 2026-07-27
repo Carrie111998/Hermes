@@ -404,6 +404,55 @@ def _load_config() -> dict:
     }
 
 
+def _load_thread_routing() -> dict:
+    """Load the optional thread-scoped recall routing table.
+
+    Same resolution/fail-open discipline as _load_config(): a missing file is a
+    silent no-op (empty table); a malformed file or a bad entry is logged and
+    that entry (or the whole table) is skipped — this must never raise and
+    must never block plugin initialize(). Path is profile-scoped via
+    get_hermes_home(), same as config.json, so multi-profile setups don't
+    collide (Planner review t_a1317d5c, S3).
+
+    Format: {"<platform>:<thread_id>": {"extra_tags": [...], "domain": "...",
+    "vault_path": "..."}}. Only "extra_tags" is consumed by this plugin today;
+    "domain"/"vault_path" are inert here, reserved for future use — a SOUL-level
+    bootstrap-recipe mechanism sharing this table was considered and declined
+    2026-07-24 (Planner consult t_32e5ae5d); these fields stay for whatever else
+    ends up wanting per-thread domain/path metadata.
+    """
+    from pathlib import Path
+
+    routing_path = get_hermes_home() / "hindsight" / "thread_routing.json"
+    if not routing_path.exists():
+        return {}
+    try:
+        raw = json.loads(routing_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("thread_routing.json is malformed, ignoring (fail-open to global recall config): %s", e)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("thread_routing.json root is not an object, ignoring: %r", type(raw))
+        return {}
+
+    validated: dict = {}
+    for key, entry in raw.items():
+        try:
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                raise ValueError("entry must be a string key -> object")
+            if entry.get("dormant"):
+                continue  # skip dormant entries — archived threads fall back to global recall config
+            extra_tags = entry.get("extra_tags", [])
+            if extra_tags is None:
+                extra_tags = []
+            if not isinstance(extra_tags, list) or not all(isinstance(t, str) for t in extra_tags):
+                raise ValueError("extra_tags must be a list of strings")
+            validated[key] = {"extra_tags": extra_tags}
+        except Exception as e:
+            logger.warning("thread_routing.json entry %r is invalid, skipping: %s", key, e)
+    return validated
+
+
 def _normalize_retain_tags(value: Any) -> List[str]:
     """Normalize tag config/tool values to a deduplicated list of strings."""
     if value is None:
@@ -1625,6 +1674,31 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         self._recall_tags = self._config.get("recall_tags") or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
+
+        # Thread-scoped recall override (Step 2, Planner review t_a1317d5c).
+        # Must run AFTER the config-based assignment above, not before —
+        # placing this near where self._thread_id is first set (~line 1250)
+        # would be silently clobbered by the config read here (Planner B2).
+        # Fail-open by construction: an unmatched key, missing file, or
+        # malformed table all leave self._recall_tags/_recall_tags_match at
+        # whatever config.json already specified — zero behavior change for
+        # any thread not explicitly routed.
+        if self._platform and self._thread_id:
+            _routing_key = f"{self._platform}:{self._thread_id}"
+            _routing_table = _load_thread_routing()
+            _routing_entry = _routing_table.get(_routing_key)
+            if _routing_entry is not None:
+                _channel_tag = f"channel:{self._platform}:{self._thread_id}"
+                _override_tags = [_channel_tag] + list(_routing_entry.get("extra_tags", []))
+                self._recall_tags = _override_tags
+                # any_strict, not any (Planner S1) — "any" would also admit
+                # untagged facts, silently weakening the existing config.
+                self._recall_tags_match = "any_strict"
+                logger.info(
+                    "Hindsight thread-routing override active: key=%s recall_tags=%s recall_tags_match=%s",
+                    _routing_key, self._recall_tags, self._recall_tags_match,
+                )
+
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
         ).strip()
@@ -1858,7 +1932,11 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 if self._prefetch_method == "reflect":
                     logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                    _reflect_kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget}
+                    if self._recall_tags:
+                        _reflect_kwargs["tags"] = self._recall_tags
+                        _reflect_kwargs["tags_match"] = self._recall_tags_match
+                    resp = self._run_hindsight_operation(lambda client: client.areflect(**_reflect_kwargs))
                     text = resp.text or ""
                 else:
                     recall_kwargs: dict = {
@@ -2020,6 +2098,8 @@ class HindsightMemoryProvider(MemoryProvider):
             lineage_tags.append(f"session:{self._session_id}")
         if self._parent_session_id:
             lineage_tags.append(f"parent:{self._parent_session_id}")
+        if self._platform and self._thread_id:
+            lineage_tags.append(f"channel:{self._platform}:{self._thread_id}")
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
@@ -2127,7 +2207,20 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = []
+                for i, r in enumerate(resp.results, 1):
+                    prov_bits = []
+                    r_context = getattr(r, "context", None)
+                    r_tags = getattr(r, "tags", None)
+                    r_type = getattr(r, "type", None)
+                    if r_type:
+                        prov_bits.append(str(r_type))
+                    if r_context:
+                        prov_bits.append(str(r_context))
+                    if r_tags:
+                        prov_bits.append("tags=" + ",".join(r_tags))
+                    prov = f" [{'; '.join(prov_bits)}]" if prov_bits else ""
+                    lines.append(f"{i}. {r.text}{prov}")
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
@@ -2140,10 +2233,12 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
+                _reflect_tool_kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget}
+                if self._recall_tags:
+                    _reflect_tool_kwargs["tags"] = self._recall_tags
+                    _reflect_tool_kwargs["tags_match"] = self._recall_tags_match
                 resp = self._run_hindsight_operation(
-                    lambda client: client.areflect(
-                        bank_id=self._bank_id, query=query, budget=self._budget
-                    )
+                    lambda client: client.areflect(**_reflect_tool_kwargs)
                 )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
@@ -2213,6 +2308,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 old_lineage_tags.append(f"session:{old_session_id}")
             if old_parent_session_id:
                 old_lineage_tags.append(f"parent:{old_parent_session_id}")
+            if self._platform and self._thread_id:
+                old_lineage_tags.append(f"channel:{self._platform}:{self._thread_id}")
             old_content = "[" + ",".join(old_turns) + "]"
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
