@@ -974,6 +974,23 @@ def test_launch_provider_limit_reconciles_created_exact_uuid_in_same_cycle() -> 
     assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
 
 
+def test_launch_current_session_limit_wording_retries_without_waiting_for_timeout() -> None:
+    item = claim()
+    limited = (
+        "You've hit your session limit · resets 6:50pm (America/New_York)"
+    )
+    source = FakeSource([None, None])
+    factory = FakeFactory(FakePty(output=limited))
+
+    result = registrar(source, factory).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert result.detail == "Claude provider limit interrupted registration"
+    assert len(factory.spawns) == 1
+    assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
+
+
 @pytest.mark.parametrize(
     "messages",
     [

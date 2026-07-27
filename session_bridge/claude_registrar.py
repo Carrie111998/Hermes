@@ -1616,7 +1616,13 @@ def _is_provider_limit_failure(output: str) -> bool:
     return (
         ("api error: 429" in folded or '"status":429' in folded)
         and ("rate_limit" in folded or "rate limit" in folded)
-    ) or ("you've hit your limit" in folded and "resets" in folded)
+    ) or (
+        (
+            "you've hit your limit" in folded
+            or "you've hit your session limit" in folded
+        )
+        and "resets" in folded
+    )
 
 
 def _fileno_closed(resource: object) -> bool:
