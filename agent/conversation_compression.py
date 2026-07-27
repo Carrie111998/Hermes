@@ -310,10 +310,11 @@ def _get_compress_timeout_executor():
 
     with _compress_timeout_executor_lock:
         if _compress_timeout_executor is None:
-            # Match asyncio's default-executor sizing heuristic.
-            workers = min(32, (os.cpu_count() or 1) + 4)
+            # Small pool: compress is rare and heavy. Sized for a few
+            # overlapping calls (live compress + fence-cancelled workers
+            # still winding down), not asyncio's min(32, cpu+4) fan-out.
             _compress_timeout_executor = DaemonThreadPoolExecutor(
-                max_workers=workers,
+                max_workers=4,
                 thread_name_prefix="compress-ctx-timeout",
             )
         return _compress_timeout_executor
