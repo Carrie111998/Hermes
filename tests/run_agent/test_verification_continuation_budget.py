@@ -51,7 +51,7 @@ def _assert_pending_response_survives(agent, result):
     assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
     assert result["completed"] is False
     assert agent._handle_max_iterations.call_count == 0
-    # The nudge is stripped by _drop_verification_continuation_scaffolding,
+    # The nudge is stripped by _drop_continuation_scaffolding,
     # so the role sequence is [user, assistant] — the candidate is the
     # tail and matches final_response so it is not duplicated. (#65919 §7)
     assert [message["role"] for message in result["messages"]] == [

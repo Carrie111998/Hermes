@@ -237,6 +237,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # pre_response rejects both the candidate assistant text and its synthetic
+    # revision request. Both exist only for the next API call and must never
+    # enter a resumed transcript.
+    "_pre_response_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an

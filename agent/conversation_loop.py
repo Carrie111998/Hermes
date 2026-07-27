@@ -2032,10 +2032,25 @@ def run_conversation(
                         agent.thinking_callback("")
 
                 _use_streaming = True
+                # A pre_response hook must inspect the whole candidate before
+                # any text reaches the user. Request the response without live
+                # text delivery while the gate is active; the accepted final
+                # result still flows through the normal surface completion
+                # path. This also keeps rejected drafts out of TTS.
+                _response_gate_active = False
+                try:
+                    from hermes_cli.plugins import has_hook as _has_response_hook
+
+                    _response_gate_active = _has_response_hook("pre_response")
+                except Exception:
+                    # Hook discovery failures are fail-open.
+                    _response_gate_active = False
+                if _response_gate_active:
+                    _use_streaming = False
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
-                if getattr(agent, "_disable_streaming", False):
+                elif getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
                 # CopilotACPClient communicates via subprocess stdio and
                 # returns a plain SimpleNamespace — not an iterable
@@ -2077,6 +2092,20 @@ def run_conversation(
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
+                    if _response_gate_active:
+                        # codex_responses streams internally even through the
+                        # non-streaming entry point. Temporarily detach visible
+                        # text/TTS consumers so it obeys the same response-gate
+                        # buffering contract as chat-completions providers.
+                        _saved_stream_delta = agent.stream_delta_callback
+                        _saved_stream_callback = agent._stream_callback
+                        agent.stream_delta_callback = None
+                        agent._stream_callback = None
+                        try:
+                            return agent._interruptible_api_call(next_api_kwargs)
+                        finally:
+                            agent.stream_delta_callback = _saved_stream_delta
+                            agent._stream_callback = _saved_stream_callback
                     return agent._interruptible_api_call(next_api_kwargs)
 
                 from hermes_cli.middleware import run_llm_execution_middleware
@@ -6633,6 +6662,79 @@ def run_conversation(
                     )
                     final_response = None
                     continue
+
+                # Generic final-response gate: unlike coding-only pre_verify,
+                # this fires for every ordinary non-empty text candidate just
+                # before the shared loop accepts it. Rejected prose and the
+                # revision request are both ephemeral retry context: do not
+                # persist or explicitly emit either one.
+                _response_nudge = None
+                _response_attempt = getattr(agent, "_pre_response_nudges", 0)
+                _response_limit = 0
+                try:
+                    from agent.response_hooks import max_response_continuations
+                    from hermes_cli.plugins import (
+                        get_pre_response_continue_message,
+                        has_hook,
+                    )
+
+                    if final_response and has_hook("pre_response"):
+                        _response_limit = max_response_continuations()
+                        _response_nudge = get_pre_response_continue_message(
+                            response_text=final_response,
+                            user_message=original_user_message,
+                            session_id=getattr(agent, "session_id", None) or "",
+                            task_id=effective_task_id or "",
+                            turn_id=turn_id or "",
+                            platform=getattr(agent, "platform", "") or "",
+                            model=getattr(agent, "model", "") or "",
+                            attempt=_response_attempt,
+                        )
+                except Exception:
+                    logger.debug("pre_response hook check failed", exc_info=True)
+                    _response_nudge = None
+
+                if _response_nudge and _response_attempt < _response_limit:
+                    agent._pre_response_nudges = _response_attempt + 1
+                    # A pre_response rejection supersedes any older
+                    # verification candidate. If this revision consumes the
+                    # remaining budget, use the normal summary fallback; never
+                    # resurrect text that this response gate did not accept.
+                    _pending_verification_response = None
+                    _pending_verification_response_previewed = False
+                    final_msg["finish_reason"] = "response_hook_continue"
+                    final_msg["content"] = final_response
+                    final_msg["_pre_response_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _response_nudge,
+                        "_pre_response_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug(
+                        "pre_response nudge issued (attempt %d/%d)",
+                        agent._pre_response_nudges,
+                        _response_limit,
+                    )
+                    final_response = None
+                    continue
+
+                if _response_nudge:
+                    final_response = (
+                        "A response hook rejected the answer after "
+                        f"{_response_limit} revision attempt"
+                        f"{'s' if _response_limit != 1 else ''}. "
+                        "Hermes stopped retrying to prevent a loop."
+                    )
+                    final_msg["content"] = final_response
+                    logger.warning(
+                        "pre_response continuation limit reached "
+                        "(attempt=%d limit=%d session=%s)",
+                        _response_attempt,
+                        _response_limit,
+                        getattr(agent, "session_id", None) or "none",
+                    )
 
                 messages.append(final_msg)
                 

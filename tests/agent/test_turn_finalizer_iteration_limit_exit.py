@@ -355,7 +355,7 @@ def test_terminal_verification_failure_is_persisted_as_one_correction(monkeypatc
         messages=[
             {"role": "user", "content": "task"},
             {"role": "assistant", "content": report},
-            # Synthetic nudge — should be dropped by _drop_verification_continuation_scaffolding.
+            # Synthetic nudge — should be dropped by _drop_continuation_scaffolding.
             {"role": "user", "content": "[System: run tests]", "_verification_stop_synthetic": True},
         ],
         conversation_history=[],

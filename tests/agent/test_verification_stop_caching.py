@@ -46,6 +46,27 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
     assert not ra._is_ephemeral_scaffolding({"role": "assistant", "content": "premature done"})
 
 
+def test_pre_response_rejected_pair_is_ephemeral(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    ra = _fresh_run_agent(tmp_path)
+
+    assert "_pre_response_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert ra._is_ephemeral_scaffolding(
+        {
+            "role": "assistant",
+            "content": "rejected draft",
+            "_pre_response_synthetic": True,
+        }
+    )
+    assert ra._is_ephemeral_scaffolding(
+        {
+            "role": "user",
+            "content": "rewrite it",
+            "_pre_response_synthetic": True,
+        }
+    )
+
+
 def _make_agent(ra, session_id, tmp_path):
     agent = ra.AIAgent(
         session_id=session_id,
@@ -124,3 +145,41 @@ def test_json_log_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
     # Only the nudge is dropped.
     assert "[System: run tests]" not in contents
     assert all(not m.get("_pre_verify_synthetic") for m in data["messages"])
+
+
+def test_db_and_json_drop_rejected_pre_response_pair(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    ra = _fresh_run_agent(tmp_path)
+    agent = _make_agent(ra, "sess_pre_response", tmp_path)
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "rejected draft",
+            "_pre_response_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "rewrite it",
+            "_pre_response_synthetic": True,
+        },
+        {"role": "assistant", "content": "accepted answer"},
+    ]
+
+    agent._flush_messages_to_session_db(messages, conversation_history=[])
+    persisted = [
+        kwargs.get("content")
+        for _args, kwargs in agent._session_db.append_message.call_args_list
+    ]
+    assert persisted == ["hi", "accepted answer"]
+
+    agent._save_session_log(messages)
+    data = json.loads(
+        (agent.logs_dir / "session_sess_pre_response.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [message.get("content") for message in data["messages"]] == [
+        "hi",
+        "accepted answer",
+    ]

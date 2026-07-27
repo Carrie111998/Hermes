@@ -841,6 +841,13 @@ agent:
   # Default 3.
   # max_verify_nudges: 3
 
+  # A `pre_response` hook (plugin or shell, see Event Hooks docs) can reject a
+  # candidate final text answer and ask the same agent loop to revise it. This
+  # caps accepted continuation directives per turn. The default retries once;
+  # another rejection returns a retry-limit notice instead of the rejected
+  # prose. Set 0 to inspect responses without allowing a continuation.
+  # max_response_continuations: 1
+
   # Enable verbose logging
   verbose: false
   
@@ -1427,13 +1434,14 @@ display:
 # =============================================================================
 # Register shell scripts as plugin-hook callbacks.  Each entry is executed as
 # a subprocess (shell=False, shlex.split) with a JSON payload on stdin.  On
-# stdout the script may return JSON that either blocks the tool call or
-# injects context into the next LLM call.
+# stdout the script may return JSON that blocks a tool call, injects context
+# into the next LLM call, or asks the agent to revise a candidate response.
 #
 # Valid events (mirror hermes_cli.plugins.VALID_HOOKS):
 #   pre_tool_call, post_tool_call, pre_llm_call, post_llm_call,
-#   pre_api_request, post_api_request, on_session_start, on_session_end,
-#   on_session_finalize, on_session_reset, subagent_stop
+#   pre_response, pre_verify, pre_api_request, post_api_request,
+#   on_session_start, on_session_end, on_session_finalize, on_session_reset,
+#   subagent_stop
 #
 # First-use consent: each (event, command) pair prompts once on a TTY, then
 # is persisted to ~/.hermes/shell-hooks-allowlist.json.  Non-interactive
@@ -1453,6 +1461,8 @@ display:
 #       command: "~/.hermes/agent-hooks/auto-format.sh"
 #   pre_llm_call:
 #     - command: "~/.hermes/agent-hooks/inject-cwd-context.sh"
+#   pre_response:
+#     - command: "~/.hermes/agent-hooks/lint-response.py"
 #   subagent_stop:
 #     - command: "~/.hermes/agent-hooks/log-orchestration.sh"
 #

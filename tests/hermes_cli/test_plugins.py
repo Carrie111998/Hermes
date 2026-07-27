@@ -17,6 +17,7 @@ from hermes_cli.plugins import (
     PluginManifest,
     get_plugin_command_handler,
     get_plugin_commands,
+    get_pre_response_continue_message,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
@@ -1089,6 +1090,94 @@ class TestGetPreVerifyContinueMessage:
         assert seen["coding"] is True
         assert seen["attempt"] == 2
         assert seen["changed_paths"] == ["a.py"]
+
+
+class TestGetPreResponseContinueMessage:
+    """`pre_response` directives gate any candidate final text response."""
+
+    def test_continue_canonical(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "continue", "message": "rewrite the answer"}
+            ],
+        )
+        assert (
+            get_pre_response_continue_message(response_text="draft")
+            == "rewrite the answer"
+        )
+
+    def test_stop_block_means_continue(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"decision": "block", "reason": "use shorter sentences"}
+            ],
+        )
+        assert (
+            get_pre_response_continue_message(response_text="draft")
+            == "use shorter sentences"
+        )
+
+    def test_first_non_empty_directive_wins(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                "noise",
+                {"action": "continue"},
+                {"decision": "block", "reason": "   "},
+                {"action": "continue", "message": "  revise this  "},
+                {"action": "continue", "message": "ignored"},
+            ],
+        )
+        assert (
+            get_pre_response_continue_message(response_text="draft")
+            == "revise this"
+        )
+
+    def test_allow_and_malformed_values_are_noops(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "allow"},
+                {"decision": "block", "reason": 42},
+                {"action": "continue", "message": None},
+                {"context": "not a directive"},
+            ],
+        )
+        assert get_pre_response_continue_message(response_text="draft") is None
+
+    def test_forwards_candidate_and_turn_context(self, monkeypatch):
+        seen = {}
+
+        def capture(hook_name, **kwargs):
+            seen["hook_name"] = hook_name
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+        get_pre_response_continue_message(
+            response_text="candidate",
+            user_message="original prompt",
+            session_id="session-1",
+            task_id="task-1",
+            turn_id="turn-1",
+            platform="desktop",
+            model="test/model",
+            attempt=1,
+        )
+
+        assert seen == {
+            "hook_name": "pre_response",
+            "response_text": "candidate",
+            "user_message": "original prompt",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "turn_id": "turn-1",
+            "platform": "desktop",
+            "model": "test/model",
+            "attempt": 1,
+        }
 
 
 class TestThreadToolWhitelist:

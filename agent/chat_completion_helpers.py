@@ -1983,7 +1983,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
-    messages.append({"role": "user", "content": summary_request})
+    summary_msg = {"role": "user", "content": summary_request}
+    if (
+        messages
+        and isinstance(messages[-1], dict)
+        and messages[-1].get("_pre_response_synthetic")
+    ):
+        # A rejected response exhausted the main-loop budget. The summary call
+        # may use its retry context, but none of that synthetic user scaffolding
+        # belongs in the durable resumed transcript.
+        summary_msg["_pre_response_synthetic"] = True
+    messages.append(summary_msg)
 
     try:
         # Build API messages, stripping internal-only fields

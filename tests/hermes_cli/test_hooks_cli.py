@@ -135,6 +135,36 @@ class TestHooksTest:
         assert '"action": "block"' in out
         assert '"message": "nope"' in out
 
+    def test_pre_response_uses_runtime_payload_shape(self, tmp_path):
+        capture = tmp_path / "pre-response.json"
+        script = _hook_script(
+            tmp_path,
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+        )
+        cfg = {"hooks": {"pre_response": [{"command": str(script)}]}}
+
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            _run(
+                SimpleNamespace(
+                    hooks_action="test",
+                    event="pre_response",
+                    for_tool=None,
+                    payload_file=None,
+                )
+            )
+
+        seen = json.loads(capture.read_text())
+        assert seen["session_id"] == "test-session"
+        assert seen["extra"] == {
+            "response_text": "Candidate response.",
+            "user_message": "Original user prompt.",
+            "task_id": "test-task",
+            "turn_id": "test-turn",
+            "platform": "cli",
+            "model": "gpt-4",
+            "attempt": 0,
+        }
+
     def test_for_tool_matcher_filters(self, tmp_path):
         script = _hook_script(tmp_path, "#!/usr/bin/env bash\nprintf '{}\\n'\n")
         cfg = {

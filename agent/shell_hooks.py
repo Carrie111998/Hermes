@@ -47,6 +47,10 @@ Wire protocol
     # Inject context for pre_llm_call:
     {"context": "Today is Friday"}
 
+    # Revise a candidate response:
+    {"action": "continue", "message": "Rewrite the answer more clearly"}
+    {"decision": "block", "reason": "Rewrite the answer more clearly"}
+
     # Silent no-op:
     <empty or any non-matching JSON object>
 
@@ -92,6 +96,16 @@ emitted by each built-in hook site.
     interrupted     – bool, True when the user interrupted
     model           – model name
     platform        – platform identifier
+
+``pre_response`` (emitted from ``agent/conversation_loop.py``)::
+
+    response_text   – non-empty candidate assistant response
+    user_message    – original user input for this turn
+    task_id         – current task id
+    turn_id         – current turn id
+    model           – model identifier
+    platform        – platform identifier
+    attempt         – continuations already accepted this turn (0 on first)
 
 ``subagent_stop`` (emitted from ``tools/delegate_tool.py``)::
 
@@ -575,8 +589,12 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
     skipping the translation silently breaks every ``pre_tool_call``
     block directive.
 
-    For ``pre_llm_call``, ``{"context": "..."}`` is passed through
-    unchanged to match the existing plugin-hook contract.
+    For ``pre_response`` and ``pre_verify``, Hermes ``continue`` and
+    Stop-compatible ``block`` directives are normalized to a continuation.
+    Directives without a non-empty message are ignored.
+
+    For ``pre_llm_call``, ``{"context": "..."}`` is passed through unchanged
+    to match the existing plugin-hook contract.
 
     Anything else returns ``None``.
     """
@@ -603,7 +621,7 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
             return {"action": "block", "message": _block_message(data.get("reason"), data.get("message"))}
         return None
 
-    if event == "pre_verify":
+    if event in {"pre_response", "pre_verify"}:
         # "continue" (Hermes) / "block" (Claude-Code Stop: block the stop) both
         # mean keep going; the message/reason is the follow-up for the model. A
         # continue with no message is a no-op — let the turn finish.

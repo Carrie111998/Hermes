@@ -139,6 +139,16 @@ _DEFAULT_PAYLOADS = {
         "model": "gpt-4",
         "platform": "cli",
     },
+    "pre_response": {
+        "session_id": "test-session",
+        "response_text": "Candidate response.",
+        "user_message": "Original user prompt.",
+        "task_id": "test-task",
+        "turn_id": "test-turn",
+        "platform": "cli",
+        "model": "gpt-4",
+        "attempt": 0,
+    },
     "pre_verify": {
         "session_id": "test-session",
         "platform": "cli",

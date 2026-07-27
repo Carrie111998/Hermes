@@ -141,6 +141,13 @@ VALID_HOOKS: Set[str] = {
     # Plugins return a string to replace the response text, or None/empty to leave unchanged.
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
+    # Final-response gate. Fired for a non-empty candidate text response just
+    # before the shared agent loop accepts it. A callback may ask the same loop
+    # to revise the candidate by returning:
+    #   {"action": "continue", "message": "<revision instruction>"}
+    # The Stop-compatible {"decision": "block", "reason": "..."} shape is
+    # accepted too. Directives without a non-empty message are no-ops.
+    "pre_response",
     "pre_llm_call",
     "post_llm_call",
     # Verification-loop gate. Fired once per turn when the agent has edited code
@@ -2331,6 +2338,49 @@ def get_pre_verify_continue_message(
         attempt=attempt,
         final_response=final_response,
         changed_paths=list(changed_paths or []),
+    )
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = str(result.get("action") or result.get("decision") or "").strip().lower()
+        if action not in ("continue", "block"):
+            continue
+        message = result.get("message") or result.get("reason")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    return None
+
+
+def get_pre_response_continue_message(
+    *,
+    response_text: str,
+    user_message: Any = "",
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    platform: str = "",
+    model: str = "",
+    attempt: int = 0,
+) -> Optional[str]:
+    """Return the first actionable ``pre_response`` continuation message.
+
+    The Hermes ``{"action": "continue", "message": "..."}`` and
+    Stop-compatible ``{"decision": "block", "reason": "..."}`` shapes both
+    keep the shared loop going. Invalid values and directives without a
+    non-empty message fail open.
+    """
+    hook_results = invoke_hook(
+        "pre_response",
+        response_text=response_text,
+        user_message=user_message,
+        session_id=session_id,
+        task_id=task_id,
+        turn_id=turn_id,
+        platform=platform,
+        model=model,
+        attempt=attempt,
     )
 
     for result in hook_results:

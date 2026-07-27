@@ -1060,6 +1060,11 @@ DEFAULT_CONFIG = {
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
         "max_verify_nudges": 3,
+        # Upper bound on `pre_response` continuations in one turn. The hook
+        # still inspects the candidate at the limit; another rejection returns
+        # a user-facing retry-limit notice instead of leaking rejected prose or
+        # trapping the loop.
+        "max_response_continuations": 1,
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
         # or the agent explains why it cannot run checks. The loop is bounded

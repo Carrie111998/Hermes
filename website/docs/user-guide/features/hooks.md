@@ -364,6 +364,7 @@ def register(ctx):
     ctx.register_hook("pre_tool_call", my_tool_observer)
     ctx.register_hook("post_tool_call", my_tool_logger)
     ctx.register_hook("pre_llm_call", my_memory_callback)
+    ctx.register_hook("pre_response", my_response_gate)
     ctx.register_hook("post_llm_call", my_sync_callback)
     ctx.register_hook("on_session_start", my_init_callback)
     ctx.register_hook("on_session_end", my_cleanup_callback)
@@ -373,7 +374,7 @@ def register(ctx):
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility — new parameters may be added in future versions without breaking your plugin.
 - If a callback **crashes**, it's logged and skipped. Other hooks and the agent continue normally. A misbehaving plugin can never break the agent.
-- Two hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, and [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call. All other hooks are fire-and-forget observers.
+- Some hooks have explicit return contracts: [`pre_tool_call`](#pre_tool_call) can **block** a tool, [`pre_llm_call`](#pre_llm_call) can **inject context**, and [`pre_response`](#pre_response) / [`pre_verify`](#pre_verify) can request a bounded continuation. Other hooks either document their own transform contract or ignore return values.
 - Observer callbacks receive `telemetry_schema_version` automatically. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat `api_request_id` as an opaque identifier; do not parse its string format.
 
 ### Quick reference
@@ -384,6 +385,7 @@ def register(ctx):
 | [`post_tool_call`](#post_tool_call) | After any tool returns | ignored |
 | [`pre_llm_call`](#pre_llm_call) | Once per turn, before the tool-calling loop | `{"context": str}` to prepend context to the user message |
 | [`post_llm_call`](#post_llm_call) | Once per turn, after the tool-calling loop | ignored |
+| [`pre_response`](#pre_response) | For each non-empty candidate final text response, just before the shared loop accepts it | `{"action": "continue", "message": str}` to revise it |
 | [`pre_verify`](#pre_verify) | Once per turn when the agent edited code, before it verifies/finishes | `{"action": "continue", "message": str}` to keep going |
 | [`on_session_start`](#on_session_start) | New session created (first turn only) | ignored |
 | [`on_session_end`](#on_session_end) | Session ends | ignored |
@@ -397,6 +399,93 @@ def register(ctx):
 | [`transform_tool_result`](#transform_tool_result) | After any tool returns, before the result is handed back to the model | `str` to replace the result, `None` to leave unchanged |
 | [`transform_terminal_output`](#transform_terminal_output) | Inside the `terminal` tool, before truncation/ANSI-strip/redact | `str` to replace the raw output, `None` to leave unchanged |
 | [`transform_llm_output`](#transform_llm_output) | After the tool-calling loop completes, before the final response is delivered | `str` to replace the response text, `None`/empty to leave unchanged |
+
+---
+
+### `pre_response`
+
+Fires for a non-empty candidate assistant text response when the shared agent
+loop is about to finish normally. It works for ordinary non-coding turns and
+for CLI, gateway, TUI, and desktop callers that use the shared loop.
+
+Use this hook for response validation that needs the model to self-correct.
+Unlike `transform_llm_output`, it can run another inference turn. Unlike
+`pre_verify`, it is not limited to coding turns or file edits.
+
+**Callback signature:**
+
+```python
+def my_callback(response_text: str, user_message, session_id: str,
+                task_id: str, turn_id: str, model: str, platform: str,
+                attempt: int, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `response_text` | `str` | Candidate final assistant text |
+| `user_message` | `str` or message content | Original user input for this turn |
+| `session_id` | `str` | Current session identifier |
+| `task_id` | `str` | Current task identifier |
+| `turn_id` | `str` | Current turn identifier |
+| `model` | `str` | Model identifier |
+| `platform` | `str` | Surface identifier (`cli`, `telegram`, `desktop`, …) |
+| `attempt` | `int` | Continuations already accepted this turn; `0` on the first candidate |
+
+**Return value — revise the candidate:**
+
+```python
+return {
+    "action": "continue",
+    "message": "Load the required style skill and rewrite only your last answer.",
+}
+```
+
+The Stop-compatible shape below has the same meaning:
+
+```python
+return {
+    "decision": "block",
+    "reason": "Load the required style skill and rewrite only your last answer.",
+}
+```
+
+The first directive with a non-empty string `message` or `reason` wins.
+Missing messages, malformed returns, exceptions, shell-hook timeouts, and
+non-directive values fail open.
+
+While this hook is active, Hermes pauses live final-text and TTS streaming so
+the hook can inspect the whole candidate before delivery. Hermes places a
+rejected candidate and continuation instruction in ephemeral assistant→user
+context for the next model call. Both messages are removed from durable and
+returned transcripts before the turn finishes.
+
+**Bounded:** `agent.max_response_continuations` controls how many continuation
+directives Hermes accepts in one turn. The default is `1`. The hook sees the
+next candidate with `attempt=1`; it can return no directive to finish. If it
+rejects again at the limit, Hermes returns a retry-limit notice instead of the
+rejected candidate. Set the value to `0` to inspect candidates without allowing
+a continuation.
+
+**Example — one-shot style validator:**
+
+```python
+def validate_style(response_text, attempt, **kwargs):
+    violations = lint_response(response_text)
+    if not violations:
+        return None
+    if attempt:
+        return None  # The validator owns its second-failure policy.
+    return {
+        "action": "continue",
+        "message": (
+            "Load the style skill. Rewrite only your last answer. "
+            f"Fix these issues: {violations}."
+        ),
+    }
+
+def register(ctx):
+    ctx.register_hook("pre_response", validate_style)
+```
 
 ---
 
@@ -1344,6 +1433,10 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 
 `tool_name` and `tool_input` are `null` for non-tool events (`pre_llm_call`, `subagent_stop`, session lifecycle). The `extra` dict carries all event-specific kwargs (`user_message`, `conversation_history`, `child_role`, `duration_ms`, …). Unserialisable values are stringified rather than omitted.
 
+For `pre_response`, `extra` contains `response_text`, `user_message`,
+`task_id`, `turn_id`, `model`, `platform`, and `attempt`. The top-level
+`session_id` uses the same value as the Python callback.
+
 **stdout — optional response:**
 
 ```jsonc
@@ -1354,7 +1447,8 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}
 
-// Keep the agent going at the verify gate (pre_verify); both shapes accepted:
+// Revise a candidate response (pre_response) or keep going at pre_verify;
+// both shapes are accepted:
 {"action": "continue", "message": "Run the formatter, then finish."}
 {"decision": "block",  "reason":  "Run the formatter, then finish."}
 

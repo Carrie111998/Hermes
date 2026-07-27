@@ -115,6 +115,25 @@ class TestParseResponse:
         assert shell_hooks._parse_response("pre_verify", '{"action": "continue"}') is None
         assert shell_hooks._parse_response("pre_verify", '{"decision": "allow"}') is None
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (
+                '{"action": "continue", "message": "rewrite this"}',
+                {"action": "continue", "message": "rewrite this"},
+            ),
+            (
+                '{"decision": "block", "reason": "use STE"}',
+                {"action": "continue", "message": "use STE"},
+            ),
+            ('{"action": "continue"}', None),
+            ('{"decision": "block", "reason": "   "}', None),
+            ('{"decision": "allow"}', None),
+        ],
+    )
+    def test_pre_response_directives(self, raw, expected):
+        assert shell_hooks._parse_response("pre_response", raw) == expected
+
     def test_block_action_without_message_uses_default(self):
         """Block is honored even when message/reason is absent."""
         r = shell_hooks._parse_response("pre_tool_call", '{"action": "block"}')
@@ -189,6 +208,34 @@ class TestSerializePayload:
         )
         payload = json.loads(raw)
         assert payload["extra"]["obj"] == "<weird>"
+
+    def test_pre_response_payload_exposes_candidate_and_turn_context(self):
+        raw = shell_hooks._serialize_payload(
+            "pre_response",
+            {
+                "response_text": "candidate answer",
+                "user_message": "original prompt",
+                "session_id": "sess-1",
+                "task_id": "task-1",
+                "turn_id": "turn-1",
+                "model": "test/model",
+                "platform": "desktop",
+                "attempt": 1,
+            },
+        )
+
+        payload = json.loads(raw)
+        assert payload["hook_event_name"] == "pre_response"
+        assert payload["session_id"] == "sess-1"
+        assert payload["extra"] == {
+            "response_text": "candidate answer",
+            "user_message": "original prompt",
+            "task_id": "task-1",
+            "turn_id": "turn-1",
+            "model": "test/model",
+            "platform": "desktop",
+            "attempt": 1,
+        }
 
 
 # ── Matcher behaviour ─────────────────────────────────────────────────────
