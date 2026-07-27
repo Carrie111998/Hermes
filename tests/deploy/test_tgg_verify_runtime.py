@@ -194,8 +194,9 @@ def test_deploy_selects_canonical_manifest_and_current_units() -> None:
     assert 'd["spec"]["deploy"]["manifestRef"]' in deploy_script
     assert '--manifest "$manifest_path"' in deploy_script
     assert "output_quality_eval.py" in deploy_script
-    assert "--trigger deploy" in deploy_script
-    assert '--maker-session-id "deploy:$head_sha"' in deploy_script
+    assert '"--trigger",\n            "deploy"' in deploy_script
+    assert '"--maker-session-id",' in deploy_script
+    assert 'f"deploy:{head_sha}"' in deploy_script
     assert "set +e" in deploy_script
     assert '"evaluator_ok": evaluator_ok' in deploy_script
     assert '"evaluator_ok":%s' in deploy_script

@@ -105,7 +105,9 @@ def test_collect_snapshot_uses_read_only_ssh_python():
 
     result = core.collect_snapshot(9, command=command)
     assert result["events"][0]["seq"] == 10
-    assert seen["argv"][:4] == ["ssh", "tgg-app-1", "python3", "-"]
+    target_index = seen["argv"].index("tgg-app-1")
+    assert seen["argv"][target_index : target_index + 3] == ["tgg-app-1", "python3", "-"]
+    assert "ConnectTimeout=15" in seen["argv"]
     assert "mode=ro" in seen["script"]
     assert "PRAGMA query_only=ON" in seen["script"]
     assert not any(word in seen["script"].upper() for word in ("UPDATE ", "INSERT ", "DELETE "))
@@ -145,9 +147,11 @@ def test_media_pull_is_source_only_allowlisted(tmp_path):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     pulled = core.pull_retained_media(bundle, tmp_path, command=command)
-    assert calls[0][0:2] == ["scp", "--"]
+    assert calls[0][0] == "scp"
+    assert "ConnectTimeout=15" in calls[0]
+    assert "--" in calls[0]
     assert {
-        call[2] for call in calls
+        call[call.index("--") + 1] for call in calls
     } == {
         "tgg-app-1:/var/lib/tgg-capture/media/photo 1.jpg",
         "tgg-app-1:/home/pclaw/.systems-pcl/data/media/tgg/hermes/photo-2.jpg",
@@ -372,12 +376,87 @@ def test_defect_dedupe_read_failure_keeps_existing_row(tmp_path):
     assert result == ("wb-existing", False)
 
 
+def test_defect_dedupe_ignores_fuzzy_unrelated_search_row(tmp_path):
+    store = core.StateStore(tmp_path)
+    calls = []
+
+    def command(argv, **_kwargs):
+        calls.append(argv)
+        if argv[2] == "search":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    {
+                        "ok": True,
+                        "data": [
+                            {
+                                "id": "wb-unrelated",
+                                "lane": "ongoing",
+                                "title": "Unrelated TGG output task",
+                                "description": "fuzzy terms only",
+                            }
+                        ],
+                    }
+                ),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "wb-correct\n", "")
+
+    filer = core.DefectFiler(store, command=command)
+    result = filer.file(
+        job_no="AM/JOB/2607/0001",
+        check={"id": "no-contact-emoji-leak", "result": "fail", "evidence": "emoji"},
+        screenshot="/tmp/case.png",
+        message_ids=["wa-10"],
+        judgment_path="/tmp/judgment.json",
+    )
+    assert result == ("wb-correct", True)
+    assert sum(argv[2] == "create" for argv in calls) == 1
+
+
 def test_state_lock_refuses_overlapping_runner(tmp_path):
     store = core.StateStore(tmp_path)
     with store.exclusive_run():
         with pytest.raises(core.RunAlreadyActive):
             with store.exclusive_run():
                 pass
+
+
+def test_lock_contended_cli_reports_health_instead_of_unconditional_green(tmp_path, capsys):
+    store = core.StateStore(tmp_path)
+    state = store.load()
+    state["batches_occurred"] = 1
+    store.save(state)
+    with store.exclusive_run():
+        rc = core.main(
+            [
+                "--state-dir",
+                str(tmp_path),
+                "run",
+                "--trigger",
+                "interval",
+                "--maker-session-id",
+                "maker",
+            ]
+        )
+    output = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert output["ok"] is False
+    assert output["reason"] == "already-running"
+    assert output["coverage_ratio"] == 0.0
+
+
+def test_run_command_applies_default_timeout(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    core.run_command(["example"])
+    assert seen["timeout"] == 900
 
 
 class FakeBrowser:

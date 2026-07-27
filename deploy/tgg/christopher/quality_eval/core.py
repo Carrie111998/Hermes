@@ -241,6 +241,7 @@ Command = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def run_command(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    kwargs.setdefault("timeout", 900)
     return subprocess.run(list(argv), text=True, check=False, **kwargs)
 
 
@@ -252,7 +253,21 @@ def collect_snapshot(
     inbox_db: str = INBOX_DB,
     tenant_db: str = TENANT_DB,
 ) -> dict[str, Any]:
-    argv = ["ssh", target, "python3", "-", str(cursor), inbox_db, tenant_db]
+    argv = [
+        "ssh",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        target,
+        "python3",
+        "-",
+        str(cursor),
+        inbox_db,
+        tenant_db,
+    ]
     result = command(argv, input=REMOTE_SNAPSHOT_SCRIPT, capture_output=True)
     if result.returncode:
         raise EvalError(f"read-only SSH snapshot failed: {result.stderr.strip()}")
@@ -400,7 +415,18 @@ def pull_retained_media(
         suffix = Path(remote_path).suffix[:16]
         local = destination / f"{hashlib.sha256(remote_path.encode()).hexdigest()[:20]}{suffix}"
         result = command(
-            ["scp", "--", f"{target}:{remote_path}", str(local)],
+            [
+                "scp",
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "--",
+                f"{target}:{remote_path}",
+                str(local),
+            ],
             capture_output=True,
         )
         if result.returncode:
@@ -714,10 +740,17 @@ class DefectFiler:
         for row in rows:
             if not isinstance(row, dict) or not isinstance(row.get("lane"), str):
                 raise EvalError("defect dedupe search row has no lane")
-        if rows:
+        identity = f"tgg-output-defect:{key}"
+        exact_rows = [
+            row
+            for row in rows
+            if identity in str(row.get("title", ""))
+            or identity in str(row.get("description", ""))
+        ]
+        if exact_rows:
             open_rows = [
                 row
-                for row in rows
+                for row in exact_rows
                 if str(row.get("lane", "")).lower() not in {"done", "cancelled", "archived"}
             ]
         else:
@@ -1293,8 +1326,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result.get("ok") else 1
     except RunAlreadyActive:
-        print(json.dumps({"ok": True, "ran": False, "reason": "already-running"}, sort_keys=True))
-        return 0
+        current_health = health(store)
+        result = {
+            **current_health,
+            "ran": False,
+            "reason": "already-running",
+        }
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["ok"] else 1
     except EvalError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
         return 1

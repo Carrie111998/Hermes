@@ -121,11 +121,39 @@ cat /home/pclaw/.hermes-christopher-tgg/runtime/capture-consumer-status.json' \
 evaluator_stdout="$receipt_root/output-quality-eval.stdout.json"
 evaluator_stderr="$receipt_root/output-quality-eval.stderr.txt"
 set +e
-"$APP_ROOT/deploy/tgg/christopher/scripts/output_quality_eval.py" \
-  run \
-  --trigger deploy \
-  --maker-session-id "deploy:$head_sha" \
-  >"$evaluator_stdout" 2>"$evaluator_stderr"
+python3 - \
+  "$APP_ROOT/deploy/tgg/christopher/scripts/output_quality_eval.py" \
+  "$head_sha" "$evaluator_stdout" "$evaluator_stderr" <<'PY'
+import pathlib
+import subprocess
+import sys
+
+evaluator, head_sha, stdout_name, stderr_name = sys.argv[1:]
+try:
+    result = subprocess.run(
+        [
+            evaluator,
+            "run",
+            "--trigger",
+            "deploy",
+            "--maker-session-id",
+            f"deploy:{head_sha}",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=1500,
+        check=False,
+    )
+    pathlib.Path(stdout_name).write_text(result.stdout)
+    pathlib.Path(stderr_name).write_text(result.stderr)
+    raise SystemExit(result.returncode)
+except subprocess.TimeoutExpired as exc:
+    stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+    stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+    pathlib.Path(stdout_name).write_text(stdout)
+    pathlib.Path(stderr_name).write_text(stderr + "\nevaluator timed out after 1500 seconds\n")
+    raise SystemExit(124)
+PY
 evaluator_rc=$?
 set -e
 evaluator_ok="$(python3 - "$evaluator_stdout" "$evaluator_stderr" \
