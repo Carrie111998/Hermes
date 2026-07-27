@@ -379,6 +379,7 @@ class CodexRealtimeSession:
         self._speech_generation = 0
         self._speech_started_at: Optional[float] = None
         self._speech_last_pcm_at: Optional[float] = None
+        self._speech_first_pcm_event: Optional[asyncio.Event] = None
         self._speech_watchdog_task: Optional[asyncio.Task] = None
         self._peer_failure_reason: Optional[str] = None
         self._failure_notified = False
@@ -570,6 +571,7 @@ class CodexRealtimeSession:
                     # can trigger independent remote-model audio.
                     self._speech_generation += 1
                     self._speech_gate = False
+                    self._wake_speech_start_waiter()
                     self._cancel_speech_watchdog()
                     continue
                 if method == "thread/realtime/transcript/done":
@@ -577,6 +579,7 @@ class CodexRealtimeSession:
                     if role == "user":
                         self._speech_generation += 1
                         self._speech_gate = False
+                        self._wake_speech_start_waiter()
                         self._cancel_speech_watchdog()
                         text = str(params.get("text") or "").strip()
                         if text:
@@ -620,8 +623,21 @@ class CodexRealtimeSession:
 
     def _handle_peer_pcm(self, pcm: bytes) -> None:
         if self._speech_gate:
-            self._speech_last_pcm_at = time.monotonic()
+            now = time.monotonic()
+            first_pcm = self._speech_last_pcm_at is None
+            self._speech_last_pcm_at = now
+            if first_pcm and self._speech_started_at is not None:
+                logger.info(
+                    "Codex realtime speech audio started after %.3fs",
+                    now - self._speech_started_at,
+                )
+            self._wake_speech_start_waiter()
             self._emit_output_pcm(pcm)
+
+    def _wake_speech_start_waiter(self) -> None:
+        event = self._speech_first_pcm_event
+        if event is not None:
+            event.set()
 
     def _handle_peer_failure(self, reason: str) -> None:
         safe_reason = safe_realtime_error(reason)
@@ -680,6 +696,7 @@ class CodexRealtimeSession:
         self._active = False
         self._speech_generation += 1
         self._speech_gate = False
+        self._wake_speech_start_waiter()
         self._cancel_speech_watchdog()
         self._speech_started_at = None
         self._speech_last_pcm_at = None
@@ -751,11 +768,35 @@ class CodexRealtimeSession:
             )
         self._speech_gate = True
         self._speech_started_at = time.monotonic()
+        self._speech_last_pcm_at = None
+        first_pcm_event = asyncio.Event()
+        self._speech_first_pcm_event = first_pcm_event
         # Fail closed if WebRTC output never starts or never becomes idle.
         gate_timeout = min(180.0, max(10.0, len(cleaned) / 8.0))
         self._speech_watchdog_task = asyncio.create_task(
             self._watch_speech_gate(generation, gate_timeout)
         )
+        try:
+            await asyncio.wait_for(
+                first_pcm_event.wait(),
+                timeout=SPEECH_FIRST_AUDIO_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            safe_reason = "Codex realtime speech produced no audio"
+            self._fail(safe_reason)
+            self._schedule_stop()
+            raise CodexRealtimeUnavailable(safe_reason) from None
+        finally:
+            if self._speech_first_pcm_event is first_pcm_event:
+                self._speech_first_pcm_event = None
+        if generation != self._speech_generation:
+            raise CodexRealtimeStaleSpeech(
+                "Hermes reply was superseded before realtime audio started"
+            )
+        if not self._active or self._speech_last_pcm_at is None:
+            raise CodexRealtimeUnavailable(
+                "Codex realtime speech ended before audio started"
+            )
         return True
 
     async def stop(self) -> None:
@@ -764,6 +805,7 @@ class CodexRealtimeSession:
             self._active = False
             self._speech_generation += 1
             self._speech_gate = False
+            self._wake_speech_start_waiter()
             watchdog = self._speech_watchdog_task
             self._cancel_speech_watchdog()
             self._speech_started_at = None

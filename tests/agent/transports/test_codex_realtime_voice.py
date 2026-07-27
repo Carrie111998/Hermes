@@ -12,6 +12,7 @@ from agent.transports.codex_realtime_voice import (
     CodexRealtimeCapabilities,
     CodexRealtimeSession,
     CodexRealtimeStaleSpeech,
+    CodexRealtimeUnavailable,
     discord_pcm_to_realtime,
     safe_realtime_error,
 )
@@ -68,6 +69,30 @@ class FakePeer:
 
     async def close(self):
         self.closed = True
+
+
+async def _append_speech_with_first_pcm(
+    session: CodexRealtimeSession,
+    peer: FakePeer,
+    text: str,
+    *,
+    pcm: bytes = b"first-pcm",
+    transcript_generation: int | None = None,
+) -> bool:
+    task = asyncio.create_task(
+        session.append_speech(
+            text,
+            transcript_generation=transcript_generation,
+        )
+    )
+    for _ in range(100):
+        if session._speech_gate:
+            break
+        await asyncio.sleep(0.001)
+    assert session._speech_gate is True
+    assert peer.on_pcm is not None
+    peer.on_pcm(pcm)
+    return await task
 
 
 @pytest.mark.asyncio
@@ -223,19 +248,28 @@ async def test_transcript_and_remote_pcm_notifications_are_forwarded(monkeypatch
     peer.on_pcm(b"\x01\x02")
     assert pcm_out == []
 
-    await session.append_speech("Hoi Maikel", transcript_generation=1)
+    await _append_speech_with_first_pcm(
+        session,
+        peer,
+        "Hoi Maikel",
+        pcm=b"\x01\x02",
+        transcript_generation=1,
+    )
     assert client.requests[-1] == (
         "thread/realtime/appendSpeech",
         {"threadId": "thread-1", "text": "Hoi Maikel"},
     )
-    peer.on_pcm(b"\x01\x02")
     assert pcm_out == [b"\x01\x02"]
     await asyncio.sleep(0.1)
     peer.on_pcm(b"\x03\x04")
     assert pcm_out == [b"\x01\x02"]
 
-    await session.append_speech("Nog een antwoord")
-    peer.on_pcm(b"\x05\x06")
+    await _append_speech_with_first_pcm(
+        session,
+        peer,
+        "Nog een antwoord",
+        pcm=b"\x05\x06",
+    )
     assert pcm_out == [b"\x01\x02", b"\x05\x06"]
     client.notifications.append({
         "method": "thread/realtime/transcript/delta",
@@ -301,7 +335,14 @@ async def test_new_user_generation_suppresses_stale_hermes_speech_and_late_compl
         for method, params in client.requests
     )
 
-    await session.append_speech("answer B", transcript_generation=generation_b)
+    await _append_speech_with_first_pcm(
+        session,
+        peer,
+        "answer B",
+        pcm=b"first-answer-b",
+        transcript_generation=generation_b,
+    )
+    pcm_out.clear()
     client.notifications.append({
         "method": "thread/realtime/transcript/done",
         "params": {
@@ -341,7 +382,8 @@ async def test_error_closes_session_and_reports_sanitized_reason():
         on_error=errors.append,
     )
     await session.start()
-    await session.append_speech("Hermes antwoord")
+    await _append_speech_with_first_pcm(session, peer, "Hermes antwoord")
+    pcm_out.clear()
     client.notifications.append({
         "method": "thread/realtime/error",
         "params": {"threadId": "thread-1", "message": "backend unavailable"},
@@ -433,12 +475,53 @@ async def test_append_speech_drops_pcm_until_request_is_acknowledged():
     peer.on_pcm(b"pre-ack")
     pcm_before_ack = list(pcm_out)
     client.release_append.set()
+    for _ in range(100):
+        if session._speech_gate:
+            break
+        await asyncio.sleep(0.001)
+    assert session._speech_gate is True
+    peer.on_pcm(b"accepted")
     assert await append_task is True
 
     assert pcm_before_ack == []
-    peer.on_pcm(b"accepted")
     assert pcm_out == [b"accepted"]
     await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_append_speech_without_first_audio_fails_for_classic_fallback(
+    monkeypatch,
+):
+    import agent.transports.codex_realtime_voice as realtime_module
+
+    monkeypatch.setattr(realtime_module, "SPEECH_FIRST_AUDIO_TIMEOUT", 0.02)
+    errors: list[str] = []
+    client = FakeClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v3"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "answer"},
+        },
+    ])
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        client_factory=lambda **kwargs: client,
+        peer_factory=FakePeer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+        on_error=errors.append,
+    )
+    await session.start()
+
+    try:
+        with pytest.raises(CodexRealtimeUnavailable, match="produced no audio"):
+            await session.append_speech("Hermes antwoord")
+    finally:
+        await session.stop()
+
+    assert errors == ["Codex realtime speech produced no audio"]
 
 
 @pytest.mark.asyncio
@@ -597,7 +680,8 @@ async def test_sideband_audio_is_ignored_for_webrtc_output():
         on_error=errors.append,
     )
     await session.start()
-    await session.append_speech("Hermes antwoord")
+    await _append_speech_with_first_pcm(session, peer, "Hermes antwoord")
+    pcm_out.clear()
     client.notifications.append({
         "method": "thread/realtime/outputAudio/delta",
         "params": {

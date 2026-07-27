@@ -448,7 +448,7 @@ class VoiceReceiver:
 
         # SSRC -> user_id mapping (populated from SPEAKING events)
         self._ssrc_to_user: Dict[int, int] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
@@ -513,6 +513,11 @@ class VoiceReceiver:
         """Offer one decoded frame to realtime, else buffer for classic STT."""
         with self._lock:
             user_id = self._ssrc_to_user.get(ssrc, 0)
+        if not user_id:
+            # A voice reconnect may resume RTP before Discord repeats its
+            # SPEAKING event. Apply the same fail-closed sole-user inference
+            # used by classic silence handling before realtime sees the frame.
+            user_id = self._infer_user_for_ssrc(ssrc)
         if self._pcm_callback is not None:
             try:
                 # user_id may still be 0 before Discord's SPEAKING mapping
@@ -735,7 +740,7 @@ class VoiceReceiver:
             ]
             if len(candidates) == 1:
                 uid = candidates[0]
-                self._ssrc_to_user[ssrc] = uid
+                self.map_ssrc(ssrc, uid)
                 logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
                 return uid
         except Exception:

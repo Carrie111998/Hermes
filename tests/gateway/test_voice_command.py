@@ -470,6 +470,43 @@ class TestSendVoiceReply:
         local_tts.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_realtime_no_audio_failure_uses_classic_tts_fallback(self, runner):
+        from agent.transports.codex_realtime_voice import CodexRealtimeUnavailable
+        from gateway.config import Platform
+
+        adapter = MagicMock()
+        adapter._voice_text_channels = {111: 123}
+        adapter.is_in_voice_channel.return_value = True
+        adapter.play_in_voice_channel = AsyncMock(return_value=True)
+        event = _make_event()
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[Platform.DISCORD] = adapter
+        manager = MagicMock()
+        manager.is_active.return_value = True
+        manager.classic_fallback_enabled.return_value = True
+        manager.append_speech = AsyncMock(
+            side_effect=CodexRealtimeUnavailable(
+                "Codex realtime speech produced no audio"
+            )
+        )
+        runner._codex_realtime_voice = manager
+
+        tts_result = '{"success": true, "file_path": "/tmp/fallback.mp3"}'
+        with patch(
+            "tools.tts_tool.text_to_speech_tool", return_value=tts_result
+        ) as local_tts, patch("os.path.isfile", return_value=True), patch("os.unlink"):
+            await runner._send_voice_reply(event, "Hoi Maikel")
+
+        manager.append_speech.assert_awaited_once_with(
+            adapter, 111, "Hoi Maikel", transcript_generation=None
+        )
+        local_tts.assert_called_once()
+        adapter.play_in_voice_channel.assert_awaited_once_with(
+            111, "/tmp/fallback.mp3"
+        )
+
+    @pytest.mark.asyncio
     async def test_realtime_reply_uses_tts_clean_text_and_drops_stale_generation(
         self, runner
     ):
@@ -777,7 +814,7 @@ class TestVoiceInHelp:
 class TestVoiceReceiver:
     """Test VoiceReceiver silence detection, SSRC mapping, and lifecycle."""
 
-    def _make_receiver(self, pcm_callback=None):
+    def _make_receiver(self, pcm_callback=None, *, allowed_user_ids=None, members=None):
         from plugins.platforms.discord.adapter import VoiceReceiver
         mock_vc = MagicMock()
         mock_vc._connection.secret_key = [0] * 32
@@ -786,7 +823,13 @@ class TestVoiceReceiver:
         mock_vc._connection.add_socket_listener = MagicMock()
         mock_vc._connection.remove_socket_listener = MagicMock()
         mock_vc._connection.hook = None
-        receiver = VoiceReceiver(mock_vc, pcm_callback=pcm_callback)
+        mock_vc.user = SimpleNamespace(id=9999)
+        mock_vc.channel = SimpleNamespace(members=members or [])
+        receiver = VoiceReceiver(
+            mock_vc,
+            pcm_callback=pcm_callback,
+            allowed_user_ids=allowed_user_ids,
+        )
         return receiver
 
     def test_initial_state(self):
@@ -845,6 +888,41 @@ class TestVoiceReceiver:
         receiver.handle_decoded_pcm(100, b"early")
 
         assert consumed == [(0, b"early")]
+        assert receiver._buffers[100] == bytearray()
+
+    def test_realtime_pcm_infers_sole_allowed_member_when_speaking_event_is_missing(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True,
+            allowed_user_ids={"42"},
+            members=[
+                SimpleNamespace(id=9999),
+                SimpleNamespace(id=42),
+            ],
+        )
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert consumed == [(42, b"pcm")]
+        assert receiver._ssrc_to_user[100] == 42
+        assert receiver._buffers[100] == bytearray()
+
+    def test_realtime_pcm_does_not_guess_between_multiple_allowed_members(self):
+        consumed = []
+        receiver = self._make_receiver(
+            pcm_callback=lambda user_id, pcm: consumed.append((user_id, pcm)) or True,
+            allowed_user_ids={"42", "43"},
+            members=[
+                SimpleNamespace(id=9999),
+                SimpleNamespace(id=42),
+                SimpleNamespace(id=43),
+            ],
+        )
+
+        receiver.handle_decoded_pcm(100, b"pcm")
+
+        assert consumed == [(0, b"pcm")]
+        assert 100 not in receiver._ssrc_to_user
         assert receiver._buffers[100] == bytearray()
 
     def test_unconsumed_pcm_falls_back_to_classic_stt_buffer(self):
