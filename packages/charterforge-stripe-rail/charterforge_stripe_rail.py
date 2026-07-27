@@ -41,7 +41,11 @@ def _verify_signature(raw_body: bytes, signature_header: str, secret: str,
     ).hexdigest()
     if not any(hmac.compare_digest(expected, candidate) for candidate in values.get("v1", [])):
         raise StripeWebhookError("Stripe webhook signature is invalid")
-    return {"scheme": "stripe_signature_v1", "signed_timestamp": timestamp}
+    return {
+        "scheme": "stripe_signature_v1",
+        "signed_timestamp": timestamp,
+        "signature_validated": True,
+    }
 
 
 def route_webhook_event(conn, *, organization_id: str, raw_body: bytes,

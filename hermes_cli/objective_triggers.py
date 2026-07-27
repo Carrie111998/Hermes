@@ -130,6 +130,13 @@ def route_external_event(
         raise TriggerError("source_reference is required for idempotency")
     if not authentication_evidence:
         raise TriggerError("external event requires adapter authentication evidence")
+    if not (
+        authentication_evidence.get("signature_validated") is True
+        or authentication_evidence.get("verified") is True
+    ):
+        raise TriggerError(
+            "external event requires an adapter-validated authentication marker"
+        )
     if (
         conn.execute(
             "SELECT 1 FROM organizations WHERE id=?", (organization_id,)

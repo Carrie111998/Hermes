@@ -64,3 +64,12 @@ The compliance catalog helps track CAN-SPAM, CASL, GDPR, the EU AI Act, SOX,
 PCI DSS, PIPEDA, RPAA, FINTRAC, and other regimes. Catalog presence is not an
 applicability conclusion. Qualified legal, tax, privacy, security, or
 accounting review is still required where the facts demand it.
+# Event ingress authentication boundary
+
+Objective wake-ups from external systems are accepted only when the adapter
+supplies an explicit `signature_validated: true` or `verified: true` marker.
+The routing layer still treats payload and text as untrusted, stores a
+credential-redacted immutable receipt, and applies idempotent source identity.
+Adapters remain responsible for performing the provider-specific cryptographic
+or platform authentication before calling the router; an evidence dictionary
+without a validated marker is rejected.

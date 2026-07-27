@@ -38,6 +38,8 @@ Hermes Agent history remains available in Git.
   fail-closed runtime, security, configuration, integrity, or drift gates.
 - Metered-invoice verification now requires independent allocation-ledger
   read-back of the exact event set and total amount.
+- External objective-event routing now rejects evidence without an adapter
+  validation marker.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.

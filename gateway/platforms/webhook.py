@@ -856,6 +856,7 @@ class WebhookAdapter(BasePlatformAdapter):
                                 route_name=route_name,
                                 authentication_evidence={
                                     "method": "webhook_hmac",
+                                    "signature_validated": True,
                                     "signature_version": (
                                         "v2"
                                         if request.headers.get(
