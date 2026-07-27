@@ -32,6 +32,18 @@ def _parser() -> argparse.ArgumentParser:
     fail.add_argument("--lease-token", required=True)
     fail.add_argument("--error-code", required=True)
     fail.add_argument("--thread-id")
+    hydration_pending = commands.add_parser("hydration-pending")
+    hydration_pending.add_argument("--limit", type=int, choices=(1,), default=1)
+    hydration_reserve = commands.add_parser("hydration-reserve")
+    hydration_reserve.add_argument("--lease-token", required=True)
+    hydration_commit = commands.add_parser("hydration-commit")
+    hydration_commit.add_argument("--lease-token", required=True)
+    hydration_commit.add_argument("--thread-id", required=True)
+    hydration_commit.add_argument("--hydration-marker", required=True)
+    hydration_fail = commands.add_parser("hydration-fail")
+    hydration_fail.add_argument("--lease-token", required=True)
+    hydration_fail.add_argument("--error-code", required=True)
+    hydration_fail.add_argument("--thread-id", required=True)
     return parser
 
 
@@ -51,6 +63,34 @@ async def dispatch(argv: Sequence[str], *, call: BrokerCall) -> dict[str, Any]:
             f"session_sidebar_{args.command}",
             {
                 "lease_token": args.lease_token,
+                "codex_thread_id": args.thread_id,
+            },
+        )
+    if args.command == "hydration-pending":
+        return await call(
+            "session_sidebar_hydration_pending",
+            {"limit": args.limit},
+        )
+    if args.command == "hydration-reserve":
+        return await call(
+            "session_sidebar_hydration_reserve",
+            {"lease_token": args.lease_token},
+        )
+    if args.command == "hydration-commit":
+        return await call(
+            "session_sidebar_hydration_commit",
+            {
+                "lease_token": args.lease_token,
+                "codex_thread_id": args.thread_id,
+                "hydration_marker": args.hydration_marker,
+            },
+        )
+    if args.command == "hydration-fail":
+        return await call(
+            "session_sidebar_hydration_fail",
+            {
+                "lease_token": args.lease_token,
+                "error_code": args.error_code,
                 "codex_thread_id": args.thread_id,
             },
         )

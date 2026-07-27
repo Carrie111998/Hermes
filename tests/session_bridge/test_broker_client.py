@@ -52,6 +52,44 @@ def test_broker_client_maps_each_command_to_the_exact_mcp_tool() -> None:
             "session_sidebar_fail",
             {"lease_token": "lease", "error_code": "sqlite_busy"},
         ),
+        (
+            ["hydration-pending"],
+            "session_sidebar_hydration_pending",
+            {"limit": 1},
+        ),
+        (
+            ["hydration-reserve", "--lease-token=hydrate-lease"],
+            "session_sidebar_hydration_reserve",
+            {"lease_token": "hydrate-lease"},
+        ),
+        (
+            [
+                "hydration-commit",
+                "--lease-token=hydrate-lease",
+                "--thread-id=thread",
+                "--hydration-marker=marker",
+            ],
+            "session_sidebar_hydration_commit",
+            {
+                "lease_token": "hydrate-lease",
+                "codex_thread_id": "thread",
+                "hydration_marker": "marker",
+            },
+        ),
+        (
+            [
+                "hydration-fail",
+                "--lease-token=hydrate-lease",
+                "--error-code=hydration_send_ambiguous",
+                "--thread-id=thread",
+            ],
+            "session_sidebar_hydration_fail",
+            {
+                "lease_token": "hydrate-lease",
+                "error_code": "hydration_send_ambiguous",
+                "codex_thread_id": "thread",
+            },
+        ),
     ]
 
     for argv, expected_tool, expected_payload in cases:

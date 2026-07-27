@@ -21,6 +21,7 @@ from session_bridge.coordinator import (
     ContinueResult,
     SessionBridgeCoordinator,
     SidebarDeliveryClaim,
+    SidebarHydrationClaim,
 )
 from session_bridge.mcp_server import (
     EXPECTED_TOOLS,
@@ -34,6 +35,7 @@ from session_bridge.mcp_server import (
 from session_bridge.models import (
     BridgeMarkerPayload,
     ContextPack,
+    HydrationMarkerPayload,
     OriginKind,
     ProjectedMessage,
     Provider,
@@ -46,6 +48,7 @@ from session_bridge.models import (
 from session_bridge.sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
+    encode_hydration_marker,
     sidebar_bridge_id,
 )
 from session_bridge.store import SessionBridgeStore
@@ -315,7 +318,9 @@ class _FakeCoordinator:
         self.stopped = 0
         self.continue_requests: list[Any] = []
         self.sidebar_claims: tuple[SidebarDeliveryClaim, ...] = ()
+        self.sidebar_hydration_claims: tuple[SidebarHydrationClaim, ...] = ()
         self.sidebar_claim_limits: list[int] = []
+        self.sidebar_hydration_claim_limits: list[int] = []
         self.sidebar_binds: list[tuple[str, str]] = []
         self.sidebar_commits: list[tuple[str, str]] = []
 
@@ -361,6 +366,14 @@ class _FakeCoordinator:
     ) -> tuple[SidebarDeliveryClaim, ...]:
         self.sidebar_claim_limits.append(limit)
         return self.sidebar_claims[:limit]
+
+    async def claim_sidebar_hydration_for_delivery(
+        self,
+        *,
+        limit: int = 1,
+    ) -> tuple[SidebarHydrationClaim, ...]:
+        self.sidebar_hydration_claim_limits.append(limit)
+        return self.sidebar_hydration_claims[:limit]
 
     async def commit_sidebar_job(
         self,
@@ -742,7 +755,7 @@ def test_health_is_minimal_and_mcp_auth_is_constant_surface(db: SessionDB) -> No
     assert coordinator.stopped == 1
 
 
-def test_tools_list_exposes_exactly_the_eleven_approved_tools(db: SessionDB) -> None:
+def test_tools_list_exposes_exactly_the_fifteen_approved_tools(db: SessionDB) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
     coordinator = _FakeCoordinator(
         bridge_id=bridge_id, source_id=source_id, target_id=target_id
@@ -767,6 +780,10 @@ def test_tools_list_exposes_exactly_the_eleven_approved_tools(db: SessionDB) -> 
             "session_sidebar_bind",
             "session_sidebar_commit",
             "session_sidebar_fail",
+            "session_sidebar_hydration_pending",
+            "session_sidebar_hydration_reserve",
+            "session_sidebar_hydration_commit",
+            "session_sidebar_hydration_fail",
         }
     )
 
@@ -973,6 +990,132 @@ def test_session_sidebar_pending_returns_durable_reserved_thread_id(
     assert response["jobs"][0]["recovered_thread_id"] == (
         "44444444-4444-4444-8444-444444444444"
     )
+
+
+def test_session_sidebar_hydration_tools_have_exact_schemas_and_commit_exact_task(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    now = time.time()
+    sidebar_lease = store.claim_sidebar_jobs(now=now, limit=1)[0]
+    thread_id = "hydration-thread-1"
+    store.commit_sidebar_job(
+        lease_token=sidebar_lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=now + 1.0,
+    )
+    snapshot = store.get_sidebar_preview_source(candidate.source_session_id)
+    payload = HydrationMarkerPayload(
+        bridge_id=candidate.bridge_id,
+        codex_thread_id=thread_id,
+        preview_digest="a" * 64,
+        preview_version=1,
+        source_cursor=snapshot["source_cursor"],
+        source_hash=snapshot["source_hash"],
+        source_session_id=candidate.source_session_id,
+    )
+    marker = encode_hydration_marker(payload, MARKER_KEY)
+    store.seed_sidebar_hydration_job(
+        candidate.source_session_id,
+        candidate.bridge_id,
+        thread_id,
+        snapshot["source_cursor"],
+        snapshot["source_hash"],
+        1,
+        payload.preview_digest,
+        marker,
+        now + 2.0,
+    )
+    raw_claim = store.claim_sidebar_hydration_jobs(now=now + 3.0)[0]
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id=f"codex:{thread_id}",
+    )
+    coordinator.sidebar_hydration_claims = (
+        SidebarHydrationClaim(
+            lease_token=raw_claim["lease_token"],
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            codex_thread_id=thread_id,
+            source_cursor=snapshot["source_cursor"],
+            source_hash=snapshot["source_hash"],
+            preview_version=1,
+            preview_digest=payload.preview_digest,
+            hydration_marker=marker,
+            hydration_message=(
+                "# Imported Claude Code Session\n\n"
+                "This is an authenticated in-place Session Bridge hydration.\n"
+                f'Call session_continue(session_id="{candidate.source_session_id}", '
+                'target_provider="codex") before project work.\n'
+                f"Hydration marker: {marker}\n"
+                "After the continuation call, reply only: HYDRATED"
+            ),
+            cwd=candidate.cwd,
+            git_root=candidate.git_root,
+            send_reserved=False,
+        ),
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        tools = {
+            tool["name"]: tool["inputSchema"]
+            for tool in _rpc(client, "tools/list")["result"]["tools"]
+        }
+        pending = _call_tool(
+            client,
+            "session_sidebar_hydration_pending",
+            {"limit": 1},
+        )
+        reserved = _call_tool(
+            client,
+            "session_sidebar_hydration_reserve",
+            {"lease_token": raw_claim["lease_token"]},
+        )
+        committed = _call_tool(
+            client,
+            "session_sidebar_hydration_commit",
+            {
+                "lease_token": raw_claim["lease_token"],
+                "codex_thread_id": thread_id,
+                "hydration_marker": marker,
+            },
+        )
+
+    assert set(tools["session_sidebar_hydration_pending"]["properties"]) == {"limit"}
+    assert set(tools["session_sidebar_hydration_reserve"]["properties"]) == {
+        "lease_token"
+    }
+    assert set(tools["session_sidebar_hydration_commit"]["properties"]) == {
+        "lease_token",
+        "codex_thread_id",
+        "hydration_marker",
+    }
+    assert set(tools["session_sidebar_hydration_fail"]["properties"]) == {
+        "lease_token",
+        "error_code",
+        "codex_thread_id",
+    }
+    assert coordinator.sidebar_hydration_claim_limits == [1]
+    job = pending["jobs"][0]
+    assert set(job) == {
+        "lease_token",
+        "codex_thread_id",
+        "hydration_message",
+        "hydration_marker",
+        "cwd",
+        "git_root",
+        "send_reserved",
+    }
+    assert job["codex_thread_id"] == thread_id
+    assert job["hydration_marker"] == marker
+    assert job["hydration_message"].startswith("# Imported Claude Code Session")
+    assert "native_path" not in json.dumps(job)
+    assert reserved == {"state": "hydration_leased", "send_reserved": True}
+    assert committed == {
+        "state": "hydration_visible",
+        "codex_thread_id": thread_id,
+    }
 
 
 def test_session_sidebar_reserve_durably_records_pre_create_boundary(

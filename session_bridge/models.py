@@ -94,6 +94,17 @@ class BridgeMarkerPayload:
 
 
 @dataclass(frozen=True)
+class HydrationMarkerPayload:
+    bridge_id: str
+    codex_thread_id: str
+    preview_digest: str
+    preview_version: int
+    source_cursor: str
+    source_hash: str
+    source_session_id: str
+
+
+@dataclass(frozen=True)
 class UpsertResult:
     session_id: str
     inserted_messages: int

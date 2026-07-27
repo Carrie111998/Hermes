@@ -41,6 +41,7 @@ from session_bridge.mirror import MirrorPolicy
 from session_bridge.models import (
     BridgeMarkerPayload,
     ContextPack,
+    HydrationMarkerPayload,
     MirrorJobState,
     OriginKind,
     ProjectedMessage,
@@ -54,8 +55,10 @@ from session_bridge.models import (
 from session_bridge.sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
+    encode_hydration_marker,
     sidebar_bridge_id,
 )
+from session_bridge.preview import build_session_preview
 from session_bridge.sidebar_executor import SidebarExecutionResult
 from session_bridge.store import SessionBridgeStore, SidebarSource, SidebarSourcePage
 from session_bridge.worktree import (
@@ -3525,6 +3528,153 @@ async def test_backfill_preview_never_exceeds_its_queue_limit(
     assert preview.examined == 11
     assert preview.queued == 10
     assert preview.by_provider == {"claude": 10, "hermes": 0}
+
+
+class _HydrationClaimStore:
+    def __init__(
+        self,
+        *,
+        candidate: SidebarCandidate,
+        snapshot: dict[str, Any],
+        preview_digest: str,
+        marker: str,
+    ) -> None:
+        self.candidate = candidate
+        self.snapshot = snapshot
+        self.failed: list[tuple[str, str, str]] = []
+        self.raw = {
+            "lease_token": "hydration-lease",
+            "source_session_id": candidate.source_session_id,
+            "bridge_id": candidate.bridge_id,
+            "codex_thread_id": "codex-thread-1",
+            "source_cursor": snapshot["source_cursor"],
+            "source_hash": snapshot["source_hash"],
+            "preview_version": 1,
+            "preview_digest": preview_digest,
+            "hydration_marker": marker,
+            "send_reserved": False,
+        }
+
+    def claim_sidebar_hydration_jobs(
+        self,
+        *,
+        now: float,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        assert now == 100.0
+        assert limit == 1
+        return [dict(self.raw)]
+
+    def get_sidebar_candidate_for_delivery(
+        self,
+        source_session_id: str,
+    ) -> SidebarCandidate:
+        assert source_session_id == self.candidate.source_session_id
+        return self.candidate
+
+    def get_sidebar_preview_source(self, source_session_id: str) -> dict[str, Any]:
+        assert source_session_id == self.candidate.source_session_id
+        return dict(self.snapshot)
+
+    def fail_sidebar_hydration_job(
+        self,
+        *,
+        lease_token: str,
+        error_code: str,
+        codex_thread_id: str,
+        now: float,
+    ) -> dict[str, Any]:
+        assert now == 100.0
+        self.failed.append((lease_token, error_code, codex_thread_id))
+        return {"state": "hydration_failed"}
+
+
+@pytest.mark.asyncio
+async def test_hydration_claim_rebuilds_and_verifies_preview_before_send() -> None:
+    candidate = SidebarCandidate(
+        source_session_id="claude:source-1",
+        provider=Provider.CLAUDE,
+        bridge_id=sidebar_bridge_id("claude:source-1"),
+        title="[Claude] Source",
+        cwd="C:/work/source",
+        git_root="C:/repo/source",
+        git_branch="main",
+        git_head="a" * 40,
+        worktree_id="worktree-1",
+        eligible_at=90.0,
+    )
+    snapshot = {
+        "source_session_id": candidate.source_session_id,
+        "provider": "claude",
+        "source_cursor": "cursor-1",
+        "source_hash": "hash-1",
+        "title": "Source",
+        "cwd": candidate.cwd,
+        "captured_at": 99.0,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Fix the remaining hydration work.",
+                "timestamp": 99.0,
+            }
+        ],
+    }
+    preview = build_session_preview(
+        source_session_id=candidate.source_session_id,
+        source_cursor=snapshot["source_cursor"],
+        source_hash=snapshot["source_hash"],
+        title=snapshot["title"],
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=snapshot["captured_at"],
+        messages=snapshot["messages"],
+        git_root=candidate.git_root,
+        git_branch=candidate.git_branch,
+        git_head=candidate.git_head,
+        worktree_id=candidate.worktree_id,
+    )
+    payload = HydrationMarkerPayload(
+        bridge_id=candidate.bridge_id,
+        codex_thread_id="codex-thread-1",
+        preview_digest=preview.digest,
+        preview_version=1,
+        source_cursor=snapshot["source_cursor"],
+        source_hash=snapshot["source_hash"],
+        source_session_id=candidate.source_session_id,
+    )
+    marker = encode_hydration_marker(payload, b"coordinator-hydration-secret")
+    store = _HydrationClaimStore(
+        candidate=candidate,
+        snapshot=snapshot,
+        preview_digest=preview.digest,
+        marker=marker,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=replace(
+            _sidebar_config(),
+            sidebar=replace(
+                _sidebar_config().sidebar,
+                legacy_hydration_enabled=True,
+            ),
+        ),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: 100.0,
+    )
+
+    claims = await coordinator.claim_sidebar_hydration_for_delivery(limit=1)
+
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim.codex_thread_id == "codex-thread-1"
+    assert claim.send_reserved is False
+    assert claim.hydration_message.startswith("# Imported Claude Code Session")
+    assert "This is an authenticated in-place Session Bridge hydration." in (
+        claim.hydration_message
+    )
+    assert f"Hydration marker: {marker}" in claim.hydration_message
+    assert store.failed == []
 
 
 class _HeartbeatClaimStore:

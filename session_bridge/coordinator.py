@@ -57,10 +57,12 @@ from .models import (
 from .sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
+    build_hydration_message,
     is_sidebar_session_eligible,
     sidebar_bridge_id,
     sidebar_title,
 )
+from .preview import build_session_preview
 from .store import (
     SIDEBAR_EXCLUSION_REASONS,
     SessionBridgeStore,
@@ -121,6 +123,23 @@ class SidebarDeliveryClaim:
     recovered_thread: VerifiedSidebarThread | None
     reserved_thread_id: str | None = None
     create_reserved: bool = False
+
+
+@dataclass(frozen=True)
+class SidebarHydrationClaim:
+    lease_token: str
+    source_session_id: str
+    bridge_id: str
+    codex_thread_id: str
+    source_cursor: str
+    source_hash: str
+    preview_version: int
+    preview_digest: str
+    hydration_marker: str
+    hydration_message: str
+    cwd: str
+    git_root: str | None
+    send_reserved: bool
 
 
 @dataclass(frozen=True)
@@ -1370,6 +1389,187 @@ class SessionBridgeCoordinator:
                 known_thread_ids=known_thread_ids,
             )
             raise
+
+    async def claim_sidebar_hydration_for_delivery(
+        self,
+        *,
+        limit: int = 1,
+    ) -> tuple[SidebarHydrationClaim, ...]:
+        if type(limit) is not int or limit != 1:
+            raise ValueError("sidebar hydration delivery limit must be exactly one")
+        if not self._config.sidebar.legacy_hydration_enabled:
+            return ()
+        claim_time = _finite_number(self._clock(), "now")
+        raw_claims = await asyncio.to_thread(
+            _call,
+            self._store,
+            "claim_sidebar_hydration_jobs",
+            now=claim_time,
+            limit=limit,
+        )
+        if not isinstance(raw_claims, list) or len(raw_claims) > 1:
+            raise ValueError("sidebar hydration claims are malformed")
+
+        delivery: list[SidebarHydrationClaim] = []
+        for raw in raw_claims:
+            if not isinstance(raw, Mapping):
+                raise ValueError("sidebar hydration claim is malformed")
+            lease_token = _exact_sidebar_claim_text(
+                raw.get("lease_token"),
+                "hydration lease token",
+            )
+            source_session_id = _exact_sidebar_claim_text(
+                raw.get("source_session_id"),
+                "hydration source session ID",
+            )
+            bridge_id = _exact_sidebar_claim_text(
+                raw.get("bridge_id"),
+                "hydration bridge ID",
+            )
+            thread_id = _exact_sidebar_claim_text(
+                raw.get("codex_thread_id"),
+                "hydration Codex thread ID",
+            )
+            source_cursor = _exact_sidebar_claim_text(
+                raw.get("source_cursor"),
+                "hydration source cursor",
+            )
+            source_hash = _exact_sidebar_claim_text(
+                raw.get("source_hash"),
+                "hydration source hash",
+            )
+            preview_digest = _exact_sidebar_claim_text(
+                raw.get("preview_digest"),
+                "hydration preview digest",
+            )
+            hydration_marker = _exact_sidebar_claim_text(
+                raw.get("hydration_marker"),
+                "hydration marker",
+            )
+            preview_version = raw.get("preview_version")
+            send_reserved = raw.get("send_reserved")
+            if type(preview_version) is not int or preview_version != 1:
+                await self._fail_sidebar_hydration_claim(
+                    lease_token,
+                    "preview_digest_mismatch",
+                    thread_id,
+                )
+                continue
+            if type(send_reserved) is not bool:
+                raise ValueError("hydration reservation flag is malformed")
+            try:
+                candidate = await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "get_sidebar_candidate_for_delivery",
+                    source_session_id,
+                )
+                if (
+                    not isinstance(candidate, SidebarCandidate)
+                    or candidate.source_session_id != source_session_id
+                    or candidate.bridge_id != bridge_id
+                ):
+                    raise ValueError("hydration candidate identity mismatch")
+                if send_reserved:
+                    message = build_hydration_message(
+                        preview_rendered=None,
+                        source_session_id=source_session_id,
+                        hydration_marker=hydration_marker,
+                        send_reserved=True,
+                    )
+                else:
+                    snapshot = await asyncio.to_thread(
+                        _call,
+                        self._store,
+                        "get_sidebar_preview_source",
+                        source_session_id,
+                    )
+                    if not isinstance(snapshot, Mapping):
+                        raise ValueError("hydration source snapshot is malformed")
+                    if (
+                        snapshot.get("source_session_id") != source_session_id
+                        or snapshot.get("provider") != candidate.provider.value
+                        or snapshot.get("source_cursor") != source_cursor
+                        or snapshot.get("source_hash") != source_hash
+                    ):
+                        raise ValueError("hydration source identity mismatch")
+                    preview = build_session_preview(
+                        source_session_id=source_session_id,
+                        source_cursor=source_cursor,
+                        source_hash=source_hash,
+                        title=cast(str | None, snapshot.get("title")),
+                        provider=candidate.provider.value,
+                        cwd=candidate.cwd,
+                        captured_at=snapshot.get("captured_at"),
+                        messages=cast(
+                            Sequence[Mapping[str, Any]],
+                            snapshot.get("messages"),
+                        ),
+                        git_root=candidate.git_root,
+                        git_branch=candidate.git_branch,
+                        git_head=candidate.git_head,
+                        worktree_id=candidate.worktree_id,
+                        budget_chars=self._config.sidebar.preview_budget_chars,
+                    )
+                    if (
+                        preview.version != preview_version
+                        or preview.digest != preview_digest
+                    ):
+                        await self._fail_sidebar_hydration_claim(
+                            lease_token,
+                            "preview_digest_mismatch",
+                            thread_id,
+                        )
+                        continue
+                    message = build_hydration_message(
+                        preview_rendered=preview.rendered,
+                        source_session_id=source_session_id,
+                        hydration_marker=hydration_marker,
+                        send_reserved=False,
+                    )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                await self._fail_sidebar_hydration_claim(
+                    lease_token,
+                    "source_identity_mismatch",
+                    thread_id,
+                )
+                continue
+            delivery.append(
+                SidebarHydrationClaim(
+                    lease_token=lease_token,
+                    source_session_id=source_session_id,
+                    bridge_id=bridge_id,
+                    codex_thread_id=thread_id,
+                    source_cursor=source_cursor,
+                    source_hash=source_hash,
+                    preview_version=preview_version,
+                    preview_digest=preview_digest,
+                    hydration_marker=hydration_marker,
+                    hydration_message=message,
+                    cwd=candidate.cwd,
+                    git_root=candidate.git_root,
+                    send_reserved=send_reserved,
+                )
+            )
+        return tuple(delivery)
+
+    async def _fail_sidebar_hydration_claim(
+        self,
+        lease_token: str,
+        error_code: str,
+        codex_thread_id: str,
+    ) -> None:
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "fail_sidebar_hydration_job",
+            lease_token=lease_token,
+            error_code=error_code,
+            codex_thread_id=codex_thread_id,
+            now=_finite_number(self._clock(), "now"),
+        )
 
     async def _finish_cancelled_sidebar_claim(
         self,

@@ -15,6 +15,7 @@ from typing import cast
 from .context_pack import _redact
 from .models import (
     OriginKind,
+    HydrationMarkerPayload,
     Provider,
     SessionPreview,
     SessionProjection,
@@ -50,11 +51,21 @@ _TITLE_PREFIXES = {
 _MAX_TITLE_CHARS = 120
 _UNICODE_LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 _MARKER_PREFIX = "HERMES_SESSION_BRIDGE_V1"
+_HYDRATION_MARKER_PREFIX = "HERMES_SESSION_HYDRATION_V1"
 _MARKER_FIELDS = frozenset({
     "bridge_id",
     "policy_generation",
     "source_session_id",
     "target_provider",
+})
+_HYDRATION_MARKER_FIELDS = frozenset({
+    "bridge_id",
+    "codex_thread_id",
+    "preview_digest",
+    "preview_version",
+    "source_cursor",
+    "source_hash",
+    "source_session_id",
 })
 _BASE64URL_CHARACTERS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -249,6 +260,127 @@ def sidebar_title(provider: Provider, title: str | None, first_request: str) -> 
     return prefix + compact[: _MAX_TITLE_CHARS - len(prefix)].rstrip()
 
 
+def encode_hydration_marker(
+    payload: HydrationMarkerPayload,
+    secret: bytes,
+) -> str:
+    normalized = _validated_hydration_payload(payload)
+    secret_bytes = _validated_marker_secret(secret)
+    body = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    encoded_body = base64.urlsafe_b64encode(body).rstrip(b"=").decode("ascii")
+    signature = hmac.new(
+        secret_bytes,
+        encoded_body.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = (
+        base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    )
+    return f"{_HYDRATION_MARKER_PREFIX}:{encoded_body}.{encoded_signature}"
+
+
+def decode_hydration_marker(
+    marker: str,
+    secret: bytes,
+) -> HydrationMarkerPayload:
+    secret_bytes = _validated_marker_secret(secret)
+    try:
+        if not isinstance(marker, str) or marker.count(":") != 1:
+            raise ValueError
+        prefix, encoded_and_signature = marker.split(":", 1)
+        if (
+            prefix != _HYDRATION_MARKER_PREFIX
+            or encoded_and_signature.count(".") != 1
+        ):
+            raise ValueError
+        encoded_body, encoded_signature = encoded_and_signature.split(".", 1)
+        body = _decode_canonical_base64url(encoded_body)
+        signature = _decode_canonical_base64url(encoded_signature)
+        if len(signature) != hashlib.sha256().digest_size:
+            raise ValueError
+        expected = hmac.new(
+            secret_bytes,
+            encoded_body.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError
+        decoded = json.loads(body.decode("utf-8"))
+        if not isinstance(decoded, dict) or set(decoded) != _HYDRATION_MARKER_FIELDS:
+            raise ValueError
+        canonical = json.dumps(
+            decoded,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if canonical != body:
+            raise ValueError
+        normalized = _validated_hydration_payload(
+            HydrationMarkerPayload(**decoded)
+        )
+        return HydrationMarkerPayload(**normalized)
+    except (
+        binascii.Error,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError("hydration marker is malformed or unauthenticated") from exc
+
+
+def _validated_hydration_payload(
+    payload: HydrationMarkerPayload,
+) -> dict[str, object]:
+    if not isinstance(payload, HydrationMarkerPayload):
+        raise ValueError("hydration marker payload is malformed")
+    source_id = _validated_source_session_id(payload.source_session_id)
+    if payload.bridge_id != sidebar_bridge_id(source_id):
+        raise ValueError("hydration marker bridge identity mismatch")
+    values = {
+        "bridge_id": payload.bridge_id,
+        "codex_thread_id": payload.codex_thread_id,
+        "preview_digest": payload.preview_digest,
+        "preview_version": payload.preview_version,
+        "source_cursor": payload.source_cursor,
+        "source_hash": payload.source_hash,
+        "source_session_id": source_id,
+    }
+    for field in (
+        "bridge_id",
+        "codex_thread_id",
+        "source_cursor",
+        "source_hash",
+    ):
+        value = values[field]
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or _has_line_break(value)
+        ):
+            raise ValueError(f"hydration marker {field} is malformed")
+    if payload.preview_version != 1:
+        raise ValueError("hydration marker preview version must be 1")
+    if _PREVIEW_DIGEST_RE.fullmatch(payload.preview_digest) is None:
+        raise ValueError(
+            "hydration marker preview digest must be lowercase SHA-256"
+        )
+    return values
+
+
+def _validated_marker_secret(secret: bytes) -> bytes:
+    if not isinstance(secret, bytes) or not secret:
+        raise ValueError("hydration marker secret must be nonempty bytes")
+    return secret
+
+
 def build_registration_prompt(
     candidate: SidebarCandidate,
     marker: str,
@@ -356,6 +488,59 @@ def is_registration_prompt(value: object) -> bool:
         return _is_exact_registration_block("\n".join(bridge_lines[4:]))
     except (TypeError, ValueError):
         return False
+
+
+def build_hydration_message(
+    *,
+    preview_rendered: str | None,
+    source_session_id: str,
+    hydration_marker: str,
+    send_reserved: bool,
+) -> str:
+    source_id = _validated_source_session_id(source_session_id)
+    marker = _exact_single_line_text(hydration_marker, "hydration marker")
+    if type(send_reserved) is not bool:
+        raise ValueError("hydration send reservation flag is malformed")
+    if preview_rendered is None:
+        if not send_reserved:
+            raise ValueError("unreserved hydration requires a readable preview")
+        readable = (
+            "# Session Bridge Hydration Reconciliation\n\n"
+            "The readable hydration was already reserved for this exact task. "
+            "Reconcile the authenticated marker; do not send it again."
+        )
+    else:
+        if (
+            not isinstance(preview_rendered, str)
+            or not preview_rendered.startswith("# Imported ")
+            or not preview_rendered.endswith("\n")
+        ):
+            raise ValueError("hydration preview is malformed")
+        readable = preview_rendered.rstrip("\n")
+    source = json.dumps(source_id, ensure_ascii=False, separators=(",", ":"))
+    return "\n".join((
+        readable,
+        "",
+        "## In-place Session Bridge Hydration",
+        "",
+        "This is an authenticated in-place Session Bridge hydration.",
+        "Call "
+        f"session_continue(session_id={source}, target_provider=\"codex\") "
+        "before project work.",
+        f"Hydration marker: {marker}",
+        "After the continuation call, reply only: HYDRATED",
+    ))
+
+
+def _exact_single_line_text(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or _has_line_break(value)
+    ):
+        raise ValueError(f"{label} must be canonical")
+    return value
 
 
 def _validate_preview(candidate: SidebarCandidate, preview: SessionPreview) -> None:

@@ -30,6 +30,7 @@ from .coordinator import ContinueRequest, ContinueResult
 from .mirror import MirrorPolicy, enqueue_mirror_job
 from .models import (
     BridgeMarkerPayload,
+    HydrationMarkerPayload,
     MirrorJobState,
     Provider,
     SidebarJobState,
@@ -38,10 +39,13 @@ from .models import (
 from .preview import build_session_preview
 from .sidebar import (
     build_registration_prompt,
+    decode_hydration_marker,
     sidebar_create_recovery_key,
     validate_sidebar_create_reservation,
 )
 from .store import (
+    HYDRATION_FATAL_ERRORS,
+    HYDRATION_RETRYABLE_ERRORS,
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_PRECREATE_RESOLUTION_CODE,
     SIDEBAR_RETRYABLE_ERRORS,
@@ -63,6 +67,10 @@ EXPECTED_TOOLS = {
     "session_sidebar_bind",
     "session_sidebar_commit",
     "session_sidebar_fail",
+    "session_sidebar_hydration_pending",
+    "session_sidebar_hydration_reserve",
+    "session_sidebar_hydration_commit",
+    "session_sidebar_hydration_fail",
 }
 _TOKEN_ENV = "HERMES_SESSION_BRIDGE_TOKEN"
 _MIN_TOKEN_BYTES = 32
@@ -459,6 +467,157 @@ def create_app(
         except Exception:
             await _rollback_sidebar_claims(store, claimed_tokens)
             raise ValueError("sidebar_pending_failed") from None
+
+    @mcp.tool()
+    async def session_sidebar_hydration_pending(limit: Any = 1) -> dict[str, Any]:
+        """Lease exactly one in-place hydration job for the Codex broker."""
+
+        if type(limit) is not int or limit != 1:
+            raise ValueError("sidebar_hydration_pending_invalid_request")
+        claim_method = getattr(
+            coordinator,
+            "claim_sidebar_hydration_for_delivery",
+            None,
+        )
+        if not callable(claim_method):
+            raise RuntimeError("sidebar_hydration_pending_unavailable")
+        claimed_tokens: list[tuple[str, str]] = []
+        try:
+            secret = marker_key
+            if secret is None:
+                secret = await asyncio.to_thread(resolve_marker_key)
+            claims = await claim_method(limit=1)
+            if not isinstance(claims, tuple) or len(claims) > 1:
+                raise ValueError("malformed sidebar hydration lease batch")
+            jobs: list[dict[str, Any]] = []
+            for claim in claims:
+                lease_token = _exact_sidebar_text(
+                    getattr(claim, "lease_token", None),
+                    "hydration lease token",
+                )
+                thread_id = _exact_sidebar_text(
+                    getattr(claim, "codex_thread_id", None),
+                    "hydration Codex thread ID",
+                )
+                claimed_tokens.append((lease_token, thread_id))
+                jobs.append(_build_sidebar_hydration_broker_job(claim, secret))
+            return {"jobs": jobs}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            for lease_token, thread_id in claimed_tokens:
+                try:
+                    await asyncio.to_thread(
+                        store.fail_sidebar_hydration_job,
+                        lease_token=lease_token,
+                        error_code="source_identity_mismatch",
+                        codex_thread_id=thread_id,
+                        now=time.time(),
+                    )
+                except Exception:
+                    pass
+            raise ValueError("sidebar_hydration_pending_failed") from None
+
+    @mcp.tool()
+    async def session_sidebar_hydration_reserve(
+        lease_token: Any,
+    ) -> dict[str, Any]:
+        """Freeze one hydration send before dispatch to the exact native task."""
+
+        token_text = _exact_sidebar_text(lease_token, "hydration lease token")
+        try:
+            result = await asyncio.to_thread(
+                store.reserve_sidebar_hydration_send,
+                lease_token=token_text,
+                now=time.time(),
+            )
+            if (
+                not isinstance(result, Mapping)
+                or result.get("state") != "hydration_leased"
+                or result.get("send_reserved_at") is None
+            ):
+                raise ValueError("malformed hydration reservation")
+            return {"state": "hydration_leased", "send_reserved": True}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_hydration_reserve_failed") from None
+
+    @mcp.tool()
+    async def session_sidebar_hydration_commit(
+        lease_token: Any,
+        codex_thread_id: Any,
+        hydration_marker: Any,
+    ) -> dict[str, Any]:
+        """Commit a verified hydration marker on one exact Codex task."""
+
+        token_text = _exact_sidebar_text(lease_token, "hydration lease token")
+        thread_id = _exact_sidebar_text(
+            codex_thread_id,
+            "hydration Codex thread ID",
+        )
+        marker = _exact_sidebar_text(hydration_marker, "hydration marker")
+        try:
+            result = await asyncio.to_thread(
+                store.commit_sidebar_hydration_job,
+                lease_token=token_text,
+                codex_thread_id=thread_id,
+                hydration_marker=marker,
+                now=time.time(),
+            )
+            if (
+                not isinstance(result, Mapping)
+                or result.get("state") != "hydration_visible"
+                or result.get("codex_thread_id") != thread_id
+            ):
+                raise ValueError("malformed hydration completion")
+            return {
+                "state": "hydration_visible",
+                "codex_thread_id": thread_id,
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_hydration_commit_failed") from None
+
+    @mcp.tool()
+    async def session_sidebar_hydration_fail(
+        lease_token: Any,
+        error_code: Any,
+        codex_thread_id: Any,
+    ) -> dict[str, Any]:
+        """Fail or retry one exact hydration lease using a fixed public code."""
+
+        token_text = _exact_sidebar_text(lease_token, "hydration lease token")
+        thread_id = _exact_sidebar_text(
+            codex_thread_id,
+            "hydration Codex thread ID",
+        )
+        if (
+            type(error_code) is not str
+            or error_code
+            not in HYDRATION_RETRYABLE_ERRORS | HYDRATION_FATAL_ERRORS
+        ):
+            raise ValueError("sidebar_hydration_fail_invalid_request")
+        try:
+            result = await asyncio.to_thread(
+                store.fail_sidebar_hydration_job,
+                lease_token=token_text,
+                error_code=error_code,
+                codex_thread_id=thread_id,
+                now=time.time(),
+            )
+            if not isinstance(result, Mapping):
+                raise ValueError("malformed hydration failure")
+            return {
+                "state": result.get("state"),
+                "error_code": result.get("error_code"),
+                "send_reserved": result.get("send_reserved_at") is not None,
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_hydration_fail_failed") from None
 
     @mcp.tool()
     async def session_sidebar_reserve(lease_token: Any) -> dict[str, Any]:
@@ -1567,6 +1726,84 @@ def _build_sidebar_broker_job(
         "rename_required": rename_required,
         "recovered_thread_id": recovered_thread_id,
         "create_reserved": create_reserved,
+    }
+
+
+def _build_sidebar_hydration_broker_job(
+    claim: object,
+    marker_key: bytes,
+) -> dict[str, Any]:
+    lease_token = _exact_sidebar_text(
+        getattr(claim, "lease_token", None),
+        "hydration lease token",
+    )
+    source_session_id = _exact_sidebar_text(
+        getattr(claim, "source_session_id", None),
+        "hydration source session ID",
+    )
+    bridge_id = _exact_sidebar_text(
+        getattr(claim, "bridge_id", None),
+        "hydration bridge ID",
+    )
+    thread_id = _exact_sidebar_text(
+        getattr(claim, "codex_thread_id", None),
+        "hydration Codex thread ID",
+    )
+    source_cursor = _exact_sidebar_text(
+        getattr(claim, "source_cursor", None),
+        "hydration source cursor",
+    )
+    source_hash = _exact_sidebar_text(
+        getattr(claim, "source_hash", None),
+        "hydration source hash",
+    )
+    preview_digest = _exact_sidebar_text(
+        getattr(claim, "preview_digest", None),
+        "hydration preview digest",
+    )
+    preview_version = getattr(claim, "preview_version", None)
+    if type(preview_version) is not int or preview_version != 1:
+        raise ValueError("hydration preview version is malformed")
+    marker = _exact_sidebar_text(
+        getattr(claim, "hydration_marker", None),
+        "hydration marker",
+    )
+    decoded = decode_hydration_marker(marker, marker_key)
+    if decoded != HydrationMarkerPayload(
+        bridge_id=bridge_id,
+        codex_thread_id=thread_id,
+        preview_digest=preview_digest,
+        preview_version=preview_version,
+        source_cursor=source_cursor,
+        source_hash=source_hash,
+        source_session_id=source_session_id,
+    ):
+        raise ValueError("hydration marker identity mismatch")
+    message = getattr(claim, "hydration_message", None)
+    if (
+        not isinstance(message, str)
+        or not message.startswith("# ")
+        or message.count(marker) != 1
+    ):
+        raise ValueError("hydration message is malformed")
+    cwd = _exact_sidebar_text(getattr(claim, "cwd", None), "hydration cwd")
+    raw_git_root = getattr(claim, "git_root", None)
+    git_root = (
+        None
+        if raw_git_root is None
+        else _exact_sidebar_text(raw_git_root, "hydration git root")
+    )
+    send_reserved = getattr(claim, "send_reserved", None)
+    if type(send_reserved) is not bool:
+        raise ValueError("hydration send reservation flag is malformed")
+    return {
+        "lease_token": lease_token,
+        "codex_thread_id": thread_id,
+        "hydration_message": message,
+        "hydration_marker": marker,
+        "cwd": cwd,
+        "git_root": git_root,
+        "send_reserved": send_reserved,
     }
 
 

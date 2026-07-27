@@ -8,6 +8,7 @@ import pytest
 
 from session_bridge.models import (
     BridgeMarkerPayload,
+    HydrationMarkerPayload,
     OriginKind,
     ProjectedMessage,
     Provider,
@@ -19,6 +20,8 @@ from session_bridge.sidebar import (
     ACK_OR_CONTROL_ONLY,
     SidebarCandidate,
     build_registration_prompt,
+    decode_hydration_marker,
+    encode_hydration_marker,
     is_registration_prompt,
     is_meaningful_user_text,
     is_sidebar_session_eligible,
@@ -709,6 +712,43 @@ def test_readable_registration_prompt_digest_mismatch_fails_classification() -> 
     )
 
     assert is_registration_prompt(prompt.replace(preview.digest, "0" * 64)) is False
+
+
+def test_hydration_marker_round_trips_exact_canonical_payload() -> None:
+    payload = HydrationMarkerPayload(
+        bridge_id=sidebar_bridge_id("claude:source-1"),
+        codex_thread_id="codex-thread-1",
+        preview_digest="a" * 64,
+        preview_version=1,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        source_session_id="claude:source-1",
+    )
+
+    marker = encode_hydration_marker(payload, b"sidebar-tests-marker-secret")
+
+    assert marker.startswith("HERMES_SESSION_HYDRATION_V1:")
+    assert decode_hydration_marker(
+        marker,
+        b"sidebar-tests-marker-secret",
+    ) == payload
+    with pytest.raises(ValueError, match="hydration marker"):
+        decode_hydration_marker(marker + "x", b"sidebar-tests-marker-secret")
+
+
+def test_hydration_marker_rejects_uppercase_preview_digest() -> None:
+    payload = HydrationMarkerPayload(
+        bridge_id=sidebar_bridge_id("claude:source-1"),
+        codex_thread_id="codex-thread-1",
+        preview_digest="A" * 64,
+        preview_version=1,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        source_session_id="claude:source-1",
+    )
+
+    with pytest.raises(ValueError, match="preview digest"):
+        encode_hydration_marker(payload, b"sidebar-tests-marker-secret")
 
 
 def test_registration_prompt_represents_missing_git_metadata_stably() -> None:
