@@ -672,6 +672,13 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        authorize_worker_action(
+            capability="web.search",
+            system="web",
+            target_resource=f"query:{query}",
+        )
+
         # Dispatch through the web search registry. All 7 providers
         # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl)
         # now live as plugins; the dispatcher is just a registry lookup +
@@ -836,6 +843,14 @@ async def web_extract_tool(
     
     try:
         logger.info("Extracting content from %d URL(s)", len(normalized_urls))
+
+        from hermes_cli.workforce_delegation import authorize_worker_action
+        for url in normalized_urls:
+            authorize_worker_action(
+                capability="web.read",
+                system="web",
+                target_resource=url,
+            )
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
         safe_urls = []

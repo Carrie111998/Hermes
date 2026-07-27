@@ -59,6 +59,9 @@ acceptance evidence.
 - Governed terminal execution is also fail-closed at the tool boundary: the
   exact shell command is part of the authorized resource, preventing a broad
   terminal grant from becoming unrestricted shell access.
+- Governed web search and extraction are checked against exact query or URL
+  resources at execution time, so a worker's web toolset does not authorize
+  arbitrary external destinations.
 - Permit consumption rechecks objective lifecycle state and rejects permits
   after cancellation, expiry, or other terminal transitions.
 - Bootstrapped organization actor checks reject unknown employee identities;

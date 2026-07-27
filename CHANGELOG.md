@@ -67,6 +67,9 @@
 - Governed terminal workers now require `terminal.exec` plus an exact
   `command:<shell text>` resource at execution time; a worker with only a
   broad terminal/toolset grant cannot run an unlisted command.
+- Governed web search and extraction now require execution-time `web.search`
+  or `web.read` authorization with exact query/URL resources; web toolsets no
+  longer imply unrestricted external destinations.
 - Bootstrapped organization actor authorization now rejects unknown
   `employee:<id>` identities; the compatibility `employee:ceo` alias resolves
   only to the active CEO in the objective's organization, while legacy

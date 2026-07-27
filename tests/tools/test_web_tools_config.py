@@ -903,3 +903,14 @@ class TestSiblingProvidersEnvResolution:
             from agent.web_search_provider import get_provider_env
 
             assert get_provider_env("WSP_TEST_UNSET_KEY") == ""
+
+
+def test_governed_web_search_requires_worker_contract(monkeypatch):
+    """A governed worker cannot search before an exact grant is present."""
+    from tools.web_tools import web_search_tool
+
+    monkeypatch.setenv("HERMES_EXECUTION_CONTRACT_ID", "grant-missing-context")
+    result = json.loads(web_search_tool("should-not-run"))
+
+    assert "error" in result
+    assert "governed worker action identity is incomplete" in result["error"]
