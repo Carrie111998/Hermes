@@ -1,10 +1,10 @@
 ---
 name: hermes-ngit
 description: "Use this skill when working with Nostr-based Git repositories (ngit / gitworkshop.dev) for decentralized, permissionless code hosting — `ngit init`, `ngit sync`, `ngit send`, `ngit issue`, `ngit pr`, and native `git push`/`git clone` against nostr:// remotes."
-version: 1.1.0
+version: 1.0.1
 author: Joey Stanford
-license: CC-BY-SA-4.0
-compatibility: "ngit installed (https://ngit.dev/install.sh) with git-remote-nostr on PATH; an identity configured via `ngit account login` (nsec or bunker/NIP-46). No daemon required. Optional: `gh` CLI for GitHub mirroring."
+license: MIT
+compatibility: "ngit installed (gitworkshop.dev/ngit) with git-remote-nostr on PATH; an identity configured via `git config --global nostr.nsec` or a bunker reference. No daemon required. Optional: `gh` CLI for GitHub mirroring."
 triggers:
   - ngit
   - nostr git
@@ -21,269 +21,146 @@ metadata:
     related_skills: [hermes-radicle]
 ---
 
-# ngit — Nostr Plugin for Git
+# ngit Skill
 
-ngit makes `clone`, `fetch`, `push` work with `nostr://` URLs and adds a CLI for PRs,
-issues, and repo management over the decentralised Nostr protocol.
+Use when working with Nostr-based Git repositories (`ngit` / gitworkshop.dev) for
+decentralized, permissionless code hosting over Nostr.
 
-- Install: `curl -Ls https://ngit.dev/install.sh | bash` (installs `ngit` and `git-remote-nostr`)
-- Web UI: https://gitworkshop.dev
+## Requirements
 
-> **Credit:** This skill's command reference and workflow details are based on enhancements
-> by **Dan Conway** (DanConwayDev/ngit-cli, `skills/ngit/SKILL.md`, CC-BY-SA-4.0). Original
-> framing and multi-mirror packaging by Joey Stanford.
+- `ngit` installed (https://gitworkshop.dev/ngit) — includes the `git-remote-nostr` helper.
+- `git-remote-nostr` on PATH (so `git push`/`git clone` work with `nostr://` URLs).
+- An identity configured. Either:
+  - raw nsec: `git config --global nostr.nsec "<nsec1...>"`, or
+  - a bunker reference (preferred when available): `nostrsec://...` — keeps the private key off disk.
+- Optional: `gh` CLI for GitHub mirroring workflows.
 
-## How it works
+**No daemon required.** Unlike Radicle, ngit/relays need no local node running.
 
-**Nostr** is a decentralised protocol where users publish signed events to relays (simple
-servers anyone can run). There is no central authority — identity is a keypair, and data is
-replicated across many relays.
+## This Repository
 
-Git has two distinct layers that ngit separates:
+- **GitHub:** https://github.com/rinchen/hermes-ngit
+- **Nostr:** published via `ngit init`; view on gitworkshop.dev under your npub.
+- **Radicle RID:** set after `rad init` (see Multi-Mirror below).
+- **Triple Push:** `origin` pushurls = GitHub + Radicle + Nostr, so `git push` updates all three.
 
-- **Git state (refs)** — which commit each branch/tag points to — is published as signed
-  events on Nostr relays. This is the source of truth for the repository.
-- **Git data (objects)** — the actual commits, trees, and blobs — is stored on ordinary git
-  servers (any server that speaks the git protocol).
+## How ngit Works (mental model)
 
-When you `git fetch`, `git-remote-nostr` reads the current ref state from Nostr relays, then
-fetches the corresponding objects from the git server(s) listed in the repository
-announcement. Because the state lives on Nostr and the data can live anywhere, git servers
-are interchangeable — switching providers requires no coordination with contributors.
+- `ngit init` **announces** the repo to Nostr: publishes the NIP-34 repository event
+  (pointing at current HEAD) and sets the `nostr://` origin URL. Run once, or re-run
+  to re-point the announcement at a new HEAD.
+- `ngit sync` only pushes **git refs** to the grasp git servers. It does **NOT** update
+  the NIP-34 announcement that gitworkshop.dev reads — so gitworkshop can show a stale
+  commit if you only sync.
+- The correct, native way to keep gitworkshop current is to add the `nostr://` URL as a
+  **pushurl** on `origin`, so a normal `git push` drives `git-remote-nostr`, which updates
+  the announcement on every push. No `ngit init` per push, no hook.
+- `ngit send` **opens a PR/proposal** (commits -> proposal). Do NOT run it on every push.
 
-**Grasp servers** are a convenience: they combine a Nostr relay and a git server into a single
-hosted service (e.g. `relay.ngit.dev`). When `ngit init` publishes a repository announcement
-listing a grasp server, the grasp server automatically creates the git repository — no prior
-setup or account configuration required. You can use separate relays and git servers if you
-prefer.
+## ⚠️ GOTCHA: `ngit init` rewrites the `origin` remote
 
-## Key rules
+`ngit init` sets `remote.origin.url` to the `nostr://` URL and **drops any
+existing `remote.origin.pushurl` entries** (it replaced our GitHub pushurl on this
+very repo). So:
 
-- **`pr/` prefix is MANDATORY for PRs** — branch names for pull requests MUST start with
-  `pr/` (e.g. `pr/my-feature`). A branch without this prefix is a plain git push and will
-  never create a PR.
-- **Always use `--json`** on `ngit` commands when reading output — far easier to parse than
-  human-readable text. `git` commands do not support `--json`.
-- **Use `--offline`** on all but the first `ngit` command in a session — reads from local
-  cache instantly. `git fetch origin` also refreshes the cache.
-- **Never construct NIP-05 addresses** (`user@domain`). Use the `npub1...` form unless a
-  NIP-05 address was explicitly provided.
-- **`<ID|nevent>`** accepts a 64-char hex event ID or a `nevent1...` bech32 string. Get IDs
-  from `ngit pr list --json` or `ngit issue list --json`.
-- **`--json` output uses `nevent1…` bech32** for all `id` and `reply_to` fields (not raw
-  hex). Use these values directly as `<ID|nevent>` arguments and in `nostr:` URI references.
-- **Reference other issues/PRs/comments in `--body` using `nostr:` URIs** — e.g.
-  `nostr:nevent1abc…` or `nostr:naddr1abc…`. Never paste raw hex IDs into body text. The `id`
-  field from `--json` output is already a valid `nevent1…` string; prefix it with `nostr:` to
-  form the URI.
+- **Always capture GitHub (or other) pushurls BEFORE running `ngit init`.**
+- After `ngit init`, re-add every pushurl you need, in this order:
+  1. FIRST `git remote set-url --push origin <github-url>` (restores the primary push target)
+  2. THEN `git remote set-url --add --push origin <nostr://url>` (appends Nostr)
+  3. Then add Radicle if present: `git remote set-url --add --push origin $(git remote get-url --push rad)`
 
-## Detecting a nostr repo
+Doing `set-url --add --push` before `set-url --push` leaves `origin` with only the
+Nostr pushurl and no GitHub pushurl — exactly the bug we hit.
+
+Correct sequence for a repo that already has a GitHub `origin`:
 
 ```bash
-git remote -v | grep -q 'nostr://'   # primary check — no cache needed
-ngit repo --json --offline            # full metadata when needed
+# 1. capture existing GitHub pushurl (BEFORE ngit init rewrites origin)
+GH_PUSH=$(git remote get-url --push origin 2>/dev/null | grep -v '^nostr://' | head -1)
+
+# 2. announce to Nostr (rewrites origin.url -> nostr://, drops pushurls)
+ngit init -d --name <repo-name>
+
+# 3. restore GitHub pushurl FIRST, then append Nostr
+[ -n "$GH_PUSH" ] && git remote set-url --push origin "$GH_PUSH"
+git remote set-url --add --push origin "$(git remote get-url origin)"
+
+# 4. (optional) add Radicle if the repo is rad-enabled
+[ -n "$(git remote get-url --push rad 2>/dev/null)" ] && \
+  git remote set-url --add --push origin "$(git remote get-url --push rad)"
+
+git push   # now updates GitHub + Nostr (+ Radicle) natively
 ```
 
-`ngit repo` always exits 0; `is_nostr_repo: false` can be a cold-cache false negative — if
-remotes show `nostr://`, run `git fetch origin` then retry. Full output includes `nostr_url`,
-`maintainers`, `grasp_servers`.
+**Caveat:** git stops on the first failed pushurl. If Nostr relays are unreachable, the
+whole `git push` (including GitHub) can abort. If that bites you, drop the `nostr://`
+pushurl and run `ngit sync` as a separate step instead.
 
-## nostr:// URLs
+## Core Commands
 
-```text
-nostr://<npub>/<identifier>
-nostr://<npub>/<relay-hint>/<identifier>   # relay-hint is bare domain, e.g. relay.ngit.dev
-```
-
-Standard git commands work directly with these URLs — `git-remote-nostr` resolves them
-transparently.
-
-## Publishing a repo
+### Announce a Repo to Nostr
 
 ```bash
-ngit init --name "My Project" --description "What it does" -d  # uses preferred grasp server or defaults
-ngit repo edit --description "New description"                 # update metadata
-ngit repo --json --offline                                     # view repo info (check nostr_url field)
+ngit init -d --name <repo-name>
 ```
 
-Publishes the NIP-34 event and sets `nostr://npub.../relay.ngit.dev/<identifier>` as the
-origin URL. `-d` = non-interactive (uses configured identity). Re-run any time to re-point
-HEAD at the latest commit.
+Publishes the NIP-34 event and sets `nostr://npub.../relay.ngit.dev/<repo-name>` as the
+origin URL. `-d` = non-interactive (uses configured nsec). Re-run any time to re-point
+HEAD at the latest commit. **Remember the remote rewrite gotcha above.**
 
-> **Keeping gitworkshop current:** `ngit sync` only pushes **git refs** to the grasp git
-> servers — it does **NOT** update the NIP-34 announcement that gitworkshop.dev reads. The
-> native fix is to add the `nostr://` URL as a **pushurl** on `origin` so a normal `git push`
-> drives `git-remote-nostr`, which updates the announcement on every push. No `ngit init` per
-> push, no hook.
-
-## Cloning
+### Make `git push` Also Publish to Nostr
 
 ```bash
-git clone nostr://<npub>/<relay-hint>/<identifier>   # preferred
-git clone nostr://<npub>/<identifier>                # slower discovery, no relay hint
-git clone nostr://user@domain.com/<identifier>       # NIP-05, only if given to you
+# nostr:// URL is now origin.url after ngit init; append it as a pushurl
+# (after restoring any GitHub pushurl first — see gotcha)
+git remote set-url --add --push origin "$(git remote get-url origin)"
 ```
 
-## Pull Requests
+Now `git push` updates GitHub, Radicle (if present), **and** Nostr. All three stay in sync
+natively. (This is exactly what `~/repos/ngit-enable-repo/ngit-enable-repo.sh` automates,
+and that script already captures the GitHub-pushurl-before-ngit-init ordering.)
 
-### Open a PR
-
-> **CRITICAL: Branch name MUST start with `pr/`** — this is what signals ngit to create a PR.
-> A branch without the `pr/` prefix is a plain push and will NEVER create a PR, regardless of
-> push options.
+### Clone a Nostr Repo
 
 ```bash
-git checkout -b pr/my-feature          # MUST use pr/ prefix
-# ... commits ...
-
-# Single commit: omit title/description — commit subject and body are used automatically (preferred)
-git push -u origin pr/my-feature
-
-# Multiple commits: supply title and description explicitly
-# Use literal \n\n for paragraph breaks — ngit's push-option parser converts them to real newlines.
-git push -u origin pr/my-feature \
-  -o 'title=My feature title' \
-  -o 'description=First paragraph.\n\nSecond paragraph.'
+git clone nostr://npub.../relay.ngit.dev/<repo-name>
+cd <repo>
+git remote -v   # shows nostr:// origin
 ```
 
-When there is only one commit, omitting `-o title=` and `-o description=` is preferred — ngit
-uses the commit subject as the title and the commit body as the description. Pass `-d` (or
-`--defaults`) to confirm this automatically. `git push` or `git push --force` can update
-existing PRs (branch must still have the `pr/` prefix).
-
-### Advanced: ngit send
-
-`ngit send` takes `--description` as a regular shell argument — the shell does **not**
-interpret `\n` inside double-quoted strings, so `"...\n\n..."` produces literal backslash-n in
-the event. Use ANSI-C quoting (`$'...'`) to embed real newlines:
+### Push a Branch / PR via ngit
 
 ```bash
-# correct — $'...' quoting gives real newlines
-ngit send HEAD~2 \
-  --subject "My Feature" \
-  --description $'First paragraph.\n\nSecond paragraph.'
+# Simple: push a branch with the pr/ prefix
+git push -o 'title=My PR' -o 'description=details' -u origin pr/my-branch
 
-# WRONG — \n inside double quotes is not interpreted; event contains literal \n\n
-ngit send HEAD~2 --subject "My Feature" --description "First paragraph.\n\nSecond paragraph."
-
-ngit send --defaults                                    # non-interactive
-ngit send HEAD~2 --in-reply-to <PR-event-id>           # update existing PR
+# Advanced: ngit send (commits -> proposal)
+ngit send -d --subject "My change" HEAD~2
 ```
 
-> **Note:** `ngit send` opens a PR/proposal (commits -> proposal). Do NOT run it on every
-> push — use the `pr/` branch + `git push` flow above for normal PRs.
-
-### List / view / comment
+### List / Create Issues
 
 ```bash
-ngit pr list --json
-ngit pr list --json --status open,draft,closed,applied
-ngit pr list --json --label bug
-ngit pr view <ID|nevent> --json
-ngit pr view <ID|nevent> --json --comments
-ngit pr comment <ID|nevent> --body "Looks good"
-ngit pr comment <ID|nevent> --body "Fixed!" --reply-to <comment-ID|nevent>
+ngit issue list --json -d          # open issues (JSON)
+ngit issue list                     # human-readable
+ngit issue create --title "..." --description "..."   # if supported
 ```
 
-### Checkout / apply
+### List / Create PRs
 
 ```bash
-ngit pr checkout <ID|nevent>
+ngit pr list --json -d              # open + draft proposals
+ngit pr list
 ```
 
-### Merge (maintainer)
+### Sync Git Refs to Grasp Servers
 
 ```bash
-ngit merge <ID|nevent>                    # merge PR into default branch; does not push
-ngit pr checkout <ID|nevent>
-ngit merge                                # infers PR from checked-out pr/ branch
-ngit merge --exclude-description <ID|nevent>
-git push origin main                      # publishes the merge event
-```
-
-`ngit merge` creates a no-ff merge commit on the default branch with the standard
-`Merge #<8-hex>: <PR title>` message. If conflicts occur, resolve them and run `git commit`;
-ngit has already prepared the commit message.
-
-### Lifecycle
-
-```bash
-ngit pr close <ID|nevent> --reason "blocked by upstream"
-ngit pr reopen <ID|nevent> --reason "fix was incomplete"
-ngit pr ready <ID|nevent> --reason "addressed review feedback"
-ngit pr draft <ID|nevent> --reason "needs more work"
-ngit pr label <ID|nevent> --label bug --label enhancement
-ngit pr set-subject <ID|nevent> --subject "New title"
-ngit pr set-cover-note <ID|nevent> --body "Updated description. See nostr:nevent1abc…"
-```
-
-## Issues
-
-```bash
-ngit issue create --subject "Bug title" --body "Details as markdown" --label bug
-ngit issue create --subject "Feature" --body "..." --label enhancement --label help-wanted
-ngit issue list --json
-ngit issue list --json --status closed
-ngit issue list --json --label bug
-ngit issue view <ID|nevent> --json
-ngit issue view <ID|nevent> --json --comments
-ngit issue comment <ID|nevent> --body "Reproduced on v2.1"
-ngit issue comment <ID|nevent> --body "Thanks!" --reply-to <comment-ID|nevent>
-ngit issue close <ID|nevent> --reason "wontfix"
-ngit issue resolved <ID|nevent> --reason "fixed in abc123"
-ngit issue reopen <ID|nevent> --reason "regression in v2.3"
-ngit issue label <ID|nevent> --label bug --label enhancement
-ngit issue set-subject <ID|nevent> --subject "New title"
-ngit issue set-cover-note <ID|nevent> --body "Updated description. See nostr:nevent1abc…"
-```
-
-## Account management
-
-```bash
-ngit account whoami --json
-ngit account whoami --json --offline          # use cache, no network
-ngit account login                            # interactive, stores nsec in global git config
-ngit account login --bunker-url bunker://...  # NIP-46 remote signer (preferred — keeps key off disk)
-ngit account login --local                    # this repo only
-ngit account create --name "Alice"
-ngit account export-keys
-ngit account logout
-git config --global nostr.nsec <nsec>         # set directly
-ngit --nsec <nsec> <command>                  # inline for CI, no login needed
-```
-
-**Security:** prefer a bunker (`--bunker-url`, NIP-46) over a raw nsec in git config so the
-private key never touches disk. If you must use a raw nsec, store it globally and keep it out
-of any committed file.
-
-## Sync
-
-```bash
-ngit sync                        # sync all refs from nostr state to git servers
-ngit sync --ref-name main        # sync specific ref
+ngit sync -d
 ```
 
 Updates the git servers (relay.ngit.dev, gitnostr.com) to match nostr state. Does not
-re-announce HEAD — use `ngit init` (or the pushurl approach above) for that.
-
-## Key flags
-
-| Flag                  | Description                            |
-| --------------------- | -------------------------------------- |
-| `-d`, `--defaults`    | Non-interactive; use sensible defaults |
-| `--offline`           | Local cache only, skip network         |
-| `--json`              | Structured output (ngit commands only) |
-| `-n`, `--nsec <NSEC>` | Provide nsec or hex private key inline |
-| `-f`, `--force`       | Bypass safety guards                   |
-| `-v`, `--verbose`     | Verbose output                         |
-
-## git config
-
-```bash
-ngit --customize                          # show all options
-git config nostr.repo-relay-only true     # don't broadcast to personal relays
-git config nostr.http-io-timeout-ms 600000 # allow large GRASP pushes
-```
+re-announce HEAD — use `ngit init` (or the pushurl approach) for that.
 
 ## Session Repo Detection
 
@@ -296,7 +173,7 @@ git remote -v 2>/dev/null | grep '^origin' | grep 'nostr://'
 If a `nostr://` origin URL is present, announce the repo is Nostr-enabled and show the
 gitworkshop link derived from it:
 
-```text
+```
 https://gitworkshop.dev/<nostr-url-without-scheme>
 ```
 
@@ -312,18 +189,21 @@ When sharing repo locations, use markdown with GitHub + Radicle + Nostr URLs:
 
 Use `~/repos/ngit-enable-repo/ngit-enable-repo.sh` to announce a repo to Nostr and add the
 `nostr://` pushurl in one shot. Run it from inside an existing Git repo (with a GitHub
-`origin`) after `ngit init` / `rad init`.
+`origin`) after `ngit init` / `rad init`. It already captures the GitHub pushurl before
+`ngit init` rewrites the remote, so the ordering bug above is handled for you.
 
 **Current Configuration:** this repo (hermes-ngit) is configured with triple push to
 GitHub + Radicle + Nostr via `origin` pushurls. `git push` updates all three.
 
 ## Rationale
 
-ngit provides a permissionless, Nostr-native Git hosting layer with no central forge and no
-daemon. Use it for:
+ngit provides a permissionless, Nostr-native Git hosting layer with no central forge and
+no daemon. Use it for:
 - Censorship-resistant mirrors
 - Distributed hosting (multiple grasp git servers listed in the announcement = redundancy)
 - Keeping GitHub for CI/PR convenience while owning a sovereign copy
 
-Keep the private key safe: prefer a bunker (`nostrsec://` / `--bunker-url`) over a raw nsec in
-git config.
+**Key safety:** never store a raw nsec inside a repository (committed file or repo-local
+git config). Keep the nsec in **global** git config only, or use a bunker
+(`nostrsec://`). If a bunker relay is down, a raw global nsec is the fallback — but it
+must never be copied into per-repo config or committed.
