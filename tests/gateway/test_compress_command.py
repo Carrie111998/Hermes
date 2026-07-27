@@ -581,3 +581,105 @@ async def test_compress_command_passes_tool_messages_to_compressor():
     # Assistant tool_calls stubs (content=None) must survive too, or the
     # tool message would dangle without its call.
     assert any(m.get("tool_calls") for m in passed), "assistant tool_calls stub dropped"
+
+
+@pytest.mark.asyncio
+async def test_compress_command_installs_profile_scope_under_multiplex(tmp_path, monkeypatch):
+    """/compress must wrap credential resolution in _profile_runtime_scope when
+    multiplex is on. Without it, _resolve_session_agent_runtime ->
+    _getenv -> get_secret raises UnscopedSecretError, OR (worse) silently
+    leaks another profile's value from os.environ. Regression for #66336."""
+    from agent import secret_scope
+
+    profile_home = tmp_path / "profileA"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text("ANTHROPIC_API_KEY=scope_value\n")
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "environ_leak_value")
+
+    captured: dict = {}
+
+    def _spy_resolve_runtime_agent_kwargs():
+        captured["scope_during"] = secret_scope.current_secret_scope()
+        captured["resolved_key"] = secret_scope.get_secret("ANTHROPIC_API_KEY", "")
+        return {"api_key": "test-key"}
+
+    history = _make_history()
+    runner = _make_runner(history)
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = lambda src: profile_home
+
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        with (
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                side_effect=_spy_resolve_runtime_agent_kwargs,
+            ),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("run_agent.AIAgent", return_value=agent_instance),
+            patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        ):
+            await runner._handle_compress_command(_make_event())
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    # get_secret must have read Profile A's value — never the leaked os.environ
+    # value. A value of "environ_leak_value" here means another profile's key
+    # could silently leak via os.environ.
+    assert captured["scope_during"] is not None, "scope not installed during /compress"
+    assert captured["resolved_key"] == "scope_value", (
+        f"/compress resolved ANTHROPIC_API_KEY from the wrong source: "
+        f"got {captured['resolved_key']!r}, expected 'scope_value' (from profile .env)."
+    )
+    assert secret_scope.current_secret_scope() is None
+
+
+@pytest.mark.asyncio
+async def test_compress_command_skips_scope_install_when_multiplex_off(monkeypatch):
+    """Single-profile gateways must not pay the scope-install cost: tokens
+    stay None and no scope is installed during /compress."""
+    from agent import secret_scope
+
+    captured: dict = {}
+
+    def _spy_resolve_runtime_agent_kwargs():
+        captured["scope_during"] = secret_scope.current_secret_scope()
+        return {"api_key": "test-key"}
+
+    history = _make_history()
+    runner = _make_runner(history)
+    assert runner.config.multiplex_profiles is False
+
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+
+    assert secret_scope.is_multiplex_active() is False
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=_spy_resolve_runtime_agent_kwargs,
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    assert captured["scope_during"] is None

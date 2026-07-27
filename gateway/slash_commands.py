@@ -3458,6 +3458,24 @@ class GatewaySlashCommandsMixin:
                 lines.append(_agg_note)
             return "\n".join(lines)
 
+        # /compress builds a one-off AIAgent outside the gateway turn's
+        # _profile_runtime_scope (gateway/run.py:19243). Without this scope
+        # install, _resolve_session_agent_runtime raises UnscopedSecretError
+        # under multiplex (#66336). The finally below resets the tokens.
+        _multiplexed = bool(getattr(self.config, "multiplex_profiles", False))
+        _home_token = _secret_token = None
+        if _multiplexed:
+            from hermes_constants import set_hermes_home_override
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                set_secret_scope,
+            )
+            _profile_home = self._resolve_profile_home_for_source(source)
+            _home_token = set_hermes_home_override(str(_profile_home))
+            _secret_token = set_secret_scope(
+                build_profile_secret_scope(_profile_home)
+            )
+
         try:
             from run_agent import AIAgent
             from agent.manual_compression_feedback import summarize_manual_compression
@@ -3699,6 +3717,13 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
+        finally:
+            if _secret_token is not None:
+                from agent.secret_scope import reset_secret_scope
+                reset_secret_scope(_secret_token)
+            if _home_token is not None:
+                from hermes_constants import reset_hermes_home_override
+                reset_hermes_home_override(_home_token)
 
     async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:
         """Handle /topic for Telegram DM user-managed topic sessions."""
