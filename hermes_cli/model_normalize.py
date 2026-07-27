@@ -410,7 +410,17 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
 
     # --- Aggregators: need vendor/model format ---
     if provider in _AGGREGATOR_PROVIDERS:
-        return _prepend_vendor(name)
+        # A name whose ``/`` prefix is the aggregator itself (e.g.
+        # ``openrouter/deepseek-v4-pro``) is not a real ``vendor/model`` slug
+        # — the prefix is the provider, not a vendor.  ``_prepend_vendor``
+        # treats any slash-bearing name as already resolved and passes it
+        # through unchanged, so the aggregator rejects it with HTTP 400 "not a
+        # valid model ID".  Strip the matching provider prefix first so
+        # ``_prepend_vendor`` re-attaches the correct vendor
+        # (``deepseek/deepseek-v4-pro``).  A genuine ``vendor/model`` slug like
+        # ``anthropic/claude-sonnet-4.6`` is untouched because its prefix does
+        # not match the provider.  See issue #72418.
+        return _prepend_vendor(_strip_matching_provider_prefix(name, provider))
 
     # --- OpenCode Zen / OpenCode Go: flat-namespace resellers.
     #     Their /v1/models API returns bare IDs only (no vendor prefix), and

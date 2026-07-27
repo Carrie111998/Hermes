@@ -164,6 +164,50 @@ class TestAggregatorProviders:
         assert result == "anthropic/claude-sonnet-4.6"
 
 
+# ── Aggregator provider-prefix repair (issue #72418) ───────────────────
+
+class TestIssue72418AggregatorProviderPrefix:
+    """Aggregators must repair a ``provider/`` prefix that matches themselves.
+
+    A name like ``openrouter/deepseek-v4-pro`` carries the *aggregator* as its
+    prefix, not a real vendor.  ``_prepend_vendor`` used to treat any
+    slash-bearing name as already-resolved and pass it through, so the
+    aggregator API received ``openrouter/deepseek-v4-pro`` and rejected it with
+    HTTP 400 "not a valid model ID".  The matching provider prefix must be
+    stripped so the correct vendor is re-attached.
+    """
+
+    @pytest.mark.parametrize("model,provider,expected", [
+        # The reported bug: provider-as-prefix on a bare model name.
+        ("openrouter/deepseek-v4-pro", "openrouter", "deepseek/deepseek-v4-pro"),
+        ("openrouter/gpt-5.4", "openrouter", "openai/gpt-5.4"),
+        ("openrouter/claude-sonnet-4.6", "openrouter", "anthropic/claude-sonnet-4.6"),
+        # Same class of bug on the other aggregators.
+        ("nous/deepseek-v4-pro", "nous", "deepseek/deepseek-v4-pro"),
+        ("kilocode/glm-5.2", "kilocode", "z-ai/glm-5.2"),
+        # Case-insensitive provider prefix.
+        ("OpenRouter/deepseek-v4-pro", "openrouter", "deepseek/deepseek-v4-pro"),
+    ])
+    def test_matching_provider_prefix_is_stripped(self, model, provider, expected):
+        assert normalize_model_for_provider(model, provider) == expected
+
+    @pytest.mark.parametrize("model,provider,expected", [
+        # A genuine vendor/model slug must survive untouched.
+        ("anthropic/claude-sonnet-4.6", "openrouter", "anthropic/claude-sonnet-4.6"),
+        ("deepseek/deepseek-v4-pro", "openrouter", "deepseek/deepseek-v4-pro"),
+        ("moonshotai/kimi-k2.5", "openrouter", "moonshotai/kimi-k2.5"),
+        # A non-matching provider prefix is left for the API to handle.
+        ("anthropic/claude-sonnet-4.6", "nous", "anthropic/claude-sonnet-4.6"),
+    ])
+    def test_real_vendor_prefix_is_preserved(self, model, provider, expected):
+        assert normalize_model_for_provider(model, provider) == expected
+
+    def test_bare_name_still_prepends_vendor(self):
+        """No prefix at all still gets the vendor prepended (unchanged behavior)."""
+        assert normalize_model_for_provider("claude-sonnet-4.6", "openrouter") == "anthropic/claude-sonnet-4.6"
+        assert normalize_model_for_provider("gpt-5.4", "nous") == "openai/gpt-5.4"
+
+
 class TestIssue6211NativeProviderPrefixNormalization:
     @pytest.mark.parametrize("model,target_provider,expected", [
         ("zai/glm-5.1", "zai", "glm-5.1"),
