@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added comprehensive fault-injection acceptance tests proving crash recovery
+  invariants for supervised workers: claim-before-execute redelivery,
+  effect-before-evidence readback, evidence-before-complete idempotency,
+  complete-before-CEO-wake sync, stale-worker fencing, master-stop blocking
+  mid-execution, exclusive claim CAS, run-id CAS preventing double-complete,
+  and idempotent re-entry after crash. All 9 tests pass.
 - Orchestrator-only Kanban list and unblock actions now require exact permits
   bound to filters/limits/tenant/archive mode or task/board target,
   respectively.

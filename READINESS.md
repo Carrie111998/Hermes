@@ -1806,6 +1806,9 @@ production multi-tenant orchestration or external authorization.
   tax or payments applicability remain deployment and legal work.
 - SQLite is the implemented authority store; Postgres and an external broker
   remain deployment work.
+- Supervised worker crash recovery invariants are proven via fault-injection
+  tests (tests/hermes_cli/test_worker_fault_injection.py); production
+  worker topology with remote authority-store remains deployment work.
 
 See [implementation status](docs/implementation-status.md) for the complete
 capability and limitation inventory, and the release boundary in
