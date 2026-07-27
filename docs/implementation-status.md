@@ -1,5 +1,11 @@
 # Implementation Status and Known Limitations
 
+**Current readiness determination:** Controlled Founder/CEO runtime acceptance
+**PASS** at [READINESS.md](../READINESS.md); production autonomous business
+operation **NOT READY**. This inventory is broader than the current release
+gate, so an implemented capability is not automatically covered by the pinned
+acceptance evidence.
+
 ## Implemented
 
 - Persistent governed objective/event runtime and explicit lifecycle state.
@@ -116,8 +122,21 @@
 
 ## Validation evidence
 
-The exact-grant increment passed 281 focused tests. The rebrand and migration
-validation passed 361 focused Python tests, desktop/TUI/web TypeScript
+The current release acceptance gate is deliberately narrower than this full
+implementation inventory. Its pinned evidence consists of the Founder/CEO
+end-to-end test, objective service/runtime/worker tests, finance and
+outcome-attribution tests, compilation of selected runtime modules, and
+`git diff --check`, all recorded against commit
+`4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe` in [READINESS.md](../READINESS.md).
+It does not claim current release-gate coverage for compliance, procurement,
+external ingress and scheduling, billing, tax/accounting, staffing/workforce,
+runtime-drift enforcement, live payment rails, or every other item in the
+inventory below.
+
+The following are historical focused regression results and capability evidence,
+not additional claims that the current release boundary covered every listed
+surface: the exact-grant increment passed 281 focused tests. The rebrand and
+migration validation passed 361 focused Python tests, desktop/TUI/web TypeScript
 typechecks, Python compilation, and the implemented `charterforge` help and
 version commands. The independent documentation site prebuild completed, but
 its Docusaurus build was unavailable because the local `docusaurus` executable

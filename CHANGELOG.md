@@ -24,9 +24,18 @@ not a claim of production autonomous-business readiness.
 - Production autonomous business operation: **NOT READY**.
 - Universal legal, tax, payment, and compliance operation: **NOT PROVEN**.
 - Evidence commit SHA: `4f7d585b8d0eda6f0d7646c843f9ddd43c4d7afe`, with exact
-  commands and results recorded in [READINESS.md](READINESS.md).
+  commands and results recorded in [READINESS.md](READINESS.md). The evidence
+  documentation itself was recorded in commit
+  `757408d82884afd60651762715c3ef00446bc0c0`.
+- This SHA is the designated `0.19.0-agentic-foundation` release boundary.
+  `main` is ahead of it: the stale-spend-hold escalation
+  (`172a515c6b5d7efeef1a4e222c5c35ca46246a0b`) and evidence-bound spend-hold
+  resolution (`5c92744e42878929ed981c81f34b1239c00d992a`) are post-boundary
+  commits. Those changes have focused regression evidence, but they are not
+  included in this release acceptance determination and remain under
+  Unreleased.
 
-## Unreleased
+## Unreleased (post-0.19.0-agentic-foundation)
 
 - Added the optional standalone `charterforge-stripe-rail` package for
   idempotent inbound Checkout Sessions, provider read-back verification, and
@@ -81,12 +90,7 @@ not a claim of production autonomous-business readiness.
   event ingress, billing, commitments, metrics, worker state, and audit
   lineage; focused regressions cover rollback preservation.
 
-All notable independent Charterforge changes are documented here. Upstream
-Hermes Agent history remains available in Git.
-
-## Unreleased
-
-### Added
+### Earlier post-boundary capability additions
 
 - Immutable usage metering and governed metered-invoice actions. Prices are
   captured when usage occurs; invoice actions reference exact event IDs and
@@ -126,17 +130,20 @@ Hermes Agent history remains available in Git.
 - Treasury, accounting, tax-record, compliance, commitment, procurement, and
   non-custodial payment-rail control surfaces.
 
-### Changed
+#### Changed
 
 - Product-specific development is independent and is not intended for
   submission to the upstream Hermes Agent repository.
 - Legacy Hermes commands, environment variables, paths, and Python modules are
   migration compatibility surfaces rather than project branding.
 
-### Security
+#### Security
 
 - Governed worker launch and result handoff fail closed when task, mandate,
   profile, authority, toolset, skill, budget, or expiry evidence differs from
   the immutable grant.
 - Housekeeping repairs lost wake events for active accepted/planned objectives
   using versioned idempotency fences, without reviving blocked objectives.
+
+All notable independent Charterforge changes are documented here. Upstream
+Hermes Agent history remains available in Git.

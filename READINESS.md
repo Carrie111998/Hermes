@@ -13,8 +13,11 @@ Charterforge fork.
 
 The passing claim means that the durable local runtime demonstrates a bounded
 Founder/CEO operating loop: a bootstrapped solo CEO creates and advances work,
-executes an admissible external action, independently verifies the result,
-replans from the resulting event, and completes without a human turn. It does
+executes an admissible external-action contract through the deterministic local
+`ExternalMarket` test-provider boundary, independently verifies the result,
+replans from the resulting event, and completes without a human turn. The test
+provider records a provider-like reference and read-back; it does not call
+Stripe, AgentMail, a network endpoint, or any live third-party system. It does
 not mean the software is a formed legal entity, a certified control system, or
 ready to hold or move funds without deployment-specific provider and legal
 review.
