@@ -494,6 +494,90 @@ def test_board_stats(kanban_home):
         assert stats["by_assignee"]["x"]["done"] == 1
         assert stats["by_assignee"]["y"]["ready"] == 1
         assert stats["oldest_ready_age_seconds"] is not None
+        # SOL-FD-004: youngest_ready_age_seconds is also present.
+        assert "youngest_ready_age_seconds" in stats
+    finally:
+        conn.close()
+
+
+def test_board_stats_event_based_ready_age(kanban_home):
+    """SOL-FD-004: board_stats uses latest transition event, not created_at,
+    for ready age. An old task recently re-ready'd should have a young age."""
+    import time as _t
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="old-promoted", assignee="z")
+        # Push created_at and the original 'created' event into the past.
+        old_ts = int(_t.time()) - 6 * 3600
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (old_ts, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'created'",
+            (old_ts, tid),
+        )
+        # Insert a fresh reclaimed transition so effective ready-at is now.
+        now_ts = int(_t.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'reclaimed', NULL, ?)",
+            (tid, now_ts),
+        )
+        conn.commit()
+        stats = kb.board_stats(conn)
+        # The ready age should be near-zero (from the reclaimed event),
+        # not 6 hours (from created_at).
+        assert stats["oldest_ready_age_seconds"] < 60, (
+            f"expected event-based age < 60s, got {stats['oldest_ready_age_seconds']}"
+        )
+    finally:
+        conn.close()
+
+
+def test_task_ready_age_event_based(kanban_home):
+    """SOL-FD-004: task_ready_age uses latest transition event."""
+    import time as _t
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="age-test", assignee="w")
+        old_ts = int(_t.time()) - 3600
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (old_ts, tid),
+        )
+        conn.commit()
+        now = int(_t.time())
+        # The 'created' event from create_task is a ready-transition kind,
+        # so task_ready_age uses its timestamp.  Since the event was recorded
+        # at real time (not old_ts), the age should be near-zero, not 3600s.
+        age_with_created_event = kb.task_ready_age(conn, tid, old_ts, now=now)
+        assert age_with_created_event < 10, (
+            f"expected event-based age < 10s, got {age_with_created_event}"
+        )
+
+        # Push the created event into the past — age should jump to ~3600s.
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'created'",
+            (old_ts, tid),
+        )
+        conn.commit()
+        age_old_created = kb.task_ready_age(conn, tid, old_ts, now=now)
+        assert age_old_created >= 3600 - 10, (
+            f"expected old-created age >= 3590s, got {age_old_created}"
+        )
+
+        # Insert a fresh reclaimed transition — age should reset to near-zero.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'reclaimed', NULL, ?)",
+            (tid, now),
+        )
+        conn.commit()
+        age_after_reclaim = kb.task_ready_age(conn, tid, old_ts, now=now)
+        assert age_after_reclaim < 10, (
+            f"expected reclaimed age < 10s, got {age_after_reclaim}"
+        )
     finally:
         conn.close()
 

@@ -894,6 +894,100 @@ class TestDispatcherNoRecentTick:
         assert len(diags) == 1
         assert diags[0].severity == "critical"  # no ticks at all + aged
 
+    def test_no_fire_for_freshly_promoted_old_task(self):
+        """SOL-FD-004: an old task with a recent 'promoted' event is NOT
+        flagged — its effective ready age is from the promotion, not
+        created_at."""
+        now_ts = int(time.time())
+        threshold = 180
+        # Task created 6h ago but promoted 200s ago.
+        task = _task(
+            id="t_promoted",
+            status="ready",
+            assignee="worker-terra",
+            created_at=now_ts - 6 * 3600,
+        )
+        events = [
+            _event("created", ts=now_ts - 6 * 3600),
+            _event("promoted", ts=now_ts - 200),
+        ]
+        ticks = []
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, events, [], now_ts,
+            {"dispatcher_tick_stale_seconds": threshold},
+            dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0, (
+            "freshly-promoted old task should not trigger diagnostic"
+        )
+
+    def test_fires_for_old_task_with_stale_promotion(self):
+        """SOL-FD-004: an old task promoted 400s ago IS flagged — its
+        effective ready age exceeds 2×threshold."""
+        now_ts = int(time.time())
+        threshold = 180
+        task = _task(
+            id="t_stale_promoted",
+            status="ready",
+            assignee="worker-terra",
+            created_at=now_ts - 6 * 3600,
+        )
+        events = [
+            _event("created", ts=now_ts - 6 * 3600),
+            _event("promoted", ts=now_ts - 400),
+        ]
+        ticks = []
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, events, [], now_ts,
+            {"dispatcher_tick_stale_seconds": threshold},
+            dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 1
+
+    def test_no_fire_for_freshly_unblocked_task(self):
+        """SOL-FD-004: an old task recently unblocked is NOT flagged."""
+        now_ts = int(time.time())
+        threshold = 180
+        task = _task(
+            id="t_unblocked",
+            status="ready",
+            assignee="worker-terra",
+            created_at=now_ts - 6 * 3600,
+        )
+        events = [
+            _event("created", ts=now_ts - 6 * 3600),
+            _event("unblocked", ts=now_ts - 100),
+        ]
+        ticks = []
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, events, [], now_ts,
+            {"dispatcher_tick_stale_seconds": threshold},
+            dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
+    def test_no_fire_for_freshly_reclaimed_task(self):
+        """SOL-FD-004: an old task recently reclaimed is NOT flagged."""
+        now_ts = int(time.time())
+        threshold = 180
+        task = _task(
+            id="t_reclaimed",
+            status="ready",
+            assignee="worker-terra",
+            created_at=now_ts - 6 * 3600,
+        )
+        events = [
+            _event("created", ts=now_ts - 6 * 3600),
+            _event("reclaimed", ts=now_ts - 150),
+        ]
+        ticks = []
+        diags = kd._rule_dispatcher_no_recent_tick(
+            task, events, [], now_ts,
+            {"dispatcher_tick_stale_seconds": threshold},
+            dispatcher_ticks=ticks,
+        )
+        assert len(diags) == 0
+
 
 class TestDispatcherStaleClaim:
     """_rule_dispatcher_stale_claim fires when claim is expired."""

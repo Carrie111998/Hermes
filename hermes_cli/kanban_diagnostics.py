@@ -40,6 +40,9 @@ import time
 # critical first so operators see the worst fires at the top.
 SEVERITY_ORDER = ("warning", "error", "critical")
 
+# SOL-FD-004: kinds of events that represent a transition into the ready state.
+_READY_TRANSITION_KINDS = frozenset({"created", "promoted", "reclaimed", "unblocked"})
+
 
 def severity_at_or_above(severity: Optional[str], threshold: Optional[str]) -> bool:
     """Return True when ``severity`` meets or exceeds ``threshold``."""
@@ -923,15 +926,10 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     # Find the most recent event that put this task into ready.
-    # ``created`` covers tasks born ready; ``promoted`` covers parent-
-    # done auto-promotion; ``reclaimed`` covers TTL/crash recovery;
-    # ``unblocked`` covers human-driven resumes.
-    READY_TRANSITION_KINDS = {
-        "created", "promoted", "reclaimed", "unblocked",
-    }
+    # SOL-FD-004: uses the shared _READY_TRANSITION_KINDS constant.
     last_ready_ts = 0
     for ev in events:
-        if _event_kind(ev) in READY_TRANSITION_KINDS:
+        if _event_kind(ev) in _READY_TRANSITION_KINDS:
             t = _event_ts(ev)
             last_ready_ts = max(last_ready_ts, t)
 
@@ -1032,9 +1030,18 @@ def _rule_dispatcher_no_recent_tick(
         return []
 
     # Determine task age — fresh tasks should not be flagged.
+    # SOL-FD-004: use event-based ready age (latest transition into
+    # 'ready') so that a freshly-promoted old task is not mis-flagged.
     created_at = int(_task_field(task, "created_at", 0) or 0)
     if created_at:
-        task_age = now - created_at
+        # Derive the latest ready-transition event timestamp.
+        last_ready_ts = 0
+        for ev in events:
+            if _event_kind(ev) in _READY_TRANSITION_KINDS:
+                t = _event_ts(ev)
+                last_ready_ts = max(last_ready_ts, t)
+        effective_ready_at = last_ready_ts if last_ready_ts > 0 else created_at
+        task_age = now - effective_ready_at
         # Tasks younger than 2× interval are still in normal wait window.
         if task_age < threshold * 2:
             return []
@@ -1261,10 +1268,19 @@ def _rule_dispatcher_nonspawnable_assignee(
         return []
 
     # Check the task's ready age — only fire after 2+ tick intervals.
+    # SOL-FD-004: use event-based ready age so freshly-promoted old tasks
+    # are not mis-flagged.
     ready_threshold = float(cfg.get("dispatcher_tick_stale_seconds", 180)) * 2
     created_at = int(_task_field(task, "created_at", 0) or 0)
-    if created_at and (now - created_at) < ready_threshold:
-        return []
+    if created_at:
+        last_ready_ts = 0
+        for ev in events:
+            if _event_kind(ev) in _READY_TRANSITION_KINDS:
+                t = _event_ts(ev)
+                last_ready_ts = max(last_ready_ts, t)
+        effective_ready_at = last_ready_ts if last_ready_ts > 0 else created_at
+        if (now - effective_ready_at) < ready_threshold:
+            return []
 
     total_skipped = len(nonspawn_ids)
 

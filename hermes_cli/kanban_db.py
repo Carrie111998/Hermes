@@ -4033,6 +4033,59 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Ready-age helpers (SOL-FD-004)
+# ---------------------------------------------------------------------------
+# Event kinds that record a transition into the ``ready`` state.  Tasks
+# that have been promoted, unblocked, reclaimed, or created directly into
+# ready get a timestamped event row; we derive the latest such event as
+# the canonical ready-at time, falling back to ``created_at`` when no
+# matching event exists (e.g. boards migrated from a pre-FD-004 schema).
+_READY_EVENT_KINDS: frozenset = frozenset({"promoted", "unblocked", "reclaimed", "created"})
+
+
+def _latest_ready_event_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[int]:
+    """Return the unix timestamp of the most recent event whose *kind*
+    represents a transition into ``ready``, or ``None`` when the task has
+    never had such an event.  Callers fall back to ``created_at`` in that
+    case so pre-FD-004 boards still produce correct ages.
+    """
+    row = conn.execute(
+        "SELECT MAX(created_at) FROM task_events "
+        "WHERE task_id = ? AND kind IN ('promoted','unblocked','reclaimed','created')",
+        (task_id,),
+    ).fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+    return None
+
+
+def task_ready_age(
+    conn: sqlite3.Connection,
+    task_id: str,
+    created_at: int,
+    now: Optional[int] = None,
+) -> int:
+    """Return a task's effective ready age in seconds.
+
+    Derived from the latest transition event into ``ready`` (promoted,
+    unblocked, reclaimed, or created); falls back to ``created_at`` when
+    no matching event exists (SOL-FD-004).
+
+    ``created_at`` is the task row's epoch timestamp.  ``conn`` is the
+    open database handle so callers that don't have pre-loaded events
+    can still get the event-based age without duplicating the SQL.
+    """
+    if now is None:
+        now = int(time.time())
+    latest_event = _latest_ready_event_at(conn, task_id)
+    effective_at = latest_event if latest_event is not None else created_at
+    return now - effective_at
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9675,6 +9728,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).
+
+    Ready age is derived from the latest transition event into ``ready``
+    (promoted, unblocked, reclaimed, or created) and falls back to
+    ``created_at`` when no matching event exists (SOL-FD-004).
     """
     by_status: dict[str, int] = {}
     for row in conn.execute(
@@ -9691,19 +9748,36 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     ):
         by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
-    oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
-    ).fetchone()
     now = int(time.time())
-    oldest_ready_age = (
-        (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
-    )
+
+    # Walk every ready task and find the *effective* ready-at timestamp
+    # (latest transition event, falling back to created_at).  This is a
+    # Python-side fallback loop rather than a single SQL join so that (a)
+    # pre-FD-004 boards without transition events still produce correct
+    # ages, and (b) downstream diagnostic callers can compute per-task
+    # interval counts against a known dispatch cadence.
+    oldest_ready_age: Optional[int] = None
+    maximum_ready_age: Optional[int] = None
+    for row in conn.execute(
+        "SELECT id, created_at FROM tasks WHERE status = 'ready'"
+    ):
+        task_id = row["id"]
+        created_at = int(row["created_at"]) if row["created_at"] is not None else None
+        if created_at is None:
+            continue
+        latest_event = _latest_ready_event_at(conn, task_id)
+        effective_at = latest_event if latest_event is not None else created_at
+        age = now - effective_at
+        if oldest_ready_age is None or age < oldest_ready_age:
+            oldest_ready_age = age
+        if maximum_ready_age is None or age > maximum_ready_age:
+            maximum_ready_age = age
 
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
-        "oldest_ready_age_seconds": oldest_ready_age,
+        "oldest_ready_age_seconds": maximum_ready_age,
+        "youngest_ready_age_seconds": oldest_ready_age,
         "now": now,
     }
 
