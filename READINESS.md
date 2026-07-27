@@ -174,7 +174,7 @@ evidence, not an expansion of the release-gate capability inventory.
 
 The current main branch has a separate, broader acceptance scenario. It is not
 retroactively attributed to the tagged release boundary. At commit
-`11650bcd27`, from the repository root, run:
+`ec1be4098c`, from the repository root, run:
 
 ```bash
 scripts/run_agentic_acceptance.sh
@@ -195,7 +195,7 @@ current-tree agentic acceptance: PASS
 ```
 
 The image ID was
-`sha256:9e18c35e288b501f52200dbaa9b73ff1b779aa1f2fd3da3e72ba2a40b8a9a719`.
+`sha256:21c34de3d2ba0a4a292f8488f1c726c13d04c6a7b6d93c027891ec285f827ada`.
 The provider boundary is a deterministic file-backed test adapter; this is
 controlled runtime evidence and not proof of live provider credentials,
 production deployment, or legal/tax readiness.

@@ -139,7 +139,7 @@ duplicate provider effect:
 scripts/run_agentic_acceptance.sh
 ```
 
-Run on 2026-07-27 at commit `11650bcd27` (the current-tree acceptance harness
+Run on 2026-07-27 at commit `ec1be4098c` (the current-tree acceptance harness
 commit). Result:
 
 ```text
@@ -152,8 +152,9 @@ current-tree agentic acceptance: PASS
 ```
 
 The image was built locally as `charterforge:agentic-acceptance` with image
-ID `sha256:9e18c35e288b501f52200dbaa9b73ff1b779aa1f2fd3da3e72ba2a40b8a9a719`.
+ID `sha256:21c34de3d2ba0a4a292f8488f1c726c13d04c6a7b6d93c027891ec285f827ada`.
 The provider is a deterministic file-backed test adapter mounted in the
 temporary state volume; no Stripe, AgentMail, network endpoint, or production
-credential is used. This proves the controlled restart/idempotency contract,
-not production deployment or live payment capability.
+credential is used. The container uses its real image entrypoint and
+supervised startup path. This proves the controlled restart/idempotency
+contract, not production deployment or live payment capability.
