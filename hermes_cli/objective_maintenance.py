@@ -125,7 +125,7 @@ def run_housekeeping(
     active_objectives = conn.execute(
         """SELECT o.id, o.version, o.status
              FROM objectives o
-            WHERE o.status IN ('accepted', 'planned')
+            WHERE o.status IN ('accepted', 'planned', 'authorized', 'executing')
               AND NOT EXISTS (
                     SELECT 1 FROM objective_inbox i
                      WHERE i.objective_id=o.id

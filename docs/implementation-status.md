@@ -77,6 +77,9 @@ acceptance evidence.
   them through the same scope and lineage checks.
 - Readiness gates declared `email.send` authority on a configured AgentMail
   inbox and API key, with deterministic blocking before execution can start.
+- Lifecycle maintenance requeues authorized and executing objectives whose
+  wake event was lost during a crash, preserving durable recovery without
+  requiring a human to redispatch the objective.
 - Security-readiness blocks now create deduplicated, organization-scoped
   advisor interventions with exact violations and a no-action boundary.
 - Advisor-by-default authority policy.

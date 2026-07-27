@@ -441,6 +441,16 @@ Result: **20 passed, 0 failed**. A charter granting `email.send` now remains
 blocked until AgentMail configuration is present, while outbound read-back and
 authenticated inbound routing remain covered at the provider boundary.
 
+Interrupted objective-cycle recovery was validated with:
+
+```sh
+python3 -m pytest tests/hermes_cli/test_objective_maintenance.py::test_housekeeping_requeues_interrupted_executing_objective tests/hermes_cli/test_objective_maintenance.py::test_housekeeping_requeues_active_objective_without_a_wakeup -q
+```
+
+Result: **2 passed, 0 failed**. Maintenance now creates a durable
+`objective.executing.reconcile` wake when a crash leaves an executing objective
+without a pending or processing event.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

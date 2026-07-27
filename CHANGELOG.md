@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Lifecycle maintenance now requeues authorized and executing objectives that
+  have no pending or processing wake event, allowing a fresh worker to resume
+  after a crash between action execution and event scheduling.
 - Readiness now blocks a charter that grants `email.send` until its declared
   AgentMail inbox and API key are actually configured; unavailable company
   email is reported as a deterministic blocker instead of failing later at

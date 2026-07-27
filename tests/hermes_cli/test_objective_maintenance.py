@@ -149,6 +149,35 @@ def test_housekeeping_requeues_active_objective_without_a_wakeup(tmp_path):
     conn.close()
 
 
+def test_housekeeping_requeues_interrupted_executing_objective(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    objective = objectives_db.create_objective(
+        conn,
+        desired_outcome="Recover a cycle that died after action admission",
+        originator="employee:ceo",
+        organization_id="org_1",
+    )
+    objectives_db.transition_objective(
+        conn, objective.id, "accepted", actor="human:advisor"
+    )
+    # Simulate the durable state left by a process crash after the worker
+    # entered execution but before it could enqueue its next wake event.
+    conn.execute(
+        "UPDATE objectives SET status='executing' WHERE id=?", (objective.id,)
+    )
+    conn.execute("DELETE FROM objective_inbox WHERE objective_id=?", (objective.id,))
+    conn.commit()
+
+    result = objective_maintenance.run_housekeeping(conn)
+
+    assert result["requeued_objectives"] == [objective.id]
+    event = conn.execute(
+        "SELECT event_type FROM objective_inbox WHERE objective_id=?",
+        (objective.id,),
+    ).fetchone()
+    assert event["event_type"] == "objective.executing.reconcile"
+
+
 def test_stale_compute_cost_escalates_once_and_cli_reconciles_with_evidence(
     tmp_path,
 ):
