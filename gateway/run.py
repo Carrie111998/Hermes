@@ -19393,21 +19393,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
         """Reset per-turn state on a cached agent before a new turn starts.
 
-        Both _last_activity_ts and _last_activity_desc are only reset for
-        fresh external turns (depth 0); they are semantically paired —
-        desc describes the activity *at* ts, so updating one without the
-        other would make get_activity_summary() misleading.
-        For interrupt-recursive turns both are preserved so the inactivity
-        watchdog can accumulate stuck-turn idle time and fire the 30-min
-        timeout (#15654).  The depth-0 reset is still needed: a session
-        idle for 29 min would otherwise trip the watchdog before the new
-        turn makes its first API call (#9051).
+        ``_last_activity_ts``, ``_last_activity_desc``, and
+        ``_last_activity_provenance`` are only reset for fresh external
+        turns (depth 0); they are a semantic triple - description and
+        provenance describe the activity *at* ts, so updating one without
+        the others would make get_activity_summary() misleading.
+        For interrupt-recursive turns all three are preserved so the
+        inactivity watchdog can accumulate stuck-turn idle time and fire
+        the 30-min timeout (#15654).  The depth-0 reset is still needed:
+        a session idle for 29 min would otherwise trip the watchdog before
+        the new turn makes its first API call (#9051).
         """
         if interrupt_depth == 0:
+            from agent.session_activity import ActivityProvenance
+
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
+            agent._last_activity_provenance = ActivityProvenance.UNKNOWN
             # Reset the SessionDB flush cursor so the new turn's messages are
-            # fully persisted — a stale value from the previous turn would
+            # fully persisted - a stale value from the previous turn would
             # cause `_flush_messages_to_session_db` to skip new rows (#44327).
             if hasattr(agent, "_last_flushed_db_idx"):
                 agent._last_flushed_db_idx = 0

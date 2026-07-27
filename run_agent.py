@@ -3502,15 +3502,10 @@ class AIAgent:
                     getattr(self, "_last_activity_provenance", None)
                 ),
             )
-        except TypeError:
-            # Older SessionDB stubs may only accept (session_id, ts).
-            try:
-                touch(session_id, getattr(self, "_last_activity_ts", None))
-            except Exception:
-                pass
         except Exception:
             # Never let durable heartbeat I/O break the agent loop.
             pass
+
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
 
