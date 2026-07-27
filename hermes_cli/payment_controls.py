@@ -294,3 +294,39 @@ def settle_spend_hold(conn: sqlite3.Connection, action_id: str) -> bool:
             (int(time.time()), action_id),
         )
     return updated.rowcount == 1
+
+
+def stale_spend_holds(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    grace_seconds: int = 3600,
+) -> list[dict[str, Any]]:
+    """Return reserved holds whose provider outcome needs advisor reconciliation."""
+    if grace_seconds <= 0:
+        raise ValueError("spend hold grace period must be positive")
+    ensure_schema(conn)
+    cutoff = (int(time.time()) if now is None else int(now)) - grace_seconds
+    payment_table = conn.execute(
+        """SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='payment_intents'"""
+    ).fetchone()
+    query = (
+        """SELECT h.*, i.organization_id,
+                  p.objective_id AS payment_objective_id
+             FROM payment_spend_holds h
+             JOIN payment_instruments i ON i.id=h.instrument_id
+             LEFT JOIN payment_intents p ON p.action_id=h.action_id
+            WHERE h.status='reserved' AND h.created_at<=?
+            ORDER BY h.created_at,h.id"""
+        if payment_table is not None
+        else
+        """SELECT h.*, i.organization_id,
+                  NULL AS payment_objective_id
+             FROM payment_spend_holds h
+             JOIN payment_instruments i ON i.id=h.instrument_id
+            WHERE h.status='reserved' AND h.created_at<=?
+            ORDER BY h.created_at,h.id"""
+    )
+    rows = conn.execute(query, (cutoff,)).fetchall()
+    return [dict(row) for row in rows]

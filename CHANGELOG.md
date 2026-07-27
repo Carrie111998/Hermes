@@ -72,6 +72,8 @@ not a claim of production autonomous-business readiness.
   initialization path.
 - Runtime-host mismatches and empty action-contract charters now create durable
   advisor handoffs before autonomous operation stops.
+- Housekeeping now escalates stale outbound spend holds without automatically
+  releasing uncertain provider commitments.
 - Hardened durable runtime ledgers so schema checks preserve active authority
   transactions across finance, accounting, payments, compliance, approvals,
   event ingress, billing, commitments, metrics, worker state, and audit

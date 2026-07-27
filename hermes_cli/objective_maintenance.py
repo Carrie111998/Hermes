@@ -13,6 +13,7 @@ from hermes_cli import (
     finance_db,
     objectives_db,
     organization_db,
+    payment_controls,
     resource_budget,
 )
 
@@ -44,6 +45,7 @@ def run_housekeeping(
     *,
     now: Optional[int] = None,
     compute_reconciliation_grace_seconds: int = 86_400,
+    spend_hold_reconciliation_grace_seconds: int = 3_600,
 ) -> dict[str, Any]:
     """Expire authority and release capital without waiting for a wake event."""
     ensure_schema(conn)
@@ -61,6 +63,7 @@ def run_housekeeping(
         "disabled_triggers": 0,
         "repaired_compute_reconciliations": [],
         "compute_reconciliation_interventions": [],
+        "spend_hold_reconciliation_interventions": [],
     }
     summary["expired_approvals"] = approval_artifacts.expire_due(
         conn, now=ts
@@ -71,6 +74,48 @@ def run_housekeeping(
     from hermes_cli import operational_control
 
     operational_control.ensure_schema(conn)
+
+    for hold in payment_controls.stale_spend_holds(
+        conn,
+        now=ts,
+        grace_seconds=spend_hold_reconciliation_grace_seconds,
+    ):
+        dedupe_key = "outbound-spend-hold-unreconciled:" + str(hold["id"])
+        existing = conn.execute(
+            """SELECT id FROM intervention_queue
+                WHERE dedupe_key=? AND status='open'""",
+            (dedupe_key,),
+        ).fetchone()
+        if existing is not None:
+            continue
+        intervention_id = operational_control.raise_intervention(
+            conn,
+            organization_id=str(hold["organization_id"]),
+            objective_id=(
+                str(hold["payment_objective_id"])
+                if hold["payment_objective_id"] is not None
+                else None
+            ),
+            action_id=str(hold["action_id"]),
+            category="outbound_spend_hold_unreconciled",
+            summary="Outbound spend hold lacks a timely provider outcome",
+            context={
+                "hold_id": str(hold["id"]),
+                "action_id": str(hold["action_id"]),
+                "amount_minor": int(hold["amount_minor"]),
+                "currency": str(hold["currency"]),
+                "created_at": int(hold["created_at"]),
+                "grace_seconds": spend_hold_reconciliation_grace_seconds,
+                "authority_boundary": "Hold remains reserved; no automatic release",
+            },
+            options=[
+                {"id": "provider_readback", "label": "Attach authoritative provider read-back"},
+                {"id": "release", "label": "Release only with settlement evidence"},
+                {"id": "manual", "label": "Keep autonomous spending stopped"},
+            ],
+            dedupe_key=dedupe_key,
+        )
+        summary["spend_hold_reconciliation_interventions"].append(intervention_id)
 
     # Lifecycle state and its wake event can be committed by separate control
     # paths (for example an operator accepting an objective outside the worker

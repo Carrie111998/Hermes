@@ -20,6 +20,8 @@
 - Outbound spend controls atomically reserve per-instrument daily velocity
   before provider calls and retain pending holds until read-back settles or
   releases them.
+- Housekeeping escalates stale outbound spend holds with a deduplicated advisor
+  intervention and never releases an uncertain provider hold automatically.
 - Payment and metered-billing schema initialization preserves active authority
   transactions when the durable tables already exist.
 - Outcome attribution synchronization uses the guarded payment schema path and

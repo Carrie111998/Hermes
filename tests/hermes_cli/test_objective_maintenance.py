@@ -9,6 +9,7 @@ from hermes_cli import (
     objectives_db,
     organization_db,
     resource_budget,
+    payment_controls,
 )
 
 
@@ -236,3 +237,60 @@ def test_stale_compute_cost_escalates_once_and_cli_reconciles_with_evidence(
             WHERE objective_id=? AND event_type='intervention.resolved'""",
         (objective.id,),
     ).fetchone()[0] == 1
+
+
+def test_stale_outbound_spend_hold_escalates_without_automatic_release(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    instrument = payment_controls.register_tokenized_instrument(
+        conn,
+        organization_id="org_spend",
+        provider="fake",
+        provider_instrument_id="token-stale-hold",
+        rail_type="virtual_card",
+        currency="USD",
+        label="Stale hold card",
+    )
+    payment_controls.set_spend_controls(
+        conn,
+        instrument_id=instrument,
+        max_transaction_minor=1_000,
+        max_daily_minor=1_000,
+        allowed_merchant_categories=[],
+        allowed_payees=[],
+        policy_version="finance-v1",
+    )
+    payment_controls.authorize_spend(
+        conn,
+        instrument_id=instrument,
+        provider="fake",
+        amount_minor=600,
+        currency="USD",
+        merchant_category="software",
+        payee_id="vendor-stale",
+        action_id="action-stale-hold",
+    )
+    now = int(time.time())
+    conn.execute(
+        "UPDATE payment_spend_holds SET created_at=? WHERE action_id=?",
+        (now - 20, "action-stale-hold"),
+    )
+    conn.commit()
+
+    first = objective_maintenance.run_housekeeping(
+        conn, now=now, spend_hold_reconciliation_grace_seconds=10
+    )
+    second = objective_maintenance.run_housekeeping(
+        conn, now=now, spend_hold_reconciliation_grace_seconds=10
+    )
+
+    assert len(first["spend_hold_reconciliation_interventions"]) == 1
+    assert second["spend_hold_reconciliation_interventions"] == []
+    assert conn.execute(
+        "SELECT status FROM payment_spend_holds WHERE action_id=?",
+        ("action-stale-hold",),
+    ).fetchone()["status"] == "reserved"
+    intervention = conn.execute(
+        "SELECT category FROM intervention_queue WHERE action_id=?",
+        ("action-stale-hold",),
+    ).fetchone()
+    assert intervention["category"] == "outbound_spend_hold_unreconciled"
