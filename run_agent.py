@@ -599,6 +599,7 @@ class AIAgent:
             from hermes_state import SessionDB
 
             self._session_db = SessionDB()
+            self._owns_session_db = True
             return self._session_db
         except Exception as exc:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
@@ -3944,6 +3945,17 @@ class AIAgent:
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     session_db.end_session(session_id, "agent_close")
+        except Exception:
+            pass
+        # 8. Close the SQLite session store if this agent owns it (lazy-recall
+        # path). Caller-injected gateway/CLI stores remain open; they are
+        # shared across agents and closed by their original owner.
+        try:
+            if getattr(self, "_owns_session_db", False):
+                db = getattr(self, "_session_db", None)
+                if db is not None:
+                    db.close()
+                    self._session_db = None
         except Exception:
             pass
 
