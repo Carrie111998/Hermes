@@ -17,6 +17,8 @@
   idempotent allocation guards against duplicate billing.
 - Metered-invoice verification independently reconciles the exact usage-event
   set and aggregate amount against the payment intent.
+- Metered invoices can calculate jurisdiction-matched tax from verified active
+  accounting registrations; missing or mismatched rules fail closed.
 - Compliance inventory, obligations, deadlines, evidence, and audit export.
 - Authenticated external-event receipts with idempotent provenance and
   credential-redacted ingress envelopes.

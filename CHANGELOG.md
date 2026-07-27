@@ -43,6 +43,8 @@ Hermes Agent history remains available in Git.
 - Permit issuance now rejects actions from superseded plan versions.
 - Permit consumption now rejects unexpired permits issued under a stale policy
   version.
+- Metered invoices now calculate optional tax only from an active,
+  organization-owned jurisdiction-matched tax rule and record the gross intent.
 - Charterforge independent identity, canonical package/CLI/namespace, state
   root, environment prefix, container/service naming, attribution, and
   migration documentation.

@@ -399,6 +399,46 @@ def calculate_tax(
     return int(amount.quantize(Decimal("1"), rounding=ROUND_HALF_UP)), str(row["id"])
 
 
+def calculate_tax_for_rule(
+    conn: sqlite3.Connection,
+    *,
+    organization_id: str,
+    tax_rule_id: str,
+    jurisdiction: str,
+    taxable_minor: int,
+    occurred_at: int,
+) -> tuple[int, str]:
+    """Calculate tax only from an active, organization-owned verified rule."""
+    if taxable_minor < 0:
+        raise AccountingError("taxable amount cannot be negative")
+    row = conn.execute(
+        """SELECT tr.tax_code, rg.jurisdiction, rg.tax_type
+             FROM tax_rates tr
+             JOIN tax_registrations rg ON rg.id=tr.registration_id
+            WHERE tr.id=? AND rg.organization_id=? AND rg.status='active'
+              AND rg.jurisdiction=?
+              AND rg.effective_from <= ? AND tr.effective_from <= ?
+              AND (rg.effective_to IS NULL OR rg.effective_to >= ?)
+              AND (tr.effective_to IS NULL OR tr.effective_to >= ?)""",
+        (tax_rule_id, organization_id, jurisdiction, occurred_at, occurred_at,
+         occurred_at, occurred_at),
+    ).fetchone()
+    if row is None:
+        raise AccountingError("tax rule is not active for this organization and jurisdiction")
+    amount, effective_rule_id = calculate_tax(
+        conn,
+        organization_id=organization_id,
+        jurisdiction=jurisdiction,
+        tax_type=str(row["tax_type"]),
+        tax_code=str(row["tax_code"]),
+        taxable_minor=taxable_minor,
+        occurred_at=occurred_at,
+    )
+    if effective_rule_id != tax_rule_id:
+        raise AccountingError("tax rule changed during calculation")
+    return amount, effective_rule_id
+
+
 def trial_balance(conn: sqlite3.Connection, organization_id: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         """SELECT a.code, a.name, a.account_type,

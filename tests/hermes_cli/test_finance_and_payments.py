@@ -295,6 +295,24 @@ def test_tax_bearing_invoice_accrues_tax_and_revenue_separately(treasury):
         authority_source="https://authority.example",
         verified_at=int(time.time()),
     )
+    calculated, effective_rule = accounting_db.calculate_tax_for_rule(
+        conn,
+        organization_id="org_1",
+        tax_rule_id=tax_rule,
+        jurisdiction="US-PA",
+        taxable_minor=2_500,
+        occurred_at=int(time.time()),
+    )
+    assert (calculated, effective_rule) == (150, tax_rule)
+    with pytest.raises(accounting_db.AccountingError, match="active"):
+        accounting_db.calculate_tax_for_rule(
+            conn,
+            organization_id="org_1",
+            tax_rule_id=tax_rule,
+            jurisdiction="CA-ON",
+            taxable_minor=2_500,
+            occurred_at=int(time.time()),
+        )
     intent = service.create_receivable(
         organization_id="org_1",
         account_id=account,

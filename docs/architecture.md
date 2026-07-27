@@ -74,3 +74,9 @@ to attach it to a different invoice is rejected.
 The payment verifier independently reads the allocation ledger and requires
 the exact event-ID set and aggregate amount to match the payment intent before
 it can pass the metered-invoice action.
+
+Metered usage is treated as the taxable base. If a verified `tax_rule_id` is
+provided, the accounting layer calculates tax from the active organization
+registration and matching customer jurisdiction; the gross payment intent and
+tax-liability journal then include that result. Missing or mismatched rules
+fail closed.

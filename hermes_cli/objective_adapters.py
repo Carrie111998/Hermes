@@ -1478,19 +1478,33 @@ def register_payment_adapters(
                     str(existing_intent["id"]) if existing_intent else None
                 ),
             )
+            tax_minor = 0
+            tax_rule_id = None
+            if payload.get("tax_rule_id"):
+                tax_rule_id = str(payload["tax_rule_id"])
+                tax_minor, tax_rule_id = accounting_db.calculate_tax_for_rule(
+                    authority_conn,
+                    organization_id=organization_id,
+                    tax_rule_id=tax_rule_id,
+                    jurisdiction=str(payload["customer_jurisdiction"]),
+                    taxable_minor=int(context["amount_minor"]),
+                    occurred_at=int(time.time()),
+                )
             intent = service.create_receivable(
                 organization_id=organization_id,
                 account_id=account_id,
                 provider=str(payload["provider"]),
-                amount_minor=int(context["amount_minor"]),
+                amount_minor=int(context["amount_minor"]) + int(tax_minor),
                 currency=str(context["currency"]),
                 customer=customer,
                 customer_jurisdiction=str(payload["customer_jurisdiction"]),
                 purpose=str(payload["purpose"]),
                 idempotency_key=str(payload["idempotency_key"]),
                 objective_id=str(payload["_governance_objective_id"]),
+                tax_minor=int(tax_minor),
+                tax_rule_id=tax_rule_id,
             )
-            if int(intent["amount_minor"]) != int(context["amount_minor"]):
+            if int(intent["amount_minor"]) != int(context["amount_minor"]) + int(tax_minor):
                 raise ValueError("idempotent metered invoice amount does not match usage events")
             usage_billing.allocate_events(
                 authority_conn,
@@ -1505,7 +1519,9 @@ def register_payment_adapters(
                 "payment_intent_id": intent["id"],
                 "status": intent["status"],
                 "payment_url": intent["payment_url"],
-                "amount_minor": context["amount_minor"],
+                "amount_minor": int(intent["amount_minor"]),
+                "usage_amount_minor": context["amount_minor"],
+                "tax_minor": tax_minor,
                 "currency": context["currency"],
                 "usage_event_ids": context["event_ids"],
             },
@@ -1625,7 +1641,7 @@ def register_payment_adapters(
                         or action.payload.get("usage_event_ids")
                         or []
                     ),
-                    expected_amount_minor=int(intent["amount_minor"]),
+                    expected_amount_minor=int(intent["amount_minor"]) - int(intent.get("tax_minor") or 0),
                 )
                 passed = passed and bool(allocation_facts["passed"])
         else:
@@ -1690,7 +1706,7 @@ def register_payment_adapters(
                 "usage_event_ids": list,
                 "purpose": str,
             },
-            optional=COMMON_ACTION_FIELDS,
+            optional={**COMMON_ACTION_FIELDS, "tax_rule_id": str},
         ),
         required_capability="payments.receive",
         target_system="payments",
