@@ -6593,6 +6593,18 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# Cleanup-operator workflow gate (Issue #139-B acceptance criterion B).
+# A Kanban task assigned to the ``cleanup-operator`` profile must
+# carry an ``apply_confirm_token_prefix:`` field in its body. The
+# dispatcher refuses to spawn any worker for tasks that lack the
+# field, are missing the field's value, or carry a value shorter
+# than ``CLEANUP_OPERATOR_TOKEN_PREFIX_MIN_LEN`` hex chars. See
+# ``skills/devops/kanban-cleanup-operator/SKILL.md`` for the
+# operator-in-the-loop sequence and the rationale.
+CLEANUP_OPERATOR_ASSIGNEE = "cleanup-operator"
+CLEANUP_OPERATOR_TOKEN_PREFIX_FIELD = "apply_confirm_token_prefix"
+CLEANUP_OPERATOR_TOKEN_PREFIX_MIN_LEN = 8
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -8053,6 +8065,65 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _extract_cleanup_operator_token(body: Optional[str]) -> Optional[str]:
+    """Return the trimmed value of ``apply_confirm_token_prefix:`` in
+    ``body``, or ``None`` if the field is missing or has no value.
+
+    The field is matched on its own line (anywhere in the body). Leading
+    and trailing whitespace around the value is stripped. Empty values
+    (e.g. ``apply_confirm_token_prefix:``) are treated as missing so a
+    half-filled body fails closed — the dispatcher should not assume
+    the operator intended to confirm anything.
+
+    Implemented as a small standalone function (rather than inlined
+    into the gate) so the dispatcher's gate and the worker's own
+    self-check can share the same parsing rules. See
+    ``skills/devops/kanban-cleanup-operator/SKILL.md``.
+    """
+    if not body:
+        return None
+    field = CLEANUP_OPERATOR_TOKEN_PREFIX_FIELD
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Match either ``field: value`` or ``field=value``.
+        for sep in (":", "="):
+            if stripped.startswith(field + sep):
+                value = stripped[len(field) + len(sep):].strip()
+                return value or None
+    return None
+
+
+def _validate_cleanup_operator_task(
+    task_id: str, body: Optional[str],
+) -> Optional[str]:
+    """Return a rejection reason if ``task_id`` should NOT be spawned
+    for the cleanup-operator workflow, else ``None``.
+
+    Used by the dispatcher gate inside :func:`_dispatch_once_locked`
+    and by the worker's own startup check (see
+    ``skills/devops/kanban-cleanup-operator/SKILL.md`` step 1).
+
+    The rejection reasons are short strings intended for the audit-trail
+    payload; the operator-facing message is composed by the
+    ``dispatch_rejected`` event handler.
+    """
+    token = _extract_cleanup_operator_token(body)
+    if token is None:
+        return (
+            f"missing {CLEANUP_OPERATOR_TOKEN_PREFIX_FIELD} field in body "
+            f"(min {CLEANUP_OPERATOR_TOKEN_PREFIX_MIN_LEN} hex chars required)"
+        )
+    if len(token) < CLEANUP_OPERATOR_TOKEN_PREFIX_MIN_LEN:
+        return (
+            f"{CLEANUP_OPERATOR_TOKEN_PREFIX_FIELD} too short: "
+            f"got {len(token)} chars, need "
+            f"{CLEANUP_OPERATOR_TOKEN_PREFIX_MIN_LEN}"
+        )
+    return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8265,6 +8336,51 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # Cleanup-operator workflow gate (Issue #139-B acceptance criterion B):
+    # refuse to spawn a worker for any ready task whose assignee is
+    # ``cleanup-operator`` and whose body lacks a valid
+    # ``apply_confirm_token_prefix:`` field. The gate runs BEFORE the
+    # spawn loop so a missing/short token is the first signal the
+    # operator sees — the task is auto-blocked and a ``dispatch_rejected``
+    # event is appended to the audit trail. See
+    # ``skills/devops/kanban-cleanup-operator/SKILL.md`` for the full
+    # worker-side sequence; this is the dispatcher-side fail-safe that
+    # ensures even an automated task-creation flow cannot bypass the
+    # operator-in-the-loop gate. Dry-run mode reports what would block
+    # without mutating state.
+    if not dry_run:
+        for row in ready_rows:
+            if (row["assignee"] or "") != CLEANUP_OPERATOR_ASSIGNEE:
+                continue
+            body_row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?", (row["id"],),
+            ).fetchone()
+            task_body = body_row["body"] if body_row else None
+            gate_reject = _validate_cleanup_operator_task(
+                row["id"], task_body,
+            )
+            if gate_reject is not None:
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET status = 'blocked' "
+                            "WHERE id = ? AND status = 'ready'",
+                            (row["id"],),
+                        )
+                        _append_event(
+                            conn, row["id"], "dispatch_rejected",
+                            {
+                                "assignee": CLEANUP_OPERATOR_ASSIGNEE,
+                                "gate": "apply_confirm_token_prefix",
+                                "reason": gate_reject,
+                            },
+                        )
+                    result.auto_blocked.append(row["id"])
+                except Exception:
+                    _log.debug(
+                        "kanban dispatch: cleanup-operator gate failed for "
+                        "task %s", row["id"], exc_info=True,
+                    )
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
