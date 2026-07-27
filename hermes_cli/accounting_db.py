@@ -764,6 +764,7 @@ def close_fiscal_period(
     conn: sqlite3.Connection,
     period_id: str,
     *,
+    organization_id: str,
     evidence: Any,
     closed_at: Optional[int] = None,
 ) -> None:
@@ -771,7 +772,8 @@ def close_fiscal_period(
     if not evidence:
         raise AccountingError("closing a fiscal period requires supporting evidence")
     period = conn.execute(
-        "SELECT * FROM fiscal_periods WHERE id = ?", (period_id,)
+        "SELECT * FROM fiscal_periods WHERE id = ? AND organization_id = ?",
+        (period_id, organization_id),
     ).fetchone()
     if period is None:
         raise KeyError(f"fiscal period not found: {period_id}")

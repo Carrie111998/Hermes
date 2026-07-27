@@ -1845,6 +1845,7 @@ def register_accounting_adapters(
             accounting_db.close_fiscal_period(
                 authority_conn,
                 period_id,
+                organization_id=organization_id,
                 evidence=dict(payload["evidence"]),
             )
         except Exception as exc:

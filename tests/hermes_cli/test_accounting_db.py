@@ -170,14 +170,23 @@ def test_fiscal_period_lifecycle_is_evidenced_idempotent_and_non_overlapping(con
             evidence={"calendar": "invalid"},
         )
 
+    with pytest.raises(KeyError, match="fiscal period not found"):
+        accounting_db.close_fiscal_period(
+            conn,
+            period,
+            organization_id="org_2",
+            evidence={"wrong_tenant": True},
+        )
     accounting_db.close_fiscal_period(
         conn,
         period,
+        organization_id="org_1",
         evidence={"trial_balance": "verified:2026-Q1"},
     )
     accounting_db.close_fiscal_period(
         conn,
         period,
+        organization_id="org_1",
         evidence={"retry": True},
     )
     row = conn.execute(
