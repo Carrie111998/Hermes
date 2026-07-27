@@ -404,19 +404,42 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
 )
 
+_SNAPSHOT_SENSITIVE_ENV_NAME_PARTS = (
+    "TOKEN",
+    "SECRET",
+    "API_KEY",
+    "PASSWORD",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+)
+_SNAPSHOT_SENSITIVE_ENV_NAME_REGEX = (
+    "(?i)(" + "|".join(_SNAPSHOT_SENSITIVE_ENV_NAME_PARTS) + ")"
+)
+
+
+def _case_insensitive_shell_glob(value: str) -> str:
+    """Return a bash ``case`` glob matching *value* case-insensitively."""
+    return "".join(
+        f"[{char.upper()}{char.lower()}]" if char.isalpha() else char
+        for char in value
+    )
+
 
 def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
-    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+    per-session bridged vars and sensitive names.
 
-    Unset the bridged vars in a subshell *before* ``export -p``. A line-based
-    ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
-    as a multi-line ``declare -x NAME="…`` block, so only the opener matches the
-    regex and continuation lines (e.g. ``curl … | bash #`` smuggled into a
-    Matrix room/display name via ``HERMES_SESSION_CHAT_NAME``) land in the
-    snapshot and execute on the next ``source`` (issue #71296). Unsetting first
-    means ``export -p`` never emits those vars — including any continuation
-    lines. ``|| true`` keeps the success contract for callers that chain on it.
+    Unset names in a subshell *before* ``export -p``. Sensitive names match
+    ``_SNAPSHOT_SENSITIVE_ENV_NAME_REGEX``; ``compgen -e`` enumerates exported
+    names without reading their values. A line-based ``grep -vE`` filter is
+    unsafe: bash 3.2 prints a value containing a newline as a multi-line
+    ``declare -x NAME="…`` block, so only the opener matches the regex and
+    continuation lines (e.g. ``curl … | bash #`` smuggled into a Matrix
+    room/display name via ``HERMES_SESSION_CHAT_NAME``) land in the snapshot and
+    execute on the next ``source`` (issue #71296). Removing the export bit and
+    unsetting first means ``export -p`` never emits those vars — including
+    readonly vars that cannot be unset, or any continuation lines. ``|| true``
+    keeps the success contract for callers that chain on it.
 
     The dump MUST be wrapped in a brace group with the redirection applied to
     the group. *tmp_path* typically embeds ``$BASHPID`` for concurrency-safe
@@ -426,12 +449,23 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     The brace-group redirect is expanded in the current shell, keeping both
     expansions consistent.
     """
-    # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
-    # because ``unset`` with only missing names is ignored under 2>/dev/null.
+    # ${!PREFIX*} and compgen are both available in bash 3.2. Variable names
+    # cannot contain shell word separators, so iterating over compgen's names is
+    # safe. Empty matches are fine because the for-loop simply does not run.
+    sensitive_name_patterns = "|".join(
+        f"*{_case_insensitive_shell_glob(part)}*"
+        for part in _SNAPSHOT_SENSITIVE_ENV_NAME_PARTS
+    )
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "HERMES_UI_SESSION_ID 2>/dev/null; "
+        "for __hermes_env_name in $(compgen -e); do "
+        "case \"$__hermes_env_name\" in "
+        f"{sensitive_name_patterns}) "
+        "export -n \"$__hermes_env_name\" 2>/dev/null || true; "
+        "unset \"$__hermes_env_name\" 2>/dev/null || true ;; "
+        "esac; done; unset __hermes_env_name; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
