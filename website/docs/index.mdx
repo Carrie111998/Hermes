@@ -1,17 +1,17 @@
 ---
 slug: /
 sidebar_position: 0
-title: "Hermes Agent Documentation"
-description: "The self-improving AI agent built by Nous Research. A built-in learning loop that creates skills from experience, improves them during use, and remembers across sessions."
+title: "Charterforge Documentation"
+description: "Documentation for the independently developed Charterforge governed autonomous-company runtime."
 hide_table_of_contents: true
 displayed_sidebar: docs
 ---
 
 import Link from "@docusaurus/Link";
 
-# Hermes Agent
+# Charterforge
 
-The self-improving AI agent built by [Nous Research](https://nousresearch.com). The only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, and builds a deepening model of who you are across sessions.
+Charterforge is an independently developed governed autonomous-company runtime derived from the Hermes Agent foundation. Its Founder/CEO manages objectives, authorized work, evidence, workers, finances, compliance, and escalation.
 
 <div
   style={{
@@ -36,19 +36,7 @@ The self-improving AI agent built by [Nous Research](https://nousresearch.com). 
     Get Started →
   </Link>
   <a
-    href="https://hermes-agent.nousresearch.com/"
-    style={{
-      display: "inline-block",
-      padding: "0.6rem 1.2rem",
-      border: "1px solid rgba(255,215,0,0.2)",
-      borderRadius: "8px",
-      textDecoration: "none",
-    }}
-  >
-    Download Desktop
-  </a>
-  <a
-    href="https://github.com/NousResearch/hermes-agent"
+    href="https://github.com/mikeholownych/hermes-agent"
     style={{
       display: "inline-block",
       padding: "0.6rem 1.2rem",
@@ -63,37 +51,29 @@ The self-improving AI agent built by [Nous Research](https://nousresearch.com). 
 
 ## Install
 
-### Windows or macOS
-
-To easily install the command-line and desktop applications, [download the Hermes Desktop installer](https://hermes-agent.nousresearch.com/) from our website and run it.
-
-### Without Hermes Desktop:
-
-For a command-line only install without Hermes Desktop, run:
-
-#### Linux / macOS / WSL2 / Android (Termux)
+This independent fork does not yet publish an installer, desktop artifact, or
+container image. Install from the repository while the project is in active
+development:
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-```
-
-#### Windows (native)
-
-Run in powershell:
-
-```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+git clone git@github.com:mikeholownych/hermes-agent.git charterforge
+cd charterforge
+uv sync
+uv run charterforge setup
 ```
 
 See the full **[Installation Guide](/getting-started/installation)** for what the installer does, the per-user vs root layout, and Windows-specific notes. For the complete platform support matrix, see **[Platform Support](/getting-started/platform-support)**.
 
 :::tip Fastest path to a working agent
-After installing, run `hermes setup --portal` — one OAuth covers a model plus all four Tool Gateway tools (web search, image generation, TTS, browser). See [Nous Portal](/integrations/nous-portal).
+After installation, run `charterforge --help` and configure the model and
+standing business charter before unattended operation.
 :::
 
-## What is Hermes Agent?
+## What is Charterforge?
 
-It's not a coding copilot tethered to an IDE or a chatbot wrapper around a single API. It's an **autonomous agent** that gets more capable the longer it runs. It lives wherever you put it — a $5 VPS, a GPU cluster, or serverless infrastructure (Daytona, Modal) that costs nearly nothing when idle. Talk to it from Telegram while it works on a cloud VM you never SSH into yourself. It's not tied to your laptop.
+Charterforge is a governed autonomous-company runtime. Its Founder/CEO owns
+mission interpretation, objectives, delegation, evidence review, adaptation,
+and escalation; the human is an advisor by default.
 
 ## Quick Links
 

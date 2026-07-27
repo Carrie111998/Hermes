@@ -3,7 +3,7 @@ import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
-  title: 'Hermes Agent',
+  title: 'Charterforge',
   tagline: 'The self-improving AI agent',
   favicon: 'img/favicon.ico',
 
@@ -11,7 +11,7 @@ const config: Config = {
   baseUrl: '/docs/',
 
   organizationName: 'NousResearch',
-  projectName: 'hermes-agent',
+  projectName: 'charterforge',
 
   onBrokenLinks: 'warn',
 
@@ -104,7 +104,7 @@ const config: Config = {
         docs: {
           routeBasePath: '/',  // Docs at the root of /docs/
           sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/NousResearch/hermes-agent/edit/main/website/',
+          editUrl: 'https://github.com/mikeholownych/hermes-agent/edit/main/website/',
         },
         blog: false,
         theme: {
@@ -127,9 +127,9 @@ const config: Config = {
       },
     },
     navbar: {
-      title: 'Hermes Agent',
+          title: 'Charterforge',
       logo: {
-        alt: 'Hermes Agent',
+        alt: 'Charterforge',
         src: 'img/logo.png',
       },
       items: [
@@ -145,8 +145,8 @@ const config: Config = {
           position: 'left',
         },
         {
-          href: 'https://hermes-agent.nousresearch.com/',
-          label: 'Download',
+          to: '/getting-started/installation',
+          label: 'Install from source',
           position: 'left',
         },
         {
@@ -154,12 +154,12 @@ const config: Config = {
           position: 'right',
         },
         {
-          href: 'https://hermes-agent.nousresearch.com',
+          to: '/',
           label: 'Home',
           position: 'right',
         },
         {
-          href: 'https://github.com/NousResearch/hermes-agent',
+          href: 'https://github.com/mikeholownych/hermes-agent',
           label: 'GitHub',
           position: 'right',
         },
@@ -186,20 +186,20 @@ const config: Config = {
           title: 'Community',
           items: [
             { label: 'Discord', href: 'https://discord.gg/NousResearch' },
-            { label: 'GitHub Issues', href: 'https://github.com/NousResearch/hermes-agent/issues' },
+            { label: 'GitHub Issues', href: 'https://github.com/mikeholownych/hermes-agent/issues' },
             { label: 'Skills Hub', href: 'https://agentskills.io' },
           ],
         },
         {
           title: 'More',
           items: [
-            { label: 'Desktop Download', href: 'https://hermes-agent.nousresearch.com/' },
-            { label: 'GitHub', href: 'https://github.com/NousResearch/hermes-agent' },
+            { label: 'Install from source', to: '/getting-started/installation' },
+            { label: 'GitHub', href: 'https://github.com/mikeholownych/hermes-agent' },
             { label: 'Nous Research', href: 'https://nousresearch.com' },
           ],
         },
       ],
-      copyright: `Built by <a href="https://nousresearch.com">Nous Research</a> · MIT License · ${new Date().getFullYear()}`,
+      copyright: `Independently developed Charterforge derivative · Hermes Agent foundation by <a href="https://nousresearch.com">Nous Research</a> · MIT License · ${new Date().getFullYear()}`,
     },
     prism: {
       theme: prismThemes.github,
