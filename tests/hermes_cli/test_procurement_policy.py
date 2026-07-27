@@ -10,6 +10,17 @@ from hermes_cli.procurement_policy import (
 )
 
 
+def test_procurement_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    from hermes_cli import procurement_policy
+
+    procurement_policy.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    procurement_policy.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_foss_precedes_build_and_paid_product():
     decision = evaluate_procurement(
         case={
