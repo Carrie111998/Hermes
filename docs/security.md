@@ -34,6 +34,11 @@ grant chain, and any revoked ancestor or cyclic chain is treated as revoked.
 The authority-integrity scan also rechecks the parent grant's exact scope,
 budget, and expiry rather than trusting the child record alone.
 
+Intervention resolution is an explicit human boundary: only `human:*` actors
+or the documented `owner`/`advisor`/`approver` aliases may resolve an open
+handoff. Employee, runtime, and worker identities are rejected even when they
+provide syntactically valid evidence.
+
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
 records. Payment integration is non-custodial: providers hold instruments and

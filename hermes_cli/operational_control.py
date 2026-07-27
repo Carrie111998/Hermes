@@ -472,6 +472,16 @@ def resolve_intervention(
     row = conn.execute(query, params).fetchone()
     if row is None or row["status"] != "open":
         raise ValueError("intervention is not open")
+    actor_identity = str(actor or "").strip().lower()
+    if not actor_identity:
+        raise PermissionError("intervention resolution requires an actor")
+    if not (
+        actor_identity.startswith("human:")
+        or actor_identity in {"owner", "advisor", "approver"}
+    ):
+        raise PermissionError(
+            "only an explicitly identified human advisor may resolve an intervention"
+        )
     allowed = {str(item.get("id")) for item in json.loads(row["options_json"])}
     if option_id not in allowed:
         raise ValueError("resolution is not one of the intervention's recorded options")

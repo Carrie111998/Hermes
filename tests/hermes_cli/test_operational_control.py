@@ -223,6 +223,14 @@ def test_restart_recovery_creates_one_evidenced_handoff_and_never_replays(tmp_pa
     assert open_items[0]["category"] == "uncertain_external_effect"
 
     intervention_id = open_items[0]["id"]
+    with pytest.raises(PermissionError, match="human advisor"):
+        operational_control.resolve_intervention(
+            conn,
+            intervention_id,
+            option_id="reconcile",
+            actor="employee:ceo",
+            evidence={"provider_readback": "not_settled"},
+        )
     with pytest.raises(ValueError, match="recorded options"):
         operational_control.resolve_intervention(
             conn,

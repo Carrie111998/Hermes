@@ -49,6 +49,9 @@
 - Authority-integrity verification now independently checks parent-grant
   expiry, budget, capabilities, systems, toolsets, skills, and exact resource
   equality, detecting persisted hierarchy expansion or stale parent evidence.
+- Intervention resolution now requires an explicitly identified human advisor
+  identity; CEO, worker, and runtime identities cannot self-resolve an open
+  escalation even with evidence-shaped payloads.
 - Delegation grants now persist the exact action resource scope and reject a
   Kanban binding to a different board; legacy grants without a scope fail closed
   until reissued under a current action contract.
