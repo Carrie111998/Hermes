@@ -410,6 +410,31 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
     }
 
 
+_skill_dir_index: Optional[Dict[str, List[Path]]] = None
+
+
+def _build_skill_dir_index() -> Dict[str, List[Path]]:
+    """Build a one-pass index of {dir_name: [skill_dirs]} under SKILLS_DIR.
+
+    Called once and cached in _skill_dir_index.  Replaces the O(N) per-skill
+    rglob that _find_installed_skill_dir_by_name used to perform.
+    """
+    index: Dict[str, List[Path]] = {}
+    if not SKILLS_DIR.exists():
+        return index
+    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        candidate = skill_md.parent
+        # Never reach outside the skills tree (symlinked/external dirs).
+        try:
+            candidate.resolve().relative_to(SKILLS_DIR.resolve())
+        except (OSError, ValueError):
+            continue
+        index.setdefault(candidate.name, []).append(candidate)
+    return index
+
+
 def _find_installed_skill_dir_by_name(skill_dir_name: str) -> Optional[Path]:
     """Locate an installed skill directory by its directory name.
 
@@ -420,21 +445,12 @@ def _find_installed_skill_dir_by_name(skill_dir_name: str) -> Optional[Path]:
     would write provenance onto the wrong skill. The caller still verifies a
     byte-identical content hash before recording anything.
     """
+    global _skill_dir_index
     if not skill_dir_name or not SKILLS_DIR.exists():
         return None
-    matches: List[Path] = []
-    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-        if is_excluded_skill_path(skill_md):
-            continue
-        candidate = skill_md.parent
-        if candidate.name != skill_dir_name:
-            continue
-        # Never reach outside the skills tree (symlinked/external dirs).
-        try:
-            candidate.resolve().relative_to(SKILLS_DIR.resolve())
-        except (OSError, ValueError):
-            continue
-        matches.append(candidate)
+    if _skill_dir_index is None:
+        _skill_dir_index = _build_skill_dir_index()
+    matches = _skill_dir_index.get(skill_dir_name, [])
     if len(matches) != 1:
         return None
     return matches[0]
