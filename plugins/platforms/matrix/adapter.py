@@ -1980,13 +1980,15 @@ class MatrixAdapter(BasePlatformAdapter):
         images: list[tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send multiple Matrix images as one ordered logical batch."""
         if not images:
-            return
+            return SendResult(success=True)
         from urllib.parse import unquote as _unquote
 
         total = len(images)
+        errors: list[str] = []
+        message_id: Optional[str] = None
         for idx, (image_url, alt_text) in enumerate(images, start=1):
             if human_delay > 0 and idx > 1:
                 await asyncio.sleep(human_delay)
@@ -2008,7 +2010,18 @@ class MatrixAdapter(BasePlatformAdapter):
                     metadata=metadata,
                 )
             if not result.success:
-                logger.warning("Matrix: failed to send image %d/%d: %s", idx, total, result.error)
+                error = result.error or "adapter reported failure"
+                errors.append(str(error))
+                logger.warning("Matrix: failed to send image %d/%d: %s", idx, total, error)
+            elif result.message_id and message_id is None:
+                message_id = result.message_id
+        if errors:
+            return SendResult(
+                success=False,
+                error=f"{len(errors)} image(s) failed: {errors[0]}",
+                message_id=message_id,
+            )
+        return SendResult(success=True, message_id=message_id)
 
     async def send_document(
         self,

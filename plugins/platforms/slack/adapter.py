@@ -3217,7 +3217,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -3232,11 +3232,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Suppressed multi-image upload in configured ignored channel %s",
                 chat_id,
             )
-            return
+            return SendResult(success=False, error="Channel is configured as ignored")
         if not self._app:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=True)
 
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
@@ -3249,10 +3249,12 @@ class SlackAdapter(BasePlatformAdapter):
                 is_safe_url as _is_safe_url,
             )
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id, images, metadata, human_delay
+            )
 
         thread_ts = self._resolve_thread_ts(None, metadata)
+        errors: List[str] = []
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
@@ -3279,6 +3281,7 @@ class SlackAdapter(BasePlatformAdapter):
                                 logger.warning(
                                     "[Slack] Skipping missing image: %s", local_path
                                 )
+                                errors.append(f"missing image: {local_path}")
                                 continue
                             file_uploads.append(
                                 {
@@ -3291,6 +3294,7 @@ class SlackAdapter(BasePlatformAdapter):
                                 logger.warning(
                                     "[Slack] Blocked unsafe image URL in batch"
                                 )
+                                errors.append(f"unsafe image URL: {image_url}")
                                 continue
                             try:
                                 response = await http_client.get(image_url)
@@ -3315,6 +3319,7 @@ class SlackAdapter(BasePlatformAdapter):
                                     safe_url_for_log(image_url),
                                     dl_err,
                                 )
+                                errors.append(f"image download failed: {dl_err}")
                                 continue
 
                 if not file_uploads:
@@ -3347,9 +3352,17 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(
+                fallback_result = await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay
                 )
+                if not fallback_result.success:
+                    errors.append(
+                        fallback_result.error or "per-image fallback failed"
+                    )
+
+        if errors:
+            return SendResult(success=False, error="; ".join(errors))
+        return SendResult(success=True)
 
     def _record_uploaded_file_thread(
         self,

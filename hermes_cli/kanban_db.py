@@ -1316,10 +1316,10 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
--- Durable, item-level outbox for notifier messages.  Chunk rows are created
--- before the first send and acknowledged independently, so a process crash or
--- later-chunk failure resumes at the first unacknowledged item instead of
--- replaying an already delivered prefix.
+-- Durable, item-level outbox for notifier messages and artifacts. Rows are
+-- created before the first send and acknowledged independently, so a process
+-- crash or later-item failure resumes at the first unacknowledged item instead
+-- of replaying an already delivered prefix.
 CREATE TABLE IF NOT EXISTS kanban_notify_deliveries (
     task_id       TEXT NOT NULL,
     platform      TEXT NOT NULL,
@@ -1327,6 +1327,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_deliveries (
     thread_id     TEXT NOT NULL DEFAULT '',
     event_id      INTEGER NOT NULL,
     chunk_index   INTEGER NOT NULL,
+    item_kind     TEXT NOT NULL DEFAULT 'text',
     delivery_key  TEXT NOT NULL UNIQUE,
     content       TEXT NOT NULL,
     state         TEXT NOT NULL DEFAULT 'pending',
@@ -2529,6 +2530,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "kanban_notify_subs",
                 "notify_lease_expires_at",
                 "notify_lease_expires_at INTEGER",
+            )
+
+    delivery_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='kanban_notify_deliveries'"
+    ).fetchone() is not None
+    if delivery_table_exists:
+        delivery_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_notify_deliveries)")
+        }
+        if "item_kind" not in delivery_cols:
+            # Rows created before artifact-safe delivery were all text chunks.
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_deliveries",
+                "item_kind",
+                "item_kind TEXT NOT NULL DEFAULT 'text'",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -10328,6 +10347,7 @@ def prepare_notify_delivery_chunks(
         existing = conn.execute(
             "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+            "AND item_kind = 'text' "
             "ORDER BY chunk_index ASC",
             identity,
         ).fetchall()
@@ -10349,14 +10369,15 @@ def prepare_notify_delivery_chunks(
             ).hexdigest()[:32]
             conn.execute(
                 "INSERT INTO kanban_notify_deliveries "
-                "(task_id, platform, chat_id, thread_id, event_id, chunk_index, "
+                "(task_id, platform, chat_id, thread_id, event_id, chunk_index, item_kind, "
                 "delivery_key, content, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, 'text', ?, ?, 'pending', ?, ?)",
                 (*identity, index, delivery_key, text, timestamp, timestamp),
             )
         rows = conn.execute(
             "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+            "AND item_kind = 'text' "
             "ORDER BY chunk_index ASC",
             identity,
         ).fetchall()
@@ -10383,7 +10404,128 @@ def pending_notify_delivery_chunks(
     rows = conn.execute(
         "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
         "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
-        "AND state != 'acked' ORDER BY chunk_index ASC",
+        "AND item_kind = 'text' AND state != 'acked' ORDER BY chunk_index ASC",
+        (
+            claim["task_id"], claim["platform"], claim["chat_id"],
+            claim.get("thread_id") or "", int(event.id),
+        ),
+    ).fetchall()
+    return [_notify_delivery_row_to_dict(row) for row in rows]
+
+
+def prepare_notify_delivery_artifacts(
+    conn: sqlite3.Connection,
+    *,
+    claim: Mapping[str, Any],
+    artifacts: Iterable[Mapping[str, Any]],
+    now: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Persist immutable artifact delivery items for a claimed event.
+
+    Existing rows win over a newly-derived artifact list. This preserves the
+    exact unsent tail if files disappear or formatter output changes between
+    retries.
+    """
+    timestamp = int(time.time()) if now is None else int(now)
+    event = claim["event"]
+    identity = (
+        str(claim["task_id"]), str(claim["platform"]), str(claim["chat_id"]),
+        str(claim.get("thread_id") or ""), int(event.id),
+    )
+    owner = str(claim["delivery_owner"])
+    with write_txn(conn):
+        sub = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND notify_inflight_event_id = ? "
+            "AND notify_inflight_owner = ?",
+            (*identity, owner),
+        ).fetchone()
+        if sub is None:
+            return []
+        existing = conn.execute(
+            "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+            "AND item_kind != 'text' ORDER BY chunk_index ASC",
+            identity,
+        ).fetchall()
+        if existing:
+            return [_notify_delivery_row_to_dict(row) for row in existing]
+
+        artifact_items = [dict(item) for item in artifacts]
+        if not artifact_items:
+            return []
+        row = conn.execute(
+            "SELECT COALESCE(MAX(chunk_index), -1) AS last_index "
+            "FROM kanban_notify_deliveries WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND event_id = ?",
+            identity,
+        ).fetchone()
+        start_index = int(row["last_index"] if row is not None else -1) + 1
+        for artifact_index, item in enumerate(artifact_items):
+            kind = str(item.pop("kind", "")).strip()
+            if kind not in {"image_batch", "video", "document"}:
+                raise ValueError(f"unsupported notification artifact kind: {kind!r}")
+            content = json.dumps(
+                item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            key_input = "\0".join(
+                (
+                    *map(str, identity),
+                    str(claim.get("notifier_profile") or "default"),
+                    "artifact",
+                    str(artifact_index),
+                    kind,
+                    content,
+                )
+            )
+            delivery_key = hashlib.sha256(
+                key_input.encode("utf-8", "replace")
+            ).hexdigest()[:32]
+            conn.execute(
+                "INSERT INTO kanban_notify_deliveries "
+                "(task_id, platform, chat_id, thread_id, event_id, chunk_index, item_kind, "
+                "delivery_key, content, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    *identity,
+                    start_index + artifact_index,
+                    kind,
+                    delivery_key,
+                    content,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        rows = conn.execute(
+            "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+            "AND item_kind != 'text' ORDER BY chunk_index ASC",
+            identity,
+        ).fetchall()
+        return [_notify_delivery_row_to_dict(row) for row in rows]
+
+
+def pending_notify_delivery_artifacts(
+    conn: sqlite3.Connection,
+    *,
+    claim: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    event = claim["event"]
+    owned = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+        "AND chat_id = ? AND thread_id = ? AND notify_inflight_event_id = ? "
+        "AND notify_inflight_owner = ?",
+        (
+            claim["task_id"], claim["platform"], claim["chat_id"],
+            claim.get("thread_id") or "", int(event.id), claim["delivery_owner"],
+        ),
+    ).fetchone()
+    if owned is None:
+        return []
+    rows = conn.execute(
+        "SELECT * FROM kanban_notify_deliveries WHERE task_id = ? "
+        "AND platform = ? AND chat_id = ? AND thread_id = ? AND event_id = ? "
+        "AND item_kind != 'text' AND state != 'acked' ORDER BY chunk_index ASC",
         (
             claim["task_id"], claim["platform"], claim["chat_id"],
             claim.get("thread_id") or "", int(event.id),

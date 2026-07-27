@@ -151,6 +151,96 @@ def test_delivery_claim_is_durable_and_reclaimable_after_lease_expiry(
         second.close()
 
 
+def test_artifact_items_resume_with_stable_unacknowledged_tail(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "artifact-items.db"))
+    kb.init_db()
+    task_id = _completed_subscription()
+
+    conn = kb.connect()
+    try:
+        claim = _claim(conn, task_id, "gateway-a", now=100)
+        assert claim is not None
+        [text] = kb.prepare_notify_delivery_chunks(
+            conn, claim=claim, chunks=["completed"], now=100,
+        )
+        assert kb.mark_notify_delivery_chunk_attempting(
+            conn,
+            delivery_key=text["delivery_key"],
+            delivery_owner="gateway-a",
+            now=101,
+        )
+        assert kb.ack_notify_delivery_chunk(
+            conn,
+            delivery_key=text["delivery_key"],
+            delivery_owner="gateway-a",
+            now=101,
+        )
+        artifacts = kb.prepare_notify_delivery_artifacts(
+            conn,
+            claim=claim,
+            artifacts=[
+                {"kind": "image_batch", "paths": ["a.png", "b.jpg"]},
+                {"kind": "document", "path": "first.pdf"},
+                {"kind": "document", "path": "second.pdf"},
+            ],
+            now=101,
+        )
+        assert [item["item_kind"] for item in artifacts] == [
+            "image_batch", "document", "document",
+        ]
+        for item in artifacts[:2]:
+            assert kb.mark_notify_delivery_chunk_attempting(
+                conn,
+                delivery_key=item["delivery_key"],
+                delivery_owner="gateway-a",
+                now=102,
+            )
+            assert kb.ack_notify_delivery_chunk(
+                conn,
+                delivery_key=item["delivery_key"],
+                delivery_owner="gateway-a",
+                now=102,
+            )
+        assert not kb.ack_notify_delivery_event(
+            conn,
+            claim=claim,
+            delivery_owner="gateway-a",
+            now=102,
+        )
+        assert kb.release_notify_delivery_claim(conn, claim=claim, now=102)
+
+        retry = _claim(conn, task_id, "gateway-b", now=103)
+        assert retry is not None
+        stable = kb.prepare_notify_delivery_artifacts(
+            conn, claim=retry, artifacts=[], now=103,
+        )
+        assert [item["delivery_key"] for item in stable] == [
+            item["delivery_key"] for item in artifacts
+        ]
+        [tail] = kb.pending_notify_delivery_artifacts(conn, claim=retry)
+        assert tail["delivery_key"] == artifacts[-1]["delivery_key"]
+        assert kb.mark_notify_delivery_chunk_attempting(
+            conn,
+            delivery_key=tail["delivery_key"],
+            delivery_owner="gateway-b",
+            now=104,
+        )
+        assert kb.ack_notify_delivery_chunk(
+            conn,
+            delivery_key=tail["delivery_key"],
+            delivery_owner="gateway-b",
+            now=104,
+        )
+        assert kb.ack_notify_delivery_event(
+            conn,
+            claim=retry,
+            delivery_owner="gateway-b",
+            now=105,
+        )
+    finally:
+        conn.close()
+
+
 def test_process_death_before_send_releases_lock_and_delivers_once(
     tmp_path, monkeypatch,
 ):

@@ -121,7 +121,7 @@ async def _self_post_chat_completion(
     raise loudly rather than run the wake in a fresh fingerprint-derived
     session nobody is looking at.
     """
-    import aiohttp
+    import httpx
 
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):
@@ -162,35 +162,36 @@ async def _self_post_chat_completion(
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])
         try:
-            timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
-            async with aiohttp.ClientSession(timeout=timeout) as http:
-                async with http.post(url, json=payload, headers=headers) as resp:
-                    if resp.status == 429:
-                        # Global concurrency cap (max_concurrent_runs) —
-                        # transient; back off and retry.
-                        last_err = RuntimeError(
-                            f"wake self-post got HTTP 429 (concurrency cap) "
-                            f"for session {session_id}"
-                        )
-                        logger.warning(
-                            "%s; attempt %d/%d", last_err, attempt + 1, attempts
-                        )
-                        continue
-                    if resp.status >= 400:
-                        body = (await resp.text())[:300]
-                        # Non-transient (auth/validation) — fail immediately.
-                        raise RuntimeError(
-                            f"wake self-post failed for session {session_id}: "
-                            f"HTTP {resp.status}: {body}"
-                        )
-                    await resp.read()
-                    logger.info(
-                        "wake self-post delivered for session %s (attempt %d)",
-                        session_id,
-                        attempt + 1,
+            timeout = httpx.Timeout(WAKE_TURN_TIMEOUT_SECONDS)
+            # This is an authenticated in-process loopback request. Never let
+            # HTTP(S)_PROXY redirect the API key or session id off-host.
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as http:
+                resp = await http.post(url, json=payload, headers=headers)
+                if resp.status_code == 429:
+                    # Global concurrency cap (max_concurrent_runs) —
+                    # transient; back off and retry.
+                    last_err = RuntimeError(
+                        f"wake self-post got HTTP 429 (concurrency cap) "
+                        f"for session {session_id}"
                     )
-                    return
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    logger.warning(
+                        "%s; attempt %d/%d", last_err, attempt + 1, attempts
+                    )
+                    continue
+                if resp.status_code >= 400:
+                    body = resp.text[:300]
+                    # Non-transient (auth/validation) — fail immediately.
+                    raise RuntimeError(
+                        f"wake self-post failed for session {session_id}: "
+                        f"HTTP {resp.status_code}: {body}"
+                    )
+                logger.info(
+                    "wake self-post delivered for session %s (attempt %d)",
+                    session_id,
+                    attempt + 1,
+                )
+                return
+        except (httpx.RequestError, asyncio.TimeoutError, OSError) as exc:
             last_err = exc
             logger.warning(
                 "wake self-post transient failure for session %s "

@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -822,25 +823,21 @@ class GatewayKanbanWatchersMixin:
                             # uploads. ``extract_local_files`` finds bare
                             # absolute paths in the summary;
                             # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
+                            # them. Each artifact is durably acknowledged so
+                            # retries resume at the first unsent item.
                             if kind == "completed":
-                                try:
-                                    await asyncio.wait_for(
-                                        self._deliver_kanban_artifacts(
-                                            adapter=adapter,
-                                            chat_id=sub["chat_id"],
-                                            metadata=metadata,
-                                            event_payload=getattr(ev, "payload", None),
-                                            task=task,
-                                        ),
-                                        timeout=_KANBAN_NOTIFY_DELIVERY_TIMEOUT_SECONDS,
-                                    )
-                                except Exception as art_exc:
-                                    logger.debug(
-                                        "kanban notifier: artifact delivery for %s failed: %s",
-                                        sub["task_id"], art_exc,
-                                    )
+                                await asyncio.wait_for(
+                                    self._deliver_kanban_artifacts(
+                                        adapter=adapter,
+                                        chat_id=sub["chat_id"],
+                                        metadata=metadata,
+                                        event_payload=getattr(ev, "payload", None),
+                                        task=task,
+                                        claim=d.get("claim"),
+                                        board=board_slug,
+                                    ),
+                                    timeout=_KANBAN_NOTIFY_DELIVERY_TIMEOUT_SECONDS,
+                                )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except asyncio.CancelledError:
@@ -1353,6 +1350,23 @@ class GatewayKanbanWatchersMixin:
             conn.close()
 
     @staticmethod
+    def _kanban_prepare_delivery_artifacts(
+        claim: dict,
+        artifacts: list[dict[str, Any]],
+        board: Optional[str] = None,
+    ) -> list[dict]:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.prepare_notify_delivery_artifacts(
+                conn, claim=claim, artifacts=artifacts,
+            )
+            return _kb.pending_notify_delivery_artifacts(conn, claim=claim)
+        finally:
+            conn.close()
+
+    @staticmethod
     def _kanban_mark_delivery_chunk(
         claim: dict,
         delivery_key: str,
@@ -1543,6 +1557,8 @@ class GatewayKanbanWatchersMixin:
         metadata: dict,
         event_payload: Optional[dict],
         task,
+        claim: Optional[dict] = None,
+        board: Optional[str] = None,
     ) -> None:
         """Upload artifact files referenced by a completed kanban task.
 
@@ -1556,14 +1572,27 @@ class GatewayKanbanWatchersMixin:
           2. ``event_payload['summary']`` (truncated first line)
           3. ``task.result`` (legacy fallback)
 
-        Files are deduplicated, missing files are silently skipped (the
-        path may have been mentioned for reference only), and delivery
-        errors are logged but do not break the notifier loop.
+        Files are deduplicated and missing files are silently skipped (the
+        path may have been mentioned for reference only). Delivery items are
+        persisted before sending and acknowledged one by one; a failure is
+        propagated so the event claim is released with its unsent tail intact.
         """
         from pathlib import Path as _Path
+        from gateway.platforms.base import BasePlatformAdapter
 
         candidates: list[str] = []
         seen: set[str] = set()
+
+        def _extract_local_paths(content: str):
+            extractor = getattr(adapter, "extract_local_files", None)
+            if callable(extractor):
+                try:
+                    result = extractor(content)
+                except Exception:
+                    result = None
+                if isinstance(result, tuple) and len(result) == 2:
+                    return result
+            return BasePlatformAdapter.extract_local_files(content)
 
         def _add(path: str) -> None:
             if not path:
@@ -1587,62 +1616,138 @@ class GatewayKanbanWatchersMixin:
             # 2. Paths embedded in the payload summary.
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
-                paths, _ = adapter.extract_local_files(summary)
+                paths, _ = _extract_local_paths(summary)
                 for p in paths:
                     _add(p)
 
         # 3. Legacy: paths embedded in task.result.
         if task is not None and getattr(task, "result", None):
             result_text = str(task.result)
-            paths, _ = adapter.extract_local_files(result_text)
+            paths, _ = _extract_local_paths(result_text)
             for p in paths:
                 _add(p)
 
-        if not candidates:
-            return
-
-        from gateway.platforms.base import BasePlatformAdapter
         candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
-        if not candidates:
-            return
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-
-        from urllib.parse import quote as _quote
 
         # Partition images so they ride a single send_multiple_images call
         # on platforms that support batch image uploads (Signal/Slack RPCs).
         image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
 
+        artifact_items: list[dict[str, Any]] = []
         if image_paths:
-            try:
-                batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(
-                    chat_id=chat_id, images=batch, metadata=metadata,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "kanban notifier: image batch upload failed: %s", exc,
-                )
-
+            artifact_items.append({"kind": "image_batch", "paths": image_paths})
         for path in other_paths:
-            ext = _Path(path).suffix.lower()
+            kind = "video" if _Path(path).suffix.lower() in _VIDEO_EXTS else "document"
+            artifact_items.append({"kind": kind, "path": path})
+
+        pending = (
+            await asyncio.to_thread(
+                self._kanban_prepare_delivery_artifacts,
+                claim,
+                artifact_items,
+                board,
+            )
+            if claim is not None
+            else [
+                {
+                    "item_kind": item["kind"],
+                    "content": json.dumps({k: v for k, v in item.items() if k != "kind"}),
+                    "delivery_key": "",
+                }
+                for item in artifact_items
+            ]
+        )
+        for item in pending:
+            kind = item["item_kind"]
+            payload = json.loads(item["content"])
+            delivery_key = item["delivery_key"]
+            if claim is not None:
+                marked = await asyncio.to_thread(
+                    self._kanban_mark_delivery_chunk,
+                    claim,
+                    delivery_key,
+                    "attempting",
+                    board,
+                )
+                if not marked:
+                    raise RuntimeError("notification delivery lease was lost")
+            item_metadata = dict(metadata)
+            if delivery_key:
+                item_metadata.setdefault("delivery_key", delivery_key)
+                item_metadata.setdefault("idempotency_key", delivery_key)
             try:
-                if ext in _VIDEO_EXTS:
-                    await adapter.send_video(
-                        chat_id=chat_id, video_path=path, metadata=metadata,
+                if kind == "image_batch":
+                    batch = [(f"file://{quote(p)}", "") for p in payload["paths"]]
+                    send_result = await adapter.send_multiple_images(
+                        chat_id=chat_id,
+                        images=batch,
+                        metadata=item_metadata,
+                    )
+                elif kind == "video":
+                    send_result = await adapter.send_video(
+                        chat_id=chat_id,
+                        video_path=payload["path"],
+                        metadata=item_metadata,
                     )
                 else:
-                    await adapter.send_document(
-                        chat_id=chat_id, file_path=path, metadata=metadata,
+                    send_result = await adapter.send_document(
+                        chat_id=chat_id,
+                        file_path=payload["path"],
+                        metadata=item_metadata,
                     )
-            except Exception as exc:
-                logger.warning(
-                    "kanban notifier: artifact upload (%s) failed: %s",
-                    path, exc,
+            except BaseException as exc:
+                if claim is not None:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            self._kanban_mark_delivery_chunk,
+                            claim,
+                            delivery_key,
+                            "pending",
+                            board,
+                            error=str(exc),
+                        )
+                    )
+                raise
+            if send_result is None:
+                error = f"adapter {kind} send returned no SendResult"
+                if claim is not None:
+                    await asyncio.to_thread(
+                        self._kanban_mark_delivery_chunk,
+                        claim,
+                        delivery_key,
+                        "pending",
+                        board,
+                        error=error,
+                    )
+                raise RuntimeError(error)
+            if getattr(send_result, "success", True) is False:
+                error = getattr(send_result, "error", None) or "adapter reported failure"
+                if claim is not None:
+                    await asyncio.to_thread(
+                        self._kanban_mark_delivery_chunk,
+                        claim,
+                        delivery_key,
+                        "pending",
+                        board,
+                        error=error,
+                    )
+                raise RuntimeError(f"adapter {kind} send reported failure: {error}")
+            if claim is not None:
+                acked = await asyncio.to_thread(
+                    self._kanban_mark_delivery_chunk,
+                    claim,
+                    delivery_key,
+                    "acked",
+                    board,
                 )
+                if not acked:
+                    raise RuntimeError(
+                        "notification artifact acknowledgement was rejected"
+                    )
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

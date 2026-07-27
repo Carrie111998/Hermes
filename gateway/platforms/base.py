@@ -3638,7 +3638,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3646,13 +3646,16 @@ class BasePlatformAdapter(ABC):
 
         Default implementation sends each item individually,
         routing animated GIFs through ``send_animation`` and local
-        files through ``send_image_file``.
+        files through ``send_image_file``. The returned ``SendResult`` is
+        successful only when every image reports successful delivery.
 
         Override in subclasses to bundle into a single native API call
         (e.g. Signal's multi-attachment RPC)
         """
         from urllib.parse import unquote as _unquote
 
+        errors: List[str] = []
+        message_id: Optional[str] = None
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -3685,9 +3688,21 @@ class BasePlatformAdapter(ABC):
                         metadata=metadata,
                     )
                 if not img_result.success:
-                    logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                    error = img_result.error or "adapter reported failure"
+                    errors.append(str(error))
+                    logger.error("[%s] Failed to send image: %s", self.name, error)
+                elif img_result.message_id and message_id is None:
+                    message_id = img_result.message_id
             except Exception as img_err:
+                errors.append(str(img_err))
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+        if errors:
+            return SendResult(
+                success=False,
+                error=f"{len(errors)} image(s) failed: {errors[0]}",
+                message_id=message_id,
+            )
+        return SendResult(success=True, message_id=message_id)
 
     async def send_image(
         self,

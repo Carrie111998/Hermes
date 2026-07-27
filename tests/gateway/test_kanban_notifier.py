@@ -307,6 +307,167 @@ def test_kanban_notifier_rewinds_claim_on_reported_send_failure(tmp_path, monkey
     )
 
 
+class ArtifactTailAdapter(RecordingAdapter):
+    """Fail the last artifact once while recording stable delivery metadata."""
+
+    def __init__(self, fail_path: Path):
+        super().__init__()
+        self.fail_path = str(fail_path.resolve())
+        self.failed_once = False
+        self.artifact_calls = []
+
+    @staticmethod
+    def extract_local_files(content):
+        return [], content
+
+    async def send_multiple_images(self, chat_id, images, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        self.artifact_calls.append(
+            ("image_batch", tuple(url for url, _ in images), dict(metadata or {}))
+        )
+        return SendResult(success=True)
+
+    async def send_document(self, chat_id, file_path, metadata=None, **kwargs):
+        from gateway.platforms.base import SendResult
+
+        resolved = str(Path(file_path).resolve())
+        self.artifact_calls.append(("document", resolved, dict(metadata or {})))
+        if resolved == self.fail_path and not self.failed_once:
+            self.failed_once = True
+            return SendResult(success=False, error="transient artifact failure")
+        return SendResult(success=True)
+
+
+class AmbiguousImageBatchAdapter(ArtifactTailAdapter):
+    """Mimic a legacy batch sender that reports no transport outcome once."""
+
+    def __init__(self):
+        super().__init__(Path("unused-failure-path"))
+
+    async def send_multiple_images(self, chat_id, images, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        self.artifact_calls.append(
+            ("image_batch", tuple(url for url, _ in images), dict(metadata or {}))
+        )
+        if len(self.artifact_calls) == 1:
+            return None
+        return SendResult(success=True)
+
+
+def test_artifact_failure_retries_only_unacknowledged_tail(tmp_path, monkeypatch):
+    """A failed artifact keeps the event live without replaying its sent prefix."""
+    db_path = tmp_path / "artifact-tail.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    image_a = tmp_path / "a.png"
+    image_b = tmp_path / "b.jpg"
+    first_doc = tmp_path / "first.pdf"
+    second_doc = tmp_path / "second.pdf"
+    for artifact in (image_a, image_b, first_doc, second_doc):
+        artifact.write_bytes(b"artifact")
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="artifact tail", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1"
+        )
+        kb.complete_task(
+            conn,
+            task_id,
+            summary="artifact delivery",
+            metadata={
+                "artifacts": [
+                    str(image_a), str(image_b), str(first_doc), str(second_doc),
+                ]
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = ArtifactTailAdapter(second_doc)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert [call[0] for call in adapter.artifact_calls] == [
+        "image_batch", "document", "document",
+    ]
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, task_id=task_id)) == 1
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert [call[0] for call in adapter.artifact_calls] == [
+        "image_batch", "document", "document", "document",
+    ]
+    assert adapter.artifact_calls[-1][1] == str(second_doc.resolve())
+    prefix_keys = [call[2]["delivery_key"] for call in adapter.artifact_calls[:2]]
+    failed_key = adapter.artifact_calls[2][2]["delivery_key"]
+    retried_key = adapter.artifact_calls[3][2]["delivery_key"]
+    assert len(set(prefix_keys + [failed_key])) == 3
+    assert failed_key == retried_key
+    assert all(
+        call[2]["idempotency_key"] == call[2]["delivery_key"]
+        for call in adapter.artifact_calls
+    )
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, task_id=task_id) == []
+    finally:
+        conn.close()
+
+
+def test_image_batch_requires_explicit_success_before_ack(tmp_path, monkeypatch):
+    db_path = tmp_path / "artifact-batch-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    image = tmp_path / "result.png"
+    image.write_bytes(b"artifact")
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="artifact batch", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1"
+        )
+        kb.complete_task(
+            conn,
+            task_id,
+            summary="artifact delivery",
+            metadata={"artifacts": [str(image)]},
+        )
+    finally:
+        conn.close()
+
+    adapter = AmbiguousImageBatchAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, task_id=task_id)
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert [call[0] for call in adapter.artifact_calls] == [
+        "image_batch",
+        "image_batch",
+    ]
+    assert (
+        adapter.artifact_calls[0][2]["delivery_key"]
+        == adapter.artifact_calls[1][2]["delivery_key"]
+    )
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, task_id=task_id) == []
+    finally:
+        conn.close()
+
+
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     """A retry cycle (crashed → reclaimed → crashed) notifies the user twice.
 
