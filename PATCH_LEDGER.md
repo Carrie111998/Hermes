@@ -176,3 +176,21 @@ for their owner.
 Also fixed at HEAD: `FakeRunner` did not compose `GatewayWorkerBridgeUltraMixin`
 while the production code calls `_ultra_route_transitions`, so 2 tests failed on
 a clean checkout. Now 58 passed, 19 xfailed, 0 failed.
+
+## Finding-ID reconciliation
+
+`profiles/aletheon/scripts/ledger_status.py` derives status by grepping commit
+subjects for the finding ID. Several fixes landed under descriptive subjects
+that never named the ID, so the tool reported them **open** and the concurrent
+session nearly re-did them. Mapping, so it does not:
+
+| ID | Fixed by | Where |
+|---|---|---|
+| H-19 delegation-guard never enforces | `9281e87` | outer `main` |
+| H-20 batch-delegation interrupt cannot escape | `326ebcf2f` | inner `audit/claude-items-2-4` |
+| H-22 daemon_pool breaks on CPython 3.14 | `8364110ab` | inner, both branches |
+
+**Convention going forward: name the finding ID in the commit subject.** A
+reconciliation tool that reads git is only as good as what the commits say, and
+the cost of omitting it is two sessions doing the same work — which already
+happened for H-01, H-05, H-24 and H-25.
