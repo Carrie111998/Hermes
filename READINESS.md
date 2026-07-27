@@ -462,6 +462,12 @@ commit `8144594bf130dad4f25f18a4e194b8fa4f82072a` on 2026-07-27. It returned
 succeeding, `duplicate_provider_calls: 0`, and `duplicate_effects: 0`.
 Image manifest: `sha256:43ba8bfdacd7b6313e92c72da1e23c0cbe7fb80cd5982bb4dfb1587ab680b051`.
 
+After exact permit target-resource binding, the acceptance was rerun from
+commit `b587ca533a9a5f0f8d1518d0d963395fbe108e9a` on 2026-07-27. It returned
+`current-tree agentic acceptance: PASS`; interrupted-provider read-back again
+succeeded with `duplicate_provider_calls: 0` and `duplicate_effects: 0`.
+Image manifest: `sha256:4f6bfd947234c853b0f1bad3a1467318d58529f3ed15b2b1e4e77c4ce1e7260a`.
+
 Compliance lineage was separately validated with:
 
 ```sh
