@@ -444,7 +444,18 @@ def run_forever(
                         # same check, but alternate/injected callbacks must not
                         # be able to begin work after an operator pause.
                         operational_control.assert_autonomous(conn)
-                        runtime_deployment.assert_current_runtime(conn, agentic)
+                        # Re-read deployment authority at the last boundary;
+                        # a charter change while this process is alive must
+                        # not leave the worker operating under stale host
+                        # permissions.
+                        current_config = load_config()
+                        current_agentic = current_config.get("agentic") or {}
+                        runtime_deployment.validate_worker_role(
+                            current_agentic, "objective-runtime"
+                        )
+                        runtime_deployment.assert_current_runtime(
+                            conn, current_agentic
+                        )
                         outcome = tick()
                         heartbeat_keeper.assert_healthy()
                         status = str(getattr(outcome, "status", "unknown"))
