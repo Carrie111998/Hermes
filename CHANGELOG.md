@@ -284,3 +284,5 @@ recorded.
   organization for objective lifecycle mutations.
 - `2a45edea8560c084c09b3ef62de82bdc904b192b` — extended employee actor scope
   checks to plan creation and action proposals.
+- `9836000c9a21a4f2c87f007e2c1547e66ea128c1` — scoped employee identities at
+  permit issuance before execution authority is minted.
