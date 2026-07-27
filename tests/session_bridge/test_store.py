@@ -6966,6 +6966,103 @@ def test_sidebar_hydration_seed_is_visible_only_idempotent_and_isolated(db) -> N
         )
 
 
+def test_sidebar_hydration_inventory_requires_recent_exact_visible_lineage(
+    db,
+) -> None:
+    now = 1_000_000.0
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "inventory-token-1",
+            "inventory-token-2",
+            "inventory-token-3",
+            "inventory-token-4",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidates = {
+        name: _sidebar_candidate(
+            db,
+            native_id=f"inventory-{name}",
+            eligible_at=eligible_at,
+        )
+        for name, eligible_at in (
+            ("eligible", now - 100.0),
+            ("old", now - 100_000.0),
+            ("missing-lineage", now - 200.0),
+            ("already-seeded", now - 300.0),
+        )
+    }
+    for candidate in candidates.values():
+        store.enqueue_sidebar_job(candidate)
+    claims = store.claim_sidebar_jobs(now=now, limit=4)
+    for index, claim in enumerate(claims):
+        source_id = str(claim["source_session_id"])
+        candidate = next(
+            item
+            for item in candidates.values()
+            if item.source_session_id == source_id
+        )
+        thread_id = f"inventory-thread-{candidate.source_session_id.split(':')[-1]}"
+        store.commit_sidebar_job(
+            lease_token=str(claim["lease_token"]),
+            codex_thread_id=thread_id,
+            now=now + index + 1.0,
+        )
+        if candidate is candidates["missing-lineage"]:
+            continue
+        target_id = _seed_sidebar_codex_target(
+            store,
+            candidate,
+            thread_id,
+        )
+        store.create_link(
+            SessionLink(
+                id=f"inventory-link-{index}",
+                from_session_id=candidate.source_session_id,
+                to_session_id=target_id,
+                relation=Relation.MIRRORS,
+                bridge_id=candidate.bridge_id,
+                source_cursor=None,
+                source_hash=None,
+                created_at=now + index + 1.5,
+            )
+        )
+    seeded_candidate = candidates["already-seeded"]
+    seeded_job = store.get_sidebar_job_for_source(seeded_candidate.source_session_id)
+    assert seeded_job is not None
+    store.seed_sidebar_hydration_job(
+        source_session_id=seeded_candidate.source_session_id,
+        bridge_id=seeded_candidate.bridge_id,
+        codex_thread_id=str(seeded_job["codex_thread_id"]),
+        source_cursor="inventory-cursor",
+        source_hash="inventory-hash",
+        preview_version=1,
+        preview_digest="b" * 64,
+        hydration_marker="HERMES_SESSION_HYDRATION_V1:inventory.marker",
+        now=now + 10.0,
+    )
+
+    inventory = store.list_sidebar_hydration_candidates(
+        now=now,
+        backfill_days=1,
+        limit=100,
+    )
+
+    eligible = candidates["eligible"]
+    eligible_job = store.get_sidebar_job_for_source(eligible.source_session_id)
+    assert inventory == [
+        {
+            "job_id": eligible_job["id"],
+            "source_session_id": eligible.source_session_id,
+            "bridge_id": eligible.bridge_id,
+            "codex_thread_id": eligible_job["codex_thread_id"],
+            "eligible_at": eligible.eligible_at,
+            "visible_at": eligible_job["visible_at"],
+        }
+    ]
+
+
 def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) -> None:
     store, candidate = _visible_sidebar_for_hydration(
         db,

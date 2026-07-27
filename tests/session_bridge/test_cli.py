@@ -63,7 +63,12 @@ from session_bridge.models import (
     SidebarJobState,
     encode_bridge_marker,
 )
-from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
+from session_bridge.preview import build_session_preview
+from session_bridge.sidebar import (
+    SidebarCandidate,
+    build_registration_prompt,
+    sidebar_bridge_id,
+)
 from session_bridge.sidebar_executor import (
     CodexAppServerSidebarDelivery,
     SidebarExecutionResult,
@@ -156,6 +161,18 @@ class FakeBackend:
             },
             "oldest_pending_age_seconds": 12.5,
             "recent_error_codes": ["hydration_send_ambiguous"],
+        }
+    )
+    sidebar_hydration_backfill_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "mode": "dry_run",
+            "days": 30,
+            "examined": 4,
+            "eligible": 3,
+            "already_readable": 1,
+            "seeded": 0,
+            "blocked": 0,
+            "blocked_codes": {},
         }
     )
     claude_visibility_payload: dict[str, Any] = field(
@@ -255,6 +272,30 @@ class FakeBackend:
     def sidebar_hydration_status(self) -> dict[str, Any]:
         self.calls.append(("sidebar_hydration_status",))
         return dict(self.sidebar_hydration_status_payload)
+
+    def sidebar_hydration_seed_backfill(
+        self,
+        *,
+        days: int,
+        apply: bool,
+        confirmation: str | None,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_hydration_seed_backfill",
+            days,
+            apply,
+            confirmation,
+        ))
+        return {
+            **self.sidebar_hydration_backfill_payload,
+            "mode": "apply" if apply else "dry_run",
+            "days": days,
+            "seeded": (
+                int(self.sidebar_hydration_backfill_payload["eligible"])
+                if apply
+                else 0
+            ),
+        }
 
     def sidebar_run_once(self) -> dict[str, Any]:
         self.calls.append(("sidebar_run_once",))
@@ -637,6 +678,43 @@ def test_sidebar_hydration_seed_requires_exact_confirmation_and_has_no_bulk_mode
     assert backend.calls == []
 
 
+def test_sidebar_hydration_seed_backfill_defaults_to_dry_run_and_requires_apply_confirmation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+
+    assert _run(["sidebar-hydration-seed-backfill", "--days", "30"], backend) == 0
+    assert _json_output(capsys) == backend.sidebar_hydration_backfill_payload
+    assert (
+        _run(
+            [
+                "sidebar-hydration-seed-backfill",
+                "--days",
+                "30",
+                "--apply",
+                "--confirm",
+                "HYDRATE_ALL_EXACT_EXISTING_TASKS",
+            ],
+            backend,
+        )
+        == 0
+    )
+    applied = _json_output(capsys)
+    assert applied["mode"] == "apply"
+    assert applied["seeded"] == 3
+    assert backend.calls == [
+        ("sidebar_hydration_seed_backfill", 30, False, None),
+        ("close",),
+        (
+            "sidebar_hydration_seed_backfill",
+            30,
+            True,
+            "HYDRATE_ALL_EXACT_EXISTING_TASKS",
+        ),
+        ("close",),
+    ]
+
+
 def test_production_sidebar_hydration_seed_requires_one_exact_visible_link(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -762,6 +840,233 @@ def test_production_sidebar_hydration_seed_requires_one_exact_visible_link(
             codex_thread_id=thread_id,
             confirmation="",
         )
+    backend.close()
+
+
+def test_production_sidebar_hydration_backfill_dry_runs_then_seeds_only_legacy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    marker_secret = b"k" * 32
+    db = SessionDB(tmp_path / "hydration-backfill.db")
+    tokens = iter(("backfill-legacy-token", "backfill-readable-token"))
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: next(tokens),
+    )
+    prompts: dict[str, str] = {}
+    candidates: dict[str, SidebarCandidate] = {}
+    for index, kind in enumerate(("legacy", "readable")):
+        native_id = f"hydration-backfill-{kind}"
+        thread_id = f"019f8927-8012-77d0-beb0-4cd5f8cc22{index}"
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id=native_id,
+                title=f"{kind.title()} hydration source",
+                cwd=str(tmp_path),
+                started_at=900.0 + index,
+                last_active=950.0 + index,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"{kind}-message",
+                        ordinal=0,
+                        role="user",
+                        content=f"Restore the {kind} readable session history",
+                        timestamp=950.0 + index,
+                    ),
+                ),
+                native_cursor=f"cursor-{kind}",
+                native_hash=f"hash-{kind}",
+            )
+        )
+        source_id = f"claude:{native_id}"
+        bridge_id = sidebar_bridge_id(source_id)
+        candidate = SidebarCandidate(
+            source_session_id=source_id,
+            provider=Provider.CLAUDE,
+            bridge_id=bridge_id,
+            title=f"[Claude] {kind.title()} hydration source",
+            cwd=str(tmp_path),
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=950.0 + index,
+        )
+        candidates[kind] = candidate
+        store.enqueue_sidebar_job(candidate)
+        lease = store.claim_sidebar_jobs(now=now, limit=1)[0]
+        store.commit_sidebar_job(
+            lease_token=lease["lease_token"],
+            codex_thread_id=thread_id,
+            now=now + index + 1,
+        )
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CODEX,
+                native_id=thread_id,
+                title=candidate.title,
+                cwd=str(tmp_path),
+                started_at=950.0 + index,
+                last_active=951.0 + index,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"{kind}-registration",
+                        ordinal=0,
+                        role="user",
+                        content="registered",
+                        timestamp=951.0 + index,
+                    ),
+                ),
+                native_cursor=f"target-cursor-{kind}",
+                native_hash=f"target-hash-{kind}",
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                origin_bridge_id=bridge_id,
+            )
+        )
+        store.create_link(
+            SessionLink(
+                id=f"hydration-backfill-link-{kind}",
+                from_session_id=source_id,
+                to_session_id=f"codex:{thread_id}",
+                relation=Relation.MIRRORS,
+                bridge_id=bridge_id,
+                source_cursor=None,
+                source_hash=None,
+                created_at=now + index + 2,
+            )
+        )
+        marker = encode_bridge_marker(
+            BridgeMarkerPayload(
+                bridge_id=bridge_id,
+                source_session_id=source_id,
+                target_provider=Provider.CODEX,
+                policy_generation=1,
+            ),
+            marker_secret,
+        )
+        if kind == "legacy":
+            prompts[thread_id] = build_registration_prompt(candidate, marker)
+        else:
+            preview = build_session_preview(
+                source_session_id=source_id,
+                source_cursor=f"cursor-{kind}",
+                source_hash=f"hash-{kind}",
+                title=candidate.title,
+                provider=Provider.CLAUDE.value,
+                cwd=candidate.cwd,
+                captured_at=951.0 + index,
+                messages=[],
+                git_root=None,
+                git_branch=None,
+                git_head=None,
+                worktree_id=None,
+            )
+            prompts[thread_id] = build_registration_prompt(
+                candidate,
+                marker,
+                preview=preview,
+            )
+
+    class ExactReader:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def read_thread_initial_prompt(
+            self,
+            *,
+            thread_id: str,
+            deadline: float,
+        ) -> str:
+            assert deadline > 0
+            self.calls.append(thread_id)
+            return prompts[thread_id]
+
+    reader = ExactReader()
+    backend = ProductionBackend(
+        BridgeConfig(
+            sidebar=SidebarConfig(
+                legacy_hydration_enabled=True,
+                preview_budget_chars=24_000,
+            )
+        )
+    )
+    backend._store = store
+    backend._catalog = object()  # type: ignore[assignment]
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: now)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_delivery",
+        lambda: reader,
+    )
+
+    dry_run = backend.sidebar_hydration_seed_backfill(
+        days=30,
+        apply=False,
+        confirmation=None,
+    )
+
+    assert dry_run == {
+        "mode": "dry_run",
+        "days": 30,
+        "examined": 2,
+        "eligible": 1,
+        "already_readable": 1,
+        "seeded": 0,
+        "blocked": 0,
+        "blocked_codes": {},
+    }
+    assert store.sidebar_hydration_status(now)["counts"]["hydration_pending"] == 0
+    with pytest.raises(RolloutGateBlocked, match="confirmation"):
+        backend.sidebar_hydration_seed_backfill(
+            days=30,
+            apply=True,
+            confirmation=None,
+        )
+
+    applied = backend.sidebar_hydration_seed_backfill(
+        days=30,
+        apply=True,
+        confirmation="HYDRATE_ALL_EXACT_EXISTING_TASKS",
+    )
+
+    assert applied == {
+        **dry_run,
+        "mode": "apply",
+        "seeded": 1,
+    }
+    assert store.sidebar_hydration_status(now)["counts"]["hydration_pending"] == 1
+    legacy_job = store.get_sidebar_job_for_source(
+        candidates["legacy"].source_session_id
+    )
+    readable_job = store.get_sidebar_job_for_source(
+        candidates["readable"].source_session_id
+    )
+    prompts[str(readable_job["codex_thread_id"])] = prompts[
+        str(legacy_job["codex_thread_id"])
+    ]
+
+    blocked = backend.sidebar_hydration_seed_backfill(
+        days=30,
+        apply=True,
+        confirmation="HYDRATE_ALL_EXACT_EXISTING_TASKS",
+    )
+
+    assert blocked == {
+        "mode": "apply",
+        "days": 30,
+        "examined": 1,
+        "eligible": 0,
+        "already_readable": 0,
+        "seeded": 0,
+        "blocked": 1,
+        "blocked_codes": {"hydration_target_identity_mismatch": 1},
+    }
+    assert store.sidebar_hydration_status(now)["counts"]["hydration_pending"] == 1
     backend.close()
 
 

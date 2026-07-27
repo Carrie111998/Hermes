@@ -7589,6 +7589,95 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
+    def list_sidebar_hydration_candidates(
+        self,
+        *,
+        now: float,
+        backfill_days: int,
+        limit: int,
+        after_visible_at: float | None = None,
+        after_job_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        checked_at = _finite_number(now, "hydration inventory time")
+        if (
+            type(backfill_days) is not int
+            or not 0 <= backfill_days <= 3_650
+        ):
+            raise ValueError(
+                "hydration inventory backfill days must be between 0 and 3650"
+            )
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("hydration inventory limit must be between 1 and 500")
+        if (after_visible_at is None) != (after_job_id is None):
+            raise ValueError("hydration inventory cursor is incomplete")
+        cursor_time: float | None = None
+        cursor_job: str | None = None
+        if after_visible_at is not None:
+            cursor_time = _finite_number(
+                after_visible_at,
+                "hydration inventory cursor time",
+            )
+            cursor_job = _exact_nonempty_text(
+                after_job_id,
+                "hydration inventory cursor job ID",
+            )
+
+        cutoff = checked_at - backfill_days * 86_400.0
+        pagination_sql = ""
+        parameters: list[object] = [
+            Provider.CLAUDE.value,
+            OriginKind.NATIVE.value,
+            Provider.CODEX.value,
+            OriginKind.BRIDGE_PLACEHOLDER.value,
+            Relation.MIRRORS.value,
+            SidebarJobState.VISIBLE.value,
+            cutoff,
+        ]
+        if cursor_time is not None and cursor_job is not None:
+            pagination_sql = (
+                " AND (job.visible_at > ?"
+                " OR (job.visible_at = ? AND job.id > ?))"
+            )
+            parameters.extend((cursor_time, cursor_time, cursor_job))
+        parameters.append(limit)
+
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            rows = conn.execute(
+                f"""SELECT job.id AS job_id,
+                           job.source_session_id,
+                           job.bridge_id,
+                           job.codex_thread_id,
+                           job.eligible_at,
+                           job.visible_at
+                      FROM session_sidebar_jobs AS job
+                      JOIN external_sessions AS source
+                        ON source.session_id = job.source_session_id
+                       AND source.provider = ?
+                       AND source.origin_kind = ?
+                      JOIN external_sessions AS target
+                        ON target.provider = ?
+                       AND target.native_id = job.codex_thread_id
+                       AND target.origin_kind = ?
+                       AND target.origin_bridge_id = job.bridge_id
+                      JOIN session_links AS link
+                        ON link.from_session_id = job.source_session_id
+                       AND link.to_session_id = target.session_id
+                       AND link.bridge_id = job.bridge_id
+                       AND link.relation = ?
+                 LEFT JOIN session_sidebar_hydration_jobs AS hydration
+                        ON hydration.source_session_id = job.source_session_id
+                     WHERE job.state = ?
+                       AND job.eligible_at >= ?
+                       AND hydration.id IS NULL
+                       {pagination_sql}
+                  ORDER BY job.visible_at, job.id
+                     LIMIT ?""",
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def claim_sidebar_hydration_jobs(
         self,
         *,

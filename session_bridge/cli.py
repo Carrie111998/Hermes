@@ -86,6 +86,8 @@ from .models import (
 from .claude_skill import install_claude_skill
 from .sidebar import (
     SidebarCandidate,
+    SidebarInitialPromptKind,
+    classify_sidebar_initial_prompt,
     encode_hydration_marker,
     sidebar_bridge_id,
     sidebar_create_recovery_key,
@@ -560,6 +562,13 @@ class _Backend(Protocol):
         source_session_id: str,
         codex_thread_id: str,
         confirmation: str,
+    ) -> Mapping[str, Any]: ...
+    def sidebar_hydration_seed_backfill(
+        self,
+        *,
+        days: int,
+        apply: bool,
+        confirmation: str | None,
     ) -> Mapping[str, Any]: ...
     def sidebar_hydration_status(self) -> Mapping[str, Any]: ...
     def sidebar_run_once(self) -> Mapping[str, Any]: ...
@@ -1094,6 +1103,114 @@ class ProductionBackend:
             "preview_version": int(seeded["preview_version"]),
             "preview_digest": seeded["preview_digest"],
         }
+
+    def sidebar_hydration_seed_backfill(
+        self,
+        *,
+        days: int,
+        apply: bool,
+        confirmation: str | None,
+    ) -> Mapping[str, Any]:
+        if not self.config.sidebar.legacy_hydration_enabled:
+            raise RolloutGateBlocked("sidebar_hydration_disabled")
+        if type(apply) is not bool:
+            raise ConfigurationFailure("invalid_sidebar_hydration_backfill_mode")
+        if apply and confirmation != "HYDRATE_ALL_EXACT_EXISTING_TASKS":
+            raise RolloutGateBlocked(
+                "sidebar_hydration_backfill_confirmation_required"
+            )
+        if not apply and confirmation is not None:
+            raise RolloutGateBlocked(
+                "sidebar_hydration_backfill_confirmation_without_apply"
+            )
+
+        store = self._require_store()
+        inventory: list[dict[str, Any]] = []
+        after_visible_at: float | None = None
+        after_job_id: str | None = None
+        while True:
+            page = store.list_sidebar_hydration_candidates(
+                now=time.time(),
+                backfill_days=days,
+                limit=100,
+                after_visible_at=after_visible_at,
+                after_job_id=after_job_id,
+            )
+            inventory.extend(page)
+            if len(page) < 100:
+                break
+            last = page[-1]
+            after_visible_at = float(last["visible_at"])
+            after_job_id = str(last["job_id"])
+
+        marker_secret = resolve_marker_key()
+        native = self._require_sidebar_terminal_delivery()
+        eligible: list[dict[str, Any]] = []
+        already_readable = 0
+        blocked_codes: dict[str, int] = {}
+        for row in inventory:
+            source_session_id = str(row.get("source_session_id") or "")
+            bridge_id = str(row.get("bridge_id") or "")
+            thread_id = str(row.get("codex_thread_id") or "")
+            try:
+                if (
+                    not source_session_id
+                    or not bridge_id
+                    or not thread_id
+                    or sidebar_bridge_id(source_session_id) != bridge_id
+                ):
+                    raise ValueError("hydration inventory identity mismatch")
+                prompt = native.read_thread_initial_prompt(
+                    thread_id=thread_id,
+                    deadline=time.monotonic() + 60.0,
+                )
+                kind = classify_sidebar_initial_prompt(prompt, marker_secret)
+                expected_source_line = (
+                    "Source session ID: "
+                    + json.dumps(
+                        source_session_id,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                if expected_source_line not in prompt.splitlines():
+                    code = "hydration_target_identity_mismatch"
+                elif kind is SidebarInitialPromptKind.LEGACY_PLACEHOLDER:
+                    eligible.append(row)
+                    continue
+                elif kind is SidebarInitialPromptKind.READABLE_REGISTRATION:
+                    already_readable += 1
+                    continue
+                else:
+                    code = "hydration_target_unrelated"
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                code = "hydration_target_unreadable"
+            blocked_codes[code] = blocked_codes.get(code, 0) + 1
+
+        result = {
+            "mode": "apply" if apply else "dry_run",
+            "days": days,
+            "examined": len(inventory),
+            "eligible": len(eligible),
+            "already_readable": already_readable,
+            "seeded": 0,
+            "blocked": sum(blocked_codes.values()),
+            "blocked_codes": dict(sorted(blocked_codes.items())),
+        }
+        if not apply or blocked_codes:
+            return result
+
+        seeded = 0
+        for row in eligible:
+            self.sidebar_hydration_seed(
+                source_session_id=str(row["source_session_id"]),
+                codex_thread_id=str(row["codex_thread_id"]),
+                confirmation="HYDRATE_EXACT_EXISTING_TASK",
+            )
+            seeded += 1
+        return {**result, "seeded": seeded}
 
     def sidebar_hydration_status(self) -> Mapping[str, Any]:
         return _public_sidebar_hydration_status(
@@ -2877,6 +2994,31 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    sidebar_hydration_seed_backfill = commands.add_parser(
+        "sidebar-hydration-seed-backfill",
+        help="inventory or seed recent exact legacy tasks for in-place hydration",
+    )
+    sidebar_hydration_seed_backfill.add_argument(
+        "--days",
+        type=_bounded_sidebar_days,
+        default=30,
+    )
+    sidebar_hydration_seed_backfill_mode = (
+        sidebar_hydration_seed_backfill.add_mutually_exclusive_group()
+    )
+    sidebar_hydration_seed_backfill_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+    )
+    sidebar_hydration_seed_backfill_mode.add_argument(
+        "--apply",
+        action="store_true",
+    )
+    sidebar_hydration_seed_backfill.add_argument(
+        "--confirm",
+        choices=("HYDRATE_ALL_EXACT_EXISTING_TASKS",),
+    )
+
     sidebar_hydration_status = commands.add_parser(
         "sidebar-hydration-status",
         help="show sanitized in-place hydration status",
@@ -3142,6 +3284,20 @@ def main(
             )
             _emit(payload)
             return EXIT_OK
+        if args.command == "sidebar-hydration-seed-backfill":
+            payload = dict(
+                backend.sidebar_hydration_seed_backfill(
+                    days=args.days,
+                    apply=bool(args.apply),
+                    confirmation=args.confirm,
+                )
+            )
+            _emit(payload)
+            return (
+                EXIT_ROLLOUT_GATE
+                if args.apply and int(payload.get("blocked", 0)) > 0
+                else EXIT_OK
+            )
         if args.command == "sidebar-hydration-status":
             payload = dict(backend.sidebar_hydration_status())
             _emit(payload)
