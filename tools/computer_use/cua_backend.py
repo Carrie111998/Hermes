@@ -166,6 +166,17 @@ _DESKTOP_WINDOW_NAMES = (
     "finder", "desktop", "dock",              # macOS desktop / shell
 )
 
+# Linux/X11 can surface GNOME Shell / desktop backdrop windows before real app
+# windows and cua-driver 0.6.x currently does not assign a useful z-order for
+# them. These windows are targetable X11 windows but do not produce screenshots
+# through get_window_state, so default app capture must skip them.
+_NON_APP_WINDOW_TITLE_PREFIXES = (
+    "@!",          # GNOME Shell background/monitor helper windows
+    "Desktop",
+    "gnome-shell",
+    "GNOME Shell",
+)
+
 
 # Env var cua-driver reads to gate its anonymous usage telemetry (PostHog).
 # Setting it to "0" disables telemetry; absence => the binary's own default
@@ -284,7 +295,7 @@ def _linux_x11_active_window_id() -> Optional[int]:
         proc = subprocess.run(
             ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=2,
             check=False,
         )
@@ -293,6 +304,15 @@ def _linux_x11_active_window_id() -> Optional[int]:
     if proc.returncode != 0:
         return None
     return _parse_xprop_net_active_window(proc.stdout or "")
+
+
+def _is_real_app_window(w: Dict[str, Any]) -> bool:
+    """Return False for desktop/shell helper windows that capture as empty."""
+    title = w.get("title", "")
+    return not any(
+        title.startswith(p) or title.lower().startswith(p.lower())
+        for p in _NON_APP_WINDOW_TITLE_PREFIXES
+    )
 
 
 def _select_capture_target(
@@ -305,25 +325,26 @@ def _select_capture_target(
 
     Callers pass windows already sorted by ``z_index`` descending (higher =
     frontmost). When ordering is informative, keep that frontmost contract.
-    On Linux/X11, for unqualified default captures only (no app filter and no
-    exact pid/window_id), when every on-screen candidate shares the same
-    ``z_index`` (tied or unknown), prefer ``_NET_ACTIVE_WINDOW`` over list
-    order (#58026). Exact-target captures must not pay for an ``xprop`` probe.
+    For unqualified default captures (no app filter and no exact
+    pid/window_id) on Linux, desktop/shell helper windows (GNOME ``ding``
+    "Desktop Icons", ``@!x,y;BDHF`` backdrop helpers) are skipped first —
+    they are targetable X11 windows but capture as empty. Then, when every
+    remaining candidate shares the same ``z_index`` (tied or unknown, the
+    common Linux/X11 case), prefer ``_NET_ACTIVE_WINDOW`` over list order
+    (#58026). Exact-target captures must not pay for an ``xprop`` probe.
     """
     candidates = [w for w in windows if not w["off_screen"]]
     pool = candidates
-    if (
-        not exact_target
-        and not app_requested
-        and pool
-        and sys.platform == "linux"
-        and _z_index_uninformative(pool)
-    ):
-        active_id = _linux_x11_active_window_id()
-        if active_id is not None:
-            for w in pool:
-                if w.get("window_id") == active_id:
-                    return w
+    if not exact_target and not app_requested and sys.platform == "linux":
+        real_apps = [w for w in candidates if _is_real_app_window(w)]
+        if real_apps:
+            pool = real_apps
+        if pool and _z_index_uninformative(pool):
+            active_id = _linux_x11_active_window_id()
+            if active_id is not None:
+                for w in pool:
+                    if w.get("window_id") == active_id:
+                        return w
     if pool:
         return pool[0]
     return windows[0]
@@ -358,7 +379,7 @@ def _resolve_mcp_invocation(
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "manifest"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             stdin=subprocess.DEVNULL,
             # cua-driver is a third-party binary — never hand it provider
             # API keys via inherited env (same policy as the MCP and CLI
@@ -424,7 +445,7 @@ def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "--help"],
-            capture_output=True, text=True, timeout=3.0,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3.0,
             stdin=subprocess.DEVNULL,
             env=_sanitize_subprocess_env(cua_driver_child_env()),
         )
@@ -536,11 +557,17 @@ def cua_driver_binary_available() -> bool:
     return resolve_cua_driver_cmd() is not None
 
 
-def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+def cua_driver_update_check(*, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """Run ``cua-driver check-update --json`` and return its parsed state.
 
     The payload mirrors the ``check_for_update`` MCP tool:
     ``{current_version, latest_version, update_available, ...}``.
+
+    ``timeout`` defaults to 8s on POSIX and 25s on Windows — first-spawn of
+    the exe there routinely eats several seconds in Defender/SmartScreen
+    scanning, and a false timeout is expensive: callers treat ``None`` as
+    indeterminate, and the ``install_cua_driver(upgrade=True)`` path used to
+    fall through to a full multi-minute reinstall on it.
 
     Returns ``None`` (callers should stay quiet) when the result is
     indeterminate: the binary is missing, the driver is too old to support
@@ -548,6 +575,8 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
     ``error`` field is set), or the output didn't parse. Best-effort; never
     raises.
     """
+    if timeout is None:
+        timeout = 25.0 if sys.platform == "win32" else 8.0
     driver_cmd = resolve_cua_driver_cmd()
     if not driver_cmd:
         return None
@@ -555,7 +584,7 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "check-update", "--json"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             # Some older drivers don't have the verb and fall through to a
             # stdin-reading mode rather than erroring — DEVNULL gives them EOF
             # so they exit fast instead of blocking until the timeout.
@@ -1235,7 +1264,7 @@ class _CuaDriverSession:
             for attempt in range(attempts):
                 try:
                     proc = _subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=max(15.0, timeout),
+                        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(15.0, timeout),
                         env=_sanitize_subprocess_env(cua_driver_child_env()),
                     )
                 except Exception as e:  # pragma: no cover - subprocess spawn failure
@@ -1497,7 +1526,9 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "app_name": w.get("app_name", ""),
             "pid": pid_int,
             "window_id": window_id_int,
-            "off_screen": not w.get("is_on_screen", True),
+            # cua-driver 0.6.x on Linux may return JSON null here.
+            # Only explicit False means off-screen; null means unknown.
+            "off_screen": w.get("is_on_screen") is False,
             "title": w.get("title", ""),
             "z_index": z_index,
         })
@@ -1893,8 +1924,9 @@ class CuaDriverBackend(ComputerUseBackend):
             windows = filtered
 
         # Pick first on-screen window (sorted by z_index / z-order above).
-        # On Linux/X11, unqualified default captures with tied/unknown z_index
-        # may additionally consult _NET_ACTIVE_WINDOW (#58026).
+        # On Linux, unqualified default captures skip desktop/shell helper
+        # windows and, with tied/unknown z_index, may additionally consult
+        # _NET_ACTIVE_WINDOW (#58026).
         target = _select_capture_target(
             windows,
             app_requested=bool(app),
@@ -1909,7 +1941,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # Record the resolved app name so capture_after= follow-ups can re-target
         # the same app rather than falling back to the frontmost window.
         if app or not self._last_app:
-            self._last_app = app_name
+            self._last_app = app_name or app or ""
         self._last_target = {
             "pid": self._active_pid,
             "window_id": self._active_window_id,
@@ -2423,7 +2455,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._snapshot_tokens = {}
-            self._last_app = target["app_name"]  # retained for back-compat diagnostics
+            self._last_app = target["app_name"] or app  # retained for back-compat diagnostics
             self._last_target = {
                 "pid": self._active_pid,
                 "window_id": self._active_window_id,

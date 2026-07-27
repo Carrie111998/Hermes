@@ -41,6 +41,8 @@ def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: floa
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Anthropic
     ("anthropic/claude-fable-5",               ""),
+    ("anthropic/claude-opus-5",                ""),
+    ("anthropic/claude-opus-5-fast",           "2x price, higher output speed"),
     ("anthropic/claude-opus-4.8",              ""),
     ("anthropic/claude-opus-4.8-fast",         "2x price, higher output speed"),
     ("anthropic/claude-sonnet-5",              ""),
@@ -192,6 +194,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
         # Anthropic
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
         "anthropic/claude-haiku-4.5",
@@ -387,8 +390,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "deepseek": [
         "deepseek-v4-pro",
         "deepseek-v4-flash",
-        "deepseek-chat",
-        "deepseek-reasoner",
     ],
     "xiaomi": [
         "mimo-v2.5-pro",
@@ -560,6 +561,18 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Azure Foundry: user-provided endpoint and model.
     # Empty list because models depend on the endpoint configuration.
     "azure-foundry": [],
+    # Google Vertex AI — static curated list.  Vertex's OpenAI-compatible
+    # endpoint has no /models listing route, so without this entry the
+    # /model picker only ever shows the currently-configured model.
+    # Model IDs use the "google/" publisher prefix Vertex's openapi
+    # endpoint expects (see hermes_cli/model_setup_flows.py).
+    "vertex": [
+        "google/gemini-3.1-pro-preview",
+        "google/gemini-3-pro-preview",
+        "google/gemini-3.5-flash",
+        "google/gemini-3-flash-preview",
+        "google/gemini-3.1-flash-lite-preview",
+    ],
     "novita": [
         "moonshotai/kimi-k2.5",
         "minimax/minimax-m2.7",
@@ -2070,11 +2083,25 @@ def _provider_keys(provider: str) -> set[str]:
     return {k for k in (key, normalized) if k}
 
 
+# Retired model IDs kept for /model auto-detect only — not shown in pickers.
+# DeepSeek cut these off on 2026-07-24; model_normalize remaps them on the wire.
+_PROVIDER_RETIRED_ALIASES: dict[str, tuple[str, ...]] = {
+    "deepseek": ("deepseek-chat", "deepseek-reasoner"),
+}
+
+
+def _provider_catalog_names(provider: str) -> tuple[str, ...]:
+    """Active picker models plus retired aliases recognized for detection."""
+    active = tuple(_PROVIDER_MODELS.get(provider, []))
+    retired = _PROVIDER_RETIRED_ALIASES.get(provider, ())
+    return active + retired
+
+
 def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
     return any(
         name_lower == model.lower()
         for provider in providers
-        for model in _PROVIDER_MODELS.get(provider, [])
+        for model in _provider_catalog_names(provider)
     )
 
 
@@ -2220,7 +2247,7 @@ def detect_static_provider_for_model(
         current_provider == "custom"
         or current_provider.startswith("custom:")
     )
-    for pid, models in _PROVIDER_MODELS.items():
+    for pid in _PROVIDER_MODELS:
         if (
             pid in current_keys
             or pid in _AGGREGATOR_PROVIDERS
@@ -2229,7 +2256,7 @@ def detect_static_provider_for_model(
             continue
         if _is_custom_current:
             continue
-        if any(name_lower == m.lower() for m in models):
+        if any(name_lower == m.lower() for m in _provider_catalog_names(pid)):
             return (pid, name)
 
     # Borrow-list providers (re-expose other vendors' models) only after every
@@ -2237,7 +2264,7 @@ def detect_static_provider_for_model(
     for pid in _BORROWED_MODEL_PROVIDERS:
         if pid in current_keys:
             continue
-        if any(name_lower == m.lower() for m in _PROVIDER_MODELS.get(pid, [])):
+        if any(name_lower == m.lower() for m in _provider_catalog_names(pid)):
             return (pid, name)
 
     return None
@@ -2510,6 +2537,24 @@ _MODELS_DEV_PREFERRED: frozenset[str] = frozenset({
 })
 
 
+def _model_dedup_key(model_id: str) -> str:
+    """Case-insensitive dedup key that also folds picker-search aliases.
+
+    Some providers serve the same model under both a curated public slug and
+    a bare live wire id (Kimi Coding Plan lists its flagship as ``k3`` while
+    the curated catalog carries ``kimi-k3``). Folding through the search-alias
+    table keeps the curated-first merge from emitting both as separate rows.
+    The row that survives is the primary list's entry; selection still sends
+    whichever id the surviving row carries.
+    """
+    key = str(model_id).strip().lower()
+    try:
+        from hermes_cli.model_search import model_alias_canonical
+        return model_alias_canonical(key)
+    except Exception:
+        return key
+
+
 def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     """Merge curated list with fresh models.dev entries for a preferred provider.
 
@@ -2775,11 +2820,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                         else:
                             primary, secondary = curated, live
                         merged = list(primary)
-                        merged_lower = {m.lower() for m in primary}
+                        merged_lower = {_model_dedup_key(m) for m in primary}
                         for m in secondary:
-                            if m.lower() not in merged_lower:
+                            if _model_dedup_key(m) not in merged_lower:
                                 merged.append(m)
-                                merged_lower.add(m.lower())
+                                merged_lower.add(_model_dedup_key(m))
                         return merged
                     return live
             # Use profile's fallback_models if defined
@@ -3649,19 +3694,11 @@ def copilot_model_api_mode(
     if _should_use_copilot_responses_api(normalized):
         return "codex_responses"
 
-    # Secondary: check catalog for non-GPT-5 models (Claude via /v1/messages, etc.)
-    if catalog:
-        catalog_entry = next((item for item in catalog if item.get("id") == normalized), None)
-        if isinstance(catalog_entry, dict):
-            supported_endpoints = {
-                str(endpoint).strip()
-                for endpoint in (catalog_entry.get("supported_endpoints") or [])
-                if str(endpoint).strip()
-            }
-            # For non-GPT-5 models, check if they only support messages API
-            if "/v1/messages" in supported_endpoints and "/chat/completions" not in supported_endpoints:
-                return "anthropic_messages"
-
+    # Copilot's Claude models are exposed through its OpenAI-compatible chat
+    # endpoint, not through Hermes' native Anthropic adapter. The live catalog may
+    # advertise /v1/messages, but the Copilot token/header scheme is handled by
+    # the OpenAI client path; selecting anthropic_messages would send the wrong
+    # auth/wire shape. Keep non-GPT Copilot slots on chat_completions.
     return "chat_completions"
 
 
