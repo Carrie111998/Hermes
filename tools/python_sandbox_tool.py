@@ -11,6 +11,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -47,6 +48,57 @@ RESULT_CAP = 8 * 1024
 INPUT_JSON_CAP = 32 * 1024
 _PROBE: tuple[float, bool, str] | None = None
 _PROBE_TTL = 30.0
+
+_SUPERVISOR_SOURCE = r"""\
+import ctypes
+import os
+import subprocess
+import sys
+
+PR_SET_DUMPABLE = 4
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE) failed")
+
+cpu_seconds = int(sys.argv[1])
+max_processes = int(sys.argv[2])
+payload = (
+    "import os,resource;"
+    f"resource.setrlimit(resource.RLIMIT_CPU, ({cpu_seconds},{cpu_seconds + 1}));"
+    f"resource.setrlimit(resource.RLIMIT_NPROC, ({max_processes},{max_processes}));"
+    "os.execv('/venv/bin/python', ['/venv/bin/python','-I','/script.py'])"
+)
+completed = subprocess.run(
+    [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-user=65534",
+        "--map-group=65534",
+        "/venv/bin/python",
+        "-I",
+        "-c",
+        payload,
+    ],
+    check=False,
+)
+
+# Preserve regular artifacts only. A payload-controlled symlink must never
+# become a live pointer into the host when /work is exported.
+for root, dirs, files in os.walk("/work", topdown=True, followlinks=False):
+    for name in list(dirs):
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            os.unlink(path)
+            dirs.remove(name)
+    for name in files:
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            os.unlink(path)
+
+subprocess.run(["mount", "-o", "remount,bind,rw", "/export"], check=True)
+subprocess.run(["cp", "-a", "/work/.", "/export/"], check=True)
+raise SystemExit(completed.returncode)
+"""
 
 
 def _load_config() -> dict[str, Any]:
@@ -269,6 +321,7 @@ def _generate_init_script(
         '[ -d /etc/alternatives ] && { mkdir -p "$JAIL/etc/alternatives"; '
         'ro_dir /etc/alternatives "$JAIL/etc/alternatives"; }',
         f'ro_file {_q(run_dir / "script.py")} "$JAIL/script.py"',
+        f'ro_file {_q(run_dir / "supervisor.py")} "$JAIL/supervisor.py"',
         f'ro_file {_q(run_dir / "inputs" / "params.json")} '
         '"$JAIL/inputs/params.json"',
     ]
@@ -301,22 +354,11 @@ def _generate_init_script(
             "cd /",
             "umount -l /.oldroot",
             "cd /work",
-            "set +e",
-            "/usr/bin/unshare --user --map-user=65534 --map-group=65534 "
-            "/venv/bin/python -I -c "
-            + _q(
-                "import os,resource;"
-                f"resource.setrlimit(resource.RLIMIT_CPU, ({int(cpu_seconds)},"
-                f"{int(cpu_seconds) + 1}));"
-                f"resource.setrlimit(resource.RLIMIT_NPROC, ({int(max_processes)},"
-                f"{int(max_processes)}));"
-                "os.execv('/venv/bin/python', ['/venv/bin/python','-I','/script.py'])"
-            ),
-            "rc=$?",
-            "set -e",
-            "mount -o remount,bind,rw /export",
-            "cp -a /work/. /export/",
-            'exit "$rc"',
+            # Replace namespace-root shell with a non-dumpable supervisor.
+            # The untrusted payload cannot ptrace PID 1 to borrow its mount
+            # namespace capabilities.
+            "exec /venv/bin/python -I /supervisor.py "
+            f"{int(cpu_seconds)} {int(max_processes)}",
             "",
         ]
     )
@@ -453,11 +495,15 @@ def _assemble_drain(
 def _list_files(work: Path) -> list[dict[str, Any]]:
     files = []
     for path in sorted(work.rglob("*")):
-        if not path.is_file() or path.name == "result.json":
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or path.name == "result.json":
             continue
         item: dict[str, Any] = {
             "path": f"work/{path.relative_to(work).as_posix()}",
-            "bytes": path.stat().st_size,
+            "bytes": metadata.st_size,
         }
         try:
             with path.open("rb") as handle:
@@ -481,7 +527,11 @@ def _harvest(
     result_truncated = False
     result_path = work / "result.json"
     error = ""
-    if result_path.exists():
+    try:
+        result_metadata = result_path.stat(follow_symlinks=False)
+    except OSError:
+        result_metadata = None
+    if result_metadata is not None and stat.S_ISREG(result_metadata.st_mode):
         raw = result_path.read_bytes()
         if len(raw) > RESULT_CAP:
             status = "result_invalid"
@@ -622,6 +672,7 @@ def python_sandbox(
     for path in (root, run, inputs, work):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     (run / "script.py").write_text(code, encoding="utf-8")
+    (run / "supervisor.py").write_text(_SUPERVISOR_SOURCE, encoding="utf-8")
     (inputs / "params.json").write_bytes(params)
     mounts, error = _resolve_datasets(datasets, config, inputs)
     if error:

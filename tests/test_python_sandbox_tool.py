@@ -190,14 +190,17 @@ def test_init_script_mount_plan_has_one_write_surface(tmp_path):
     assert 'remount,bind,ro "$target"' in script
     assert 'tmpfs "$JAIL/work"' in script
     assert 'mount -o remount,bind,ro "$JAIL/export"' in script
-    assert "mount -o remount,bind,rw /export" in script
-    assert script.count("remount,bind,rw") == 1
+    assert 'ro_file ' in script and '"$JAIL/supervisor.py"' in script
+    assert "exec /venv/bin/python -I /supervisor.py" in script
+    assert "PR_SET_DUMPABLE = 4" in sandbox._SUPERVISOR_SOURCE
+    assert '"remount,bind,rw", "/export"' in sandbox._SUPERVISOR_SOURCE
+    assert sandbox._SUPERVISOR_SOURCE.count("remount,bind,rw") == 1
     assert "$HOME" not in script
     assert "HERMES_HOME" not in script
     assert '/usr/sbin/pivot_root "$JAIL"' in script
     assert 'mount -o remount,bind,ro "$JAIL"' in script
-    assert "/usr/bin/unshare --user --map-user=65534" in script
-    assert "resource.setrlimit(resource.RLIMIT_NPROC" in script
+    assert '"/usr/bin/unshare"' in sandbox._SUPERVISOR_SOURCE
+    assert "resource.setrlimit(resource.RLIMIT_NPROC" in sandbox._SUPERVISOR_SOURCE
     assert "cd /work" in script
     assert 'mkdir -p "$JAIL/opt/python/3.13"' in script
     assert 'ro_dir /opt/python/3.13 "$JAIL/opt/python/3.13"' in script
@@ -519,8 +522,9 @@ def test_jailed_network_and_write_escape_are_blocked(tmp_path, monkeypatch):
         "path": str(media),
         "description": "Generic directory dataset.",
     }
+    home = tmp_path / "home"
     monkeypatch.setattr(sandbox, "_load_config", lambda: config)
-    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: tmp_path / "home")
+    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: home)
     code = r'''
 import ctypes, errno, json, os, socket, urllib.request
 inputs = json.loads(os.environ["SANDBOX_INPUTS"])
@@ -549,7 +553,11 @@ for label, target in {
     ctypes.set_errno(0)
     rc = libc.mount(None, target, None, 32 | 4096, None)
     blocked[label] = rc == -1 and ctypes.get_errno() == errno.EPERM
+ctypes.set_errno(0)
+rc = libc.ptrace(16, 1, None, None)  # PTRACE_ATTACH namespace PID 1
+blocked["ptrace_pid1"] = rc == -1 and ctypes.get_errno() == errno.EPERM
 open("/work/ok.txt", "w").write("ok")
+os.symlink("/etc/passwd", "/work/host-pointer")
 open(os.environ["RESULT_PATH"], "w").write(json.dumps(blocked))
 '''
     response = json.loads(
@@ -563,11 +571,15 @@ open(os.environ["RESULT_PATH"], "w").write(json.dumps(blocked))
         "directory_write": True,
         "etc_write": True,
         "home_is_scratch": False,
+        "ptrace_pid1": True,
         "venv_write": True,
         "venv_remount": True,
         "directory_remount": True,
     }
     assert any(item["path"] == "work/ok.txt" for item in response["files"])
+    assert all(item["path"] != "work/host-pointer" for item in response["files"])
+    run_work = home / "sandbox_runs" / response["run_id"] / "work"
+    assert not os.path.lexists(run_work / "host-pointer")
 
 
 @pytest.mark.skipif(not _can_run_jail(), reason="kernel user namespaces unavailable")

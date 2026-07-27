@@ -70,6 +70,26 @@ Exercise this before the client demo:
 
 If any step fails, leave the kill switch false and flip the engine slot back to the prior reviewed tree. Do not bypass the probe or run a degraded subprocess.
 
+## XLSX return path
+
+The v1 sandbox can create a valid workbook in the run's retained `/work`
+directory, but that does not make the workbook client-deliverable.
+
+- Return the result summary and counts in WhatsApp.
+- Do not emit a local path or promise an attachment. WB `65b4eac4` proves an
+  image-only `MEDIA:` path on a worker branch; it is not on `main`, and it does
+  not cover XLSX documents.
+- The existing portal download route serves registered report artifacts only.
+  It does not currently expose arbitrary sandbox-run artifacts.
+
+Until one of those consumers is built and verified, retain the XLSX as operator
+evidence. The portal fallback, if selected, must be an authenticated
+sandbox-artifact route keyed by run ID and file name. It must resolve only
+inside `HERMES_HOME/sandbox_runs/<run_id>/work`, allowlist extension and MIME
+type, respect run expiry, return `Content-Disposition: attachment`, and return
+404 after expiry. The client receives that authenticated portal URL, never the
+host path.
+
 ## Demo and close evidence
 
 Run the management-chat demo from design §6.1. Record tool-call count, wall time, independently recomputed counts, snapshot wording in the reply, and the journal window. The ship gate is one sandbox run (at most one self-corrected retry), under 60 seconds, with no service disruption.
