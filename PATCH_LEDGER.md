@@ -260,3 +260,172 @@ Regression class worth noting for the next merge: an upstream change that is
 purely cosmetic *at the point of edit* can still be semantic at a consumer that
 parses the same field. String-literal coupling between a producer and a distant
 consumer is the thing to grep for, not the diff's own line count.
+
+---
+
+# Integration: `integration/hermes-core-audit-20260727`
+
+Final reconciliation of both audit sessions, the upstream delta, and Codex's
+continuation repair onto one branch.
+
+## Topology as found (the brief's numbers were stale)
+
+| Ref | vs origin/main | Note |
+|---|---|---|
+| `origin/main` @ `731aa0ccc` | — | fetched 2026-07-27 |
+| `audit/claude-items-2-4` @ `bdac397c3` | 56 ahead / 10 behind | already carried the 160-commit merge `75a67b162` |
+| `main` = `integration/audit-merge` @ `f45bfab66` | 61 ahead / 170 behind | peer session; merged this branch at `002266661` |
+
+The brief described "28 unpushed audit commits, origin/main ~114 ahead". Neither
+held: `audit..main` is **10** commits (51 of main's 61 were already here),
+`audit..origin/main` is **10**, and `main..audit` is **165**. `main` is ~160
+upstream commits behind what this branch already carried, so merging in that
+direction would have been a large regression.
+
+Backup refs, created before any history change:
+
+```
+refs/backup/pre-integration-audit-20260727       bdac397c3
+refs/backup/pre-integration-main-20260727        f45bfab66
+refs/backup/pre-integration-originmain-20260727  731aa0ccc
+```
+
+## Merge order and result
+
+`ebe6b9e93` merged `origin/main` first (10 commits: nine desktop/UI, one browser
+CDP fix) so the peer's work would land on a current base. Clean.
+
+`e76e0d9cb` then merged `main`. **No textual conflict.** The only overlap is the
+two files both sessions independently fixed for H-01, and the auto-merge
+composed rather than chose:
+
+| File | Theirs | Mine | Result |
+|---|---|---|---|
+| `agent/turn_finalizer.py` | `turn_crashed()` shared predicate | `EMPTY_TERMINAL_EXIT_REASON` (H-26) | both, module-level |
+| `tools/delegate_tool.py` | `child_crashed`, `exit_reason="crashed"` | exit-reason-keyed `_empty_sentinel` | both, same branch chain |
+
+Neither side was a superset; a whole-side resolution would have dropped real
+behaviour either way. Two fixups the merge itself required are in `e76e0d9cb`:
+a test anchored on the literal `CRASH_EXIT_PREFIXES` (stale once the predicate
+was extracted — re-anchored to accept either spelling, ordering assertion
+unchanged) and a comment block left describing a `_crashed` assignment the merge
+had replaced.
+
+## `gateway/run.py`
+
+Contrary to the brief, **neither commit range touches it** —
+`git diff --stat 002266661 main -- gateway/run.py` is empty and the upstream
+range changes nothing. The only `gateway/run.py` work was Codex's, applied by
+hunk in `8b8d73fbe`:
+
+| Codex hunk | Disposition |
+|---|---|
+| import `GatewayWorkerBridgeUltraMixin` | already present (`b26927b2c`, found independently) — **not reapplied** |
+| insert it into the `GatewayRunner` MRO | already present (`b26927b2c`) — **not reapplied** |
+| widen the `_start_worker_bridge_watchers` enable gate | **applied** |
+
+Taking their whole file would have duplicated an import; taking ours would have
+dropped the gate fix. The gate hunk fixes a live defect: this branch already
+called `_worker_bridge_review_continuations` and `_worker_bridge_stage_successors`
+inside `_worker_bridge_notifier_watcher`, but refused to start that watcher
+unless alerts or failure successors were enabled — so a deployment enabling only
+stage successors got a watcher that never ran, silently.
+
+## Codex repair provenance
+
+Not on any branch, ref, stash or note. It existed **only as uncommitted files in
+the main worktree** `AppData/Local/hermes/hermes-agent`: `gateway/stage_successors.py`,
+`STAGE_SUCCESSORS.md` and three test files untracked, plus `gateway/run.py`,
+`FAILURE_SUCCESSORS.md` and `tests/gateway/test_worker_bridge_watcher_wiring.py`
+modified. Recovered and committed for the first time in `8b8d73fbe`; the
+originals are left in place untouched.
+
+This also closed a **clean-checkout breakage**: `worker_bridge_watchers.py:29`
+imports `gateway.stage_successors`, a module that did not exist in this tree.
+The import resolved only because the venv's editable-install finder served it
+from the *other* worktree. Any fresh clone or CI runner would have failed at
+gateway import. Verified after the fix that zero `gateway`/`agent`/`tools`/
+`hermes_cli` modules load from outside this worktree.
+
+## The 19 XFAILs — all dispositioned, 18 resolved
+
+Classified by reading the shipped code, not by trusting the file's own header —
+which proved wrong on three of its four claims. Independently re-verified, and
+one "invalid spec" verdict was overturned on challenge.
+
+| # | Test | Disposition |
+|---|---|---|
+| 1–3 | `test_free_slots_counts_live_leases`, `test_stale_lease_pid_frees_capacity`, `test_free_slots_never_negative` | **Valid — implemented** (`a7d23517e`). Header called leases-backed capacity superseded; `orchestrator.py:258` acquires `("global", maximum_concurrency)` and the live bridge.db has the table. |
+| 4–5 | `test_capacity_limits_spawn_budget`, `test_zero_free_slots_spawns_nothing_and_audits_no_capacity` | **Valid — passed untouched** once capacity was leases-backed. Filed under "spawn/audit semantics differ"; that reason was wrong. |
+| 6–11 | `test_format_alert_text_*` (3), `test_tick_includes_pending_work_in_alert`, `test_nudge_lists_blocked_when_auto_dispatch_enabled`, `test_nudge_unchanged_when_auto_dispatch_disabled` | **Valid — implemented** (`a43209ad2`). Auto-dispatch-aware wording, failures sorted first, `(blocked: reason)`. |
+| 12 | `test_resolve_target_uses_most_recent_session_when_unpinned` | **Valid — implemented** (`a43209ad2`). Alert target re-stamped with the bridge's system identity, so its own injected turn stops becoming the next target. |
+| 13–14 | `test_auto_dispatch_spawns_and_audits`, `test_spawn_exception_does_not_corrupt_task` | **Valid — implemented** (`a43209ad2`). `_audit_dispatch` emitted `task.gateway_dispatch`; nothing consumed it. Now `task.autodispatch` with `status_before`/`by`/`pid`. |
+| 15 | `test_skip_audit_deduped_until_reason_changes` | **Valid — implemented** (`a43209ad2`). Skips audited, deduped per (task, reason). |
+| 16–17 | `test_claim_marks_task_and_returns_snapshot`, `test_release_leaves_row_alone_if_live_pid_took_over` | **Valid — implemented** (`71ffe2316`). Key renamed to `dispatch_claim`; the orphan risk the header cited is removed by reading the legacy key and never writing it. |
+| 18 | `test_requeued_retry_is_dispatchable` | **Test-only fixture fix** (`71ffe2316`). `_retries_exhausted` was already correct; the fixture seeded `created`, a status this watcher does not select, so the guard was never reached. Zero production change. |
+| 19 | `test_selects_only_created_and_queued` | **Open question — remains a documented non-strict xfail.** See below. |
+
+Three defects were found *while* implementing and fixed in the same commits:
+`float(ad.get("interval") or DEFAULT)` turned an explicit `0` into 15 s;
+`has_active_worker_tasks` was defined as `count_free_global_slots(db_path, 1) == 0`
+so the leases change silently moved the idle-nudge threshold (now standalone);
+and `release_dispatch_claim` restored its snapshot unconditionally, erasing a
+live runner's pid when a spawn raised after that runner had already stamped it —
+one task, two runners.
+
+## The one open question: who owns `created` tasks
+
+Not missing work. A deployment decision with live blast radius, so it is
+recorded rather than decided.
+
+The plan gives this watcher both `created` and `queued`, and the live event log
+shows it once did — 105 `task.autodispatch` events with `status_before='created'`
+(2026-07-12..16), against 212 `task.auto_dispatched` events from the thin
+dispatcher (07-22..27), with **zero task_ids in both sets**. The fork was
+sequential, not concurrent: the watcher path died with the source loss and the
+thin dispatcher was written on 07-22 as its replacement.
+
+What makes this more than bookkeeping: `hermes_worker_bridge.dispatch.dispatch_pending`
+**applies none of the Step-8 guards**. It honours only `spec.context.auto_dispatch is False`,
+so for every `created` task the manual-hold, `depends_on`, pending-permission,
+pending-input and retries-exhausted gates are bypassed. The guards this
+workstream exists to enforce currently apply only to orphaned `queued` tasks.
+
+Resolving it means either giving the guarded watcher sole ownership of `created`
+(and retiring the thin dispatcher), or moving the guards into `dispatch_pending`
+— which lives in the **production profile plugin**, outside this repo and outside
+the authorisation for this work. Both change live dispatch behaviour. The test is
+left non-strict so whichever lands produces an XPASS immediately.
+
+## Verification
+
+```
+tests/contract/                                35 passed
+evals/behavioral/                              13 passed, 4 skipped
+scripts/verify_protected_behavior.py           16/16 simulated regressions caught
+scripts/rehearse_rollback.py                   every rollback path restores and verifies
+tests/gateway/test_worker_bridge_watchers_mixin.py + _watchers.py + _watcher_wiring.py
+                                               91 passed, 1 xfailed  (was 58 passed, 19 xfailed)
+tests/gateway/ stage successors + continuation + e2e + wiring   21 passed, 1 skipped
+tests/tools/ -k delegat                        352 passed, 3 skipped
+```
+
+## Remaining risk
+
+* **The `created`-ownership question above.** Until it is answered, `created`
+  tasks bypass every Step-8 guard. This is the highest-value open item here.
+* **Pre-existing suite failures, not introduced by this work.** An independent
+  read-only review extracted both merge parents with `git archive` and ran
+  `tests/gateway/` + `tests/tools/` on each: **228 failed on both, with
+  byte-identical failure name sets**; the merge adds 74 net passing tests.
+  `tests/gateway/test_worker_bridge_ultra.py` is untracked and its failures are
+  arithmetic inside the test, not the gateway.
+* **A whole-repo `pytest tests/` run aborts with 50 collection errors.** Every
+  affected file collects cleanly on its own (`test_clipboard.py` alone: 107
+  tests) and two-file combinations are clean, so this is cross-file import
+  pollution in the suite, pre-existing and independent of this branch. Run
+  per-directory to get a real signal.
+* **The editable-install cross-worktree leak is a property of the venv, not the
+  branch.** It is closed for `stage_successors`, but the finder will still serve
+  any *other* missing module from the sibling worktree. Only a clean clone
+  proves a module is really present.

@@ -61,31 +61,37 @@ STATUSES = frozenset(DEFAULT_STATUSES)
 
 
 # ---------------------------------------------------------------------------
-# Step 8 of PLAN_AUTO_DISPATCH.md is only partly built.
+# Step 8 of PLAN_AUTO_DISPATCH.md is built, except for one open question.
 #
-# This file was written spec-first alongside that plan. The guards it specifies
-# that carry their own weight — dependency gating, retry-budget gating,
-# surfacing paused/waiting_input, the env kill switch — are implemented and are
-# covered by the passing cases below.
+# This file was written spec-first alongside that plan and carried 19 xfails.
+# Eighteen are now implemented and pass. The comment that used to live here
+# described three of them as designs "superseded during implementation"; that
+# was wrong, and checking each claim against the shipped code is what resolved
+# them:
 #
-# The rest of the plan was superseded during implementation and is NOT built:
+#   * leases-backed capacity was called superseded. gateway/orchestrator.py
+#     acquires ("global", maximum_concurrency) before every run and the live
+#     bridge.db has the table — the spec was right and the comment was not.
+#   * renaming `gateway_dispatch_claim` -> `dispatch_claim` was called unsafe
+#     because live rows carry the old key. True only inside the 120 s claim TTL,
+#     and _dispatch_claim_is_live now reads the legacy key too, so the risk is
+#     gone rather than avoided.
+#   * the auto-dispatch-aware alert wording was simply unbuilt.
 #
-#   * The plan gives this watcher both `created` and `queued`. Shipped instead:
-#     GatewayWorkerTaskDispatcherMixin owns `created` and atomically reserves
-#     each one into `queued` (store.reserve_created_task) before spawning, and
-#     this watcher claims only `queued`. The two interlock; letting both select
-#     `created` would race them for the same task.
-#   * `count_free_global_slots` reading the `leases` table (shipped: count of
-#     tasks in running/verifying).
-#   * The auto-dispatch-aware alert wording ("Free worker capacity: N task(s)
-#     are pending…") replacing the manual "run `hermes worker tasks start`" text.
-#   * Renaming runtime `gateway_dispatch_claim` -> `dispatch_claim`. The shipped
-#     key is already persisted in live bridge.db rows; renaming it would orphan
-#     in-flight claims.
+# The one genuine open question is who owns `created` tasks:
 #
-# These are marked xfail rather than deleted so the specification survives and
-# whoever finishes Step 8 gets an XPASS the moment each lands. Non-strict on
-# purpose: a partial implementation should not turn into a hard failure here.
+#   The plan gives this watcher both `created` and `queued`, and the live event
+#   log shows it once did (105 task.autodispatch events with
+#   status_before='created'). Today GatewayWorkerTaskDispatcherMixin owns
+#   `created` and reserves each into `queued` (store.reserve_created_task),
+#   while this watcher claims only `queued`. That split matters because the thin
+#   dispatcher applies NONE of the guards below — a `created` task bypasses the
+#   manual-hold, dependency, permission, input and retry gates entirely. Which
+#   loop should own `created` is a deployment decision with live blast radius,
+#   so it is recorded in PATCH_LEDGER.md rather than decided here.
+#
+# The remaining xfail is non-strict on purpose: it is a question awaiting an
+# answer, not a partial implementation.
 # ---------------------------------------------------------------------------
 _PENDING_STEP_8 = {
     "test_selects_only_created_and_queued": "plan gives this watcher `created`; shipped design reserves created->queued in GatewayWorkerTaskDispatcherMixin",
