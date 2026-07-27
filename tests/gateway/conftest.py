@@ -465,3 +465,26 @@ def pytest_configure(config):
         else:
             cache_file.write_text("clean", encoding="utf-8")
 
+
+
+def pytest_collection_modifyitems(items):
+    """Honour a test module's ``_PENDING_<FEATURE>`` xfail maps.
+
+    A module that was written spec-first can declare
+    ``_PENDING_STEP_8 = {test_name: reason}`` next to the tests it describes;
+    the cases whose implementation has not landed are marked xfail here (the
+    hook only fires from a conftest, not from the module itself). Non-strict,
+    so finishing the feature turns them into XPASS instead of a hard failure.
+    """
+    for item in items:
+        module = getattr(item, "module", None)
+        if module is None:
+            continue
+        for attr in vars(module):
+            if not attr.startswith("_PENDING_"):
+                continue
+            reason = getattr(module, attr).get(item.name)
+            if reason:
+                item.add_marker(
+                    pytest.mark.xfail(reason=reason, strict=False)
+                )

@@ -44,6 +44,25 @@ SKIP_MANUAL_HOLD = "manual_hold"
 SKIP_NO_CAPACITY = "no_capacity"
 SKIP_SPAWN_ERROR = "spawn_error"
 SKIP_CLAIM_LOST = "claim_lost"
+SKIP_PAUSED = "paused"
+SKIP_WAITING_INPUT = "waiting_input"
+SKIP_DEP_INCOMPLETE = "dependency_incomplete"
+SKIP_RETRIES_EXHAUSTED = "retries_exhausted"
+
+# Statuses this watcher may dispatch. ``created`` is owned by
+# GatewayWorkerTaskDispatcherMixin, which atomically reserves it into
+# ``queued`` (store.reserve_created_task) before spawning — see the note on
+# select_dispatchable_tasks.
+AUTO_DISPATCH_STATUSES = ("queued",)
+# Additional statuses surfaced as *skipped* so the alert text can explain why
+# work is sitting idle. Resuming these is a human/agent decision.
+PENDING_VISIBLE_STATUSES = ("paused", "waiting_input")
+_STATUS_SKIP_REASONS = {
+    "paused": SKIP_PAUSED,
+    "waiting_input": SKIP_WAITING_INPUT,
+}
+# A dependency counts as satisfied only in these terminal-success states.
+_DEP_SATISFIED_STATUSES = ("succeeded", "accepted")
 
 _DISPATCH_CLAIM_TTL_SECONDS = 120.0
 def resolve_bridge_db_path() -> Path:
@@ -281,19 +300,28 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def select_dispatchable_tasks(
     db_path: Path, limit: int
 ) -> tuple[list[dict], list[dict]]:
-    """Return orphaned queued tasks and queued tasks excluded by a guard.
+    """Return dispatchable queued tasks and pending tasks excluded by a guard.
 
-    ``created`` tasks are deliberately absent from this query:
-    ``GatewayWorkerTaskDispatcherMixin`` is their sole owner.
+    ``created`` tasks are deliberately absent from the *dispatchable* set:
+    ``GatewayWorkerTaskDispatcherMixin`` owns them and atomically reserves each
+    one into ``queued`` via ``store.reserve_created_task`` before spawning.
+    Selecting them here too would have both loops racing for the same task.
+
+    ``paused`` and ``waiting_input`` are never dispatchable — resuming them is a
+    human/agent decision — but they are returned in ``skipped`` so the alert
+    text can say why work is sitting idle.
     """
     if not db_path.exists():
         return [], []
     conn = _connect_readonly(db_path)
     try:
+        visible = (*AUTO_DISPATCH_STATUSES, *PENDING_VISIBLE_STATUSES)
+        placeholders = ",".join("?" for _ in visible)
         rows = conn.execute(
             "SELECT task_id, worker, status, priority, spec, runtime, created_at "
-            "FROM tasks WHERE status='queued' "
-            "ORDER BY priority DESC, created_at ASC, task_id ASC"
+            f"FROM tasks WHERE status IN ({placeholders}) "
+            "ORDER BY priority DESC, created_at ASC, task_id ASC",
+            visible,
         ).fetchall()
         has_permissions = _table_exists(conn, "permission_requests")
         has_inputs = _table_exists(conn, "input_requests")
@@ -310,8 +338,10 @@ def select_dispatchable_tasks(
                 "created_at": row["created_at"],
                 "objective": str(spec.get("objective") or "")[:100],
             }
-            reason: Optional[str] = None
-            if runtime.get("pid") and _pid_alive(runtime["pid"]):
+            reason: Optional[str] = _STATUS_SKIP_REASONS.get(row["status"])
+            if reason:
+                pass  # paused / waiting_input: surfaced, never dispatched
+            elif runtime.get("pid") and _pid_alive(runtime["pid"]):
                 reason = SKIP_LIVE_PID
             elif _dispatch_claim_is_live(runtime):
                 reason = SKIP_LIVE_PID
@@ -332,6 +362,10 @@ def select_dispatchable_tasks(
                 metadata.get("manual_dispatch") or metadata.get("hold")
             ):
                 reason = SKIP_MANUAL_HOLD
+            if not reason and _retries_exhausted(spec, runtime):
+                reason = SKIP_RETRIES_EXHAUSTED
+            if not reason and not _dependencies_satisfied(conn, spec):
+                reason = SKIP_DEP_INCOMPLETE
             if reason:
                 skipped.append({**task, "skip_reason": reason})
             elif len(eligible) < max(0, int(limit)):
@@ -339,6 +373,59 @@ def select_dispatchable_tasks(
         return eligible, skipped
     finally:
         conn.close()
+
+
+def _retries_exhausted(spec: dict, runtime: dict) -> bool:
+    """True when the task has already used its whole retry budget.
+
+    A re-queued task carries ``runtime.retries``; ``queue_retry()`` already
+    enforces the ceiling, so this is belt-and-braces against a task that was
+    re-queued by hand.  A missing or unparseable limit means "no limit".
+    """
+    limits = spec.get("limits")
+    if not isinstance(limits, dict):
+        return False
+    try:
+        maximum = int(limits.get("maximum_retries"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        used = int(runtime.get("retries", 0) or 0)
+    except (TypeError, ValueError):
+        used = 0
+    return maximum >= 0 and used >= maximum
+
+
+def _dependencies_satisfied(conn: Any, spec: dict) -> bool:
+    """True when every task this one depends on reached terminal success.
+
+    Dependencies come from ``spec.parent_task_id`` and
+    ``spec.metadata.depends_on``.  Fails closed: a dependency that is not in
+    the store at all counts as unsatisfied, so a task whose parent was pruned
+    is held rather than dispatched into a broken precondition.
+    """
+    metadata = spec.get("metadata") or {}
+    depends_on = metadata.get("depends_on") if isinstance(metadata, dict) else None
+    if isinstance(depends_on, str):
+        depends_on = [depends_on]
+    deps = [
+        str(dep)
+        for dep in [spec.get("parent_task_id"), *(depends_on or [])]
+        if dep
+    ]
+    if not deps:
+        return True
+    placeholders = ",".join("?" for _ in deps)
+    rows = conn.execute(
+        f"SELECT task_id, status FROM tasks WHERE task_id IN ({placeholders})",
+        deps,
+    ).fetchall()
+    done = {
+        row["task_id"]
+        for row in rows
+        if row["status"] in _DEP_SATISFIED_STATUSES
+    }
+    return not (set(deps) - done)
 
 
 def _dispatch_claim_is_live(runtime: dict) -> bool:
@@ -503,6 +590,17 @@ def _resolve_alert_settings(cfg: Any) -> "Optional[dict]":
     if not isinstance(auto_raw, dict):
         auto_raw = {}
     auto_enabled = auto_raw.get("enabled", DEFAULT_AUTO_DISPATCH_ENABLED) is not False
+    # Env kill switch: lets an operator stop the watcher from starting new
+    # worker tasks without editing config or restarting into a new profile.
+    # Auto-dispatch spawns workers that write into their target repository, so
+    # this is the fastest way to quiet it.
+    if os.environ.get("HERMES_WORKER_BRIDGE_AUTODISPATCH", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        auto_enabled = False
     try:
         auto_interval = max(
             MIN_INTERVAL_SECONDS,
