@@ -12,6 +12,8 @@
   state, exact blockers, and separate CEO worker-liveness status.
 - The current-tree acceptance harness now exercises the image's real supervised
   container entrypoint before the worker/restart assertions.
+- The example solo-founder charter now explicitly grants bounded successor
+  objective authority (`objectives.create` on the `objectives` system).
 - `business payment-rails` now performs credential-safe, read-only payment-rail
   discovery and reports unavailable optional providers without implying
   settlement readiness.

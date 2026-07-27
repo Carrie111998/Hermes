@@ -183,12 +183,6 @@ def prepare() -> None:
     config = config_module.load_config()
     agentic = config.setdefault("agentic", {})
     agentic.update(charter)
-    agentic["allowed_capabilities"] = sorted(
-        set(agentic.get("allowed_capabilities") or []) | {"objectives.create"}
-    )
-    agentic["allowed_systems"] = sorted(
-        set(agentic.get("allowed_systems") or []) | {"objectives"}
-    )
     agentic.setdefault("operating_cadence", {})["enabled"] = False
     agentic["runtime_host"] = "standalone"
     agentic.setdefault("security", {}).update(

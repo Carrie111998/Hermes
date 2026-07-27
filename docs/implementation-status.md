@@ -22,6 +22,9 @@ acceptance evidence.
 - Hiring materialization rechecks current headcount and payroll limits against
   the immutable decision before adding an employee.
 - Founder/CEO organization bootstrap and versioned mandate.
+- The example solo-founder charter grants only bounded market execution plus
+  `objectives.create` successor authority, so autonomous operating cadence can
+  continue without silently broadening system access.
 - Unconfigured operator status exposes a structured, non-mutating first-run
   charter handoff without starting autonomy.
 - Standalone objective-worker launch registers durable worker health and stops

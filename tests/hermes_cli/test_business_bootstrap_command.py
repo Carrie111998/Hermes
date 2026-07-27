@@ -1,5 +1,6 @@
 import argparse
 import json
+from pathlib import Path
 import sqlite3
 import time
 
@@ -14,6 +15,15 @@ def _parser():
     sub = parser.add_subparsers(dest="command", required=True)
     business.build_parser(sub)
     return parser
+
+
+def test_example_charter_grants_bounded_successor_authority():
+    charter = json.loads(
+        (Path(__file__).parents[2] / "examples" / "agentic-charter.json")
+        .read_text(encoding="utf-8")
+    )
+    assert "objectives.create" in charter["allowed_capabilities"]
+    assert "objectives" in charter["allowed_systems"]
 
 
 def test_business_bootstrap_is_noninteractive_and_persists_charter(
