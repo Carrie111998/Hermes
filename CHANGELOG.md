@@ -201,7 +201,7 @@ recorded.
 - Blocked worker cycles now retain the exact readiness reason in durable worker
   health evidence for advisor diagnosis.
 - Current-main focused acceptance evidence was rerun at
-  `f468dd7c19138583bbab352eba829a16da02cdce`: 98 tests
+  `56e2c1a1ccf2a4a5c5409b9d7187816e2ecf7b98`: 98 tests
   passed across 10 files; this does not move the immutable 0.19.0 release
   boundary.
 - Security readiness failures now open a deduplicated organization-scoped

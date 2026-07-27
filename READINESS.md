@@ -85,7 +85,7 @@ determination until a newer evidence commit is recorded.
 
 The exact acceptance command set plus the installer contract was rerun against
 current `main` at baseline commit
-`f468dd7c19138583bbab352eba829a16da02cdce` (the readiness security-policy
+`56e2c1a1ccf2a4a5c5409b9d7187816e2ecf7b98` (the payment compliance-readiness
 surface).
 This is a separate,
 post-boundary evidence run; it does not move or rewrite the immutable release
