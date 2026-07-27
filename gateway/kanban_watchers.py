@@ -407,17 +407,19 @@ class GatewayKanbanWatchersMixin:
         await asyncio.sleep(5)
 
         profile_locks: dict[str, object] = {}
+        delivery_lock = None
         watcher_task = asyncio.current_task()
         if watcher_task is not None:
             # Cancellation skips the normal post-loop cleanup below. Release
             # profile locks when this coroutine finishes so a replacement
             # watcher in the same process can take over promptly.
-            watcher_task.add_done_callback(
-                lambda _task: [
+            def _cleanup_notifier_locks(_task) -> None:
+                for handle in tuple(profile_locks.values()):
                     _release_singleton_lock(handle)
-                    for handle in tuple(profile_locks.values())
-                ]
-            )
+                if delivery_lock is not None:
+                    self._kanban_release_delivery_lock(delivery_lock)
+
+            watcher_task.add_done_callback(_cleanup_notifier_locks)
         while self._running:
             try:
                 serviceable = self._kanban_notifier_adapters_by_profile()
@@ -635,6 +637,34 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
+                    try:
+                        delivery_lock = await asyncio.to_thread(
+                            self._kanban_acquire_delivery_lock,
+                            sub,
+                            board_slug,
+                        )
+                    except Exception as lock_exc:
+                        logger.warning(
+                            "kanban notifier: delivery lock failed for %s; "
+                            "rewinding claim: %s",
+                            sub["task_id"],
+                            lock_exc,
+                        )
+                        await asyncio.to_thread(
+                            self._kanban_rewind,
+                            sub,
+                            d["cursor"],
+                            d.get("old_cursor", 0),
+                            board_slug,
+                        )
+                        continue
+
+                    def _release_delivery_lock() -> None:
+                        nonlocal delivery_lock
+                        if delivery_lock is not None:
+                            self._kanban_release_delivery_lock(delivery_lock)
+                            delivery_lock = None
+
                     if not await asyncio.to_thread(
                         self._kanban_subscription_owned,
                         sub,
@@ -650,6 +680,7 @@ class GatewayKanbanWatchersMixin:
                             sub["task_id"],
                             sub_profile,
                         )
+                        _release_delivery_lock()
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
@@ -686,6 +717,7 @@ class GatewayKanbanWatchersMixin:
                                 format_exc,
                                 exc_info=True,
                             )
+                            _release_delivery_lock()
                             await asyncio.to_thread(
                                 self._kanban_rewind,
                                 sub,
@@ -768,6 +800,7 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except asyncio.CancelledError:
+                            _release_delivery_lock()
                             await asyncio.shield(
                                 asyncio.to_thread(
                                     self._kanban_rewind,
@@ -793,9 +826,11 @@ class GatewayKanbanWatchersMixin:
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
+                                _release_delivery_lock()
                                 await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
                             else:
+                                _release_delivery_lock()
                                 await asyncio.to_thread(
                                     self._kanban_rewind,
                                     sub,
@@ -907,6 +942,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 sub_fail_counts.pop(sub_key, None)
                             except asyncio.CancelledError:
+                                _release_delivery_lock()
                                 await asyncio.shield(
                                     asyncio.to_thread(
                                         self._kanban_rewind,
@@ -932,12 +968,14 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
+                                    _release_delivery_lock()
                                     await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
                                     # tick retries the self-post — the event
                                     # is NOT lost.
+                                    _release_delivery_lock()
                                     await asyncio.to_thread(
                                         self._kanban_rewind,
                                         sub,
@@ -954,6 +992,7 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
+                        _release_delivery_lock()
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
@@ -1040,6 +1079,9 @@ class GatewayKanbanWatchersMixin:
                                     exc_info=True,
                                 )
             except Exception as exc:
+                if delivery_lock is not None:
+                    self._kanban_release_delivery_lock(delivery_lock)
+                    delivery_lock = None
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
@@ -1070,6 +1112,33 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_acquire_delivery_lock(
+        self,
+        sub: dict,
+        board: Optional[str] = None,
+    ):
+        """Acquire the row lock shared with subscription owner transfer."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            lock_path = _kb._notify_delivery_lock_path(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+        return _kb._acquire_notify_delivery_lock(lock_path)
+
+    @staticmethod
+    def _kanban_release_delivery_lock(handle) -> None:
+        from hermes_cli import kanban_db as _kb
+
+        _kb._release_notify_delivery_lock(handle)
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,

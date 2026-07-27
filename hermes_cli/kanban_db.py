@@ -1307,6 +1307,8 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    inflight_profile TEXT,
+    inflight_old_cursor INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2455,6 +2457,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "inflight_profile" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "inflight_profile", "inflight_profile TEXT"
+            )
+        if "inflight_old_cursor" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "inflight_old_cursor",
+                "inflight_old_cursor INTEGER",
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2579,7 +2592,8 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, inflight_profile TEXT,"
+        " inflight_old_cursor INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -9429,6 +9443,97 @@ def _normalize_notify_profile(value: Any) -> str:
     return str(value or "default").strip() or "default"
 
 
+_NOTIFY_DELIVERY_LOCK_TIMEOUT_SECONDS = 60.0
+_NOTIFY_DELIVERY_LOCK_POLL_SECONDS = 0.02
+
+
+def _notify_delivery_lock_path(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Path:
+    """Return a board-local advisory-lock path for one subscription row."""
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    main = next((row for row in rows if str(row[1]) == "main"), None)
+    raw_path = str(main[2] or "") if main is not None else ""
+    db_path = Path(raw_path) if raw_path else kanban_db_path()
+    identity = "\0".join(
+        (str(task_id), str(platform), str(chat_id), str(thread_id or ""))
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return db_path.with_name(db_path.name + ".notify-locks") / f"{digest}.lock"
+
+
+def _acquire_notify_delivery_lock(lock_path: Path):
+    """Acquire a bounded cross-process subscription-delivery lock."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    deadline = time.monotonic() + _NOTIFY_DELIVERY_LOCK_TIMEOUT_SECONDS
+    if _IS_WINDOWS:
+        import msvcrt
+
+        locking = getattr(msvcrt, "locking")
+        mode = getattr(msvcrt, "LK_NBLCK")
+        while True:
+            try:
+                handle.seek(0)
+                locking(handle.fileno(), mode, 1)
+                return handle
+            except OSError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise TimeoutError(
+                        f"notification delivery lock timed out: {lock_path}"
+                    )
+                time.sleep(_NOTIFY_DELIVERY_LOCK_POLL_SECONDS)
+    else:
+        import fcntl
+
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise TimeoutError(
+                        f"notification delivery lock timed out: {lock_path}"
+                    )
+                time.sleep(_NOTIFY_DELIVERY_LOCK_POLL_SECONDS)
+
+
+def _release_notify_delivery_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            locking = getattr(msvcrt, "locking")
+            locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        handle.close()
+
+
+@contextlib.contextmanager
+def _notify_delivery_lock(lock_path: Path):
+    handle = _acquire_notify_delivery_lock(lock_path)
+    try:
+        yield
+    finally:
+        _release_notify_delivery_lock(handle)
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -9457,7 +9562,20 @@ def add_notify_sub(
     if notifier_profile is not None:
         notifier_profile = _normalize_notify_profile(notifier_profile)
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    delivery_guard = contextlib.nullcontext()
+    if notifier_profile is not None:
+        delivery_guard = _notify_delivery_lock(
+            _notify_delivery_lock_path(
+                conn,
+                task_id=task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        )
+    # Lock ordering is subscription lock → SQLite write transaction in both
+    # notifier delivery and ownership transfer, avoiding transfer/send races.
+    with delivery_guard, write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -9495,33 +9613,39 @@ def add_notify_sub(
             # target from another profile is an explicit ownership transfer;
             # leaving the stale owner would make the row permanently
             # undeliverable when only the new profile's adapter is connected.
-            # Rewind one task event on a real owner change so an event claimed
-            # by the old owner but not yet sent can be replayed by the new one.
-            # The notifier revalidates ownership immediately before send.
+            # When the old owner has an in-flight claim, restore its exact old
+            # cursor before handing the row over. The subscription delivery
+            # lock makes this transfer atomic with pre-send revalidation and
+            # successful cursor acknowledgement.
             conn.execute(
                 """
                 UPDATE kanban_notify_subs
-                   SET last_event_id = CASE
-                         WHEN COALESCE(
-                                  NULLIF(TRIM(notifier_profile), ''),
-                                  'default'
-                              ) <> ?
-                         THEN COALESCE(
-                              (
-                                SELECT MAX(task_events.id)
-                                  FROM task_events
-                                 WHERE task_events.task_id = kanban_notify_subs.task_id
-                                   AND task_events.id < kanban_notify_subs.last_event_id
-                              ),
-                              0
-                         )
-                         ELSE last_event_id
-                       END,
+                   SET last_event_id = COALESCE(
+                           inflight_old_cursor,
+                           last_event_id
+                       ),
+                       inflight_profile = NULL,
+                       inflight_old_cursor = NULL,
                        notifier_profile = ?
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND COALESCE(
+                           NULLIF(TRIM(notifier_profile), ''),
+                           'default'
+                       ) <> ?
                 """,
                 (
                     notifier_profile,
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread_id or "",
+                    notifier_profile,
+                ),
+            )
+            conn.execute(
+                "UPDATE kanban_notify_subs SET notifier_profile = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (
                     notifier_profile,
                     task_id,
                     platform,
@@ -9761,12 +9885,17 @@ def claim_unseen_events_for_sub(
         if not events:
             return old_cursor, old_cursor, []
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs "
+            "SET last_event_id = ?, "
+            "inflight_profile = COALESCE("
+            "NULLIF(TRIM(notifier_profile), ''), 'default'), "
+            "inflight_old_cursor = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ? AND (? IS NULL OR "
             "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
             (
-                int(new_cursor), task_id, platform, chat_id, thread_id or "",
+                int(new_cursor), int(old_cursor), task_id, platform, chat_id,
+                thread_id or "",
                 int(old_cursor), owner, owner,
             ),
         )
@@ -9790,7 +9919,8 @@ def advance_notify_cursor(
     )
     with write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "inflight_profile = NULL, inflight_old_cursor = NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND (? IS NULL OR "
             "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",
@@ -9825,7 +9955,8 @@ def rewind_notify_cursor(
     )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "inflight_profile = NULL, inflight_old_cursor = NULL "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ? AND (? IS NULL OR "
             "COALESCE(NULLIF(TRIM(notifier_profile), ''), 'default') = ?)",

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -296,10 +298,10 @@ def test_inflight_transfer_routes_event_only_to_new_owner(tmp_path, monkeypatch)
     old_adapter = MagicMock()
     old_adapter.send = AsyncMock(return_value=SendResult(success=True))
     old_runner = _runner("profile-a", primary=old_adapter)
-    original_owned = old_runner._kanban_subscription_owned
+    original_acquire = old_runner._kanban_acquire_delivery_lock
     transferred = False
 
-    def transfer_then_check(sub, board):
+    def transfer_then_acquire(sub, board):
         nonlocal transferred
         if not transferred:
             transferred = True
@@ -314,9 +316,9 @@ def test_inflight_transfer_routes_event_only_to_new_owner(tmp_path, monkeypatch)
                 )
             finally:
                 conn.close()
-        return original_owned(sub, board)
+        return original_acquire(sub, board)
 
-    old_runner._kanban_subscription_owned = transfer_then_check
+    old_runner._kanban_acquire_delivery_lock = transfer_then_acquire
     asyncio.run(_run_one_tick(monkeypatch, old_runner))
     old_adapter.send.assert_not_called()
 
@@ -329,6 +331,84 @@ def test_inflight_transfer_routes_event_only_to_new_owner(tmp_path, monkeypatch)
     conn = kb.connect()
     try:
         assert kb.list_notify_subs(conn, task_id=task_id) == []
+    finally:
+        conn.close()
+
+
+class _BlockingSendAdapter:
+    def __init__(self):
+        self.send_started = threading.Event()
+        self.release_send = threading.Event()
+        self.messages: list[str] = []
+
+    async def send(self, _chat_id, text, metadata=None):
+        self.messages.append(text)
+        self.send_started.set()
+        released = await asyncio.to_thread(self.release_send.wait, 5)
+        assert released, "test timed out waiting to release the in-flight send"
+        return SendResult(success=True)
+
+
+def test_owner_transfer_waits_for_inflight_send_without_replay(tmp_path, monkeypatch):
+    """A transfer after owner validation cannot race or replay a delivered event."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="post-check transfer", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="shared-chat",
+            notifier_profile="profile-a",
+        )
+        assert kb.block_task(conn, task_id, reason="waiting for input")
+    finally:
+        conn.close()
+
+    old_adapter = _BlockingSendAdapter()
+    old_runner = _runner("profile-a", primary=old_adapter)
+    transfer_finished = threading.Event()
+
+    def transfer_owner() -> None:
+        transfer_conn = kb.connect()
+        try:
+            kb.add_notify_sub(
+                transfer_conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="shared-chat",
+                notifier_profile="profile-b",
+            )
+        finally:
+            transfer_conn.close()
+            transfer_finished.set()
+
+    async def run_delivery_and_transfer() -> None:
+        watcher = asyncio.create_task(_run_one_tick(monkeypatch, old_runner))
+        assert await asyncio.to_thread(old_adapter.send_started.wait, 5)
+        transfer = asyncio.create_task(asyncio.to_thread(transfer_owner))
+        await asyncio.to_thread(time.sleep, 0.1)
+        assert not transfer_finished.is_set(), (
+            "ownership transfer must wait until the in-flight send is acknowledged"
+        )
+        old_adapter.release_send.set()
+        await asyncio.wait_for(asyncio.gather(watcher, transfer), timeout=10)
+
+    asyncio.run(run_delivery_and_transfer())
+    assert len(old_adapter.messages) == 1
+
+    new_adapter = MagicMock()
+    new_adapter.send = AsyncMock(return_value=SendResult(success=True))
+    new_runner = _runner("profile-b", primary=new_adapter)
+    asyncio.run(_run_one_tick(monkeypatch, new_runner))
+
+    new_adapter.send.assert_not_called()
+    conn = kb.connect()
+    try:
+        [sub] = kb.list_notify_subs(conn, task_id=task_id)
+        assert sub["notifier_profile"] == "profile-b"
     finally:
         conn.close()
 
