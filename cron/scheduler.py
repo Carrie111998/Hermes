@@ -153,6 +153,149 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+_EXPLICIT_TOOL_CODE_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
+_EXPLICIT_TOOL_POSITIVE_RE = re.compile(
+    r"\b(must|require(?:d|s)?|use|call|invoke|run|execute|search with|via)\b"
+    r"|必ず|必須|使(?:う|用)|呼び出|実行|検索",
+    re.IGNORECASE,
+)
+_EXPLICIT_TOOL_NEGATIVE_RE = re.compile(
+    r"\b(do not|don't|never|avoid|without|not\s+(?:use|call|invoke|run|execute))\b"
+    r"|禁止|使わない|使用しない|呼び出さない|実行しない",
+    re.IGNORECASE,
+)
+
+
+def _line_looks_like_positive_tool_requirement(line: str) -> bool:
+    """Heuristic: distinguish required tool mentions from prohibitions/docs."""
+    if _EXPLICIT_TOOL_NEGATIVE_RE.search(line):
+        return False
+    return bool(_EXPLICIT_TOOL_POSITIVE_RE.search(line))
+
+
+def _resolve_tool_names_for_toolsets(toolsets: list[str] | None) -> set[str] | None:
+    """Return requested tool names for *toolsets*, or None for full defaults."""
+    if toolsets is None:
+        return None
+    requested: set[str] = set()
+    try:
+        from model_tools import _LEGACY_TOOLSET_MAP
+        from toolsets import resolve_toolset, validate_toolset
+    except Exception:
+        return requested
+
+    for toolset_name in toolsets:
+        if validate_toolset(toolset_name):
+            requested.update(resolve_toolset(toolset_name))
+        elif toolset_name in _LEGACY_TOOLSET_MAP:
+            requested.update(_LEGACY_TOOLSET_MAP[toolset_name])
+    return requested
+
+
+def _cron_instruction_text_for_required_tool_preflight(job: dict) -> str:
+    """Return instruction-bearing text for required-tool preflight.
+
+    Only the job's stored prompt is treated as an instruction source. Runtime-
+    collected data — pre-run script stdout and ``context_from`` upstream-job
+    output — is intentionally excluded: those sections are untrusted/data
+    sources that may quote tool-shaped phrases (for example
+    ``Must use `terminal```) without requiring those tools on the job.
+    """
+    return str(job.get("prompt") or "")
+
+
+def _explicit_prompt_tool_availability_error(
+    instruction_prompt: str,
+    *,
+    enabled_toolsets: list[str] | None,
+    disabled_toolsets: list[str] | None,
+) -> str | None:
+    """Return a cron preflight error when instruction-required tools are hidden.
+
+    Cron jobs are unattended and auto-delivered. If the job's instruction
+    prompt says things like ``必ず `x_search` ツール`` but the effective cron
+    toolsets do not expose that tool (or the tool's check_fn filters it out),
+    running the LLM is wasteful and often produces a misleading "success".
+
+    Callers must pass *instruction* text only (see
+    :func:`_cron_instruction_text_for_required_tool_preflight`). Injected
+    script/upstream data must never be scanned here.
+
+    We only inspect exact markdown-code references to known Hermes tool names
+    to avoid flagging prose, commands, paths, or skill names.
+    """
+    if not instruction_prompt:
+        return None
+
+    try:
+        import model_tools
+        from model_tools import get_tool_definitions
+        from tools.registry import registry
+    except Exception as exc:
+        logger.warning("Cron explicit-tool preflight skipped: %s", exc)
+        return None
+
+    known_tool_names = set(registry.get_all_tool_names())
+    explicit: set[str] = set()
+    for line in instruction_prompt.splitlines():
+        for segment in re.split(r"(?<=[。.!?])\s+|[。.!?]", line):
+            if not _line_looks_like_positive_tool_requirement(segment):
+                continue
+            explicit.update(
+                match.group(1)
+                for match in _EXPLICIT_TOOL_CODE_RE.finditer(segment)
+                if match.group(1) in known_tool_names
+            )
+    explicit_tool_names = sorted(explicit)
+    if not explicit_tool_names:
+        return None
+
+    # skip_tool_search_assembly=True: when tool-search progressive disclosure
+    # is active, MCP/plugin tools are deferred behind tool_search/tool_call and
+    # vanish from the top-level schema. Preflight still needs the raw catalog
+    # to decide whether a required tool is *reachable* under the job's
+    # toolset filters (not whether it is listed in the collapsed schema).
+    available_tool_names = {
+        tool.get("function", {}).get("name")
+        for tool in get_tool_definitions(  # type: ignore[arg-type]
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    }
+    missing = [name for name in explicit_tool_names if name not in available_tool_names]
+    if not missing:
+        return None
+
+    requested_names = _resolve_tool_names_for_toolsets(enabled_toolsets)
+    disabled_names = _resolve_tool_names_for_toolsets(disabled_toolsets) or set()
+    enabled_display = ", ".join(enabled_toolsets) if enabled_toolsets is not None else "<default/full>"
+    disabled_display = ", ".join(disabled_toolsets or []) or "<none>"
+
+    detail_lines: list[str] = []
+    for tool_name in missing:
+        toolset = model_tools.get_toolset_for_tool(tool_name) or "unknown"
+        if tool_name in disabled_names:
+            reason = f"toolset '{toolset}' is disabled"
+        elif requested_names is not None and tool_name not in requested_names:
+            reason = f"toolset '{toolset}' is not included in enabled_toolsets"
+        else:
+            reason = "tool requirements/check_fn failed (credential or runtime dependency unavailable)"
+        detail_lines.append(f"- `{tool_name}` (toolset `{toolset}`): {reason}")
+
+    return (
+        "Cron job instruction explicitly requires tool(s) that are not exposed "
+        "to this job. Refusing to run the unattended LLM tick.\n\n"
+        f"enabled_toolsets: {enabled_display}\n"
+        f"disabled_toolsets: {disabled_display}\n\n"
+        + "\n".join(detail_lines)
+        + "\n\nFix: add the missing toolset(s) to this cron job's `enabled_toolsets`, "
+        "enable the required credentials/dependencies, or remove the explicit "
+        "tool requirement from the job prompt."
+    )
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -3421,6 +3564,9 @@ def run_job(
         # ticks short-circuit on already-connected servers inside
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
+        #
+        # Discovery MUST run before required-tool preflight so dynamically
+        # registered MCP tools are known and resolvable.
         try:
             from tools.mcp_tool import discover_mcp_tools
             _mcp_tools = discover_mcp_tools()
@@ -3434,6 +3580,26 @@ def run_job(
                 "Job '%s': MCP initialization failed (non-fatal): %s",
                 job_id, _mcp_exc,
             )
+
+        cron_enabled_toolsets = _resolve_cron_enabled_toolsets(
+            job,
+            _cfg if isinstance(_cfg, dict) else {},
+        )
+        cron_disabled_toolsets = _resolve_cron_disabled_toolsets(
+            _cfg if isinstance(_cfg, dict) else {},
+        )
+
+        # Fail loud when the job *instruction* requires tools that this cron
+        # tick will not expose. Scan only instruction-bearing text (job
+        # prompt) — never injected script/upstream data. See
+        # _cron_instruction_text_for_required_tool_preflight.
+        tool_preflight_error = _explicit_prompt_tool_availability_error(
+            _cron_instruction_text_for_required_tool_preflight(job),
+            enabled_toolsets=cron_enabled_toolsets,
+            disabled_toolsets=cron_disabled_toolsets,
+        )
+        if tool_preflight_error:
+            raise RuntimeError(tool_preflight_error)
 
         agent = AIAgent(
             model=model,
@@ -3454,8 +3620,8 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            enabled_toolsets=cron_enabled_toolsets,
+            disabled_toolsets=cron_disabled_toolsets,
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
