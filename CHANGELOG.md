@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added `business readiness --check`, a non-mutating exit-status contract for
+  supervisors and container healthchecks; blocked or unconfigured readiness
+  returns status 1 while preserving the diagnostic JSON projection.
 - Governed employee worker launches now carry and verify exact capabilities
   and systems in addition to toolsets and skills; a subprocess with a broader
   semantic surface fails closed before it can perform task work.

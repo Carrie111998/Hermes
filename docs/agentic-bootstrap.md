@@ -289,3 +289,8 @@ After exact capability/system launch-surface enforcement, the installed
 acceptance was rerun from commit `a1251763116dd951e6f3ab2303032ce2956ccb90`
 on 2026-07-27 and returned `current-tree agentic acceptance: PASS`. Image
 manifest: `sha256:367f6b56334dc5053cdcb6658dc9c9a68c00e6af6f67082cf5829d8d1a277e6c`.
+
+After adding the readiness healthcheck contract, the installed acceptance was
+rerun from commit `5dbdbf96ae036bb0e9d20a31782124a75760ae07` on 2026-07-27 and
+returned `current-tree agentic acceptance: PASS`. Image manifest:
+`sha256:2b08831350ebd5c9a605f78d5049e1ad3d1a7caa261ff1606ae5385bdb905862`.

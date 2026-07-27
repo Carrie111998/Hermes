@@ -475,6 +475,11 @@ subordinate process validated its exact grant, completed the task, and woke
 the CEO with durable evidence. Image manifest:
 `sha256:367f6b56334dc5053cdcb6658dc9c9a68c00e6af6f67082cf5829d8d1a277e6c`.
 
+After adding the readiness healthcheck contract, the installed acceptance was
+rerun from commit `5dbdbf96ae036bb0e9d20a31782124a75760ae07` on 2026-07-27.
+It returned `current-tree agentic acceptance: PASS`; image manifest:
+`sha256:2b08831350ebd5c9a605f78d5049e1ad3d1a7caa261ff1606ae5385bdb905862`.
+
 The governed runtime regression was also run from current `main` (`cd256040a36a281d61356b57f4c43ac4c4563bd2`) with:
 
 ```sh
