@@ -39,6 +39,15 @@ logger = logging.getLogger(__name__)
 _WARNED_DISABLED_BUNDLES: set = set()
 
 
+def _is_delegated_child_context() -> bool:
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return is_delegated_child_context()
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -323,6 +332,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            _is_delegated_child_context(),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -366,7 +376,11 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not _is_delegated_child_context()
+            and "kanban" not in effective_enabled_toolsets
+        ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
@@ -555,10 +569,15 @@ def _compute_tool_definitions(
                 config=ts_cfg,
             )
             if assembly.activated and not quiet_mode:
+                _forms = {"full": "catalog listing embedded",
+                          "names": "names-only listing embedded",
+                          "mixed": "listing embedded (oversized servers summarized)",
+                          "groups": "server summary embedded (search-only discovery)",
+                          "none": "no listing (search-only)"}
                 print(
-                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
-                    f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
-                    f"Threshold ~{assembly.threshold_tokens} tokens."
+                    f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
+                    f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
+                    f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
                 )
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
@@ -711,6 +730,16 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     properties = (schema.get("parameters") or {}).get("properties")
     if not properties:
         return args
+
+    # The model saw the SANITIZED schema — property keys violating provider
+    # patterns (e.g. Cloudflare's ``issue_class~neq``) were renamed before
+    # the request. Map any sanitized keys back to the registry's original
+    # wire names before schema lookup / dispatch.
+    try:
+        from tools.schema_sanitizer import unrename_tool_args
+        args = unrename_tool_args(schema.get("parameters"), args)
+    except Exception:  # pragma: no cover — never break dispatch
+        pass
 
     for key, value in list(args.items()):
         prop_schema = properties.get(key)

@@ -325,6 +325,12 @@ class CodexAppServerClient:
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
+        # _windows_startup() already returns CREATE_NO_WINDOW + SW_HIDE, so this
+        # subsumes hermes_cli._subprocess_compat.windows_hide_flags() and keeps
+        # the console-flash fix (#56747). It additionally sets
+        # STARTF_USESTDHANDLES and CREATE_SUSPENDED so the child can be assigned
+        # to a kill job before it runs — that is what stops orphaned codex
+        # processes, which plain hide-flags do not do.
         creationflags, startupinfo = _windows_startup()
         self._job = _create_kill_job()
         popen_kwargs: dict[str, Any] = {
