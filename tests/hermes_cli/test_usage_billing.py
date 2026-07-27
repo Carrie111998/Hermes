@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_cli import objectives_db, usage_billing
+from hermes_cli import metered_billing, objectives_db, usage_billing
 
 
 def test_usage_is_idempotent_and_prices_are_recorded(tmp_path):
@@ -80,3 +80,22 @@ def test_invoice_context_rejects_cross_customer_and_currency(tmp_path):
             conn, organization_id="org", customer_ref="customer-1", currency="CAD",
             event_ids=[event["id"]],
         )
+
+
+def test_business_meter_isolated_from_inherited_model_usage_meter(tmp_path):
+    conn = objectives_db.connect(tmp_path / "usage.db")
+    model_meter = metered_billing.create_meter(
+        conn, organization_id="org", name="model-token", currency="USD",
+        unit_price_microminor=1, unit_name="token",
+    )
+    metered_billing.record_usage(
+        conn, meter_id=model_meter, customer_id="customer-1", quantity=1,
+        idempotency_key="model-event", evidence={"request_id": "r1"},
+    )
+    business_event = usage_billing.record_usage(
+        conn, organization_id="org", customer_ref="customer-1", metric="service_call",
+        quantity=1, unit_price_minor=100, currency="USD", idempotency_key="business-event",
+    )
+    assert conn.execute("SELECT COUNT(*) AS n FROM usage_events").fetchone()["n"] == 1
+    assert conn.execute("SELECT COUNT(*) AS n FROM agentic_usage_events").fetchone()["n"] == 1
+    assert business_event["amount_minor"] == 100
