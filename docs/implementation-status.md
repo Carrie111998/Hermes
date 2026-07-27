@@ -88,6 +88,8 @@ acceptance evidence.
 - Objective intent freshness is durable: `reaffirmed_at` and the configured
   reaffirmation TTL block stale objectives and require evidence-bearing advisor
   reaffirmation before planning resumes.
+- Reaffirmation resolution requires a substantive decision basis; an arbitrary
+  non-empty JSON payload cannot refresh stale intent.
 - Runtime-host mismatches and charters with no registered action contracts also
   persist bounded advisor handoffs before stopping.
 - Optional fail-closed runtime drift detection with immutable human-accepted
