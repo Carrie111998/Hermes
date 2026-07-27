@@ -509,6 +509,18 @@ class ChatCompletionsTransport(ProviderTransport):
         if overrides:
             api_kwargs.update(overrides)
 
+        # Strip no-op service_tier values.  Only "priority" is meaningful
+        # (OpenAI Priority Processing); empty / "normal" / "default" are the
+        # provider's own default and sending them is at best redundant and at
+        # worst a hard HTTP 400 on providers that reject the parameter
+        # entirely (e.g. Poe — "Unsupported parameter: service_tier").  The
+        # desktop app always sends ``fast: false`` on session create, which
+        # sets ``service_tier=""`` / ``"normal"`` via the session-override
+        # path; without this strip that leaks to every custom-provider call.
+        _st = api_kwargs.get("service_tier")
+        if isinstance(_st, str) and _st.strip().lower() in ("", "normal", "default", "standard"):
+            api_kwargs.pop("service_tier", None)
+
         return api_kwargs
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
@@ -626,6 +638,11 @@ class ChatCompletionsTransport(ProviderTransport):
                     extra_body.update(v)
                 else:
                     api_kwargs[k] = v
+
+        # Strip no-op service_tier values — see the legacy path for rationale.
+        _st = api_kwargs.get("service_tier")
+        if isinstance(_st, str) and _st.strip().lower() in ("", "normal", "default", "standard"):
+            api_kwargs.pop("service_tier", None)
 
         if extra_body:
             # Native Gemini (generativelanguage.googleapis.com, non-/openai)

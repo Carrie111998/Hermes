@@ -644,6 +644,26 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["service_tier"] == "priority"
 
+    def test_noop_service_tier_normal_is_stripped(self, transport):
+        """service_tier="normal" is a no-op (the provider default) and is
+        rejected as an unknown parameter by providers like Poe. Strip it."""
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="grok-4.5", messages=msgs,
+            request_overrides={"service_tier": "normal"},
+        )
+        assert "service_tier" not in kw
+
+    def test_noop_service_tier_empty_is_stripped(self, transport):
+        """Empty-string service_tier (sent by the desktop app's fast=false
+        session-create path) must not leak to the API call."""
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="grok-4.5", messages=msgs,
+            request_overrides={"service_tier": ""},
+        )
+        assert "service_tier" not in kw
+
     def test_fixed_temperature(self, transport):
         """Fixed temperature is now set via ProviderProfile.fixed_temperature."""
         from providers.base import ProviderProfile
