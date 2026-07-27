@@ -62,7 +62,7 @@ import tempfile
 import threading
 import time
 import requests
-from typing import Dict, Any, Callable, Optional, List, Tuple, Union
+from typing import Dict, Any, Callable, Mapping, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from agent.redact import (
@@ -1357,6 +1357,13 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # navigation.  Without this, a task that navigated to localhost on the local
 # sidecar would fall back to the cloud session on its next snapshot call.
 _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
+
+# Snapshot refs are meaningful only for the exact page load that produced
+# them.  Keep the binding server-side so a Grace execution worker cannot
+# accidentally reuse an @ref after a reload or tab switch.  The model never
+# supplies or edits the expected page identity.
+_snapshot_ref_contexts: Dict[str, Dict[str, Any]] = {}
+_snapshot_ref_lock = threading.Lock()
 _LOCAL_SUFFIX = "::local"
 
 # Flag to track if cleanup has been done
@@ -2656,6 +2663,410 @@ def _browser_page_identity(
         return "", "", f"page identity probe was invalid: {exc}"
 
 
+def _guarded_snapshot_identity(browser_task_id: str) -> Optional[str]:
+    """Return pre-snapshot identity for a Grace execution, else None."""
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not kanban_task_id:
+        return None
+    try:
+        from hermes_cli import kanban_db as _kanban_db
+
+        with _kanban_db.connect_closing() as scope_conn:
+            if not _kanban_db.is_grace_execution_task(
+                scope_conn,
+                kanban_task_id,
+            ):
+                return None
+    except Exception:
+        return None
+    _url, identity, identity_error = _browser_page_identity(browser_task_id)
+    return None if identity_error else identity
+
+
+_GUARDED_INTERACTIVE_ROLES = frozenset({
+    "button", "checkbox", "combobox", "link", "listbox", "menuitem",
+    "menuitemcheckbox", "menuitemradio", "option", "radio", "searchbox",
+    "slider", "spinbutton", "switch", "tab", "textbox", "treeitem",
+})
+
+
+def _snapshot_ax_nodes(browser_task_id: str) -> list[dict[str, Any]]:
+    """Capture one AX tree whose nodes become both refs and DOM bindings."""
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        supervisor = SUPERVISOR_REGISTRY.get(browser_task_id)
+        if supervisor is None:
+            return []
+        result = supervisor.call_page_cdp("Accessibility.getFullAXTree")
+        if not result.get("ok"):
+            return []
+        nodes = result.get("result", {}).get("nodes", [])
+    except Exception:
+        return []
+    captured: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, Mapping) or node.get("ignored"):
+            continue
+        backend_id = node.get("backendDOMNodeId")
+        role = node.get("role", {}).get("value")
+        name = node.get("name", {}).get("value")
+        if backend_id and role:
+            captured.append({
+                "backend_node_id": int(backend_id),
+                "role": str(role).strip(),
+                "name": str(name or "").strip(),
+            })
+    return captured
+
+
+def _remember_snapshot_refs(
+    browser_task_id: str,
+    snapshot_result: Mapping[str, Any],
+    before_identity: Optional[str],
+) -> None:
+    """Replace Grace refs with one atomically captured AX-tree binding."""
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not kanban_task_id:
+        return
+    data = snapshot_result.get("data")
+    ax_nodes = _snapshot_ax_nodes(browser_task_id)
+    current_url, after_identity, identity_error = _browser_page_identity(
+        browser_task_id,
+    )
+    if (
+        not before_identity
+        or identity_error
+        or before_identity != after_identity
+        or not isinstance(data, dict)
+        or not ax_nodes
+    ):
+        with _snapshot_ref_lock:
+            _snapshot_ref_contexts.pop(browser_task_id, None)
+        return
+    snapshot_url = str(data.get("origin") or data.get("url") or "")
+    if snapshot_url and snapshot_url != current_url:
+        with _snapshot_ref_lock:
+            _snapshot_ref_contexts.pop(browser_task_id, None)
+        return
+    original_snapshot = str(data.get("snapshot") or "")
+    normalized_refs: dict[str, dict[str, Any]] = {}
+    snapshot_lines: list[str] = []
+    for node in ax_nodes:
+        role = str(node["role"])
+        name = str(node["name"])
+        if role.casefold() in _GUARDED_INTERACTIVE_ROLES:
+            ref = f"e{len(normalized_refs) + 1}"
+            backend_id = int(node["backend_node_id"])
+            normalized_refs[ref] = {
+                "role": role,
+                "name": name,
+                "backend_node_id": backend_id,
+            }
+            snapshot_lines.append(
+                f"- {role} {json.dumps(name, ensure_ascii=False)} [ref={ref}]"
+            )
+    with _snapshot_ref_lock:
+        if normalized_refs:
+            _snapshot_ref_contexts[browser_task_id] = {
+                "page_identity": after_identity,
+                "kanban_task_id": kanban_task_id,
+                "kanban_run_id": _kanban_worker_run_id(),
+                "refs": normalized_refs,
+            }
+            data["refs"] = {
+                ref: {"role": meta["role"], "name": meta["name"]}
+                for ref, meta in normalized_refs.items()
+            }
+            original_without_refs = re.sub(
+                r"\s*\[ref=e[0-9]+\]",
+                "",
+                original_snapshot,
+            )
+            data["snapshot"] = (
+                original_without_refs.rstrip()
+                + "\n\nGuarded interactive controls:\n"
+                + "\n".join(snapshot_lines)
+            ).strip()
+            data["url"] = current_url
+        else:
+            _snapshot_ref_contexts.pop(browser_task_id, None)
+
+
+def _snapshot_ref_metadata(
+    browser_task_id: str,
+    ref: str,
+    expected_page_identity: str,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    normalized_ref = str(ref or "").lstrip("@")
+    with _snapshot_ref_lock:
+        context = _snapshot_ref_contexts.get(browser_task_id)
+        if not context:
+            return None, (
+                "Guarded browser action requires a fresh browser_snapshot "
+                "from this exact page load."
+            )
+        if context.get("page_identity") != expected_page_identity:
+            return None, (
+                "Guarded browser action blocked: the page load changed after "
+                "the snapshot. Take a fresh browser_snapshot."
+            )
+        current_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        current_run_id = _kanban_worker_run_id()
+        if (
+            context.get("kanban_task_id") != current_task_id
+            or context.get("kanban_run_id") != current_run_id
+        ):
+            _snapshot_ref_contexts.pop(browser_task_id, None)
+            return None, (
+                "Guarded browser action blocked: snapshot task/run scope "
+                "changed. Take a fresh browser_snapshot."
+            )
+        try:
+            from hermes_cli import kanban_db as _kanban_db
+
+            with _kanban_db.connect_closing() as scope_conn:
+                active = scope_conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
+                    "AND current_run_id = ?",
+                    (current_task_id, current_run_id),
+                ).fetchone()
+        except Exception:
+            active = None
+        if active is None:
+            _snapshot_ref_contexts.pop(browser_task_id, None)
+            return None, (
+                "Guarded browser action blocked: snapshot worker run is no "
+                "longer active."
+            )
+        metadata = context.get("refs", {}).get(normalized_ref)
+        if not isinstance(metadata, dict):
+            return None, (
+                f"Guarded browser action blocked: {ref} is not present in the "
+                "fresh snapshot for this page load."
+            )
+        # Claim the whole snapshot context while holding the lock. Mutation
+        # refs are one-shot capabilities, so concurrent callers cannot reuse
+        # the same or another stale ref from this capture.
+        _snapshot_ref_contexts.pop(browser_task_id, None)
+        return dict(metadata), None
+
+
+def _run_atomic_ref_action(
+    browser_task_id: str,
+    ref: str,
+    page_identity: Optional[str],
+    *,
+    action: str,
+    text: Optional[str] = None,
+) -> str:
+    if not page_identity:
+        return json.dumps({
+            "success": False,
+            "error": "Guarded browser action is missing the expected page identity.",
+        }, ensure_ascii=False)
+    metadata, metadata_error = _snapshot_ref_metadata(
+        browser_task_id,
+        ref,
+        page_identity,
+    )
+    if metadata_error:
+        return json.dumps(
+            {"success": False, "error": metadata_error},
+            ensure_ascii=False,
+        )
+    current_url = page_identity.rsplit("|", 1)[0]
+    from urllib.parse import urlsplit
+    from hermes_cli import kanban_db as _kanban_db
+
+    parsed = urlsplit(current_url)
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    group_match = re.match(r"^/groups/(\d+)(?:/|$)", parsed.path)
+    normalized_host = str(parsed.hostname or "").rstrip(".").casefold()
+    is_facebook_host = (
+        normalized_host == "facebook.com"
+        or normalized_host.endswith(".facebook.com")
+    )
+    is_group_route = (
+        parsed.path == "/groups"
+        or parsed.path.startswith("/groups/")
+    )
+    if (
+        is_facebook_host
+        and not is_group_route
+        and _kanban_db.external_platform_for_url(current_url) != "facebook"
+    ):
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Facebook mutation blocked: the current page is neither an "
+                "authorized numeric group destination nor a reserved create "
+                "route."
+            ),
+        }, ensure_ascii=False)
+    normalized_name = re.sub(
+        r"\s+",
+        " ",
+        str(metadata.get("name") or "").strip(),
+    ).casefold()
+    is_join_button = (
+        action == "click"
+        and str(metadata.get("role") or "").casefold() == "button"
+        and normalized_name in {"join group", "加入社團"}
+    )
+    required_group_id: Optional[str] = None
+    reserved_group_id: Optional[str] = None
+    if is_facebook_host and is_join_button and group_match is None:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Facebook Join group action blocked: the current destination "
+                "cannot be mapped to an authorized numeric group target."
+            ),
+        }, ensure_ascii=False)
+    if is_facebook_host and is_group_route and group_match is None:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Facebook group action blocked: the current group route "
+                "cannot be mapped to an authorized numeric group target."
+            ),
+        }, ensure_ascii=False)
+    if (
+        is_facebook_host
+        and group_match
+    ):
+        try:
+            with _kanban_db.connect_closing() as scope_conn:
+                task = _kanban_db.get_task(scope_conn, kanban_task_id)
+            body = task.body if task is not None else ""
+        except Exception as exc:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Facebook group contract scope check failed closed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }, ensure_ascii=False)
+        allowed_group_ids = _kanban_db.grace_external_group_ids(body)
+        group_id = group_match.group(1)
+        if group_id not in allowed_group_ids:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Facebook group action blocked: group {group_id} is not "
+                    "listed in this exact Loop Contract."
+                ),
+            }, ensure_ascii=False)
+        if not is_join_button:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Facebook group action blocked: this contract permits only "
+                    "the exact Join group button; posting, sharing, typing, and "
+                    "questionnaire actions remain forbidden."
+                ),
+            }, ensure_ascii=False)
+        required_group_id = group_id
+        try:
+            with _kanban_db.connect_closing() as reserve_conn:
+                reserve_error = _kanban_db.reserve_external_group_join(
+                    reserve_conn,
+                    kanban_task_id,
+                    group_id,
+                    expected_run_id=_kanban_worker_run_id(),
+                )
+        except Exception as exc:
+            reserve_error = (
+                "Facebook group join reservation failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if reserve_error:
+            return json.dumps(
+                {"success": False, "error": reserve_error},
+                ensure_ascii=False,
+            )
+        reserved_group_id = group_id
+
+    def _release_known_pre_dispatch(reason: str) -> None:
+        if not reserved_group_id:
+            return
+        try:
+            with _kanban_db.connect_closing() as release_conn:
+                _kanban_db.release_external_group_join_reservation(
+                    release_conn,
+                    kanban_task_id,
+                    reserved_group_id,
+                    expected_run_id=_kanban_worker_run_id(),
+                    reason=reason,
+                )
+        except Exception:
+            # Failing closed means preserving join_started so no blind retry
+            # can occur when release itself is uncertain.
+            pass
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        supervisor = SUPERVISOR_REGISTRY.get(browser_task_id)
+        if supervisor is None:
+            _release_known_pre_dispatch("CDP supervisor is unavailable")
+            return json.dumps({
+                "success": False,
+                "error": "Guarded browser action backend failed closed: "
+                "CDP supervisor is unavailable",
+            }, ensure_ascii=False)
+        with _kanban_db.connect_closing() as dispatch_conn:
+            with _kanban_db.write_txn(dispatch_conn):
+                active = dispatch_conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
+                    "AND current_run_id = ?",
+                    (kanban_task_id, _kanban_worker_run_id()),
+                ).fetchone()
+                if active is None:
+                    raise RuntimeError(
+                        "worker run was revoked before browser dispatch"
+                    )
+                # Hold the writer lease through the complete browser mutation.
+                # Cancellation/completion/reassignment uses the same SQLite
+                # write boundary and cannot interleave after this check.
+                action_result = supervisor.guarded_dom_action(
+                    backend_node_id=int(metadata["backend_node_id"]),
+                    expected_page_identity=page_identity,
+                    action=action,
+                    text=text,
+                    expected_role=str(metadata["role"]),
+                    expected_name=str(metadata["name"]),
+                    required_group_id=required_group_id,
+                )
+    except Exception as exc:
+        with _snapshot_ref_lock:
+            _snapshot_ref_contexts.pop(browser_task_id, None)
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Guarded browser action backend failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }, ensure_ascii=False)
+    with _snapshot_ref_lock:
+        # Snapshot refs are one-shot mutation capabilities. A fresh snapshot
+        # is required even when the exact-node action fails.
+        _snapshot_ref_contexts.pop(browser_task_id, None)
+    if not action_result.get("ok"):
+        if not action_result.get("dispatch_ambiguous"):
+            _release_known_pre_dispatch(
+                str(action_result.get("error") or "pre-dispatch validation failed")
+            )
+        return json.dumps({
+            "success": False,
+            "error": action_result.get("error") or "Guarded browser action failed",
+        }, ensure_ascii=False)
+    return json.dumps({
+        "success": True,
+        "result": action_result.get("result"),
+    }, ensure_ascii=False)
+
+
 def _bind_external_create_page(
     browser_task_id: str,
     guard_conn: Any = None,
@@ -2708,6 +3119,7 @@ def _run_guarded_external_browser_action(
     action: Callable[[Optional[str]], str],
     *,
     atomic_page_check: bool = False,
+    action_holds_own_lease: bool = False,
 ) -> str:
     """Serialize a protected page mutation with the active Kanban run."""
     kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
@@ -2766,11 +3178,26 @@ def _run_guarded_external_browser_action(
                             "retry with a fallback."
                         ),
                     }, ensure_ascii=False)
-                result = action(page_identity)
-                if (
-                    atomic_page_check
-                    and _kanban_db.external_platform_for_url(current_url)
-                ):
+                if not action_holds_own_lease:
+                    result = action(page_identity)
+                    if _kanban_db.external_platform_for_url(current_url):
+                        bind_error = _bind_external_create_page(
+                            browser_task_id,
+                            guard_conn,
+                            require_protected=True,
+                        )
+                        if bind_error:
+                            return json.dumps(
+                                {"success": False, "error": bind_error},
+                                ensure_ascii=False,
+                            )
+                    return result
+            result = action(page_identity)
+            if (
+                atomic_page_check
+                and _kanban_db.external_platform_for_url(current_url)
+            ):
+                with _kanban_db.write_txn(guard_conn):
                     bind_error = _bind_external_create_page(
                         browser_task_id,
                         guard_conn,
@@ -2781,7 +3208,7 @@ def _run_guarded_external_browser_action(
                             {"success": False, "error": bind_error},
                             ensure_ascii=False,
                         )
-                return result
+            return result
     except Exception as exc:
         return json.dumps({
             "success": False,
@@ -3128,8 +3555,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Auto-take a compact snapshot so the model can act immediately
         # without a separate browser_snapshot call.
         try:
+            before_identity = _guarded_snapshot_identity(nav_session_key)
             snap_result = _run_browser_command(nav_session_key, "snapshot", ["-c"])
             if snap_result.get("success"):
+                _remember_snapshot_refs(
+                    nav_session_key,
+                    snap_result,
+                    before_identity,
+                )
                 snap_data = snap_result.get("data", {})
                 snapshot_text = snap_data.get("snapshot", "")
                 refs = snap_data.get("refs", {})
@@ -3177,9 +3610,11 @@ def browser_snapshot(
     if not full:
         args.extend(["-c"])  # Compact mode
 
+    before_identity = _guarded_snapshot_identity(effective_task_id)
     result = _run_browser_command(effective_task_id, "snapshot", args)
 
     if result.get("success"):
+        _remember_snapshot_refs(effective_task_id, result, before_identity)
         data = result.get("data", {})
         snapshot_text = data.get("snapshot", "")
         refs = data.get("refs", {})
@@ -3279,10 +3714,21 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
 
     guarded_result = _run_guarded_external_browser_action(
         effective_task_id,
-        lambda _identity: json.dumps(
-            _run_browser_command(effective_task_id, "click", [ref]),
-            ensure_ascii=False,
+        lambda identity: (
+            _run_atomic_ref_action(
+                effective_task_id,
+                ref,
+                identity,
+                action="click",
+            )
+            if identity
+            else json.dumps(
+                _run_browser_command(effective_task_id, "click", [ref]),
+                ensure_ascii=False,
+            )
         ),
+        atomic_page_check=True,
+        action_holds_own_lease=True,
     )
     try:
         result = json.loads(guarded_result)
@@ -3334,10 +3780,22 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     # Use fill command (clears then types)
     guarded_result = _run_guarded_external_browser_action(
         effective_task_id,
-        lambda _identity: json.dumps(
-            _run_browser_command(effective_task_id, "fill", [ref, text]),
-            ensure_ascii=False,
+        lambda identity: (
+            _run_atomic_ref_action(
+                effective_task_id,
+                ref,
+                identity,
+                action="fill",
+                text=text,
+            )
+            if identity
+            else json.dumps(
+                _run_browser_command(effective_task_id, "fill", [ref, text]),
+                ensure_ascii=False,
+            )
         ),
+        atomic_page_check=True,
+        action_holds_own_lease=True,
     )
     try:
         result = json.loads(guarded_result)
@@ -3479,10 +3937,22 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
         )
     guarded_result = _run_guarded_external_browser_action(
         effective_task_id,
-        lambda _identity: json.dumps(
-            _run_browser_command(effective_task_id, "press", [key]),
-            ensure_ascii=False,
+        lambda identity: (
+            json.dumps({
+                "success": False,
+                "error": (
+                    "Task-bound browser key mutation blocked: no trusted "
+                    "atomic key backend is available; use a fresh snapshot "
+                    "and a contract-approved ref action."
+                ),
+            }, ensure_ascii=False)
+            if identity
+            else json.dumps(
+                _run_browser_command(effective_task_id, "press", [key]),
+                ensure_ascii=False,
+            )
         ),
+        atomic_page_check=True,
     )
     try:
         result = json.loads(guarded_result)
@@ -4403,6 +4873,8 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         with _cleanup_lock:
             _active_sessions.pop(task_id, None)
             _session_last_activity.pop(task_id, None)
+        with _snapshot_ref_lock:
+            _snapshot_ref_contexts.pop(task_id, None)
 
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.

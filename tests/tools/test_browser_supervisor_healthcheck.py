@@ -165,3 +165,48 @@ def test_missing_thread_and_loop_attrs_trigger_recreate(
     assert fresh is not broken
     assert isolated_registry._by_task["t4"] is fresh
     fresh.stop()
+
+
+def test_guarded_action_uses_browser_computed_accessible_name(monkeypatch):
+    supervisor = bs.CDPSupervisor("t-ax", "ws://unused")
+    calls: list[str] = []
+
+    def fake_call(method, params=None, timeout=10.0):
+        calls.append(method)
+        if method == "DOM.resolveNode":
+            return {"ok": True, "result": {"object": {"objectId": "node-1"}}}
+        if method == "Accessibility.getPartialAXTree":
+            return {
+                "ok": True,
+                "result": {
+                    "nodes": [{
+                        "backendDOMNodeId": 44,
+                        "role": {"value": "textbox"},
+                        # This can come from <label for>, aria-labelledby, etc.
+                        "name": {"value": "Email address"},
+                    }],
+                },
+            }
+        return {
+            "ok": True,
+            "result": {"result": {"value": {"ok": True}}},
+        }
+
+    monkeypatch.setattr(supervisor, "call_page_cdp", fake_call)
+
+    result = supervisor.guarded_dom_action(
+        backend_node_id=44,
+        expected_page_identity="https://example.com/form|100",
+        expected_role="textbox",
+        expected_name="Email address",
+        action="fill",
+        text="person@example.com",
+    )
+
+    assert result["ok"] is True
+    assert calls == [
+        "DOM.resolveNode",
+        "Runtime.callFunctionOn",
+        "Accessibility.getPartialAXTree",
+        "Runtime.callFunctionOn",
+    ]

@@ -566,6 +566,397 @@ class CDPSupervisor:
 
         return {"ok": True, "result": value, "result_type": result_type}
 
+    def call_page_cdp(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Send one CDP command to this supervisor's attached page session."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "supervisor loop is not running"}
+        with self._state_lock:
+            if not self._active:
+                return {"ok": False, "error": "supervisor is not active"}
+            session_id = self._page_session_id
+        if not session_id:
+            return {"ok": False, "error": "supervisor has no attached page session"}
+
+        async def _do_call() -> Dict[str, Any]:
+            return await self._cdp(
+                method,
+                params or {},
+                session_id=session_id,
+                timeout=timeout,
+            )
+
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            fut = safe_schedule_threadsafe(_do_call(), loop)
+            if fut is None:
+                return {"ok": False, "error": "Browser supervisor loop unavailable"}
+            response = fut.result(timeout=timeout + 1)
+            return {"ok": True, "result": response.get("result", {})}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def guarded_dom_action(
+        self,
+        *,
+        backend_node_id: int,
+        expected_page_identity: str,
+        action: str,
+        expected_role: str,
+        expected_name: str,
+        required_group_id: Optional[str] = None,
+        text: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Mutate one captured AX node after an in-turn page identity check."""
+        resolved = self.call_page_cdp(
+            "DOM.resolveNode",
+            {"backendNodeId": int(backend_node_id)},
+            timeout=timeout,
+        )
+        if not resolved.get("ok"):
+            return resolved
+        object_id = resolved.get("result", {}).get("object", {}).get("objectId")
+        if not object_id:
+            return {
+                "ok": False,
+                "error": "captured snapshot node is no longer resolvable",
+            }
+        guard_token = f"{time.time_ns()}-{threading.get_ident()}"
+        armed = self.call_page_cdp(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                function(token) {
+                  const prior = this.__hermesAtomicGuard;
+                  if (prior?.observer) prior.observer.disconnect();
+                  if (prior?.listener && prior?.eventTypes) {
+                    for (const type of prior.eventTypes) {
+                      window.removeEventListener(type, prior.listener, true);
+                    }
+                  }
+                  const state = {token, dirty: false, observer: null};
+                  state.observer = new MutationObserver(() => {
+                    state.dirty = true;
+                  });
+                  const targets = [this];
+                  const labelledBy = (
+                    this.getAttribute("aria-labelledby") || ""
+                  ).split(/\\s+/).filter(Boolean);
+                  for (const id of labelledBy) {
+                    const target = this.ownerDocument.getElementById(id);
+                    if (target) targets.push(target);
+                  }
+                  if (this.id) {
+                    for (const label of this.ownerDocument.querySelectorAll(
+                      `label[for="${CSS.escape(this.id)}"]`
+                    )) targets.push(label);
+                  }
+                  const wrappingLabel = this.closest?.("label");
+                  if (wrappingLabel) targets.push(wrappingLabel);
+                  for (const target of new Set(targets)) {
+                    state.observer.observe(target, {
+                      subtree: true,
+                      childList: true,
+                      attributes: true,
+                      characterData: true
+                    });
+                  }
+                  Object.defineProperty(this, "__hermesAtomicGuard", {
+                    value: state, configurable: true
+                  });
+                  return true;
+                }
+                """,
+                "arguments": [{"value": guard_token}],
+                "returnByValue": True,
+            },
+            timeout=timeout,
+        )
+        if not armed.get("ok"):
+            return armed
+        arm_payload = armed.get("result", {})
+        if arm_payload.get("exceptionDetails"):
+            return {
+                "ok": False,
+                "error": "failed to arm exact-node mutation guard",
+            }
+
+        def _cleanup_guard() -> None:
+            self.call_page_cdp(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """
+                    function(token) {
+                      const guard = this.__hermesAtomicGuard;
+                      if (guard?.token === token) {
+                        if (guard.listener && guard.eventTypes) {
+                          for (const type of guard.eventTypes) {
+                            window.removeEventListener(
+                              type, guard.listener, true
+                            );
+                          }
+                        }
+                        guard.observer?.disconnect();
+                        delete this.__hermesAtomicGuard;
+                      }
+                    }
+                    """,
+                    "arguments": [{"value": guard_token}],
+                },
+                timeout=timeout,
+            )
+
+        live_ax = self.call_page_cdp(
+            "Accessibility.getPartialAXTree",
+            {
+                "backendNodeId": int(backend_node_id),
+                "fetchRelatives": False,
+            },
+            timeout=timeout,
+        )
+        if not live_ax.get("ok"):
+            _cleanup_guard()
+            return live_ax
+        live_nodes = live_ax.get("result", {}).get("nodes", [])
+        live_node = next(
+            (
+                node for node in live_nodes
+                if int(node.get("backendDOMNodeId") or 0)
+                == int(backend_node_id)
+                and not node.get("ignored")
+            ),
+            None,
+        )
+        normalize = lambda value: " ".join(str(value or "").split()).casefold()
+        live_role = (
+            live_node.get("role", {}).get("value") if live_node else None
+        )
+        live_name = (
+            live_node.get("name", {}).get("value") if live_node else None
+        )
+        if (
+            live_node is None
+            or normalize(live_role) != normalize(expected_role)
+            or normalize(live_name) != normalize(expected_name)
+        ):
+            _cleanup_guard()
+            return {
+                "ok": False,
+                "error": (
+                    "Captured snapshot node semantics changed before "
+                    "atomic action"
+                ),
+            }
+        if action == "click":
+            clicked = self.call_page_cdp(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """
+                    function(expected, token, requiredGroupId) {
+                      const guard = this.__hermesAtomicGuard;
+                      const fail = message => {
+                        guard?.observer?.disconnect();
+                        if (guard?.token === token) {
+                          delete this.__hermesAtomicGuard;
+                        }
+                        throw new Error(message);
+                      };
+                      const identity = () =>
+                        `${location.href}|${performance.timeOrigin}`;
+                      const targetAt = (x, y) => {
+                        const hit = this.ownerDocument.elementFromPoint(x, y);
+                        return hit === this || (hit && this.contains(hit));
+                      };
+                      if (
+                        !guard
+                        || guard.token !== token
+                        || guard.dirty
+                        || guard.observer.takeRecords().length
+                      ) fail("Captured snapshot node changed after validation");
+                      if (identity() !== expected || !this.isConnected) {
+                        fail("Protected page load changed before atomic click");
+                      }
+                      const rect = this.getBoundingClientRect();
+                      const x = rect.left + rect.width / 2;
+                      const y = rect.top + rect.height / 2;
+                      const style = getComputedStyle(this);
+                      if (
+                        rect.width <= 0 || rect.height <= 0
+                        || x < 0 || y < 0
+                        || x > innerWidth || y > innerHeight
+                        || style.display === "none"
+                        || style.visibility === "hidden"
+                        || style.pointerEvents === "none"
+                        || Number(style.opacity) === 0
+                        || this.disabled
+                        || this.getAttribute("aria-disabled") === "true"
+                        || !targetAt(x, y)
+                      ) fail("Captured snapshot node is not interactable");
+                      if (requiredGroupId) {
+                        const match = location.pathname.match(
+                          /^\\/groups\\/([0-9]+)(?:\\/|$)/
+                        );
+                        if (
+                          !match
+                          || match[1] !== String(requiredGroupId)
+                        ) {
+                          fail(
+                            "Current route is not the authorized group"
+                          );
+                        }
+                      }
+                      guard.observer.disconnect();
+                      delete this.__hermesAtomicGuard;
+                      // The hit test, page identity check, group binding, and
+                      // dispatch run in one renderer task. This cannot click a
+                      // replacement document between separate CDP calls.
+                      this.click();
+                      return {
+                        ok: true, action: "click", pageIdentity: expected
+                      };
+                    }
+                    """,
+                    "arguments": [
+                        {"value": expected_page_identity},
+                        {"value": guard_token},
+                        {"value": required_group_id},
+                    ],
+                    "returnByValue": True,
+                    "userGesture": True,
+                },
+                timeout=timeout,
+            )
+            if not clicked.get("ok"):
+                _cleanup_guard()
+                clicked["dispatch_ambiguous"] = True
+                return clicked
+            payload = clicked.get("result", {})
+            exception = payload.get("exceptionDetails")
+            if exception:
+                return {
+                    "ok": False,
+                    "error": (
+                        exception.get("exception", {}).get("description")
+                        or exception.get("text")
+                        or "guarded atomic click failed"
+                    ),
+                }
+            return {
+                "ok": True,
+                "result": payload.get("result", {}).get("value"),
+            }
+        function_declaration = """
+        function(expected, action, text, token) {
+          const guard = this.__hermesAtomicGuard;
+          const fail = message => {
+            guard?.observer?.disconnect();
+            if (guard?.token === token) delete this.__hermesAtomicGuard;
+            throw new Error(message);
+          };
+          const actual = `${location.href}|${performance.timeOrigin}`;
+          if (actual !== expected) {
+            fail("Protected page load changed before atomic action");
+          }
+          if (!this.isConnected) {
+            fail("Captured snapshot node is detached");
+          }
+          if (
+            !guard
+            || guard.token !== token
+            || guard.dirty
+            || guard.observer.takeRecords().length
+          ) {
+            fail("Captured snapshot node changed after semantic validation");
+          }
+          if (action === "fill") {
+            const proto = this instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype
+              : this instanceof HTMLInputElement
+                ? HTMLInputElement.prototype
+                : null;
+            const setter = proto
+              && Object.getOwnPropertyDescriptor(proto, "value")?.set;
+            this.focus();
+            if (
+              `${location.href}|${performance.timeOrigin}` !== expected
+              || !this.isConnected
+              || guard.dirty
+              || guard.observer.takeRecords().length
+            ) {
+              fail("Fill target changed while receiving focus");
+            }
+            guard.observer.disconnect();
+            delete this.__hermesAtomicGuard;
+            if (this.isContentEditable) {
+              this.textContent = String(text ?? "");
+              this.dispatchEvent(new InputEvent("input", {
+                bubbles: true,
+                inputType: "insertText",
+                data: String(text ?? "")
+              }));
+              this.dispatchEvent(new Event("change", {bubbles: true}));
+            } else if (!setter) {
+              throw new Error("Guarded fill target has no native value setter");
+            } else {
+              setter.call(this, String(text ?? ""));
+              this.dispatchEvent(new InputEvent("input", {
+                bubbles: true, inputType: "insertText", data: String(text ?? "")
+              }));
+              this.dispatchEvent(new Event("change", {bubbles: true}));
+            }
+          } else {
+            fail(`Unsupported guarded action ${action}`);
+          }
+          return {ok: true, action, pageIdentity: actual};
+        }
+        """
+        called = self.call_page_cdp(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "arguments": [
+                    {"value": expected_page_identity},
+                    {"value": action},
+                    {"value": text},
+                    {"value": guard_token},
+                ],
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": True,
+            },
+            timeout=timeout,
+        )
+        if not called.get("ok"):
+            _cleanup_guard()
+            return called
+        payload = called.get("result", {})
+        exception = payload.get("exceptionDetails")
+        if exception:
+            return {
+                "ok": False,
+                "error": (
+                    exception.get("exception", {}).get("description")
+                    or exception.get("text")
+                    or "guarded DOM action failed"
+                ),
+            }
+        return {
+            "ok": True,
+            "result": payload.get("result", {}).get("value"),
+        }
+
     # ── Supervisor loop internals ────────────────────────────────────────────
 
     def _thread_main(self) -> None:

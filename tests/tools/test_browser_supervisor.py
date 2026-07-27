@@ -133,6 +133,10 @@ def _test_page_url() -> str:
     html = """<!doctype html>
 <html><head><title>Supervisor pytest</title></head><body>
 <h1>Supervisor pytest</h1>
+<button aria-label="Join group" onclick="window.__joined = true">
+  Join group
+</button>
+<div role="textbox" aria-label="Draft body" contenteditable="true"></div>
 <iframe id="inner" srcdoc="<body><h2>frame-marker</h2></body>" width="400" height="100"></iframe>
 </body></html>"""
     return "data:text/html;base64," + base64.b64encode(html.encode()).decode()
@@ -213,6 +217,89 @@ def test_supervisor_start_and_snapshot(chrome_cdp, supervisor_registry):
     assert snap.pending_dialogs == ()
     # At minimum a top frame should exist after the navigate.
     assert snap.frame_tree.get("top") is not None
+
+
+def test_guarded_dom_action_revalidates_semantics_and_contenteditable(
+    chrome_cdp,
+    supervisor_registry,
+):
+    cdp_url, _port = chrome_cdp
+    supervisor = supervisor_registry.get_or_start(
+        task_id="pytest-guarded-dom",
+        cdp_url=cdp_url,
+    )
+    _fire_on_page(cdp_url, "void 0")
+    identity_result = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": "`${location.href}|${performance.timeOrigin}`",
+            "returnByValue": True,
+        },
+    )
+    identity = identity_result["result"]["result"]["value"]
+    ax_result = supervisor.call_page_cdp("Accessibility.getFullAXTree")
+    nodes = ax_result["result"]["nodes"]
+
+    def backend_id(role, name):
+        return next(
+            node["backendDOMNodeId"]
+            for node in nodes
+            if node.get("role", {}).get("value") == role
+            and node.get("name", {}).get("value") == name
+        )
+
+    clicked = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("button", "Join group"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Join group",
+        action="click",
+    )
+    assert clicked["ok"] is True
+
+    filled = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("textbox", "Draft body"),
+        expected_page_identity=identity,
+        expected_role="textbox",
+        expected_name="Draft body",
+        action="fill",
+        text="guarded content",
+    )
+    assert filled["ok"] is True
+    readback = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": (
+                "({joined: window.__joined === true, "
+                "draft: document.querySelector('[contenteditable]').textContent})"
+            ),
+            "returnByValue": True,
+        },
+    )
+    assert readback["result"]["result"]["value"] == {
+        "joined": True,
+        "draft": "guarded content",
+    }
+
+    changed = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": (
+                "document.querySelector('button').setAttribute("
+                "'aria-label', 'Publish')"
+            ),
+        },
+    )
+    assert changed["ok"] is True
+    rejected = supervisor.guarded_dom_action(
+        backend_node_id=backend_id("button", "Join group"),
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Join group",
+        action="click",
+    )
+    assert rejected["ok"] is False
+    assert "semantics changed" in rejected["error"]
 
 
 def test_main_frame_alert_detection_and_dismiss(chrome_cdp, supervisor_registry):
