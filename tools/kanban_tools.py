@@ -732,6 +732,14 @@ def _handle_block(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
+    # Evidence field: the worker's falsification record (per Article XII P5 +
+    # Article XIV P2). The runtime block_task() rejects empty evidence on
+    # non-dependency blocks; we surface a clearer error here too. The
+    # redact_sensitive_text pass is also applied so an SSH-key fingerprint
+    # or token-shaped string the worker pastes in cannot leak.
+    evidence = args.get("evidence")
+    if evidence is not None:
+        evidence = redact_sensitive_text(str(evidence), force=True)
     kind = args.get("kind")
     board = args.get("board")
     try:
@@ -770,6 +778,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                evidence=evidence,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1663,6 +1672,22 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "evidence": {
+                "type": "string",
+                "description": (
+                    "Required for non-dependency blocks. The falsification "
+                    "record: the command/observation you ran to verify the "
+                    "blocking condition, the result you observed, and the "
+                    "conclusion that the blocker is real. Example: 'ran "
+                    "ssh-add ~/.ssh/id_ed25519_macbook_pro; result: key "
+                    "loaded successfully; the SSH key is available, so the "
+                    "blocker is the same tool's BatchMode option, not the "
+                    "key itself.' The runtime rejects empty/missing evidence "
+                    "on non-dependency blocks — the 2026-07-19 incident "
+                    "(false 'Blocked on SSH key' when the key was loadable) "
+                    "is structurally impossible without this field."
                 ),
             },
             "board": _board_schema_prop(),
