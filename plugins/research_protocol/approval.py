@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
+from tools.thread_context import propagate_context_to_thread
 
 from .models import BudgetLimits, Capability, ExternalRight
 from .models.base import Sha256, StrictContract
@@ -125,7 +126,8 @@ class ApprovalService:
     async def request(
         self, scope: ApprovalScope, summary: str
     ) -> ApprovalRecord | None:
-        decision = await asyncio.to_thread(request_workflow_approval, scope, summary)
+        request_with_context = propagate_context_to_thread(request_workflow_approval)
+        decision = await asyncio.to_thread(request_with_context, scope, summary)
         verdict = (
             ApprovalVerdict.APPROVED
             if decision is WorkflowApprovalDecision.ACCEPT

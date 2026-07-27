@@ -142,6 +142,50 @@ def test_approval_service_does_not_block_the_async_event_loop(monkeypatch):
     asyncio.run(exercise())
 
 
+def test_approval_service_propagates_cli_callback_to_native_consent_thread(
+    monkeypatch,
+):
+    from tools import terminal_tool
+
+    parent_thread_id = threading.get_ident()
+    callback_observations = []
+
+    def approve_once(_message, _description, **kwargs):
+        callback_observations.append(
+            (threading.get_ident(), terminal_tool._get_approval_callback(), kwargs)
+        )
+        return "once"
+
+    monkeypatch.setattr(
+        "tools.approval._is_gateway_approval_context",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "prompt_toolkit.application.current.get_app_or_none",
+        lambda: object(),
+    )
+    previous_callback = terminal_tool._get_approval_callback()
+    terminal_tool.set_approval_callback(approve_once)
+    try:
+        store = RecordingApprovalStore()
+        result = asyncio.run(
+            ApprovalService(store=store).request(make_scope(), "bounded summary")
+        )
+    finally:
+        terminal_tool.set_approval_callback(previous_callback)
+
+    assert len(callback_observations) == 1
+    worker_thread_id, visible_callback, callback_kwargs = callback_observations[0]
+    assert worker_thread_id != parent_thread_id
+    assert visible_callback is approve_once
+    assert callback_kwargs == {"allow_permanent": False}
+    assert len(store.records) == 1
+    assert result is not None
+    assert result is store.records[0]
+    assert result.verdict is ApprovalVerdict.APPROVED
+    assert store.records[0].verdict is ApprovalVerdict.APPROVED
+
+
 def test_approval_service_persists_expired_denial_with_exact_scope(monkeypatch):
     monkeypatch.setattr(
         "plugins.research_protocol.approval.request_workflow_approval",
