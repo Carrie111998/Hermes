@@ -11,6 +11,7 @@ The HA instance URL is read from ``HASS_URL`` (default: http://homeassistant.loc
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -279,6 +280,30 @@ def _handle_call_service(args: dict, **kw) -> str:
             data = json.loads(data) if data.strip() else None
         except json.JSONDecodeError as e:
             return tool_error(f"Invalid JSON string in 'data' parameter: {e}")
+
+    hass_url, _ = _get_config()
+    request_scope = {
+        "hass_url": hass_url,
+        "domain": domain,
+        "service": service,
+        "entity_id": entity_id,
+        "data": data or {},
+    }
+    resource = "homeassistant-service:" + hashlib.sha256(
+        json.dumps(
+            request_scope, sort_keys=True, separators=(",", ":"), default=str
+        ).encode()
+    ).hexdigest()
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    try:
+        authorize_worker_action(
+            capability="homeassistant.call_service",
+            system="homeassistant",
+            target_resource=resource,
+        )
+    except Exception as exc:
+        return tool_error(f"Home Assistant authorization denied: {exc}")
 
     try:
         result = _run_async(_async_call_service(domain, service, entity_id, data))

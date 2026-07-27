@@ -38,6 +38,53 @@ SAMPLE_STATES = [
 ]
 
 
+def test_homeassistant_service_authorization_is_payload_scoped(monkeypatch):
+    calls = []
+
+    def record(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", record
+    )
+    def fake_run(coro):
+        coro.close()
+        return {"success": True}
+
+    monkeypatch.setattr("tools.homeassistant_tool._run_async", fake_run)
+
+    _handle_call_service(
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "entity_id": "light.bedroom",
+            "data": {"brightness": 100},
+        }
+    )
+
+    assert calls[0][0:2] == ("homeassistant.call_service", "homeassistant")
+    assert calls[0][2].startswith("homeassistant-service:")
+
+
+def test_homeassistant_denial_happens_before_service_dispatch(monkeypatch):
+    def reject(*_args, **_kwargs):
+        raise RuntimeError("home assistant authority denied")
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", reject
+    )
+    dispatch = patch("tools.homeassistant_tool._run_async")
+    with dispatch as run_async:
+        result = json.loads(
+            _handle_call_service(
+                {"domain": "light", "service": "turn_on", "entity_id": "light.bedroom"}
+            )
+        )
+
+    assert "authorization denied" in result["error"]
+    run_async.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Entity filtering and summarization
 # ---------------------------------------------------------------------------
