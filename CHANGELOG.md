@@ -254,3 +254,6 @@ recorded.
 - `3f91ce6344150885a0e74ec961565c7190fa56c2` — made company-email send
   recording explicitly idempotent and payload-bound, returning the original
   operation for true retries and rejecting changed recipients or content.
+- `4523d7c42844473497d12deae9679e3153230dec` — bound compute-cost
+  reconciliation retries to provider, model, reference, amount, status, and
+  exact evidence, rejecting changed settlement identity.
