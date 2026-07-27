@@ -36,6 +36,8 @@ acceptance evidence.
 - Desktop computer-use actions are governed per operation and desktop session;
   detached workers cannot obtain UI authority from an interactive approval
   callback or an unrestricted computer-use toolset.
+- Dynamic MCP tools and resource/prompt utilities are governed per server and
+  tool, with URI or prompt-name scope for parameterized utility calls.
 - Grant admission requires the delegator employee and mandate to be active at
   issuance time; suspended or expired managers cannot create new authority.
 - Parent-grant delegation is bounded to the same objective and action type,

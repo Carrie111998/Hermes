@@ -1334,6 +1334,32 @@ passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production desktop-driver isolation or external authorization.
 
+## Dynamic MCP authority evidence (7ac13d16a3)
+
+MCP tools are dynamically registered, so their handlers now enforce
+`mcp.call` against an exact resource such as
+`mcp-server:<server>:tool:<tool>`. Resource reads and prompt retrieval add the
+requested URI or prompt name to the scope. The authorization check runs before
+transport lookup or RPC dispatch, preventing an advertised MCP tool from
+becoming an ungoverned side-effect route.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/mcp_tool.py tests/tools/test_mcp_tool.py
+uv run --extra dev pytest -q \
+  tests/tools/test_mcp_tool.py \
+  tests/tools/test_mcp_capability_gating.py \
+  tests/tools/test_mcp_utility_capability_gating.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **253 tests passed, ruff passed, and current-tree agentic acceptance
+passed**. The acceptance image manifest digest was
+`sha256:8d6d1c193db2d8dc224fe9cd4a310006084eb94b8a9a2b5b29361fdcdef04ba8`.
+This remains deterministic local-provider evidence and does not establish
+production MCP-server trust or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

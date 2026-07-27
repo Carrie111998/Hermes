@@ -48,6 +48,10 @@
 - Desktop `computer_use` actions now require exact `computer.<operation>`
   permits bound to a desktop session. Governed workers use the permit as their
   execution authority instead of relying on an ambient interactive approval.
+- Dynamically discovered MCP tools and MCP resource/prompt utilities now
+  require `mcp.call` permits bound to the exact configured server and tool
+  (plus URI or prompt name where applicable); MCP cannot bypass the authority
+  plane merely because a server advertises a tool.
 - Grant admission now requires the delegator employee and mandate to be
   active; suspended or expired managers cannot issue new authority.
 - Delegated grants now persist an immutable `parent_grant_id`; authority
