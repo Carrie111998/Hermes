@@ -414,6 +414,9 @@ old split as its whole contract. Rewritten rather than deleted, as
 `test_dispatch_selection_owns_created_and_queued`, and extended to prove the
 reservation is atomic and that a second claim on a live-claimed row is refused.
 
+Commits: `c03fe6360` (the handover), `fc8e133d4` (update hardening),
+`673f36a18` (failure classification).
+
 **Rollback**, if auto-dispatch misbehaves under the guards: revert the handover
 commit and the thin dispatcher resumes on the next gateway restart — its body is
 intact and the production plugin was never modified.
