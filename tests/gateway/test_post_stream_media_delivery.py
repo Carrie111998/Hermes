@@ -19,7 +19,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _collect_history_media_paths
 from gateway.session import SessionSource
 
 
@@ -144,3 +144,57 @@ async def test_explicit_media_document_still_delivers_post_stream(tmp_path, monk
         file_path=str(media_file),
         metadata={},
     )
+
+
+@pytest.mark.asyncio
+async def test_post_stream_skips_media_already_in_history(tmp_path, monkeypatch):
+    """Streaming already_sent path must build history_media_paths locally.
+
+    The non-streaming set lives in ``_process_message_background`` and is out
+    of scope when ``already_sent`` short-circuits. Referencing that unbound
+    name used to raise NameError after every successful streamed turn
+    (commonly the first message after ``/compress``).
+    """
+    old = _allowed_media_path(tmp_path, monkeypatch, "old.png")
+    new = _allowed_media_path(tmp_path, monkeypatch, "new.png")
+    adapter = _adapter()
+    history = [
+        {"role": "assistant", "content": f"Earlier chart MEDIA:{old}"},
+    ]
+    # Same construction as the already_sent block in _handle_message_with_agent.
+    history_media_paths = _collect_history_media_paths(history or [])
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"Echo MEDIA:{old}\nFresh MEDIA:{new}",
+        _event(),
+        adapter,
+        history_media_paths=history_media_paths,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once()
+    images_kwargs = adapter.send_multiple_images.await_args.kwargs
+    delivered = [path for path, _caption in images_kwargs["images"]]
+    assert any(str(new) in path for path in delivered)
+    assert not any(str(old) in path for path in delivered)
+
+
+@pytest.mark.asyncio
+async def test_post_stream_history_media_paths_empty_history_still_delivers(
+    tmp_path, monkeypatch
+):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "solo.png")
+    adapter = _adapter()
+    history_media_paths = _collect_history_media_paths([])
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"Here MEDIA:{media_file}",
+        _event(),
+        adapter,
+        history_media_paths=history_media_paths,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once()
+    images_kwargs = adapter.send_multiple_images.await_args.kwargs
+    assert str(media_file) in images_kwargs["images"][0][0]
