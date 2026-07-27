@@ -43,6 +43,10 @@ _RELEASE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SUDOERS_RELEASE_PATH = re.compile(
     rb"/opt/muncho-trusted-observation/releases/([0-9a-f]{40})/"
 )
+_SUDOERS_STAGING_RELEASE_PATH = re.compile(
+    rb"/opt/muncho-trusted-observation/releases/"
+    rb"\.([0-9a-f]{40})\.bootstrap/"
+)
 
 
 class TrustedSignerStage0Error(RuntimeError):
@@ -189,8 +193,18 @@ def _exact_directory(path: Path, *, mode: int) -> Mapping[str, Any]:
     return {"path": str(path), "uid": 0, "gid": 0, "mode": f"{mode:04o}"}
 
 
-def _render_sudoers(release: Path) -> bytes:
-    source = release / HOST_SUDOERS_TEMPLATE
+def _render_sudoers(
+    source_release: Path,
+    *,
+    command_release: Path | None = None,
+) -> bytes:
+    selected_release = command_release or source_release
+    if (
+        source_release.parent != HOST_RELEASE_BASE
+        or selected_release.parent != HOST_RELEASE_BASE
+    ):
+        _error("trusted_signer_stage0_sudoers_invalid")
+    source = source_release / HOST_SUDOERS_TEMPLATE
     raw = stage0._read_regular(
         source,
         maximum=64 * 1024,
@@ -200,10 +214,15 @@ def _render_sudoers(release: Path) -> bytes:
     placeholder = b"@RELEASE_SHA@"
     if raw.count(placeholder) < 1:
         _error("trusted_signer_stage0_sudoers_invalid")
-    rendered = raw.replace(placeholder, release.name.encode("ascii"))
+    rendered = raw.replace(
+        placeholder,
+        selected_release.name.encode("ascii"),
+    )
     if b"@" in rendered or b"/usr/bin/python3" in rendered or b"\r" in rendered:
         _error("trusted_signer_stage0_sudoers_invalid")
-    expected_prefix = str(release / "venv/bin/python").encode("ascii")
+    expected_prefix = str(selected_release / "venv/bin/python").encode(
+        "ascii"
+    )
     if expected_prefix not in rendered:
         _error("trusted_signer_stage0_sudoers_invalid")
     return rendered
@@ -273,14 +292,17 @@ def _validate_predecessor_sudoers(
     successor_release: Path,
 ) -> Path:
     revisions = set(_SUDOERS_RELEASE_PATH.findall(raw))
+    staging_revisions = set(_SUDOERS_STAGING_RELEASE_PATH.findall(raw))
     if (
         successor_release.parent != HOST_RELEASE_BASE
         or _RELEASE_REVISION.fullmatch(successor_release.name) is None
-        or len(revisions) != 1
+        or (len(revisions), len(staging_revisions)) not in {(1, 0), (0, 1)}
     ):
         _error("trusted_signer_stage0_sudoers_conflict")
     try:
-        predecessor_revision = next(iter(revisions)).decode(
+        predecessor_revision = next(
+            iter(revisions or staging_revisions)
+        ).decode(
             "ascii", errors="strict"
         )
     except UnicodeError:
@@ -290,8 +312,18 @@ def _validate_predecessor_sudoers(
         state = predecessor.lstat()
     except OSError as exc:
         _error("trusted_signer_stage0_sudoers_conflict", exc)
+    broken_staging = (
+        HOST_RELEASE_BASE / f".{predecessor_revision}.bootstrap"
+        if staging_revisions
+        else None
+    )
+    if broken_staging is not None and os.path.lexists(broken_staging):
+        _error("trusted_signer_stage0_sudoers_conflict")
     try:
-        expected_payload = _render_sudoers(predecessor)
+        expected_payload = _render_sudoers(
+            predecessor,
+            command_release=broken_staging,
+        )
     except TrustedSignerStage0Error as exc:
         _error("trusted_signer_stage0_sudoers_conflict", exc)
     if (
@@ -806,9 +838,9 @@ def _install_host_offline_runtime_locked(
         runner=stage0_runner,
     )
     revision = str(manifest["release_revision"])
-    sudoers_payload = _render_sudoers(staging)
     release_evidence = _seal_release(staging, revision=revision)
     final = HOST_RELEASE_BASE / revision
+    sudoers_payload = _render_sudoers(final)
     sudoers_evidence = _install_sudoers(
         sudoers_payload,
         successor_release=final,

@@ -200,6 +200,10 @@ def test_predecessor_sudoers_must_match_one_immutable_managed_release(
         b"@RELEASE_SHA@",
         predecessor_revision.encode("ascii"),
     )
+    broken_staging = rendered.replace(
+        f"/releases/{predecessor_revision}/".encode("ascii"),
+        f"/releases/.{predecessor_revision}.bootstrap/".encode("ascii"),
+    )
     real_lstat = Path.lstat
 
     def root_lstat(path: Path) -> SimpleNamespace:
@@ -218,10 +222,22 @@ def test_predecessor_sudoers_must_match_one_immutable_managed_release(
     monkeypatch.setattr(stage0, "HOST_RELEASE_BASE", release_base)
     monkeypatch.setattr(Path, "lstat", root_lstat)
     monkeypatch.setattr(stage0.stage0, "_read_regular", root_reader)
-    monkeypatch.setattr(stage0, "_render_sudoers", lambda _release: rendered)
+
+    def render(
+        _release: Path,
+        *,
+        command_release: Path | None = None,
+    ) -> bytes:
+        return broken_staging if command_release is not None else rendered
+
+    monkeypatch.setattr(stage0, "_render_sudoers", render)
 
     assert stage0._validate_predecessor_sudoers(
         rendered,
+        successor_release=release_base / successor_revision,
+    ) == predecessor
+    assert stage0._validate_predecessor_sudoers(
+        broken_staging,
         successor_release=release_base / successor_revision,
     ) == predecessor
 
