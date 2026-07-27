@@ -10,6 +10,15 @@ from hermes_cli import (
 )
 
 
+def test_compensation_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    compensation.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    compensation.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 class SagaPlanner:
     identity = "employee:ceo"
 
