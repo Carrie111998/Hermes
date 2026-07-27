@@ -48,9 +48,19 @@ from agent.context_engine import (
     sanitize_memory_context,
 )
 from agent.model_metadata import estimate_request_tokens_rough
-from agent.session_activity import ActivityProvenance
+from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
+
+# Terminal compression outcomes published by host/hygiene timeout or cooldown
+# writers. Detached heartbeat workers must not clobber these back to
+# agent.compression after cancel (otherwise timeout is unobservable).
+_TERMINAL_COMPRESSION_PROVENANCES = frozenset(
+    {
+        ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+        ActivityProvenance.AGENT_COMPRESSION_COOLDOWN,
+    }
+)
 
 # Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
 # status as ``kind="compacting"`` (tui_gateway/server.py::_status_update), so
@@ -778,7 +788,9 @@ class _CompressionActivityHeartbeat:
         )
 
     def start(self) -> "_CompressionActivityHeartbeat":
-        self._touch("context compression started")
+        # A new compression episode always republishes agent.compression even
+        # if a prior timeout/cooldown stamp is still on the agent.
+        self._touch("context compression started", allow_terminal_overwrite=True)
         self._thread.start()
         return self
 
@@ -788,8 +800,14 @@ class _CompressionActivityHeartbeat:
             self._thread.join(timeout=1.0)
         self._touch(desc)
 
-    def _touch(self, desc: str) -> None:
+    def _touch(self, desc: str, *, allow_terminal_overwrite: bool = False) -> None:
         try:
+            if not allow_terminal_overwrite:
+                current = normalize_activity_provenance(
+                    getattr(self._agent, "_last_activity_provenance", None)
+                )
+                if current in _TERMINAL_COMPRESSION_PROVENANCES:
+                    return
             touch = getattr(self._agent, "_touch_activity", None)
             if callable(touch):
                 touch(desc, provenance=ActivityProvenance.AGENT_COMPRESSION)
