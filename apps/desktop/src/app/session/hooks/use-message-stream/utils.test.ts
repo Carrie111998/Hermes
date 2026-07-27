@@ -1,16 +1,68 @@
 import { describe, expect, it } from 'vitest'
 
-import type { GatewayEventPayload } from '@/lib/chat-messages'
+import type { ChatMessage, GatewayEventPayload } from '@/lib/chat-messages'
 
 import {
   completionErrorText,
   delegateTaskPayloads,
   hasSessionInfoStatePatch,
   sessionInfoStatePatch,
+  settleOrphanedToolMessages,
+  settleOrphanedToolParts,
   toTodoPayload
 } from './utils'
 
 const payload = (over: Record<string, unknown>): GatewayEventPayload => over as GatewayEventPayload
+
+describe('settleOrphanedToolParts', () => {
+  it('settles only tool calls that never received a completion event', () => {
+    const pending = { type: 'tool-call', toolCallId: 'pending', toolName: 'patch', args: {} } as const
+    const completed = {
+      type: 'tool-call',
+      toolCallId: 'completed',
+      toolName: 'patch',
+      args: {},
+      result: { success: true }
+    } as const
+
+    const [settledPending, settledCompleted] = settleOrphanedToolParts([pending, completed])
+
+    expect(settledPending).toMatchObject({ isError: true, result: { error: expect.stringContaining('completion') } })
+    expect(settledCompleted).toBe(completed)
+  })
+
+  it('preserves the parts array when every tool already has a terminal result', () => {
+    const parts = [
+      { type: 'tool-call', toolCallId: 'null-result', toolName: 'patch', args: {}, result: null }
+    ] as ChatMessage['parts']
+
+    expect(settleOrphanedToolParts(parts)).toBe(parts)
+  })
+})
+
+describe('settleOrphanedToolMessages', () => {
+  it('settles a tool in a sealed interim bubble even when the final answer uses another bubble', () => {
+    const interim = {
+      id: 'interim',
+      role: 'assistant',
+      interim: true,
+      parts: [{ type: 'tool-call', toolCallId: 'pending', toolName: 'patch', args: {} }]
+    } as ChatMessage
+    const final = { id: 'final', role: 'assistant', parts: [{ type: 'text', text: 'Done' }] } as ChatMessage
+
+    const settled = settleOrphanedToolMessages([interim, final])
+
+    expect(settled[0]).not.toBe(interim)
+    expect(settled[0].parts[0]).toMatchObject({ isError: true })
+    expect(settled[1]).toBe(final)
+  })
+
+  it('preserves transcript identity when there are no orphaned tools', () => {
+    const messages = [{ id: 'final', role: 'assistant', parts: [{ type: 'text', text: 'Done' }] }] as ChatMessage[]
+
+    expect(settleOrphanedToolMessages(messages)).toBe(messages)
+  })
+})
 
 describe('completionErrorText', () => {
   it('flags provider/HTTP/retry failures, ignores normal text', () => {

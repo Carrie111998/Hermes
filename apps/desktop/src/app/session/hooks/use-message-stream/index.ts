@@ -29,7 +29,13 @@ import { setSessionTodos } from '@/store/todos'
 import type { ClientSessionState } from '../../../types'
 
 import { useGatewayEventHandler } from './gateway-event'
-import { completionErrorText, delegateTaskPayloads, MAX_STREAM_FLUSH_GAP_MS, STREAM_DELTA_FLUSH_MS } from './utils'
+import {
+  completionErrorText,
+  delegateTaskPayloads,
+  MAX_STREAM_FLUSH_GAP_MS,
+  settleOrphanedToolMessages,
+  STREAM_DELTA_FLUSH_MS
+} from './utils'
 
 interface MessageStreamOptions {
   activeGatewayProfile?: string
@@ -504,12 +510,12 @@ export function useMessageStream({
           const settled = { ...message, pending: false, interim: false }
 
           if (completionError && !keepFailedPartialText) {
-            return { ...settled, error: completionError, parts: message.parts.filter(part => part.type !== 'text') }
+            return { ...settled, error: completionError, parts: settled.parts.filter(part => part.type !== 'text') }
           }
 
           return {
             ...settled,
-            parts: replaceTextPart(message.parts),
+            parts: replaceTextPart(settled.parts),
             ...(completionError ? { error: completionError } : {})
           }
         }
@@ -522,7 +528,7 @@ export function useMessageStream({
           ...(completionError && { error: completionError })
         })
 
-        const prev = state.messages
+        const prev = settleOrphanedToolMessages(state.messages)
         let nextMessages = prev
 
         if (streamId && prev.some(m => m.id === streamId)) {

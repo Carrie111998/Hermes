@@ -1,4 +1,4 @@
-import type { GatewayEventPayload } from '@/lib/chat-messages'
+import type { ChatMessage, ChatMessagePart, GatewayEventPayload } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 
 import type { ClientSessionState } from '../../../types'
@@ -85,6 +85,49 @@ export function completionErrorText(finalText: string): string | null {
   const text = finalText.trim()
 
   return text && COMPLETION_ERROR_PATTERNS.some(re => re.test(text)) ? text : null
+}
+
+// A terminal message event is authoritative: no tool may remain running after
+// it. If a tool.complete event was dropped during reconnect or shutdown, settle
+// that orphan explicitly instead of leaving the Desktop card spinning forever.
+export function settleOrphanedToolParts(parts: ChatMessagePart[]): ChatMessagePart[] {
+  let changed = false
+  const settled = parts.map(part => {
+    if (part.type !== 'tool-call' || part.result !== undefined) {
+      return part
+    }
+
+    changed = true
+
+    return {
+      ...part,
+      result: { error: 'Tool execution ended before a completion event was received' },
+      isError: true
+    }
+  })
+
+  return changed ? settled : parts
+}
+
+// Tool calls can live in a sealed interim bubble while the final answer lands
+// in a new bubble. Reconcile the whole session transcript at the terminal turn
+// boundary so an orphan cannot survive merely because it is not in the bubble
+// selected to receive the final text. Preserve references on the no-op path.
+export function settleOrphanedToolMessages(messages: ChatMessage[]): ChatMessage[] {
+  let changed = false
+  const settled = messages.map(message => {
+    const parts = settleOrphanedToolParts(message.parts)
+
+    if (parts === message.parts) {
+      return message
+    }
+
+    changed = true
+
+    return { ...message, parts }
+  })
+
+  return changed ? settled : messages
 }
 
 export const SUBAGENT_EVENT_TYPES = new Set([
