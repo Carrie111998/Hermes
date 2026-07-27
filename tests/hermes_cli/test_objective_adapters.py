@@ -131,7 +131,7 @@ def test_model_failure_releases_durable_compute_reservation(monkeypatch, tmp_pat
 
 def test_unknown_employee_actor_cannot_propose_in_bootstrapped_org(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")
-    organization_id, _ = organization_db.bootstrap_solo_founder(
+    organization_id, ceo_id = organization_db.bootstrap_solo_founder(
         conn,
         organization_name="Actor Boundary Company",
         purpose="Reject unknown employee identities",
@@ -156,6 +156,33 @@ def test_unknown_employee_actor_cannot_propose_in_bootstrapped_org(tmp_path):
         risks=[],
         created_by="employee:ceo",
     )
+    conn.execute(
+        """INSERT INTO employees (
+               id,organization_id,profile_name,display_name,title,level,
+               department_id,manager_id,status,employment_type,annual_cost_minor,
+               currency,hired_for_objective_id,proposed_by,approved_by,created_at,
+               updated_at,started_at,ended_at
+           ) SELECT 'emp_duplicate_ceo',organization_id,'duplicate-ceo',
+               display_name,title,'ceo',department_id,NULL,'active',employment_type,
+               annual_cost_minor,currency,hired_for_objective_id,proposed_by,
+               approved_by,created_at,updated_at,started_at,ended_at
+             FROM employees WHERE id=?""",
+        (ceo_id,),
+    )
+    with pytest.raises(objectives_db.ObjectiveStateError, match="not authorized"):
+        objectives_db.propose_action(
+            conn,
+            objective_id=objective.id,
+            plan_id=plan_id,
+            action_type="web.read",
+            payload={"system": "web", "target_resource": "public"},
+            expected_outcome="read completes",
+            required_capability="web.read",
+            verification_method="web.read.completed",
+            risk_class="low",
+            reversible=True,
+            proposed_by="employee:ceo",
+        )
     with pytest.raises(objectives_db.ObjectiveStateError, match="not authorized"):
         objectives_db.propose_action(
             conn,

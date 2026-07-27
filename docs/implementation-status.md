@@ -40,6 +40,9 @@ acceptance evidence.
 - Organization-bound execution permits require a known `employee:<id>`
   executor; control and arbitrary service labels cannot be used as an
   execution principal without an explicit employee identity.
+- CEO compatibility aliases fail closed when the organization has zero or
+  multiple active CEOs; ambiguous organizational authority is never resolved
+  by selecting an arbitrary employee.
 - Registered action payload schemas and temporal observation windows are
   validated before permit admission and again at the final execution boundary.
 - Runtime construction rejects self-supervising verifier identities; verifier

@@ -47,6 +47,8 @@
   `__unscoped__` objective stores retain their explicit compatibility path.
 - Organization-bound permits now require a known employee executor; control
   or arbitrary service labels cannot receive execution authority implicitly.
+- CEO compatibility alias resolution now fails closed when active CEO state is
+  missing or ambiguous instead of selecting the first matching row.
 - Revocation checks now traverse the parent-grant chain and fail closed when
   any ancestor is revoked or the chain is cyclic, fencing descendant workers
   and result handoffs immediately.

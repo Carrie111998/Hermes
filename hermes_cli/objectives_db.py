@@ -1475,12 +1475,14 @@ def _assert_employee_actor_scope(
     # only as a lookup to the one active CEO in this objective's organization;
     # arbitrary employee aliases are never accepted as authority.
     if employee is None and employee_id in {"ceo", "founder"} and objective is not None:
-        employee = conn.execute(
+        active_ceos = conn.execute(
             """SELECT organization_id,status FROM employees
                 WHERE organization_id=? AND level='ceo' AND status='active'
-                ORDER BY created_at,id LIMIT 1""",
+                ORDER BY created_at,id""",
             (objective["organization_id"],),
-        ).fetchone()
+        ).fetchall()
+        if len(active_ceos) == 1:
+            employee = active_ceos[0]
     if employee is None or (
         objective is None
         or str(employee["organization_id"]) != str(objective["organization_id"])
