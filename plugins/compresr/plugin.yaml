@@ -2,7 +2,7 @@ name: compresr
 version: 1.0.0
 kind: backend
 description: >-
-  Query-aware context + tool-output compression via Compresr (YC W26).
+  Context and tool-output compression via Compresr.
   Out-of-tree, SDK-backed: all logic ships in the `compresr` PyPI package
   (compresr.integrations.hermes); this plugin is a thin shim. Cuts token cost
   of context compaction and large tool outputs. Fail-open, inert without an

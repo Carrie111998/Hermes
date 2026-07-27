@@ -3,10 +3,9 @@
 These pin the two things this repo is responsible for (the SDK owns the rest):
 
 1. The shim wires Compresr's cache subdir into the generic out-of-tree cache
-   surface so a recovery path is agent-visible on non-Local backends. This is
-   the fix for "tool-output compression dead on Docker/Modal/SSH" that an
-   out-of-tree plugin cannot achieve without the widened core, exercised
-   against the REAL translator (not the SDK test suite's faked one).
+   surface so cached files are visible on non-Local backends (Docker/Modal/SSH)
+   — which an out-of-tree plugin cannot achieve without the widened core.
+   Exercised against the REAL translator (not the SDK test suite's faked one).
 2. The shim fails open when the ``compresr`` package is absent, and delegates
    to the SDK's ``register`` when present.
 """
@@ -17,6 +16,7 @@ import types
 
 import pytest
 
+import hermes_cli.plugins_cmd as pc
 import tools.credential_files as cf
 
 
@@ -47,7 +47,7 @@ def _load_shim():
     return importlib.import_module("plugins.compresr")
 
 
-# --- 1. cache-visibility wiring (the C1 fix) --------------------------------
+# --- 1. cache-visibility wiring ---------------------------------------------
 
 def test_translator_returns_none_without_registration(isolated_cache_dirs, hermes_home):
     """Counterfactual: with no registration the compresr cache is invisible."""
@@ -122,3 +122,78 @@ def _blocking_import(blocked_prefix, real):
         return real(name, *args, **kwargs)
 
     return _imp
+
+
+# ---------------------------------------------------------------------------
+# requires_env resolution + prompt-on-enable (hermes_cli.plugins_cmd)
+# ---------------------------------------------------------------------------
+
+
+def test_plugin_requires_env_from_entrypoint_module(monkeypatch):
+    """Entrypoint plugins expose requires_env via a module-level REQUIRES_ENV."""
+    mod = types.ModuleType("fake_ep_plugin")
+    mod.REQUIRES_ENV = [{"name": "FAKE_KEY", "secret": True}]
+    monkeypatch.setitem(sys.modules, "fake_ep_plugin", mod)
+    assert pc._plugin_requires_env("entrypoint", "fake_ep_plugin") == [
+        {"name": "FAKE_KEY", "secret": True}
+    ]
+
+
+def test_plugin_requires_env_from_bundled_manifest(tmp_path):
+    """Bundled/user plugins read requires_env from their plugin.yaml."""
+    (tmp_path / "plugin.yaml").write_text(
+        "name: x\nrequires_env:\n  - name: X_KEY\n    secret: true\n"
+    )
+    assert pc._plugin_requires_env("user", str(tmp_path)) == [
+        {"name": "X_KEY", "secret": True}
+    ]
+
+
+def test_plugin_requires_env_swallows_errors():
+    """A bad/empty locator yields [] rather than raising."""
+    assert pc._plugin_requires_env("entrypoint", "no.such.module.exists") == []
+    assert pc._plugin_requires_env("entrypoint", None) == []
+
+
+def test_prompt_requires_env_for_key_forwards_resolved_env(monkeypatch):
+    """Resolves a plugin's requires_env by key and forwards it to the prompt."""
+    monkeypatch.setattr(
+        pc,
+        "_discover_all_plugins",
+        lambda: [("compresr", "1", "d", "entrypoint", "fake_ep2", "compresr")],
+    )
+    mod = types.ModuleType("fake_ep2")
+    mod.REQUIRES_ENV = [{"name": "COMPRESR_API_KEY", "secret": True}]
+    monkeypatch.setitem(sys.modules, "fake_ep2", mod)
+    seen = {}
+    monkeypatch.setattr(
+        pc, "_prompt_plugin_env_vars", lambda manifest, console: seen.update(manifest)
+    )
+    pc._prompt_requires_env_for_key("compresr", console=None)
+    assert seen.get("name") == "compresr"
+    assert seen.get("requires_env") == [{"name": "COMPRESR_API_KEY", "secret": True}]
+
+
+def test_prompt_requires_env_for_key_no_env_no_prompt(monkeypatch):
+    """A plugin with no requires_env triggers no prompt call."""
+    monkeypatch.setattr(
+        pc,
+        "_discover_all_plugins",
+        lambda: [("plain", "1", "d", "bundled", None, "plain")],
+    )
+    called = []
+    monkeypatch.setattr(
+        pc, "_prompt_plugin_env_vars", lambda *a, **k: called.append(1)
+    )
+    pc._prompt_requires_env_for_key("plain", console=None)
+    assert called == []
+
+
+def test_prompt_requires_env_for_key_swallows_errors(monkeypatch):
+    """A failure while resolving requires_env must never propagate."""
+
+    def _boom():
+        raise RuntimeError("discovery blew up")
+
+    monkeypatch.setattr(pc, "_discover_all_plugins", _boom)
+    pc._prompt_requires_env_for_key("compresr", console=None)  # must not raise

@@ -173,7 +173,7 @@ class FileSyncManager:
 
         By default a transport failure is logged and swallowed (best-effort
         background sync). Pass ``raise_on_error=True`` when the caller must know
-        the upload landed (e.g. a cache write handing the model a recovery path);
+        the upload landed (e.g. a cache write whose path is read back later);
         the error is then re-raised after rollback.
         """
         if not force and not os.environ.get(_FORCE_SYNC_ENV):

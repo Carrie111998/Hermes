@@ -5,6 +5,5 @@
 #     pip install 'compresr>=2.8.4'
 #
 # Hermes does not auto-install repo-plugin dependencies; this file documents
-# the runtime requirement for operators and CI. Pin is the first release that
-# ships compresr.integrations.hermes (current PyPI 2.8.2 does not).
+# the runtime requirement for operators and CI.
 compresr>=2.8.4

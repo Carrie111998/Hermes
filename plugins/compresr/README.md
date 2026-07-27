@@ -1,25 +1,17 @@
 # Compresr plugin (out-of-tree, SDK-backed)
 
-Query-aware **context compaction** and **large tool-output** compression via
-[Compresr](https://compresr.ai) (YC W26). Fail-open and inert without an API key.
+**Context compaction** and **large tool-output** compression via
+[Compresr](https://compresr.ai). Fail-open and inert without an API key.
 
-This is the **new-style** integration: none of the compression logic lives in
-this repo. It ships in the `compresr` PyPI package under
-`compresr.integrations.hermes`, and this plugin is a thin shim that:
+None of the compression logic lives in this repo. It ships in the `compresr`
+PyPI package under `compresr.integrations.hermes`, and this plugin is a thin
+shim that:
 
 1. registers Compresr's cache subdir (`cache/compresr/tool-output`) with the
-   generic out-of-tree cache surface
-   (`tools.credential_files.register_cache_dir`), so recovery paths resolve on
-   **Docker / Modal / SSH** backends — not only Local; and
+   generic cache surface (`tools.credential_files.register_cache_dir`), so
+   cached tool output resolves on **Docker / Modal / SSH** backends — not only
+   Local; and
 2. delegates to the SDK's `register(ctx)`.
-
-## Why out-of-tree
-
-Upstream Hermes declines in-tree vendor SaaS integrations under `plugins/`
-(they must ship as a standalone package + pip entry point). So the compression
-code lives in the Compresr SDK, and Hermes only needs a small, **vendor-neutral**
-plugin surface — provided here — for any cache-backed out-of-tree plugin. This
-plugin is the reference consumer of that surface.
 
 ## Install
 

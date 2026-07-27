@@ -2,7 +2,7 @@
 
 All compression logic ships in the ``compresr`` PyPI package
 (``compresr.integrations.hermes``). This shim only registers Compresr's
-tool-output cache subdir so recovery paths resolve on Docker/Modal/SSH backends,
+tool-output cache subdir so cached files resolve on Docker/Modal/SSH backends,
 then delegates to the SDK's ``register(ctx)``. Requires ``pip install compresr``
 in the interpreter that runs Hermes; fail-open and inert without it or an API key.
 """
@@ -43,7 +43,9 @@ def register(ctx: Any) -> None:
     try:
         from compresr.integrations.hermes.plugin import register as _sdk_register
     except ImportError:
-        logger.error(_INSTALL_HINT)
+        # Inert/fail-open state (plugin enabled but SDK not installed) — warn,
+        # not error, to match sibling plugins and avoid tripping error alerting.
+        logger.warning(_INSTALL_HINT)
         return
     _sdk_register(ctx)
 

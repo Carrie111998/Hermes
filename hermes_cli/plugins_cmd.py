@@ -936,8 +936,8 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
     else:
         console.print(f"[dim]Plugin '{key}' is already enabled.[/dim]")
 
-    # Prompt for any secrets the plugin declares (e.g. COMPRESR_API_KEY) that
-    # aren't set yet, saving them to ~/.hermes/.env. No-op if none are missing.
+    # Prompt for any secrets the plugin declares that aren't set yet, saving
+    # them to ~/.hermes/.env. No-op if none are missing.
     _prompt_requires_env_for_key(key, console)
 
     # Built-in tool override is a privileged grant. Bundled plugins ship with
@@ -1726,7 +1726,7 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
             f"\n[green]\u2713[/green] General plugins: {len(new_enabled)} enabled, "
             f"{len(plugin_keys) - len(new_enabled)} disabled."
         )
-        # Prompt for secrets of plugins just switched on (e.g. COMPRESR_API_KEY).
+        # Prompt for secrets of plugins just switched on.
         for i in chosen:
             if i not in plugin_selected and 0 <= i < len(plugin_keys):
                 _prompt_requires_env_for_key(plugin_keys[i], console)
