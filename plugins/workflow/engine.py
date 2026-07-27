@@ -3286,6 +3286,13 @@ class WorkflowEngine:
                                                 states[rev_id].started_at = datetime.now(timezone.utc).isoformat()
                                                 state.review_counts[rev_id] = state.review_counts.get(rev_id, 0) + 1
                                                 pending.add(rev_id)
+                                                # Save state so the has_active_review check
+                                                # can find the reviewer card ID.
+                                                self._save_state(
+                                                    workflow.name, states, results,
+                                                    0, layers,
+                                                    run_id=workflow.run_id, context=context,
+                                                )
                                                 print(f"   📋 {nid} pending review → created {rev_id} (card {reviewer_card_id})")
                                         except Exception as e:
                                             print(f"   ⚠  Failed to create reviewer card: {e}")
