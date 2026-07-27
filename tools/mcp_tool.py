@@ -4535,6 +4535,25 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+def _authorize_mcp_action(
+    server_name: str, tool_name: str, detail: Optional[str] = None,
+) -> None:
+    """Authorize one exact MCP server/tool operation for governed workers."""
+    from hermes_cli.workforce_delegation import authorize_worker_action
+
+    resource = (
+        f"mcp-server:{sanitize_mcp_name_component(server_name)}"
+        f":tool:{sanitize_mcp_name_component(tool_name)}"
+    )
+    if detail:
+        resource += f":{detail}"
+    authorize_worker_action(
+        capability="mcp.call",
+        system="mcp",
+        target_resource=resource,
+    )
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -4543,6 +4562,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        _authorize_mcp_action(server_name, tool_name)
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4766,6 +4786,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        _authorize_mcp_action(server_name, "list_resources")
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -4828,15 +4849,20 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
+        uri = args.get("uri")
+        if not uri:
+            return tool_error("Missing required parameter 'uri'")
+        _authorize_mcp_action(
+            server_name,
+            "read_resource",
+            f"uri:{sanitize_mcp_name_component(str(uri))}",
+        )
+
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
-
-        uri = args.get("uri")
-        if not uri:
-            return tool_error("Missing required parameter 'uri'")
 
         async def _call():
             _mark_server_call_started(server)
@@ -4893,6 +4919,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        _authorize_mcp_action(server_name, "list_prompts")
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
@@ -4960,15 +4987,21 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
+        name = args.get("name")
+        if not name:
+            return tool_error("Missing required parameter 'name'")
+        _authorize_mcp_action(
+            server_name,
+            "get_prompt",
+            f"name:{sanitize_mcp_name_component(str(name))}",
+        )
+
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
-        name = args.get("name")
-        if not name:
-            return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
 
         async def _call():

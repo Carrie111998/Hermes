@@ -33,6 +33,40 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
     return tool
 
 
+def test_mcp_authorization_is_server_and_tool_scoped(monkeypatch):
+    from tools.mcp_tool import _authorize_mcp_action
+
+    calls = []
+
+    def record(*, capability, system, target_resource):
+        calls.append((capability, system, target_resource))
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", record
+    )
+
+    _authorize_mcp_action("my-server", "write-file")
+
+    assert calls == [
+        ("mcp.call", "mcp", "mcp-server:my_server:tool:write_file")
+    ]
+
+
+def test_mcp_tool_denial_happens_before_transport(monkeypatch):
+    from tools.mcp_tool import _make_tool_handler
+
+    def reject(*_args, **_kwargs):
+        raise RuntimeError("MCP authority denied")
+
+    monkeypatch.setattr(
+        "hermes_cli.workforce_delegation.authorize_worker_action", reject
+    )
+    handler = _make_tool_handler("server", "dangerous-tool", 30)
+
+    with pytest.raises(RuntimeError, match="MCP authority denied"):
+        handler({})
+
+
 def _make_call_result(text="file contents here", is_error=False):
     """Create a fake MCP CallToolResult."""
     block = SimpleNamespace(text=text)
