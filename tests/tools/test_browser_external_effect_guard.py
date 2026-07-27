@@ -154,14 +154,12 @@ def test_browser_navigate_reserves_first_create_for_current_run(
     monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
     monkeypatch.setattr(
         browser_tool,
-        "_browser_eval",
-        lambda *args: json.dumps({
-            "success": True,
-            "result": json.dumps({
-                "href": "https://seller.shopee.tw/portal/product/new",
-                "timeOrigin": 123.0,
-            }),
-        }),
+        "_browser_page_identity",
+        lambda *_args: (
+            "https://seller.shopee.tw/portal/product/new",
+            "https://seller.shopee.tw/portal/product/new|123.0",
+            None,
+        ),
     )
     monkeypatch.setattr(
         browser_tool,
@@ -208,14 +206,12 @@ def test_camofox_mutation_is_guarded_before_backend_call(
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
     monkeypatch.setattr(
         browser_tool,
-        "_browser_eval",
-        lambda *args: json.dumps({
-            "success": True,
-            "result": json.dumps({
-                "href": "https://m.facebook.com/marketplace/create/item",
-                "timeOrigin": 456.0,
-            }),
-        }),
+        "_browser_page_identity",
+        lambda *_args: (
+            "https://m.facebook.com/marketplace/create/item",
+            "https://m.facebook.com/marketplace/create/item|456.0",
+            None,
+        ),
     )
 
     called = False
@@ -300,14 +296,8 @@ def test_protected_ref_action_is_blocked_even_with_bound_reservation(
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
     monkeypatch.setattr(
         browser_tool,
-        "_browser_eval",
-        lambda *args: json.dumps({
-            "success": True,
-            "result": json.dumps({
-                "href": protected_url,
-                "timeOrigin": 789.0,
-            }),
-        }),
+        "_browser_page_identity",
+        lambda *_args: (protected_url, page_identity, None),
     )
 
     called = False
@@ -363,6 +353,7 @@ def test_grace_ref_click_uses_exact_snapshot_bound_dom_node(
                     "role": "button",
                     "name": "Join group",
                     "backend_node_id": 2468,
+                    "captured_session_id": "captured-session",
                 }
             },
         },
@@ -391,6 +382,7 @@ def test_grace_ref_click_uses_exact_snapshot_bound_dom_node(
         "expected_role": "button",
         "expected_name": "Join group",
         "required_group_id": "1703088130054399",
+        "captured_session_id": "captured-session",
     }]
     with kb.connect_closing(db_path) as conn:
         effect = kb.list_external_effects(conn, task_id)[0]
@@ -436,6 +428,7 @@ def test_grace_ref_click_rejects_group_outside_contract(
                     "role": "button",
                     "name": "Join group",
                     "backend_node_id": 2468,
+                    "captured_session_id": "captured-session",
                 }
             },
         },
@@ -493,6 +486,7 @@ def test_grace_ref_click_rejects_nested_group_outside_contract(
                     "role": "button",
                     "name": "Join group",
                     "backend_node_id": 2468,
+                    "captured_session_id": "captured-session",
                 }
             },
         },
@@ -541,6 +535,7 @@ def test_grace_ref_click_rejects_custom_slug_group_route(
                     "role": "button",
                     "name": "Join group",
                     "backend_node_id": 2468,
+                    "captured_session_id": "captured-session",
                 }
             },
         },
@@ -589,6 +584,7 @@ def test_grace_ref_click_rejects_join_button_on_discovery_page(
                     "role": "button",
                     "name": "Join group",
                     "backend_node_id": 2468,
+                    "captured_session_id": "captured-session",
                 }
             },
         },
@@ -862,8 +858,11 @@ def test_guarded_snapshot_reports_url_mismatch_without_exposing_refs(
         browser_tool,
         "_snapshot_ax_nodes",
         lambda *_args: (
-            [{"backend_node_id": 29, "role": "button", "name": "Share"}],
-            None,
+            _ for _ in ()
+        ).throw(
+            AssertionError(
+                "URL mismatch must fail before rebinding the supervisor"
+            )
         ),
     )
     monkeypatch.setattr(
@@ -928,6 +927,41 @@ def test_guarded_snapshot_with_only_static_ax_nodes_returns_error(
     )
     assert snapshot["data"]["refs"] == {}
     assert snapshot["data"]["guarded_refs_available"] is False
+
+
+def test_guarded_page_identity_uses_snapshot_session_not_supervisor(
+    monkeypatch,
+):
+    live_url = "https://www.facebook.com/marketplace/you/selling"
+    calls: list[tuple[str, str, list[str]]] = []
+
+    def fake_run(task_id, command, args):
+        calls.append((task_id, command, args))
+        return {
+            "success": True,
+            "data": {
+                "result": json.dumps({
+                    "href": live_url,
+                    "timeOrigin": 123.5,
+                }),
+            },
+        }
+
+    monkeypatch.setattr(browser_tool, "_run_browser_command", fake_run)
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_eval",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("identity must not use a possibly misbound supervisor")
+        ),
+    )
+
+    url, identity, error = browser_tool._browser_page_identity("browser-1")
+
+    assert error is None
+    assert url == live_url
+    assert identity == f"{live_url}|123.5"
+    assert calls[0][0:2] == ("browser-1", "eval")
 
 
 def test_ordinary_kanban_snapshot_keeps_native_refs(monkeypatch, tmp_path):
@@ -1035,14 +1069,12 @@ def test_stale_worker_is_blocked_on_non_create_page(
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
     monkeypatch.setattr(
         browser_tool,
-        "_browser_eval",
-        lambda *args: json.dumps({
-            "success": True,
-            "result": json.dumps({
-                "href": "https://www.facebook.com/marketplace/you/selling",
-                "timeOrigin": 999.0,
-            }),
-        }),
+        "_browser_page_identity",
+        lambda *_args: (
+            "https://www.facebook.com/marketplace/you/selling",
+            "https://www.facebook.com/marketplace/you/selling|999.0",
+            None,
+        ),
     )
 
     called = False

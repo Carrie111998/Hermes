@@ -311,6 +311,7 @@ class CDPSupervisor:
         self._pending_calls: Dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
+        self._page_target_id: Optional[str] = None
         self._child_sessions: Dict[str, Dict[str, Any]] = {}  # session_id -> info
 
         # Dialog auto-dismiss watchdog handles (per dialog id).
@@ -603,6 +604,184 @@ class CDPSupervisor:
         except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    def capture_ax_tree_for_url(
+        self,
+        expected_url: str,
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Bind and capture one AX tree from the unique page at ``expected_url``.
+
+        A browser-level CDP endpoint can expose several ``page`` targets
+        (for example the user's Facebook tab plus Chrome's New Tab page).
+        The agent-browser CLI selects the active web page independently, so
+        selection, attachment, configuration, and AX capture run as one
+        event-loop operation with one deadline. The returned session id is
+        part of the guarded ref capability, so a later snapshot cannot
+        redirect its action. Missing or duplicate targets fail closed.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "supervisor loop is not running"}
+        with self._state_lock:
+            if not self._active:
+                return {"ok": False, "error": "supervisor is not active"}
+        deadline = time.monotonic() + timeout
+
+        async def _capture() -> Dict[str, Any]:
+            session_id = ""
+            adopted = False
+            response = await self._cdp("Target.getTargets")
+            targets = response.get("result", {}).get("targetInfos", [])
+            matches = [
+                target for target in targets
+                if target.get("type") == "page"
+                and str(target.get("url") or "") == expected_url
+            ]
+            if len(matches) != 1:
+                return {
+                    "ok": False,
+                    "error": (
+                        "expected exactly one browser page target for "
+                        f"{expected_url!r}, found {len(matches)}"
+                    ),
+                }
+            target_id = str(matches[0].get("targetId") or "")
+            if not target_id:
+                return {
+                    "ok": False,
+                    "error": "matched browser page target had no targetId",
+                }
+            attach = await self._cdp(
+                "Target.attachToTarget",
+                {"targetId": target_id, "flatten": True},
+            )
+            session_id = str(attach.get("result", {}).get("sessionId") or "")
+            if not session_id:
+                return {
+                    "ok": False,
+                    "error": "browser page target attach returned no sessionId",
+                }
+            try:
+                await self._configure_page_session(session_id)
+                ax_response = await self._cdp(
+                    "Accessibility.getFullAXTree",
+                    session_id=session_id,
+                )
+                with self._state_lock:
+                    old_session_id = self._page_session_id
+                if old_session_id and old_session_id != session_id:
+                    await self._cdp(
+                        "Target.detachFromTarget",
+                        {"sessionId": old_session_id},
+                    )
+                # No await occurs between adoption and return, so deadline
+                # cancellation cannot report failure and mutate state later.
+                with self._state_lock:
+                    self._page_target_id = target_id
+                    self._page_session_id = session_id
+                    self._frames.clear()
+                adopted = True
+                return {
+                    "ok": True,
+                    "target_id": target_id,
+                    "session_id": session_id,
+                    "result": ax_response.get("result", {}),
+                }
+            finally:
+                if session_id and not adopted:
+                    try:
+                        await self._cdp(
+                            "Target.detachFromTarget",
+                            {"sessionId": session_id},
+                            timeout=2.0,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "unadopted page session cleanup failed: %s",
+                            exc,
+                        )
+
+        async def _capture_with_deadline() -> Dict[str, Any]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("AX capture deadline expired before dispatch")
+            return await asyncio.wait_for(_capture(), timeout=remaining)
+
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            fut = safe_schedule_threadsafe(_capture_with_deadline(), loop)
+            if fut is None:
+                return {"ok": False, "error": "Browser supervisor loop unavailable"}
+            try:
+                return fut.result(timeout=timeout + 1)
+            except TimeoutError:
+                fut.cancel()
+                return {
+                    "ok": False,
+                    "error": (
+                        "browser page AX capture timed out and its queued "
+                        "operation was cancelled"
+                    ),
+                }
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def call_session_cdp(
+        self,
+        session_id: str,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Send one CDP command to an explicitly captured page session."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "supervisor loop is not running"}
+        with self._state_lock:
+            if not self._active:
+                return {"ok": False, "error": "supervisor is not active"}
+        if not session_id:
+            return {"ok": False, "error": "captured page session is unavailable"}
+        deadline = time.monotonic() + timeout
+
+        async def _do_call() -> Dict[str, Any]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "captured page action deadline expired before dispatch"
+                )
+            return await self._cdp(
+                method,
+                params or {},
+                session_id=session_id,
+                timeout=remaining,
+            )
+
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            fut = safe_schedule_threadsafe(_do_call(), loop)
+            if fut is None:
+                return {"ok": False, "error": "Browser supervisor loop unavailable"}
+            try:
+                response = fut.result(timeout=timeout + 1)
+            except TimeoutError:
+                fut.cancel()
+                return {
+                    "ok": False,
+                    "error": (
+                        "captured page CDP action timed out; dispatch outcome "
+                        "is indeterminate and must not be retried"
+                    ),
+                    "dispatch_ambiguous": True,
+                }
+            return {"ok": True, "result": response.get("result", {})}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     def guarded_dom_action(
         self,
         *,
@@ -613,10 +792,26 @@ class CDPSupervisor:
         expected_name: str,
         required_group_id: Optional[str] = None,
         text: Optional[str] = None,
+        captured_session_id: Optional[str] = None,
         timeout: float = 10.0,
     ) -> Dict[str, Any]:
         """Mutate one captured AX node after an in-turn page identity check."""
-        resolved = self.call_page_cdp(
+        def guarded_call(
+            method: str,
+            params: Optional[Dict[str, Any]] = None,
+            *,
+            timeout: float = timeout,
+        ) -> Dict[str, Any]:
+            if captured_session_id:
+                return self.call_session_cdp(
+                    captured_session_id,
+                    method,
+                    params,
+                    timeout=timeout,
+                )
+            return self.call_page_cdp(method, params, timeout=timeout)
+
+        resolved = guarded_call(
             "DOM.resolveNode",
             {"backendNodeId": int(backend_node_id)},
             timeout=timeout,
@@ -630,7 +825,7 @@ class CDPSupervisor:
                 "error": "captured snapshot node is no longer resolvable",
             }
         guard_token = f"{time.time_ns()}-{threading.get_ident()}"
-        armed = self.call_page_cdp(
+        armed = guarded_call(
             "Runtime.callFunctionOn",
             {
                 "objectId": object_id,
@@ -691,7 +886,7 @@ class CDPSupervisor:
             }
 
         def _cleanup_guard() -> None:
-            self.call_page_cdp(
+            guarded_call(
                 "Runtime.callFunctionOn",
                 {
                     "objectId": object_id,
@@ -716,7 +911,7 @@ class CDPSupervisor:
                 timeout=timeout,
             )
 
-        live_ax = self.call_page_cdp(
+        live_ax = guarded_call(
             "Accessibility.getPartialAXTree",
             {
                 "backendNodeId": int(backend_node_id),
@@ -758,7 +953,7 @@ class CDPSupervisor:
                 ),
             }
         if action == "click":
-            clicked = self.call_page_cdp(
+            clicked = guarded_call(
                 "Runtime.callFunctionOn",
                 {
                     "objectId": object_id,
@@ -921,7 +1116,7 @@ class CDPSupervisor:
           return {ok: true, action, pageIdentity: actual};
         }
         """
-        called = self.call_page_cdp(
+        called = guarded_call(
             "Runtime.callFunctionOn",
             {
                 "objectId": object_id,
@@ -1028,6 +1223,7 @@ class CDPSupervisor:
                 # Reset per-connection session state so stale ids don't hang
                 # around after a reconnect.
                 self._page_session_id = None
+                self._page_target_id = None
                 self._child_sessions.clear()
                 # We deliberately keep `_pending_dialogs` and `_frames` —
                 # they're reconciled as the supervisor resubscribes and
@@ -1090,7 +1286,14 @@ class CDPSupervisor:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
         resp = await self._cdp("Target.getTargets")
         targets = resp.get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        pages = [t for t in targets if t.get("type") == "page"]
+        page_target = next(
+            (
+                target for target in pages
+                if str(target.get("url") or "").startswith(("http://", "https://"))
+            ),
+            pages[0] if pages else None,
+        )
         if page_target is None:
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
             target_id = created["result"]["targetId"]
@@ -1101,19 +1304,25 @@ class CDPSupervisor:
             "Target.attachToTarget",
             {"targetId": target_id, "flatten": True},
         )
-        self._page_session_id = attach["result"]["sessionId"]
-        await self._cdp("Page.enable", session_id=self._page_session_id)
-        await self._cdp("Runtime.enable", session_id=self._page_session_id)
+        session_id = attach["result"]["sessionId"]
+        self._page_target_id = target_id
+        self._page_session_id = session_id
+        await self._configure_page_session(session_id)
+
+    async def _configure_page_session(self, session_id: str) -> None:
+        """Enable supervisor domains and dialog handling on one page session."""
+        await self._cdp("Page.enable", session_id=session_id)
+        await self._cdp("Runtime.enable", session_id=session_id)
         await self._cdp(
             "Target.setAutoAttach",
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
-            session_id=self._page_session_id,
+            session_id=session_id,
         )
         # Install the dialog bridge — overrides native alert/confirm/prompt with
         # a synchronous XHR we intercept via Fetch domain. This is how we make
         # dialog response work on Browserbase (whose CDP proxy auto-dismisses
         # real native dialogs before we can call handleJavaScriptDialog).
-        await self._install_dialog_bridge(self._page_session_id)
+        await self._install_dialog_bridge(session_id)
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session.

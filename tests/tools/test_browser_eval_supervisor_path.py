@@ -236,6 +236,8 @@ def _make_supervisor_with_cdp(cdp_response):
     sup._state_lock = threading.Lock()
     sup._active = True
     sup._page_session_id = "test-session-id"
+    sup._page_target_id = "test-target-id"
+    sup._frames = {}
 
     # Build a real running event loop on a background thread so
     # asyncio.run_coroutine_threadsafe has somewhere to dispatch.
@@ -402,6 +404,8 @@ def _make_supervisor_with_cdp_fn(cdp_fn):
     sup._state_lock = threading.Lock()
     sup._active = True
     sup._page_session_id = "test-session-id"
+    sup._page_target_id = "test-target-id"
+    sup._frames = {}
 
     loop = asyncio.new_event_loop()
 
@@ -416,6 +420,253 @@ def _make_supervisor_with_cdp_fn(cdp_fn):
     sup._loop = loop
     sup._thread = thread
     return sup
+
+
+def test_capture_ax_tree_retargets_unique_exact_page():
+    calls = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        calls.append((method, params, session_id))
+        if method == "Target.getTargets":
+            return {
+                "result": {
+                    "targetInfos": [
+                        {
+                            "type": "page",
+                            "targetId": "new-tab",
+                            "url": "chrome://newtab/",
+                        },
+                        {
+                            "type": "page",
+                            "targetId": "facebook",
+                            "url": "https://www.facebook.com/marketplace/you/selling",
+                        },
+                    ]
+                }
+            }
+        if method == "Target.attachToTarget":
+            return {"result": {"sessionId": "facebook-session"}}
+        if method == "Accessibility.getFullAXTree":
+            return {"result": {"nodes": [{"backendDOMNodeId": 42}]}}
+        if method == "Target.detachFromTarget":
+            return {"result": {}}
+        raise AssertionError(f"unexpected CDP call: {method}")
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+
+    async def fake_configure(session_id):
+        calls.append(("configure", None, session_id))
+
+    sup._configure_page_session = fake_configure
+    try:
+        result = sup.capture_ax_tree_for_url(
+            "https://www.facebook.com/marketplace/you/selling"
+        )
+        assert result["ok"] is True
+        assert result["target_id"] == "facebook"
+        assert result["session_id"] == "facebook-session"
+        assert result["result"]["nodes"][0]["backendDOMNodeId"] == 42
+        assert sup._page_target_id == "facebook"
+        assert sup._page_session_id == "facebook-session"
+        assert [call[0] for call in calls] == [
+            "Target.getTargets",
+            "Target.attachToTarget",
+            "configure",
+            "Accessibility.getFullAXTree",
+            "Target.detachFromTarget",
+        ]
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_capture_ax_tree_fails_closed_when_target_is_ambiguous():
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        assert method == "Target.getTargets"
+        return {
+            "result": {
+                "targetInfos": [
+                    {
+                        "type": "page",
+                        "targetId": "facebook-1",
+                        "url": "https://www.facebook.com/groups/123",
+                    },
+                    {
+                        "type": "page",
+                        "targetId": "facebook-2",
+                        "url": "https://www.facebook.com/groups/123",
+                    },
+                ]
+            }
+        }
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+    try:
+        result = sup.capture_ax_tree_for_url(
+            "https://www.facebook.com/groups/123"
+        )
+        assert result["ok"] is False
+        assert "found 2" in result["error"]
+        assert sup._page_target_id == "test-target-id"
+        assert sup._page_session_id == "test-session-id"
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_capture_ax_tree_reattaches_even_when_target_id_is_cached():
+    calls = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        calls.append(method)
+        if method == "Target.getTargets":
+            return {
+                "result": {
+                    "targetInfos": [{
+                        "type": "page",
+                        "targetId": "test-target-id",
+                        "url": "https://example.com/current",
+                    }]
+                }
+            }
+        if method == "Target.attachToTarget":
+            return {"result": {"sessionId": "fresh-session"}}
+        if method == "Accessibility.getFullAXTree":
+            return {"result": {"nodes": []}}
+        if method == "Target.detachFromTarget":
+            return {"result": {}}
+        raise AssertionError(f"unexpected CDP call: {method}")
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+
+    async def fake_configure(_session_id):
+        calls.append("configure")
+
+    sup._configure_page_session = fake_configure
+    try:
+        result = sup.capture_ax_tree_for_url("https://example.com/current")
+        assert result["ok"] is True
+        assert sup._page_session_id == "fresh-session"
+        assert calls == [
+            "Target.getTargets",
+            "Target.attachToTarget",
+            "configure",
+            "Accessibility.getFullAXTree",
+            "Target.detachFromTarget",
+        ]
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_capture_ax_tree_timeout_cleans_up_without_late_adoption():
+    import asyncio
+    import time
+
+    calls = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        calls.append((method, params))
+        if method == "Target.getTargets":
+            return {
+                "result": {
+                    "targetInfos": [{
+                        "type": "page",
+                        "targetId": "fresh-target",
+                        "url": "https://example.com/current",
+                    }]
+                }
+            }
+        if method == "Target.attachToTarget":
+            return {"result": {"sessionId": "fresh-session"}}
+        if method == "Target.detachFromTarget":
+            return {"result": {}}
+        raise AssertionError(f"unexpected CDP call: {method}")
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+
+    async def slow_configure(_session_id):
+        await asyncio.sleep(1)
+
+    sup._configure_page_session = slow_configure
+    try:
+        result = sup.capture_ax_tree_for_url(
+            "https://example.com/current",
+            timeout=0.01,
+        )
+        time.sleep(0.05)
+        assert result["ok"] is False
+        assert sup._page_target_id == "test-target-id"
+        assert sup._page_session_id == "test-session-id"
+        assert (
+            "Target.detachFromTarget",
+            {"sessionId": "fresh-session"},
+        ) in calls
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_queued_ax_capture_does_not_dispatch_after_caller_timeout():
+    import threading
+    import time
+
+    cdp_calls = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        cdp_calls.append(method)
+        return {"result": {"targetInfos": []}}
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+    blocker_started = threading.Event()
+
+    def block_loop():
+        blocker_started.set()
+        time.sleep(1.2)
+
+    try:
+        sup._loop.call_soon_threadsafe(block_loop)
+        assert blocker_started.wait(timeout=1)
+        result = sup.capture_ax_tree_for_url(
+            "https://example.com/current",
+            timeout=0.01,
+        )
+        time.sleep(0.3)
+        assert result["ok"] is False
+        assert cdp_calls == []
+        assert sup._page_session_id == "test-session-id"
+    finally:
+        _stop_supervisor(sup)
+
+
+def test_queued_captured_action_is_ambiguous_and_never_dispatches_late():
+    import threading
+    import time
+
+    cdp_calls = []
+
+    async def fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
+        cdp_calls.append(method)
+        return {"result": {}}
+
+    sup = _make_supervisor_with_cdp_fn(fake_cdp)
+    blocker_started = threading.Event()
+
+    def block_loop():
+        blocker_started.set()
+        time.sleep(1.2)
+
+    try:
+        sup._loop.call_soon_threadsafe(block_loop)
+        assert blocker_started.wait(timeout=1)
+        result = sup.call_session_cdp(
+            "captured-session",
+            "Runtime.callFunctionOn",
+            {"objectId": "node-1"},
+            timeout=0.01,
+        )
+        time.sleep(0.3)
+        assert result["ok"] is False
+        assert result["dispatch_ambiguous"] is True
+        assert cdp_calls == []
+    finally:
+        _stop_supervisor(sup)
 
 
 class TestEvaluateRuntimeDomNodeCrashRetry:

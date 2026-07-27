@@ -2643,13 +2643,20 @@ def _browser_page_identity(
     browser_task_id: str,
 ) -> tuple[str, str, Optional[str]]:
     """Return (url, page-load identity, error) from the live page itself."""
-    probe = _browser_eval(
-        "JSON.stringify({href: location.href, timeOrigin: performance.timeOrigin})",
+    # Do not use _browser_eval's supervisor fast path here. A browser-level
+    # CDP endpoint can expose several page targets, and the supervisor may not
+    # yet be aligned with the page selected by agent-browser. The subprocess
+    # probe uses the same session/target selection as snapshot itself.
+    payload = _run_browser_command(
         browser_task_id,
+        "eval",
+        [
+            "JSON.stringify({href: location.href, "
+            "timeOrigin: performance.timeOrigin})"
+        ],
     )
     try:
-        payload = json.loads(probe)
-        result = payload.get("result")
+        result = payload.get("data", {}).get("result")
         if isinstance(result, str):
             result = json.loads(result)
         if not payload.get("success") or not isinstance(result, dict):
@@ -2692,6 +2699,7 @@ _GUARDED_INTERACTIVE_ROLES = frozenset({
 
 def _snapshot_ax_nodes(
     browser_task_id: str,
+    expected_url: str,
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Capture one AX tree whose nodes become both refs and DOM bindings."""
     try:
@@ -2700,13 +2708,16 @@ def _snapshot_ax_nodes(
         supervisor = SUPERVISOR_REGISTRY.get(browser_task_id)
         if supervisor is None:
             return [], "CDP supervisor is unavailable for this browser session"
-        result = supervisor.call_page_cdp("Accessibility.getFullAXTree")
+        result = supervisor.capture_ax_tree_for_url(expected_url)
         if not result.get("ok"):
             return [], (
-                "Accessibility.getFullAXTree failed: "
-                f"{result.get('error') or 'unknown CDP error'}"
+                "CDP supervisor could not bind and capture the snapshot page: "
+                f"{result.get('error') or 'unknown target capture error'}"
             )
         nodes = result.get("result", {}).get("nodes", [])
+        captured_session_id = str(result.get("session_id") or "")
+        if not captured_session_id:
+            return [], "AX capture returned no bound CDP page session"
     except Exception as exc:
         return [], (
             "Accessibility tree capture raised "
@@ -2724,6 +2735,7 @@ def _snapshot_ax_nodes(
                 "backend_node_id": int(backend_id),
                 "role": str(role).strip(),
                 "name": str(name or "").strip(),
+                "captured_session_id": captured_session_id,
             })
     if not captured:
         return [], "Accessibility tree contained no bindable backend nodes"
@@ -2792,7 +2804,6 @@ def _remember_snapshot_refs(
     if not guarded_execution:
         return None
     data = snapshot_result.get("data")
-    ax_nodes, ax_error = _snapshot_ax_nodes(browser_task_id)
     current_url, after_identity, identity_error = _browser_page_identity(
         browser_task_id,
     )
@@ -2820,18 +2831,22 @@ def _remember_snapshot_refs(
             snapshot_result,
             "snapshot backend returned no structured data",
         )
-    if ax_error or not ax_nodes:
-        return _invalidate_guarded_snapshot(
-            browser_task_id,
-            snapshot_result,
-            ax_error or "Accessibility tree returned no bindable nodes",
-        )
     snapshot_url = str(data.get("origin") or data.get("url") or "")
     if snapshot_url and snapshot_url != current_url:
         return _invalidate_guarded_snapshot(
             browser_task_id,
             snapshot_result,
             "snapshot URL did not match the live page URL",
+        )
+    ax_nodes, ax_error = _snapshot_ax_nodes(
+        browser_task_id,
+        current_url,
+    )
+    if ax_error or not ax_nodes:
+        return _invalidate_guarded_snapshot(
+            browser_task_id,
+            snapshot_result,
+            ax_error or "Accessibility tree returned no bindable nodes",
         )
     original_snapshot = str(data.get("snapshot") or "")
     normalized_refs: dict[str, dict[str, Any]] = {}
@@ -2846,6 +2861,9 @@ def _remember_snapshot_refs(
                 "role": role,
                 "name": name,
                 "backend_node_id": backend_id,
+                "captured_session_id": str(
+                    node.get("captured_session_id") or ""
+                ),
             }
             snapshot_lines.append(
                 f"- {role} {json.dumps(name, ensure_ascii=False)} [ref={ref}]"
@@ -2965,6 +2983,15 @@ def _run_atomic_ref_action(
             {"success": False, "error": metadata_error},
             ensure_ascii=False,
         )
+    captured_session_id = str(metadata.get("captured_session_id") or "")
+    if not captured_session_id:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Guarded browser action blocked: the trusted snapshot has no "
+                "captured CDP page session. Take a fresh browser_snapshot."
+            ),
+        }, ensure_ascii=False)
     current_url = page_identity.rsplit("|", 1)[0]
     from urllib.parse import urlsplit
     from hermes_cli import kanban_db as _kanban_db
@@ -3127,6 +3154,7 @@ def _run_atomic_ref_action(
                     expected_role=str(metadata["role"]),
                     expected_name=str(metadata["name"]),
                     required_group_id=required_group_id,
+                    captured_session_id=captured_session_id,
                 )
     except Exception as exc:
         with _snapshot_ref_lock:
