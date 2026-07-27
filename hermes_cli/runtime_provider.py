@@ -1698,6 +1698,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    enforce_openrouter_policy: bool = True,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1708,15 +1709,16 @@ def resolve_runtime_provider(
     api_mode is derived from the model they are switching TO, not the stale
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
+
+    enforce_openrouter_policy: When True (default), reject forbidden
+    OpenRouter model families before resolving credentials — see
+    ``_assert_openrouter_model_allowed``. Callers that only need resolved
+    metadata (e.g. context-window lookups for display) and never send a
+    request with the returned credentials should pass False so a passive
+    introspection call cannot be mistaken for the live-routing spend it is
+    guarding against.
     """
     requested_provider = resolve_requested_provider(requested)
-    _model_cfg_for_guard = _get_model_config()
-    _assert_openrouter_model_allowed(
-        requested_provider=requested_provider,
-        explicit_base_url=explicit_base_url,
-        model_cfg=_model_cfg_for_guard,
-        target_model=target_model,
-    )
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
@@ -1727,7 +1729,10 @@ def resolve_runtime_provider(
     # for a provider the user explicitly turned off.
     #
     # Fail fast with a typed error so the fallback chain can advance to
-    # the next provider instead of using a disabled one.
+    # the next provider instead of using a disabled one. This must run
+    # BEFORE the OpenRouter model-family guard below: a provider the user
+    # has explicitly disabled should always fail with the same typed
+    # ValueError regardless of which model it was last configured with.
     from hermes_cli.config import is_provider_enabled, load_config
     _full_cfg = load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
@@ -1738,6 +1743,15 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    if enforce_openrouter_policy:
+        _model_cfg_for_guard = _get_model_config()
+        _assert_openrouter_model_allowed(
+            requested_provider=requested_provider,
+            explicit_base_url=explicit_base_url,
+            model_cfg=_model_cfg_for_guard,
+            target_model=target_model,
+        )
 
     if requested_provider == "moa":
         return {

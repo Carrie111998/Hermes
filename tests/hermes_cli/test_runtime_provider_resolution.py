@@ -650,6 +650,41 @@ def test_resolve_runtime_provider_openrouter_allows_non_forbidden_models(monkeyp
     assert resolved["api_key"] == "sk-or-test"
 
 
+def test_resolve_runtime_provider_metadata_only_callers_can_bypass_openrouter_policy(monkeypatch):
+    """enforce_openrouter_policy=False lets passive metadata lookups (e.g. the
+    MoA aggregator context-length probe in agent/model_metadata.py) resolve a
+    policy-forbidden combination without raising, since no live request is
+    ever sent with the returned credentials. The default stays fail-closed."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: type("P", (), {"has_credentials": lambda self: False})())
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-api",
+            "base_url": "https://openrouter.ai/api/v1",
+            "default": "anthropic/claude-opus-4.8",
+        },
+    )
+
+    with pytest.raises(rp.AuthError):
+        rp.resolve_runtime_provider(
+            requested="openrouter", target_model="anthropic/claude-opus-4.8"
+        )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openrouter",
+        target_model="anthropic/claude-opus-4.8",
+        enforce_openrouter_policy=False,
+    )
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == "sk-or-test"
+
+
 def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeypatch):
     class _Entry:
         access_token = "pool-key"

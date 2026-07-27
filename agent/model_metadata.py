@@ -2218,7 +2218,18 @@ def get_model_context_length(
             agg_provider = str(agg.get("provider") or "").strip()
             agg_model = str(agg.get("model") or "").strip()
             if agg_model and agg_provider and agg_provider.lower() != "moa":
-                rt = resolve_runtime_provider(requested=agg_provider, target_model=agg_model)
+                # Metadata-only lookup: the resolved credentials below are
+                # used solely to recurse into another get_model_context_length()
+                # call for display purposes, never to send a request. Skip the
+                # forbidden-model-family spend guard so a policy-forbidden
+                # aggregator model (whatever the user has actually configured)
+                # still resolves its real context window here instead of
+                # silently falling through to the 256K default.
+                rt = resolve_runtime_provider(
+                    requested=agg_provider,
+                    target_model=agg_model,
+                    enforce_openrouter_policy=False,
+                )
                 return get_model_context_length(
                     agg_model,
                     base_url=rt.get("base_url", "") or "",
