@@ -837,10 +837,11 @@ class APIServerRuntimeMixin:
             _SESSIONS[agent_session_id] = session
 
         def configure_agent(agent: Any) -> None:
+            native_runtime_tools = {"skill_view", "web_search", "web_extract"}
             native = [
                 tool
                 for tool in (agent.tools or [])
-                if tool.get("function", {}).get("name") == "skill_view"
+                if tool.get("function", {}).get("name") in native_runtime_tools
             ]
             agent.tools = native + schemas
             agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}

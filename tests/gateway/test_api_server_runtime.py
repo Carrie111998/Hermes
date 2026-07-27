@@ -39,6 +39,14 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
                     "type": "function",
                     "function": {"name": "skills_list", "description": "", "parameters": {"type": "object"}},
                 },
+                {
+                    "type": "function",
+                    "function": {"name": "web_search", "description": "", "parameters": {"type": "object"}},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "web_extract", "description": "", "parameters": {"type": "object"}},
+                },
             ],
             valid_tool_names={"skill_view", "skills_list"},
             model="configured-model",
@@ -63,6 +71,8 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
             "ask_user_question",
             "skill_view",
             "ultra_media_job_create",
+            "web_extract",
+            "web_search",
         }
         ask_schema = next(
             tool["function"]["parameters"]
