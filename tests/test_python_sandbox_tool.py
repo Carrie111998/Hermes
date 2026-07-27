@@ -539,6 +539,7 @@ for label, action in {
         os.path.expanduser("~") == "/work"
         and open(os.path.expanduser("~/x"), "w").close() is None
     ),
+    "pid1_environ": lambda: open("/proc/1/environ", "rb").read(),
     "venv_write": lambda: open("/venv/probe.txt", "w"),
 }.items():
     try: action(); blocked[label] = False
@@ -571,6 +572,7 @@ open(os.environ["RESULT_PATH"], "w").write(json.dumps(blocked))
         "directory_write": True,
         "etc_write": True,
         "home_is_scratch": False,
+        "pid1_environ": True,
         "ptrace_pid1": True,
         "venv_write": True,
         "venv_remount": True,

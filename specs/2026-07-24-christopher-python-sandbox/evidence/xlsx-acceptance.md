@@ -12,15 +12,15 @@ only after `python_sandbox` returns, then uploads it.
 
 ## Result
 
-- Branch commit: `693a980889`
+- Branch commit: `4d999fa71d`
 - Pull request: <https://github.com/teren-papercutlabs/hermes-pcl/pull/4>
-- CI run: <https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30237111519>
-- CI artifact: `python-sandbox-open-cases`, artifact ID `8641990271`
-- Artifact URL: <https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30237111519/artifacts/8641990271>
+- CI run: <https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30237584638>
+- CI artifact: `python-sandbox-open-cases`, artifact ID `8642133344`
+- Artifact URL: <https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30237584638/artifacts/8642133344>
 - Unit population: 18 tests, 18 passed
 - Jailed E2E population: 9 tests, 9 passed, 0 skipped
 - Workbook: `open-cases-acceptance.xlsx`
-- SHA-256: `66d2333ee82d7cb71d002b739e15443547d9464d2be9465e4d29db7360bfdba4`
+- SHA-256: `f9fcd05bd694a93db09e5e970298f5c9b77ae4e4978f6d7ccce625cf1d540d18`
 - Sheet: `Open Cases`
 - Shape: 81 rows including header, 5 columns
 - Exported population: 80 open cases; every data row has state `open`
