@@ -1584,6 +1584,27 @@ agentic acceptance passed**. The acceptance image manifest digest was
 This remains deterministic local-provider evidence and does not establish
 production search/extraction credentials, quotas, or external authorization.
 
+## Remote media authority evidence (d2c510410c)
+
+Remote image and video sources now require separate URL-bound permits before
+network download. Local filesystem media permissions do not imply external
+fetch authority; each remote source is represented by a SHA-256 resource
+derived from its exact URL.
+
+Validation:
+
+```sh
+uv run --extra dev ruff check tools/image_source.py tools/vision_tools.py
+uv run --extra dev pytest -q tests/tools/test_image_source.py tests/tools/test_vision_tools.py
+scripts/run_agentic_acceptance.sh
+```
+
+Results: **106 media regression tests passed, Ruff passed, and current-tree
+agentic acceptance passed**. The acceptance image manifest digest was
+`sha256:8081a3ec740c3a271fe9ed82500f5f54e79a073f3951fd7699f842c44785ed76`.
+This remains deterministic local-provider evidence and does not establish
+production media-provider credentials, quotas, or external authorization.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal

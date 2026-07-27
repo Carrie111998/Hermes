@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Remote image and video ingestion now requires URL-bound `vision.read` and
+  `video.read` permits before any download; local media grants do not imply
+  authority to fetch arbitrary external media.
 - Web search and extraction permits now bind the complete provider request,
   including query or URL plus result limit, output format, and character limit;
   a worker cannot broaden quota or change returned content under one grant.
