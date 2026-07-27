@@ -1122,21 +1122,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False
 
             # Parse allowed user entries (may contain usernames or IDs)
-            allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
-            if allowed_env:
-                self._allowed_user_ids = {
-                    _clean_discord_id(uid) for uid in allowed_env.split(",")
-                    if uid.strip()
-                }
+            self._allowed_user_ids = self._get_allowed_users()
 
-            # Parse DISCORD_ALLOWED_ROLES — comma-separated role IDs.
+            # Parse DISCORD_ALLOWED_ROLES - comma-separated role IDs.
             # Users with ANY of these roles can interact with the bot.
-            roles_env = os.getenv("DISCORD_ALLOWED_ROLES", "")
-            if roles_env:
-                self._allowed_role_ids = {
-                    int(rid.strip()) for rid in roles_env.split(",")
-                    if rid.strip().isdigit()
-                }
+            self._allowed_role_ids = self._get_allowed_roles()
 
             # Set up intents.
             # Message Content is required for normal text replies.
@@ -5756,6 +5746,42 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _get_allowed_channels(self) -> set:
+        """Return allowed channel IDs, reading per-adapter config first."""
+        raw = self.config.extra.get("allowed_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
+        if not raw:
+            return set()
+        return {ch.strip() for ch in str(raw).split(",") if ch.strip()}
+
+    def _get_ignored_channels(self) -> set:
+        """Return ignored channel IDs, reading per-adapter config first."""
+        raw = self.config.extra.get("ignored_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
+        if not raw:
+            return set()
+        return {ch.strip() for ch in str(raw).split(",") if ch.strip()}
+
+    def _get_allowed_users(self) -> set:
+        """Return allowed user IDs, reading per-adapter config first."""
+        raw = self.config.extra.get("allowed_users")
+        if raw is None:
+            raw = os.getenv("DISCORD_ALLOWED_USERS", "")
+        if not raw:
+            return set()
+        return {_clean_discord_id(uid) for uid in str(raw).split(",") if uid.strip()}
+
+    def _get_allowed_roles(self) -> set:
+        """Return allowed role IDs, reading per-adapter config first."""
+        raw = self.config.extra.get("allowed_roles")
+        if raw is None:
+            raw = os.getenv("DISCORD_ALLOWED_ROLES", "")
+        if not raw:
+            return set()
+        return {int(rid.strip()) for rid in str(raw).split(",") if rid.strip().isdigit()}
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -7226,18 +7252,15 @@ class DiscordAdapter(BasePlatformAdapter):
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
             channel_keys = self._discord_channel_keys(message, parent_channel_id)
-
             # Check allowed channels - if set, only respond in these channels
-            allowed_channels_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
-            if allowed_channels_raw:
-                allowed_channels = {ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()}
+            allowed_channels = self._get_allowed_channels()
+            if allowed_channels:
                 if "*" not in allowed_channels and not (channel_keys & allowed_channels):
                     logger.debug("[%s] Ignoring message in non-allowed channel: %s", self.name, channel_keys)
                     return False
 
             # Check ignored channels - never respond even when mentioned
-            ignored_channels_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
-            ignored_channels = {ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()}
+            ignored_channels = self._get_ignored_channels()
             if "*" in ignored_channels or (channel_keys & ignored_channels):
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
                 return False
@@ -9456,6 +9479,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(allowed_users_cfg, list):
             allowed_users_cfg = ",".join(str(v) for v in allowed_users_cfg)
         os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
+        seeded_extra["allowed_users"] = str(allowed_users_cfg)
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
@@ -9481,12 +9505,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["DISCORD_IGNORED_CHANNELS"] = str(ic)
+        seeded_extra["ignored_channels"] = str(ic)
     # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
     ac = discord_cfg.get("allowed_channels")
     if ac is not None and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
+        seeded_extra["allowed_channels"] = str(ac)
     # no_thread_channels: channels where bot responds directly without creating thread
     ntc = discord_cfg.get("no_thread_channels")
     if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
