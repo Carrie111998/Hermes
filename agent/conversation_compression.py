@@ -364,11 +364,19 @@ def run_compress_context_with_progress_timeout(
     fence = CompressionCommitFence()
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
-    executor = concurrent.futures.ThreadPoolExecutor(
+    # Daemon workers: on cancel we shutdown(wait=False) and must not register
+    # with concurrent.futures' atexit join (stdlib pool would block process exit
+    # while a hung summary call is still running).
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+    from tools.thread_context import propagate_context_to_thread
+
+    executor = DaemonThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="compress-ctx-timeout",
     )
-    future = executor.submit(worker, fence)
+    # Bare ThreadPoolExecutor workers start with an empty ContextVar map;
+    # propagate the parent conversation/approval context into the worker.
+    future = executor.submit(propagate_context_to_thread(worker), fence)
     wait_started = time.monotonic()
     try:
         while True:
@@ -1927,12 +1935,15 @@ def compress_context(
         # thread-local and the compress call is synchronous on this thread,
         # so it cannot leak into unrelated auxiliary calls.
         #
-        # Fenceless callers (CLI /compress, in-loop auto-compress) install a
-        # no-op hook: nobody polls their progress, but an ACTIVE hook is what
-        # switches the summary call onto the streamed path — giving every
-        # compression path the same two guarantees: the configured timeout
-        # acts on inactivity (slow models finish), and a byte-trickling
-        # provider that keeps the connection alive forever is cut off at the
+        # Callers that pass no commit_fence install a no-op progress hook
+        # here.  AIAgent._compress_context injects an owned fence for
+        # fenceless callers so the host-level progress-aware wait can
+        # extend on streamed tokens; gateway hygiene already passes its
+        # own fence.  An ACTIVE hook (even a no-op) is what switches the
+        # summary call onto the streamed path — giving every compression
+        # path the same two guarantees: the configured timeout acts on
+        # inactivity (slow models finish), and a byte-trickling provider
+        # that keeps the connection alive forever is cut off at the
         # streamed total ceiling (see _aux_stream_total_ceiling) instead of
         # outliving the SDK's inactivity timeout indefinitely.
         from agent.auxiliary_client import aux_progress_hook

@@ -159,6 +159,72 @@ class TestRunCompressContextWithProgressTimeout:
             )
 
 
+    def test_propagates_conversation_context_into_worker(self):
+        from agent.portal_tags import (
+            get_conversation_context,
+            reset_conversation_context,
+            set_conversation_context,
+        )
+
+        seen = {}
+        token = set_conversation_context("conv-timeout-ctx")
+        try:
+            def worker(fence: CompressionCommitFence):
+                seen["ctx"] = get_conversation_context()
+                if not fence.begin_commit():
+                    return ([], "")
+                try:
+                    return ([{"role": "user", "content": "ok"}], "p")
+                finally:
+                    fence.finish_commit()
+
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=[{"role": "user", "content": "x"}],
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=1.0,
+                total_ceiling_seconds=2.0,
+            )
+        finally:
+            reset_conversation_context(token)
+
+        assert seen.get("ctx") == "conv-timeout-ctx"
+        assert prompt == "p"
+        assert msgs[0]["content"] == "ok"
+
+    def test_uses_daemon_executor(self, monkeypatch):
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        created = []
+
+        class TrackingPool(DaemonThreadPoolExecutor):
+            def __init__(self, *args, **kwargs):
+                created.append(type(self))
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "tools.daemon_pool.DaemonThreadPoolExecutor",
+            TrackingPool,
+        )
+
+        def worker(fence: CompressionCommitFence):
+            if not fence.begin_commit():
+                return ([], "")
+            try:
+                return ([{"role": "user", "content": "ok"}], "p")
+            finally:
+                fence.finish_commit()
+
+        run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=[],
+            system_prompt_fallback="",
+            idle_timeout_seconds=1.0,
+            total_ceiling_seconds=1.0,
+        )
+        assert created and issubclass(created[0], DaemonThreadPoolExecutor)
+
+
 class TestCompressContextForwarderOwnsTimeout:
     """AIAgent._compress_context wraps when no caller fence is supplied."""
 
@@ -171,6 +237,9 @@ class TestCompressContextForwarderOwnsTimeout:
         agent._emit_warning = MagicMock()
         agent._build_system_prompt = MagicMock(return_value="sys")
         agent._conversation_root_id = MagicMock(return_value=None)
+        agent.context_compressor = MagicMock()
+        agent.context_compressor._consecutive_timeout_failures = 0
+        agent.context_compressor._record_compression_failure_cooldown = MagicMock()
 
         hang = threading.Event()
         calls = {"n": 0}
@@ -210,6 +279,13 @@ class TestCompressContextForwarderOwnsTimeout:
         assert out_prompt == "sys"
         assert calls["n"] == 1
         agent._emit_warning.assert_called_once()
+        assert agent.context_compressor._consecutive_timeout_failures == 1
+        agent.context_compressor._record_compression_failure_cooldown.assert_called_once()
+        cooldown_args = (
+            agent.context_compressor._record_compression_failure_cooldown.call_args[0]
+        )
+        assert cooldown_args[0] == 60.0
+        assert "host compress_context timeout" in cooldown_args[1]
 
     def test_caller_fence_bypasses_owned_wrapper(self, monkeypatch):
         from run_agent import AIAgent
