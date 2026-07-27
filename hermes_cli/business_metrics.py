@@ -148,6 +148,12 @@ def _json(value: Any) -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(metric_targets)")
+        }
+        if "max_observation_age_seconds" in columns:
+            return
     conn.executescript(SCHEMA_SQL)
     columns = {
         str(row["name"]) for row in conn.execute("PRAGMA table_info(metric_targets)")
