@@ -486,6 +486,19 @@ class PaymentService:
                         external_reference=remote.reference,
                         evidence=remote.evidence,
                     )
+            if intent["direction"] == "outgoing":
+                payment_controls.settle_spend_hold(
+                    self.conn, str(intent["action_id"])
+                )
+        elif intent["direction"] == "outgoing" and remote.status in {
+            "failed",
+            "cancelled",
+        }:
+            payment_controls.release_spend_hold(
+                self.conn,
+                str(intent["action_id"]),
+                reason=f"provider_status:{remote.status}",
+            )
         result = self._get(intent_id)
         result["provider_readback_id"] = readback_id
         return result

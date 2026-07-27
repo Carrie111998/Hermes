@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS spend_controls (
     policy_version TEXT NOT NULL, created_at INTEGER NOT NULL,
     FOREIGN KEY(instrument_id) REFERENCES payment_instruments(id)
 );
+CREATE TABLE IF NOT EXISTS payment_spend_holds (
+    id TEXT PRIMARY KEY, instrument_id TEXT NOT NULL, action_id TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL,
+    created_at INTEGER NOT NULL, released_at INTEGER, release_reason TEXT,
+    UNIQUE(action_id),
+    FOREIGN KEY(instrument_id) REFERENCES payment_instruments(id)
+);
+CREATE INDEX IF NOT EXISTS idx_payment_spend_holds_velocity
+    ON payment_spend_holds(instrument_id,status,created_at);
 """
 
 FORBIDDEN_CREDENTIAL_FIELDS = frozenset(
@@ -42,11 +51,29 @@ class SpendControlError(PermissionError):
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    if conn.in_transaction and conn.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type='table' AND name='payment_instruments'"
-    ).fetchone():
-        return
+    if conn.in_transaction:
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if {"payment_instruments", "spend_controls"}.issubset(tables):
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS payment_spend_holds (
+                    id TEXT PRIMARY KEY, instrument_id TEXT NOT NULL,
+                    action_id TEXT NOT NULL, amount_minor INTEGER NOT NULL,
+                    currency TEXT NOT NULL, status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, released_at INTEGER,
+                    release_reason TEXT, UNIQUE(action_id),
+                    FOREIGN KEY(instrument_id) REFERENCES payment_instruments(id)
+                )"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_payment_spend_holds_velocity
+                   ON payment_spend_holds(instrument_id,status,created_at)"""
+            )
+            return
     conn.executescript(SCHEMA_SQL)
 
 
@@ -130,55 +157,140 @@ def authorize_spend(
     payee_id: str,
     action_id: str,
 ) -> dict[str, Any]:
+    if amount_minor <= 0:
+        raise ValueError("payment amount must be positive")
     now = int(time.time())
-    instrument = conn.execute(
-        """SELECT * FROM payment_instruments
-           WHERE id = ? AND status = 'active'
-             AND (expires_at IS NULL OR expires_at > ?)""",
-        (instrument_id, now),
-    ).fetchone()
-    if instrument is None:
-        raise SpendControlError("payment instrument is missing, inactive, or expired")
-    if instrument["provider"] != provider or instrument["currency"] != currency.upper():
-        raise SpendControlError("instrument does not match provider or currency")
-    control = conn.execute(
-        """SELECT * FROM spend_controls WHERE instrument_id = ?
-             AND effective_from <= ? AND (expires_at IS NULL OR expires_at > ?)
-           ORDER BY effective_from DESC, created_at DESC LIMIT 1""",
-        (instrument_id, now, now),
-    ).fetchone()
-    if control is None:
-        raise SpendControlError("instrument has no active spend controls")
-    if amount_minor > int(control["max_transaction_minor"]):
-        raise SpendControlError("payment exceeds per-transaction limit")
-    categories = set(json.loads(control["allowed_merchant_categories_json"]))
-    payees = set(json.loads(control["allowed_payees_json"]))
-    if categories and merchant_category not in categories:
-        raise SpendControlError("merchant category is not allowed")
-    if payees and payee_id not in payees:
-        raise SpendControlError("payee is not allowed")
-    since = now - 86400
-    daily = conn.execute(
-        """SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payment_intents
-           WHERE direction = 'outgoing' AND status = 'succeeded'
-             AND json_extract(metadata_json, '$.instrument_id') = ?
-             AND updated_at >= ?""",
-        (instrument_id, since),
-    ).fetchone()
-    if int(daily["total"]) + amount_minor > int(control["max_daily_minor"]):
-        raise SpendControlError("payment exceeds 24-hour velocity limit")
-    threshold = control["human_threshold_minor"]
-    if threshold is not None and amount_minor > int(threshold):
-        permit = conn.execute(
-            """SELECT p.approval_artifact_id FROM permits p
-               WHERE p.action_id = ? AND p.consumed_at IS NOT NULL
-               ORDER BY p.issued_at DESC LIMIT 1""",
+    ensure_schema(conn)
+    started_transaction = not conn.in_transaction
+    if started_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        instrument = conn.execute(
+            """SELECT * FROM payment_instruments
+               WHERE id = ? AND status = 'active'
+                 AND (expires_at IS NULL OR expires_at > ?)""",
+            (instrument_id, now),
+        ).fetchone()
+        if instrument is None:
+            raise SpendControlError(
+                "payment instrument is missing, inactive, or expired"
+            )
+        if instrument["provider"] != provider or instrument["currency"] != currency.upper():
+            raise SpendControlError("instrument does not match provider or currency")
+        control = conn.execute(
+            """SELECT * FROM spend_controls WHERE instrument_id = ?
+                 AND effective_from <= ? AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY effective_from DESC, created_at DESC LIMIT 1""",
+            (instrument_id, now, now),
+        ).fetchone()
+        if control is None:
+            raise SpendControlError("instrument has no active spend controls")
+        existing_hold = conn.execute(
+            """SELECT amount_minor,currency,status FROM payment_spend_holds
+               WHERE action_id=?""",
             (action_id,),
         ).fetchone()
-        if permit is None or not permit["approval_artifact_id"]:
-            raise SpendControlError("payment exceeds the human authorization threshold")
+        if existing_hold is not None:
+            if (
+                int(existing_hold["amount_minor"]) != amount_minor
+                or str(existing_hold["currency"]) != currency.upper()
+            ):
+                raise SpendControlError("action already has a different spend hold")
+            if str(existing_hold["status"]) == "released":
+                raise SpendControlError("action's spend hold was already released")
+        else:
+            if amount_minor > int(control["max_transaction_minor"]):
+                raise SpendControlError("payment exceeds per-transaction limit")
+            categories = set(json.loads(control["allowed_merchant_categories_json"]))
+            payees = set(json.loads(control["allowed_payees_json"]))
+            if categories and merchant_category not in categories:
+                raise SpendControlError("merchant category is not allowed")
+            if payees and payee_id not in payees:
+                raise SpendControlError("payee is not allowed")
+            since = now - 86400
+            payment_intents_table = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='payment_intents'"""
+            ).fetchone()
+            daily_total = 0
+            if payment_intents_table is not None:
+                daily_total = int(
+                    conn.execute(
+                        """SELECT COALESCE(SUM(amount_minor), 0) AS total
+                             FROM payment_intents
+                            WHERE direction = 'outgoing' AND status = 'succeeded'
+                              AND json_extract(metadata_json, '$.instrument_id') = ?
+                              AND updated_at >= ?""",
+                        (instrument_id, since),
+                    ).fetchone()["total"]
+                )
+            held = conn.execute(
+                """SELECT COALESCE(SUM(amount_minor), 0) AS total
+                     FROM payment_spend_holds
+                    WHERE instrument_id=? AND status='reserved'""",
+                (instrument_id,),
+            ).fetchone()
+            if daily_total + int(held["total"]) + amount_minor > int(
+                control["max_daily_minor"]
+            ):
+                raise SpendControlError("payment exceeds 24-hour velocity limit")
+            threshold = control["human_threshold_minor"]
+            if threshold is not None and amount_minor > int(threshold):
+                permit = conn.execute(
+                    """SELECT p.approval_artifact_id FROM permits p
+                       WHERE p.action_id = ? AND p.consumed_at IS NOT NULL
+                       ORDER BY p.issued_at DESC LIMIT 1""",
+                    (action_id,),
+                ).fetchone()
+                if permit is None or not permit["approval_artifact_id"]:
+                    raise SpendControlError(
+                        "payment exceeds the human authorization threshold"
+                    )
+            conn.execute(
+                """INSERT INTO payment_spend_holds
+                   (id,instrument_id,action_id,amount_minor,currency,status,created_at)
+                   VALUES (?,?,?,?,?,'reserved',?)""",
+                (
+                    f"spendhold_{uuid.uuid4().hex}", instrument_id, action_id,
+                    amount_minor, currency.upper(), now,
+                ),
+            )
+        if started_transaction:
+            conn.commit()
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
     return {
         "provider_instrument_id": instrument["provider_instrument_id"],
         "policy_version": control["policy_version"],
         "control_id": control["id"],
     }
+
+
+def release_spend_hold(
+    conn: sqlite3.Connection, action_id: str, *, reason: str
+) -> bool:
+    """Release a pending outbound hold after a terminal provider result."""
+    ensure_schema(conn)
+    with conn:
+        updated = conn.execute(
+            """UPDATE payment_spend_holds
+                  SET status='released', released_at=?, release_reason=?
+                WHERE action_id=? AND status='reserved'""",
+            (int(time.time()), reason, action_id),
+        )
+    return updated.rowcount == 1
+
+
+def settle_spend_hold(conn: sqlite3.Connection, action_id: str) -> bool:
+    """Mark a hold settled after a provider result is durably recorded."""
+    ensure_schema(conn)
+    with conn:
+        updated = conn.execute(
+            """UPDATE payment_spend_holds
+                  SET status='settled', released_at=?
+                WHERE action_id=? AND status='reserved'""",
+            (int(time.time()), action_id),
+        )
+    return updated.rowcount == 1

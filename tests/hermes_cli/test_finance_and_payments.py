@@ -437,6 +437,9 @@ def test_business_can_pay_only_against_exact_reservation(treasury):
         idempotency_key="pay-1",
     )
     assert result["status"] == "succeeded"
+    assert conn.execute(
+        "SELECT status FROM payment_spend_holds WHERE action_id=?", ("act_1",)
+    ).fetchone()["status"] == "settled"
     assert finance_db.account_balance(conn, account) == 4_000
     registration = accounting_db.configure_tax_registration(
         conn,
@@ -469,6 +472,57 @@ def test_business_can_pay_only_against_exact_reservation(treasury):
     assert conn.execute(
         "SELECT status FROM tax_obligations WHERE id=?", (obligation,)
     ).fetchone()["status"] == "paid"
+
+
+def test_concurrent_spend_controls_reserve_daily_velocity_atomically(tmp_path):
+    path = tmp_path / "spend-velocity.db"
+    conn = objectives_db.connect(path)
+    instrument = payment_controls.register_tokenized_instrument(
+        conn,
+        organization_id="org_1",
+        provider="fake",
+        provider_instrument_id="provider-card-token-velocity",
+        rail_type="virtual_card",
+        currency="USD",
+        label="Velocity test card",
+    )
+    payment_controls.set_spend_controls(
+        conn,
+        instrument_id=instrument,
+        max_transaction_minor=1_000,
+        max_daily_minor=1_000,
+        allowed_merchant_categories=[],
+        allowed_payees=[],
+        policy_version="finance-v1",
+    )
+    conn.close()
+
+    def authorize(action_id):
+        worker = objectives_db.connect(path)
+        try:
+            payment_controls.authorize_spend(
+                worker,
+                instrument_id=instrument,
+                provider="fake",
+                amount_minor=600,
+                currency="USD",
+                merchant_category="software",
+                payee_id="vendor-velocity",
+                action_id=action_id,
+            )
+            return "reserved"
+        except payment_controls.SpendControlError:
+            return "rejected"
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(authorize, ("velocity-a", "velocity-b")))
+    assert sorted(outcomes) == ["rejected", "reserved"]
+    conn = objectives_db.connect(path)
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM payment_spend_holds WHERE status='reserved'"
+    ).fetchone()["n"] == 1
 
 
 def test_raw_financial_credentials_are_rejected(treasury):
