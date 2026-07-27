@@ -330,6 +330,68 @@ def test_codex_delivery_observes_client_initialized_after_construction() -> None
     assert client.initialize_timeouts == []
 
 
+def test_codex_delivery_reads_exact_initial_user_prompt_without_mutation() -> None:
+    prompt = _registration_prompt()
+    client = FakeCodexAppServerClient({
+        "thread/read": [_persisted_registration(prompt)],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    observed = delivery.read_thread_initial_prompt(
+        thread_id=THREAD_1,
+        deadline=105.0,
+    )
+
+    assert observed == prompt
+    assert [method for method, _params, _timeout in client.calls] == ["thread/read"]
+
+
+def test_codex_delivery_resumes_before_reading_exact_initial_user_prompt() -> None:
+    prompt = _registration_prompt()
+    client = FakeCodexAppServerClient({
+        "thread/read": [
+            CodexAppServerError(
+                code=-32600,
+                message=f"thread not loaded: {THREAD_1}",
+            )
+        ],
+        "thread/resume": [_persisted_registration(prompt)],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    observed = delivery.read_thread_initial_prompt(
+        thread_id=THREAD_1,
+        deadline=105.0,
+    )
+
+    assert observed == prompt
+    assert [method for method, _params, _timeout in client.calls] == [
+        "thread/read",
+        "thread/resume",
+    ]
+
+
+def test_codex_delivery_rejects_missing_initial_user_prompt() -> None:
+    client = FakeCodexAppServerClient({
+        "thread/read": [
+            {
+                "thread": {
+                    "id": THREAD_1,
+                    "cwd": "C:/source",
+                    "turns": [{"id": TURN_1, "status": "completed", "items": []}],
+                }
+            }
+        ],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    with pytest.raises(ValueError, match="initial user prompt"):
+        delivery.read_thread_initial_prompt(
+            thread_id=THREAD_1,
+            deadline=105.0,
+        )
+
+
 def _registration_prompt(source: str = SOURCE_1) -> str:
     expected = BridgeMarkerPayload(
         bridge_id=sidebar_bridge_id(source),

@@ -101,6 +101,10 @@ class NativeSidebarDelivery(Protocol):
         self, *, thread_id: str, deadline: float
     ) -> NativeThreadState | None: ...
 
+    def read_thread_initial_prompt(
+        self, *, thread_id: str, deadline: float
+    ) -> str: ...
+
     def register_thread(
         self,
         *,
@@ -402,6 +406,17 @@ class CodexAppServerSidebarDelivery:
         turns = cast(list[object], thread["turns"])
         status = _native_thread_status(thread.get("status"), turns=turns)
         return NativeThreadState(thread_id=wanted, status=status, cwd=cwd)
+
+    def read_thread_initial_prompt(
+        self,
+        *,
+        thread_id: str,
+        deadline: float,
+    ) -> str:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        self._ensure_initialized(deadline)
+        thread = self._read_or_resume_thread(wanted, deadline=deadline)
+        return _exact_first_user_text(thread)
 
     def _read_or_resume_thread(
         self,
@@ -1419,6 +1434,33 @@ def _thread_has_exact_marker(
             if marker in _SIGNED_MARKER_RE.findall(text):
                 return True
     return False
+
+
+def _exact_first_user_text(thread: Mapping[str, object]) -> str:
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        raise ValueError("Codex thread has no turns list")
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        items = turn.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "userMessage":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                raise ValueError("Codex initial user prompt is malformed")
+            parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if part.get("type") == "text" and isinstance(text, str):
+                    parts.append(text)
+            return _required_text("".join(parts), "Codex initial user prompt")
+    raise ValueError("Codex initial user prompt is missing")
 
 
 def _native_thread_status(

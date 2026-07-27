@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+import session_bridge.sidebar as sidebar_module
 from session_bridge.models import (
     BridgeMarkerPayload,
     HydrationMarkerPayload,
@@ -712,6 +713,53 @@ def test_readable_registration_prompt_digest_mismatch_fails_classification() -> 
     )
 
     assert is_registration_prompt(prompt.replace(preview.digest, "0" * 64)) is False
+
+
+def test_authenticated_initial_prompt_classifier_distinguishes_legacy_and_readable(
+) -> None:
+    candidate = _candidate()
+    marker_secret = b"sidebar-tests-marker-secret"
+    marker = _marker_for(candidate)
+    preview = build_session_preview(
+        source_session_id=candidate.source_session_id,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        title="Readable source",
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=NOW,
+        messages=[],
+        git_root=candidate.git_root,
+        git_branch=candidate.git_branch,
+        git_head=candidate.git_head,
+        worktree_id=candidate.worktree_id,
+    )
+
+    legacy = build_registration_prompt(candidate, marker)
+    readable = build_registration_prompt(candidate, marker, preview=preview)
+
+    assert sidebar_module.classify_sidebar_initial_prompt(
+        legacy,
+        marker_secret,
+    ).value == "legacy_placeholder"
+    assert sidebar_module.classify_sidebar_initial_prompt(
+        readable,
+        marker_secret,
+    ).value == "readable_registration"
+    assert sidebar_module.classify_sidebar_initial_prompt(
+        "ordinary user request",
+        marker_secret,
+    ).value == "unrelated"
+
+
+def test_authenticated_initial_prompt_classifier_rejects_wrong_signature() -> None:
+    candidate = _candidate()
+    prompt = build_registration_prompt(candidate, _marker_for(candidate))
+
+    assert sidebar_module.classify_sidebar_initial_prompt(
+        prompt,
+        b"wrong-sidebar-marker-secret",
+    ).value == "unrelated"
 
 
 def test_hydration_marker_round_trips_exact_canonical_payload() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 from dataclasses import dataclass
+from enum import StrEnum
 import hashlib
 import hmac
 import json
@@ -14,12 +15,14 @@ from typing import cast
 
 from .context_pack import _redact
 from .models import (
+    InvalidBridgeMarker,
     OriginKind,
     HydrationMarkerPayload,
     Provider,
     SessionPreview,
     SessionProjection,
     canonical_session_id,
+    decode_bridge_marker,
 )
 
 
@@ -98,6 +101,12 @@ class VerifiedSidebarThread:
     thread_id: str
     source_session_id: str
     bridge_id: str
+
+
+class SidebarInitialPromptKind(StrEnum):
+    LEGACY_PLACEHOLDER = "legacy_placeholder"
+    READABLE_REGISTRATION = "readable_registration"
+    UNRELATED = "unrelated"
 
 
 def normalize_meaningful_user_text(value: object) -> str | None:
@@ -488,6 +497,52 @@ def is_registration_prompt(value: object) -> bool:
         return _is_exact_registration_block("\n".join(bridge_lines[4:]))
     except (TypeError, ValueError):
         return False
+
+
+def classify_sidebar_initial_prompt(
+    value: object,
+    marker_secret: bytes,
+) -> SidebarInitialPromptKind:
+    """Classify only structurally exact registrations with an authentic marker."""
+
+    if type(marker_secret) is not bytes or not marker_secret:
+        raise ValueError("sidebar marker secret must be non-empty bytes")
+    if not isinstance(value, str):
+        return SidebarInitialPromptKind.UNRELATED
+
+    if _is_exact_registration_block(value):
+        registration = value
+        kind = SidebarInitialPromptKind.LEGACY_PLACEHOLDER
+    elif (
+        value.count(_READABLE_REGISTRATION_DELIMITER) == 1
+        and is_registration_prompt(value)
+    ):
+        _rendered, bridge_block = value.split(
+            _READABLE_REGISTRATION_DELIMITER,
+            1,
+        )
+        bridge_lines = bridge_block.split("\n")
+        registration = "\n".join(bridge_lines[4:])
+        kind = SidebarInitialPromptKind.READABLE_REGISTRATION
+    else:
+        return SidebarInitialPromptKind.UNRELATED
+
+    lines = registration.split("\n")
+    try:
+        marker = _prompt_line_value(lines[2], "Signed marker: ")
+        source = _decode_canonical_prompt_field(lines[3], "Source session ID: ")
+        payload = decode_bridge_marker(marker, marker_secret)
+        if (
+            not isinstance(source, str)
+            or payload.source_session_id != source
+            or payload.bridge_id != sidebar_bridge_id(source)
+            or payload.target_provider is not Provider.CODEX
+            or payload.policy_generation != 1
+        ):
+            return SidebarInitialPromptKind.UNRELATED
+    except (InvalidBridgeMarker, TypeError, ValueError):
+        return SidebarInitialPromptKind.UNRELATED
+    return kind
 
 
 def build_hydration_message(
