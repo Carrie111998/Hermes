@@ -1085,6 +1085,24 @@ def test_dispatch_rejects_non_object_params():
     }
 
 
+def test_session_create_immediately_reports_configured_provider(monkeypatch):
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("gpt-5.6-terra", "novacode"))
+    monkeypatch.setattr(server, "_resolve_model", lambda: "gpt-5.6-terra")
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.create", "params": {"cols": 80}}
+    )
+    assert isinstance(resp, dict)
+    result = resp.get("result")
+    assert isinstance(result, dict)
+    sid = result["session_id"]
+    try:
+        assert result["info"]["model"] == "gpt-5.6-terra"
+        assert result["info"]["provider"] == "novacode"
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_system_battery_returns_reading(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
