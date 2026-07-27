@@ -52,4 +52,44 @@ describe('reorderBidi', () => {
 
     expect(textFrom(output)).toBe('gpt-5 ابحرم')
   })
+
+  it('uses an RTL base for English-first Persian-majority technical prose', async () => {
+    const { reorderBidi } = await importBidiWithSoftwareReordering()
+    const input = charactersFrom('React یک کتابخانه جاوااسکریپت بسیار محبوب است.')
+    const output = reorderBidi(input)
+
+    expect(textFrom(output)).toBe('.تسا بوبحم رایسب تپیرکسااواج هناخباتک کی React')
+  })
+
+  it('keeps an LTR base when English remains the strong-character majority', async () => {
+    const { reorderBidi } = await importBidiWithSoftwareReordering()
+    const input = charactersFrom('React is a popular library: محبوب')
+    const output = reorderBidi(input)
+
+    expect(textFrom(output)).toBe('React is a popular library: بوبحم')
+  })
+
+  it('uses an LTR base for RTL-first, LTR-majority technical prose', async () => {
+    const { reorderBidi } = await importBidiWithSoftwareReordering()
+    const input = charactersFrom('محبوب React is a popular library.')
+    const output = reorderBidi(input)
+
+    expect(textFrom(output)).toBe('بوبحم React is a popular library.')
+  })
+
+  it('falls back to first-strong behavior for an LTR-first tie', async () => {
+    const { reorderBidi } = await importBidiWithSoftwareReordering()
+    const input = charactersFrom('Aب.')
+    const output = reorderBidi(input)
+
+    expect(textFrom(output)).toBe('Aب.')
+  })
+
+  it('falls back to first-strong behavior for an RTL-first tie', async () => {
+    const { reorderBidi } = await importBidiWithSoftwareReordering()
+    const input = charactersFrom('بA.')
+    const output = reorderBidi(input)
+
+    expect(textFrom(output)).toBe('.Aب')
+  })
 })
