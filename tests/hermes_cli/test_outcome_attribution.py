@@ -16,6 +16,15 @@ from hermes_cli import (
 )
 
 
+def test_attribution_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    outcome_attribution.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    outcome_attribution.ensure_schema(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def _company(tmp_path):
     conn = objectives_db.connect(tmp_path / "authority.db")
     organization_id, _ = organization_db.bootstrap_solo_founder(
