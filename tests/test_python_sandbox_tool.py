@@ -7,6 +7,7 @@ import errno
 import json
 import os
 import platform
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -392,6 +393,115 @@ print("600 compared; 50 missing; 20 mismatched")
     assert response["result"] == {"rows": 600, "missing": 50, "mismatched": 20}
     assert "50 missing" in response["stdout"]
     assert any(item["path"] == "work/details.csv" for item in response["files"])
+
+
+@pytest.mark.skipif(not _can_run_jail(), reason="kernel user namespaces unavailable")
+@pytest.mark.sandbox_e2e
+def test_jailed_open_cases_xlsx_acceptance(tmp_path, monkeypatch):
+    """Produce a real workbook from a copied tenant-shaped database."""
+    source = tmp_path / "tenant-source.db"
+    connection = sqlite3.connect(source)
+    connection.execute(
+        "create table cases ("
+        "job_no text primary key, zone text not null, state text not null, "
+        "priority text, updated_at integer not null)"
+    )
+    connection.executemany(
+        "insert into cases values (?, ?, ?, ?, ?)",
+        [
+            (
+                f"JOB-{index:04d}",
+                f"ZONE-{index % 4 + 1}",
+                "open" if index % 3 else "closed",
+                "urgent" if index % 10 == 1 else "normal",
+                1_800_000_000 + index,
+            )
+            for index in range(120)
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    tenant_copy = tmp_path / "tenant-copy.db"
+    shutil.copy2(source, tenant_copy)
+    config = {
+        "enabled": True,
+        "datasets": {
+            "cases": {
+                "type": "sqlite",
+                "path": str(tenant_copy),
+                "description": "Copied tenant case database.",
+            },
+        },
+        "limits": {"wall_seconds": 30, "max_wall_seconds": 30},
+    }
+    home = tmp_path / "home"
+    monkeypatch.setattr(sandbox, "_load_config", lambda: config)
+    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: home)
+    code = r'''
+import json, os, sqlite3
+from openpyxl import Workbook
+
+inputs = json.loads(os.environ["SANDBOX_INPUTS"])
+rows = sqlite3.connect(inputs["cases"]).execute(
+    "select job_no, zone, state, priority, updated_at "
+    "from cases where state = 'open' order by job_no"
+).fetchall()
+workbook = Workbook()
+sheet = workbook.active
+sheet.title = "Open Cases"
+sheet.append(["Job No", "Zone", "State", "Priority", "Updated At"])
+for row in rows:
+    sheet.append(row)
+sheet.freeze_panes = "A2"
+sheet.auto_filter.ref = sheet.dimensions
+sheet.column_dimensions["A"].width = 18
+sheet.column_dimensions["B"].width = 14
+sheet.column_dimensions["C"].width = 12
+sheet.column_dimensions["D"].width = 12
+sheet.column_dimensions["E"].width = 18
+output = "/work/open-cases.xlsx"
+workbook.save(output)
+result = {"open_cases": len(rows), "workbook": "open-cases.xlsx"}
+open(os.environ["RESULT_PATH"], "w").write(json.dumps(result))
+print(f"{len(rows)} open cases exported to open-cases.xlsx")
+'''
+    response = json.loads(
+        sandbox.python_sandbox(code, ["cases"], timeout_seconds=30)
+    )
+    assert response["status"] == "success", response
+    assert response["result"] == {
+        "open_cases": 80,
+        "workbook": "open-cases.xlsx",
+    }
+    assert any(
+        item["path"] == "work/open-cases.xlsx" and item["bytes"] > 0
+        for item in response["files"]
+    )
+
+    output = home / "sandbox_runs" / response["run_id"] / "work" / "open-cases.xlsx"
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(output, read_only=True)
+    sheet = workbook["Open Cases"]
+    assert sheet.max_row == 81
+    assert tuple(cell.value for cell in next(sheet.iter_rows(max_row=1))) == (
+        "Job No",
+        "Zone",
+        "State",
+        "Priority",
+        "Updated At",
+    )
+    assert {row[2] for row in sheet.iter_rows(min_row=2, values_only=True)} == {
+        "open"
+    }
+    workbook.close()
+
+    artifact_dir = os.environ.get("PYTHON_SANDBOX_ACCEPTANCE_DIR")
+    if artifact_dir:
+        destination = Path(artifact_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(output, destination / "open-cases.xlsx")
 
 
 @pytest.mark.skipif(not _can_run_jail(), reason="kernel user namespaces unavailable")
