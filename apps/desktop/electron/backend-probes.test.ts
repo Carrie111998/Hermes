@@ -15,6 +15,7 @@ import { test } from 'vitest'
 import {
   canImportHermesCli,
   hermesRuntimeImportProbe,
+  PROBE_TIMEOUT_MS,
   shouldTrustHermesOverride,
   verifyHermesCli
 } from './backend-probes'
@@ -100,9 +101,20 @@ test('verifyHermesCli returns true when --version exits 0', () => {
 })
 
 test('verifyHermesCli swallows timeouts (does not throw)', () => {
-  // We can't easily provoke a real 5s hang in CI without slowing the
-  // suite, but we CAN confirm that an invocation that DOES throw
-  // (because the binary is missing) returns false rather than
-  // propagating. Same code path the timeout case takes.
+  // We can't easily provoke a real hang equal to PROBE_TIMEOUT_MS in CI
+  // without slowing the suite, but we CAN confirm that an invocation
+  // that DOES throw (because the binary is missing) returns false
+  // rather than propagating. Same code path the timeout case takes.
   assert.equal(verifyHermesCli('/definitely/not/a/real/binary/anywhere'), false)
+})
+
+test('runtime probe timeout clears measured cold Windows import times', () => {
+  // Contract from #72632/#72707: cold `import hermes_cli` ~4.3s and
+  // `hermes --version` ~10.5s on a healthy Windows venv. A bound at or
+  // under those measurements false-negatives step-3 active-runtime
+  // usability and hands the user hermes-setup.exe --update.
+  assert.ok(
+    PROBE_TIMEOUT_MS >= 30_000,
+    `PROBE_TIMEOUT_MS=${PROBE_TIMEOUT_MS} must be >= 30s so cold Windows probes do not strand a healthy install`
+  )
 })
