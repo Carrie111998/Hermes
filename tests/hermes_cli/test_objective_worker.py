@@ -6,6 +6,21 @@ import time
 from hermes_cli import objective_worker, objectives_db, operational_control
 
 
+def test_worker_schema_read_preserves_active_transaction(tmp_path):
+    conn = objectives_db.connect(tmp_path / "authority.db")
+    objective_worker.ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO objective_workers "
+        "(id, organization_id, role, pid, process_nonce, status, started_at, heartbeat_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("worker_txn", "__unscoped__", "test", 1, "nonce", "running", 1, 1),
+    )
+    assert objective_worker.worker_health(conn)[0]["id"] == "worker_txn"
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
 def test_supervised_worker_persists_cycle_and_graceful_stop(tmp_path):
     path = tmp_path / "authority.db"
     calls = []

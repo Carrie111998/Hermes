@@ -31,6 +31,11 @@ CREATE INDEX IF NOT EXISTS idx_objective_workers_health
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction and conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='objective_workers'"
+    ).fetchone():
+        return
     conn.executescript(SCHEMA_SQL)
     columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(objective_workers)")
