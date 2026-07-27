@@ -14598,6 +14598,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
+                        # Compute here — the non-streaming path builds this
+                        # set later in `_process_message_background`, which is
+                        # skipped when already_sent short-circuits. Referencing
+                        # that out-of-scope name raised NameError after every
+                        # successful streamed turn (commonly after /compress).
+                        _history_media_paths = _collect_history_media_paths(
+                            history or []
+                        )
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                             history_media_paths=_history_media_paths,
