@@ -21,6 +21,8 @@
   five while leaving successful governed stops stopped.
 - Payment readiness now also requires a durable non-custodial compliance profile
   and current AML/sanctions-screened provider assessment per declared direction.
+- Recorded a cross-process authority snapshot restore smoke that preserves
+  accounting integrity, pauses autonomy, and opens reconciliation handoff.
 
 ## 0.19.0-agentic-foundation — 2026-07-27
 

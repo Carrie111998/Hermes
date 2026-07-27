@@ -221,7 +221,8 @@ acceptance evidence.
   local installer, and a local Docker image/startup smoke are supported and
   verified; publication remains unreleased work.
 - Trademark clearance for Charterforge.
-- High-availability database replication or disaster-recovery drill evidence.
+- High-availability database replication or a full disaster-recovery drill;
+  local authority snapshot restore smoke is verified and documented.
 - Runtime drift enforcement remains opt-in for migrated installations; fresh
   agentic setup enables the strict gate and records a baseline. Migrated
   installations should enable it after reviewing deployment policy.

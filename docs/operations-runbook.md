@@ -107,6 +107,36 @@ profile registration, intentional stopped-state preservation, stale PID cleanup,
 and live gateway auto-start after a real Docker restart. This is local restart
 evidence, not a disaster-recovery or high-availability drill.
 
+## Authority snapshot restore smoke
+
+The implemented authority snapshot path was exercised on 2026-07-27 with a
+temporary state root. The sequence was:
+
+```bash
+state_dir=$(mktemp -d)
+export HERMES_HOME="$state_dir" CHARTERFORGE_HOME="$state_dir"
+uv run charterforge business bootstrap \
+  --charter-file examples/agentic-charter.json
+snapshot=$(find "$state_dir/business-recovery" -maxdepth 3 \
+  -name '*.json' -print -quit)
+uv run charterforge business recovery-verify --snapshot "$snapshot"
+uv run charterforge business --db "$state_dir/objectives.db" autonomy paused \
+  --reason "recovery smoke pause"
+uv run charterforge business --db "$state_dir/objectives.db" recovery-restore \
+  --snapshot "$snapshot" --actor human:smoke \
+  --reason "recovery smoke restore" \
+  --evidence '{"source_integrity_failed":false,"workers_stopped":true,"smoke":true}'
+uv run charterforge business status
+```
+
+Observed result: manifest verification was `valid: true`; restore returned
+`restored: true`, `autonomy: paused`, and `reconciliation_required: true`.
+The post-restore status preserved the organization, CEO, balanced USD 10.00
+opening ledger, and snapshot integrity evidence, while opening one durable
+`post_restore_reconciliation` advisor intervention. This proves local snapshot
+restore semantics only; it does not prove high availability, multi-host
+replication, or a complete disaster-recovery exercise.
+
 ## Sandbox provider validation
 
 The Docker terminal provider was exercised against a live container with:

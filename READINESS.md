@@ -124,6 +124,11 @@ tag above.
   containers shared one temporary state directory. The read-back worker record
   contained `security_blocked`, `runtime_blocked:security_blocked`, and the
   exact isolation/secret readiness reason; no external action was attempted.
+- Authority restore smoke passed from a temporary state root: bootstrap created
+  a verified snapshot, `recovery-verify` returned `valid: true`, restore returned
+  `restored: true` with autonomy paused, and read-back status showed
+  `reconciliation_required: true` plus one durable post-restore advisor
+  intervention. This is restore-smoke evidence, not HA or full DR evidence.
 - Non-interactive bootstrap smoke: two consecutive bootstrap invocations
   returned identical organization/objective IDs, and `business status` reported
   configured state from the persistent directory.
