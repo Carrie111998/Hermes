@@ -777,6 +777,16 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
+    # Keep the live-transcript manifest in sync after the async worker
+    # finishes.  The synchronous path in delegate_tool already calls
+    # update_manifest_statuses, but the background-pool path was missing it,
+    # so completed tasks appeared as "running" forever in manifest.json.
+    try:
+        from tools.delegation_live_log import update_manifest_statuses
+        update_manifest_statuses(delegation_id, [result])
+    except Exception:
+        logger.debug("Live transcript manifest update failed", exc_info=True)
+
 
 def _begin_finalization(
     delegation_id: str,
@@ -1019,6 +1029,15 @@ def _finalize_batch(
 
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
+
+    # Keep the live-transcript manifest in sync (same gap as _finalize above).
+    try:
+        from tools.delegation_live_log import update_manifest_statuses
+        results = combined.get("results") or []
+        if results:
+            update_manifest_statuses(delegation_id, results)
+    except Exception:
+        logger.debug("Live transcript manifest update failed", exc_info=True)
 
 
 def _push_batch_completion_event(

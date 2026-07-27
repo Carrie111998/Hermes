@@ -143,6 +143,59 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_single_async_finalization_updates_live_manifest(monkeypatch):
+    calls = []
+    from tools import delegation_live_log
+
+    monkeypatch.setattr(
+        delegation_live_log,
+        "update_manifest_statuses",
+        lambda delegation_id, results: calls.append((delegation_id, results)),
+    )
+    result = {
+        "status": "completed",
+        "summary": "verified handoff",
+        "exit_reason": "completed",
+    }
+    res = ad.dispatch_async_delegation(
+        goal="manifest single", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=lambda: result,
+        max_async_children=1,
+    )
+    assert _drain_for(res["delegation_id"]) is not None
+
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert calls == [(res["delegation_id"], [result])]
+
+
+def test_batch_async_finalization_updates_live_manifest(monkeypatch):
+    calls = []
+    from tools import delegation_live_log
+
+    monkeypatch.setattr(
+        delegation_live_log,
+        "update_manifest_statuses",
+        lambda delegation_id, results: calls.append((delegation_id, results)),
+    )
+    results = [
+        {"task_index": 0, "status": "completed", "summary": "one"},
+        {"task_index": 1, "status": "failed", "summary": None},
+    ]
+    res = ad.dispatch_async_delegation_batch(
+        goals=["one", "two"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=lambda: {"results": results},
+        max_async_children=1,
+    )
+    assert _drain_for(res["delegation_id"]) is not None
+
+    deadline = time.monotonic() + 2.0
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert calls == [(res["delegation_id"], results)]
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",
