@@ -24,6 +24,7 @@ Usage:
 """
 
 from typing import List, Dict, Any, Set, Optional
+from tools import web_tools  # ensure web_search/web_extract handlers are registered early
 
 
 # Shared tool list for CLI and all messaging platform toolsets.
