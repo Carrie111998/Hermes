@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 
 
 SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS usage_events (
+CREATE TABLE IF NOT EXISTS agentic_usage_events (
     id TEXT PRIMARY KEY,
     organization_id TEXT NOT NULL,
     customer_ref TEXT NOT NULL,
@@ -25,29 +25,29 @@ CREATE TABLE IF NOT EXISTS usage_events (
     created_at INTEGER NOT NULL,
     UNIQUE(organization_id, idempotency_key)
 );
-CREATE INDEX IF NOT EXISTS idx_usage_events_customer
-    ON usage_events(organization_id, customer_ref, currency, occurred_at, id);
-CREATE TABLE IF NOT EXISTS usage_invoice_allocations (
+CREATE INDEX IF NOT EXISTS idx_agentic_usage_events_customer
+    ON agentic_usage_events(organization_id, customer_ref, currency, occurred_at, id);
+CREATE TABLE IF NOT EXISTS agentic_usage_invoice_allocations (
     id TEXT PRIMARY KEY,
     usage_event_id TEXT NOT NULL UNIQUE,
     payment_intent_id TEXT NOT NULL,
     allocated_at INTEGER NOT NULL,
-    FOREIGN KEY(usage_event_id) REFERENCES usage_events(id),
+    FOREIGN KEY(usage_event_id) REFERENCES agentic_usage_events(id),
     FOREIGN KEY(payment_intent_id) REFERENCES payment_intents(id)
 );
-CREATE INDEX IF NOT EXISTS idx_usage_allocations_intent
-    ON usage_invoice_allocations(payment_intent_id);
-CREATE TRIGGER IF NOT EXISTS usage_events_immutable_update
-BEFORE UPDATE ON usage_events
+CREATE INDEX IF NOT EXISTS idx_agentic_usage_allocations_intent
+    ON agentic_usage_invoice_allocations(payment_intent_id);
+CREATE TRIGGER IF NOT EXISTS agentic_usage_events_immutable_update
+BEFORE UPDATE ON agentic_usage_events
 BEGIN SELECT RAISE(ABORT, 'usage events are immutable'); END;
-CREATE TRIGGER IF NOT EXISTS usage_events_immutable_delete
-BEFORE DELETE ON usage_events
+CREATE TRIGGER IF NOT EXISTS agentic_usage_events_immutable_delete
+BEFORE DELETE ON agentic_usage_events
 BEGIN SELECT RAISE(ABORT, 'usage events are immutable'); END;
-CREATE TRIGGER IF NOT EXISTS usage_invoice_allocations_immutable_update
-BEFORE UPDATE ON usage_invoice_allocations
+CREATE TRIGGER IF NOT EXISTS agentic_usage_invoice_allocations_immutable_update
+BEFORE UPDATE ON agentic_usage_invoice_allocations
 BEGIN SELECT RAISE(ABORT, 'usage invoice allocations are immutable'); END;
-CREATE TRIGGER IF NOT EXISTS usage_invoice_allocations_immutable_delete
-BEFORE DELETE ON usage_invoice_allocations
+CREATE TRIGGER IF NOT EXISTS agentic_usage_invoice_allocations_immutable_delete
+BEFORE DELETE ON agentic_usage_invoice_allocations
 BEGIN SELECT RAISE(ABORT, 'usage invoice allocations are immutable'); END;
 """
 
@@ -85,7 +85,7 @@ def record_usage(
     amount_minor = quantity * unit_price_minor
     metadata_json = json.dumps(dict(metadata or {}), separators=(",", ":"), sort_keys=True)
     existing = conn.execute(
-        "SELECT * FROM usage_events WHERE organization_id=? AND idempotency_key=?",
+        "SELECT * FROM agentic_usage_events WHERE organization_id=? AND idempotency_key=?",
         (organization_id, idempotency_key),
     ).fetchone()
     if existing:
@@ -115,7 +115,7 @@ def record_usage(
         "created_at": now,
     }
     conn.execute(
-        """INSERT INTO usage_events
+        """INSERT INTO agentic_usage_events
            (id,organization_id,customer_ref,metric,quantity,unit_price_minor,
             amount_minor,currency,occurred_at,idempotency_key,metadata_json,created_at)
            VALUES (:id,:organization_id,:customer_ref,:metric,:quantity,:unit_price_minor,
@@ -140,8 +140,8 @@ def invoice_context(
         raise ValueError("metered invoice requires at least one usage event")
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
-        f"SELECT u.*, a.payment_intent_id AS allocated_payment_intent_id FROM usage_events u "
-        f"LEFT JOIN usage_invoice_allocations a ON a.usage_event_id=u.id "
+        f"SELECT u.*, a.payment_intent_id AS allocated_payment_intent_id FROM agentic_usage_events u "
+        f"LEFT JOIN agentic_usage_invoice_allocations a ON a.usage_event_id=u.id "
         f"WHERE u.id IN ({placeholders}) ORDER BY u.occurred_at,u.id",
         ids,
     ).fetchall()
@@ -171,12 +171,12 @@ def allocate_events(conn: sqlite3.Connection, *, event_ids: Iterable[str], payme
     for event_id in dict.fromkeys(str(value) for value in event_ids):
         try:
             conn.execute(
-                "INSERT INTO usage_invoice_allocations (id,usage_event_id,payment_intent_id,allocated_at) VALUES (?,?,?,?)",
+                "INSERT INTO agentic_usage_invoice_allocations (id,usage_event_id,payment_intent_id,allocated_at) VALUES (?,?,?,?)",
                 (uuid.uuid4().hex, event_id, payment_intent_id, now),
             )
         except sqlite3.IntegrityError as exc:
             existing = conn.execute(
-                "SELECT payment_intent_id FROM usage_invoice_allocations WHERE usage_event_id=?",
+                "SELECT payment_intent_id FROM agentic_usage_invoice_allocations WHERE usage_event_id=?",
                 (event_id,),
             ).fetchone()
             if existing and existing["payment_intent_id"] == payment_intent_id:
