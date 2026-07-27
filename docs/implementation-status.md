@@ -29,6 +29,9 @@ acceptance evidence.
   charter handoff without starting autonomy.
 - Standalone objective-worker launch registers durable worker health and stops
   fail-closed when the provider/evidence boundary is unavailable.
+- The unified current-tree acceptance covers both ordinary verified-state
+  restart recovery and ambiguous provider-effect recovery through read-back;
+  the latter never replays the provider call.
 - Planner/provider rate-limit failures are classified explicitly, persisted in
   the durable event retry state with bounded backoff, honor SDK attributes,
   `Retry-After`, and rate-limit reset headers, and recover on a later tick

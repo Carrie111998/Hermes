@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The unified current-tree acceptance now includes an interrupted provider
+  effect, a real container restart, read-back reconciliation, and a zero
+  duplicate-provider-call assertion after the normal CEO restart path.
 - Objective runtime now classifies LLM/provider rate-limit failures, persists a
   durable retry marker and backoff, honors provider retry hints, and resumes
   the claimed event without replaying an external action.

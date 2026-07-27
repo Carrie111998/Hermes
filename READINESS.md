@@ -215,6 +215,26 @@ The provider boundary is a deterministic file-backed test adapter; this is
 controlled runtime evidence and not proof of live provider credentials,
 production deployment, or legal/tax readiness.
 
+At current-main commit `0ed1118bec`, the same command was extended to include
+the ambiguous provider-effect recovery in one acceptance run. The exact output
+was:
+
+```text
+{"phase": "prepare", "initial_readiness": "blocked"}
+{"phase": "prepare", "ready": true, "runtime_active": false}
+{"phase": "run", "objective": "verified", "effects": 1}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1}
+current-tree agentic acceptance: PASS
+```
+
+The resulting image manifest was
+`sha256:249224289f6e7db05a8c29b5362ede6ce99e0b61fb5b30705b085214c456fb03`.
+This is the current-main acceptance boundary; it remains deterministic
+provider-adapter evidence, not live payment-provider or production deployment
+proof.
+
 ## Interrupted provider-action evidence
 
 The current tree also proves the ambiguous mid-flight payment case. At commit
