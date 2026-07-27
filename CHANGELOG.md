@@ -7,6 +7,11 @@
   exact profile/mandate/toolset/skill grant, records evidence in the task run,
   and a fresh CEO runtime consumes the completion event and verifies the parent
   objective. The proof uses deterministic local databases and providers.
+- Added `scripts/delegation_process_acceptance.py`, an installed-runtime
+  acceptance harness that launches the subordinate process, records its task
+  evidence, wakes a fresh CEO runtime, and verifies the parent objective. The
+  complete container acceptance now runs this phase in an isolated authority
+  database and Kanban board.
 - Delegation grants now fail closed when any capability, system, toolset, skill,
   budget, or expiry would exceed the current delegator mandate, in addition to
   the subordinate mandate and objective scope.

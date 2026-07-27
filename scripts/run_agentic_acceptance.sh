@@ -31,6 +31,16 @@ docker restart "$container_name" >/dev/null
 docker exec "$container_name" python3 \
   /opt/hermes/scripts/agentic_acceptance.py recover
 
+# Prove the installed image can launch a subordinate process from an exact
+# grant, persist its evidence, wake a fresh CEO runtime, and verify the parent
+# objective.  Use an isolated authority DB and board so this proof does not
+# alter the primary bootstrap acceptance state.
+docker exec \
+  -e HERMES_DELEGATION_AUTHORITY_DB=/tmp/delegation-acceptance.db \
+  -e HERMES_DELEGATION_BOARD="process-separated-acceptance-$$" \
+  "$container_name" python3 \
+  /opt/hermes/scripts/delegation_process_acceptance.py
+
 # Exercise the harder failure boundary in the same installed image and state
 # volume: the provider effect occurs, the response is lost, and recovery must
 # reconcile by read-back after a real container restart without replaying it.

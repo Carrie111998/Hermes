@@ -143,6 +143,17 @@ objective. The grant is specific to the employee profile, mandate version,
 capabilities, systems, toolsets, skills, budget, and expiry; it is not a
 standing account-wide authorization.
 
+The same proof runs inside the installed container as one phase of
+`scripts/run_agentic_acceptance.sh`:
+
+```sh
+docker exec "$container_name" python3 \
+  /opt/hermes/scripts/delegation_process_acceptance.py
+```
+
+The acceptance harness supplies an isolated authority database and board for
+this phase, so the delegation proof cannot mutate the primary bootstrap state.
+
 The single current-tree acceptance scenario is the decisive bounded runtime
 proof. It builds and installs the wheel, starts a fresh container, demonstrates
 blocked readiness before controls are satisfied, applies the test charter and
