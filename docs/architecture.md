@@ -23,6 +23,10 @@ be revived after the CEO has changed course.
 Permit consumption also checks the active runtime policy version; changing
 policy invalidates unconsumed permits issued under the prior version.
 
+Hiring decisions receive the same stale-state treatment: materialization
+rechecks current headcount and payroll limits immediately before adding an
+employee, so an older positive decision cannot bypass intervening budget use.
+
 ## Runtime components
 
 | Component | Responsibility |

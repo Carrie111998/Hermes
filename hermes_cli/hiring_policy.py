@@ -252,11 +252,28 @@ def materialize_hiring_decision(
         raise ValueError("contractor hiring decision requires a future mandate expiry")
     annual_cost_minor = int(proposed_case.get("annual_cost_minor") or 0)
     organization = conn.execute(
-        "SELECT base_currency FROM organizations WHERE id=?",
+        "SELECT base_currency, headcount_limit, payroll_budget_minor FROM organizations WHERE id=?",
         (organization_id,),
     ).fetchone()
     if organization is None:
         raise ValueError("hiring organization not found")
+    headcount, payroll = organization_db._active_headcount_and_payroll(
+        conn, organization_id
+    )
+    if (
+        organization["headcount_limit"] is not None
+        and headcount + 1 > int(organization["headcount_limit"])
+    ):
+        raise PermissionError(
+            "hiring decision is stale: headcount limit is no longer available"
+        )
+    if (
+        organization["payroll_budget_minor"] is not None
+        and payroll + annual_cost_minor > int(organization["payroll_budget_minor"])
+    ):
+        raise PermissionError(
+            "hiring decision is stale: payroll budget is no longer available"
+        )
     manager = organization_db.get_employee_record(conn, manager_id)
     if manager["organization_id"] != organization_id:
         raise PermissionError("hire manager belongs to another organization")

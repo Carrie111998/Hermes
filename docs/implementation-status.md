@@ -7,6 +7,8 @@
   actions cannot regain execution authority.
 - Permit consumption rejects permits whose policy version is stale for the
   active runtime.
+- Hiring materialization rechecks current headcount and payroll limits against
+  the immutable decision before adding an employee.
 - Founder/CEO organization bootstrap and versioned mandate.
 - Advisor-by-default authority policy.
 - Exact solo-founder and employee delegation grants.
