@@ -260,6 +260,32 @@ def test_permit_consumption_rejects_stale_policy_version(conn):
         )
 
 
+def test_permit_consumption_rejects_cancelled_objective(conn):
+    objective = _accepted_objective(conn)
+    plan_id = odb.create_plan(
+        conn, objective.id, assumptions=[], tasks=[], dependencies=[], risks=[], created_by="planner"
+    )
+    odb.transition_objective(conn, objective.id, "planned", actor="control")
+    payload = {"path": "artifact"}
+    action_id = odb.propose_action(
+        conn, objective_id=objective.id, plan_id=plan_id,
+        action_type="artifact.write", payload=payload,
+        expected_outcome="artifact exists", required_capability="filesystem.write",
+        verification_method="artifact.readback", risk_class="low", reversible=True,
+        proposed_by="planner",
+    )
+    permit_id = odb.issue_permit(
+        conn, action_id, capability="filesystem.write", issued_to="worker",
+        policy_version="policy-v1", expires_at=int(time.time()) + 60,
+    )
+    odb.transition_objective(conn, objective.id, "cancelled", actor="human:advisor")
+    with pytest.raises(odb.PermitError, match="no longer admits execution"):
+        odb.consume_permit(
+            conn, permit_id, action_id=action_id, payload=payload, executor="worker",
+            current_policy_version="policy-v1",
+        )
+
+
 def test_claim_skips_events_for_terminal_objectives(conn):
     objective = _accepted_objective(conn)
     plan_id = odb.create_plan(

@@ -1055,6 +1055,18 @@ def consume_permit(
             raise PermitError("permit not found")
         if permit["action_id"] != action_id:
             raise PermitError("permit is bound to a different action")
+        objective = conn.execute(
+            """SELECT o.status FROM objectives o
+                 JOIN candidate_actions a ON a.objective_id=o.id
+                WHERE a.id=?""",
+            (action_id,),
+        ).fetchone()
+        if objective is None:
+            raise PermitError("permit action objective was removed")
+        if objective["status"] not in {"planned", "authorized", "executing"}:
+            raise PermitError(
+                f"objective status {objective['status']} no longer admits execution"
+            )
         if permit["revoked_at"] is not None:
             raise PermitError("permit was revoked")
         if permit["consumed_at"] is not None:

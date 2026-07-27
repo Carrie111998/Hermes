@@ -7,6 +7,8 @@
   actions cannot regain execution authority.
 - Permit consumption rejects permits whose policy version is stale for the
   active runtime.
+- Permit consumption rechecks objective lifecycle state and rejects permits
+  after cancellation, expiry, or other terminal transitions.
 - Hiring materialization rechecks current headcount and payroll limits against
   the immutable decision before adding an employee.
 - Founder/CEO organization bootstrap and versioned mandate.

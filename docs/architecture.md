@@ -22,6 +22,9 @@ older proposed actions ineligible for new permits, so stale authority cannot
 be revived after the CEO has changed course.
 Permit consumption also checks the active runtime policy version; changing
 policy invalidates unconsumed permits issued under the prior version.
+It also rechecks objective lifecycle state at the moment of consumption, so
+cancelled, expired, or otherwise terminal objectives cannot spend a permit
+issued earlier.
 
 Hiring decisions receive the same stale-state treatment: materialization
 rechecks current headcount and payroll limits immediately before adding an

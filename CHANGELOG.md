@@ -45,6 +45,8 @@ Hermes Agent history remains available in Git.
   version.
 - Hiring materialization now rejects stale positive decisions when intervening
   headcount or payroll use exhausts the current organization limits.
+- Permit consumption now rechecks objective lifecycle state and rejects stale
+  permits after cancellation or expiry.
 - Metered invoices now calculate optional tax only from an active,
   organization-owned jurisdiction-matched tax rule and record the gross intent.
 - External subscriptions now skip terminal objectives, preventing stale goals
