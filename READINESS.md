@@ -771,6 +771,12 @@ Result: **10 passed, 0 failed**. Scope-free resolution is rejected for
 organization-bound interventions; only explicitly unscoped control records
 retain that path.
 
+The broader governance regression sweep was rerun on current `main` commit
+`8044ca64f9b51b02178c0b917ec9435cbed9ef3d` with the objective, intervention,
+approval, event, AgentMail, maintenance, and bootstrap suites. Result:
+**99 passed, 0 failed**. This confirms production resolution paths provide
+tenant scope while legacy objective-only stores remain non-crashing.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
