@@ -56,6 +56,12 @@ version-tag pushes, then retains the artifacts in GitHub Actions. It is an
 artifact pipeline, not an automatic package-index publication; publication
 still requires an explicitly configured trusted-publishing environment.
 
+The independent `.github/workflows/charterforge-container.yml` similarly builds
+the Docker image on pull requests, `main`, and version-tag pushes, runs the
+container CLI smoke, and retains the image identity as an artifact. It does not
+push to a registry; registry publication remains a separately authorized
+deployment action.
+
 ## Current boundary
 
 Source installation, local artifact installation, and the checked-in local
