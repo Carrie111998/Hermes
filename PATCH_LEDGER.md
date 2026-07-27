@@ -471,6 +471,7 @@ a named owner.
 | `aa0c686b1` | H-01 | the crash-patch rationale had gone stale after the 160-commit merge — three claims in it were false | `agent/turn_finalizer.py` (comment) | n/a — documentation | the comment stops describing the code |
 | `5cdd0c3ad`, `83bdb0566`, `8b1c27e4b` | — | peer-session integration merges, no independent behaviour | — | — | — |
 | `6a9c6695b` | — | this ledger section and the Step-8 header rewrite | `PATCH_LEDGER.md`, test header | n/a — documentation | — |
+| `39baa8ede` | — | the draft-PR body, shipped as a file because publication is blocked on credentials | `INTEGRATION_PR.md` (new) | n/a — documentation | the PR is opened and the body lives on GitHub |
 
 ## Failure classification — `tests/gateway/` (measured, not assumed)
 
