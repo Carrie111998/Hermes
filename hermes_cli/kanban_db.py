@@ -6848,13 +6848,9 @@ def fail_qualification_intake_run(
 
 
 def _qualification_worker_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return True
+    from gateway.status import _pid_exists
+
+    return _pid_exists(int(pid))
 
 
 def recover_stale_qualification_intakes(

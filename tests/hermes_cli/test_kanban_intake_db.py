@@ -366,6 +366,18 @@ def test_stale_intake_runs_retry_once_then_require_attention(conn):
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
+def test_qualification_worker_pid_check_uses_cross_platform_probe(monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        "gateway.status._pid_exists",
+        lambda pid: observed.append(pid) or pid == 4242,
+    )
+
+    assert kb._qualification_worker_pid_alive(4242) is True
+    assert kb._qualification_worker_pid_alive(4343) is False
+    assert observed == [4242, 4343]
+
+
 def test_live_intake_worker_renews_expired_claim_instead_of_reclaiming(conn):
     intake_id = kb.create_qualification_intake(
         conn, raw_request="take time to assess", source="chat", created_at=10
