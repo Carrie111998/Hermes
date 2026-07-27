@@ -17,6 +17,10 @@ flowchart LR
 The model proposes plans and actions. It is not the state machine, policy
 engine, executor, verifier, or ledger.
 
+Permits are bound to the current immutable plan version. Replanning makes
+older proposed actions ineligible for new permits, so stale authority cannot
+be revived after the CEO has changed course.
+
 ## Runtime components
 
 | Component | Responsibility |

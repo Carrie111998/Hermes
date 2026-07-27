@@ -980,6 +980,19 @@ def issue_permit(
             raise PermitError(
                 f"objective status {objective.status} does not admit new permits"
             )
+        plan = conn.execute(
+            "SELECT version FROM plans WHERE id = ?", (action["plan_id"],)
+        ).fetchone()
+        latest = conn.execute(
+            "SELECT MAX(version) AS version FROM plans WHERE objective_id = ?",
+            (action["objective_id"],),
+        ).fetchone()
+        if (
+            plan is None
+            or latest is None
+            or int(plan["version"]) != int(latest["version"])
+        ):
+            raise PermitError("action belongs to a superseded plan")
         if capability != action["required_capability"]:
             raise PermitError("permit capability does not match proposed action")
         if expires_at <= _now():

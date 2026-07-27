@@ -204,6 +204,30 @@ def test_permit_is_single_use_and_bound_to_payload_and_executor(conn):
         )
 
 
+def test_permit_rejects_action_from_superseded_plan(conn):
+    objective = _accepted_objective(conn)
+    plan_v1 = odb.create_plan(
+        conn, objective.id, assumptions=[], tasks=[], dependencies=[], risks=[], created_by="planner"
+    )
+    odb.transition_objective(conn, objective.id, "planned", actor="control")
+    action_id = odb.propose_action(
+        conn, objective_id=objective.id, plan_id=plan_v1,
+        action_type="artifact.write", payload={"path": "artifact"},
+        expected_outcome="artifact exists", required_capability="filesystem.write",
+        verification_method="artifact.readback", risk_class="low", reversible=True,
+        proposed_by="planner",
+    )
+    odb.create_plan(
+        conn, objective.id, assumptions=["replanned"], tasks=[], dependencies=[],
+        risks=[], created_by="planner",
+    )
+    with pytest.raises(odb.PermitError, match="superseded plan"):
+        odb.issue_permit(
+            conn, action_id, capability="filesystem.write", issued_to="worker",
+            policy_version="test-v1", expires_at=int(time.time()) + 60,
+        )
+
+
 def test_expired_objective_cannot_continue(conn):
     objective = odb.create_objective(
         conn,
