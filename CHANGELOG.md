@@ -191,7 +191,7 @@ recorded.
 - `4a129bcbb3d09606ce83b577e63a6e601303331b` — revalidated standalone worker
   deployment authority before every cycle to fence dynamic host changes.
 - Current-main focused acceptance rerun at baseline
-  `29df862970a7caa3e34e3b4f27c98218ab0efce2`: 6 Founder/CEO E2E tests, 48
+  `c4662689660f1e2447a2479f1844fae28bd2a57c`: 6 Founder/CEO E2E tests, 48
   objective service/runtime/worker tests, and 21 finance/attribution tests
   passed; compilation and diff checks passed. This is post-boundary evidence,
   not a release-tag move.
@@ -205,3 +205,6 @@ recorded.
 - `29df862970a7caa3e34e3b4f27c98218ab0efce2` — rejected malformed,
   future-dated, and stale authenticated external-event evidence before
   objective wake-up; the focused ingress regression passed 21 tests.
+- `c4662689660f1e2447a2479f1844fae28bd2a57c` — provider-authenticated ingress
+  now requires signed freshness evidence for Stripe and Svix schemes; the
+  focused ingress regression passed 23 tests.
