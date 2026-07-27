@@ -37,6 +37,7 @@ from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
+    _split_concatenated_json_objects,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
@@ -3084,6 +3085,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     try:
                         json.loads(arguments)
                     except json.JSONDecodeError:
+                        # Some models (observed: Gemini 3.5 Flash) try to
+                        # call the same tool for N items by concatenating
+                        # N complete JSON objects instead of emitting N
+                        # separate tool_calls. Detect that narrow pattern
+                        # first — it needs splitting into multiple tool
+                        # calls, not string repair. Falls through to
+                        # normal single-object repair for every other
+                        # malformation (truncation, trailing commas, etc).
+                        split_args = _split_concatenated_json_objects(arguments)
+                        if split_args is not None:
+                            logger.warning(
+                                "Split concatenated tool_call arguments for "
+                                "%s into %d separate calls",
+                                tool_name, len(split_args),
+                            )
+                            for split_idx, split_arg in enumerate(split_args):
+                                mock_tool_calls.append(SimpleNamespace(
+                                    id=f"{tc['id']}_split{split_idx}",
+                                    type=tc["type"],
+                                    extra_content=tc.get("extra_content"),
+                                    function=SimpleNamespace(
+                                        name=tc["function"]["name"],
+                                        arguments=split_arg,
+                                    ),
+                                ))
+                            continue
                         # Attempt repair before flagging as truncated.
                         # Models like GLM-5.1 via Ollama produce trailing
                         # commas, unclosed brackets, Python None, etc.

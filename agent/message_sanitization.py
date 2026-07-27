@@ -279,6 +279,76 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
+def _split_concatenated_json_objects(raw: str) -> list | None:
+    """If ``raw`` is 2+ complete top-level JSON objects concatenated with
+    no separator, return the list of individual JSON strings; else None.
+
+    Some models (observed: Gemini 3.5 Flash, both on built-in tools like
+    ``search_files`` and single-item-schema MCP tools) try to express
+    "call this tool N times for N items" by emitting N complete JSON
+    objects back-to-back in a single tool_call's arguments field instead
+    of emitting N separate tool_calls, e.g.
+    ``{"path": "a.json"}{"path": "b.json"}``. This is invalid as a single
+    argument object and previously fell through to
+    ``_repair_tool_call_arguments``, which cannot fix it (no amount of
+    brace-balancing repairs a second complete object) and returns ``"{}"``,
+    silently discarding every item but the first. Detecting this narrow
+    pattern lets the caller expand it into N separate tool calls instead.
+
+    Deliberately conservative: bails to ``None`` (unchanged behavior,
+    falls through to normal single-object repair) unless every character
+    is accounted for by 2+ individually-valid JSON objects with only
+    whitespace between them. A genuinely truncated single object (e.g.
+    cut off mid-array before ever closing) never reaches depth 0 twice,
+    so it always returns None here, not a false split.
+    """
+    s = raw.strip()
+    if not s or s[0] != "{":
+        return None
+
+    objects = []
+    depth = 0
+    in_string = False
+    escape = False
+    start = 0
+    for i, ch in enumerate(s):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                objects.append(s[start:i + 1])
+                j = i + 1
+                while j < len(s) and s[j].isspace():
+                    j += 1
+                start = j
+            elif depth < 0:
+                return None
+
+    if len(objects) < 2:
+        return None
+    if start != len(s):
+        return None
+
+    for obj in objects:
+        try:
+            json.loads(obj)
+        except json.JSONDecodeError:
+            return None
+    return objects
+
+
 def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
     """Append a synthetic assistant turn when an interrupted tail is a tool result.
 
@@ -469,6 +539,7 @@ __all__ = [
     "_sanitize_messages_surrogates",
     "_escape_invalid_chars_in_json_strings",
     "_repair_tool_call_arguments",
+    "_split_concatenated_json_objects",
     "_strip_non_ascii",
     "_sanitize_messages_non_ascii",
     "_sanitize_tools_non_ascii",
