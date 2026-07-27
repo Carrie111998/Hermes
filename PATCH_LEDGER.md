@@ -429,3 +429,21 @@ tests/tools/ -k delegat                        352 passed, 3 skipped
   branch.** It is closed for `stage_successors`, but the finder will still serve
   any *other* missing module from the sibling worktree. Only a clean clone
   proves a module is really present.
+
+## Commit index — the concurrent session's fixes, carried in by `e76e0d9cb`
+
+These landed on `main` in the peer audit session and arrived here through the
+merge. Recorded so the drift check reconciles them and so their protections have
+a named owner.
+
+| Commit | Finding | Purpose | Upstream files | Protected by | Removal condition |
+|---|---|---|---|---|---|
+| `9ca6ec9fa` | H-01 | a crashed turn must not report `completed=True`; adds the `turn_crashed()` predicate | `agent/turn_finalizer.py` | `tests/agent/test_turn_finalizer_completion_honesty.py`, `tests/agent/test_turn_completion_honesty.py`, `tests/contract/test_protected_behavior.py` | upstream derives completion from something other than the exit reason |
+| `3b9e68606` | H-05 | strip forgeable steer markers from every tool result | `agent/turn_context.py` | `tests/agent/test_steer_marker_forgery.py` | upstream gains an authenticated steer channel |
+| `1439fedf0` | H-24 | classify force push spelled as a `+refspec` as dangerous | `tools/` git gate | `tests/tools/test_force_push_refspec_gate.py` | upstream's gate parses refspecs itself |
+| `6c69216e0` | H-25 | deny writes to project `.env` files, matching the existing read block | `tools/` file-write gate | `tests/agent/test_env_write_protection.py` | upstream denies `.env` writes natively |
+| `f735959fa` | — | make WAL-vulnerable SQLite fatal rather than advisory; adds `HERMES_ALLOW_VULNERABLE_SQLITE` | `hermes_cli/runtime_guard.py` | `tests/hermes_cli/test_runtime_guard.py` | minimum supported SQLite is ≥ 3.51.3 |
+| `dcd3546d2` | — | contract tests pinning the SQLite gate and the crash-completion fix | `tests/contract/test_protected_behavior.py` | itself | the behaviours it pins move upstream |
+| `aa0c686b1` | H-01 | the crash-patch rationale had gone stale after the 160-commit merge — three claims in it were false | `agent/turn_finalizer.py` (comment) | n/a — documentation | the comment stops describing the code |
+| `5cdd0c3ad`, `83bdb0566`, `8b1c27e4b` | — | peer-session integration merges, no independent behaviour | — | — | — |
+| `6a9c6695b` | — | this ledger section and the Step-8 header rewrite | `PATCH_LEDGER.md`, test header | n/a — documentation | — |
