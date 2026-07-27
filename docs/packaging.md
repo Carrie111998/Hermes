@@ -38,6 +38,12 @@ The build is validated by `tests/test_packaging_build_guard.py`. A successful
 artifact build does not imply that the package has been published to an index,
 that a container image exists, or that provider credentials are configured.
 
+`.github/workflows/charterforge-artifacts.yml` repeats the wheel/sdist build and
+isolated `charterforge --version` install smoke on pull requests, `main`, and
+version-tag pushes, then retains the artifacts in GitHub Actions. It is an
+artifact pipeline, not an automatic package-index publication; publication
+still requires an explicitly configured trusted-publishing environment.
+
 ## Current boundary
 
 Source installation, local artifact installation, and the checked-in local
