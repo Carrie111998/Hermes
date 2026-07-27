@@ -2726,6 +2726,7 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "user_id": "",            # one Discord user ID; quote snowflakes in YAML
             "voice": "",              # empty = protocol default; queried at runtime
+            "spoken_language": "",    # e.g. nl-NL; empty preserves detected language
             "protocol_version": "v3", # WebRTC supports v1 or v3; v3 is current
             "fallback_to_classic": True,
             "codex_bin": "codex",

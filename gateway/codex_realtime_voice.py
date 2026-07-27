@@ -47,6 +47,7 @@ class CodexRealtimeVoiceConfig:
     enabled: bool = False
     user_id: Optional[int] = None
     voice: Optional[str] = None
+    spoken_language: Optional[str] = None
     protocol_version: str = DEFAULT_CODEX_REALTIME_PROTOCOL
     fallback_to_classic: bool = True
     codex_bin: str = "codex"
@@ -61,9 +62,17 @@ class CodexRealtimeVoiceConfig:
             return cls()
         voice = raw.get("voice")
         voice = str(voice).strip() if voice is not None else None
-        protocol_version = str(
-            raw.get("protocol_version") or DEFAULT_CODEX_REALTIME_PROTOCOL
-        ).strip().lower()
+        spoken_language = raw.get("spoken_language")
+        spoken_language = (
+            " ".join(str(spoken_language).split())[:80]
+            if spoken_language is not None
+            else None
+        )
+        protocol_version = (
+            str(raw.get("protocol_version") or DEFAULT_CODEX_REALTIME_PROTOCOL)
+            .strip()
+            .lower()
+        )
         codex_bin = str(raw.get("codex_bin") or "codex").strip() or "codex"
         codex_home = raw.get("codex_home")
         codex_home = str(codex_home).strip() if codex_home else None
@@ -71,6 +80,7 @@ class CodexRealtimeVoiceConfig:
             enabled=_config_bool(raw.get("enabled"), False),
             user_id=_positive_id(raw.get("user_id")),
             voice=voice or None,
+            spoken_language=spoken_language or None,
             protocol_version=protocol_version,
             fallback_to_classic=_config_bool(raw.get("fallback_to_classic"), True),
             codex_bin=codex_bin,
@@ -145,6 +155,12 @@ class CodexRealtimeVoiceManager:
     def configured_fallback_enabled(adapter: Any) -> bool:
         """Return the durable fallback policy even after a session is removed."""
         return CodexRealtimeVoiceConfig.from_adapter(adapter).fallback_to_classic
+
+    @staticmethod
+    def configured_spoken_language(adapter: Any) -> Optional[str]:
+        """Return the prompt-level spoken-language preference for a route."""
+
+        return CodexRealtimeVoiceConfig.from_adapter(adapter).spoken_language
 
     def prepare_for_voice_channel(self, adapter: Any, guild_id: int) -> bool:
         """Reserve PCM before Discord starts its receiver during an opted-in join."""
@@ -246,6 +262,7 @@ class CodexRealtimeVoiceManager:
                     codex_bin=config.codex_bin,
                     codex_home=config.codex_home,
                     protocol_version=config.protocol_version,
+                    spoken_language=config.spoken_language,
                     on_user_transcript=_on_transcript,
                     on_output_pcm=_on_output_pcm,
                     on_error=_on_error,

@@ -399,6 +399,7 @@ discord:
     enabled: true
     user_id: "123456789012345678"
     voice: ""                    # empty = selected protocol's default
+    spoken_language: ""          # e.g. nl-NL; empty preserves spoken language
     protocol_version: "v3"       # WebRTC supports v1 or v3
     fallback_to_classic: true
     codex_bin: "codex"
@@ -412,10 +413,12 @@ Requirements and limits:
 - account entitlement to Codex realtime voice; availability is checked when `/voice join` starts
 - WebRTC protocol `v3` by default; `v1` remains available as an explicit compatibility option, while `v2` does not support this WebRTC route
 - supported voices are queried from Codex at runtime; V3 preserves the V1 Codex Voice family
+- `spoken_language` optionally pins Hermes' reply and synthesized speech to a language such as `nl-NL`; input transcription still preserves the language the user spoke
+- `spoken_language` is a prompt preference, because Codex app-server does not expose a native language/locale field for this route
 - each voice session uses an ephemeral Codex app-server thread rather than a persisted Codex conversation
 - decoded Discord audio and Hermes' synthesized reply text are sent to Codex/OpenAI for the duration of the session; do not enable this route in channels where that external processing is inappropriate
 - while realtime is active, PCM from other VC users is ignored rather than routed through a parallel classic-STT path
-- no realtime reasoning-effort control, language selector, or guaranteed language-auto-detection contract
+- no realtime reasoning-effort control or native provider language/locale selector; automatic language detection is not a contractual guarantee
 - no extra OpenAI API key is required for the WebRTC route when the Codex account is entitled
 
 If dependency loading, Codex capability checks, account entitlement, SDP negotiation, or the realtime transport fails, `fallback_to_classic: true` keeps the existing Whisper/STT → Hermes → TTS path active. The join response states which path is active.

@@ -1280,6 +1280,9 @@ class TestVoiceChannelCommands:
         bound_adapter = AsyncMock()
         bound_adapter._voice_text_channels = {111: 123}
         bound_adapter._voice_sources = {}
+        bound_adapter.config = SimpleNamespace(extra={
+            "codex_realtime_voice": {"spoken_language": "nl-NL"}
+        })
         bound_adapter._client = MagicMock()
         bound_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
         bound_adapter.handle_message = AsyncMock()
@@ -1295,6 +1298,9 @@ class TestVoiceChannelCommands:
 
         event = bound_adapter.handle_message.call_args.args[0]
         assert event.message_type == MessageType.TEXT
+        assert "connected Discord voice channel" in event.text
+        assert "nl-NL" in event.text
+        assert event.text.endswith("Realtime transcript")
         assert event.raw_message.guild_id == 111
         primary_adapter.handle_message.assert_not_called()
 
@@ -1347,6 +1353,26 @@ class TestVoiceChannelCommands:
         msg = mock_channel.send.call_args[0][0]
         assert "Test transcript" in msg
         assert "42" in msg  # user_id in mention
+
+    @pytest.mark.asyncio
+    async def test_input_respects_disabled_transcript_echo(self, runner):
+        """Voice input remains actionable without posting raw STT into chat."""
+        from gateway.config import Platform
+
+        runner.config = SimpleNamespace(stt_echo_transcripts=False)
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "Quiet transcript")
+
+        mock_channel.send.assert_not_awaited()
+        mock_adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_input_suppresses_duplicate_transcript(self, runner):

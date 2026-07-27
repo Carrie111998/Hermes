@@ -35,10 +35,27 @@ SPEECH_AUDIO_IDLE_TIMEOUT = 0.75
 
 _SPEECH_INTERFACE_PROMPT = (
     "You are a low-latency speech interface for another assistant. "
-    "Transcribe the user's speech accurately. Do not answer the user, "
-    "do not call tools, and do not delegate work. Stay silent until "
-    "the client supplies text to speak."
+    "Transcribe the user's speech accurately in the language they actually "
+    "speak; preserve that language and never translate it. Do not answer "
+    "the user, do not call tools, and do not delegate work. Stay silent "
+    "until the client supplies text to speak."
 )
+
+
+def _speech_interface_prompt(spoken_language: Optional[str]) -> str:
+    """Build the speech-only prompt without claiming a native locale API."""
+
+    if not spoken_language:
+        return _SPEECH_INTERFACE_PROMPT
+    return (
+        "You are a low-latency speech interface for another assistant. "
+        f"The configured spoken language is {spoken_language}. "
+        "Transcribe the user's speech accurately in the language they actually "
+        "speak; preserve that language and never translate it. Do not answer "
+        "the user, do not call tools, and do not delegate work. Stay silent "
+        "until the client supplies text to speak, then speak that supplied text "
+        "naturally in the configured language."
+    )
 
 
 class CodexRealtimeUnavailable(RuntimeError):
@@ -322,6 +339,7 @@ class CodexRealtimeSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         protocol_version: str = DEFAULT_CODEX_REALTIME_PROTOCOL,
+        spoken_language: Optional[str] = None,
         client_factory: Callable[..., Any] = CodexAppServerClient,
         peer_factory: Callable[[], Any] = AiortcRealtimePeer,
         binary_checker: Callable[..., tuple[bool, str]] = check_codex_binary,
@@ -337,6 +355,9 @@ class CodexRealtimeSession:
             raise CodexRealtimeUnavailable(
                 "Codex realtime WebRTC protocol_version must be v1 or v3"
             )
+        self._spoken_language = (
+            " ".join(str(spoken_language).split())[:80] if spoken_language else None
+        )
         self._client_factory = client_factory
         self._peer_factory = peer_factory
         self._binary_checker = binary_checker
@@ -469,7 +490,7 @@ class CodexRealtimeSession:
             "clientManagedHandoffs": True,
             "includeStartupContext": False,
             "outputModality": "audio",
-            "prompt": _SPEECH_INTERFACE_PROMPT,
+            "prompt": _speech_interface_prompt(self._spoken_language),
             "transport": {"type": "webrtc", "sdp": offer_sdp},
             "version": self._protocol_version,
         }

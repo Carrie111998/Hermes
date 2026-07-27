@@ -117,9 +117,10 @@ async def test_start_uses_experimental_v3_webrtc_contract_and_lists_capabilities
             "outputModality": "audio",
             "prompt": (
                 "You are a low-latency speech interface for another assistant. "
-                "Transcribe the user's speech accurately. Do not answer the user, "
-                "do not call tools, and do not delegate work. Stay silent until "
-                "the client supplies text to speak."
+                "Transcribe the user's speech accurately in the language they actually "
+                "speak; preserve that language and never translate it. Do not answer "
+                "the user, do not call tools, and do not delegate work. Stay silent "
+                "until the client supplies text to speak."
             ),
             "transport": {"type": "webrtc", "sdp": "v=offer\r\n"},
             "version": "v3",
@@ -129,6 +130,42 @@ async def test_start_uses_experimental_v3_webrtc_contract_and_lists_capabilities
     assert peer.answer_sdp == "v=answer\r\n"
     assert session.active is True
 
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_spoken_language_guides_output_without_translating_input():
+    client = FakeClient([
+        {
+            "method": "thread/realtime/started",
+            "params": {"threadId": "thread-1", "version": "v3"},
+        },
+        {
+            "method": "thread/realtime/sdp",
+            "params": {"threadId": "thread-1", "sdp": "v=answer\r\n"},
+        },
+    ])
+    session = CodexRealtimeSession(
+        cwd="/tmp",
+        spoken_language="nl-NL",
+        client_factory=lambda **kwargs: client,
+        peer_factory=FakePeer,
+        binary_checker=lambda *_args: (True, "0.145.0"),
+    )
+
+    await session.start()
+
+    start_params = client.requests[2][1]
+    assert "nl-NL" in start_params["prompt"]
+    assert "language they actually speak" in start_params["prompt"]
+    assert "never translate it" in start_params["prompt"]
+    assert (
+        "speak that supplied text naturally in the configured language"
+        in (start_params["prompt"])
+    )
+    # Codex app-server exposes no native language field for this route; the
+    # setting is an explicit speech-interface prompt hint, not a fake protocol claim.
+    assert "language" not in start_params
     await session.stop()
 
 

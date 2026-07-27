@@ -398,6 +398,7 @@ discord:
     enabled: true
     user_id: "284102345871466496"  # exactly one bound Discord user
     voice: ""                      # empty uses the selected protocol's default
+    spoken_language: ""            # e.g. nl-NL; empty preserves spoken language
     protocol_version: "v3"         # WebRTC supports v1 or v3
     fallback_to_classic: true
     codex_bin: "codex"
@@ -411,11 +412,12 @@ Capability boundaries are explicit:
 - WebRTC realtime protocol `v3` by default; `v1` is an explicit compatibility option and `v2` is rejected for WebRTC
 - V3 preserves the V1 Codex Voice behavior and voice family
 - supported voice names are discovered at startup
+- `spoken_language` can pin Hermes' reply and synthesized speech to a language such as `nl-NL`; input transcription still preserves the language the user spoke
 - Codex app-server thread state is ephemeral for each voice session
 - decoded Discord audio and Hermes' synthesized reply text are sent to Codex/OpenAI for the session, so only enable the route where that external processing is appropriate
 - while the route is active, audio from users other than the configured `user_id` is ignored
 - realtime reasoning effort is not configurable
-- language/locale selection is not exposed
+- no native Codex language/locale protocol field is exposed; `spoken_language` is an explicit speech-interface prompt preference instead
 - automatic language detection is not a contractual guarantee
 - account entitlement is checked at session start and can be denied independently of a valid login
 

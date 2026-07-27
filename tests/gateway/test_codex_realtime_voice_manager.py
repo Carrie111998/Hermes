@@ -134,7 +134,12 @@ async def test_enabled_route_requires_the_configured_single_user():
         session_factory=FakeSession,
         dependency_ensurer=lambda: None,
     )
-    adapter = FakeAdapter({"enabled": True, "user_id": "42", "voice": "cedar"})
+    adapter = FakeAdapter({
+        "enabled": True,
+        "user_id": "42",
+        "voice": "cedar",
+        "spoken_language": "nl-NL",
+    })
 
     rejected = await manager.start_for_voice_channel(
         adapter=adapter,
@@ -157,6 +162,7 @@ async def test_enabled_route_requires_the_configured_single_user():
     active_session = manager.session_for(adapter, 7)
     assert active_session is not None
     assert active_session.kwargs["protocol_version"] == "v3"
+    assert active_session.kwargs["spoken_language"] == "nl-NL"
     assert adapter.mixer_started == [7]
 
     # While realtime is active, non-bound speakers are consumed/dropped rather

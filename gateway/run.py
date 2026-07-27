@@ -15850,22 +15850,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        # Show transcript in text channel (after auth, with mention sanitization)
-        try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+        # Show transcript in text channel only when raw STT echo is enabled.
+        if self._should_echo_stt_transcripts():
+            try:
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                    await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+            except Exception:
+                pass
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
         # guild_id and _send_voice_reply() plays audio in the voice channel.
         from types import SimpleNamespace
+        agent_input = transcript
+        if realtime:
+            spoken_language = self._get_codex_realtime_voice_manager().configured_spoken_language(
+                adapter
+            )
+            language_context = (
+                f" The configured spoken language is {spoken_language}; "
+                "reply naturally in that language."
+                if spoken_language
+                else " Reply naturally in the language the user spoke."
+            )
+            # Realtime audio is represented as a TEXT event to avoid the base
+            # adapter's classic auto-TTS path. Preserve the otherwise-lost
+            # modality and language context for the normal Hermes turn.
+            agent_input = (
+                "[This was spoken live in the connected Discord voice channel."
+                f"{language_context}]\n{transcript}"
+            )
         event = MessageEvent(
             source=source,
-            text=transcript,
+            text=agent_input,
             message_type=MessageType.TEXT if realtime else MessageType.VOICE,
             raw_message=SimpleNamespace(
                 guild_id=guild_id,
@@ -15938,7 +15957,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
-        return bool(getattr(self.config, "stt_echo_transcripts", True))
+        config = getattr(self, "config", None)
+        return bool(getattr(config, "stt_echo_transcripts", True))
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
