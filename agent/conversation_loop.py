@@ -1202,6 +1202,14 @@ def run_conversation(
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
+    # When a truncated-tool-call retry succeeds with a boosted output cap,
+    # remember that cap for the remainder of the turn.  Without this, a
+    # model that chronically overflows the base cap pays ~2x API calls per
+    # iteration (truncate → boosted retry → succeed → cap reverts →
+    # truncate again next iteration).  Persisting the boost lets subsequent
+    # calls in the same turn start with enough room (#72329).
+    _persisted_tc_boost: Optional[int] = None
+    _pending_tc_boost: Optional[int] = None
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
@@ -2059,6 +2067,13 @@ def run_conversation(
                         moa_prepared=_moa_prepared_request,
                     )
                 )
+                # Re-apply a persisted output-cap boost from a prior
+                # truncated-tool-call recovery in this same turn.  The boost
+                # was consumed one-shot by _build_api_kwargs on the retry that
+                # succeeded; without re-applying it here, the next iteration
+                # reverts to the base cap and likely truncates again (#72329).
+                if _persisted_tc_boost is not None:
+                    agent._ephemeral_max_output_tokens = _persisted_tc_boost
                 api_kwargs = agent._build_api_kwargs(api_messages)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
@@ -2965,14 +2980,7 @@ def run_conversation(
                             _is_stub_stall = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                             )
-                            # Also count this as a length continuation so the
-                            # 4-retry ceiling can trip even when the truncated
-                            # turn carries a tool call. Without this, a model
-                            # whose oversized read-only tool calls keep
-                            # overflowing the output cap gets re-nudged
-                            # indefinitely (#72329).
-                            length_continue_retries += 1
-                            if truncated_tool_call_retries < 4 and length_continue_retries < 4:
+                            if truncated_tool_call_retries < 4:
                                 truncated_tool_call_retries += 1
                                 if _is_stub_stall:
                                     # The stream broke mid tool-call (network /
@@ -3000,6 +3008,9 @@ def run_conversation(
                                     _tc_boost = max(_tc_boost, _tc_requested_cap)
                                 _tc_boost_cap = max(32768, _tc_requested_cap or 0)
                                 agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
+                                # Remember the boost that's about to be used so
+                                # we can persist it if this retry succeeds.
+                                _pending_tc_boost = min(_tc_boost, _tc_boost_cap)
                                 # Don't append the broken response to messages;
                                 # just re-run the same API call from the current
                                 # message state, giving the model another chance.
@@ -6130,6 +6141,16 @@ def run_conversation(
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
                 truncated_tool_call_retries = 0
+                # Persist the boosted output cap for the remainder of the
+                # turn.  The boost was consumed one-shot by _build_api_kwargs,
+                # so without re-applying it here the next iteration reverts to
+                # the base cap and likely truncates again — costing a wasted
+                # API call before the boost is re-derived.  Network-stall
+                # retries (_is_stub_stall) don't need a bigger budget, so only
+                # persist genuine output-cap boosts (#72329).
+                if _pending_tc_boost is not None:
+                    _persisted_tc_boost = _pending_tc_boost
+                    _pending_tc_boost = None
 
                 # Signal that a paragraph break is needed before the next
                 # streamed text.  We don't emit it immediately because

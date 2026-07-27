@@ -6124,6 +6124,80 @@ class TestRunConversation:
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
 
+    def test_truncated_tool_call_boost_persists_after_successful_recovery(self, agent):
+        """After a boosted retry recovers a truncated tool call, the boosted
+        output cap must persist for the remainder of the turn so a model that
+        chronically overflows the base cap doesn't pay 2x API calls per
+        iteration (truncate → boost → succeed → cap reverts → truncate again).
+        Regression for #72329."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        agent.max_tokens = 4096
+
+        # First call: truncated tool call → triggers boosted retry
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"a.md","content":"partial',
+            call_id="c1",
+        )
+        truncated_resp = _mock_response(
+            content="", finish_reason="length", tool_calls=[bad_tc],
+        )
+        # Second call: boosted retry succeeds → tool executes, boost persisted
+        good_tc1 = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"a.md","content":"full"}',
+            call_id="c2",
+        )
+        good_resp1 = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[good_tc1],
+        )
+        # Third call: another tool call — should get the persisted boost,
+        # NOT revert to base cap and truncate again
+        good_tc2 = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"b.md","content":"full"}',
+            call_id="c3",
+        )
+        good_resp2 = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[good_tc2],
+        )
+        # Fourth call: final text response
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+
+        captured_max_tokens = []
+        original_build = agent._build_api_kwargs
+
+        def _capture_kwargs(api_messages):
+            kwargs = original_build(api_messages)
+            captured_max_tokens.append(kwargs.get("max_tokens"))
+            return kwargs
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}'),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.client.chat.completions.create.side_effect = [
+                truncated_resp, good_resp1, good_resp2, final_resp,
+            ]
+            with patch.object(agent, "_build_api_kwargs", side_effect=_capture_kwargs):
+                result = agent.run_conversation("write two files")
+
+        # Both tools executed
+        assert result["final_response"] == "Done!"
+        # The first API call uses the base cap (4096)
+        assert captured_max_tokens[0] == 4096
+        # The second call (boosted retry) uses a higher cap
+        assert captured_max_tokens[1] > 4096
+        # The third call (after successful recovery) must still have the
+        # persisted boost — NOT revert to base cap
+        assert captured_max_tokens[2] == captured_max_tokens[1], (
+            "Boost should persist after successful recovery, but "
+            f"call 2 used {captured_max_tokens[1]} and call 3 reverted to {captured_max_tokens[2]}"
+        )
+
     def test_stub_stall_mid_tool_call_recovers_within_3_retries(self, agent):
         """A network stream stall mid tool-call (PARTIAL_STREAM_STUB_ID) must
         retry up to 3 times rather than hard-failing after one — and recover
