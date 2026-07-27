@@ -403,14 +403,25 @@ def _dependencies_satisfied(conn: Any, spec: dict) -> bool:
     ``spec.metadata.depends_on``.  Fails closed: a dependency that is not in
     the store at all counts as unsatisfied, so a task whose parent was pruned
     is held rather than dispatched into a broken precondition.
+
+    Exception — failure successors.  ``gateway.failure_successors`` creates
+    those only for parents that reached ``failed``/``timed_out`` and stamps the
+    failed parent as ``parent_task_id``.  There the field records *which task
+    failed* (provenance), not a precondition: the successor exists precisely
+    because the parent will never succeed.  Gating it on parent success would
+    hold every one of them forever.  Their ``depends_on`` entries, if any, are
+    still real preconditions and are still enforced.
     """
     metadata = spec.get("metadata") or {}
     depends_on = metadata.get("depends_on") if isinstance(metadata, dict) else None
     if isinstance(depends_on, str):
         depends_on = [depends_on]
+    parent = spec.get("parent_task_id")
+    if isinstance(metadata, dict) and metadata.get("failure_successor") is True:
+        parent = None
     deps = [
         str(dep)
-        for dep in [spec.get("parent_task_id"), *(depends_on or [])]
+        for dep in [parent, *(depends_on or [])]
         if dep
     ]
     if not deps:

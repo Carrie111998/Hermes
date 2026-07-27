@@ -1091,6 +1091,46 @@ def test_parent_dependency_blocks_until_terminal_success(bridge):
     assert reasons["child-missing"] == SKIP_DEP_INCOMPLETE  # fail closed
 
 
+def test_failure_successor_is_not_blocked_by_its_failed_parent(bridge):
+    """A failure successor's parent is failed BY DEFINITION — never gate on it.
+
+    gateway.failure_successors only creates a successor when the parent reached
+    failed/timed_out, and stamps that parent as parent_task_id. Requiring the
+    parent to be succeeded/accepted would hold every failure successor forever
+    with dependency_incomplete, silently killing orphan recovery for them.
+    """
+    conn, db_path, _state = bridge
+    add_task(conn, "parent-failed", status="failed")
+    add_task(conn, "parent-timeout", status="timed_out")
+    add_task(conn, "succ-failed", status="queued", created_at=1.0,
+             spec_extra={"parent_task_id": "parent-failed",
+                         "metadata": {"failure_successor": True}})
+    add_task(conn, "succ-timeout", status="queued", created_at=2.0,
+             spec_extra={"parent_task_id": "parent-timeout",
+                         "metadata": {"failure_successor": True}})
+
+    eligible, skipped = select_dispatchable_tasks(db_path, 10)
+    assert [t["task_id"] for t in eligible] == ["succ-failed", "succ-timeout"]
+    assert skipped == []
+
+
+def test_failure_successor_still_honours_explicit_depends_on(bridge):
+    """The provenance exemption is scoped to parent_task_id only."""
+    conn, db_path, _state = bridge
+    add_task(conn, "parent-failed", status="failed")
+    add_task(conn, "blocker", status="running", runtime={"pid": os.getpid()})
+    add_task(conn, "succ", status="queued", created_at=1.0,
+             spec_extra={"parent_task_id": "parent-failed",
+                         "metadata": {"failure_successor": True,
+                                      "depends_on": ["blocker"]}})
+
+    eligible, skipped = select_dispatchable_tasks(db_path, 10)
+    assert eligible == []
+    assert {s["task_id"]: s["skip_reason"] for s in skipped} == {
+        "succ": SKIP_DEP_INCOMPLETE
+    }
+
+
 def test_metadata_depends_on_blocks(bridge):
     conn, db_path, _state = bridge
     add_task(conn, "dep-ok", status="accepted")
