@@ -65,17 +65,30 @@ def ingest(
     ]
     status = "quarantined" if findings else "available_as_data"
     content_id = f"external_{uuid.uuid4().hex}"
-    with conn:
-        conn.execute(
-            """INSERT INTO external_content
-               (id, organization_id, source_type, source_reference, content_sha256,
-                content_text, trust_level, findings_json, status, received_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'untrusted', ?, ?, ?)""",
-            (
-                content_id, organization_id, source_type, source_reference, digest,
-                content, json.dumps(findings), status, int(time.time()),
-            ),
-        )
+    try:
+        with conn:
+            conn.execute(
+                """INSERT INTO external_content
+                   (id, organization_id, source_type, source_reference, content_sha256,
+                    content_text, trust_level, findings_json, status, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'untrusted', ?, ?, ?)""",
+                (
+                    content_id, organization_id, source_type, source_reference, digest,
+                    content, json.dumps(findings), status, int(time.time()),
+                ),
+            )
+    except sqlite3.IntegrityError:
+        # Two webhook deliveries may pass the read-before-insert check at the
+        # same time. The immutable natural key makes the losing insert a safe
+        # idempotent retry, not an operational failure.
+        existing = conn.execute(
+            """SELECT * FROM external_content WHERE organization_id = ?
+               AND source_type = ? AND source_reference = ? AND content_sha256 = ?""",
+            (organization_id, source_type, source_reference, digest),
+        ).fetchone()
+        if existing is None:
+            raise
+        return dict(existing)
     return dict(
         conn.execute("SELECT * FROM external_content WHERE id = ?", (content_id,)).fetchone()
     )
