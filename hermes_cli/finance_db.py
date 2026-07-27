@@ -357,12 +357,15 @@ def reserve_budget(
     amount_minor: int,
     currency: str,
     expires_at: int,
+    objective_budget_minor: Optional[int] = None,
 ) -> str:
     ensure_schema(conn)
     if amount_minor < 0:
         raise BudgetError("reservation amount must be non-negative")
     if expires_at <= _now():
         raise BudgetError("reservation expiry must be in the future")
+    if objective_budget_minor is not None and objective_budget_minor < 0:
+        raise BudgetError("objective budget cannot be negative")
     if conn.in_transaction:
         raise BudgetError(
             "budget reservation requires an independent atomic transaction"
@@ -380,6 +383,20 @@ def reserve_budget(
                 )
             conn.commit()
             return str(existing["id"])
+        if objective_budget_minor is not None:
+            objective_spend = int(
+                conn.execute(
+                    """SELECT COALESCE(SUM(amount_minor),0) AS n
+                         FROM budget_reservations
+                        WHERE objective_id=? AND status IN ('reserved','settled')
+                          AND currency=?""",
+                    (objective_id, currency.upper()),
+                ).fetchone()["n"]
+            )
+            if objective_spend + amount_minor > objective_budget_minor:
+                raise BudgetError(
+                    "objective cumulative budget would be exceeded"
+                )
         cash = int(
             conn.execute(
                 """SELECT COALESCE(SUM(amount_minor),0) AS n

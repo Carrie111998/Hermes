@@ -453,6 +453,7 @@ def evaluate_and_record(
                 amount_minor=estimated_cost,
                 currency=currency,
                 expires_at=int(time.time()) + decision.ttl_seconds,
+                objective_budget_minor=objective.get("max_spend_minor"),
             )
             reservation_created = True
         except finance_db.BudgetError as exc:

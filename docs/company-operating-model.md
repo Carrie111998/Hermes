@@ -52,5 +52,6 @@ FTE roles are used for durable organizational need.
 Procurement evaluates existing capability, suitable FOSS, internal build, paid
 purchase, then defer. Available unreserved capital—not gross balance—is the
 hard ceiling. A paid action requires a matching verified procurement decision
-and treasury reservation.
-
+and treasury reservation. Reservations also enforce each objective's cumulative
+spend ceiling atomically, so repeated or concurrent actions cannot exceed the
+objective mandate.

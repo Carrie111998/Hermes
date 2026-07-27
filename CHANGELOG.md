@@ -6,6 +6,9 @@
   idempotent inbound Checkout Sessions, provider read-back verification, and
   narrowly scoped Connected Account outbound payments. The core runtime does
   not install or enable it automatically.
+- Enforced objective-level cumulative spend ceilings inside the atomic treasury
+  reservation transaction, including concurrent workers and released-budget
+  reuse.
 
 All notable independent Charterforge changes are documented here. Upstream
 Hermes Agent history remains available in Git.

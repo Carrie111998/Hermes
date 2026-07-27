@@ -131,6 +131,61 @@ def test_reservations_prevent_oversubscription_and_exact_settlement(treasury):
     assert finance_db.account_balance(conn, account) == 2_500
 
 
+def test_objective_cumulative_budget_is_atomic(treasury):
+    conn, account = treasury
+    finance_db.seed_initial_capital(
+        conn, account_id=account, amount_minor=2_000, currency="USD", actor="human"
+    )
+    finance_db.reserve_budget(
+        conn, account_id=account, objective_id="obj_cap", action_id="act_a",
+        amount_minor=600, currency="USD", expires_at=9_999_999_999,
+        objective_budget_minor=1_000,
+    )
+    with pytest.raises(finance_db.BudgetError, match="cumulative budget"):
+        finance_db.reserve_budget(
+            conn, account_id=account, objective_id="obj_cap", action_id="act_b",
+            amount_minor=401, currency="USD", expires_at=9_999_999_999,
+            objective_budget_minor=1_000,
+        )
+    # A released reservation no longer consumes the objective ceiling.
+    finance_db.release_reservation(conn, "act_a", reason="test")
+    finance_db.reserve_budget(
+        conn, account_id=account, objective_id="obj_cap", action_id="act_c",
+        amount_minor=1_000, currency="USD", expires_at=9_999_999_999,
+        objective_budget_minor=1_000,
+    )
+
+
+def test_concurrent_objective_budget_reservations_are_serialized(tmp_path):
+    path = tmp_path / "objective-budget.db"
+    conn = objectives_db.connect(path)
+    account = finance_db.create_treasury_account(
+        conn, organization_id="org_1", currency="USD"
+    )
+    finance_db.seed_initial_capital(
+        conn, account_id=account, amount_minor=2_000, currency="USD", actor="human"
+    )
+    conn.close()
+
+    def reserve(action_id):
+        worker = objectives_db.connect(path)
+        try:
+            finance_db.reserve_budget(
+                worker, account_id=account, objective_id="obj_cap",
+                action_id=action_id, amount_minor=600, currency="USD",
+                expires_at=9_999_999_999, objective_budget_minor=1_000,
+            )
+            return "reserved"
+        except finance_db.BudgetError:
+            return "rejected"
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(reserve, ("act_1", "act_2")))
+    assert sorted(outcomes) == ["rejected", "reserved"]
+
+
 def test_concurrent_payment_reservations_cannot_double_allocate_cash(tmp_path):
     path = tmp_path / "business.db"
     conn = objectives_db.connect(path)
