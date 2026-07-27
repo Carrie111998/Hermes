@@ -7,6 +7,22 @@ commit. It uses least-privilege permits, payload hashes, idempotency keys,
 resource budgets, immutable evidence, exact employee grants, intervention
 queues, and circuit breakers.
 
+### Concrete resource authorization
+
+Authorization is bound to the exact action, not merely to an agent name or a
+general tool label. A permit stores the action payload hash and target resource;
+consumption rejects a changed path, resource, executor, organization, or
+capability. Therefore a hypothetical `filesystem.read` permit for
+`/home/mike/ceofile.txt` cannot be retargeted to
+`/home/mike/notceofile.txt`, and it cannot be used for a write action. A write
+requires a separately proposed action, a distinct write capability, a new
+permit, and a policy decision within the current objective and charter.
+
+Employee grants apply the same non-amplification rule across the subordinate
+mandate and the delegator mandate, including capabilities, systems, toolsets,
+skills, budget, and expiry. Filesystem access is only available through a
+registered typed executor; raw shell access is not implied by a read grant.
+
 External vendor plugins and payment rails should remain separate packages.
 Credentials must not enter prompts, task grants, audit exports, or authority
 records. Payment integration is non-custodial: providers hold instruments and
