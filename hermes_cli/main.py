@@ -10104,6 +10104,29 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     # node_modules means the cache was recorded by another checkout.
     if not (PROJECT_ROOT / "node_modules").is_dir():
         return True
+    # A root node_modules directory alone is not enough for npm workspaces.
+    # A scoped install for another workspace can leave that directory and the
+    # manifest digest intact while removing the TUI/dashboard links. Require
+    # each runtime workspace link whenever its source manifest exists.
+    required_workspace_links = (
+        (
+            PROJECT_ROOT / "ui-tui" / "package.json",
+            PROJECT_ROOT / "node_modules" / "hermes-tui",
+        ),
+        (
+            PROJECT_ROOT / "ui-tui" / "packages" / "hermes-ink" / "package.json",
+            PROJECT_ROOT / "node_modules" / "@hermes" / "ink",
+        ),
+        (
+            PROJECT_ROOT / "web" / "package.json",
+            PROJECT_ROOT / "node_modules" / "web",
+        ),
+    )
+    if any(
+        source.is_file() and not installed.exists()
+        for source, installed in required_workspace_links
+    ):
+        return True
     try:
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
         cache_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
@@ -10212,7 +10235,7 @@ def _update_node_dependencies() -> list[str]:
                 (PROJECT_ROOT / workspace / "package.json").exists()
                 for workspace in ("ui-tui", "web")
             ):
-                failed.append("ui-tui, web workspaces")
+                failed.append("ui-tui, @hermes/ink, web workspaces")
             return failed
         return []
 
@@ -10269,9 +10292,20 @@ def _update_node_dependencies() -> list[str]:
             print(f"    {stderr.splitlines()[-1]}")
         return _partial_update_failure("repo root")
 
-    # Step 2: install only the workspaces update needs (ui-tui, web).
+    # Step 2: install only the workspaces update needs. Select the nested Ink
+    # workspace explicitly: selecting ui-tui alone does not guarantee npm
+    # recreates node_modules/@hermes/ink after another scoped install removed
+    # that link.
     # --workspace selects specific workspaces; the rest (desktop) are skipped.
-    ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
+    ws_args = [
+        *extra_args,
+        "--workspace",
+        "ui-tui",
+        "--workspace",
+        "ui-tui/packages/hermes-ink",
+        "--workspace",
+        "web",
+    ]
     ws_result = _run_npm_install_deterministic(
         npm,
         PROJECT_ROOT,
@@ -10281,14 +10315,40 @@ def _update_node_dependencies() -> list[str]:
     )
     if ws_result.returncode == 0:
         _record_npm_lockfile_hash(shared_hermes_root)
-        print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
+        print("  ✓ repo root + ui-tui, @hermes/ink, web workspaces (desktop skipped)")
         return []
 
     print("  ⚠ npm workspace install failed")
     stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
     if stderr:
         print(f"    {stderr.splitlines()[-1]}")
-    return _partial_update_failure("ui-tui, web workspaces")
+    return _partial_update_failure("ui-tui, @hermes/ink, web workspaces")
+
+
+def _repair_node_dependencies_if_needed() -> bool:
+    """Repair stale or missing runtime workspaces on a zero-commit update.
+
+    Returns True when an install was performed. A failed repair exits nonzero
+    so ``hermes update`` cannot report an unhealthy checkout as current.
+    """
+    if not (PROJECT_ROOT / "package.json").is_file():
+        return False
+
+    from hermes_constants import get_default_hermes_root
+
+    if not _npm_lockfile_changed(get_default_hermes_root()):
+        return False
+
+    print("→ Repairing Node.js workspace dependencies...")
+    node_failures = _update_node_dependencies()
+    if node_failures:
+        failed_labels = ", ".join(node_failures)
+        print(f"✗ Node.js workspace dependency repair failed ({failed_labels}).")
+        print("  Fix npm/Node.js, then re-run: hermes update")
+        raise SystemExit(1)
+
+    print("✓ Node.js workspace dependencies repaired!")
+    return True
 
 
 class _UpdateOutputStream:
@@ -12020,7 +12080,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            else:
+            node_repaired = _repair_node_dependencies_if_needed()
+
+            if healthy and not node_repaired:
                 print("✓ Already up to date!")
             if runtime_repaired is not None and not _is_windows():
                 print()
