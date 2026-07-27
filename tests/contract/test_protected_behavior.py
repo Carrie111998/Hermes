@@ -485,3 +485,45 @@ def test_no_guidance_block_instructs_skipping_approval():
             assert not re.search(r"don'?t wait to be asked", text, re.IGNORECASE), (
                 f"{name} overrides the identity slot's approval discipline again"
             )
+
+
+# ── 19. the real runner must satisfy its own mixins ──────────────────────────
+
+def test_gateway_runner_provides_every_method_its_mixins_call():
+    """GatewayRunner must actually compose what its watchers call.
+
+    _worker_bridge_tick calls self._ultra_route_transitions and self._ultra_pump,
+    which live in GatewayWorkerBridgeUltraMixin — and GatewayRunner did not
+    inherit it. Every alert tick carrying transitions raised AttributeError.
+
+    The unit suite could not see this: its FakeRunner composes the mixin
+    explicitly, so the test passed against a runner that was NOT how production
+    is assembled. Assert against the REAL class.
+    """
+    from gateway.run import GatewayRunner
+
+    required = ("_ultra_route_transitions", "_ultra_pump",
+                "_worker_bridge_tick", "_start_worker_bridge_watchers")
+    missing = [name for name in required if not hasattr(GatewayRunner, name)]
+    assert not missing, (
+        f"GatewayRunner is missing {missing} — a watcher will raise "
+        f"AttributeError at runtime. MRO: "
+        f"{[c.__name__ for c in GatewayRunner.__mro__]}"
+    )
+
+
+def test_fake_runner_composition_matches_the_real_runner():
+    """A test double that is assembled differently from production proves nothing.
+
+    This is what let the defect above hide: FakeRunner was given the ultra mixin
+    to make its tests pass, which made the suite green over a broken runner.
+    """
+    from gateway.run import GatewayRunner
+    from gateway.worker_bridge_ultra import GatewayWorkerBridgeUltraMixin
+    from gateway.worker_bridge_watchers import GatewayWorkerBridgeWatchersMixin
+
+    for mixin in (GatewayWorkerBridgeUltraMixin, GatewayWorkerBridgeWatchersMixin):
+        assert issubclass(GatewayRunner, mixin), (
+            f"the real runner does not compose {mixin.__name__}, but the test "
+            f"double does — the suite is testing a class that does not exist"
+        )

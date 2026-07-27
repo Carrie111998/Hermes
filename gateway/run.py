@@ -2196,6 +2196,7 @@ from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.worker_bridge_watchers import GatewayWorkerBridgeWatchersMixin
+from gateway.worker_bridge_ultra import GatewayWorkerBridgeUltraMixin
 from gateway.worker_task_dispatcher import GatewayWorkerTaskDispatcherMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
@@ -3336,6 +3337,11 @@ def _reconnect_backoff(attempt: int) -> int:
 class GatewayRunner(
     GatewayAuthorizationMixin,
     GatewayKanbanWatchersMixin,
+    # MUST precede GatewayWorkerBridgeWatchersMixin in the MRO: that
+    # mixin's _worker_bridge_tick calls self._ultra_route_transitions
+    # and self._ultra_pump, which live here. Without it every alert
+    # tick carrying transitions raised AttributeError.
+    GatewayWorkerBridgeUltraMixin,
     GatewayWorkerBridgeWatchersMixin,
     GatewayWorkerTaskDispatcherMixin,
     GatewaySlashCommandsMixin,
