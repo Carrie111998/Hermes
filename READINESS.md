@@ -632,6 +632,32 @@ Result: **17 passed, 0 failed**. The tests cover stale heartbeat fencing,
 supervisor stop/circuit behavior, authenticated event persistence across worker
 restart, and verified objective completion after the restart.
 
+The complete acceptance was rerun against current `main` commit
+`435c540428e0c77eb553a06b1c288b1bb13c62a7` after immutable parent-grant
+lineage was added. The exact command was:
+
+```sh
+scripts/run_agentic_acceptance.sh
+```
+
+It returned `current-tree agentic acceptance: PASS`. The critical results were:
+
+```text
+{"phase": "run", "objective": "verified", "effects": 1, "scheduled_events": 1, "plan_versions": 2}
+{"phase": "recover", "durable_state": "verified", "duplicate_effects": 0}
+{"phase": "ceo", "event": "kanban.task.done", "objective": "verified"}
+{"phase": "interrupt", "intent": "uncertain", "provider_effect": 1}
+{"phase": "recover", "readback": "succeeded", "duplicate_provider_calls": 0, "ledger_entries": 1, "inbound_received_minor": 530, "tax_minor": 30}
+{"phase": "stop", "autonomy": "paused", "generation": 2, "duplicate_effects": 0}
+current-tree agentic acceptance: PASS
+```
+
+The resulting local image manifest was
+`sha256:75d8a8671a1512526574c2d924a4e6ce5f0d771e95dcbbd9cae682046141dd04`.
+This remains deterministic local-provider evidence and does not establish
+production deployment, live payment credentials, or legal/compliance
+readiness.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
