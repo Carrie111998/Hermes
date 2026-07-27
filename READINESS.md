@@ -700,6 +700,26 @@ Result: **Charterforge v0.19.0 (2026.7.20)**. This proves local isolated
 installation from the project artifact; package-index publication remains
 separately authorized and unproven.
 
+The current governed-runtime regression sweep was run on commit
+`c88c88333d15120183efa7ce0d7cb04a35517bf7` with:
+
+```sh
+uv run --extra dev pytest -q \
+  tests/hermes_cli/test_objective_policy.py \
+  tests/hermes_cli/test_objective_runtime.py \
+  tests/hermes_cli/test_objective_service.py \
+  tests/hermes_cli/test_objective_worker.py \
+  tests/hermes_cli/test_workforce_delegation.py \
+  tests/hermes_cli/test_finance_and_payments.py \
+  tests/hermes_cli/test_business_bootstrap_command.py \
+  tests/hermes_cli/test_agentic_business_e2e.py
+```
+
+Result: **121 passed, 0 failed**. This is focused regression evidence for the
+durable objective loop, worker coordination, delegation authority, finance,
+readiness, and Founder/CEO end-to-end surfaces; it does not establish the
+external production gates listed below.
+
 ## Release gates that remain open
 
 - Corporate formation, legal personhood, banking, and human legal-principal
