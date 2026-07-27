@@ -1,0 +1,5 @@
+[charterforge.inbound_payment_rails]
+stripe = charterforge_stripe_rail:StripeRail
+
+[charterforge.outbound_payment_rails]
+stripe = charterforge_stripe_rail:StripeRail

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["uv_build>=0.8.0,<1.0.0"]
+build-backend = "uv_build"
+
+[project]
+name = "charterforge-circle-rail"
+version = "0.1.0"
+description = "Circle USDC/CCTP payment rail for Charterforge"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "web3>=7.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.entry-points."charterforge.inbound_payment_rails"]
+circle = "charterforge_circle_rail:InboundCircleRail"
+
+[project.entry-points."charterforge.outbound_payment_rails"]
+circle = "charterforge_circle_rail:OutboundCircleRail"
+
+[project.urls]
+Homepage = "https://github.com/mikeholownych/hermes-agent"
+Documentation = "https://github.com/mikeholownych/hermes-agent/tree/main/packages/charterforge-circle-rail"

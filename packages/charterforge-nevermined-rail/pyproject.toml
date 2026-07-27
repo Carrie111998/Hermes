@@ -1,0 +1,33 @@
+[build-system]
+requires = ["uv_build>=0.8.0,<1.0.0"]
+build-backend = "uv_build"
+
+[project]
+name = "charterforge-nevermined-rail"
+version = "0.1.0"
+description = "Nevermined AI agent payment rail for Charterforge"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "payments-py>=0.1.0",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+]
+
+[project.entry-points."charterforge.inbound_payment_rails"]
+nevermined = "charterforge_nevermined_rail:InboundNeverminedRail"
+
+[project.entry-points."charterforge.outbound_payment_rails"]
+nevermined = "charterforge_nevermined_rail:OutboundNeverminedRail"
+
+[tool.uv.build]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mikeholownych/hermes-agent"
+Documentation = "https://github.com/mikeholownych/hermes-agent/tree/main/packages/charterforge-nevermined-rail"
