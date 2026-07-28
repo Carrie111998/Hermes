@@ -71,6 +71,7 @@ from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
 )
+from agent.internal_user_messages import MAX_ITERATIONS_SUMMARY_REQUEST
 from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
@@ -1912,7 +1913,7 @@ _SYNTHETIC_USER_FLAGS = (
 )
 
 
-def _is_real_user_message(message: Any) -> bool:
+def is_real_user_message(message: Any) -> bool:
     """Distinguish human intent from user-role runtime scaffolding.
 
     A compaction summary pinned to ``role="user"`` (the compressor flips the
@@ -1928,11 +1929,17 @@ def _is_real_user_message(message: Any) -> bool:
     text = _message_text(message).strip()
     if not text:
         return False
+    if text == MAX_ITERATIONS_SUMMARY_REQUEST:
+        return False
     if text.startswith(_SYNTHETIC_USER_PREFIXES):
         return False
     from agent.context_compressor import ContextCompressor
 
     return not ContextCompressor._is_synthetic_compression_user_turn(message)
+
+
+# Backward-compatible private name for existing compression call sites.
+_is_real_user_message = is_real_user_message
 
 
 def _strip_stale_todo_snapshot(content: Any) -> Any:
