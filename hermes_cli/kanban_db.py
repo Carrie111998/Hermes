@@ -4328,7 +4328,27 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if row is not None:
+        return row["kind"] == "blocked"
+    trow = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if trow is None or trow["status"] != "blocked":
+        return False
+    if trow["block_kind"] == "dependency":
+        # Dependency blocks auto-clear via parent gating.
+        return False
+    gave_up = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'gave_up' "
+        "LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if gave_up is not None:
+        # Circuit-breaker path: keep the documented auto-recover semantics.
+        return False
+    # Blocked STATUS with no event provenance: fail safe -- stay blocked
+    # until an explicit unblock or an approval auto-clear (apply_approvals).
+    return True
 
 
 def recompute_ready(
