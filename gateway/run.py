@@ -24472,54 +24472,63 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             raise SystemExit(runner.exit_code)
         return True
 
-    # Start the background cron scheduler via the resolved provider so
-    # scheduled jobs fire automatically. The built-in provider is the
-    # historical in-process 60s ticker; an external provider (e.g. chronos)
-    # may arm a schedule and return. Pass the event loop so cron delivery can
-    # use live adapters (E2EE support).
-    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+    # Start the background cron scheduler in a deferred thread so the
+    # heavy synchronous init (cron scheduler resolution, YAML config I/O,
+    # profile discovery) happens off the event loop thread. On Windows,
+    # this prevents a ~45s event loop stall during startup (#73435).
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    _cron_loop = asyncio.get_running_loop()
+    _cron_adapters = runner.adapters
+    _cron_run_multiplex = getattr(runner.config, "multiplex_profiles", False)
 
-    # Multiplex profiles: tell the built-in ticker which profile homes to
-    # tick so secondary-profile cron jobs actually fire (#69377).
-    # Without this, only the process-global HERMES_HOME (default profile)
-    # is iterated and every secondary profile's cron store is silently
-    # ignored — jobs show as "scheduled" with a valid next_run_at but
-    # never execute because no ticker owns that store.
-    if (
-        isinstance(cron_provider, InProcessCronScheduler)
-        and getattr(runner.config, "multiplex_profiles", False)
-    ):
-        try:
-            from hermes_cli.profiles import profiles_to_serve
+    def _start_cron_in_thread() -> None:
+        """Resolve the cron scheduler provider and run the ticker loop.
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if profile_homes:
-                cron_start_kwargs["profile_homes"] = profile_homes
-                logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
-                    len(profile_homes),
-                    [p[0] if isinstance(p, tuple) else p for p in profile_homes],
+        Everything EXCEPT ``cron_stop`` is captured from the enclosing
+        scope so the thread is fully self-contained -- it opens its own
+        config files, discovers profiles, and resolves the provider
+        without any synchronous I/O on the event loop thread.
+        """
+        from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+
+        _provider = resolve_cron_scheduler()
+        _kwargs: Dict[str, Any] = {
+            "adapters": _cron_adapters,
+            "loop": _cron_loop,
+        }
+
+        # Multiplex profiles: tell the built-in ticker which profile homes
+        # to tick so secondary-profile cron jobs actually fire (#69377).
+        if isinstance(_provider, InProcessCronScheduler) and _cron_run_multiplex:
+            try:
+                from hermes_cli.profiles import profiles_to_serve
+
+                _profile_homes = list(profiles_to_serve(multiplex=True))
+                if _profile_homes:
+                    _kwargs["profile_homes"] = _profile_homes
+                    logger.info(
+                        "Cron scheduler will tick %d profile(s) under multiplex: %s",
+                        len(_profile_homes),
+                        [p[0] if isinstance(p, tuple) else p for p in _profile_homes],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Could not resolve profile homes for multiplex cron: %s",
+                    exc,
                 )
-        except Exception as exc:
-            logger.warning(
-                "Could not resolve profile homes for multiplex cron: %s",
-                exc,
+
+        # External cron providers own their remote scheduling contract.
+        # Only the in-process ticker polls local due jobs, so only it
+        # receives the external-drain dispatch gate.
+        if isinstance(_provider, InProcessCronScheduler):
+            _kwargs["can_dispatch"] = lambda: not (
+                runner._draining or runner._external_drain_active
             )
 
-    # External cron providers own their remote scheduling contract. Only the
-    # in-process ticker polls local due jobs, so only it receives the local
-    # external-drain dispatch gate.
-    if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
-        )
+        _provider.start(cron_stop, **_kwargs)
+
     cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs=cron_start_kwargs,
+        target=_start_cron_in_thread,
         daemon=True,
         name="cron-scheduler",
     )
