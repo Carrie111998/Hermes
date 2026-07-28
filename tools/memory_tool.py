@@ -99,7 +99,9 @@ def _scan_memory_content(content: str) -> Optional[str]:
 # must not match "ban").
 _POLICY_CLAIM_DIRECTIVE_RE = re.compile(
     r'\b(?:'
-    r'ban|bans|block|blocks|disable|disables|prohibit|prohibits'
+    r'ban|bans|banned|banning|block|blocks|blocked|blocking'
+    r'|disable|disables|disabled|disabling|prohibit|prohibits'
+    r'|prohibited|prohibiting'
     r'|never\s+use|do\s+not\s+use|don\'t\s+use|must\s+not\s+use'
     r'|stop\s+using|stopped\s+using|no\s+longer\s+use'
     r'|removed?\s+from\s+(?:the\s+)?(?:chain|routing|fallback)'
@@ -119,13 +121,14 @@ _ROUTING_VERB_RE = re.compile(
 # positives cause a confirmation prompt, not data loss.
 _POLICY_CLAIM_MODEL_RE = re.compile(
     r'\b(?:'
-    r'gpt-?\d[\w.-]*|o[13](?:-mini|-preview)?'
+    r'gpt-?\d[\w.-]*|o[1-9]\d*(?:-mini|-preview)?'
     r'|claude|gemini|llama\d*|grok|deepseek'
     r'|anthropic|openai|xai|google|meta'
     r'|mistral|mi[rx]tral|codestral|cohere|perplexity'
     r'|sonar|dbrx|command-r'
     r'|nvidia|nemotron|qwq|qwen\d*|groq'
     r'|doubao|kimi|ernie|spark|hunyuan|bedrock|azure'
+    r'|yi|glm|baichuan'
     r'|together|fireworks|replicate'
     r')\b',
     re.IGNORECASE,
@@ -136,7 +139,7 @@ _POLICY_CLAIM_MODEL_RE = re.compile(
 # classifier body) — "Going forward, use claude" is a routing directive;
 # "Going forward, claude is fast" is an observation.
 _POLICY_CLAIM_PERMANENCE_RE = re.compile(
-    r'\b(?:permanent|forever|indefinitely|from\s+now\s+on|going\s+forward)\b',
+    r'\b(?:permanent|forever|indefinitely|from\s+now\s+on|going\s+forward|always)\b',
     re.IGNORECASE,
 )
 

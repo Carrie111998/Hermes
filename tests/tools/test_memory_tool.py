@@ -753,3 +753,67 @@ class TestDetectPolicyClaim:
     def test_dont_use_contraction(self):
         """Contraction 'don't use' should be detected."""
         assert self._detect("don't use gemini anymore") is not None
+
+    # ── Past-tense directive forms (#64681 follow-up) ──
+
+    def test_banned_model_past_tense(self):
+        """Past-tense 'User banned gpt-5.6-sol' should be detected."""
+        assert self._detect("User banned gpt-5.6-sol") is not None
+
+    def test_blocked_provider_past_tense(self):
+        """Past-tense 'OpenAI blocked claude 5' should be detected."""
+        assert self._detect("OpenAI blocked claude 5 via API") is not None
+
+    def test_disabled_model_past_tense(self):
+        """Past-tense 'disabled gemini models' should be detected."""
+        assert self._detect("User disabled gemini models last week") is not None
+
+    def test_prohibited_provider_past_tense(self):
+        """Past-tense 'prohibited anthropic routing' should be detected."""
+        assert self._detect("prohibited anthropic routing") is not None
+
+    def test_banning_gerund(self):
+        """Gerund 'banning gpt-5.6-sol' should be detected."""
+        assert self._detect("Consider banning gpt-5.6-sol for code review") is not None
+
+    # ── 'always' permanence (#64681 follow-up) ──
+
+    def test_always_with_routing_verb(self):
+        """'Always use claude for routing' should be detected."""
+        assert self._detect("Always use claude for routing") is not None
+
+    def test_always_without_routing_verb(self):
+        """'Always' + model but NO routing verb should not trigger."""
+        assert self._detect("Always claude for code reviews") is None
+
+    def test_always_without_model(self):
+        """'Always' + routing verb but NO model should not trigger."""
+        assert self._detect("Always use bullet points") is None
+
+    # ── o4 / o4-mini model coverage (#64681 follow-up) ──
+
+    def test_o4_model_detected(self):
+        """'never use o4-mini' should be detected (was missing from o[13])."""
+        assert self._detect("never use o4-mini for this project") is not None
+
+    def test_o4_bare_detected(self):
+        """'ban o4' (bare, no -mini suffix) should be detected."""
+        assert self._detect("ban o4") is not None
+
+    def test_o1_pro_detected(self):
+        """'o1-pro' variant should be detected (o[1-9]\\d* covers it)."""
+        assert self._detect("block o1-pro for routing") is not None
+
+    # ── yi / glm / baichuan provider coverage (#64681 follow-up) ──
+
+    def test_yi_provider_detected(self):
+        """'never use yi for code' should be detected."""
+        assert self._detect("never use yi for code") is not None
+
+    def test_glm_provider_detected(self):
+        """'block glm routing' should be detected."""
+        assert self._detect("block glm routing") is not None
+
+    def test_baichuan_provider_detected(self):
+        """'disable baichuan entirely' should be detected."""
+        assert self._detect("disable baichuan entirely") is not None
