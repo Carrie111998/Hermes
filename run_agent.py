@@ -3828,6 +3828,17 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_codex_session(self) -> None:
+        """Detach and close the Codex app-server session, if one is active."""
+        codex_session = getattr(self, "_codex_session", None)
+        self._codex_session = None
+        if codex_session is None:
+            return
+        try:
+            codex_session.close()
+        except Exception:
+            logger.debug("Failed to close Codex app-server session", exc_info=True)
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -3865,6 +3876,11 @@ class AIAgent:
                         pass
         except Exception:
             pass
+
+        # A rebuilt agent cannot reuse this instance's Codex thread. Closing
+        # it here prevents cache eviction from orphaning the app-server and
+        # its MCP subprocesses.
+        self._close_codex_session()
 
         # Retire the OpenAI/httpx client to release sockets immediately.
         # #70773: eviction runs on the gateway's memory-manager thread — a
@@ -3934,7 +3950,10 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. Close the Codex app-server runtime owned by this agent.
+        self._close_codex_session()
+
+        # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3943,14 +3962,14 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5b. Close the cached per-request wire client (reused across
+        # 6b. Close the cached per-request wire client (reused across
         # sequential LLM calls; see _create_request_openai_client).
         try:
             self._close_cached_request_openai_client(reason="agent_close")
         except Exception:
             pass
 
-        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -3961,7 +3980,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 7. Finalize the owned SQLite session row unless this agent is only a
+        # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,
         # or background-review forks that share the live parent's session_id and
