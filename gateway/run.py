@@ -316,12 +316,10 @@ def _non_conversational_metadata(
     *,
     platform: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    """Mark Discord lifecycle/status sends without changing other platforms."""
-    if _gateway_platform_value(platform) != "discord":
+    """Mark trusted lifecycle/status sends for adapters that consume the flag."""
+    if _gateway_platform_value(platform) not in {"discord", "line"}:
         return metadata
-    merged = dict(metadata or {})
-    merged["non_conversational"] = True
-    return merged
+    return _mark_non_conversational_metadata(metadata)
 
 
 def _seed_hygiene_system_prompt(
@@ -2205,6 +2203,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _mark_non_conversational_metadata,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,

@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as _datetime
 import enum
 import hashlib
 import hmac
@@ -74,12 +75,34 @@ import secrets
 import tempfile
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _DeliveryTaskGuard:
+    """Unbounded-by-lifetime authorization carried only by one inbound task."""
+
+    adapter: Any
+    chat_id: str
+    run_id: str
+    blocked: bool = False
+
+
+# Immutable connection authorization copied into each inbound processing task.
+# Unlike the bounded diagnostic run map, this value cannot be evicted while an
+# old task remains alive after disconnect/reconnect.
+_DELIVERY_TASK_EPOCH: ContextVar[Optional[Tuple[Any, int]]] = ContextVar(
+    "line_delivery_task_epoch", default=None
+)
+_DELIVERY_TASK_GUARD: ContextVar[Optional[_DeliveryTaskGuard]] = ContextVar(
+    "line_delivery_task_guard", default=None
+)
 
 # ---------------------------------------------------------------------------
 # Lazy / function-level imports for gateway internals are NOT used here —
@@ -92,6 +115,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _is_trusted_non_conversational_metadata,
     cache_image_from_bytes,
 )
 from gateway.config import Platform
@@ -104,6 +128,8 @@ from gateway.config import Platform
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
+LINE_QUOTA_URL = "https://api.line.me/v2/bot/message/quota"
+LINE_QUOTA_CONSUMPTION_URL = "https://api.line.me/v2/bot/message/quota/consumption"
 LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
 
@@ -121,12 +147,24 @@ DEFAULT_MEDIA_PATH_PREFIX = "/line/media"
 
 # Slow-LLM postback button defaults
 DEFAULT_SLOW_RESPONSE_THRESHOLD = 45.0  # seconds; 0 disables
+DEFAULT_PUSH_SOFT_LIMIT_RATIO = 0.8
+DEFAULT_QUOTA_LOOKUP_TIMEOUT_SECONDS = 3.0
+MAX_DELIVERY_STATE_ENTRIES = 2048
 DEFAULT_PENDING_REPLY_TEXT = (
     "🤔 Still thinking. Tap below to fetch the answer when it's ready."
 )
 DEFAULT_BUTTON_LABEL = "Get answer"
 DEFAULT_DELIVERED_TEXT = "Already replied ✅"
 DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
+
+
+class _LineDefiniteReplyError(RuntimeError):
+    """LINE explicitly rejected a reply; Push fallback cannot duplicate it."""
+
+
+class _LineDefinitePushError(RuntimeError):
+    """LINE explicitly rejected a Push; the quota reservation can be released."""
+
 
 # Media defaults
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
@@ -294,6 +332,7 @@ class _CacheEntry:
     state: State
     payload: Any = None
     chat_id: str = ""
+    delivery_guard: Optional[_DeliveryTaskGuard] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -310,29 +349,56 @@ class RequestCache:
         self,
         ttl_seconds: int = 3600,
         pending_ttl_seconds: int = 86400,
+        max_entries: int = MAX_DELIVERY_STATE_ENTRIES,
+        on_prune: Optional[Callable[[Dict[str, _CacheEntry]], None]] = None,
     ) -> None:
         self._entries: Dict[str, _CacheEntry] = {}
         self._ttl = ttl_seconds
         self._pending_ttl = pending_ttl_seconds
+        try:
+            parsed_max_entries = int(max_entries)
+        except (TypeError, ValueError):
+            parsed_max_entries = MAX_DELIVERY_STATE_ENTRIES
+        self._max_entries = max(1, parsed_max_entries)
+        self._on_prune = on_prune
 
-    def register_pending(self, chat_id: str) -> str:
+    def register_pending(
+        self,
+        chat_id: str,
+        delivery_guard: Optional[_DeliveryTaskGuard] = None,
+    ) -> Optional[str]:
+        self.prune()
+        if len(self._entries) >= self._max_entries:
+            return None
         rid = str(uuid.uuid4())
-        self._entries[rid] = _CacheEntry(state=State.PENDING, chat_id=chat_id)
+        self._entries[rid] = _CacheEntry(
+            state=State.PENDING,
+            chat_id=chat_id,
+            delivery_guard=delivery_guard,
+        )
         return rid
 
     def get(self, request_id: str) -> Optional[_CacheEntry]:
+        self.prune()
         return self._entries.get(request_id)
 
-    def set_ready(self, request_id: str, payload: Any) -> None:
-        entry = self._entries.get(request_id)
+    def discard(self, request_id: str) -> None:
+        self._entries.pop(request_id, None)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def set_ready(self, request_id: str, payload: Any) -> bool:
+        entry = self.get(request_id)
         if entry is None or entry.state is not State.PENDING:
-            return
+            return False
         entry.state = State.READY
         entry.payload = payload
         entry.updated_at = time.time()
+        return True
 
     def set_error(self, request_id: str, message: str) -> None:
-        entry = self._entries.get(request_id)
+        entry = self.get(request_id)
         if entry is None or entry.state is not State.PENDING:
             return
         entry.state = State.ERROR
@@ -340,32 +406,152 @@ class RequestCache:
         entry.updated_at = time.time()
 
     def mark_delivered(self, request_id: str) -> None:
-        entry = self._entries.get(request_id)
+        entry = self.get(request_id)
         if entry is None or entry.state not in {State.READY, State.ERROR}:
             return
         entry.state = State.DELIVERED
         entry.updated_at = time.time()
 
     def find_pending_for_chat(self, chat_id: str) -> Optional[str]:
+        self.prune()
         for rid, entry in self._entries.items():
             if entry.state is State.PENDING and entry.chat_id == chat_id:
                 return rid
         return None
 
-    def prune(self) -> int:
+    def prune(self) -> Set[str]:
         now = time.time()
-        removed = 0
+        removed_entries: Dict[str, _CacheEntry] = {}
         for rid in list(self._entries.keys()):
             entry = self._entries[rid]
             if entry.state is State.PENDING:
                 if now - entry.created_at > self._pending_ttl:
                     del self._entries[rid]
-                    removed += 1
+                    removed_entries[rid] = entry
             else:
                 if now - entry.updated_at > self._ttl:
                     del self._entries[rid]
-                    removed += 1
-        return removed
+                    removed_entries[rid] = entry
+        if removed_entries and self._on_prune:
+            self._on_prune(removed_entries)
+        return set(removed_entries)
+
+
+@dataclass(frozen=True)
+class QuotaDecision:
+    """Result of reserving one metered LINE Push recipient."""
+
+    allowed: bool
+    reason: str
+    effective_usage: Optional[int] = None
+    soft_limit: Optional[int] = None
+
+
+class _PushQuotaBudget:
+    """Fail-closed, concurrency-safe soft budget for slow-response Pushes.
+
+    LINE's consumption endpoint can lag a successful Push. The budget keeps
+    an in-process estimate of active reservations and successful-but-not-yet-
+    observed Pushes so concurrent slow runs cannot spend the same final slot.
+    """
+
+    def __init__(self, soft_limit_ratio: float = DEFAULT_PUSH_SOFT_LIMIT_RATIO) -> None:
+        try:
+            ratio = float(soft_limit_ratio)
+        except (TypeError, ValueError):
+            ratio = DEFAULT_PUSH_SOFT_LIMIT_RATIO
+        self.soft_limit_ratio = (
+            ratio if 0 < ratio <= 1 else DEFAULT_PUSH_SOFT_LIMIT_RATIO
+        )
+        self._lock = asyncio.Lock()
+        self._period_key = self._current_period_key()
+        self._observed_usage = 0
+        self._committed_unobserved = 0
+        self._active_reservations = 0
+
+    @staticmethod
+    def _current_period_key() -> str:
+        return _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y-%m")
+
+    def _reset_if_new_period(self) -> None:
+        period = self._current_period_key()
+        if period != self._period_key:
+            self._period_key = period
+            self._observed_usage = 0
+            self._committed_unobserved = 0
+            self._active_reservations = 0
+
+    async def reserve(self, client: "_LineClient") -> QuotaDecision:
+        async with self._lock:
+            self._reset_if_new_period()
+            try:
+                quota, consumption = await client.get_quota_status()
+            except Exception as exc:
+                logger.warning(
+                    "LINE quota decision: allowed=false reason=quota_unavailable error=%s",
+                    type(exc).__name__,
+                )
+                return QuotaDecision(False, "quota_unavailable")
+
+            quota_type = quota.get("type") if isinstance(quota, dict) else None
+            if quota_type == "unlimited":
+                self._active_reservations += 1
+                return QuotaDecision(True, "unlimited")
+            if quota_type != "limited":
+                return QuotaDecision(False, "quota_invalid")
+
+            try:
+                raw_limit = quota["value"]
+                raw_usage = consumption["totalUsage"]
+
+                def _strict_count(value: Any) -> int:
+                    if type(value) is not int:
+                        raise ValueError
+                    return value
+
+                limit = _strict_count(raw_limit)
+                usage = _strict_count(raw_usage)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return QuotaDecision(False, "quota_invalid")
+            if limit <= 0 or usage < 0:
+                return QuotaDecision(False, "quota_invalid")
+
+            if usage > self._observed_usage:
+                acknowledged = usage - self._observed_usage
+                self._committed_unobserved = max(
+                    0, self._committed_unobserved - acknowledged
+                )
+                self._observed_usage = usage
+
+            soft_limit = int(limit * self.soft_limit_ratio)
+            effective = (
+                max(usage, self._observed_usage)
+                + self._committed_unobserved
+                + self._active_reservations
+            )
+            if effective + 1 > soft_limit:
+                return QuotaDecision(
+                    False,
+                    "soft_limit_reached",
+                    effective_usage=effective,
+                    soft_limit=soft_limit,
+                )
+
+            self._active_reservations += 1
+            return QuotaDecision(
+                True,
+                "within_soft_limit",
+                effective_usage=effective,
+                soft_limit=soft_limit,
+            )
+
+    def finish(self, *, pushed: bool) -> None:
+        """Release one active reservation, committing only after Push success."""
+        if self._active_reservations <= 0:
+            return
+        self._active_reservations -= 1
+        if pushed:
+            self._committed_unobserved += 1
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +638,16 @@ class _LineClient:
     for the four endpoints we actually call).
     """
 
-    def __init__(self, channel_access_token: str, *, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        channel_access_token: str,
+        *,
+        timeout: float = 15.0,
+        quota_timeout: float = DEFAULT_QUOTA_LOOKUP_TIMEOUT_SECONDS,
+    ) -> None:
         self._token = channel_access_token
         self._timeout = timeout
+        self._quota_timeout = quota_timeout
         self._headers = {
             "Authorization": f"Bearer {channel_access_token}",
             "Content-Type": "application/json",
@@ -463,28 +656,83 @@ class _LineClient:
     async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
+        started = time.monotonic()
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(
                 LINE_REPLY_URL,
                 headers=self._headers,
                 json={"replyToken": reply_token, "messages": messages},
             ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                body = await resp.text()
+                if 400 <= resp.status < 500:
+                    self._log_delivery_failure("reply", resp, body, started)
+                    raise _LineDefiniteReplyError(f"LINE reply {resp.status}")
+                if resp.status >= 500:
+                    self._log_delivery_failure("reply", resp, body, started)
+                    raise RuntimeError(f"LINE reply delivery uncertain ({resp.status})")
+                self._log_delivery_receipt("reply", resp, body, started)
 
     async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
+        started = time.monotonic()
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(
                 LINE_PUSH_URL,
                 headers=self._headers,
                 json={"to": chat_id, "messages": messages},
             ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                body = await resp.text()
+                if 400 <= resp.status < 500:
+                    self._log_delivery_failure("push", resp, body, started)
+                    raise _LineDefinitePushError(f"LINE push {resp.status}")
+                if resp.status >= 500:
+                    self._log_delivery_failure("push", resp, body, started)
+                    raise RuntimeError(f"LINE push delivery uncertain ({resp.status})")
+                self._log_delivery_receipt("push", resp, body, started)
+
+    @staticmethod
+    def _log_delivery_receipt(operation: str, resp, _body: str, started: float) -> None:
+        """Log LINE's delivery receipt without response-body-derived fields."""
+        request_id = (
+            resp.headers.get("x-line-request-id")
+            or resp.headers.get("X-Line-Request-Id")
+            or "-"
+        )
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.info(
+            "LINE delivery success: operation=%s status=%s request_id=%s "
+            "elapsed_ms=%s",
+            operation,
+            resp.status,
+            request_id,
+            elapsed_ms,
+        )
+
+    @staticmethod
+    def _log_delivery_failure(operation: str, resp, _body: str, started: float) -> None:
+        """Log a safe LINE API error summary without request payload secrets."""
+        request_id = (
+            resp.headers.get("x-line-request-id")
+            or resp.headers.get("X-Line-Request-Id")
+            or "-"
+        )
+        if 400 <= resp.status < 500:
+            error = "http_4xx"
+        elif resp.status >= 500:
+            error = "http_5xx"
+        else:
+            error = "http_error"
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.warning(
+            "LINE delivery failed: operation=%s status=%s request_id=%s "
+            "error=%s elapsed_ms=%s",
+            operation,
+            resp.status,
+            request_id,
+            error,
+            elapsed_ms,
+        )
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -503,6 +751,33 @@ class _LineClient:
                 )
         except Exception as exc:  # best-effort; never raise
             logger.debug("LINE loading indicator failed: %s", exc)
+
+    async def get_quota_status(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Fetch monthly quota/consumption within the reply-token safety window."""
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=self._quota_timeout)
+        async with asyncio.timeout(self._quota_timeout):
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=True
+            ) as session:
+                payloads: List[Dict[str, Any]] = []
+                for label, url in (
+                    ("quota", LINE_QUOTA_URL),
+                    ("quota consumption", LINE_QUOTA_CONSUMPTION_URL),
+                ):
+                    async with session.get(url, headers=self._headers) as resp:
+                        body = await resp.text()
+                        if resp.status >= 400:
+                            raise RuntimeError(f"LINE {label} {resp.status}")
+                        try:
+                            parsed = json.loads(body) if body else {}
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(f"LINE {label} invalid JSON") from exc
+                        if not isinstance(parsed, dict):
+                            raise RuntimeError(f"LINE {label} invalid payload")
+                        payloads.append(parsed)
+        return payloads[0], payloads[1]
 
     async def fetch_content(self, message_id: str) -> bytes:
         """Download an inbound media message's binary content."""
@@ -700,6 +975,24 @@ class LineAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self.slow_response_threshold = DEFAULT_SLOW_RESPONSE_THRESHOLD
 
+        mode = str(extra.get("slow_response_mode", "postback")).strip().lower()
+        self.slow_response_mode = mode if mode in {"postback", "auto_push"} else "postback"
+        self._quota_budget = _PushQuotaBudget(
+            extra.get("push_quota_soft_limit_ratio", DEFAULT_PUSH_SOFT_LIMIT_RATIO)
+        )
+        try:
+            quota_timeout = float(
+                extra.get(
+                    "quota_lookup_timeout_seconds",
+                    DEFAULT_QUOTA_LOOKUP_TIMEOUT_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            quota_timeout = DEFAULT_QUOTA_LOOKUP_TIMEOUT_SECONDS
+        self.quota_lookup_timeout_seconds = (
+            quota_timeout if quota_timeout > 0 else DEFAULT_QUOTA_LOOKUP_TIMEOUT_SECONDS
+        )
+
         # User-overridable copy
         self.pending_text = (
             os.getenv("LINE_PENDING_TEXT")
@@ -720,11 +1013,13 @@ class LineAdapter(BasePlatformAdapter):
 
         # Runtime state
         self._client: Optional[_LineClient] = None
+        self._disconnecting = False
+        self._delivery_epoch = 0
         self._app = None  # aiohttp.web.Application
         self._runner = None  # aiohttp.web.AppRunner
         self._site = None  # aiohttp.web.TCPSite
         self._reply_tokens: Dict[str, Tuple[str, float]] = {}  # chat_id → (token, expiry)
-        self._cache = RequestCache()
+        self._cache = RequestCache(on_prune=self._cleanup_pruned_requests)
         self._dedup = _MessageDeduplicator()
         self._bot_user_id: Optional[str] = None
         self._lock_key: Optional[str] = None
@@ -737,12 +1032,68 @@ class LineAdapter(BasePlatformAdapter):
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
+        # DMs approved for one budgeted slow-response Push. Membership is the
+        # reservation identity, preventing duplicate settlement per chat.
+        self._auto_push_reservations: Set[str] = set()
+        # Generation identity for live gateway runs.  Chat-level state remains
+        # as a compatibility fallback for proactive sends and direct callers
+        # that have no inbound message context.
+        self._delivery_run_by_chat: Dict[str, str] = {}
+        # Bounded epoch tombstones keep old task-local generations invalid
+        # across disconnect/reconnect without retaining unbounded chat state.
+        self._delivery_run_epochs: Dict[Tuple[str, str], int] = {}
+        self._delivery_state_order: Dict[str, None] = {}
+        self._reply_token_runs: Dict[str, str] = {}
+        self._auto_push_reservation_runs: Dict[str, str] = {}
+        self._auto_push_completed_runs: Dict[Tuple[str, str], None] = {}
+        # Claims a chat before quota I/O so concurrent threshold tasks cannot
+        # create two numeric reservations behind one set membership marker.
+        self._auto_push_inflight: Set[str] = set()
+        # Compatibility guard for proactive/direct sends without a gateway run
+        # generation. Real inbound runs use _auto_push_completed_runs.
+        self._auto_push_completed_chats: Set[str] = set()
+        # Chats whose quota-safe postback could not be delivered. The next
+        # final response is failed closed instead of silently spending Push.
+        self._blocked_slow_pushes: Set[str] = set()
+        # Request IDs currently being delivered after a postback tap. This
+        # closes the READY read→reply→DELIVERED double-click race.
+        self._postback_delivering: Set[str] = set()
+        # Postbacks selected specifically to avoid metered Push. A rejected
+        # fresh reply token must not fall back to Push and bypass the budget.
+        self._quota_guarded_postbacks: Set[str] = set()
+
+    def _cleanup_pruned_requests(
+        self, removed_entries: Dict[str, _CacheEntry]
+    ) -> None:
+        """Revoke bound runs and remove side state for TTL-evicted entries."""
+        if not removed_entries:
+            return
+        request_ids = set(removed_entries)
+        fallback_chats: List[str] = []
+        for chat_id, request_id in list(self._pending_buttons.items()):
+            if request_id in request_ids:
+                self._pending_buttons.pop(chat_id, None)
+                if request_id in self._quota_guarded_postbacks:
+                    guard = removed_entries[request_id].delivery_guard
+                    if guard is not None and guard.adapter is self:
+                        guard.blocked = True
+                    else:
+                        fallback_chats.append(chat_id)
+        self._quota_guarded_postbacks.difference_update(request_ids)
+        self._postback_delivering.difference_update(request_ids)
+        for chat_id in fallback_chats:
+            self._block_slow_push(chat_id)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Preserve the current adapter lifecycle signature while restoring the
+        # feature's generation fence: reconnects must invalidate any task
+        # still carrying authorization from the previous connection.
+        self._disconnecting = False
+        self._delivery_epoch += 1
         if not self.channel_access_token or not self.channel_secret:
             self._set_fatal_error(
                 "config_missing",
@@ -767,7 +1118,10 @@ class LineAdapter(BasePlatformAdapter):
         except ImportError:
             self._lock_key = None
 
-        self._client = _LineClient(self.channel_access_token)
+        self._client = _LineClient(
+            self.channel_access_token,
+            quota_timeout=self.quota_lookup_timeout_seconds,
+        )
 
         # Best-effort: fetch our own bot userId for self-message filtering.
         # If the call fails (offline tests, transient 5xx) we fall back to
@@ -824,6 +1178,8 @@ class LineAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._disconnecting = True
+        self._delivery_epoch += 1
         self._mark_disconnected()
 
         if self._site is not None:
@@ -849,6 +1205,24 @@ class LineAdapter(BasePlatformAdapter):
         self._media_temp_paths.clear()
         self._media_tokens.clear()
 
+        # Drop all chat/run identifiers and delivery claims on disconnect.
+        self._reply_tokens.clear()
+        self._delivery_run_by_chat.clear()
+        self._delivery_state_order.clear()
+        self._reply_token_runs.clear()
+        for _chat_id in tuple(self._auto_push_reservations):
+            self._quota_budget.finish(pushed=False)
+        self._auto_push_reservations.clear()
+        self._auto_push_reservation_runs.clear()
+        self._auto_push_inflight.clear()
+        self._auto_push_completed_runs.clear()
+        self._auto_push_completed_chats.clear()
+        self._blocked_slow_pushes.clear()
+        self._cache.clear()
+        self._pending_buttons.clear()
+        self._postback_delivering.clear()
+        self._quota_guarded_postbacks.clear()
+
         if self._lock_key:
             try:
                 from gateway.status import release_scoped_lock
@@ -860,6 +1234,188 @@ class LineAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Webhook handlers
     # ------------------------------------------------------------------
+
+    def _context_delivery_run_id(self, chat_id: str) -> str:
+        """Return only the task-local inbound generation, if one is bound."""
+        try:
+            from gateway.session_context import get_session_env
+
+            context_chat = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            context_run = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+            if context_chat == chat_id and context_run:
+                return context_run
+        except Exception:
+            pass
+        return ""
+
+    def _current_delivery_guard(
+        self, chat_id: str
+    ) -> Optional[_DeliveryTaskGuard]:
+        guard = _DELIVERY_TASK_GUARD.get()
+        if guard is not None and guard.adapter is self and guard.chat_id == chat_id:
+            return guard
+        return None
+
+    def _has_foreign_delivery_context(self) -> bool:
+        task_epoch = _DELIVERY_TASK_EPOCH.get()
+        return task_epoch is not None and task_epoch[0] is not self
+
+    def _delivery_run_id(self, chat_id: str) -> str:
+        """Return this adapter's task generation, falling back to its live run."""
+        if self._has_foreign_delivery_context():
+            return ""
+        return self._context_delivery_run_id(chat_id) or self._delivery_run_by_chat.get(
+            chat_id, ""
+        )
+
+    def _evict_delivery_chat_state(self, chat_id: str) -> None:
+        self._delivery_state_order.pop(chat_id, None)
+        self._delivery_run_by_chat.pop(chat_id, None)
+        self._reply_tokens.pop(chat_id, None)
+        self._reply_token_runs.pop(chat_id, None)
+        self._blocked_slow_pushes.discard(chat_id)
+        self._auto_push_completed_chats.discard(chat_id)
+        for key in [key for key in self._auto_push_completed_runs if key[0] == chat_id]:
+            self._auto_push_completed_runs.pop(key, None)
+
+    def _touch_delivery_state(self, chat_id: str) -> None:
+        if not chat_id:
+            return
+        now = time.time()
+        for token_chat, (_, expires_at) in list(self._reply_tokens.items()):
+            if now >= expires_at:
+                self._reply_tokens.pop(token_chat, None)
+                self._reply_token_runs.pop(token_chat, None)
+        self._delivery_state_order.pop(chat_id, None)
+        self._delivery_state_order[chat_id] = None
+        while len(self._delivery_state_order) > MAX_DELIVERY_STATE_ENTRIES:
+            evicted = False
+            for candidate in list(self._delivery_state_order):
+                if candidate == chat_id:
+                    continue
+                if candidate in self._auto_push_reservations:
+                    continue
+                if candidate in self._auto_push_inflight:
+                    continue
+                if candidate in self._pending_buttons:
+                    continue
+                self._evict_delivery_chat_state(candidate)
+                evicted = True
+                break
+            if not evicted:
+                break
+
+    def _block_slow_push(self, chat_id: str) -> None:
+        guard = self._current_delivery_guard(chat_id)
+        if guard is not None:
+            guard.blocked = True
+        self._touch_delivery_state(chat_id)
+        self._blocked_slow_pushes.add(chat_id)
+
+    def _begin_delivery_run(self, chat_id: str, run_id: str) -> None:
+        """Activate a generation only when its queued run actually starts."""
+        if not chat_id or not run_id:
+            return
+        previous_reservation = self._auto_push_reservation_runs.get(chat_id)
+        if previous_reservation and previous_reservation != run_id:
+            self._settle_auto_push(chat_id, pushed=False)
+        self._delivery_run_by_chat[chat_id] = run_id
+        epoch_key = (chat_id, run_id)
+        self._delivery_run_epochs.pop(epoch_key, None)
+        self._delivery_run_epochs[epoch_key] = self._delivery_epoch
+        while len(self._delivery_run_epochs) > MAX_DELIVERY_STATE_ENTRIES:
+            oldest_epoch = next(iter(self._delivery_run_epochs))
+            self._delivery_run_epochs.pop(oldest_epoch, None)
+        self._touch_delivery_state(chat_id)
+        self._auto_push_completed_runs.pop((chat_id, run_id), None)
+        self._auto_push_completed_chats.discard(chat_id)
+
+    def _mark_delivery_completed(
+        self,
+        chat_id: str,
+        *,
+        run_id: str = "",
+        fallback_chat: bool = False,
+    ) -> None:
+        completed_run = run_id or self._delivery_run_id(chat_id)
+        if completed_run:
+            key = (chat_id, completed_run)
+            self._auto_push_completed_runs.pop(key, None)
+            self._auto_push_completed_runs[key] = None
+            while len(self._auto_push_completed_runs) > MAX_DELIVERY_STATE_ENTRIES:
+                oldest = next(iter(self._auto_push_completed_runs))
+                self._auto_push_completed_runs.pop(oldest, None)
+        elif fallback_chat:
+            self._auto_push_completed_chats.add(chat_id)
+
+    def _delivery_completed(self, chat_id: str) -> bool:
+        if self._disconnecting:
+            return True
+        task_epoch = _DELIVERY_TASK_EPOCH.get()
+        task_bound = False
+        foreign_task = False
+        if task_epoch is not None:
+            if task_epoch[0] is self:
+                task_bound = True
+                if task_epoch[1] != self._delivery_epoch:
+                    return True
+            else:
+                foreign_task = True
+        context_run = (
+            "" if foreign_task else self._context_delivery_run_id(chat_id)
+        )
+        if not context_run and not task_bound:
+            return chat_id in self._auto_push_completed_chats
+        live_run = self._delivery_run_by_chat.get(chat_id, "")
+        if context_run:
+            bound_epoch = self._delivery_run_epochs.get((chat_id, context_run))
+            if bound_epoch is not None and bound_epoch != self._delivery_epoch:
+                return True
+        token_run = self._reply_token_runs.get(chat_id, "")
+        if (
+            context_run
+            and token_run
+            and chat_id in self._reply_tokens
+            and context_run != token_run
+        ):
+            return True
+        if context_run and live_run and context_run != live_run:
+            return True
+        run_id = context_run or live_run
+        if run_id:
+            return (chat_id, run_id) in self._auto_push_completed_runs
+        return chat_id in self._auto_push_completed_chats
+
+    def _has_auto_push_reservation(self, chat_id: str) -> bool:
+        if chat_id not in self._auto_push_reservations:
+            return False
+        reserved_run = self._auto_push_reservation_runs.get(chat_id, "")
+        if not reserved_run:
+            return True
+        return reserved_run == self._delivery_run_id(chat_id)
+
+    def _start_session_processing(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        interrupt_event: Optional[asyncio.Event] = None,
+    ) -> bool:
+        run_id = event.message_id or session_key
+        guard_token = _DELIVERY_TASK_GUARD.set(
+            _DeliveryTaskGuard(self, event.source.chat_id, run_id)
+        )
+        epoch_token = _DELIVERY_TASK_EPOCH.set((self, self._delivery_epoch))
+        try:
+            started = super()._start_session_processing(
+                event, session_key, interrupt_event=interrupt_event
+            )
+        finally:
+            _DELIVERY_TASK_EPOCH.reset(epoch_token)
+            _DELIVERY_TASK_GUARD.reset(guard_token)
+        if started:
+            self._begin_delivery_run(event.source.chat_id, run_id)
+        return started
 
     async def _handle_health(self, request) -> Any:
         from aiohttp import web
@@ -939,13 +1495,16 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        self._touch_delivery_state(chat_id)
 
-        # Stash the reply token for outbound use.
+        # Stash the reply token with the inbound generation.  A queued newer
+        # event must not donate its single-use token to the older active run.
         if chat_id and reply_token:
             self._reply_tokens[chat_id] = (
                 reply_token,
                 time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
             )
+            self._reply_token_runs[chat_id] = message_id
 
         # Handle media inbound — fetch the binary, cache it, and surface a
         # vision-tool-friendly local path on the MessageEvent.
@@ -996,6 +1555,18 @@ class LineAdapter(BasePlatformAdapter):
         await self.handle_message(event_obj)
 
     async def _handle_postback_event(self, event: Dict[str, Any]) -> None:
+        """Bind a postback webhook to the connection epoch that accepted it."""
+        existing_epoch = _DELIVERY_TASK_EPOCH.get()
+        epoch_token = None
+        if existing_epoch is None or existing_epoch[0] is not self:
+            epoch_token = _DELIVERY_TASK_EPOCH.set((self, self._delivery_epoch))
+        try:
+            await self._handle_postback_event_current(event)
+        finally:
+            if epoch_token is not None:
+                _DELIVERY_TASK_EPOCH.reset(epoch_token)
+
+    async def _handle_postback_event_current(self, event: Dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver cached payload."""
         postback = event.get("postback") or {}
         data = postback.get("data", "") or ""
@@ -1017,40 +1588,81 @@ class LineAdapter(BasePlatformAdapter):
         entry = self._cache.get(request_id)
         if not self._client or not reply_token or not entry:
             return
+        if entry.chat_id != chat_id:
+            logger.warning("LINE: rejected cross-chat postback request")
+            return
 
         if entry.state is State.READY:
+            if request_id in self._postback_delivering:
+                return
+            self._postback_delivering.add(request_id)
             payload = entry.payload or ""
             chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
             messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
             try:
-                await self._client.reply(reply_token, messages)
-                self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
-            except Exception as exc:
-                logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, messages)
+                    sent = await self._reply_current(chat_id, reply_token, messages)
+                    if not sent:
+                        return
                     self._cache.mark_delivered(request_id)
                     self._pending_buttons.pop(chat_id, None)
-                except Exception as exc2:
-                    logger.error("LINE: postback push fallback failed: %s", exc2)
+                    self._quota_guarded_postbacks.discard(request_id)
+                except _LineDefiniteReplyError as exc:
+                    if request_id in self._quota_guarded_postbacks:
+                        logger.warning(
+                            "LINE: quota-guarded postback reply rejected (%s); Push blocked",
+                            type(exc).__name__,
+                        )
+                        return
+                    logger.warning(
+                        "LINE: postback reply explicitly rejected (%s); falling back to push",
+                        type(exc).__name__,
+                    )
+                    try:
+                        sent = await self._push_current(chat_id, messages)
+                        if not sent:
+                            return
+                        self._cache.mark_delivered(request_id)
+                        self._pending_buttons.pop(chat_id, None)
+                    except Exception as exc2:
+                        logger.error(
+                            "LINE: postback Push fallback failed (%s)",
+                            type(exc2).__name__,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "LINE: postback reply delivery uncertain (%s); Push suppressed",
+                        type(exc).__name__,
+                    )
+            finally:
+                self._postback_delivering.discard(request_id)
         elif entry.state is State.ERROR:
             text = str(entry.payload or self.interrupted_text)
             try:
-                await self._client.reply(reply_token, [_text_message(text)])
+                sent = await self._reply_current(
+                    chat_id, reply_token, [_text_message(text)]
+                )
+                if not sent:
+                    return
                 self._cache.mark_delivered(request_id)
                 self._pending_buttons.pop(chat_id, None)
             except Exception as exc:
-                logger.warning("LINE: postback ERROR reply failed: %s", exc)
+                logger.warning(
+                    "LINE: postback ERROR reply failed (%s)", type(exc).__name__
+                )
         elif entry.state is State.DELIVERED:
             try:
-                await self._client.reply(reply_token, [_text_message(self.delivered_text)])
+                await self._reply_current(
+                    chat_id, reply_token, [_text_message(self.delivered_text)]
+                )
             except Exception:
                 pass
         elif entry.state is State.PENDING:
             # Still working — re-issue the wait notice.
             try:
-                await self._client.reply(reply_token, [_text_message(self.pending_text)])
+                await self._reply_current(
+                    chat_id, reply_token, [_text_message(self.pending_text)]
+                )
             except Exception:
                 pass
 
@@ -1078,6 +1690,47 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound send (text)
     # ------------------------------------------------------------------
 
+    def _final_delivery_adapter(
+        self, source: Any
+    ) -> BasePlatformAdapter:
+        """Keep LINE finals on the adapter that owns their run and quota state.
+
+        The base implementation hands an unsent final to a replacement adapter
+        after reconnect. LINE cannot safely do that: Reply-token ownership,
+        delivery generation, and paid-Push reservations are adapter-local. A
+        disconnected owner therefore suppresses its stale final instead of
+        letting a replacement treat it as an unbound proactive Push.
+        """
+        return self
+
+    async def _reply_current(
+        self, chat_id: str, reply_token: str, messages: List[Dict[str, Any]]
+    ) -> bool:
+        """Send Reply only while the caller's immutable epoch is current."""
+        guard = self._current_delivery_guard(chat_id)
+        if (
+            not self._client
+            or self._delivery_completed(chat_id)
+            or (guard is not None and guard.blocked)
+        ):
+            return False
+        await self._client.reply(reply_token, messages)
+        return True
+
+    async def _push_current(
+        self, chat_id: str, messages: List[Dict[str, Any]]
+    ) -> bool:
+        """Send Push only while the caller's immutable epoch is current."""
+        guard = self._current_delivery_guard(chat_id)
+        if (
+            not self._client
+            or self._delivery_completed(chat_id)
+            or (guard is not None and guard.blocked)
+        ):
+            return False
+        await self._client.push(chat_id, messages)
+        return True
+
     async def send(
         self,
         chat_id: str,
@@ -1088,18 +1741,91 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
+        if self._delivery_completed(chat_id):
+            logger.info(
+                "LINE delivery suppressed: reason=run_completed kind=text"
+            )
+            return SendResult(success=True, message_id=None)
+        if (
+            self._has_foreign_delivery_context()
+            and chat_id in self._auto_push_reservations
+        ):
+            logger.info(
+                "LINE delivery suppressed: reason=foreign_context_active_reservation "
+                "kind=text"
+            )
+            return SendResult(
+                success=False,
+                error="LINE foreign delivery context conflicts with active reservation",
+            )
+
+        trusted_non_conversational = _is_trusted_non_conversational_metadata(
+            metadata
+        )
+        is_heartbeat = (
+            trusted_non_conversational
+            and content.startswith("⏳ Working —")
+        )
+        is_system_bypass = _is_system_bypass(content) or is_heartbeat
+        guard = self._current_delivery_guard(chat_id)
+        if guard is not None and guard.blocked:
+            kind = "heartbeat" if is_heartbeat else "text"
+            logger.info(
+                "LINE delivery suppressed: reason=task_guard_blocked kind=%s",
+                kind,
+            )
+            if is_system_bypass:
+                return SendResult(success=True, message_id=None)
+            return SendResult(
+                success=False,
+                error="LINE slow-response Push blocked by task delivery policy",
+            )
+        if not is_system_bypass and chat_id in self._blocked_slow_pushes:
+            self._blocked_slow_pushes.discard(chat_id)
+            return SendResult(
+                success=False,
+                error="LINE slow-response fallback unavailable; Push blocked by quota policy",
+            )
+
+        # Once a slow final owns the single Push reservation, suppress noisy
+        # system acks rather than letting them spend an untracked Push first.
+        if is_system_bypass and self._has_auto_push_reservation(chat_id):
+            kind = "heartbeat" if is_heartbeat else "system"
+            logger.info(
+                "LINE delivery suppressed: reason=reserved_for_final kind=%s",
+                kind,
+            )
+            return SendResult(success=True, message_id=None)
+
         # System busy-acks (interrupting / queued / steered) bypass the
         # postback cache and route directly to LINE so they reach the user
         # as visible bubbles. Source: PR #18153.
-        if _is_system_bypass(content):
-            return await self._send_text_chunks(chat_id, content, force_push=False)
+        if is_system_bypass:
+            return await self._send_text_chunks(
+                chat_id,
+                content,
+                force_push=False,
+                settle_auto_reservation=False,
+                allow_push_fallback=self.slow_response_mode != "auto_push",
+            )
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
-            self._cache.set_ready(pending_rid, content)
-            return SendResult(success=True, message_id=pending_rid)
+            quota_guarded = pending_rid in self._quota_guarded_postbacks
+            if self._cache.set_ready(pending_rid, content):
+                return SendResult(success=True, message_id=pending_rid)
+            guard = self._current_delivery_guard(chat_id)
+            if (
+                quota_guarded
+                or (guard is not None and guard.blocked)
+                or chat_id in self._blocked_slow_pushes
+            ):
+                return SendResult(
+                    success=False,
+                    error="LINE postback expired; Push blocked by quota policy",
+                )
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
 
@@ -1109,37 +1835,110 @@ class LineAdapter(BasePlatformAdapter):
         content: str,
         *,
         force_push: bool,
+        settle_auto_reservation: bool = True,
+        allow_push_fallback: bool = True,
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
+        has_reservation = (
+            settle_auto_reservation and self._has_auto_push_reservation(chat_id)
+        )
         chunks = split_for_line(strip_markdown_preserving_urls(content))
         if not chunks:
+            if has_reservation:
+                self._settle_auto_push(chat_id, pushed=False)
             return SendResult(success=True, message_id=None)
         messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
 
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, messages)
+                sent = await self._reply_current(chat_id, token, messages)
+                if not sent:
+                    if has_reservation:
+                        self._settle_auto_push(chat_id, pushed=False)
+                    return SendResult(success=True, message_id=None)
+                if has_reservation:
+                    self._settle_auto_push(chat_id, pushed=False)
+                elif settle_auto_reservation:
+                    self._mark_delivery_completed(chat_id)
                 return SendResult(success=True, message_id=token)
+            except _LineDefiniteReplyError as exc:
+                logger.info(
+                    "LINE: reply explicitly rejected (%s); falling back to push",
+                    type(exc).__name__,
+                )
+                # Definite HTTP rejection: LINE did not accept the Reply.
             except Exception as exc:
-                logger.info("LINE: reply token rejected (%s); falling back to push", exc)
-                # fall through to push
+                if has_reservation:
+                    self._settle_auto_push(chat_id, pushed=False)
+                elif settle_auto_reservation:
+                    self._mark_delivery_completed(chat_id)
+                logger.warning(
+                    "LINE: reply delivery uncertain (%s); Push suppressed",
+                    type(exc).__name__,
+                )
+                return SendResult(
+                    success=False,
+                    error="LINE reply delivery uncertain; Push suppressed",
+                )
+
+        if not allow_push_fallback:
+            return SendResult(success=True, message_id=None)
 
         try:
-            await self._client.push(chat_id, messages)
+            sent = await self._push_current(chat_id, messages)
+            if not sent:
+                if has_reservation:
+                    self._settle_auto_push(chat_id, pushed=False)
+                return SendResult(success=True, message_id=None)
+            if has_reservation:
+                self._settle_auto_push(chat_id, pushed=True)
+            elif settle_auto_reservation:
+                self._mark_delivery_completed(chat_id)
             return SendResult(success=True, message_id=None)
-        except Exception as exc:
-            logger.error("LINE: push send failed: %s", exc)
+        except _LineDefinitePushError as exc:
+            if has_reservation:
+                self._settle_auto_push(chat_id, pushed=False)
+            logger.error("LINE: Push explicitly rejected (%s)", type(exc).__name__)
             return SendResult(success=False, error=str(exc))
+        except Exception as exc:
+            # Transport timeout/reset is ambiguous: LINE may have accepted the
+            # Push. Keep the local usage estimate conservative and never retry.
+            if has_reservation:
+                self._settle_auto_push(chat_id, pushed=True)
+            elif settle_auto_reservation:
+                self._mark_delivery_completed(chat_id)
+            logger.error(
+                "LINE: Push delivery uncertain (%s); no retry",
+                type(exc).__name__,
+            )
+            return SendResult(
+                success=False,
+                error="LINE Push delivery uncertain; not retried",
+            )
+
+    def _settle_auto_push(self, chat_id: str, *, pushed: bool) -> None:
+        if chat_id not in self._auto_push_reservations:
+            return
+        run_id = self._auto_push_reservation_runs.pop(chat_id, "")
+        self._auto_push_reservations.discard(chat_id)
+        self._quota_budget.finish(pushed=pushed)
+        self._mark_delivery_completed(
+            chat_id, run_id=run_id, fallback_chat=not bool(run_id)
+        )
 
     def _consume_reply_token(self, chat_id: str) -> Tuple[str, bool]:
-        """Consume a stashed reply token if present and unexpired.
-
-        Returns ``(token, used_reply)``.
-        """
+        """Consume a matching, unexpired single-use Reply token."""
+        if self._has_foreign_delivery_context():
+            return "", False
+        token_run = self._reply_token_runs.get(chat_id, "")
+        active_run = self._delivery_run_id(chat_id)
+        if token_run and active_run and token_run != active_run:
+            return "", False
         entry = self._reply_tokens.pop(chat_id, None)
+        self._reply_token_runs.pop(chat_id, None)
         if not entry:
             return "", False
         token, expires_at = entry
@@ -1169,8 +1968,132 @@ class LineAdapter(BasePlatformAdapter):
         return strip_markdown_preserving_urls(content)
 
     # ------------------------------------------------------------------
-    # Slow-LLM postback button — driven by _keep_typing
+    # Slow-LLM postback / budgeted auto-Push — driven by _keep_typing
     # ------------------------------------------------------------------
+
+    async def _reserve_slow_auto_push(self, chat_id: str) -> bool:
+        """Reserve one slow-response Push for a 1:1 DM when budget permits."""
+        if (
+            self.slow_response_mode != "auto_push"
+            or not chat_id.startswith("U")
+            or not self._client
+            or chat_id in self._auto_push_reservations
+            or chat_id in self._auto_push_inflight
+            or chat_id in self._pending_buttons
+            or len(self._auto_push_reservations | self._auto_push_inflight)
+            >= MAX_DELIVERY_STATE_ENTRIES
+        ):
+            return False
+
+        reservation_epoch = self._delivery_epoch
+        self._auto_push_inflight.add(chat_id)
+        try:
+            decision = await self._quota_budget.reserve(self._client)
+        finally:
+            self._auto_push_inflight.discard(chat_id)
+        if self._disconnecting or reservation_epoch != self._delivery_epoch:
+            if decision.allowed:
+                self._quota_budget.finish(pushed=False)
+            return False
+        logger.info(
+            "LINE slow-response decision: mode=auto_push allowed=%s reason=%s "
+            "usage=%s soft_limit=%s",
+            str(decision.allowed).lower(),
+            decision.reason,
+            decision.effective_usage if decision.effective_usage is not None else "-",
+            decision.soft_limit if decision.soft_limit is not None else "-",
+        )
+        if not decision.allowed:
+            return False
+        self._auto_push_reservations.add(chat_id)
+        run_id = self._delivery_run_id(chat_id)
+        if run_id:
+            self._auto_push_reservation_runs[chat_id] = run_id
+        return True
+
+    async def _handle_slow_threshold(self, chat_id: str) -> None:
+        """Choose auto-Push reservation or the free postback fallback."""
+        if self._delivery_completed(chat_id):
+            return
+        # Only act while the original reply token remains usable. A fast final
+        # response consumes it before this threshold handler runs.
+        if not self._client or chat_id not in self._reply_tokens:
+            return
+        token_run = self._reply_token_runs.get(chat_id, "")
+        active_run = self._delivery_run_id(chat_id)
+        if token_run and active_run and token_run != active_run:
+            return
+        if (
+            chat_id in self._pending_buttons
+            or chat_id in self._auto_push_reservations
+            or chat_id in self._auto_push_inflight
+        ):
+            return
+        expected_token_entry = self._reply_tokens.get(chat_id)
+        reserved = await self._reserve_slow_auto_push(chat_id)
+        # The final answer (or a newer inbound event) may consume/replace the
+        # chat's token while quota lookup is in flight. Never create stale
+        # state or consume a newer event's token in that case.
+        if self._reply_tokens.get(chat_id) != expected_token_entry:
+            if reserved:
+                self._settle_auto_push(chat_id, pushed=False)
+            return
+        if reserved:
+            # Keep the reply token for the narrow threshold→TTL window. If it
+            # expires, final delivery settles exactly one Push reservation.
+            return
+
+        rid = self._cache.register_pending(
+            chat_id,
+            delivery_guard=self._current_delivery_guard(chat_id),
+        )
+        if rid is None:
+            logger.warning("LINE: postback cache at capacity; request denied")
+            token, used = self._consume_reply_token(chat_id)
+            if used:
+                try:
+                    await self._reply_current(
+                        chat_id, token, [_text_message(self.pending_text)]
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "LINE: cache-capacity notice delivery failed (%s)",
+                        type(exc).__name__,
+                    )
+            if self.slow_response_mode == "auto_push":
+                self._block_slow_push(chat_id)
+            return
+        self._pending_buttons[chat_id] = rid
+        if self.slow_response_mode == "auto_push":
+            self._quota_guarded_postbacks.add(rid)
+        token, used = self._consume_reply_token(chat_id)
+        if not used:
+            self._pending_buttons.pop(chat_id, None)
+            self._quota_guarded_postbacks.discard(rid)
+            self._cache.discard(rid)
+            if self.slow_response_mode == "auto_push":
+                self._block_slow_push(chat_id)
+            return
+        msg = build_postback_button_message(
+            self.pending_text, self.button_label, rid
+        )
+        try:
+            sent = await self._reply_current(chat_id, token, [msg])
+            if not sent:
+                self._pending_buttons.pop(chat_id, None)
+                self._quota_guarded_postbacks.discard(rid)
+                self._cache.discard(rid)
+                return
+            logger.info("LINE: sent slow-LLM postback button")
+        except Exception as exc:
+            logger.warning(
+                "LINE: postback button send failed: %s", type(exc).__name__
+            )
+            self._pending_buttons.pop(chat_id, None)
+            self._quota_guarded_postbacks.discard(rid)
+            self._cache.discard(rid)
+            if self.slow_response_mode == "auto_push":
+                self._block_slow_push(chat_id)
 
     async def _keep_typing(self, chat_id: str, *args, **kwargs) -> None:
         """Override the base loop to fire the postback button at threshold.
@@ -1192,27 +2115,7 @@ class LineAdapter(BasePlatformAdapter):
                 await asyncio.sleep(self.slow_response_threshold)
             except asyncio.CancelledError:
                 raise
-            # Only fire if we still have a usable reply token. If the agent
-            # already responded, _consume_reply_token has cleared it.
-            if chat_id not in self._reply_tokens:
-                return
-            if chat_id in self._pending_buttons:
-                return
-            rid = self._cache.register_pending(chat_id)
-            self._pending_buttons[chat_id] = rid
-            token, used = self._consume_reply_token(chat_id)
-            if not used:
-                self._pending_buttons.pop(chat_id, None)
-                return
-            msg = build_postback_button_message(
-                self.pending_text, self.button_label, rid
-            )
-            try:
-                await self._client.reply(token, [msg])
-                logger.info("LINE: sent slow-LLM postback button for chat %s (rid=%s)", chat_id, rid)
-            except Exception as exc:
-                logger.warning("LINE: postback button send failed: %s", exc)
-                self._pending_buttons.pop(chat_id, None)
+            await self._handle_slow_threshold(chat_id)
 
         post_task = asyncio.create_task(_fire_postback())
         try:
@@ -1226,30 +2129,84 @@ class LineAdapter(BasePlatformAdapter):
                     pass
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str) -> None:
-        """Resolve any orphan PENDING postback so the button doesn't loop."""
+        """Resolve orphan PENDING state so neither delivery path leaks."""
         await super().interrupt_session_activity(session_key, chat_id)
+        self._settle_auto_push(chat_id, pushed=False)
+        self._blocked_slow_pushes.discard(chat_id)
         rid = self._pending_buttons.pop(chat_id, None)
         if rid:
+            self._quota_guarded_postbacks.discard(rid)
             self._cache.set_error(rid, self.interrupted_text)
 
     # ------------------------------------------------------------------
     # Outbound media (image / voice / video)
     # ------------------------------------------------------------------
 
+    def _native_media_policy_failure(self, chat_id: str) -> Optional[SendResult]:
+        """Fail closed before media registration when no paid Push is authorized."""
+        if (
+            self._has_foreign_delivery_context()
+            and chat_id in self._auto_push_reservations
+        ):
+            logger.info(
+                "LINE delivery suppressed: reason=foreign_context_active_reservation "
+                "kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE foreign media context conflicts with active reservation",
+            )
+        guard = self._current_delivery_guard(chat_id)
+        if guard is not None and guard.blocked:
+            logger.info(
+                "LINE delivery suppressed: reason=task_guard_blocked kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE native media Push blocked by task delivery policy",
+            )
+        if chat_id in self._pending_buttons:
+            logger.info(
+                "LINE delivery suppressed: reason=postback_pending kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE native media unavailable while postback delivery is pending",
+            )
+        if chat_id in self._blocked_slow_pushes:
+            logger.info(
+                "LINE delivery suppressed: reason=quota_blocked kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE native media Push blocked by quota policy",
+            )
+        return None
+
+    def _drop_media_token(self, token: str) -> None:
+        entry = self._media_tokens.pop(token, None)
+        if not entry:
+            return
+        path, _ = entry
+        if path not in self._media_temp_paths:
+            return
+        if any(other_path == path for other_path, _ in self._media_tokens.values()):
+            return
+        self._media_temp_paths.discard(path)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     def _register_media(self, file_path: str, *, cleanup: bool = False) -> str:
         """Register a local file for HTTPS serving; return the URL token."""
-        # Evict expired tokens first.
         now = time.time()
-        for token in list(self._media_tokens.keys()):
-            path, exp = self._media_tokens[token]
-            if now > exp:
-                self._media_tokens.pop(token, None)
-                if path in self._media_temp_paths:
-                    self._media_temp_paths.discard(path)
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+        for token, (_, expires_at) in list(self._media_tokens.items()):
+            if now > expires_at:
+                self._drop_media_token(token)
+        max_tokens = max(1, MAX_DELIVERY_STATE_ENTRIES)
+        while len(self._media_tokens) >= max_tokens:
+            self._drop_media_token(next(iter(self._media_tokens)))
 
         resolved = str(Path(file_path).resolve())
         token = secrets.token_urlsafe(32)
@@ -1290,7 +2247,7 @@ class LineAdapter(BasePlatformAdapter):
 
         file_path, expires_at = entry
         if time.time() > expires_at:
-            self._media_tokens.pop(token, None)
+            self._drop_media_token(token)
             return web.Response(status=410, text="gone")
 
         path = Path(file_path)
@@ -1326,6 +2283,11 @@ class LineAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if self._delivery_completed(chat_id):
+            return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         path = Path(image_path)
         if not path.exists() or not path.is_file():
             return SendResult(success=False, error=f"image file not found: {image_path}")
@@ -1356,6 +2318,11 @@ class LineAdapter(BasePlatformAdapter):
         duration_ms: int = 1000,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if self._delivery_completed(chat_id):
+            return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         path = Path(audio_path)
         if not path.exists() or not path.is_file():
             return SendResult(success=False, error=f"audio file not found: {audio_path}")
@@ -1380,6 +2347,11 @@ class LineAdapter(BasePlatformAdapter):
         preview_path: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if self._delivery_completed(chat_id):
+            return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         path = Path(video_path)
         if not path.exists() or not path.is_file():
             return SendResult(success=False, error=f"video file not found: {video_path}")
@@ -1423,41 +2395,119 @@ class LineAdapter(BasePlatformAdapter):
         chat_id: str,
         messages: List[Dict[str, Any]],
     ) -> SendResult:
-        """Send already-built message objects, batched at 5/call."""
+        """Send native message objects while honoring one slow Push reservation."""
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+        if self._delivery_completed(chat_id):
+            return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         if not messages:
             return SendResult(success=True, message_id=None)
 
+        has_reservation = self._has_auto_push_reservation(chat_id)
         first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
-        rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
+        # A budgeted slow final is at-most-one Push request. Native media paths
+        # currently build at most two objects (media + caption), so truncating
+        # any unexpected overflow is safer than spending a second recipient.
+        rest = [] if has_reservation else messages[LINE_MAX_MESSAGES_PER_CALL:]
 
-        # First batch: try reply token, fall back to push.
         token, used_reply = self._consume_reply_token(chat_id)
+        delivered_by_push = False
         if used_reply:
             try:
-                await self._client.reply(token, first_batch)
-            except Exception as exc:
-                logger.info("LINE: reply token rejected (%s); falling back to push", exc)
+                sent = await self._reply_current(chat_id, token, first_batch)
+                if not sent:
+                    if has_reservation:
+                        self._settle_auto_push(chat_id, pushed=False)
+                    return SendResult(success=True, message_id=None)
+                if has_reservation:
+                    self._settle_auto_push(chat_id, pushed=False)
+            except _LineDefiniteReplyError as exc:
+                logger.info(
+                    "LINE: native reply explicitly rejected (%s); falling back to Push",
+                    type(exc).__name__,
+                )
                 try:
-                    await self._client.push(chat_id, first_batch)
-                except Exception as exc2:
+                    sent = await self._push_current(chat_id, first_batch)
+                    if not sent:
+                        if has_reservation:
+                            self._settle_auto_push(chat_id, pushed=False)
+                        return SendResult(success=True, message_id=None)
+                    delivered_by_push = True
+                except _LineDefinitePushError as exc2:
+                    if has_reservation:
+                        self._settle_auto_push(chat_id, pushed=False)
                     return SendResult(success=False, error=str(exc2))
+                except Exception as exc2:
+                    if has_reservation:
+                        self._settle_auto_push(chat_id, pushed=True)
+                    else:
+                        self._mark_delivery_completed(chat_id)
+                    return SendResult(
+                        success=False,
+                        error="LINE native Push delivery uncertain; not retried",
+                    )
+            except Exception as exc:
+                if has_reservation:
+                    self._settle_auto_push(chat_id, pushed=False)
+                else:
+                    self._mark_delivery_completed(chat_id)
+                logger.warning(
+                    "LINE: native reply delivery uncertain (%s); Push suppressed",
+                    type(exc).__name__,
+                )
+                return SendResult(
+                    success=False,
+                    error="LINE native reply delivery uncertain; Push suppressed",
+                )
         else:
             try:
-                await self._client.push(chat_id, first_batch)
-            except Exception as exc:
+                sent = await self._push_current(chat_id, first_batch)
+                if not sent:
+                    if has_reservation:
+                        self._settle_auto_push(chat_id, pushed=False)
+                    return SendResult(success=True, message_id=None)
+                delivered_by_push = True
+            except _LineDefinitePushError as exc:
+                if has_reservation:
+                    self._settle_auto_push(chat_id, pushed=False)
                 return SendResult(success=False, error=str(exc))
+            except Exception as exc:
+                if has_reservation:
+                    self._settle_auto_push(chat_id, pushed=True)
+                else:
+                    self._mark_delivery_completed(chat_id)
+                logger.error(
+                    "LINE: native Push delivery uncertain (%s); no retry",
+                    type(exc).__name__,
+                )
+                return SendResult(
+                    success=False,
+                    error="LINE native Push delivery uncertain; not retried",
+                )
 
-        # Subsequent batches: always push (reply token is single-use).
+        if has_reservation:
+            if delivered_by_push:
+                self._settle_auto_push(chat_id, pushed=True)
+        elif used_reply or delivered_by_push:
+            self._mark_delivery_completed(chat_id)
+
+        # Non-budgeted proactive deliveries preserve the existing batching
+        # behavior. Slow budgeted deliveries intentionally never enter here.
         while rest:
             batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
             rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
             try:
-                await self._client.push(chat_id, batch)
+                sent = await self._push_current(chat_id, batch)
+                if not sent:
+                    return SendResult(success=True, message_id=None)
             except Exception as exc:
-                logger.warning("LINE: push for follow-up batch failed: %s", exc)
-                return SendResult(success=False, error=str(exc))
+                logger.warning(
+                    "LINE: follow-up Push failed (%s)", type(exc).__name__
+                )
+                return SendResult(success=False, error="LINE follow-up Push failed")
 
         return SendResult(success=True, message_id=None)
 
