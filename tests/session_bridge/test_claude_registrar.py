@@ -1661,6 +1661,49 @@ def test_winpty_readiness_crosses_restricted_workspace_trust_gate_once() -> None
     assert process.reads == 5
 
 
+def test_winpty_readiness_crosses_cursor_positioned_workspace_trust_gate() -> None:
+    trust = (
+        "\x1b[2JAccessing\x1b[1Cworkspace:\x1b[2C"
+        "Quick\x1b[1Csafety\x1b[1Ccheck\x1b[3C"
+        "Security\x1b[1Cguide\x1b[2C"
+        "Yes,\x1b[1CI\x1b[1Ctrust\x1b[1Cthis\x1b[1Cfolder\x1b[2C"
+        "No,\x1b[1Cexit"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                [
+                    "\x1b[?2004h",
+                    trust,
+                    "\x1b[?2004h",
+                    "\x1b[2m\u23f5\u23f5\x1b[0m",
+                ]
+            )
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(
+        1.0, accept_workspace_trust=True
+    )
+
+    assert "\u23f5\u23f5" in output
+    assert process.writes == ["\r"]
+    assert process.reads == 5
+
+
 @pytest.mark.parametrize(
     "redraw_chunks, expected_reads",
     [

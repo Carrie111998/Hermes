@@ -1699,32 +1699,35 @@ def _readiness_timeout_reason(
 def _workspace_trust_prompt_end(output: str) -> int | None:
     """Return the raw offset after the latest complete native trust frame."""
 
-    text, _, raw_ends = _terminal_text_with_raw_offsets(output)
-    signatures = (
-        (
-            "Accessing workspace:",
-            "Yes, I trust this folder",
-            "No, exit",
-            "Security guide",
-        ),
-        (
-            "Accessing workspace:",
-            "Yes, I trust this folder",
-            "No, continue without these permissions",
-            "Security guide",
-        ),
-        (
-            "Accessing workspace:",
-            "Security guide",
-            "Yes, I trust this folder",
-            "No, exit",
-        ),
-        (
-            "Accessing workspace:",
-            "Security guide",
-            "Yes, I trust this folder",
-            "No, continue without these permissions",
-        ),
+    text, _, raw_ends = _compact_terminal_text_with_raw_offsets(output)
+    signatures = tuple(
+        tuple(_compact_terminal_text(value) for value in signature)
+        for signature in (
+            (
+                "Accessing workspace:",
+                "Yes, I trust this folder",
+                "No, exit",
+                "Security guide",
+            ),
+            (
+                "Accessing workspace:",
+                "Yes, I trust this folder",
+                "No, continue without these permissions",
+                "Security guide",
+            ),
+            (
+                "Accessing workspace:",
+                "Security guide",
+                "Yes, I trust this folder",
+                "No, exit",
+            ),
+            (
+                "Accessing workspace:",
+                "Security guide",
+                "Yes, I trust this folder",
+                "No, continue without these permissions",
+            ),
+        )
     )
     latest_end: int | None = None
     for signature in signatures:
@@ -1748,8 +1751,8 @@ def _workspace_trust_prompt_end(output: str) -> int | None:
 def _workspace_trust_prompt_prefix_start(output: str) -> int | None:
     """Return the raw start of the latest exact native trust-frame prefix."""
 
-    text, raw_starts, _ = _terminal_text_with_raw_offsets(output)
-    prefix_start = text.rfind("Accessing workspace:")
+    text, raw_starts, _ = _compact_terminal_text_with_raw_offsets(output)
+    prefix_start = text.rfind(_compact_terminal_text("Accessing workspace:"))
     return None if prefix_start < 0 else raw_starts[prefix_start]
 
 
@@ -1775,6 +1778,26 @@ def _terminal_text_with_raw_offsets(
             raw_ends.append(cursor + 1)
         cursor += 1
     return "".join(cleaned), raw_starts, raw_ends
+
+
+def _compact_terminal_text(value: str) -> str:
+    return "".join(character for character in value if not character.isspace())
+
+
+def _compact_terminal_text_with_raw_offsets(
+    output: str,
+) -> tuple[str, list[int], list[int]]:
+    """Remove terminal framing and layout whitespace while preserving raw offsets."""
+
+    text, raw_starts, raw_ends = _terminal_text_with_raw_offsets(output)
+    keep = [
+        index for index, character in enumerate(text) if not character.isspace()
+    ]
+    return (
+        "".join(text[index] for index in keep),
+        [raw_starts[index] for index in keep],
+        [raw_ends[index] for index in keep],
+    )
 
 
 def _claude_main_repl_ready(output: str) -> bool:
