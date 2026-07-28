@@ -787,6 +787,12 @@ def _memory_provider_options() -> List[str]:
 
 
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "memory.memory_char_limit": {
+        "type": "number",
+        "description": "MEMORY.md character limit (1-8000)",
+        "minimum": 1,
+        "maximum": 8000,
+    },
     "memory.provider": {
         "type": "select",
         "description": "Memory provider plugin",
@@ -1196,6 +1202,7 @@ class EnvVarReveal(BaseModel):
 
 class MemoryProviderConfigUpdate(BaseModel):
     values: Dict[str, Any] = {}
+    activate: bool = True
 
 
 class MemoryProviderSetupRequest(BaseModel):
@@ -6137,6 +6144,65 @@ async def get_memory_provider_config(name: str, surface: Optional[str] = None, p
 
     return await asyncio.to_thread(_run)
 
+
+@app.get("/api/memory/providers/{name}/status")
+async def get_memory_provider_runtime_status(name: str, profile: Optional[str] = None):
+    _require_valid_memory_provider_name(name)
+
+    def _run():
+        with _profile_scope(profile):
+            provider = _load_memory_provider(name)
+            if provider is None:
+                if not _memory_provider_manifest(name):
+                    raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
+                snapshot = None
+            else:
+                try:
+                    snapshot = provider.get_runtime_status()
+                except Exception as exc:
+                    _log.warning("Memory provider status probe failed for %s: %s", name, exc)
+                    snapshot = {
+                        "configured": provider.is_available(),
+                        "reachable": False,
+                        "healthy": False,
+                        "error": str(exc),
+                    }
+
+            config = load_config()
+            memory_config = config.get("memory")
+            active = ""
+            if isinstance(memory_config, dict):
+                active = _normalize_memory_provider_name(memory_config.get("provider"))
+            common = {
+                "provider": name,
+                "active": active == name,
+                "configured": False,
+                "reachable": False,
+                "healthy": False,
+                "endpoint": "",
+                "console_url": "",
+                "version": "",
+                "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "error": "Runtime monitoring is not supported by this provider.",
+                "details": None,
+            }
+            if isinstance(snapshot, dict):
+                for key in (
+                    "configured",
+                    "reachable",
+                    "healthy",
+                    "endpoint",
+                    "console_url",
+                    "version",
+                    "error",
+                    "details",
+                ):
+                    if key in snapshot:
+                        common[key] = snapshot[key]
+            return common
+
+    return await asyncio.to_thread(_run)
+
 @app.post("/api/memory/providers/{name}/setup")
 async def setup_memory_provider(name: str, body: MemoryProviderSetupRequest):
     _require_valid_memory_provider_name(name)
@@ -6178,15 +6244,17 @@ async def update_memory_provider_config(
             if provider is None:
                 raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
             _write_memory_provider_config_values(name, provider, values)
-            _require_memory_provider_ready(name)
             config = load_config()
             memory_config = config.get("memory")
             if not isinstance(memory_config, dict):
                 memory_config = {}
                 config["memory"] = memory_config
-            memory_config["provider"] = name
-            save_config(config)
-            return {"ok": True, "active": name}
+            if body.activate:
+                _require_memory_provider_ready(name)
+                memory_config["provider"] = name
+                save_config(config)
+            active = _normalize_memory_provider_name(memory_config.get("provider"))
+            return {"ok": True, "active": active}
 
     try:
         return await asyncio.to_thread(_run)
@@ -6984,6 +7052,18 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # frontend can only overwrite what it explicitly sends.
             existing = read_raw_config()
             incoming = _denormalize_config_from_web(body.config)
+            incoming_memory = incoming.get("memory")
+            if isinstance(incoming_memory, dict) and "memory_char_limit" in incoming_memory:
+                memory_char_limit = incoming_memory["memory_char_limit"]
+                if (
+                    isinstance(memory_char_limit, bool)
+                    or not isinstance(memory_char_limit, int)
+                    or not 1 <= memory_char_limit <= 8000
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="memory.memory_char_limit must be an integer between 1 and 8000",
+                    )
             # The frontend sends the complete ``providers`` mapping; if a
             # provider was deleted, it is absent from ``incoming`` but would
             # survive ``_deep_merge`` (which only iterates *override* keys).
