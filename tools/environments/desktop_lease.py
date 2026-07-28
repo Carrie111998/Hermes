@@ -84,12 +84,14 @@ _manager_lock = threading.Lock()
 
 
 def get_desktop_sandbox_manager(provider: Any | None = None) -> DesktopSandboxManager:
-    """Return the process-wide manager, constructing the Modal PoC by default."""
+    """Return the process-wide manager for the configured compute provider."""
     global _manager
     with _manager_lock:
         if _manager is None:
             if provider is None:
-                from tools.environments.modal_desktop import ModalDesktopProvider
-                provider = ModalDesktopProvider()
+                from hermes_cli.config import load_config_readonly
+                from tools.environments.cua_fleet import _provider_from_config
+
+                provider = _provider_from_config(load_config_readonly().get("compute", {}))
             _manager = DesktopSandboxManager(provider)
         return _manager

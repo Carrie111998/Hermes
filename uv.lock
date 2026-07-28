@@ -833,6 +833,22 @@ wheels = [
 ]
 
 [[package]]
+name = "cua-fleet"
+version = "0.0.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "httpx" },
+    { name = "python-dateutil" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/b9/c422ab18a5fcb5867aca475b80897ff9068d6155ade8578b12a06c943414/cua_fleet-0.0.5-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:e510abe08ab08bbf753ee430967673364ffba3627164f3367c3210a089dce3b8", size = 781058, upload-time = "2026-07-27T20:25:29.7Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/6f/34e9bb32b75b5403b53bc64c0ba136bd5c84a8784392ea47640632bf1ce7/cua_fleet-0.0.5-py3-none-macosx_11_0_arm64.whl", hash = "sha256:57a0a81fa2be56325c93256e2bc3e1bfc3af77a672ab0ccf361fe1448ebc42f5", size = 757511, upload-time = "2026-07-27T20:25:31.151Z" },
+    { url = "https://files.pythonhosted.org/packages/43/7f/f816a5af70991bbfa7013b16d1ff7e991075092f5c06245a3c61a9e2937b/cua_fleet-0.0.5-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:976ace24c31c11e5fadb3e848e8871f0aa5e9bf9c7c615bb33270f16a3a7f3e1", size = 829236, upload-time = "2026-07-27T20:25:32.282Z" },
+    { url = "https://files.pythonhosted.org/packages/93/56/38f72bb99213efc816ebf74000c5730362ddc80e07b4d2c53b0bf1af5230/cua_fleet-0.0.5-py3-none-manylinux_2_34_x86_64.whl", hash = "sha256:4432fcc373dd2a4436c1bd624ca6fb39f63916a0a35ac585b2a5deb625d2d11f", size = 910232, upload-time = "2026-07-27T20:25:33.741Z" },
+]
+
+[[package]]
 name = "darabonba-core"
 version = "1.0.8"
 source = { registry = "https://pypi.org/simple" }
@@ -1633,6 +1649,9 @@ computer-use = [
     { name = "mcp" },
     { name = "starlette" },
 ]
+cua-fleet = [
+    { name = "cua-fleet" },
+]
 daytona = [
     { name = "daytona" },
 ]
@@ -1820,6 +1839,7 @@ requires-dist = [
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==48.0.1" },
+    { name = "cua-fleet", marker = "extra == 'cua-fleet'", specifier = "==0.0.5" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = "==0.155.0" },
     { name = "debugpy", marker = "extra == 'dev'", specifier = "==1.8.20" },
     { name = "defusedxml", marker = "extra == 'wecom'", specifier = "==0.7.1" },
@@ -1936,7 +1956,7 @@ requires-dist = [
     { name = "websockets", specifier = "==15.0.1" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
 ]
-provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "vercel", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "wake", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "cua-fleet", "daytona", "vercel", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "wake", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
 
 [[package]]
 name = "hf-xet"
@@ -3997,7 +4017,7 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 dependencies = [
-    { name = "numpy", marker = "python_full_version < '3.12'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7a/97/5a3609c4f8d58b039179648e62dd220f89864f56f7357f5d4f45c29eb2cc/scipy-1.17.1.tar.gz", hash = "sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0", size = 30573822, upload-time = "2026-02-23T00:26:24.851Z" }
 wheels = [
@@ -4052,7 +4072,7 @@ resolution-markers = [
     "python_full_version == '3.12.*'",
 ]
 dependencies = [
-    { name = "numpy", marker = "python_full_version >= '3.12'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a7/25/c2700dfaf6442b4effaa91af24ebce5dc9d31bb4a69706313aae70d72cd0/scipy-1.18.0.tar.gz", hash = "sha256:67b2ad2ad54c72ca6d04975a9b2df8c3638c34ddd5b28738e94fc2b57929d378", size = 30774447, upload-time = "2026-06-19T15:01:43.456Z" }
 wheels = [
