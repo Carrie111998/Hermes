@@ -1,0 +1,5 @@
+name: klib
+version: 1.0.0
+description: "Search the klib personal knowledge base from Telegram via the /klib slash command."
+author: "cwliao"
+hooks: []
