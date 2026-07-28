@@ -196,6 +196,25 @@ def test_segmented_and_nested_argv_redaction(value, expected):
     assert "SECRET" not in json.dumps(result)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Users\UNSEEN_REVIEW_USER\AppData\Local\private",
+        r"D:\Private\credentials.txt",
+        r"\\review-server\secret-share\credentials.txt",
+        "/home/unseen-review-user/private",
+        "/opt/private/credentials",
+        "/var/lib/private-state",
+        "/Users/unseen-review-user/private",
+    ],
+)
+def test_redaction_neutralizes_generic_absolute_paths(path):
+    result = _redact({"path": path})
+    dumped = json.dumps(result)
+    assert result == {"path": "<absolute-path>"}
+    assert path not in dumped
+
+
 def _security_parser():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -318,6 +337,29 @@ def test_inventory_tools_exception_does_not_mutate_process_state(monkeypatch):
     assert registry_module._check_fn_last_good == last_good_before
 
 
+def test_inventory_tools_restores_modules_in_fresh_process():
+    script = """
+import json
+import sys
+from hermes_cli import autonomy_inventory
+before = "tools.registry" in sys.modules
+autonomy_inventory.inventory_tools()
+after = "tools.registry" in sys.modules
+print(json.dumps({"before": before, "after": after}))
+"""
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"before": False, "after": False}
+
+
 def test_real_inventory_is_offline_read_only_and_restores_registry(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     sentinel = "sentinel-machine-independent-value"
@@ -394,6 +436,7 @@ cron:
         monkeypatch.setattr(os, "mkdir", deny_write)
         monkeypatch.setattr(os, "makedirs", deny_write)
         monkeypatch.setattr(Path, "mkdir", deny_write)
+        monkeypatch.setattr(Path, "touch", deny_write)
         monkeypatch.setattr(Path, "write_text", deny_write)
         monkeypatch.setattr(Path, "write_bytes", deny_write)
         monkeypatch.setattr(builtins, "open", guarded_open)

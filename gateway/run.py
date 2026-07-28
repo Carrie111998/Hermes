@@ -407,20 +407,10 @@ def _gateway_loop_exception_handler(
     """
     exc = context.get("exception")
     if exc is not None and _is_transient_network_error(exc):
-        message = context.get("message") or "transient network error"
-        task = context.get("future") or context.get("task")
-        task_name = ""
-        if task is not None:
-            try:
-                task_name = task.get_name() if hasattr(task, "get_name") else repr(task)
-            except Exception:
-                task_name = repr(task)
         logger.warning(
-            "Gateway swallowed transient network error from %s: %s: %s",
-            task_name or "<unknown task>",
+            "Telegram operation failed operation=event_loop_network_error "
+            "error_type=%s",
             type(exc).__name__,
-            exc,
-            exc_info=(type(exc), exc, exc.__traceback__),
         )
         return
     # Fall back to the default handler for anything we don't recognise.
@@ -4239,8 +4229,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
             )
-        except Exception:
-            logger.debug("Failed to read Telegram topic mode state", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=read_topic_mode "
+                "error_type=%s",
+                type(exc).__name__,
+            )
             return False
         # Only honor a real True from the SessionDB. Any other value
         # (including MagicMock instances from test fixtures that didn't
@@ -4362,9 +4356,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         try:
             self._record_telegram_topic_binding(source, session_entry)
-        except Exception:
+        except Exception as exc:
             logger.debug(
-                "telegram topic binding refresh failed (%s)", reason, exc_info=True,
+                "Telegram operation failed operation=refresh_topic_binding "
+                "reason=%s error_type=%s",
+                reason,
+                type(exc).__name__,
             )
 
     def _recover_telegram_topic_thread_id(
@@ -6168,12 +6165,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # can inject messages into an active session they don't own.
         if not self._is_user_authorized(event.source):
             logger.warning(
-                "Dropping message from unauthorized user in active session: "
-                "user=%s (%s), platform=%s, session=%s",
-                event.source.user_id,
-                event.source.user_name,
+                "Dropping unauthorized message in active session platform=%s",
                 event.source.platform.value if event.source.platform else "unknown",
-                session_key,
             )
             return True  # handled (silently dropped); do not fall through
 
@@ -7518,9 +7511,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             source = event.source
             logger.info(
-                "Queued inbound message during gateway startup restore: platform=%s chat=%s",
+                "Queued inbound message during gateway startup restore platform=%s",
                 source.platform.value if source and source.platform else "unknown",
-                source.chat_id if source else "unknown",
             )
         except Exception:
             pass
@@ -9106,10 +9098,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         logger.info(
-            "Handoff: dispatching synthetic turn for CLI session %s → %s "
-            "(home=%s, thread=%s, session_key=%s)",
-            cli_session_id, platform_name, home.chat_id, effective_thread_id,
-            session_key,
+            "Handoff: dispatching synthetic turn platform=%s thread_present=%s",
+            platform_name,
+            bool(effective_thread_id),
         )
 
         # Dispatch through the runner directly. Going through
@@ -11034,10 +11025,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _action = _result.get("action")
                 if _action == "skip":
                     logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                        "pre_gateway_dispatch skip: reason=%s platform=%s",
                         _result.get("reason"),
                         source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
                     )
                     return None
                 if _action == "rewrite":
@@ -11062,7 +11052,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
         elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            logger.warning(
+                "Unauthorized inbound user platform=%s",
+                source.platform.value,
+            )
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
@@ -13125,8 +13118,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )) if self._session_db else None
-            except Exception:
-                logger.debug("Failed to read Telegram topic binding", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Telegram operation failed operation=read_topic_binding "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
                 binding = None
             if binding:
                 bound_session_id = str(binding.get("session_id") or "")
@@ -13174,8 +13171,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 try:
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
-                except Exception:
-                    logger.debug("Failed to record Telegram topic binding", exc_info=True)
+                except Exception as exc:
+                    logger.debug(
+                        "Telegram operation failed operation=record_topic_binding "
+                        "error_type=%s",
+                        type(exc).__name__,
+                    )
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -15114,10 +15115,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
-            "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
+            "Slash command /%s denied for platform=%s "
+            "(not admin, not in user_allowed_commands)",
             canonical_cmd,
             source.platform.value if source.platform else "?",
-            source.user_id,
         )
         allowed_preview = sorted(policy.user_allowed_commands)
         if allowed_preview:
@@ -15708,15 +15709,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
-            logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
+            logger.debug("Unauthorized voice input ignored")
             return
 
         if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
             logger.info(
-                "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
-                guild_id,
-                user_id,
-                transcript[:100],
+                "Suppressing duplicate voice transcript",
             )
             return
 
@@ -16236,8 +16234,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return {"checked": False}
         try:
             me = await bot.get_me()
-        except Exception:
-            logger.debug("Failed to fetch Telegram getMe topic capabilities", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=fetch_topic_capabilities "
+                "error_type=%s",
+                type(exc).__name__,
+            )
             return {"checked": False}
 
         def _field(name: str):
@@ -16267,8 +16269,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if callable(create_topic):
             try:
                 thread_id = await create_topic(int(source.chat_id), "System")
-            except Exception:
-                logger.debug("Failed to create Telegram System topic", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Telegram operation failed operation=create_system_topic "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
         if not thread_id:
             return
 
@@ -16280,8 +16286,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata={"thread_id": str(thread_id)},
             )
             message_id = getattr(send_result, "message_id", None)
-        except Exception:
-            logger.debug("Failed to send Telegram System topic intro", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=send_system_topic_intro "
+                "error_type=%s",
+                type(exc).__name__,
+            )
         if not message_id:
             return
 
@@ -16294,8 +16304,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=int(message_id),
                 disable_notification=True,
             )
-        except Exception:
-            logger.debug("Failed to pin Telegram System topic intro", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=pin_system_topic_intro "
+                "error_type=%s",
+                type(exc).__name__,
+            )
 
     async def _send_telegram_topic_setup_image(self, source: SessionSource) -> None:
         """Send the bundled BotFather Threads Settings screenshot when available."""
@@ -16312,8 +16326,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 caption="BotFather → Bot Settings → Threads Settings",
                 metadata={"thread_id": str(source.thread_id)} if source.thread_id else None,
             )
-        except Exception:
-            logger.debug("Failed to send Telegram topic setup image", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=send_topic_setup_image "
+                "error_type=%s",
+                type(exc).__name__,
+            )
 
     def _sanitize_telegram_topic_title(self, title: str) -> str:
         """Return a Bot API-safe forum topic name from a generated session title."""
@@ -16458,8 +16476,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
                     return
-            except Exception:
-                logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Telegram operation failed operation=verify_topic_binding "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
                 return
 
         if adapter is None:
@@ -16493,8 +16515,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_thread_id=source.thread_id,
                     name=topic_name,
                 )
-        except Exception:
-            logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=auto_rename_topic error_type=%s",
+                type(exc).__name__,
+            )
 
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """Return True when operator disabled per-topic auto-rename for this Telegram chat.
@@ -16551,8 +16576,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _log_rename_failure(fut) -> None:
             try:
                 fut.result()
-            except Exception:
-                logger.debug("Telegram topic title rename failed", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Telegram operation failed operation=rename_topic "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
 
         future.add_done_callback(_log_rename_failure)
 
@@ -16651,8 +16680,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=str(source.user_id),
                 limit=10,
             )
-        except Exception:
-            logger.debug("Failed to list unlinked Telegram sessions", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=list_unlinked_sessions "
+                "error_type=%s",
+                type(exc).__name__,
+            )
             sessions = []
 
         if sessions:
@@ -17118,8 +17151,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(get_dm_topic_info):
                 try:
                     topic_info = get_dm_topic_info(adapter, str(chat_id), str(thread_id))
-                except Exception:
-                    logger.debug("Failed to inspect Telegram DM topic metadata", exc_info=True)
+                except Exception as exc:
+                    logger.debug(
+                        "Telegram operation failed operation=inspect_dm_topic_metadata "
+                        "error_type=%s",
+                        type(exc).__name__,
+                    )
                 else:
                     return isinstance(topic_info, dict)
         return False
@@ -17577,21 +17614,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the log line is misleading and hides real delivery failures.
             if result is not None and getattr(result, "success", True) is False:
                 logger.warning(
-                    "Restart notification to %s:%s was not delivered: %s",
+                    "Restart notification was not delivered platform=%s",
                     platform_str,
-                    chat_id,
-                    getattr(result, "error", "send returned success=False"),
                 )
                 return None
 
             logger.info(
-                "Sent restart notification to %s:%s",
+                "Sent restart notification platform=%s",
                 platform_str,
-                chat_id,
             )
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
         except Exception as e:
-            logger.warning("Restart notification failed: %s", e)
+            logger.warning(
+                "Restart notification failed error_type=%s",
+                type(e).__name__,
+            )
             return None
         finally:
             notify_path.unlink(missing_ok=True)
@@ -17656,25 +17693,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = await transport.adapter.send(str(home.chat_id), message)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
-                        "Home-channel startup notification failed for %s:%s: %s",
+                        "Home-channel startup notification failed platform=%s",
                         platform.value,
-                        home.chat_id,
-                        getattr(result, "error", "send returned success=False"),
                     )
                     continue
 
                 delivered.add(target)
                 logger.info(
-                    "Sent home-channel startup notification to %s:%s",
+                    "Sent home-channel startup notification platform=%s",
                     platform.value,
-                    home.chat_id,
                 )
             except Exception as exc:
                 logger.warning(
-                    "Home-channel startup notification failed for %s:%s: %s",
+                    "Home-channel startup notification failed platform=%s "
+                    "error_type=%s",
                     platform.value,
-                    home.chat_id,
-                    exc,
+                    type(exc).__name__,
                 )
 
         return delivered
@@ -18155,10 +18189,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
         if not platform_name or not chat_type or not chat_id:
             logger.warning(
-                "Synthetic event source unresolvable: "
-                "session_key=%r platform=%r chat_type=%r chat_id=%r "
-                "evt_type=%s",
-                session_key, platform_name, chat_type, chat_id,
+                "Synthetic event source unresolvable platform=%r "
+                "chat_type=%r evt_type=%s",
+                platform_name, chat_type,
                 evt.get("type", "?"),
             )
             return None
@@ -18293,15 +18326,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=metadata,
             )
             logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                "Watch pattern notification injecting platform=%s "
+                "thread_present=%s",
                 platform_name,
-                source.chat_id,
-                source.thread_id,
+                bool(source.thread_id),
             )
             await adapter.handle_message(synth_event)
             return True
         except Exception as e:
-            logger.error("Watch notification injection error: %s", e)
+            logger.error(
+                "Watch notification injection failed error_type=%s",
+                type(e).__name__,
+            )
             return False
 
     @staticmethod
@@ -22662,15 +22698,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _binding and _binding.get("thread_id"):
                             source.thread_id = str(_binding["thread_id"])
                             logger.debug(
-                                "Restored source.thread_id=%s from binding after session split %s → %s",
-                                source.thread_id,
-                                session_id,
-                                agent_session_id,
+                                "Restored Telegram thread binding after session split",
                             )
                     except Exception:
                         logger.debug(
                             "Failed to restore thread_id from binding after session split",
-                            exc_info=True,
                         )
                 if _session_split_entry_persisted:
                     self._sync_telegram_topic_binding(

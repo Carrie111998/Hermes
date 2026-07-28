@@ -54,10 +54,14 @@ _TEXT_SECRET_FIELD = re.compile(
     """
 )
 _WINDOWS_ABSOLUTE_PATH = re.compile(
-    r"(?i)\b[A-Z]:\\(?:Users\\[^\\\s]+|Documents and Settings\\[^\\\s]+)"
-    r"(?:\\[^\s,;\"']*)?"
+    r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/][^\s,;\"']+"
 )
-_UNIX_HOME_PATH = re.compile(r"(?<![A-Za-z0-9_])/(?:home|Users)/[^/\s]+(?:/[^\s,;\"']*)?")
+_WINDOWS_UNC_PATH = re.compile(
+    r"(?<!\\)\\\\[^\\\s,;\"']+\\[^\\\s,;\"']+(?:\\[^\s,;\"']*)?"
+)
+_UNIX_ABSOLUTE_PATH = re.compile(
+    r"(?<![:/A-Za-z0-9_])/(?!/)[^/\s,;\"']+/[^\s,;\"']*"
+)
 _RECOMMENDED_SECTIONS = (
     "objective",
     "preconditions",
@@ -95,8 +99,9 @@ def _redact_string(value: str, known_values: frozenset[str]) -> str:
     result = _ENV_ASSIGNMENT.sub(r"\1\2<redacted>", result)
     result = _CLI_SECRET.sub(r"\1<redacted>", result)
     result = _TEXT_SECRET_FIELD.sub(r"\1<redacted>", result)
-    result = _WINDOWS_ABSOLUTE_PATH.sub("<redacted-path>", result)
-    result = _UNIX_HOME_PATH.sub("<redacted-path>", result)
+    result = _WINDOWS_UNC_PATH.sub("<absolute-path>", result)
+    result = _WINDOWS_ABSOLUTE_PATH.sub("<absolute-path>", result)
+    result = _UNIX_ABSOLUTE_PATH.sub("<absolute-path>", result)
     return result
 
 
@@ -254,8 +259,21 @@ def inventory_skills(skills_dir: Path | None = None) -> list[dict[str, Any]]:
 
 
 def inventory_tools() -> dict[str, Any]:
-    import tools.registry as registry_module
+    modules_before = dict(sys.modules)
+    try:
+        import tools.registry as registry_module
 
+        return _inventory_tools_from_registry(registry_module)
+    finally:
+        for name in set(sys.modules) - set(modules_before):
+            sys.modules.pop(name, None)
+        for name, module in modules_before.items():
+            if sys.modules.get(name) is not module:
+                sys.modules[name] = module
+
+
+def _inventory_tools_from_registry(registry_module: Any) -> dict[str, Any]:
+    """Inspect loaded state and static declarations without persistent imports."""
     registry = registry_module.registry
     tools_dir = Path(registry_module.__file__).resolve().parent
     declared_modules = sorted(

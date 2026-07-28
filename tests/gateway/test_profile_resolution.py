@@ -4,12 +4,13 @@ import asyncio
 import hashlib
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.session import SessionSource, build_session_key
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _gateway_loop_exception_handler
 from gateway.profile_routing import ProfileRoute
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import BasePlatformAdapter
@@ -666,3 +667,66 @@ class TestTelegramTopicPrivacyAndIsolation:
             "researcher": (homes["researcher"], "researcher-secret"),
             "tester": (homes["tester"], "tester-secret"),
         }
+
+
+class TestTelegramGatewayLogPrivacy:
+    CHAT_ID = "-100693147180559"
+    THREAD_ID = "223606797749"
+    USER_ID = "244948974278"
+
+    @classmethod
+    def _assert_private(cls, text: str) -> None:
+        for raw in (cls.CHAT_ID, cls.THREAD_ID, cls.USER_ID):
+            assert raw not in text
+            assert hashlib.sha256(raw.encode()).hexdigest()[:12] not in text
+
+    def test_event_loop_network_exception_uses_type_only(self, caplog, capsys):
+        class NetworkError(Exception):
+            pass
+
+        try:
+            raise NetworkError(
+                f"chat={self.CHAT_ID} thread={self.THREAD_ID} user={self.USER_ID}"
+            )
+        except NetworkError as exc:
+            with caplog.at_level(logging.WARNING, logger="gateway.run"):
+                _gateway_loop_exception_handler(
+                    SimpleNamespace(default_exception_handler=lambda _ctx: None),
+                    {"exception": exc, "message": str(exc)},
+                )
+
+        captured = capsys.readouterr()
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        self._assert_private(rendered + captured.out + captured.err)
+        assert "error_type=NetworkError" in rendered
+        assert all(record.exc_info is None for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_busy_and_startup_queue_logs_do_not_expose_source(
+        self, caplog, capsys
+    ):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=self.CHAT_ID,
+            chat_type="group",
+            thread_id=self.THREAD_ID,
+            user_id=self.USER_ID,
+            user_name=self.USER_ID,
+        )
+        event = SimpleNamespace(source=source)
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._is_user_authorized = lambda _source: False
+        runner._startup_restore_queue = []
+
+        with caplog.at_level(logging.DEBUG, logger="gateway.run"):
+            assert (
+                await runner._handle_active_session_busy_message(
+                    event, f"telegram:{self.CHAT_ID}:{self.THREAD_ID}"
+                )
+                is True
+            )
+            runner._queue_startup_restore_event(event)
+
+        captured = capsys.readouterr()
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        self._assert_private(rendered + captured.out + captured.err)

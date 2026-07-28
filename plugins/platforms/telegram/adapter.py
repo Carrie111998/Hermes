@@ -36,8 +36,11 @@ def _consume_abandoned_task(task: asyncio.Task) -> None:
         task.exception()
     except asyncio.CancelledError:
         pass
-    except Exception:
-        logger.debug("Abandoned Telegram init task failed after timeout", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Telegram operation failed operation=observe_abandoned_init error_type=%s",
+            type(exc).__name__,
+        )
 
 
 # Grace period after the wall-clock deadline fires: if the event loop still
@@ -65,8 +68,11 @@ def _dump_loop_blocked_diagnostics(timeout: float, grace: float) -> None:
     )
     try:
         faulthandler.dump_traceback(all_threads=True)
-    except Exception:
-        logger.debug("faulthandler traceback dump failed", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Telegram operation failed operation=dump_init_traceback error_type=%s",
+            type(exc).__name__,
+        )
 
 
 async def _await_with_thread_deadline(awaitable, timeout: float, *, on_abandon=None):
@@ -167,8 +173,11 @@ async def _run_abandon_cleanup(on_abandon) -> None:
         result = on_abandon()
         if asyncio.iscoroutine(result) or asyncio.isfuture(result):
             await result
-    except Exception:
-        logger.debug("Abandoned Telegram init cleanup failed", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Telegram operation failed operation=abandoned_init_cleanup error_type=%s",
+            type(exc).__name__,
+        )
 
 
 async def _shutdown_abandoned_app(app) -> None:
@@ -188,8 +197,11 @@ async def _shutdown_abandoned_app(app) -> None:
         return
     try:
         await app.shutdown()
-    except Exception:
-        logger.debug("Abandoned Telegram app.shutdown() failed", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Telegram operation failed operation=abandoned_app_shutdown error_type=%s",
+            type(exc).__name__,
+        )
     # Directly close the underlying request transports (bypasses PTB's
     # init-gated shutdown so the eagerly-built httpx pool is released even when
     # the abandoned initialize() never flipped _initialized).
@@ -205,8 +217,12 @@ async def _shutdown_abandoned_app(app) -> None:
             result = shutdown()
             if asyncio.iscoroutine(result) or asyncio.isfuture(result):
                 await result
-        except Exception:
-            logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "Telegram operation failed operation=abandoned_request_shutdown "
+                "error_type=%s",
+                type(exc).__name__,
+            )
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -2028,20 +2044,24 @@ class TelegramAdapter(BasePlatformAdapter):
             # Bounded: a wedged CLOSE-WAIT socket can make this close hang
             # forever and freeze the reconnect ladder (#66377).
             await asyncio.wait_for(polling_req.shutdown(), timeout=_DRAIN_TIMEOUT)
-        except Exception:
+        except Exception as exc:
             logger.debug(
-                "[%s] Polling request shutdown failed/timed out (non-fatal)",
-                self.name, exc_info=True,
+                "[%s] Telegram operation failed operation=polling_request_shutdown "
+                "error_type=%s",
+                self.name,
+                type(exc).__name__,
             )
         try:
             await asyncio.wait_for(polling_req.initialize(), timeout=_DRAIN_TIMEOUT)
             logger.debug(
                 "[%s] Polling request pool drained before reconnect", self.name
             )
-        except Exception:
+        except Exception as exc:
             logger.debug(
-                "[%s] Polling request re-initialize failed/timed out (non-fatal)",
-                self.name, exc_info=True,
+                "[%s] Telegram operation failed operation=polling_request_reinitialize "
+                "error_type=%s",
+                self.name,
+                type(exc).__name__,
             )
 
     def _begin_polling_generation(self) -> tuple[int, asyncio.Event]:
@@ -2252,10 +2272,12 @@ class TelegramAdapter(BasePlatformAdapter):
         async with self._get_general_request_drain_lock():
             try:
                 await general_req.shutdown()
-            except Exception:
+            except Exception as exc:
                 logger.debug(
-                    "[%s] General request shutdown failed after pool timeout (non-fatal)",
-                    self.name, exc_info=True,
+                    "[%s] Telegram operation failed operation=general_request_shutdown "
+                    "error_type=%s",
+                    self.name,
+                    type(exc).__name__,
                 )
             try:
                 await general_req.initialize()
@@ -2263,10 +2285,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] General request pool drained after Telegram pool timeout",
                     self.name,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.debug(
-                    "[%s] General request re-initialize failed after pool timeout (non-fatal)",
-                    self.name, exc_info=True,
+                    "[%s] Telegram operation failed operation=general_request_reinitialize "
+                    "error_type=%s",
+                    self.name,
+                    type(exc).__name__,
                 )
 
     def _schedule_polling_recovery(self, error: Exception, *, reason: str) -> None:
@@ -3299,7 +3323,10 @@ class TelegramAdapter(BasePlatformAdapter):
             from hermes_constants import get_hermes_home
             config_path = get_hermes_home() / "config.yaml"
             if not config_path.exists():
-                logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
+                logger.warning(
+                    "[%s] Telegram topic configuration file not found",
+                    self.name,
+                )
                 return
 
             import yaml as _yaml
@@ -3468,10 +3495,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._refresh_bot_identity(force=True)
             except asyncio.CancelledError:
                 return
-            except Exception:
+            except Exception as exc:
                 logger.debug(
-                    "[%s] Telegram identity refresh loop iteration failed",
-                    self.name, exc_info=True,
+                    "[%s] Telegram operation failed operation=identity_refresh "
+                    "error_type=%s",
+                    self.name,
+                    type(exc).__name__,
                 )
 
     def _start_post_connect_housekeeping(self) -> None:
@@ -6273,8 +6302,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     from tools.approval import resolve_gateway_approval
                     count = resolve_gateway_approval(session_key, choice)
                     logger.info(
-                        "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
+                        "Telegram button resolved approval count=%d choice=%s",
+                        count, choice,
                     )
                 except Exception as exc:
                     logger.error(
@@ -6679,9 +6708,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
         except asyncio.TimeoutError:
             label = f"❌ {verb} timed out"
-            logger.error("[%s] gmail-triage callback timed out: verb=%s arg=%s", self.name, verb, arg)
+            logger.error(
+                "[%s] gmail-triage callback timed out verb=%s",
+                self.name,
+                verb,
+            )
         except Exception as exc:
-            label = f"❌ {verb} error: {exc}"
+            label = f"❌ {verb} error: {type(exc).__name__}"
             logger.error(
                 "[%s] gmail-triage callback exception: verb=%s arg=%s err=%s",
                 self.name, verb, arg, type(exc).__name__,
