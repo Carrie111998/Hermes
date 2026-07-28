@@ -7,6 +7,7 @@ PID is rejected safely.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -344,11 +345,13 @@ def test_completed_worker_cleanup_excludes_root_pid(monkeypatch):
     alive = {child_pid}
     signalled: list[int] = []
 
-    monkeypatch.setattr(
-        kb,
-        "_owned_process_tree",
-        lambda _pid, **_kwargs: ([root_pid, child_pid], identity),
-    )
+    def owned_tree(_pid, **kwargs):
+        snapshot = kwargs.get("identity_snapshot")
+        if snapshot is not None:
+            snapshot.update({root_pid: dict(identity), child_pid: dict(identity)})
+        return [root_pid, child_pid], identity
+
+    monkeypatch.setattr(kb, "_owned_process_tree", owned_tree)
     monkeypatch.setattr(kb, "_process_identity", lambda _pid: identity)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid in alive)
 
@@ -505,3 +508,264 @@ def test_successful_completion_terminates_dead_worker_session_descendant(
             worker.wait()
         if _local_pid_alive(descendant_pid):
             os.kill(descendant_pid, 9)
+
+
+def test_inconsistent_isolated_identity_fallback_fails_closed(monkeypatch):
+    """Dead-leader fallback requires a semantically isolated PGID/SID tuple."""
+    if os.name == "nt":
+        pytest.skip("process identity probe is POSIX-only")
+    root_pid = 999999
+    host = kb._claimer_id().split(":", 1)[0]
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(kb, "_process_identity", lambda _pid: None)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    result = kb._terminate_reclaimed_worker(
+        root_pid,
+        f"{host}:worker",
+        signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        expected_start_time="dead",
+        expected_pgid=root_pid - 1,
+        expected_sid=root_pid,
+        identity_required=True,
+    )
+
+    assert signalled == []
+    assert result["ownership_verified"] is False
+    assert result["termination_attempted"] is False
+
+
+def test_pidfd_validates_identity_after_open_before_signal(monkeypatch):
+    """PID reuse after pidfd_open fails closed; a matching handle is signalled."""
+    if sys.platform != "linux":
+        pytest.skip("pidfd is a Linux primitive")
+    import signal
+
+    recorded = {"start_time": "10", "pgid": 4321, "sid": 4321}
+    current = {"start_time": "11", "pgid": 4321, "sid": 4321}
+    calls: list[tuple] = []
+    monkeypatch.setattr(os, "pidfd_open", lambda pid, flags: calls.append(("open", pid, flags)) or 77, raising=False)
+    monkeypatch.setattr(os, "close", lambda fd: calls.append(("close", fd)))
+    monkeypatch.setattr(
+        signal, "pidfd_send_signal",
+        lambda fd, sig, info, flags: calls.append(("send", fd, sig, flags)),
+        raising=False,
+    )
+    monkeypatch.setattr(kb, "_process_identity", lambda _pid: dict(current))
+
+    kb._signal_verified_target(4321, signal.SIGTERM, recorded)
+    assert [item[0] for item in calls] == ["open", "close"]
+
+    calls.clear()
+    current["start_time"] = "10"
+    kb._signal_verified_target(4321, signal.SIGTERM, recorded)
+    assert [item[0] for item in calls] == ["open", "send", "close"]
+
+
+def test_missing_identity_is_unknown_not_a_match(tmp_path):
+    assert kb._worker_identity_matches(1) is False
+
+
+def test_administrative_completion_never_signals_registered_worker_root(
+    conn, monkeypatch,
+):
+    """Completion cleanup excludes the registered root for every caller."""
+    task_id = kb.create_task(conn, title="admin completion", assignee="worker")
+    host = kb._claimer_id().split(":", 1)[0]
+    run = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+    assert run is not None
+    registered_pid = os.getpid() + 10000
+    kb._set_worker_pid(conn, task_id, registered_pid)
+    run_id = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()[0]
+    calls = []
+    monkeypatch.setattr(kb, "_cleanup_worker_processes", lambda **kw: calls.append(kw))
+    assert kb.complete_task(conn, task_id, expected_run_id=run_id)
+    assert calls[0]["exclude_pid"] == registered_pid
+    assert kb.reconcile_terminal_worker_cleanups(conn) == []
+    assert calls[1]["exclude_pid"] == registered_pid
+
+
+def test_completion_keeps_workspace_lease_until_dispatcher_verifies_exit(
+    conn, tmp_path, monkeypatch,
+):
+    """Done stays leased until a later dispatcher reconciliation proves exit."""
+    workspace = tmp_path / "leased"
+    first = kb.create_task(
+        conn, title="first", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    second = kb.create_task(
+        conn, title="second", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    assert kb.claim_task(conn, first) is not None
+    kb._set_worker_pid(conn, first, os.getpid())
+    run_id = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (first,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        kb, "_cleanup_worker_processes",
+        lambda **_kw: {"terminated": True, "ownership_verified": True},
+    )
+
+    assert kb.complete_task(conn, first, expected_run_id=run_id)
+    cleanup_verified = conn.execute(
+        "SELECT cleanup_verified FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()[0]
+    assert cleanup_verified == 0
+    assert kb.claim_task(conn, second) is None
+
+    now = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, ended_at = ? WHERE id = ?",
+            (now - 1, now - kb.RECLAIM_DEFER_GRACE_SECONDS - 1, run_id),
+        )
+    assert kb.reconcile_terminal_worker_cleanups(conn) == []
+    assert kb.claim_task(conn, second) is None
+
+    monkeypatch.setattr(kb, "_worker_identity_matches", lambda *_a, **_kw: False)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    assert kb.reconcile_terminal_worker_cleanups(conn) == [first]
+    assert kb.claim_task(conn, second) is not None
+
+
+def test_unregistered_completed_worker_lease_has_bounded_auditable_fallback(
+    conn, tmp_path,
+):
+    workspace = tmp_path / "unregistered-lease"
+    first = kb.create_task(
+        conn, title="first", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    second = kb.create_task(
+        conn, title="second", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    claimed = kb.claim_task(conn, first)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    assert run_id is not None
+
+    assert kb.complete_task(conn, first, expected_run_id=run_id)
+    assert kb.reconcile_terminal_worker_cleanups(conn) == []
+    assert kb.claim_task(conn, second) is None
+
+    now = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, ended_at = ? WHERE id = ?",
+            (now - 1, now - kb.RECLAIM_DEFER_GRACE_SECONDS - 1, run_id),
+        )
+    assert kb.reconcile_terminal_worker_cleanups(conn) == [first]
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'worker_cleanup_verified' ORDER BY id DESC LIMIT 1",
+        (first,),
+    ).fetchone()
+    assert event is not None
+    assert json.loads(event["payload"])["reason"] == (
+        "unregistered_worker_lease_expired"
+    )
+    assert kb.claim_task(conn, second) is not None
+
+
+def test_registered_pid_reuse_lease_expires_without_signalling_new_generation(
+    conn, tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "registered-reuse-lease"
+    first = kb.create_task(
+        conn, title="first", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    second = kb.create_task(
+        conn, title="second", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    claimed = kb.claim_task(conn, first)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    assert run_id is not None
+    reused_pid = 987654
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (reused_pid, first),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, worker_pgid = ?, "
+            "worker_sid = ?, worker_start_time = ? WHERE id = ?",
+            (reused_pid, reused_pid, reused_pid, "old-generation", run_id),
+        )
+
+    signals = []
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == reused_pid)
+    monkeypatch.setattr(kb, "_worker_identity_matches", lambda *_a, **_kw: False)
+    monkeypatch.setattr(kb.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    assert kb.complete_task(conn, first, expected_run_id=run_id)
+    assert kb.reconcile_terminal_worker_cleanups(conn) == []
+    assert kb.claim_task(conn, second) is None
+
+    now = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, ended_at = ? WHERE id = ?",
+            (now - 1, now - kb.RECLAIM_DEFER_GRACE_SECONDS - 1, run_id),
+        )
+    assert kb.reconcile_terminal_worker_cleanups(conn) == [first]
+    assert signals == []
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'worker_cleanup_verified' ORDER BY id DESC LIMIT 1",
+        (first,),
+    ).fetchone()
+    assert event is not None
+    assert json.loads(event["payload"])["reason"] == (
+        "unverified_worker_lease_expired"
+    )
+    assert kb.claim_task(conn, second) is not None
+
+
+def test_spawn_registration_losing_completion_cas_reaps_worker_and_releases_lease(
+    conn, tmp_path,
+):
+    workspace = tmp_path / "spawn-race"
+    first = kb.create_task(
+        conn, title="first", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    second = kb.create_task(
+        conn, title="second", workspace_kind="dir", workspace_path=str(workspace),
+    )
+    claimed = kb.claim_task(conn, first)
+    assert claimed is not None
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert kb.complete_task(
+            conn, first, expected_run_id=claimed.current_run_id,
+        )
+        assert kb.claim_task(conn, second) is None
+
+        assert kb._set_worker_pid(
+            conn,
+            first,
+            worker.pid,
+            expected_run_id=claimed.current_run_id,
+            expected_claim_lock=claimed.claim_lock,
+        ) is False
+        worker.wait(timeout=5)
+        task = kb.get_task(conn, first)
+        assert task is not None
+        assert task.worker_pid is None
+        cleanup_verified = conn.execute(
+            "SELECT cleanup_verified FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()[0]
+        assert cleanup_verified == 1
+        assert kb.claim_task(conn, second) is not None
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait()
