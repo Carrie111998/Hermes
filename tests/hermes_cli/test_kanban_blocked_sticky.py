@@ -277,3 +277,74 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
 # (landed via #28754 / #28781).  The original PR shipped a duplicate test
 # here; dropped during salvage to avoid two assertions of the same contract.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Sticky gate honoured on the ``todo`` routing path (t_jarvis_autopromote_20260728)
+# ---------------------------------------------------------------------------
+
+
+def test_sticky_block_survives_blocked_to_todo_reset(kanban_home: Path) -> None:
+    """Live evidence 2026-07-28 20:26Z + 6-wake reclaim loop: a card that was
+    sticky-blocked, then reset to ``todo`` WITHOUT an ``unblocked`` event
+    (triage reset / approval-auto-clear / direct status write), escaped the
+    ``blocked``-status sticky guard and was promoted+claimed every tick.
+
+    With the guard extended to ``todo`` rows whose block_kind is not
+    ``dependency``, the card must stay parked until ``unblock_task`` emits
+    ``unblocked``.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="time-gated card")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid,
+            reason="awaiting 24h soak gate",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Reset to todo WITHOUT an unblocked event (what jarvis-triage did),
+        # with block_kind cleared (not 'dependency').
+        conn.execute(
+            "UPDATE tasks SET status='todo', block_kind=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        # Sticky gate must hold on the todo path: no promotion across ticks.
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "todo"
+
+        # Explicit unblock event is the legitimate exit — emit it via SQL
+        # flip back to blocked + unblock_task (the operator path).
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.unblock_task(conn, tid)
+        assert kb.recompute_ready(conn) >= 0
+        assert kb.get_task(conn, tid).status in ("ready", "todo")
+
+
+def test_dependency_block_in_todo_still_auto_recovers(kanban_home: Path) -> None:
+    """The ``dependency`` block kind is the intentional auto-recovery path:
+    once parents are done, the card promotes.  The sticky-guard extension
+    must NOT break this contract."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.complete_task(conn, parent, result="ok")
+
+        kb.claim_task(conn, child)
+        kb.block_task(
+            conn, child,
+            reason="waiting on parent",
+            kind="dependency",
+            expected_run_id=kb.get_task(conn, child).current_run_id,
+        )
+        assert kb.get_task(conn, child).status == "todo"
+
+        # Parents already done — dependency auto-recovery promotes it,
+        # and the sticky-guard extension must NOT block this path.
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, child).status == "ready"

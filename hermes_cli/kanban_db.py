@@ -4367,12 +4367,13 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, block_kind "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            row_block_kind = row["block_kind"] if "block_kind" in row.keys() else None
             if cur_status == "blocked":
                 if _has_sticky_block(conn, task_id):
                     # Worker / operator asked for human review — do not
@@ -4419,6 +4420,19 @@ def recompute_ready(
                         (task_id,),
                     )
                 else:
+                    # ``todo`` rows whose block_kind is NOT ``dependency``
+                    # got there via a non-dependency routing path (triage
+                    # reset, approval-auto-clear, direct status write). If the
+                    # card was ever sticky-blocked, honour that gate here too
+                    # — otherwise a blocked→todo reset escapes the sticky
+                    # guard and the dispatcher reclaims it (live evidence:
+                    # t_jarvis_autopromote_20260728, 2026-07-28 20:26Z and the
+                    # 6-wake loop that followed). ``dependency`` kind is the
+                    # intentional auto-recovery path and is exempt.
+                    if row_block_kind != "dependency" and _has_sticky_block(
+                        conn, task_id
+                    ):
+                        continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
