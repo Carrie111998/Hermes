@@ -1483,8 +1483,15 @@ install_deps() {
         export VIRTUAL_ENV="$INSTALL_DIR/venv"
     fi
 
-    source "$INSTALL_DIR/scripts/lib/pillow_source_build.sh"
-    prepare_python_build_environment
+    if ! source "$INSTALL_DIR/scripts/lib/pillow_source_build.sh"; then
+        log_error "Cannot load Pillow compatibility checks."
+        return 1
+    fi
+
+    if ! prepare_python_build_environment; then
+        log_error "Aborting dependency installation: Pillow source-build prerequisites are unavailable."
+        return 1
+    fi
 
     # Install the main package in editable mode with all extras.
     #
