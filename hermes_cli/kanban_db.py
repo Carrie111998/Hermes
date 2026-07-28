@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from agent.redact import redact_sensitive_text
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -7971,6 +7972,12 @@ def record_verify_failure(
     Returns ``{"blocked", "stale_run", "failures", "effective_limit",
     "limit_source"}``.
     """
+    # Defense in depth: the kanban_verify runner already reports a redacted
+    # command, but this is a public API — a raw secret-bearing command
+    # (``TOKEN=... ./check.sh``) must never reach last_failure_error,
+    # events, or comments through any caller.
+    if command:
+        command = redact_sensitive_text(command, force=True)
     error = f"verification failed ({gate}, exit {exit_code}): {command or ''}"
     info: dict = {}
     blocked = _record_task_failure(
@@ -9432,7 +9439,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 "kanban_complete will only succeed after this command exits 0 "
                 "in your workspace (run it yourself before completing):"
             )
-            lines.append(f"    {task.verify_cmd}")
+            # Redacted + capped: the prompt is broadcast into transcripts
+            # and logs, and an inline-credential command must not ride
+            # along raw (the gate still executes the stored original).
+            lines.append(
+                f"    {_cap(redact_sensitive_text(task.verify_cmd, force=True))}"
+            )
         else:
             lines.append(
                 "kanban_complete requires fresh, full-scope green verification "

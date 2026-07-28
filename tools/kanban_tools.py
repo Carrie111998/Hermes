@@ -173,20 +173,16 @@ def _verify_session_ids(kw: dict) -> list[str]:
     "default"`` in tools/terminal_tool.py): the registry-dispatch session id,
     the env session id (they coincide on the happy path; the env var is the
     same trusted identity ``_stamp_worker_session_metadata`` uses), then the
-    dispatch task-id kwarg. Deduped, falsy dropped — and ``"default"`` never
-    offered: the shared bucket must not vouch for a task it never worked on.
+    dispatch task-id kwarg. Sanitizing (falsy dropped, the shared
+    ``"default"`` bucket dropped, deduped) is delegated to
+    ``kanban_verify.normalize_session_candidates`` — the single home for
+    that rule.
     """
-    out: list[str] = []
-    for cand in (
+    return kanban_verify.normalize_session_candidates((
         kw.get("session_id"),
         os.environ.get("HERMES_SESSION_ID"),
         kw.get("task_id"),
-    ):
-        s = str(cand).strip() if cand else ""
-        if not s or s == "default" or s in out:
-            continue
-        out.append(s)
-    return out
+    ))
 
 
 def _config_failure_limit() -> Optional[int]:
@@ -691,18 +687,38 @@ def _handle_complete(args: dict, **kw) -> str:
                     # turn, and auto mode would consult THIS session's
                     # ledger bucket, which never saw the worker's runs.
                     # Reject without counting — no DB write; the live
-                    # worker's budget is untouched.
+                    # worker's budget is untouched. Deliberately does NOT
+                    # spell out the CLI override incantation: any caller
+                    # with a terminal tool could simply run it (the same
+                    # bypass class the goal-judge gate closes in
+                    # hermes_cli/kanban.py), so the message names the
+                    # legitimate paths without handing over the keys.
                     return tool_error(
                         f"kanban_complete blocked: task {tid} has a "
                         f"verified-completion gate ({task.verify_mode}) and "
                         f"can only be completed by its dispatched worker, "
                         f"whose workspace and session the gate checks. "
-                        f"Either let the worker finish, or override as a "
-                        f"human with `hermes kanban complete {tid}` from "
-                        f"the CLI. No failure was counted."
+                        f"Either let the worker finish, or ask a human "
+                        f"operator to override from the CLI. No failure "
+                        f"was counted."
                     )
+                # Auto mode: bound acceptance to evidence created after the
+                # active run started. Edit-staleness is tracked per ledger
+                # bucket, so a previous incarnation's green evidence in the
+                # shared task-id bucket can never be staled by THIS run's
+                # edits — the freshness bound is what rejects it.
+                evidence_not_before = None
+                if task.verify_mode == "auto":
+                    try:
+                        if task.current_run_id:
+                            _run = kb.get_run(conn, task.current_run_id)
+                            if _run is not None:
+                                evidence_not_before = _run.started_at
+                    except Exception:
+                        evidence_not_before = None
                 v = kanban_verify.evaluate_task_verification(
                     task, session_ids=_verify_session_ids(kw),
+                    evidence_not_before=evidence_not_before,
                 )
                 if v is not None and not v.ok:
                     _preview = (summary or result or "").strip()

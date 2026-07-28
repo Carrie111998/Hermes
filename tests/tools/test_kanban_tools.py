@@ -1261,7 +1261,11 @@ def test_complete_verify_nonworker_caller_rejected_uncounted(
 
     out = json.loads(kt._handle_complete({"task_id": tid, "summary": "done"}))
     assert "error" in out
-    assert "hermes kanban complete" in out["error"]
+    assert "verified-completion gate" in out["error"]
+    assert "human" in out["error"]
+    # The rejection must never hand an LLM caller the literal bypass
+    # incantation — any profile with a terminal tool could just run it.
+    assert "hermes kanban complete" not in out["error"]
 
     conn = kb.connect()
     try:
@@ -1270,6 +1274,68 @@ def test_complete_verify_nonworker_caller_rejected_uncounted(
         assert t.consecutive_failures == 0
         assert not [e for e in kb.list_events(conn, tid)
                     if e.kind == "completion_blocked_evidence"]
+    finally:
+        conn.close()
+
+
+def test_complete_verify_auto_rejects_prior_incarnation_evidence(
+    monkeypatch, tmp_path
+):
+    """Wire test for the run-freshness bound: green full-scope ledger
+    evidence recorded BEFORE the active run started (a previous
+    incarnation's leftovers under the shared task-id bucket) must not
+    complete the task — while evidence recorded during the run does."""
+    from datetime import datetime, timezone
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_mode="auto",
+        workspace_path=str(ws), max_retries=5,
+    )
+
+    def status_created_at(created_at):
+        return lambda *, session_id, cwd: {
+            "status": "passed",
+            "evidence": {"scope": "full", "canonical_command": "pytest -q",
+                         "exit_code": 0, "created_at": created_at},
+        }
+
+    monkeypatch.setattr(
+        kv, "verification_status",
+        status_created_at("2020-01-01T00:00:00+00:00"),
+    )
+    # The registry-injected task_id kwarg feeds the candidate chain — the
+    # task-id ledger bucket is exactly the shared key a previous
+    # incarnation's evidence survives under.
+    out = json.loads(
+        kt._handle_complete({"summary": "done"}, task_id=tid)
+    )
+    assert "error" in out
+    assert "predates" in out["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        kv, "verification_status",
+        status_created_at(datetime.now(timezone.utc).isoformat()),
+    )
+    out2 = json.loads(
+        kt._handle_complete({"summary": "done"}, task_id=tid)
+    )
+    assert out2.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
     finally:
         conn.close()
 

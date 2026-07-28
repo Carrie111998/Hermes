@@ -20,7 +20,10 @@ Covers the DB + policy layers of the verified-completion gate:
 from __future__ import annotations
 
 import json
+import sys
+import time
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -342,6 +345,34 @@ def test_verify_failure_stale_run_audits_without_counting(
                     if c.author == "verify-gate"]
 
 
+def test_record_verify_failure_redacts_command(kanban_home: Path) -> None:
+    """Output arrives pre-redacted, but the COMMAND string is a public-API
+    input — a secret-bearing command must never reach last_failure_error,
+    events, or the blocked-evidence comment."""
+    secret = "ghp_" + "Abc123XyZ0" * 3
+    raw_cmd = f"GH_TOKEN={secret} ./integration-check.sh"
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, verify_cmd=raw_cmd)
+        info = kb.record_verify_failure(
+            conn, tid,
+            gate="verify_cmd",
+            command=raw_cmd,
+            exit_code=1,
+            output_excerpt="1 failed",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+            failure_limit=1,
+        )
+        assert info["blocked"] is True
+        t = kb.get_task(conn, tid)
+        assert secret not in (t.last_failure_error or "")
+        for e in kb.list_events(conn, tid):
+            assert secret not in json.dumps(e.payload or {})
+        comments = [c for c in kb.list_comments(conn, tid)
+                    if c.author == "verify-gate"]
+        assert comments
+        assert secret not in comments[-1].body
+
+
 def test_verify_exhaustion_holds_under_recompute_ready(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _running_task(conn, verify_cmd="pytest -q", max_retries=1)
@@ -450,6 +481,53 @@ def test_run_verify_command_redacts_secrets(tmp_path: Path) -> None:
     out = kv.run_verify_command(f"echo {secret}; exit 1", cwd=str(tmp_path))
     assert out.ok is False
     assert secret not in out.detail
+
+
+def test_run_verify_command_non_utf8_output_still_green(tmp_path: Path) -> None:
+    """A green suite emitting one undecodable byte (latin-1 fixture data,
+    binary spew) must stay green with mojibake — never a counted infra
+    failure that burns the retry budget on exit-0 runs."""
+    out = kv.run_verify_command(
+        "printf 'ok \\377\\376 done'; exit 0", cwd=str(tmp_path)
+    )
+    assert out.ok is True
+    assert out.exit_code == 0
+    assert "ok" in out.detail
+    assert "done" in out.detail
+
+
+def test_run_verify_command_reports_redacted_command(tmp_path: Path) -> None:
+    """The RAW command is executed, but the reported ``command`` field flows
+    into events/comments/tool_error — an inline credential must not ride
+    along."""
+    secret = "ghp_" + "Abc123XyZ0" * 3
+    out = kv.run_verify_command(f"GH_TOKEN={secret} exit 0", cwd=str(tmp_path))
+    assert out.ok is True
+    assert secret not in (out.command or "")
+
+
+def test_run_verify_command_double_timeout_salvages_partial_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An escaped-setsid grandchild holds the pipe through the bounded
+    reap: the partial capture must be salvaged off the exception — it is
+    the evidence a human unblocking the card needs."""
+    monkeypatch.setattr(kv, "REAP_TIMEOUT_SECONDS", 1)
+    cmd = (
+        "echo partial-marker; "
+        f"{sys.executable} -c 'import os,time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid(); time.sleep(8)\n"
+        "else:\n"
+        "    os._exit(0)'; "
+        "sleep 30"
+    )
+    out = kv.run_verify_command(cmd, cwd=str(tmp_path), timeout=1)
+    assert out.ok is False
+    assert out.timed_out is True
+    assert out.exit_code is None
+    assert "timed out" in out.detail
+    assert "partial-marker" in out.detail
 
 
 def test_run_verify_command_timeout_is_red(tmp_path: Path) -> None:
@@ -596,6 +674,58 @@ def test_auto_tries_candidate_keys_in_order(tmp_path, monkeypatch) -> None:
     assert "no verification evidence" in out2.detail
 
 
+def test_auto_freshness_bound_rejects_prior_incarnation_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    """Edit-staleness is per (session, root) bucket, so a previous
+    incarnation's green evidence in the shared task-id bucket can never be
+    staled by THIS run's edits — the ``not_before`` bound (the active
+    run's start time) is what rejects it."""
+
+    def status_created_at(created_at):
+        return lambda *, session_id, cwd: {
+            "status": "passed",
+            "evidence": {"scope": "full", "canonical_command": "pytest -q",
+                         "exit_code": 0, "created_at": created_at},
+        }
+
+    # Evidence recorded long before this dispatch: rejected, actionable.
+    monkeypatch.setattr(
+        kv, "verification_status",
+        status_created_at("2020-01-01T00:00:00+00:00"),
+    )
+    out = kv.check_auto_evidence(
+        ["t_task"], str(tmp_path), not_before=time.time()
+    )
+    assert out.ok is False
+    assert "predates" in out.detail
+    assert "re-run" in out.detail.lower()
+
+    # Evidence recorded after the run started: accepted.
+    fresh = datetime.now(timezone.utc).isoformat()
+    monkeypatch.setattr(kv, "verification_status", status_created_at(fresh))
+    out2 = kv.check_auto_evidence(
+        ["t_task"], str(tmp_path), not_before=time.time() - 3600
+    )
+    assert out2.ok is True
+
+    # Unparseable / missing created_at with a bound set: fail closed.
+    for bad in ("not-a-timestamp", None):
+        monkeypatch.setattr(kv, "verification_status", status_created_at(bad))
+        out3 = kv.check_auto_evidence(
+            ["t_task"], str(tmp_path), not_before=time.time() - 3600
+        )
+        assert out3.ok is False
+
+    # No bound (not_before=None): behavior unchanged — accepted.
+    monkeypatch.setattr(
+        kv, "verification_status",
+        status_created_at("2020-01-01T00:00:00+00:00"),
+    )
+    out4 = kv.check_auto_evidence(["t_task"], str(tmp_path))
+    assert out4.ok is True
+
+
 def test_auto_without_session_identity_fails_closed(
     tmp_path, monkeypatch
 ) -> None:
@@ -616,6 +746,20 @@ def test_evaluate_returns_none_without_verify_mode(tmp_path) -> None:
         verify_mode=None, verify_cmd=None, workspace_path=str(tmp_path)
     )
     assert kv.evaluate_task_verification(task, session_ids=["s"]) is None
+
+
+def test_evaluate_unknown_verify_mode_fails_closed(tmp_path) -> None:
+    """A truthy-but-unrecognized verify_mode (hand-edited row,
+    cross-version DB) must fail loudly, not silently degrade into
+    auto-mode semantics."""
+    task = types.SimpleNamespace(
+        verify_mode="bogus", verify_cmd=None, workspace_path=str(tmp_path)
+    )
+    out = kv.evaluate_task_verification(task, session_ids=["s"])
+    assert out is not None
+    assert out.ok is False
+    assert out.gate == "verify_invalid"
+    assert "bogus" in out.detail
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +798,19 @@ def test_worker_context_renders_latest_red_evidence(kanban_home: Path) -> None:
         ctx = kb.build_worker_context(conn, tid)
         assert "2 failed, 1 passed" in ctx
         assert "Exit code: 1" in ctx
+
+
+def test_worker_context_redacts_verify_cmd(kanban_home: Path) -> None:
+    """The worker prompt is broadcast into transcripts/logs — an
+    inline-credential verify command must not ride along raw."""
+    secret = "ghp_" + "Abc123XyZ0" * 3
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker",
+                             verify_cmd=f"API_TOKEN={secret} pytest -q")
+        ctx = kb.build_worker_context(conn, tid)
+        assert "## Verified completion gate" in ctx
+        assert secret not in ctx
+        assert "pytest -q" in ctx
 
 
 def test_worker_context_unchanged_without_verify_config(
