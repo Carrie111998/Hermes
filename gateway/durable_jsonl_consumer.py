@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import contextlib
 import fcntl
 import hashlib
@@ -249,8 +250,8 @@ class SingletonLock:
         self._handle = None
 
 
-def _bridge_item(value: Any) -> dict[str, Any]:
-    """Accept the durable bridge item or a shallow append-envelope wrapper."""
+def _bridge_item_ref(value: Any) -> Mapping[str, Any]:
+    """Resolve the durable bridge item or a shallow append-envelope wrapper."""
     if not isinstance(value, Mapping):
         raise ConsumerError("durable JSONL record is not an object")
     candidates = [value]
@@ -265,8 +266,13 @@ def _bridge_item(value: Any) -> dict[str, Any]:
             candidates.append(nested)
     for candidate in candidates:
         if candidate.get("messageId") and candidate.get("chatId"):
-            return dict(candidate)
+            return candidate
     raise ConsumerError("durable JSONL record has no bridge messageId/chatId item")
+
+
+def _bridge_item(value: Any) -> dict[str, Any]:
+    """Return an isolated durable bridge item for normalization/persistence."""
+    return dict(_bridge_item_ref(value))
 
 
 def _declared_document_mime(value: Any) -> str:
@@ -297,6 +303,7 @@ class InboxRecord:
     start_offset: int
     end_offset: int
     raw: dict[str, Any]
+    retention_state: str | None = None
 
 
 def _initial_retention_state(item: Mapping[str, Any]) -> str:
@@ -617,7 +624,8 @@ class DurableInbox:
         )
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
+                "retention_state "
                 "FROM ingress_events WHERE status='pending' "
                 f"ORDER BY {priority_clause}seq LIMIT ?",
                 (*priority, max(1, limit)),
@@ -630,6 +638,7 @@ class DurableInbox:
                 start_offset=int(row["start_offset"]),
                 end_offset=int(row["end_offset"]),
                 raw=json.loads(row["raw_json"]),
+                retention_state=str(row["retention_state"]),
             )
             for row in rows
         ]
@@ -652,7 +661,8 @@ class DurableInbox:
         excluded = set(exclude_chats or ())
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
+                "retention_state "
                 "FROM ingress_events WHERE status='pending' "
                 "AND retention_state IN ('complete','bypassed') ORDER BY seq"
             ).fetchall()
@@ -672,6 +682,7 @@ class DurableInbox:
                     start_offset=int(row["start_offset"]),
                     end_offset=int(row["end_offset"]),
                     raw=json.loads(row["raw_json"]),
+                    retention_state=str(row["retention_state"]),
                 )
             )
         ordered = sorted(grouped.items(), key=lambda item: item[1][0].seq)
@@ -690,7 +701,8 @@ class DurableInbox:
             raise ConsumerError("bounded replay cutoff must be timezone-aware")
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
+                "retention_state "
                 "FROM ingress_events ORDER BY seq"
             ).fetchall()
         selected: list[InboxRecord] = []
@@ -701,6 +713,7 @@ class DurableInbox:
                 seq=int(row["seq"]), message_id=str(row["message_id"]),
                 chat_id=str(row["chat_id"]), start_offset=int(row["start_offset"]),
                 end_offset=int(row["end_offset"]), raw=json.loads(row["raw_json"]),
+                retention_state=str(row["retention_state"]),
             )
             if _record_ingress_timestamp(record) >= cutoff.astimezone(timezone.utc):
                 selected.append(record)
@@ -714,7 +727,8 @@ class DurableInbox:
         placeholders = ",".join("?" for _ in wanted)
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
+                "retention_state "
                 f"FROM ingress_events WHERE message_id IN ({placeholders}) ORDER BY seq",
                 wanted,
             ).fetchall()
@@ -731,6 +745,7 @@ class DurableInbox:
                 seq=int(row["seq"]), message_id=str(row["message_id"]),
                 chat_id=str(row["chat_id"]), start_offset=int(row["start_offset"]),
                 end_offset=int(row["end_offset"]), raw=json.loads(row["raw_json"]),
+                retention_state=str(row["retention_state"]),
             )
             for row in rows
         ]
@@ -871,7 +886,8 @@ class DurableInbox:
         placeholders = ",".join("?" for _ in selected)
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
+                "retention_state "
                 "FROM ingress_events WHERE status='pending' "
                 f"AND chat_id IN ({placeholders}) ORDER BY seq DESC LIMIT 1",
                 tuple(selected),
@@ -886,6 +902,7 @@ class DurableInbox:
                 start_offset=int(row["start_offset"]),
                 end_offset=int(row["end_offset"]),
                 raw=json.loads(row["raw_json"]),
+                retention_state=str(row["retention_state"]),
             )
         ]
 
@@ -1054,7 +1071,8 @@ class DurableInbox:
         """Bounded pending-business work, with new rows ahead of retries."""
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
+                "retention_state "
                 "FROM ingress_events WHERE status='pending' "
                 "AND retention_state IN ('pending','held') "
                 "ORDER BY CASE retention_state WHEN 'pending' THEN 0 ELSE 1 END, "
@@ -1069,6 +1087,7 @@ class DurableInbox:
                 start_offset=int(row["start_offset"]),
                 end_offset=int(row["end_offset"]),
                 raw=json.loads(row["raw_json"]),
+                retention_state=str(row["retention_state"]),
             )
             for row in rows
         ]
@@ -1564,6 +1583,55 @@ def _converge_retained_media(
     return dict(result)
 
 
+def _retention_identity(
+    record: InboxRecord, item: Mapping[str, Any]
+) -> tuple[str, str, str, str]:
+    """Return the stable retention identity and filename prefix for a record."""
+    chat_id = str(item.get("chatId") or record.chat_id)
+    message_id = str(item.get("messageId") or record.message_id)
+    if chat_id != record.chat_id or message_id != record.message_id:
+        raise MediaRetentionError(
+            "PROVENANCE_DIVERGENCE: inbox/event identity mismatch"
+        )
+    identity_digest = hashlib.sha256(
+        (chat_id + "\0" + message_id).encode("utf-8")
+    ).hexdigest()
+    source_key = f"whatsapp-capture-v1:{identity_digest}"
+    filename_prefix = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:24]
+    return chat_id, message_id, source_key, filename_prefix
+
+
+def _document_retention_kind(path: Any) -> str:
+    if isinstance(path, Mapping):
+        path = (
+            path.get("path")
+            or path.get("filePath")
+            or path.get("localPath")
+            or path.get("url")
+        )
+    extension = Path(str(path or "")).suffix.lower()
+    return "spreadsheet" if extension in {".xlsx", ".csv"} else "document"
+
+
+def _retained_document_name(
+    filename_prefix: str,
+    retention_kind: str,
+    ordinal: int,
+    digest: str,
+    extension: str,
+) -> str:
+    return (
+        f"{filename_prefix}_{retention_kind}_{ordinal}_"
+        f"{digest[:24]}{extension}"
+    )
+
+
+def _retained_document_glob(
+    root: Path, filename_prefix: str, retention_kind: str, ordinal: int
+) -> list[Path]:
+    return sorted(root.glob(f"{filename_prefix}_{retention_kind}_{ordinal}_*"))
+
+
 def _retain_record_media_impl(
     record: InboxRecord, *, config_path: Path
 ) -> dict[str, Any]:
@@ -1577,15 +1645,9 @@ def _retain_record_media_impl(
     if config is None:
         return {"retained": 0, "bytes": 0, "operation": False}
     item = _bridge_item(record.raw)
-    chat_id = str(item.get("chatId") or record.chat_id)
-    message_id = str(item.get("messageId") or record.message_id)
-    if chat_id != record.chat_id or message_id != record.message_id:
-        raise MediaRetentionError("PROVENANCE_DIVERGENCE: inbox/event identity mismatch")
-    identity_digest = hashlib.sha256(
-        (chat_id + "\0" + message_id).encode("utf-8")
-    ).hexdigest()
-    source_key = f"whatsapp-capture-v1:{identity_digest}"
-    filename_prefix = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:24]
+    chat_id, message_id, source_key, filename_prefix = _retention_identity(
+        record, item
+    )
     root: Path = config["root"]
     documents = _event_retainable_documents(item)
     retained_documents = 0
@@ -1610,24 +1672,26 @@ def _retain_record_media_impl(
             content = source.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
             extension = source.suffix.lower()
-            retention_kind = (
-                "spreadsheet" if extension in {".xlsx", ".csv"} else "document"
-            )
+            retention_kind = _document_retention_kind(source)
             target = (
                 root
-                / (
-                    f"{filename_prefix}_{retention_kind}_{ordinal}_"
-                    f"{digest[:24]}{extension}"
+                / _retained_document_name(
+                    filename_prefix,
+                    retention_kind,
+                    ordinal,
+                    digest,
+                    extension,
                 )
             ).resolve()
             if not target.is_relative_to(root):
                 raise MediaRetentionError(
                     "derived document retention target escapes configured root"
                 )
-            ordinal_candidates = [
-                *root.glob(f"{filename_prefix}_spreadsheet_{ordinal}_*"),
-                *root.glob(f"{filename_prefix}_document_{ordinal}_*"),
-            ]
+            ordinal_candidates = _retained_document_glob(
+                root, filename_prefix, "spreadsheet", ordinal
+            ) + _retained_document_glob(
+                root, filename_prefix, "document", ordinal
+            )
             if ordinal_candidates and target not in ordinal_candidates:
                 raise MediaRetentionError(
                     "PROVENANCE_DIVERGENCE: retained document ordinal "
@@ -1991,6 +2055,97 @@ def _turn_rows(state_db: Path, *, replay_run_id: str) -> list[sqlite3.Row]:
         conn.close()
 
 
+def _sandbox_dataset_for_retention_root(
+    config_path: Path, retention_root: Path
+) -> str | None:
+    from tools.python_sandbox_paths import is_python_sandbox_dataset_name
+
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    sandbox = data.get("python_sandbox") if isinstance(data, Mapping) else None
+    datasets = sandbox.get("datasets") if isinstance(sandbox, Mapping) else None
+    if not isinstance(datasets, Mapping):
+        return None
+    matches: list[str] = []
+    for raw_name, spec in datasets.items():
+        if not isinstance(spec, Mapping) or spec.get("type") != "path":
+            continue
+        raw_path = spec.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        if Path(raw_path).expanduser().resolve() == retention_root:
+            name = str(raw_name)
+            if not is_python_sandbox_dataset_name(name):
+                raise MediaRetentionError(
+                    f"python_sandbox dataset name is invalid: {name!r}"
+                )
+            matches.append(name)
+    if len(matches) > 1:
+        raise MediaRetentionError(
+            "multiple python_sandbox datasets map the media retention root"
+        )
+    return matches[0] if matches else None
+
+
+def _mutable_bridge_item(value: dict[str, Any]) -> dict[str, Any]:
+    item = _bridge_item_ref(value)
+    if not isinstance(item, dict):
+        raise ConsumerError("copied durable bridge item is not mutable")
+    return item
+
+
+def _replay_messages_with_retained_documents(
+    records: Sequence[InboxRecord], *, config_path: Path
+) -> tuple[dict[str, Any], ...]:
+    """Copy records and append jail-visible retained-document paths."""
+    config = _retention_config(config_path)
+    if config is None:
+        return tuple(copy.deepcopy(record.raw) for record in records)
+    root: Path = config["root"]
+    dataset_name = _sandbox_dataset_for_retention_root(config_path, root)
+    if dataset_name is None:
+        return tuple(copy.deepcopy(record.raw) for record in records)
+
+    from tools.python_sandbox_paths import python_sandbox_dataset_path
+
+    messages: list[dict[str, Any]] = []
+    for record in records:
+        message = copy.deepcopy(record.raw)
+        messages.append(message)
+        if record.retention_state != "complete":
+            continue
+        item = _mutable_bridge_item(message)
+        documents = _event_retainable_documents(item)
+        if not documents:
+            continue
+        _, _, _, filename_prefix = _retention_identity(record, item)
+        annotations: list[str] = []
+        for ordinal, raw_path, _declared_mime in documents:
+            retention_kind = _document_retention_kind(raw_path)
+            candidates = [
+                path
+                for path in _retained_document_glob(
+                    root, filename_prefix, retention_kind, ordinal
+                )
+                if path.is_file()
+            ]
+            if len(candidates) > 1:
+                raise MediaRetentionError(
+                    "PROVENANCE_DIVERGENCE: multiple retained documents for "
+                    f"ordinal {ordinal}"
+                )
+            if not candidates:
+                continue
+            annotations.append(
+                "[Attachment retained for analysis in python_sandbox: "
+                f"{python_sandbox_dataset_path(dataset_name) / candidates[0].name}]"
+            )
+        if not annotations:
+            continue
+        body = str(item.get("body") or item.get("text") or "").rstrip()
+        item["body"] = (body + "\n\n" if body else "") + "\n".join(annotations)
+    return tuple(messages)
+
+
 async def process_live_records(
     records: Sequence[InboxRecord],
     *,
@@ -2045,7 +2200,9 @@ async def process_live_records(
     )
     replay_plan = ReplayPlan(
         platform="whatsapp",
-        messages=tuple(record.raw for record in records),
+        messages=_replay_messages_with_retained_documents(
+            records, config_path=config_path
+        ),
         run_id=run_id,
         attempt_id=f"attempt-{uuid.uuid4().hex[:12]}",
         delivery_mode="capture",

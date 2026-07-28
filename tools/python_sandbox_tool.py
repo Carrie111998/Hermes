@@ -27,6 +27,10 @@ except ImportError:  # pragma: no cover - Windows availability is fail-closed
 
 from hermes_constants import get_hermes_home
 from tools.path_security import validate_within_dir
+from tools.python_sandbox_paths import (
+    is_python_sandbox_dataset_name,
+    python_sandbox_dataset_path,
+)
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -237,11 +241,7 @@ def _resolve_datasets(
     mounts: dict[str, Path] = {}
     max_mb = _limits(config)["max_snapshot_mb"]
     for name in names:
-        if not name or any(
-            char
-            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-            for char in name
-        ):
+        if not is_python_sandbox_dataset_name(name):
             return {}, f"invalid dataset name: {name!r}"
         spec = available[name]
         kind = spec.get("type")
@@ -376,7 +376,8 @@ def _build_env(
     env = {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "SANDBOX_INPUTS": json.dumps(
-            {name: f"/inputs/{name}" for name in mounts}, sort_keys=True
+            {name: str(python_sandbox_dataset_path(name)) for name in mounts},
+            sort_keys=True,
         ),
         "RESULT_PATH": "/work/result.json",
         "TMPDIR": "/work",

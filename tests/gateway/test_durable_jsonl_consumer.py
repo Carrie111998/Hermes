@@ -381,6 +381,171 @@ def test_docx_only_retention_completes(tmp_path):
     assert tuple(row) == ("complete", 1)
 
 
+@pytest.mark.asyncio
+async def test_retained_documents_are_annotated_only_in_replay_copy(
+    tmp_path,
+):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    document = capture / "brief.pdf"
+    document.write_bytes(b"%PDF-1.7\nfixture")
+    retained = tmp_path / "retained"
+    config = _retention_config(tmp_path, capture, retained)
+    config_data = yaml.safe_load(config.read_text(encoding="utf-8"))
+    config_data["model"] = {"provider": "test-provider", "default": "test-model"}
+    config_data["python_sandbox"] = {
+        "datasets": {"media": {"type": "path", "path": str(retained)}}
+    }
+    config.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+    raw = _message("DOCUMENT-ANNOTATION")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook), str(document)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet",
+                "application/pdf",
+            ],
+        }
+    )
+    retained_record = consumer.InboxRecord(
+        1,
+        "DOCUMENT-ANNOTATION",
+        "test-group@g.us",
+        0,
+        1,
+        raw,
+    )
+    assert consumer.retain_record_media(
+        retained_record, config_path=config
+    )["retained"] == 2
+    complete_record = consumer.InboxRecord(
+        1,
+        "DOCUMENT-ANNOTATION",
+        "test-group@g.us",
+        0,
+        1,
+        raw,
+        retention_state="complete",
+    )
+
+    case_db = _write_case_db(tmp_path / "case.db")
+    consumer._inject_bounded_source_evidence(
+        case_db,
+        [complete_record],
+        before_image_path=tmp_path / "before.json",
+        run_id="projection-before-annotation",
+        dry_run=False,
+    )
+    plans = []
+
+    class Runner:
+        async def replay(self, plan):
+            plans.append(plan)
+            return SimpleNamespace(processed=1, outbound=[])
+
+    await consumer.process_live_records(
+        [complete_record],
+        config_path=config,
+        state_db=tmp_path / "state.db",
+        runner=Runner(),
+    )
+
+    annotated = plans[0].messages[0]["body"]
+    retained_names = [
+        path.name
+        for path in sorted(retained.iterdir())
+        if path.suffix in {".xlsx", ".pdf"}
+    ]
+    assert len(retained_names) == 2
+    annotation_lines = [
+        line for line in annotated.splitlines() if line.startswith("[Attachment retained")
+    ]
+    assert len(annotation_lines) == 2
+    assert ".xlsx]" in annotation_lines[0]
+    assert ".pdf]" in annotation_lines[1]
+    assert retained_names[0] in annotated
+    assert retained_names[1] in annotated
+    assert all("/inputs/media/" in line for line in annotation_lines)
+    assert raw["body"] == "fixture message"
+    with sqlite3.connect(case_db) as conn:
+        projected_body, projected_raw = conn.execute(
+            "SELECT text,raw_json FROM bridge_message_log WHERE source_ref=?",
+            ("DOCUMENT-ANNOTATION",),
+        ).fetchone()
+    assert projected_body == "fixture message"
+    assert json.loads(projected_raw)["body"] == "fixture message"
+    assert projected_body != annotated
+
+
+def test_bypassed_document_is_not_annotated_even_if_retained_target_exists(
+    tmp_path,
+):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    retained = tmp_path / "retained"
+    config = _retention_config(tmp_path, capture, retained)
+    config_data = yaml.safe_load(config.read_text(encoding="utf-8"))
+    config_data["python_sandbox"] = {
+        "datasets": {"media": {"type": "path", "path": str(retained)}}
+    }
+    config.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+    raw = _message("DOCUMENT-BYPASSED")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "DOCUMENT-BYPASSED", "test-group@g.us", 0, 1, raw
+    )
+    consumer.retain_record_media(record, config_path=config)
+    bypassed = consumer.InboxRecord(
+        1,
+        "DOCUMENT-BYPASSED",
+        "test-group@g.us",
+        0,
+        1,
+        raw,
+        retention_state="bypassed",
+    )
+
+    messages = consumer._replay_messages_with_retained_documents(
+        [bypassed], config_path=config
+    )
+
+    assert messages[0]["body"] == "fixture message"
+    retained_targets = list(retained.glob("*.xlsx"))
+    assert retained_targets
+
+    retained_targets[0].unlink()
+    completed_without_target = consumer.InboxRecord(
+        1,
+        "DOCUMENT-BYPASSED",
+        "test-group@g.us",
+        0,
+        1,
+        raw,
+        retention_state="complete",
+    )
+    missing_target_messages = consumer._replay_messages_with_retained_documents(
+        [completed_without_target], config_path=config
+    )
+    assert missing_target_messages[0]["body"] == "fixture message"
+
+
 def test_macro_document_refusal_is_durable_and_recorded(tmp_path):
     capture = tmp_path / "capture"
     capture.mkdir()
