@@ -1269,6 +1269,7 @@ def test_create_kanban_card_resolves_templates_when_workflow_provided(
     captured = {}
 
     def fake_create_task(conn, *, title, body, assignee, **kwargs):
+        captured["title"] = title
         captured["body"] = body
         captured["assignee"] = assignee
         captured["tenant"] = kwargs.get("tenant")
@@ -1288,6 +1289,11 @@ def test_create_kanban_card_resolves_templates_when_workflow_provided(
     )
     # Card id was parsed from the mocked JSON
     assert card_id == "t_fake_card_123"
+    # Title was resolved (not raw template text)
+    title = captured["title"]
+    assert "All positions:" in title
+    assert "{phase1.all}" not in title
+    assert "{context.q}" not in title
     # Body was substituted before posting
     body = captured["body"]
     assert "EDISON_OUT" in body
