@@ -52,6 +52,8 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_FULL_OPTION_THRESHOLD_UTF16_UNITS = 40
+_DISCORD_EMBED_FIELD_UTF16_LIMIT = 1024
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
@@ -6803,6 +6805,44 @@ class DiscordAdapter(BasePlatformAdapter):
                     value="Pick one below, or click ✏️ Other to type a custom answer.",
                     inline=False,
                 )
+                if any(
+                    utf16_len(choice) > _DISCORD_FULL_OPTION_THRESHOLD_UTF16_UNITS
+                    for choice in clean_choices
+                ):
+                    full_options = "\n".join(
+                        f"{index}. {choice}" for index, choice in enumerate(
+                            clean_choices, start=1
+                        )
+                    )
+                    lines = full_options.split("\n")
+                    chunks = []
+                    chunk = []
+                    chunk_units = 0
+                    for line in lines:
+                        line_units = utf16_len(line)
+                        if not chunk:
+                            chunk.append(line)
+                            chunk_units = line_units
+                            continue
+                        if chunk_units + 1 + line_units <= _DISCORD_EMBED_FIELD_UTF16_LIMIT:
+                            chunk.append(line)
+                            chunk_units += 1 + line_units
+                        else:
+                            chunks.append("\n".join(chunk))
+                            chunk = [line]
+                            chunk_units = line_units
+                    if chunk:
+                        chunks.append("\n".join(chunk))
+
+                    for chunk_index, chunk_value in enumerate(chunks):
+                        embed.add_field(
+                            name=(
+                                "Full options"
+                                if chunk_index == 0 else "Full options (continued)"
+                            ),
+                            value=chunk_value,
+                            inline=False,
+                        )
                 view = ClarifyChoiceView(
                     choices=clean_choices,
                     clarify_id=clarify_id,
