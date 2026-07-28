@@ -160,6 +160,14 @@ app.commandLine.appendSwitch('disable-renderer-backgrounding')
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
 app.commandLine.appendSwitch('disable-background-timer-throttling')
 
+// Dev only: expose Chrome DevTools Protocol so tooling (the electron-debug
+// skill, via Playwright connectOverCDP) can attach to the running renderer for
+// UI verification. Gated on the dev-server env var so it never opens in
+// packaged builds. Must run before app `ready`.
+if (DEV_SERVER) {
+  app.commandLine.appendSwitch('remote-debugging-port', '9222')
+}
+
 const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 
 // Build-time install stamp -- the git ref this .exe was built against.
@@ -528,7 +536,7 @@ function registerMediaProtocol() {
     try {
       const url = new URL(request.url)
       const filePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
-      ;({ resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' }))
+        ; ({ resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' }))
     } catch {
       return new Response('Media not found', { status: 404 })
     }
@@ -1994,8 +2002,8 @@ function resolveWebDist() {
   if (IS_PACKAGED && /app\.asar(?=$|[\\/])/.test(fallback) && !directoryExists(fallback)) {
     rememberLog(
       `[web-dist] dashboard frontend dir resolved to an asar-internal path that ` +
-        `is not a real directory: ${fallback}. Static routes will 404. ` +
-        `Ensure dist/** is unpacked (asarUnpack) or set HERMES_DESKTOP_WEB_DIST.`
+      `is not a real directory: ${fallback}. Static routes will 404. ` +
+      `Ensure dist/** is unpacked (asarUnpack) or set HERMES_DESKTOP_WEB_DIST.`
     )
   }
   return fallback
@@ -2010,8 +2018,8 @@ function resolveRendererIndex() {
   // and the fix before Electron loads the missing file.
   rememberLog(
     `[renderer] index.html not found — the desktop app was packaged without a ` +
-      `renderer bundle. Tried: ${candidates.join(', ')}. ` +
-      `Rebuild with: hermes desktop --force-build`
+    `renderer bundle. Tried: ${candidates.join(', ')}. ` +
+    `Rebuild with: hermes desktop --force-build`
   )
   return candidates[0]
 }
@@ -2374,8 +2382,8 @@ async function ensureRuntime(backend) {
     if (!bootstrapResult.ok) {
       const bootstrapError = new Error(
         `Hermes bootstrap failed${bootstrapResult.failedStage ? ` at stage '${bootstrapResult.failedStage}'` : ''}: ` +
-          `${bootstrapResult.error || 'unknown error'}. ` +
-          `Check ${path.join(HERMES_HOME, 'logs', 'desktop.log')} for the full transcript.`
+        `${bootstrapResult.error || 'unknown error'}. ` +
+        `Check ${path.join(HERMES_HOME, 'logs', 'desktop.log')} for the full transcript.`
       )
       bootstrapError.isBootstrapFailure = true
       bootstrapError.failedStage = bootstrapResult.failedStage || null
@@ -2401,7 +2409,7 @@ async function ensureRuntime(backend) {
   if (!isHermesSourceRoot(ACTIVE_HERMES_ROOT)) {
     throw new Error(
       `Hermes install at ${ACTIVE_HERMES_ROOT} is missing or incomplete. ` +
-        'Reinstall via the desktop installer or scripts/install.ps1.'
+      'Reinstall via the desktop installer or scripts/install.ps1.'
     )
   }
 
@@ -2414,9 +2422,9 @@ async function ensureRuntime(backend) {
   if (IS_WINDOWS && !findGitBash()) {
     throw new Error(
       'Git for Windows is required for Hermes on Windows (provides Git Bash, ' +
-        "which the agent's terminal tool uses). Install it from " +
-        'https://git-scm.com/download/win or run `winget install -e --id Git.Git`, ' +
-        'then relaunch Hermes.'
+      "which the agent's terminal tool uses). Install it from " +
+      'https://git-scm.com/download/win or run `winget install -e --id Git.Git`, ' +
+      'then relaunch Hermes.'
     )
   }
 
@@ -2511,7 +2519,7 @@ function fetchJson(url, token, options = {}) {
             reject(
               new Error(
                 `Expected JSON from ${url} but got HTML (status ${res.statusCode}). ` +
-                  'The endpoint is likely missing on the Hermes backend.'
+                'The endpoint is likely missing on the Hermes backend.'
               )
             )
             return
@@ -2585,7 +2593,7 @@ function fetchPublicJson(url, options = {}) {
             reject(
               new Error(
                 `Expected JSON from ${url} but got HTML (status ${res.statusCode}). ` +
-                  'The endpoint is likely missing on the Hermes backend.'
+                'The endpoint is likely missing on the Hermes backend.'
               )
             )
             return
@@ -2986,7 +2994,7 @@ async function previewFileTarget(rawTarget, baseDir) {
     return null
   }
 
-  ;({ resolvedPath: resolved } = await resolveReadableFileForIpc(resolved, { purpose: 'Preview target' }))
+  ; ({ resolvedPath: resolved } = await resolveReadableFileForIpc(resolved, { purpose: 'Preview target' }))
 
   const mimeType = mimeTypeForPath(resolved)
   const metadata = previewFileMetadata(resolved, mimeType)
@@ -3246,16 +3254,16 @@ function buildApplicationMenu() {
     submenu: [
       IS_MAC
         ? {
-            accelerator: 'CommandOrControl+W',
-            click: () => {
-              if (previewShortcutActive) {
-                sendClosePreviewRequested()
-              } else {
-                mainWindow?.close()
-              }
-            },
-            label: 'Close'
-          }
+          accelerator: 'CommandOrControl+W',
+          click: () => {
+            if (previewShortcutActive) {
+              sendClosePreviewRequested()
+            } else {
+              mainWindow?.close()
+            }
+          },
+          label: 'Close'
+        }
         : { role: 'quit' }
     ]
   })
@@ -4128,7 +4136,7 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
     if (!(await hasLiveOauthSession(baseUrl))) {
       const err = new Error(
         'Remote Hermes gateway uses OAuth, but you are not signed in. ' +
-          'Open Settings → Gateway and click "Sign in", or switch back to Local.'
+        'Open Settings → Gateway and click "Sign in", or switch back to Local.'
       )
       err.needsOauthLogin = true
       throw err
@@ -4160,7 +4168,7 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
   if (!token) {
     throw new Error(
       'Remote Hermes gateway is selected, but no session token is saved. ' +
-        'Open Settings → Gateway and save a token, or switch back to Local.'
+      'Open Settings → Gateway and save a token, or switch back to Local.'
     )
   }
 
@@ -4200,7 +4208,7 @@ async function resolveRemoteBackend(profile) {
     if (!rawEnvToken) {
       throw new Error(
         'HERMES_DESKTOP_REMOTE_URL is set but HERMES_DESKTOP_REMOTE_TOKEN is not. ' +
-          'Both must be provided to connect to a remote Hermes backend.'
+        'Both must be provided to connect to a remote Hermes backend.'
       )
     }
     return buildRemoteConnection(rawEnvUrl, 'token', rawEnvToken, 'env')
@@ -4361,7 +4369,7 @@ async function testDesktopConnectionConfig(input = {}) {
     if (!probe.ok) {
       throw new Error(
         `Reached the gateway over HTTP, but the live WebSocket (/api/ws) connection failed: ${probe.reason} ` +
-          'The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or gateway auth/origin guard.'
+        'The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or gateway auth/origin guard.'
       )
     }
   }
@@ -6067,8 +6075,8 @@ async function runDesktopUninstall(mode) {
     } else if (IS_WINDOWS) {
       rememberLog(
         '[uninstall] no system Python found for lite/full on Windows; falling back ' +
-          'to the venv python — venv files locked by the running interpreter may ' +
-          'remain and need manual deletion.'
+        'to the venv python — venv files locked by the running interpreter may ' +
+        'remain and need manual deletion.'
       )
     }
   }
@@ -6130,7 +6138,7 @@ async function runDesktopUninstall(mode) {
 
   rememberLog(
     `[uninstall] launched detached cleanup (${mode}): ${scriptPath} ` +
-      `(removesAgent=${modeRemovesAgent(mode)} removesUserData=${modeRemovesUserData(mode)} bundle=${removeBundle || 'none'})`
+    `(removesAgent=${modeRemovesAgent(mode)} removesUserData=${modeRemovesUserData(mode)} bundle=${removeBundle || 'none'})`
   )
 
   // Give the renderer a beat to show its "uninstalling…" state, then quit so
@@ -6208,9 +6216,9 @@ ipcMain.handle('hermes:deep-link-ready', () => {
     _pendingDeepLink = null
     handleDeepLink(
       `${HERMES_PROTOCOL}://${queued.kind}/${encodeURIComponent(queued.name)}` +
-        (Object.keys(queued.params).length
-          ? '?' + new URLSearchParams(queued.params).toString()
-          : ''),
+      (Object.keys(queued.params).length
+        ? '?' + new URLSearchParams(queued.params).toString()
+        : ''),
     )
   }
   return { ok: true }

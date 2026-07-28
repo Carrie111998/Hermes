@@ -35,6 +35,7 @@ import {
   terminalContextBlocksFromDraft,
   updateComposerAttachment
 } from '@/store/composer'
+import { buildOutgoingUserText } from '@/store/mcp-app'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -523,15 +524,20 @@ export function usePromptActions({
       // Images use their base64 preview so the thumbnail renders inline without
       // a (remote-mode 403-prone) /api/media fetch — see optimisticAttachmentRef.
       let attachmentRefs = attachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
+
       const buildContextText = (atts: ComposerAttachment[]): string => {
         const contextRefs = atts
           .map(a => a.refText)
           .filter(Boolean)
           .join('\n')
 
+        // Staged MCP Apps card context (ui/update-model-context) rides along
+        // invisibly with the next user message, per the spec's deferred-delivery
+        // allowance — it never appears in the visible transcript bubble.
         return (
-          [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
-          (atts.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
+          buildOutgoingUserText(
+            [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n')
+          ) || (atts.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
         )
       }
 
@@ -540,6 +546,7 @@ export function usePromptActions({
       // bounce the drained send. The drain lock serializes them; the user path
       // keeps the guard so a stray Enter mid-turn can't double-submit.
       const hasSendable = Boolean(visibleText || terminalContextBlocks || attachments.length || hasImage)
+
       if (!hasSendable || (!options?.fromQueue && busyRef.current)) {
         return false
       }
@@ -652,6 +659,7 @@ export function usePromptActions({
         const syncedAttachments = await syncAttachmentsForSubmit(sessionId, attachments, {
           updateComposerAttachments: usingComposerAttachments
         })
+
         // Rewrite the optimistic message + prompt text with the synced refs so
         // the gateway receives @file: paths that resolve in its workspace.
         // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
@@ -672,6 +680,7 @@ export function usePromptActions({
             const resumed = await requestGateway<{ session_id: string }>('session.resume', {
               session_id: selectedStoredSessionIdRef.current
             })
+
             const recoveredId = resumed?.session_id
 
             if (recoveredId) {
@@ -1284,6 +1293,7 @@ export function usePromptActions({
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
             session_id: selectedStoredSessionIdRef.current
           })
+
           const recoveredId = resumed?.session_id
 
           if (recoveredId) {

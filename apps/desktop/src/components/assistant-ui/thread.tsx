@@ -57,6 +57,7 @@ import { uploadComposerAttachment } from '@/app/session/hooks/use-prompt-actions
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { DirectiveContent, hermesDirectiveFormatter } from '@/components/assistant-ui/directive-text'
 import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
+import { hasMcpUi, McpAppCard } from '@/components/assistant-ui/mcp-app-card'
 import { VirtualizedThread } from '@/components/assistant-ui/thread-virtualizer'
 import { HoistedTodoPanel, todosFromMessageContent } from '@/components/assistant-ui/todo-tool'
 import { ToolFallback, ToolGroupSlot } from '@/components/assistant-ui/tool-fallback'
@@ -149,37 +150,37 @@ export const Thread: FC<{
   sessionId = null,
   sessionKey
 }) => {
-  const messageComponents = useMemo(
-    () => ({
-      AssistantMessage: () => <AssistantMessage onBranchInNewChat={onBranchInNewChat} />,
-      SystemMessage,
-      UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
-      UserMessage: () => <UserMessage onCancel={onCancel} />
-    }),
-    [cwd, gateway, onBranchInNewChat, onCancel, sessionId]
-  )
+    const messageComponents = useMemo(
+      () => ({
+        AssistantMessage: () => <AssistantMessage onBranchInNewChat={onBranchInNewChat} />,
+        SystemMessage,
+        UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
+        UserMessage: () => <UserMessage onCancel={onCancel} />
+      }),
+      [cwd, gateway, onBranchInNewChat, onCancel, sessionId]
+    )
 
-  const emptyPlaceholder = intro ? (
-    <div className="flex min-h-0 w-full flex-col items-center justify-center pt-[var(--composer-measured-height)]">
-      <Intro {...intro} />
-    </div>
-  ) : undefined
-
-  return (
-    <GeneratedImageProvider>
-      <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-transparent contain-[layout_paint]">
-        <VirtualizedThread
-          clampToComposer={clampToComposer}
-          components={messageComponents}
-          emptyPlaceholder={emptyPlaceholder}
-          loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
-          sessionKey={sessionKey}
-        />
-        {loading === 'session' && <CenteredThreadSpinner />}
+    const emptyPlaceholder = intro ? (
+      <div className="flex min-h-0 w-full flex-col items-center justify-center pt-[var(--composer-measured-height)]">
+        <Intro {...intro} />
       </div>
-    </GeneratedImageProvider>
-  )
-}
+    ) : undefined
+
+    return (
+      <GeneratedImageProvider>
+        <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-transparent contain-[layout_paint]">
+          <VirtualizedThread
+            clampToComposer={clampToComposer}
+            components={messageComponents}
+            emptyPlaceholder={emptyPlaceholder}
+            loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
+            sessionKey={sessionKey}
+          />
+          {loading === 'session' && <CenteredThreadSpinner />}
+        </div>
+      </GeneratedImageProvider>
+    )
+  }
 
 function pickPrimaryPreviewTarget(targets: string[]): string[] {
   if (targets.length <= 1) {
@@ -359,6 +360,12 @@ const ChainToolFallback: FC<ToolCallMessagePartProps> = props => {
     return null
   }
 
+  // MCP Apps: any tool whose result carries an interactive UI card renders as a
+  // sandboxed iframe, regardless of the (dynamic) MCP tool name.
+  if (hasMcpUi(props.result)) {
+    return <McpAppCard {...props} />
+  }
+
   if (props.toolName === 'image_generate') {
     return <ImageGenerateTool {...props} />
   }
@@ -473,14 +480,23 @@ const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; star
   const messageId = useAuiState(s => s.message.id)
   const messageRunning = useAuiState(s => s.message.status?.type === 'running')
 
-  const pending = useAuiState(
-    s =>
-      s.thread.isRunning &&
-      s.message.status?.type === 'running' &&
-      s.message.parts
-        .slice(Math.max(0, startIndex), endIndex + 1)
-        .some(p => p?.type === 'reasoning' && p.status?.type !== 'complete')
-  )
+  const pending = useAuiState(s => {
+    if (!s.thread.isRunning || s.message.status?.type !== 'running') {
+      return false
+    }
+
+    // Only the TAIL reasoning group is live. Once any later part exists
+    // (tool/text), this burst is finished even though the message is still
+    // running — otherwise every historical Thinking block in a multi-tool
+    // turn keeps its shimmer + ticking timer until the whole turn ends (D8).
+    const lastIndex = s.message.parts.length - 1
+
+    return (
+      s.message.parts[lastIndex]?.type === 'reasoning' &&
+      lastIndex >= Math.max(0, startIndex) &&
+      lastIndex <= endIndex
+    )
+  })
 
   // A reasoning group with no actual text is pure noise — drop the whole
   // "Thinking" disclosure rather than leave an empty header eating a row. This
@@ -507,8 +523,21 @@ const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; star
 
 const ReasoningTextPart: FC<{ text: string; status?: { type: string } }> = ({ text, status }) => {
   const displayText = text.trimStart()
-  const messageRunning = useAuiState(s => s.message.status?.type === 'running')
-  const isRunning = status?.type === 'running' || messageRunning
+
+  // Live only while this part is the message's trailing reasoning burst — not
+  // for the whole turn (D8: old Thinking text kept shimmering through later
+  // tool calls because this used to read message-level running state).
+  const isTailLive = useAuiState(s => {
+    if (s.message.status?.type !== 'running') {
+      return false
+    }
+
+    const last = s.message.parts.at(-1)
+
+    return last?.type === 'reasoning' && last.text === text
+  })
+
+  const isRunning = status?.type === 'running' || isTailLive
 
   return (
     <MarkdownTextContent

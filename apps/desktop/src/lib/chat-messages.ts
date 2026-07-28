@@ -38,6 +38,8 @@ export type GatewayEventPayload = {
   error?: string | boolean
   inline_diff?: string
   duration_s?: number
+  // MCP Apps: interactive UI card carried on tool.complete (server, uri, html, csp)
+  ui?: unknown
   todos?: unknown
   model?: string
   provider?: string
@@ -191,6 +193,15 @@ export function appendTextPart(parts: ChatMessagePart[], delta: string): ChatMes
 }
 
 export function appendAssistantTextPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
+  // Don't OPEN a text part with pure whitespace. Providers (qwen/deepseek)
+  // stream a leading "\n\n" content delta between reasoning bursts; an
+  // invisible whitespace-only text part splits what reads as one continuous
+  // "Thinking" run into two disclosures. Once a text part exists, whitespace
+  // appends normally (it's real prose spacing).
+  if (!delta.trim() && parts.at(-1)?.type !== 'text') {
+    return parts
+  }
+
   const next = appendTextPart(parts, delta)
   const last = next.at(-1)
 
@@ -216,6 +227,12 @@ export function appendReasoningPart(parts: ChatMessagePart[], delta: string): Ch
     next[next.length - 1] = { ...last, text: `${last.text}${delta}` }
 
     return next
+  }
+
+  // Same guard as text parts: never OPEN a reasoning part with pure
+  // whitespace — it renders as an empty collapsed "Thinking" shell.
+  if (!delta.trim()) {
+    return parts
   }
 
   next.push(reasoningPart(delta))
@@ -306,6 +323,26 @@ function findToolPartIndex(
 
     if (stableIndex >= 0) {
       return stableIndex
+    }
+
+    // Adopt the synthetic generating row. `tool.generating` emits name-only
+    // (no id, no args), then `tool.start` arrives with the stable id — for
+    // tools without a context preview (every MCP tool) the contextual
+    // matching below can never link them, orphaning the synthetic row as a
+    // forever-spinning "Running …" line next to the completed one. Only
+    // synthetic rows (`live-tool:` ids) are adoptable, so a parallel
+    // same-name call can't steal a row already claimed by another id.
+    const syntheticIndex = parts.findIndex(
+      part =>
+        part.type === 'tool-call' &&
+        part.toolName === name &&
+        part.result === undefined &&
+        typeof part.toolCallId === 'string' &&
+        part.toolCallId.startsWith('live-tool:')
+    )
+
+    if (syntheticIndex >= 0) {
+      return syntheticIndex
     }
 
     // Some live streams start without an id, then complete with one. Fall
@@ -411,6 +448,7 @@ function toolResult(
     ...(payload?.preview ? { preview: payload.preview } : {}),
     ...(payload?.duration_s !== undefined ? { duration_s: payload.duration_s } : {}),
     ...carryTodos(payload, prevResult, prevArgs),
+    ...(payload?.ui ? { ui: payload.ui } : {}),
     ...(payload?.error ? { error: payload.error } : {})
   }
 }

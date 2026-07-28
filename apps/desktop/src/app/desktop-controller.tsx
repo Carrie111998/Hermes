@@ -11,7 +11,6 @@ import { Pane, PaneMain } from '@/components/pane-shell'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
-import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getCronJobs, getSessionMessages, listAllProfileSessions, type SessionInfo, triggerCronJob } from '../hermes'
 import { preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
@@ -37,6 +36,7 @@ import {
   SIDEBAR_SESSIONS_PAGE_SIZE,
   unpinSession
 } from '../store/layout'
+import { $mcpAppUserMessage, clearMcpAppUserMessage } from '../store/mcp-app'
 import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '../store/preview'
 import {
   $activeGatewayProfile,
@@ -80,6 +80,7 @@ import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store
 import { isSecondaryWindow } from '../store/windows'
 
 import { ChatView } from './chat'
+import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
 import {
   ChatPreviewRail,
@@ -277,18 +278,23 @@ export function DesktopController() {
       if (!payload || payload.kind !== 'blueprint' || !payload.name) {
         return
       }
+
       const slots = Object.entries(payload.params || {})
         .map(([k, v]) => {
           const sval = /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v
+
           return `${k}=${sval}`
         })
         .join(' ')
+
       const command = `/blueprint ${payload.name}${slots ? ' ' + slots : ''}`
       requestComposerInsert(command, { mode: 'block', target: 'main' })
       requestComposerFocus('main')
     })
+
     // Tell the main process the renderer is ready to receive deep links.
     void window.hermesDesktop?.signalDeepLinkReady?.()
+
     return () => unsubscribe?.()
   }, [])
 
@@ -729,6 +735,20 @@ export function DesktopController() {
     sttEnabled,
     updateSessionState
   })
+
+  // MCP Apps card→agent delegation (`ui/message` from a card, staged via
+  // src/store/mcp-app.ts): route through the normal send path so the agent
+  // picks up e.g. "checkout_id=… 帮我下单" exactly like a typed message.
+  const mcpAppUserMessage = useStore($mcpAppUserMessage)
+
+  useEffect(() => {
+    if (!mcpAppUserMessage) {
+      return
+    }
+
+    clearMcpAppUserMessage()
+    void submitText(mcpAppUserMessage.text)
+  }, [mcpAppUserMessage, submitText])
 
   useGatewayBoot({
     handleGatewayEvent: handleDesktopGatewayEvent,
