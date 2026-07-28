@@ -472,7 +472,24 @@ class TestWebSearchSchema:
         # tool dispatcher resolves a provider from the registry and calls
         # provider.search(query, limit). Mock the provider lookup so we can
         # assert the limit is clamped before reaching the backend.
-        fake_search = MagicMock(return_value={"success": True, "data": {"web": []}})
+        #
+        # Return a non-empty hit: fork CloakBrowser auto-fallback treats an
+        # empty ``data.web`` as provider failure and would otherwise issue a
+        # real network search, which is outside this unit's scope.
+        primary_payload = {
+            "success": True,
+            "data": {
+                "web": [
+                    {
+                        "title": "Docs",
+                        "url": "https://example.com/docs",
+                        "description": "example",
+                        "position": 1,
+                    }
+                ]
+            },
+        }
+        fake_search = MagicMock(return_value=primary_payload)
         fake_provider = MagicMock(
             name="ParallelWebSearchProvider",
             supports_search=MagicMock(return_value=True),
@@ -487,7 +504,7 @@ class TestWebSearchSchema:
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("docs", limit=500))
 
-        assert result == {"success": True, "data": {"web": []}}
+        assert result == primary_payload
         fake_search.assert_called_once_with("docs", 100)
 
 

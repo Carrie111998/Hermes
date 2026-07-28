@@ -264,13 +264,40 @@ const toInboundMessages = async (client, cache, event, phone) => {
     assert "Preserve mixed text + attachment iMessage payloads" not in before
 
 
-def test_spectrum_patch_satisfied_helper_detects_upstream() -> None:
+def test_spectrum_patch_satisfied_helper_detects_upstream(tmp_path: Path) -> None:
+    """Helper must detect upstream/Hermes markers without requiring a live
+    ``npm install`` under the real sidecar (node_modules is gitignored, so CI
+    checkouts do not ship ``@spectrum-ts/imessage``).
+    """
     from plugins.platforms.photon.adapter import (
+        _SPECTRUM_PATCH_MARKER,
+        _SPECTRUM_UPSTREAM_MIXED_MARKER,
         _spectrum_mixed_attachment_patch_satisfied,
     )
 
-    sidecar = Path("plugins/platforms/photon/sidecar")
-    assert _spectrum_mixed_attachment_patch_satisfied(sidecar) is True
+    missing = tmp_path / "no-modules"
+    missing.mkdir()
+    assert _spectrum_mixed_attachment_patch_satisfied(missing) is False
+
+    upstream = tmp_path / "upstream-sidecar"
+    dist = upstream / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.js").write_text(
+        f"export const parts = {_SPECTRUM_UPSTREAM_MIXED_MARKER!r};\n",
+        encoding="utf-8",
+    )
+    assert _spectrum_mixed_attachment_patch_satisfied(upstream) is True
+
+    hermes_patched = tmp_path / "hermes-patched-sidecar"
+    patched_dist = (
+        hermes_patched / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    )
+    patched_dist.mkdir(parents=True)
+    (patched_dist / "index.js").write_text(
+        f"// {_SPECTRUM_PATCH_MARKER}\nexport {{}};\n",
+        encoding="utf-8",
+    )
+    assert _spectrum_mixed_attachment_patch_satisfied(hermes_patched) is True
 
 
 def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:

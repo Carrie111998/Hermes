@@ -278,7 +278,10 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 
 T = TypeVar("T")
 
-DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+# Path() wraps the home so a str-returning monkeypatch/override during tests
+# cannot break module import with ``str / str`` (TypeError) before SessionDB
+# is constructed — seen as a flake when tui_gateway imports hermes_state late.
+DEFAULT_DB_PATH = Path(get_hermes_home()) / "state.db"
 
 SCHEMA_VERSION = 23
 
