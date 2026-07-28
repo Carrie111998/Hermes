@@ -1,7 +1,7 @@
 name: Request CodeRabbit Review
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, ready_for_review, labeled]
 concurrency:
   group: request-coderabbit-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -12,7 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write # needed to request reviewers via pulls.requestReviewers
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'ai-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review')
     steps:
       - name: Request CodeRabbit and Gemini reviews
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
@@ -25,9 +29,9 @@ jobs:
                 owner,
                 repo,
                 pull_number: prNumber,
-                reviewers: ['coderabbitai', 'gemini-code-assist[bot]'],
+                reviewers: ['coderabbitai'],
               });
-              core.info('Review requested from coderabbitai and gemini-code-assist[bot]');
+              core.info('Review requested from coderabbitai');
             } catch (e) {
               const status = e.status ?? e.response?.status;
               const msg = e.response?.data?.message ?? e.message;

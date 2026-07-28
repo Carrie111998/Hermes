@@ -2,6 +2,9 @@ language: "en-US"
 tone_instructions: "Be concise and direct."
 reviews:
   profile: "assertive"
+  # Auto-review stays ON here because this is a public repo, and CodeRabbit
+  # reviews on public repos do not consume the paid quota.
+  # Private repos in this account run on-demand only, via the `ai-review` label.
   auto_review:
     enabled: true
     drafts: true
