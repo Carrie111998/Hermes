@@ -1,4 +1,5 @@
 .DS_Store
+.idea/
 /venv/
 /venv.old/
 /_pycache/
@@ -112,6 +113,8 @@ models-dev-upstream/
 .cursor/
 .gemini/
 .zed/
+.opencode/
+.codegraph/
 .mcp.json
 opencode.json
 config/mcporter.json

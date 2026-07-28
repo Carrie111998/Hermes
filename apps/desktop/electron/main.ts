@@ -38,6 +38,7 @@ import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
+import { resolveHermesHome } from './hermes-home'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -159,7 +160,6 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
-import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath } from './wsl-path-bridge'
@@ -423,46 +423,13 @@ if (INSTALL_STAMP) {
 // HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
 // HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
 // touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
-function resolveHermesHome() {
-  if (process.env.HERMES_HOME) {
-    return normalizeHermesHomeRoot(process.env.HERMES_HOME)
-  }
-
-  if (USER_DATA_OVERRIDE) {
-    return path.join(path.resolve(USER_DATA_OVERRIDE), 'hermes-home')
-  }
-
-  if (IS_WINDOWS) {
-    // A GUI app launched from Explorer inherits the environment block captured
-    // at login, so a HERMES_HOME set via `setx` AFTER login is invisible in
-    // process.env even though the CLI (a fresh shell) sees it. Without this the
-    // backend silently falls back to %LOCALAPPDATA%\hermes and reports "No
-    // inference provider configured" despite a valid configured home (#45471).
-    // Consult the live User-scoped registry value before the default below.
-    const fromRegistry = readWindowsUserEnvVar('HERMES_HOME')
-
-    if (fromRegistry) {
-      return normalizeHermesHomeRoot(fromRegistry)
-    }
-  }
-
-  if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
-    const legacy = path.join(app.getPath('home'), '.hermes')
-
-    // Migrate transparently to LOCALAPPDATA, but honour an existing legacy
-    // ~/.hermes setup (no LOCALAPPDATA install yet) so users don't lose state.
-    if (!directoryExists(localappdata) && directoryExists(legacy)) {
-      return legacy
-    }
-
-    return localappdata
-  }
-
-  return path.join(app.getPath('home'), '.hermes')
-}
-
-const HERMES_HOME = resolveHermesHome()
+const HERMES_HOME = resolveHermesHome({
+  directoryExists,
+  homeDirectory: app.getPath('home'),
+  isWindows: IS_WINDOWS,
+  localAppData: process.env.LOCALAPPDATA,
+  userDataOverride: USER_DATA_OVERRIDE
+})
 
 function hermesManagedNodePathEntries() {
   // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in

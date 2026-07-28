@@ -470,7 +470,7 @@ function spawnPowerShell(scriptPath, args, { emit, stageName, abortSignal, herme
           ...process.env,
           // Pass HERMES_HOME through so install.ps1 respects the caller's
           // choice rather than re-computing the default.
-          HERMES_HOME: hermesHome || process.env.HERMES_HOME || ''
+          HERMES_HOME: hermesHome || ''
         }
       })
     )
@@ -566,7 +566,7 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        HERMES_HOME: hermesHome || process.env.HERMES_HOME || ''
+        HERMES_HOME: hermesHome || ''
       }
     })
 

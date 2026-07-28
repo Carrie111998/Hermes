@@ -20,6 +20,8 @@ import re
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
+from hermes_constants import get_hermes_home_env
+
 ServiceManagerKind = Literal["systemd", "launchd", "windows", "s6", "none"]
 
 # Profile name → service directory mapping. Profile names must be safe
@@ -344,11 +346,9 @@ def _profile_dir_for_gateway_service(name: str) -> Path:
     service suffix to either the root default profile or
     ``<root>/profiles/<profile>``.
     """
-    import os
-
     profile = name[len(S6_SERVICE_PREFIX):] if name.startswith(S6_SERVICE_PREFIX) else name
     validate_profile_name(profile)
-    hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    hermes_home = Path(get_hermes_home_env() or "/opt/data")
     if hermes_home.parent.name == "profiles":
         root = hermes_home.parent.parent
     else:

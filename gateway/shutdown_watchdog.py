@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_process_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -46,10 +46,7 @@ _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
 
 def _process_hermes_home() -> Path:
     """HERMES_HOME for process-level identity files (ignore profile overrides)."""
-    val = os.environ.get("HERMES_HOME", "").strip()
-    if val:
-        return Path(val)
-    return get_hermes_home()
+    return get_process_hermes_home()
 
 
 def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
