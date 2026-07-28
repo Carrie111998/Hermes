@@ -116,6 +116,31 @@ def test_no_idempotency_key_never_collides(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_dispatch_blocks_agent_task_without_body(kanban_home, all_assignees_spawnable):
+    spawned = []
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="underspecified",
+            body="   ",
+            assignee="worker",
+            created_by="user",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        task = _must_task(conn, tid)
+        assert spawned == []
+        assert tid in result.auto_blocked
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert task.worker_pid is None
+    finally:
+        conn.close()
+
+
 def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawnable):
     """N consecutive spawn failures on the same task → auto_blocked."""
 

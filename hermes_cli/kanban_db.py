@@ -8481,7 +8481,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body, created_by FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -8592,6 +8592,15 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        if row["created_by"] is not None and not (row["body"] or "").strip():
+            if dry_run or block_task(
+                conn,
+                row["id"],
+                reason="Task body is required before dispatch",
+                kind="needs_input",
+            ):
+                result.auto_blocked.append(row["id"])
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
