@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Your order — MMM Investment</title>
-<meta name="description" content="Storefront mockup: kits, tools, and homeschool resources invoiced against TEFA and other state education funds.">
+<title>The Vulturian — MMM Investment General Store</title>
+<meta name="description" content="General Store mockup: family titles and activity books sold at retail, kept separate from the TEFA/ESA-funded storefront.">
 <meta name="color-scheme" content="light dark">
-<meta property="og:title" content="Your order — MMM Investment">
-<meta property="og:description" content="Storefront mockup: kits, tools, and homeschool resources invoiced against TEFA and other state education funds.">
+<meta property="og:title" content="The Vulturian — MMM Investment General Store">
+<meta property="og:description" content="General Store mockup: family titles and activity books sold at retail, kept separate from the TEFA/ESA-funded storefront.">
 <meta property="og:type" content="website">
 <style>
   *,*::before,*::after{box-sizing:border-box}
@@ -17,14 +17,9 @@
 </head>
 <body>
 <!--
-  MOCKUP — the third of three linked storefront-page templates
-  (shop → product → order). See ../../README.md.
-
-  The cart lives in localStorage via cart.js — there is no backend and
-  nothing is ever charged. "Request itemized quote" builds a mailto: link
-  from the cart contents, which matches the real ordering model: browse,
-  build a list, get an invoice, submit it to your program. No checkout,
-  because education funds pay against an approved invoice, not a card.
+  MOCKUP — the one fully-built product page in the General Store, standing
+  in as the template every other title/coloring book would use. Everything
+  bracketed is a real placeholder, not invented content about a real book.
 -->
 
 <style>
@@ -336,87 +331,71 @@ a.product{text-decoration:none; color:inherit}
   *{animation:none !important}
 }
 
-
-.order-empty{padding:3rem 0; text-align:center; color:var(--muted)}
-.order-empty a{color:var(--accent)}
 </style>
 
 <div class="page">
 <a class="skip" href="#main">Skip to content</a>
-<div class="mockup-flag">Prototype — mockup for review, not the live site</div>
+<div class="gs-flag">General Store &mdash; real checkout, paid by card &mdash; prototype, not the live site</div>
 
 <header class="topbar">
   <div class="wrap topbar-in">
     <a class="brand" href="../index.html">
       <span class="brand-mark">MMM Investment</span>
-      <span class="brand-sub mono">Supply co.</span>
+      <span class="brand-sub mono">General store</span>
     </a>
     <nav class="nav" aria-label="Primary">
       <a href="shop.html">Shop</a>
-      <a href="../index.html#funding">Funding help</a>
-      <a href="../index.html#carbon">Carbon</a>
-      <a href="../index.html#faq">FAQ</a>
-      <a href="../general-store/shop.html">General store</a>
+      <a href="../store/shop.html">ESA / TEFA store</a>
+      <a href="../index.html">Main site</a>
     </nav>
-    <a class="btn btn-ghost btn-sm" href="order.html" aria-current="page">Order <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
+    <a class="btn btn-ghost btn-sm" href="checkout.html">Cart <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
   </div>
 </header>
 
 <main id="main">
-  <div class="wrap band">
-    <div class="opener"><span class="mono">Your order</span></div>
-    <h1 class="h-lg" style="padding-bottom:.5rem">Review before you request a quote.</h1>
-    <p class="prose" style="padding-bottom:1.5rem">Nothing here is charged. This list becomes an itemized
-      invoice, categorised to match your program, that you submit for approval.</p>
+  <div class="wrap">
+    <nav class="crumb" aria-label="Breadcrumb">
+      <a href="shop.html">Shop</a><span aria-hidden="true">/</span>
+      <b>The Vulturian</b>
+    </nav>
 
-    <ol class="progress" style="padding-bottom:2rem; max-width:34rem">
-      <li data-state="done">Browse</li>
-      <li data-state="active">Review order</li>
-      <li data-state="">Get invoice</li>
-      <li data-state="">Program approves</li>
-      <li data-state="">Ships</li>
-    </ol>
+    <section class="pd-grid" style="padding-bottom:2.5rem">
+      <div class="pd-gallery" aria-hidden="true">The Vulturian<br><span class="fill">[cover image]</span></div>
 
-    <div class="order-grid">
-      <div>
-        <div style="overflow-x:auto">
-          <table class="order-table">
-            <colgroup>
-              <col style="width:auto">
-              <col style="width:6rem">
-              <col style="width:8.5rem">
-              <col style="width:6rem">
-              <col style="width:4.5rem">
-            </colgroup>
-            <thead>
-              <tr>
-                <th>Item</th>
-                <th style="text-align:right">Price</th>
-                <th style="text-align:center">Qty</th>
-                <th style="text-align:right">Total</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="order-list"></tbody>
-          </table>
+      <div class="stack g-20">
+        <div class="stack g-8">
+          <span class="mono" style="color:var(--clay)">GEN-BK-001 · Books</span>
+          <h1 class="h-xl">The Vulturian</h1>
         </div>
-        <div id="order-empty" class="order-empty" hidden>
-          <p>Your order is empty. <a href="shop.html">Browse the shop</a> to add a kit.</p>
+        <p class="prose" style="max-width:52ch">by <span class="fill">[author names, as you want them credited]</span></p>
+
+        <p class="pd-price"><span class="fill">[price TBD]</span></p>
+
+        <div class="pd-meta">
+          <span>Format <b><span class="fill">[print / ebook]</span></b></span>
+          <span>Pages <b><span class="fill">[__]</span></b></span>
+          <span>ISBN <b><span class="fill">[if applicable]</span></b></span>
+        </div>
+
+        <div class="stack g-12">
+          <span class="mono" style="color:var(--muted)">About this book</span>
+          <p class="prose"><span class="fill">[Drop in your real back-cover copy or a short description here — nothing has been invented about the plot, setting, or characters, since this is a real book by real authors.]</span></p>
+        </div>
+
+        <div class="stack g-16" style="padding-top:.5rem">
+          <div style="display:flex; align-items:center; gap:1rem; flex-wrap:wrap">
+            <span class="qty">
+              <button type="button" onclick="var i=document.getElementById('pd-qty'); i.value=Math.max(1,(parseInt(i.value,10)||1)-1)" aria-label="Decrease quantity">−</button>
+              <input type="text" id="pd-qty" value="1" inputmode="numeric" data-qty-for="GEN-BK-001" aria-label="Quantity">
+              <button type="button" onclick="var i=document.getElementById('pd-qty'); i.value=(parseInt(i.value,10)||1)+1" aria-label="Increase quantity">+</button>
+            </span>
+            <button type="button" class="btn btn-solid" data-add-to-cart="GEN-BK-001">Add to cart</button>
+          </div>
+          <p style="font-size:.86rem; color:var(--muted); max-width:48ch">Paid at checkout by card &mdash;
+            this is a retail sale, not a TEFA/ESA-funded purchase.</p>
         </div>
       </div>
-
-      <aside class="summary">
-        <span class="mono">Order summary</span>
-        <div class="sum-row"><span>Subtotal</span><span id="order-subtotal">$0.00</span></div>
-        <div class="sum-row"><span>Shipping</span><span>Carbon-neutral, included</span></div>
-        <div class="sum-row sum-total"><span>Estimated total</span><span id="order-total">$0.00</span></div>
-        <p style="font-size:.86rem; color:var(--muted); padding-top:1rem; line-height:1.55">
-          This is an estimate. Your actual invoice may adjust once we confirm which items your program
-          currently treats as eligible.</p>
-        <a class="btn btn-solid btn-block" id="quote-link" href="mailto:Mmminvestment25@gmail.com" style="margin-top:1rem">Request itemized quote</a>
-        <a class="btn btn-ghost btn-block" href="../index.html#funding" style="margin-top:.6rem">No program account yet? Get funding help</a>
-      </aside>
-    </div>
+    </section>
   </div>
 </main>
 
@@ -426,16 +405,13 @@ a.product{text-decoration:none; color:inherit}
       <span class="foot-brand">MMM Investment</span>
       <nav class="foot-nav" aria-label="Footer">
         <a href="shop.html">Shop</a>
-        <a href="order.html">Order</a>
-        <a href="../index.html#funding">Funding help</a>
-        <a href="../index.html#carbon">Carbon</a>
-        <a href="../general-store/shop.html">General store</a>
+        <a href="checkout.html">Cart</a>
+        <a href="../store/shop.html">ESA / TEFA store</a>
         <a href="mailto:Mmminvestment25@gmail.com">Email</a>
       </nav>
     </div>
-    <p class="disclaim">Prices shown are illustrative for this mockup and computed from example costs
-      per PRICING.md, not final. MMM Investment is an independent supplier of educational tools and
-      materials, not affiliated with or endorsed by TEFA or any state program.</p>
+    <p class="disclaim">General Store purchases are paid at retail and are not TEFA/ESA-funded
+      purchases. Price, page count, and cover shown are placeholders pending real details.</p>
   </div>
 </footer>
 </div>

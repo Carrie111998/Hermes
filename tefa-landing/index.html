@@ -115,9 +115,14 @@
 *,*::before,*::after{box-sizing:border-box}
 .page{
   font-family:var(--body); font-size:1.0625rem; line-height:1.72;
-  color:var(--ink); background:var(--paper);
+  color:var(--ink); background:var(--paper); min-height:100vh; min-height:100dvh;
   -webkit-font-smoothing:antialiased; position:relative; overflow-x:hidden;
 }
+/* min-height matters here, not just for looks: overflow-x:hidden gives .page
+   a used overflow-y of auto, which makes it a clipping container for the
+   fixed-position grid background below — on a page shorter than the
+   viewport, that background would otherwise clip to content height and
+   leave bare white beneath it. */
 .page::before{
   content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
   background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),

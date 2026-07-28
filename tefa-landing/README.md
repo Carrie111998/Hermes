@@ -28,19 +28,35 @@ a stand-in for what every SKU's page would look like in production. Each mockup 
 `PRICING.md` for how those prices were actually calculated. These pages are not yet linked
 from `index.html` — wire that up once you've picked a direction.
 
+The Situation Handling & Self-Command department now includes two additions aimed at the
+transition into adulthood: an **Interview & First Job Prep Kit** (mock interviews, resume
+worksheet, follow-up scripts) and an **Adulting Launch Kit** (first apartment, pay stubs,
+basic taxes and insurance). Both are genuinely educational, so they stay in the ESA store
+rather than the General Store below.
+
+## General Store (`general-store/`)
+
+A second, separate prototype for retail goods — a family book (*The Vulturian*) and a
+handful of original activity/coloring books — paid by card rather than invoiced through a
+program. It's kept apart from the ESA store on purpose: TEFA/ESA funds cover approved
+educational expenses, and a coloring book or novel invoiced alongside skill kits risks a
+program questioning the invoice. See `general-store/README.md` for the full breakdown of
+what's a working prototype versus what still needs a real payment processor, a real tax
+rate, and real book details wired in — none of that is invented here.
+
 ## Editing
 
-Edit `src/page.html` for the main page, or anything under `store/src/` for the storefront
-mockups, then rebuild everything at once:
+Edit `src/page.html` for the main page, or anything under `store/src/` or
+`general-store/src/` for the mockups, then rebuild everything at once:
 
 ```
 python3 build.py
 ```
 
 That inlines the four subset webfonts from `fonts/` into `index.html`, and inlines the
-same fonts plus `store/shared_style.css` (the mockups' shared design tokens) into each
-`store/*.html`. Editing the built files directly works too, but the next build overwrites
-them.
+same fonts plus `store/shared_style.css` (shared design tokens for both mockup sets) into
+each `store/*.html` and `general-store/*.html`. Editing the built files directly works
+too, but the next build overwrites them.
 
 ## Before it goes live
 

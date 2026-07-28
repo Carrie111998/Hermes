@@ -106,9 +106,14 @@
 *,*::before,*::after{box-sizing:border-box}
 .page{
   font-family:var(--body); font-size:1.0625rem; line-height:1.72;
-  color:var(--ink); background:var(--paper);
+  color:var(--ink); background:var(--paper); min-height:100vh; min-height:100dvh;
   -webkit-font-smoothing:antialiased; position:relative; overflow-x:hidden;
 }
+/* min-height matters here, not just for looks: overflow-x:hidden gives .page
+   a used overflow-y of auto, which makes it a clipping container for the
+   fixed-position grid background below — on any page/state shorter than the
+   viewport (e.g. an empty-cart or order-confirmation panel), that background
+   would otherwise clip to content height and leave bare white beneath it. */
 .page::before{
   content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
   background-image:linear-gradient(var(--grid-line) 1px,transparent 1px),
@@ -291,6 +296,43 @@ a.product{text-decoration:none; color:inherit}
 .mockup-flag{background:var(--pine-accent); color:var(--on-pine-accent); text-align:center; font-family:var(--mono);
   font-size:.66rem; letter-spacing:.1em; text-transform:uppercase; padding:.55rem 1rem}
 
+/* General Store banner: same tokens, but flagged clay/red rather than the
+   ESA store's pine/accent so the two are never mistaken for one another. */
+.gs-flag{background:var(--clay); color:#FFF6F1; text-align:center; font-family:var(--mono);
+  font-size:.66rem; letter-spacing:.1em; text-transform:uppercase; padding:.55rem 1rem}
+.gs-badge{font-family:var(--mono); font-size:.6rem; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--clay); border:1px solid currentColor; border-radius:2px; padding:.24rem .45rem}
+
+/* ---------- Checkout form (General Store) ---------- */
+.field{display:flex; flex-direction:column; gap:.4rem}
+.field label{font-family:var(--mono); font-size:.66rem; letter-spacing:.08em; text-transform:uppercase; color:var(--muted)}
+.field input,.field select{font-family:var(--body); font-size:.98rem; color:var(--ink); background:var(--card);
+  border:1px solid var(--rule); border-radius:2px; padding:.7rem .8rem; width:100%}
+.field input:focus-visible,.field select:focus-visible{outline:2.5px solid var(--focus); outline-offset:1px}
+.field-row{display:grid; grid-template-columns:1fr 1fr; gap:1rem}
+.field-row-3{display:grid; grid-template-columns:1.4fr .8fr .8fr; gap:1rem}
+@media (max-width:560px){.field-row,.field-row-3{grid-template-columns:1fr}}
+.form-section{display:flex; flex-direction:column; gap:1rem; padding-block:1.75rem; border-bottom:1px solid var(--rule)}
+.form-section:first-child{padding-top:0}
+.form-section h2{font-size:1.05rem}
+
+.ship-opt{display:flex; align-items:center; justify-content:space-between; gap:1rem; border:1px solid var(--rule);
+  border-radius:3px; padding:.9rem 1rem; cursor:pointer; transition:border-color .15s ease}
+.ship-opt:has(input:checked){border-color:var(--accent); background:color-mix(in oklab, var(--accent) 6%, var(--card))}
+.ship-opt input{accent-color:var(--accent)}
+.ship-opt .so-label{display:flex; align-items:center; gap:.65rem; font-size:.95rem}
+.ship-opt .so-price{font-family:var(--mono); font-size:.85rem; font-variant-numeric:tabular-nums}
+
+.pay-mock{border:1px dashed var(--rule); border-radius:3px; padding:1.25rem 1.1rem; background:var(--paper-2)}
+.pay-mock p{font-size:.88rem; color:var(--muted); line-height:1.55}
+.pay-mock .mono{color:var(--clay); display:block; padding-bottom:.5rem}
+.pay-methods{display:flex; flex-wrap:wrap; gap:.6rem; padding-top:.9rem}
+.pay-methods span{font-family:var(--mono); font-size:.66rem; letter-spacing:.06em; text-transform:uppercase;
+  border:1px solid var(--rule); border-radius:2px; padding:.4rem .65rem; color:var(--muted); background:var(--card)}
+
+.confirm{text-align:center; padding-block:3.5rem; max-width:34rem; margin-inline:auto}
+.confirm .mono{color:var(--good); display:block; padding-bottom:1rem}
+
 @media (prefers-reduced-motion:reduce){
   .product:hover,.btn:hover{transform:none}
   *{animation:none !important}
@@ -318,6 +360,7 @@ a.product{text-decoration:none; color:inherit}
       <a href="../index.html#funding">Funding help</a>
       <a href="../index.html#carbon">Carbon</a>
       <a href="../index.html#faq">FAQ</a>
+      <a href="../general-store/shop.html">General store</a>
     </nav>
     <a class="btn btn-ghost btn-sm" href="order.html">Order <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
   </div>
@@ -428,6 +471,30 @@ a.product{text-decoration:none; color:inherit}
           <p class="desc">Asking for what you need, holding a boundary, and putting it in writing when it matters.</p>
           <span class="sku">MMM-SC-203</span>
           <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-SC-203">Add to order</button>
+        </div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Interview & First Job Prep Kit">
+          <div class="thumb">Interview &amp;<br>First Job Prep Kit</div>
+        </a>
+        <div class="pbody">
+          <div class="price-line"><span class="price">$39.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Interview &amp; First Job Prep Kit</h4></a>
+          <p class="desc">Sixty mock-interview questions, a resume worksheet, and the scripts for the calls and follow-ups that actually land the job.</p>
+          <span class="sku">MMM-SC-204</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-SC-204">Add to order</button>
+        </div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Adulting Launch Kit">
+          <div class="thumb">Adulting<br>Launch Kit</div>
+        </a>
+        <div class="pbody">
+          <div class="price-line"><span class="price">$57.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Adulting Launch Kit</h4></a>
+          <p class="desc">Renting a first place, reading a pay stub, basic taxes and insurance &mdash; the head start for the year school hands them a diploma instead.</p>
+          <span class="sku">MMM-SC-205</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-SC-205">Add to order</button>
         </div>
       </article>
     </div>
@@ -594,6 +661,7 @@ a.product{text-decoration:none; color:inherit}
         <a href="order.html">Order</a>
         <a href="../index.html#funding">Funding help</a>
         <a href="../index.html#carbon">Carbon</a>
+        <a href="../general-store/shop.html">General store</a>
         <a href="mailto:Mmminvestment25@gmail.com">Email</a>
       </nav>
     </div>

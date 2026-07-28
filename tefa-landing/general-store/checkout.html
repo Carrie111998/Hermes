@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Your order — MMM Investment</title>
-<meta name="description" content="Storefront mockup: kits, tools, and homeschool resources invoiced against TEFA and other state education funds.">
+<title>Checkout — MMM Investment General Store</title>
+<meta name="description" content="General Store mockup: family titles and activity books sold at retail, kept separate from the TEFA/ESA-funded storefront.">
 <meta name="color-scheme" content="light dark">
-<meta property="og:title" content="Your order — MMM Investment">
-<meta property="og:description" content="Storefront mockup: kits, tools, and homeschool resources invoiced against TEFA and other state education funds.">
+<meta property="og:title" content="Checkout — MMM Investment General Store">
+<meta property="og:description" content="General Store mockup: family titles and activity books sold at retail, kept separate from the TEFA/ESA-funded storefront.">
 <meta property="og:type" content="website">
 <style>
   *,*::before,*::after{box-sizing:border-box}
@@ -17,14 +17,12 @@
 </head>
 <body>
 <!--
-  MOCKUP — the third of three linked storefront-page templates
-  (shop → product → order). See ../../README.md.
-
-  The cart lives in localStorage via cart.js — there is no backend and
-  nothing is ever charged. "Request itemized quote" builds a mailto: link
-  from the cart contents, which matches the real ordering model: browse,
-  build a list, get an invoice, submit it to your program. No checkout,
-  because education funds pay against an approved invoice, not a card.
+  MOCKUP — checkout.html deliberately stops short of a real payment field.
+  See the .pay-mock section below and general-store/README.md: a static
+  page has no business collecting raw card numbers (not PCI-compliant),
+  so this shows the full checkout LAYOUT — address, shipping, order
+  summary, tax line — and mocks only the payment step, clearly labelled.
+  "Place order" shows a client-side confirmation and charges nothing.
 -->
 
 <style>
@@ -337,85 +335,131 @@ a.product{text-decoration:none; color:inherit}
 }
 
 
-.order-empty{padding:3rem 0; text-align:center; color:var(--muted)}
-.order-empty a{color:var(--accent)}
+.checkout-grid{display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); gap:clamp(2rem,5vw,3rem); align-items:start}
+@media (max-width:940px){.checkout-grid{grid-template-columns:1fr}}
+.co-mini{display:flex; justify-content:space-between; gap:1rem; padding:.6rem 0; border-bottom:1px solid var(--rule-soft); font-size:.92rem}
+.co-mini:last-of-type{border-bottom:0}
+.co-mini b{font-variant-numeric:tabular-nums; font-family:var(--mono); font-weight:500}
+.co-mini.sum-total span{font-family:var(--display); font-weight:750; font-size:1.02rem; color:var(--ink)}
+.co-mini.sum-total b{font-size:1.1rem; color:var(--ink)}
 </style>
 
 <div class="page">
 <a class="skip" href="#main">Skip to content</a>
-<div class="mockup-flag">Prototype — mockup for review, not the live site</div>
+<div class="gs-flag">General Store &mdash; real checkout, paid by card &mdash; prototype, not the live site</div>
 
 <header class="topbar">
   <div class="wrap topbar-in">
     <a class="brand" href="../index.html">
       <span class="brand-mark">MMM Investment</span>
-      <span class="brand-sub mono">Supply co.</span>
+      <span class="brand-sub mono">General store</span>
     </a>
     <nav class="nav" aria-label="Primary">
       <a href="shop.html">Shop</a>
-      <a href="../index.html#funding">Funding help</a>
-      <a href="../index.html#carbon">Carbon</a>
-      <a href="../index.html#faq">FAQ</a>
-      <a href="../general-store/shop.html">General store</a>
+      <a href="../store/shop.html">ESA / TEFA store</a>
+      <a href="../index.html">Main site</a>
     </nav>
-    <a class="btn btn-ghost btn-sm" href="order.html" aria-current="page">Order <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
+    <a class="btn btn-ghost btn-sm" href="checkout.html" aria-current="page">Cart <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
   </div>
 </header>
 
 <main id="main">
-  <div class="wrap band">
-    <div class="opener"><span class="mono">Your order</span></div>
-    <h1 class="h-lg" style="padding-bottom:.5rem">Review before you request a quote.</h1>
-    <p class="prose" style="padding-bottom:1.5rem">Nothing here is charged. This list becomes an itemized
-      invoice, categorised to match your program, that you submit for approval.</p>
+  <div class="wrap band" id="checkout-body">
+    <div class="opener"><span class="mono" style="color:var(--clay)">Checkout</span></div>
+    <h1 class="h-lg" style="padding-bottom:.5rem">Review, ship, and pay.</h1>
+    <p class="prose" style="padding-bottom:2rem">This is a retail purchase, paid now by card &mdash;
+      not a TEFA/ESA invoice. You'll get an order confirmation by email once this connects to a
+      real payment processor.</p>
 
-    <ol class="progress" style="padding-bottom:2rem; max-width:34rem">
-      <li data-state="done">Browse</li>
-      <li data-state="active">Review order</li>
-      <li data-state="">Get invoice</li>
-      <li data-state="">Program approves</li>
-      <li data-state="">Ships</li>
-    </ol>
+    <div class="checkout-grid">
+      <form id="checkout-form">
+        <div class="form-section">
+          <h2 class="h-sm">Contact</h2>
+          <div class="field-row">
+            <div class="field"><label for="fname">First name</label><input id="fname" name="fname" required autocomplete="given-name"></div>
+            <div class="field"><label for="lname">Last name</label><input id="lname" name="lname" required autocomplete="family-name"></div>
+          </div>
+          <div class="field"><label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email"></div>
+        </div>
 
-    <div class="order-grid">
-      <div>
+        <div class="form-section">
+          <h2 class="h-sm">Shipping address</h2>
+          <div class="field"><label for="addr1">Address</label><input id="addr1" name="addr1" required autocomplete="address-line1"></div>
+          <div class="field-row-3">
+            <div class="field"><label for="city">City</label><input id="city" name="city" required autocomplete="address-level2"></div>
+            <div class="field"><label for="state">State</label><input id="state" name="state" required autocomplete="address-level1" maxlength="2" placeholder="TX"></div>
+            <div class="field"><label for="zip">ZIP</label><input id="zip" name="zip" required autocomplete="postal-code" inputmode="numeric"></div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h2 class="h-sm">Shipping method</h2>
+          <div class="stack g-12">
+            <label class="ship-opt">
+              <span class="so-label"><input type="radio" name="ship" value="standard" checked> Standard &mdash; 5&ndash;7 business days</span>
+              <span class="so-price">$4.95</span>
+            </label>
+            <label class="ship-opt">
+              <span class="so-label"><input type="radio" name="ship" value="expedited"> Expedited &mdash; 2&ndash;3 business days</span>
+              <span class="so-price">$12.95</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="form-section" style="border-bottom:0">
+          <h2 class="h-sm">Payment</h2>
+          <div class="pay-mock">
+            <span class="mono">Not wired up yet, on purpose</span>
+            <p>This mockup does not collect or transmit any real payment or card information. A
+              static page has no business capturing raw card numbers &mdash; before this goes live,
+              connect an actual PCI-compliant payment processor (Stripe, Square, Shopify Payments,
+              or similar) here instead.</p>
+            <div class="pay-methods">
+              <span>Card</span><span>Apple Pay</span><span>Google Pay</span><span>PayPal</span>
+            </div>
+          </div>
+        </div>
+      </form>
+
+      <aside class="summary">
+        <span class="mono" style="color:var(--clay)">Order summary</span>
         <div style="overflow-x:auto">
           <table class="order-table">
             <colgroup>
-              <col style="width:auto">
-              <col style="width:6rem">
-              <col style="width:8.5rem">
-              <col style="width:6rem">
-              <col style="width:4.5rem">
+              <col style="width:auto"><col style="width:5.5rem"><col style="width:7.5rem"><col style="width:5.5rem"><col style="width:4rem">
             </colgroup>
             <thead>
-              <tr>
-                <th>Item</th>
-                <th style="text-align:right">Price</th>
-                <th style="text-align:center">Qty</th>
-                <th style="text-align:right">Total</th>
-                <th></th>
-              </tr>
+              <tr><th>Item</th><th style="text-align:right">Price</th><th style="text-align:center">Qty</th><th style="text-align:right">Total</th><th></th></tr>
             </thead>
-            <tbody id="order-list"></tbody>
+            <tbody id="checkout-list"></tbody>
           </table>
         </div>
-        <div id="order-empty" class="order-empty" hidden>
-          <p>Your order is empty. <a href="shop.html">Browse the shop</a> to add a kit.</p>
+        <div id="checkout-empty" class="order-empty" hidden>
+          <p>Your cart is empty. <a href="shop.html">Browse the shop</a>.</p>
         </div>
-      </div>
 
-      <aside class="summary">
-        <span class="mono">Order summary</span>
-        <div class="sum-row"><span>Subtotal</span><span id="order-subtotal">$0.00</span></div>
-        <div class="sum-row"><span>Shipping</span><span>Carbon-neutral, included</span></div>
-        <div class="sum-row sum-total"><span>Estimated total</span><span id="order-total">$0.00</span></div>
-        <p style="font-size:.86rem; color:var(--muted); padding-top:1rem; line-height:1.55">
-          This is an estimate. Your actual invoice may adjust once we confirm which items your program
-          currently treats as eligible.</p>
-        <a class="btn btn-solid btn-block" id="quote-link" href="mailto:Mmminvestment25@gmail.com" style="margin-top:1rem">Request itemized quote</a>
-        <a class="btn btn-ghost btn-block" href="../index.html#funding" style="margin-top:.6rem">No program account yet? Get funding help</a>
+        <div style="padding-top:1rem; border-top:1px solid var(--rule); margin-top:1rem">
+          <div class="co-mini"><span>Subtotal</span><b id="co-subtotal">$0.00</b></div>
+          <div class="co-mini"><span>Shipping</span><b id="co-shipping">$4.95</b></div>
+          <div class="co-mini"><span>Sales tax</span><b id="co-tax">$0.00 (est.)</b></div>
+          <div class="co-mini sum-total"><span>Total</span><b id="co-total">$0.00</b></div>
+        </div>
+        <p style="font-size:.82rem; color:var(--muted); padding-top:.85rem; line-height:1.5">
+          Tax shown is a placeholder rate, not your real obligation &mdash; connect a tax
+          calculation step (or your own resale-permit filing process) before this goes live.</p>
+        <button type="button" class="btn btn-solid btn-block" id="place-order" style="margin-top:1rem">Place order</button>
       </aside>
+    </div>
+  </div>
+
+  <div class="wrap band confirm" id="checkout-confirm" hidden>
+    <span class="mono">Order received &mdash; mockup only</span>
+    <h1 class="h-lg" style="padding-bottom:.75rem">Thank you. No payment was actually collected.</h1>
+    <p class="prose" style="margin-inline:auto">This confirmation is a client-side prototype state.
+      Nothing was charged, no order was created, and no email was sent &mdash; this screen exists to
+      show what a completed checkout looks like once a real payment processor is connected.</p>
+    <div class="hero-cta" style="justify-content:center; padding-top:1.5rem">
+      <a class="btn btn-ghost" href="shop.html">Back to the shop</a>
     </div>
   </div>
 </main>
@@ -426,16 +470,13 @@ a.product{text-decoration:none; color:inherit}
       <span class="foot-brand">MMM Investment</span>
       <nav class="foot-nav" aria-label="Footer">
         <a href="shop.html">Shop</a>
-        <a href="order.html">Order</a>
-        <a href="../index.html#funding">Funding help</a>
-        <a href="../index.html#carbon">Carbon</a>
-        <a href="../general-store/shop.html">General store</a>
+        <a href="checkout.html">Cart</a>
+        <a href="../store/shop.html">ESA / TEFA store</a>
         <a href="mailto:Mmminvestment25@gmail.com">Email</a>
       </nav>
     </div>
-    <p class="disclaim">Prices shown are illustrative for this mockup and computed from example costs
-      per PRICING.md, not final. MMM Investment is an independent supplier of educational tools and
-      materials, not affiliated with or endorsed by TEFA or any state program.</p>
+    <p class="disclaim">General Store purchases are paid at retail and are not TEFA/ESA-funded
+      purchases. This checkout is a UI prototype: no payment is collected and no order is placed.</p>
   </div>
 </footer>
 </div>

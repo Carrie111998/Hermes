@@ -9,16 +9,22 @@ a USB stick.
     python3 build.py
 
 Produces:
-    index.html          the main landing page, from src/page.html
-    store/shop.html      storefront mockup: category grid, from store/src/shop.html
-    store/product.html   storefront mockup: product detail, from store/src/product.html
-    store/order.html      storefront mockup: order/quote review, from store/src/order.html
+    index.html                 main landing page, from src/page.html
+    store/shop.html             ESA store mockup: category grid
+    store/product.html          ESA store mockup: product detail
+    store/order.html             ESA store mockup: order/quote review
+    general-store/shop.html      General Store mockup: category grid
+    general-store/product.html   General Store mockup: product detail
+    general-store/checkout.html  General Store mockup: checkout
 
-The store pages share store/shared_style.css (also font-inlined), spliced in
-at each page's __STORE_SHARED_CSS__ marker, so the design tokens stay in one
-place instead of being copy-pasted three times. They also load store/cart.js
-directly (a relative <script src>, not inlined) since the mockups aren't
-meant to be single-file-portable the way index.html is.
+Both mockup sets share store/shared_style.css (font-inlined once), spliced
+in at each page's __STORE_SHARED_CSS__ marker, so the design tokens stay in
+one place instead of being copy-pasted six times. Cross-links between the
+two mockup sets use MAIN_SITE_URL / ESA_SHOP_URL placeholders, resolved
+here to relative paths for the repo build — see resolve_cross_links().
+Each set also loads its own cart.js directly (a relative <script src>, not
+inlined) since the mockups aren't meant to be single-file-portable the way
+index.html is.
 
 The fonts in fonts/ were subset from their upstream Google Fonts releases to
 Latin text plus the punctuation this page actually uses, and the variable
@@ -84,11 +90,8 @@ def build_main_page():
     print(f"index.html  {out.stat().st_size / 1024:.0f} KB")
 
 
-def build_store_pages():
+def build_store_pages(shared_css: str):
     store = HERE / "store"
-    shared_css = inline_fonts(
-        (store / "shared_style.css").read_text(), "store/shared_style.css"
-    )
     desc = (
         "Storefront mockup: kits, tools, and homeschool resources invoiced against "
         "TEFA and other state education funds."
@@ -98,11 +101,45 @@ def build_store_pages():
         if "__STORE_SHARED_CSS__" not in src:
             raise SystemExit(f"__STORE_SHARED_CSS__ missing from store/src/{name}.html")
         page = src.replace("__STORE_SHARED_CSS__", shared_css)
+        page = resolve_cross_links(
+            page, main="../index.html", esa_shop="shop.html", general_store="../general-store/shop.html"
+        )
         out = store / f"{name}.html"
         out.write_text(standalone_document(page, desc))
         print(f"store/{name}.html  {out.stat().st_size / 1024:.0f} KB")
 
 
+def build_general_store_pages(shared_css: str):
+    gs = HERE / "general-store"
+    desc = (
+        "General Store mockup: family titles and activity books sold at retail, "
+        "kept separate from the TEFA/ESA-funded storefront."
+    )
+    for name in ("shop", "product", "checkout"):
+        src = (gs / "src" / f"{name}.html").read_text()
+        if "__STORE_SHARED_CSS__" not in src:
+            raise SystemExit(f"__STORE_SHARED_CSS__ missing from general-store/src/{name}.html")
+        page = src.replace("__STORE_SHARED_CSS__", shared_css)
+        page = resolve_cross_links(
+            page, main="../index.html", esa_shop="../store/shop.html", general_store="shop.html"
+        )
+        out = gs / f"{name}.html"
+        out.write_text(standalone_document(page, desc))
+        print(f"general-store/{name}.html  {out.stat().st_size / 1024:.0f} KB")
+
+
+def resolve_cross_links(page: str, main: str, esa_shop: str, general_store: str) -> str:
+    return (
+        page.replace("MAIN_SITE_URL", main)
+        .replace("ESA_SHOP_URL", esa_shop)
+        .replace("GENERAL_STORE_URL", general_store)
+    )
+
+
 if __name__ == "__main__":
     build_main_page()
-    build_store_pages()
+    _shared_css = inline_fonts(
+        (HERE / "store" / "shared_style.css").read_text(), "store/shared_style.css"
+    )
+    build_store_pages(_shared_css)
+    build_general_store_pages(_shared_css)

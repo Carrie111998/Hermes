@@ -13,6 +13,8 @@
     'MMM-SC-201': { name: 'Situation Handling Deck', price: 30.95, dept: 'Situation Handling & Self-Command' },
     'MMM-SC-202': { name: 'Focus & Energy System', price: 52.95, dept: 'Situation Handling & Self-Command' },
     'MMM-SC-203': { name: 'Self-Advocacy Workbook', price: 24.95, dept: 'Situation Handling & Self-Command' },
+    'MMM-SC-204': { name: 'Interview & First Job Prep Kit', price: 39.95, dept: 'Situation Handling & Self-Command' },
+    'MMM-SC-205': { name: 'Adulting Launch Kit', price: 57.95, dept: 'Situation Handling & Self-Command' },
     'MMM-CS-301': { name: 'Graphic Design Bench', price: 318.95, dept: 'Design & Motion Studio' },
     'MMM-CS-302': { name: 'Motion & Video Kit', price: 363.95, dept: 'Design & Motion Studio' },
     'MMM-CS-303': { name: 'Skill-to-Income Pack', price: 35.95, dept: 'Design & Motion Studio' },
