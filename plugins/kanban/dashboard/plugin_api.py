@@ -489,13 +489,9 @@ def get_board(
             )
         ]
         # List of distinct assignees for the lane-by-profile sub-grouping.
-        assignees = [
-            r["assignee"]
-            for r in conn.execute(
-                "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
-            )
-        ]
+        # Use known_assignees which unions on-disk profiles with DB profiles
+        # so fresh profiles appear in the picker before they've been assigned.
+        assignees = [a["name"] for a in kanban_db.known_assignees(conn)]
 
         return {
             "columns": [
