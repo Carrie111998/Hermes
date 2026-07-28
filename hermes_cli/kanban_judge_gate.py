@@ -71,7 +71,7 @@ BYPASS_TRANSPORT = "transport"        # judge unreachable
 BYPASS_PARSE = "parse_failed"         # judge reachable, reply unusable
 BYPASS_CEILING = "ceiling"            # rejection ceiling reached
 BYPASS_UNRECORDABLE = "unrecordable"  # rejection could not be persisted
-BYPASS_DISABLED = "disabled_by_env"   # HERMES_KANBAN_JUDGE_GATE=0
+BYPASS_DISABLED = "disabled_by_config"   # kanban.judge_gate: false
 BYPASS_NO_JUDGE = "no_judge"          # no auxiliary judge configured
 
 
@@ -110,27 +110,52 @@ class GateDecision(NamedTuple):
         return self.bypass == BYPASS_TRANSPORT
 
 
+def _kanban_config() -> dict:
+    """The ``kanban:`` config block, or ``{}`` when it cannot be read.
+
+    Deliberately config-driven rather than environment-driven. A dispatcher
+    worker controls its own environment — it could switch the gate off for
+    itself with an env var and, in the same breath, drop ``HERMES_KANBAN_TASK``
+    to defeat the ownership check. It does not own ``config.yaml``, so keeping
+    the toggles there leaves the escape hatch with the operator.
+
+    Imported lazily: ``hermes_cli.config`` pulls in a large dependency graph and
+    this module is imported from the tool path.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        block = cfg.get("kanban", {})
+        return block if isinstance(block, dict) else {}
+    except Exception:  # unreadable/missing config must not disable the gate
+        return {}
+
+
 def gate_enabled() -> bool:
-    """False when ``HERMES_KANBAN_JUDGE_GATE`` explicitly disables the gate."""
-    env = os.environ.get("HERMES_KANBAN_JUDGE_GATE")
-    if env is None:
-        return True
-    return env.strip().lower() not in {"0", "false", "no", "off"}
+    """False only when ``kanban.judge_gate`` is explicitly falsey in config.
+
+    Any failure to read config leaves the gate ON — a broken config file is
+    not consent to stop checking.
+    """
+    value = _kanban_config().get("judge_gate", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
 
 
 def max_rejections() -> int:
-    """Rejection ceiling, overridable via ``HERMES_KANBAN_JUDGE_MAX_REJECTIONS``.
+    """Rejection ceiling, from ``kanban.judge_max_rejections``.
 
     A value of 0 disables the ceiling (reject forever — the old behaviour).
     """
-    raw = os.environ.get("HERMES_KANBAN_JUDGE_MAX_REJECTIONS")
-    if raw is None or not raw.strip():
+    raw = _kanban_config().get("judge_max_rejections", DEFAULT_MAX_REJECTIONS)
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
         return DEFAULT_MAX_REJECTIONS
     try:
-        value = int(raw.strip())
-    except ValueError:
+        value = int(str(raw).strip())
+    except (ValueError, TypeError):
         logger.warning(
-            "HERMES_KANBAN_JUDGE_MAX_REJECTIONS=%r is not an integer; using %d",
+            "kanban.judge_max_rejections=%r is not an integer; using %d",
             raw, DEFAULT_MAX_REJECTIONS,
         )
         return DEFAULT_MAX_REJECTIONS
@@ -258,15 +283,15 @@ def evaluate(kb: Any, conn: Any, task: Any, response_text: str, *,
     if task is None or not getattr(task, "goal_mode", False):
         return GateDecision(allow=True)
     if not gate_enabled():
-        # Audited like every other bypass. HERMES_KANBAN_JUDGE_GATE is
-        # settable by the very worker being gated, so a silent skip here
-        # would be the one way to complete a goal_mode card with no trace
-        # that the judge was never consulted.
-        logger.warning("judge gate disabled via env; allowing completion of %s",
+        # Audited like every other bypass. Even though the toggle now lives in
+        # operator-owned config rather than the worker's environment, a silent
+        # skip here would still be the one way to complete a goal_mode card
+        # with no trace that the judge was never consulted.
+        logger.warning("judge gate disabled via config; allowing completion of %s",
                        task_id)
         _record(kb, conn, task_id, EVENT_DISABLED,
-                {"env": "HERMES_KANBAN_JUDGE_GATE"})
-        return GateDecision(allow=True, reason="judge gate disabled via env",
+                {"config": "kanban.judge_gate"})
+        return GateDecision(allow=True, reason="judge gate disabled via config",
                             bypass=BYPASS_DISABLED)
     if not judge_available():
         # No judge configured at all — historical fail-open behaviour, but it

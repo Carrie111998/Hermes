@@ -74,9 +74,21 @@ def _patch_judge(monkeypatch, verdict, reason, transport_failed,
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
+def _clean_config(monkeypatch):
+    """Every test starts from stock config: gate on, default ceiling.
+
+    Also clears the old env vars. They are no longer read, and pinning them
+    empty keeps a stale export in a developer's shell from being mistaken for
+    the code still honouring them.
+    """
+    monkeypatch.setattr(gate, "_kanban_config", lambda: {})
     monkeypatch.delenv("HERMES_KANBAN_JUDGE_GATE", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_JUDGE_MAX_REJECTIONS", raising=False)
+
+
+def _patch_config(monkeypatch, **kanban):
+    """Point the gate at a synthetic ``kanban:`` config block."""
+    monkeypatch.setattr(gate, "_kanban_config", lambda: dict(kanban))
 
 
 def test_non_goal_mode_skips_gate(monkeypatch):
@@ -213,7 +225,7 @@ def test_ceiling_counts_only_the_current_run(monkeypatch):
 
 def test_ceiling_is_configurable(monkeypatch):
     _patch_judge(monkeypatch, "continue", "nope", False)
-    monkeypatch.setenv("HERMES_KANBAN_JUDGE_MAX_REJECTIONS", "5")
+    _patch_config(monkeypatch, judge_max_rejections=5)
     # 2 priors is well under a ceiling of 5, so still blocked.
     d = gate.evaluate(_FakeKb(), _FakeConn(count=2), _task(), "x", task_id="t1")
     assert d.allow is False
@@ -222,13 +234,51 @@ def test_ceiling_is_configurable(monkeypatch):
 def test_ceiling_zero_disables_override(monkeypatch):
     """Ceiling 0 restores the old reject-forever behaviour."""
     _patch_judge(monkeypatch, "continue", "nope", False)
-    monkeypatch.setenv("HERMES_KANBAN_JUDGE_MAX_REJECTIONS", "0")
+    _patch_config(monkeypatch, judge_max_rejections=0)
     d = gate.evaluate(_FakeKb(), _FakeConn(count=99), _task(), "x", task_id="t1")
     assert d.allow is False and d.override is False
 
 
-def test_gate_can_be_disabled_by_env(monkeypatch):
+def test_env_var_no_longer_disables_the_gate(monkeypatch):
+    """The old env switch must be inert.
+
+    A dispatcher worker owns its own environment, so honouring an env toggle
+    would let the process being gated switch the gate off for itself. This is
+    the regression test for that: setting the historical variable must not
+    change behaviour.
+    """
     monkeypatch.setenv("HERMES_KANBAN_JUDGE_GATE", "off")
+    _patch_judge(monkeypatch, "continue", "nope", False)
+    d = gate.evaluate(_FakeKb(), _FakeConn(), _task(), "x", task_id="t1")
+    assert d.allow is False
+
+
+def test_unreadable_config_leaves_the_gate_on(monkeypatch):
+    """A broken config file is not consent to stop checking.
+
+    Fails ``load_config`` itself rather than stubbing ``_kanban_config``: the
+    tolerance being tested lives *inside* that helper, so replacing it would
+    stub out the very guard under test.
+    """
+    monkeypatch.undo()  # drop the autouse _kanban_config stub for this test
+
+    def _boom(*a, **kw):
+        raise RuntimeError("config.yaml is unparseable")
+
+    import hermes_cli.config as _cfg
+    monkeypatch.setattr(_cfg, "load_config", _boom)
+
+    assert gate._kanban_config() == {}
+    assert gate.gate_enabled() is True
+    assert gate.max_rejections() == gate.DEFAULT_MAX_REJECTIONS
+
+    _patch_judge(monkeypatch, "continue", "nope", False)
+    d = gate.evaluate(_FakeKb(), _FakeConn(), _task(), "x", task_id="t1")
+    assert d.allow is False
+
+
+def test_gate_can_be_disabled_by_config(monkeypatch):
+    _patch_config(monkeypatch, judge_gate=False)
     monkeypatch.setattr(
         "hermes_cli.goals.judge_goal",
         lambda **kw: pytest.fail("judge must not run when gate is disabled"),
@@ -236,10 +286,10 @@ def test_gate_can_be_disabled_by_env(monkeypatch):
     kb = _FakeKb()
     d = gate.evaluate(kb, _FakeConn(), _task(), "x", task_id="t1")
     assert d.allow is True
-    # The env switch is settable by the worker being gated, so the skip must
-    # leave a trace — otherwise it is an untraceable way past the judge.
+    # Operator-owned or not, the skip must leave a trace — otherwise it is an
+    # untraceable way past the judge.
     assert kb.events == [("t1", gate.EVENT_DISABLED,
-                          {"env": "HERMES_KANBAN_JUDGE_GATE"})]
+                          {"config": "kanban.judge_gate"})]
     # Its own kind: claiming "unrecordable" would assert that a DB write
     # failed when it in fact succeeded.
     assert d.bypass == gate.BYPASS_DISABLED

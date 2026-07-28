@@ -2989,6 +2989,26 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+
+        # Goal-mode completion gate. When a goal_mode task calls
+        # ``kanban_complete``, the goal judge decides whether the work
+        # actually satisfies the contract.
+        #
+        # Deliberately config-only, never an environment variable: a
+        # dispatcher worker owns its own environment, so an env toggle would
+        # let the very process being gated switch the gate off for itself
+        # (and drop HERMES_KANBAN_TASK to defeat the ownership check in the
+        # same breath). It does not own this file.
+        #
+        # Turning this off is audited, not silent — the bypass is recorded on
+        # the task as ``disabled_by_config``.
+        "judge_gate": True,
+
+        # How many times the judge may reject the same card before the gate
+        # gives up and allows completion, so a card cannot be rejected
+        # forever by a judge that will never be satisfied. 0 disables the
+        # ceiling (reject indefinitely).
+        "judge_max_rejections": 2,
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
