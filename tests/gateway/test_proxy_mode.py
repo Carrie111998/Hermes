@@ -188,6 +188,12 @@ class TestRunAgentProxyDispatch:
 
         runner._run_agent_via_proxy = AsyncMock(return_value=expected_result)
 
+        metadata = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "message_id": "4456",
+            "reply_to_message_id": "4455",
+        }
         result = await runner._run_agent(
             message="hi",
             context_prompt="",
@@ -196,9 +202,13 @@ class TestRunAgentProxyDispatch:
             session_id="test-session-123",
             session_key="test-key",
             run_generation=7,
+            persist_user_platform_metadata=metadata,
         )
 
         assert result["final_response"] == "Hello from remote!"
+        assert result["agent_persisted"] is False
+        assert result["messages"][0]["platform_message_id"] == "4456"
+        assert result["messages"][0]["platform_metadata"] == metadata
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 

@@ -338,6 +338,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    persist_user_platform_metadata: Optional[Dict[str, str]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -551,6 +552,11 @@ def build_turn_context(
         user_msg["display_kind"] = persist_user_display_kind
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_platform_metadata:
+        user_msg["platform_metadata"] = dict(persist_user_platform_metadata)
+        platform_message_id = persist_user_platform_metadata.get("message_id")
+        if platform_message_id is not None:
+            user_msg["platform_message_id"] = str(platform_message_id)
 
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1

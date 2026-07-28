@@ -2909,7 +2909,16 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     is present — so orphans from session loading or manual message
     manipulation are always caught.
     """
-    # --- Role allowlist: drop messages with roles the API won't accept ---
+    # --- Role allowlist and internal-metadata stripping ---
+    # Platform correlation fields belong in the durable transcript, not on the
+    # provider wire. Strict OpenAI-compatible backends reject unknown message
+    # properties, and chat/message identifiers are private transport metadata.
+    internal_fields = {
+        "platform_metadata",
+        "platform_message_id",
+        "message_id",
+        "_db_persisted",
+    }
     filtered = []
     for msg in messages:
         role = msg.get("role")
@@ -2919,6 +2928,8 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 role,
             )
             continue
+        if any(field in msg for field in internal_fields):
+            msg = {key: value for key, value in msg.items() if key not in internal_fields}
         filtered.append(msg)
     messages = filtered
 

@@ -2109,6 +2109,10 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    platform_message_id=(
+                        msg.get("platform_message_id") or msg.get("message_id")
+                    ),
+                    platform_metadata=msg.get("platform_metadata"),
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                     display_kind=(
@@ -7001,6 +7005,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        persist_user_platform_metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7046,6 +7051,7 @@ class AIAgent:
                     persist_user_timestamp=persist_user_timestamp,
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
+                    persist_user_platform_metadata=persist_user_platform_metadata,
                     moa_config=moa_config,
                 )
             finally:

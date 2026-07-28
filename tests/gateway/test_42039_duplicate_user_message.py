@@ -91,6 +91,7 @@ def _event():
             user_id="12345",
         ),
         message_id="msg-42",
+        reply_to_message_id="msg-41",
     )
 
 
@@ -181,6 +182,17 @@ async def test_agent_failed_early_no_skip_db_when_no_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, False
     )
+    user_message = next(
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2 and call.args[1].get("role") == "user"
+    )
+    assert user_message["platform_metadata"] == {
+        "platform": "telegram",
+        "chat_id": "-1001",
+        "message_id": "msg-42",
+        "reply_to_message_id": "msg-41",
+    }
 
 
 # ── Test 3: not-new-messages path uses skip_db=True ───────────────────
@@ -210,6 +222,17 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+    user_message = next(
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2 and call.args[1].get("role") == "user"
+    )
+    assert user_message["platform_metadata"] == {
+        "platform": "telegram",
+        "chat_id": "-1001",
+        "message_id": "msg-42",
+        "reply_to_message_id": "msg-41",
+    }
 
 
 # ── Post-stream MEDIA delivery keeps prior-turn deduplication ──────────

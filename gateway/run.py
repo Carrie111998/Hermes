@@ -14219,6 +14219,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                persist_user_platform_metadata=event.platform_persistence_metadata(),
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -14666,6 +14667,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
+                _platform_metadata = event.platform_persistence_metadata()
+                if _platform_metadata:
+                    _user_entry["platform_metadata"] = _platform_metadata
                 # Dedupe: skip if this platform message_id is already in the
                 # transcript (prevents duplicate user turns on Telegram retries
                 # after transient failures). #47237
@@ -14708,6 +14712,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
+                    _platform_metadata = event.platform_persistence_metadata()
+                    if _platform_metadata:
+                        _user_entry["platform_metadata"] = _platform_metadata
                     await self.async_session_store.append_to_transcript(
                         session_entry.session_id,
                         _user_entry,
@@ -20286,6 +20293,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -20304,6 +20312,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_platform_metadata=persist_user_platform_metadata,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -20315,6 +20324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_platform_metadata=persist_user_platform_metadata,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -20436,6 +20446,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20451,7 +20462,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            proxy_result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
                 history=history,
@@ -20461,6 +20472,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            # The remote API process cannot persist into this gateway's local
+            # transcript. Mark the result for gateway-side persistence and stamp
+            # the inbound user row with the same provenance as the local runtime.
+            proxy_result["agent_persisted"] = False
+            if persist_user_platform_metadata:
+                for proxy_message in proxy_result.get("messages") or []:
+                    if proxy_message.get("role") == "user":
+                        proxy_message["platform_metadata"] = dict(
+                            persist_user_platform_metadata
+                        )
+                        platform_message_id = persist_user_platform_metadata.get(
+                            "message_id"
+                        )
+                        if platform_message_id is not None:
+                            proxy_message["platform_message_id"] = str(
+                                platform_message_id
+                            )
+                        break
+            return proxy_result
 
         from run_agent import AIAgent
         import queue
@@ -22538,6 +22568,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                if persist_user_platform_metadata:
+                    _conversation_kwargs["persist_user_platform_metadata"] = persist_user_platform_metadata
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
@@ -23608,6 +23640,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    persist_user_platform_metadata=(
+                        pending_event.platform_persistence_metadata()
+                        if pending_event is not None
+                        else None
+                    ),
                     channel_prompt=next_channel_prompt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
