@@ -947,19 +947,28 @@ def _git_bash_bin_dirs() -> list[str]:
         _git_bash_bin_dirs_cache = []
         return _git_bash_bin_dirs_cache
 
-    bin_dir = os.path.dirname(bash)          # <root>\bin  or  <root>\usr\bin
-    parent = os.path.dirname(bin_dir)
+    # Use ntpath deliberately: tests exercise Windows semantics while running
+    # under a Windows Python process, but the discovered Git Bash path can be
+    # either ``C:\\...`` or MSYS ``/c/...``. os.path.join on Windows would
+    # inject backslashes into the latter and break the shell PATH.
+    import ntpath
+    import posixpath
+
+    is_msys_path = bash.startswith("/") and not bash.startswith("//")
+    pathmod = posixpath if is_msys_path else ntpath
+    bin_dir = pathmod.dirname(bash)          # <root>\bin  or  <root>\usr\bin
+    parent = pathmod.dirname(bin_dir)
     # MinGit ships bash under usr\bin; PortableGit/system Git under bin.
-    root = os.path.dirname(parent) if os.path.basename(parent).lower() == "usr" else parent
+    root = pathmod.dirname(parent) if pathmod.basename(parent).lower() == "usr" else parent
 
     # Order mirrors Git-for-Windows /etc/profile so coreutils win over the
     # same-named Windows System32 tools (find.exe, sort.exe) inside the shell.
     for candidate in (
-        os.path.join(root, "mingw64", "bin"),
-        os.path.join(root, "mingw32", "bin"),
-        os.path.join(root, "usr", "local", "bin"),
-        os.path.join(root, "usr", "bin"),
-        os.path.join(root, "bin"),
+        pathmod.join(root, "mingw64", "bin"),
+        pathmod.join(root, "mingw32", "bin"),
+        pathmod.join(root, "usr", "local", "bin"),
+        pathmod.join(root, "usr", "bin"),
+        pathmod.join(root, "bin"),
     ):
         if os.path.isdir(candidate) and candidate not in dirs:
             dirs.append(candidate)
@@ -1189,6 +1198,11 @@ def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
     (#56147).
     """
     if not _IS_WINDOWS:
+        # Do not leak Windows-only MSYS controls into POSIX subprocesses when
+        # the parent environment itself came from Git Bash (or when tests
+        # monkeypatch the platform flag).
+        env.pop("MSYS_NO_PATHCONV", None)
+        env.pop("MSYS2_ARG_CONV_EXCL", None)
         return
     env.setdefault("MSYS_NO_PATHCONV", "1")
     env.setdefault("MSYS2_ARG_CONV_EXCL", "*")
