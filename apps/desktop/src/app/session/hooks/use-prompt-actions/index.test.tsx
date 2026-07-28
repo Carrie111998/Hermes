@@ -23,6 +23,8 @@ import {
 import { dropSessionState, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
+import type { SessionActivationRef } from '../../session-activation'
+
 import type { SubmitTextOptions } from './utils'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
@@ -99,6 +101,7 @@ function Harness({
   refreshSessions,
   requestGateway,
   resumeStoredSession,
+  sessionActivationRef,
   seedMessages,
   selectedStoredSessionIdRef: selectedStoredSessionIdRefProp,
   storedSessionId,
@@ -120,6 +123,7 @@ function Harness({
   openMemoryGraph?: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+  sessionActivationRef?: SessionActivationRef
   resumeStoredSession?: (storedSessionId: string) => Promise<void> | void
   seedMessages?: unknown[]
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
@@ -160,6 +164,7 @@ function Harness({
     refreshSessions,
     requestGateway,
     resumeStoredSession: resumeStoredSession ?? (() => undefined),
+    sessionActivationRef,
     selectedStoredSessionIdRef,
     startFreshSessionDraft: () => undefined,
     sttEnabled: false,
@@ -3610,6 +3615,122 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
 
     expect(await submitting).toBe(false)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(false)
+  })
+})
+
+describe('usePromptActions session activation submit barrier (#72971)', () => {
+  const STORED_SESSION_A = 'stored-activation-a'
+  const STORED_SESSION_B = 'stored-activation-b'
+  const RUNTIME_SESSION_B = 'rt-activation-b'
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    $connection.set(null)
+    $composerAttachments.set([])
+  })
+
+  it('blocks prompt.submit while the selected session activation is unacknowledged', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_B }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_B }
+    const sessionActivationRef: SessionActivationRef = {
+      current: { requestId: 7, storedSessionId: STORED_SESSION_B }
+    }
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={RUNTIME_SESSION_B}
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => STORED_SESSION_B}
+        getRuntimeIdForStoredSession={() => RUNTIME_SESSION_B}
+        getRouteToken={() => `/${STORED_SESSION_B}::`}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        sessionActivationRef={sessionActivationRef}
+        storedSessionId={STORED_SESSION_B}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    expect(await handle!.submitText('do not leak into the previous session')).toBe(false)
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+
+    sessionActivationRef.current = null
+
+    expect(await handle!.submitText('send after activate ack')).toBe(true)
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      expect.objectContaining({ session_id: RUNTIME_SESSION_B, text: 'send after activate ack' }),
+      expect.anything()
+    )
+  })
+
+  it('re-reads the active runtime immediately before prompt.submit', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl: vi.fn(async () => 'data:application/pdf;base64,JVBERi0=') }
+    })
+
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_A }
+    let releaseAttach: () => void = () => {}
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'file.attach') {
+        await new Promise<void>(resolve => {
+          releaseAttach = resolve
+        })
+
+        return { attached: true, ref_text: '@file:.hermes/desktop-attachments/test.pdf' } as never
+      }
+
+      return {} as never
+    })
+
+    const attachment: ComposerAttachment = {
+      id: 'activation-race-file',
+      kind: 'file',
+      label: 'test.pdf',
+      path: '/abs/test.pdf',
+      refText: '@file:`/abs/test.pdf`'
+    }
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={RUNTIME_SESSION_ID}
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => STORED_SESSION_A}
+        getRuntimeIdForStoredSession={() => activeSessionIdRef.current}
+        getRouteToken={() => `/${STORED_SESSION_A}::`}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={STORED_SESSION_A}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const submitting = handle!.submitText('bind me to the acknowledged runtime', { attachments: [attachment] })
+    await waitFor(() => expect(calls.some(call => call.method === 'file.attach')).toBe(true))
+
+    activeSessionIdRef.current = RUNTIME_SESSION_B
+    releaseAttach()
+
+    expect(await submitting).toBe(true)
+    expect(calls.find(call => call.method === 'prompt.submit')?.params).toMatchObject({
+      session_id: RUNTIME_SESSION_B,
+      text: expect.stringContaining('bind me to the acknowledged runtime')
+    })
   })
 })
 

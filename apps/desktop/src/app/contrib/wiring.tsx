@@ -87,6 +87,7 @@ import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
+import type { SessionActivationRef } from '../session/session-activation'
 import { newSessionOpensTab, startWorkspaceSession } from '../session/workspace-session-target'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
@@ -127,6 +128,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
+  const sessionActivationRef: SessionActivationRef = useRef(null)
   // Billing recovery routes to Settings → Billing from surfaces without router
   // context (the sticky toast). The shell owns `navigate`, so it consumes the
   // intent counter here; the ref skips the initial mount value.
@@ -435,6 +437,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     requestGateway,
     resetViewSync,
     runtimeIdByStoredSessionIdRef,
+    sessionActivationRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
@@ -565,6 +568,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshSessions,
     requestGateway,
     resumeStoredSession: resumeSession,
+    sessionActivationRef,
     selectedStoredSessionIdRef,
     startFreshSessionDraft,
     sttEnabled,

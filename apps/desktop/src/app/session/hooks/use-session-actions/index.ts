@@ -71,6 +71,7 @@ import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, Usag
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
+import { acknowledgeSessionActivation, beginSessionActivation, type SessionActivationRef } from '../../session-activation'
 import { sessionContextDrift } from '../session-context-drift'
 
 import {
@@ -104,6 +105,7 @@ interface SessionActionsOptions {
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   resetViewSync: () => void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
+  sessionActivationRef?: SessionActivationRef
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
@@ -208,6 +210,7 @@ export function useSessionActions({
   requestGateway,
   resetViewSync,
   runtimeIdByStoredSessionIdRef,
+  sessionActivationRef,
   selectedStoredSessionId,
   selectedStoredSessionIdRef,
   sessionStateByRuntimeIdRef,
@@ -539,6 +542,7 @@ export function useSessionActions({
     async (storedSessionId: string, replaceRoute = false) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
+      beginSessionActivation(sessionActivationRef, requestId, storedSessionId)
       const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
 
@@ -716,6 +720,8 @@ export function useSessionActions({
                 setCurrentUsage(current => ({ ...current, ...usage }))
               }
 
+              acknowledgeSessionActivation(sessionActivationRef, requestId)
+
               return
             }
 
@@ -777,6 +783,7 @@ export function useSessionActions({
               setBusy(running)
               setAwaitingResponse(running)
               syncSessionStateToView(cachedRuntimeId, activatedState)
+              acknowledgeSessionActivation(sessionActivationRef, requestId)
 
               return
             }
@@ -971,6 +978,7 @@ export function useSessionActions({
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
+        acknowledgeSessionActivation(sessionActivationRef, requestId)
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
@@ -1102,6 +1110,7 @@ export function useSessionActions({
       resetViewSync,
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionIdRef,
+      sessionActivationRef,
       sessionStateByRuntimeIdRef,
       startFreshSessionDraft,
       syncSessionStateToView,

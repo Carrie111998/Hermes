@@ -38,6 +38,7 @@ import { $sessionTiles } from '@/store/session-states'
 
 import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
+import type { SessionActivationRef } from '../session-activation'
 
 import { useSessionActions } from './use-session-actions'
 
@@ -575,6 +576,7 @@ function ResumeHarness({
   onReady,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
+  sessionActivationRef,
   selectedStoredSessionId = null,
   sessionStateByRuntimeIdRef
 }: {
@@ -582,6 +584,7 @@ function ResumeHarness({
   onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
+  sessionActivationRef?: SessionActivationRef
   selectedStoredSessionId?: string | null
   sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
 }) {
@@ -599,6 +602,7 @@ function ResumeHarness({
     requestGateway,
     resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>()),
+    sessionActivationRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: sessionStateByRuntimeIdRef ?? ref(new Map<string, ClientSessionState>()),
@@ -1432,6 +1436,63 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(methods).not.toContain('session.resume')
     expect(getSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+  })
+
+  it('keeps the activation barrier pending until warm session.activate is acknowledged', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', clientState('stored-A')]])
+    }
+    const sessionActivationRef: SessionActivationRef = { current: null }
+    const activation = deferred<Record<string, unknown>>()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return (await activation.promise) as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionActivationRef={sessionActivationRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    let resumePromise!: Promise<unknown>
+    act(() => {
+      resumePromise = resume!('stored-A', true)
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.activate', expect.anything()))
+
+    expect(sessionActivationRef.current?.storedSessionId).toBe('stored-A')
+
+    activation.resolve({
+      session_id: 'rt-A',
+      session_key: 'stored-A',
+      resumed: 'stored-A',
+      message_count: 0,
+      messages: [],
+      running: false,
+      info: {}
+    })
+
+    await act(async () => {
+      await resumePromise
+    })
+
+    expect(sessionActivationRef.current).toBeNull()
   })
 
   it('preserves cached image attachments through an idle persisted transcript refresh', async () => {
