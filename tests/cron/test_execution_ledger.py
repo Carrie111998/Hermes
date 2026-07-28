@@ -465,3 +465,10 @@ def test_recovery_backfill_survives_a_missing_job_record(monkeypatch, tmp_path):
 
     assert InProcessCronScheduler().recover_interrupted() == 2
     assert jobs.get_job(job["id"])["last_status"] == "unknown"
+
+
+def test_execution_retention_holds_multiple_days_of_history():
+    """1000 rows was ~24h on a busy profile — too short to date a daily job."""
+    from cron.executions import MAX_TERMINAL_EXECUTIONS
+
+    assert MAX_TERMINAL_EXECUTIONS >= 10000

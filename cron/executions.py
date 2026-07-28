@@ -19,7 +19,11 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
-MAX_TERMINAL_EXECUTIONS = 1000
+# Global row cap, not per-job. At ~800 attempts/day on a busy profile the old
+# 1000 held barely 24h — too short to answer "when did this daily job last
+# run", the exact question asked when jobs.json's last_run_at is in doubt.
+# 10000 is ~10 days there and still only a few MB.
+MAX_TERMINAL_EXECUTIONS = 10000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
