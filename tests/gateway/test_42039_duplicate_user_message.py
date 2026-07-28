@@ -313,3 +313,28 @@ async def test_normal_path_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+
+
+@pytest.mark.asyncio
+async def test_exception_before_agent_start_persists_platform_metadata(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(side_effect=RuntimeError("provider init failed"))
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    user_message = next(
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2 and call.args[1].get("role") == "user"
+    )
+    assert user_message["message_id"] == "msg-42"
+    assert user_message["platform_metadata"] == {
+        "platform": "telegram",
+        "chat_id": "-1001",
+        "message_id": "msg-42",
+        "reply_to_message_id": "msg-41",
+    }

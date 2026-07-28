@@ -14895,6 +14895,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         }
                         if getattr(event, "message_id", None):
                             _user_entry["message_id"] = str(event.message_id)
+                        _platform_metadata = event.platform_persistence_metadata()
+                        if _platform_metadata:
+                            _user_entry["platform_metadata"] = _platform_metadata
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id,
                             _user_entry,
