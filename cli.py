@@ -2804,9 +2804,7 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"!\[([^\]]*)\]\([^\)]*\)", r"\1", plain)
     plain = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", plain)
     plain = re.sub(r"\*\*\*([^*]+)\*\*\*", r"\1", plain)
-    plain = re.sub(r"(?<!\w)___([^_]+)___(?!\w)", r"\1", plain)
     plain = re.sub(r"\*\*([^*]+)\*\*", r"\1", plain)
-    plain = re.sub(r"(?<!\w)__([^_]+)__(?!\w)", r"\1", plain)
     # Only strip `*emphasis*` markers when the inner text is non-whitespace.
     # This avoids corrupting cron expressions like "* * * * *".
     plain = re.sub(r"\*([^\s*][^*]*?[^\s*])\*", r"\1", plain)
@@ -12469,14 +12467,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return inner + 2
 
         def _wrap_panel_text(text: str, width: int, subsequent_indent: str = "") -> list[str]:
-            wrapped = textwrap.wrap(
-                text,
-                width=max(8, width),
-                replace_whitespace=False,
-                drop_whitespace=False,
-                subsequent_indent=subsequent_indent,
-            )
-            return wrapped or [""]
+            """Wrap text preserving newlines — each original line segment is wrapped independently."""
+            wrapped = []
+            for line in text.split('\n'):
+                sub = textwrap.wrap(
+                    line,
+                    width=max(8, width),
+                    replace_whitespace=False,
+                    drop_whitespace=False,
+                    subsequent_indent=subsequent_indent,
+                )
+                wrapped.extend(sub if sub else [''])
+            return wrapped
 
         def _append_panel_line(lines, border_style: str, content_style: str, text: str, box_width: int) -> None:
             inner_width = max(0, box_width - 2)
