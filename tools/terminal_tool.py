@@ -559,10 +559,12 @@ def _read_shell_token(command: str, start: int) -> tuple[str, int]:
     return command[start:i], i
 
 
-def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
-    """Rewrite only real unquoted sudo command words, not plain text mentions.
+def _rewrite_sudo_command_words(command: str, replacement: str) -> tuple[str, int]:
+    """Replace real unquoted sudo command words with *replacement*.
 
-    Returns the rewritten command and the number of sudo invocations rewritten.
+    Only command words are rewritten, so plain text mentions of sudo (arguments,
+    quoted strings, comments) are left alone. Returns the rewritten command and
+    the number of sudo command words replaced.
     """
     out: list[str] = []
     i = 0
@@ -609,7 +611,7 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
 
         token, next_i = _read_shell_token(command, i)
         if command_start and token == "sudo":
-            out.append("sudo -S -p ''")
+            out.append(replacement)
             sudo_count += 1
         else:
             out.append(token)
@@ -623,60 +625,17 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
     return "".join(out), sudo_count
 
 
-def _count_real_sudo_invocations(command: str) -> int:
-    """Return how many real sudo command words appear in *command*.
+def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
+    """Rewrite only real unquoted sudo command words, not plain text mentions.
 
-    Lightweight scan that reuses the same tokeniser as
-    ``_rewrite_real_sudo_invocations`` but skips the string-building, so it
-    is cheap to call from the result-processing path.
+    Returns the rewritten command and the number of sudo invocations rewritten.
     """
-    count = 0
-    i = 0
-    n = len(command)
-    command_start = True
+    return _rewrite_sudo_command_words(command, "sudo -S -p ''")
 
-    while i < n:
-        ch = command[i]
 
-        if ch.isspace():
-            if ch == "\n":
-                command_start = True
-            i += 1
-            continue
-
-        if ch == "#" and command_start:
-            comment_end = command.find("\n", i)
-            if comment_end == -1:
-                break
-            i = comment_end
-            continue
-
-        if command.startswith("&&", i) or command.startswith("||", i) or command.startswith(";;", i):
-            i += 2
-            command_start = True
-            continue
-
-        if ch in ";|&(":
-            i += 1
-            command_start = True
-            continue
-
-        if ch == ")":
-            i += 1
-            command_start = False
-            continue
-
-        token, next_i = _read_shell_token(command, i)
-        if command_start and token == "sudo":
-            count += 1
-
-        if command_start and _looks_like_env_assignment(token):
-            command_start = True
-        else:
-            command_start = False
-        i = next_i
-
-    return count
+def _count_real_sudo_invocations(command: str) -> int:
+    """Return how many real sudo command words appear in *command*."""
+    return _rewrite_real_sudo_invocations(command)[1]
 
 
 def _sudo_nopasswd_works() -> bool:
