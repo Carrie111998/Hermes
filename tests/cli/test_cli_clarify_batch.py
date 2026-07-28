@@ -3,14 +3,15 @@
 Drives ``_clarify_callback`` with a ``questions`` list on a background
 thread (the way the agent thread calls it) and simulates the keybinding
 handlers by calling the same helper methods they call
-(``_clarify_batch_set_active`` for Tab, ``_clarify_batch_enter`` for
-Enter, ``_clarify_batch_lock`` for the freetext submit path). No real
+(``_clarify_batch_set_active`` for Tab, ``_handle_clarify_enter`` for
+Enter, and ``_clarify_batch_lock`` for the freetext submit path). No real
 terminal needed — mirrors tests/cli/test_cli_approval_ui.py.
 """
 
 import json
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from cli import HermesCLI
@@ -38,6 +39,30 @@ def _q(index, question, choices=None, multi_select=False):
         "choices_offered": list(choices) if choices else None,
         "multi_select": bool(multi_select) and bool(choices),
     }
+
+
+class _FakeBuffer:
+    def __init__(self, text=""):
+        self.text = text
+        self.cursor_position = len(text)
+
+    def reset(self, append_to_history=False):
+        self.text = ""
+        self.cursor_position = 0
+
+    def insert_text(self, data):
+        position = self.cursor_position
+        self.text = self.text[:position] + data + self.text[position:]
+        self.cursor_position = position + len(data)
+
+
+def _make_event(text=""):
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            current_buffer=_FakeBuffer(text),
+            invalidate=MagicMock(),
+        )
+    )
 
 
 def _start_batch(cli, questions):
@@ -238,6 +263,75 @@ class TestClarifyBatchPanel:
         assert result["value"] == "a"
 
 
+class TestClarifyBatchTypedDraft:
+    def test_typed_answer_wins_over_highlighted_batch_choice(self):
+        cli = _make_cli_stub()
+        questions = [
+            _q(0, "Color?", ["red", "blue"]),
+            _q(1, "Size?", ["small", "large"]),
+        ]
+        thread, result = _start_batch(cli, questions)
+        state = cli._clarify_state
+        state["selected"] = 1
+        event = _make_event("chartreuse")
+
+        assert cli._handle_clarify_enter(event) is True
+
+        assert event.app.current_buffer.text == ""
+        assert state["answers"] == {"q0": "chartreuse"}
+        assert state["answer_meta"]["q0"] == {
+            "kind": "other",
+            "other_text": "chartreuse",
+        }
+        assert state["active"] == 1
+
+        assert cli._handle_clarify_enter(_make_event()) is True
+        thread.join(timeout=2)
+        assert result["value"] == {
+            "answers": {"q0": "chartreuse", "q1": "small"}
+        }
+
+    def test_typed_multi_select_answer_keeps_checked_choices_and_metadata(self):
+        cli = _make_cli_stub()
+        questions = [
+            _q(0, "Toppings?", ["ham", "olives", "basil"], multi_select=True),
+        ]
+        thread, result = _start_batch(cli, questions)
+        state = cli._clarify_state
+        state["selected_indices"].update({0, 3})
+
+        assert cli._handle_clarify_enter(_make_event("capers")) is True
+
+        thread.join(timeout=2)
+        assert json.loads(result["value"]["answers"]["q0"]) == ["ham", "capers"]
+        assert state["answer_meta"]["q0"] == {
+            "kind": "multi",
+            "choices": ["ham"],
+            "other_text": "capers",
+        }
+
+    def test_digit_in_a_batch_multi_select_draft_does_not_toggle_or_lock(self):
+        cli = _make_cli_stub()
+        questions = [
+            _q(0, "Targets?", ["staging", "prod"], multi_select=True),
+            _q(1, "Confirm?", ["yes", "no"]),
+        ]
+        thread, _ = _start_batch(cli, questions)
+        state = cli._clarify_state
+        state["selected_indices"].add(0)
+        event = _make_event("deploy v")
+
+        cli._make_clarify_number_handler(1, "2")(event)
+
+        assert event.app.current_buffer.text == "deploy v2"
+        assert state["selected_indices"] == {0}
+        assert state["answers"] == {}
+        assert cli._clarify_state is state
+
+        state["response_queue"].put("cancel")
+        thread.join(timeout=2)
+
+
 class TestClarifyBatchNavigation:
     """Shift-Tab, answer restore on re-visit, and Other edit-prefill."""
 
@@ -340,4 +434,3 @@ class TestClarifyBatchNavigation:
         cli._clarify_batch_enter(state)
         thread.join(timeout=2)
         assert result["value"] == {"answers": {"q0": "red", "q1": "small"}}
-
