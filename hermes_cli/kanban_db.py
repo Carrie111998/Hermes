@@ -4307,7 +4307,7 @@ def claim_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
-        board=get_current_board(),
+        board=_normalize_board_slug(board) or get_current_board(),
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )

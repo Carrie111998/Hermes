@@ -70,6 +70,28 @@ def test_claim_fires_hook(kanban_home, captured_hooks):
     assert kw["run_id"] is not None
 
 
+def test_claim_explicit_board_fires_hook_with_named_board(
+    kanban_home, captured_hooks
+):
+    kb.create_board("guarded", allowed_profiles=["worker"])
+    conn = kb.connect(board="guarded")
+    try:
+        tid = kb.create_task(
+            conn,
+            title="named-board task",
+            assignee="worker",
+            board="guarded",
+        )
+        claimed = kb.claim_task(conn, tid, board="guarded")
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_claimed"]
+    assert len(fired) == 1
+    assert fired[0][1]["board"] == "guarded"
+
+
 def test_complete_fires_hook_with_summary(kanban_home, captured_hooks):
     conn = kb.connect()
     try:
