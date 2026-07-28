@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -497,6 +497,55 @@ _MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_events_tenant_unprocessed
             ON integration_events(tenant_id, processed)
             WHERE processed = false;
+        """,
+    ),
+    # v9 → v10: monitoring & observability (RFC-0.27.0).
+    (
+        9,
+        """
+        CREATE TABLE IF NOT EXISTS metrics (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            metric_name     TEXT        NOT NULL,
+            metric_type     TEXT        NOT NULL
+                CHECK (metric_type IN ('counter', 'gauge', 'histogram')),
+            value           DOUBLE PRECISION NOT NULL,
+            labels          JSONB       NOT NULL DEFAULT '{}',
+            recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_metrics_tenant_name_time
+            ON metrics(tenant_id, metric_name, recorded_at DESC);
+
+        CREATE TABLE IF NOT EXISTS health_checks (
+            id              BIGSERIAL   PRIMARY KEY,
+            service_name    TEXT        NOT NULL,
+            status          TEXT        NOT NULL
+                CHECK (status IN ('healthy', 'degraded', 'unhealthy')),
+            details         JSONB       NOT NULL DEFAULT '{}',
+            checked_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_health_checks_service
+            ON health_checks(service_name, checked_at DESC);
+
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            name            TEXT        NOT NULL,
+            metric_name     TEXT        NOT NULL,
+            condition       TEXT        NOT NULL,
+            threshold       DOUBLE PRECISION NOT NULL,
+            window_seconds  INTEGER     NOT NULL DEFAULT 300,
+            notify_channel  TEXT        NOT NULL DEFAULT '',
+            enabled         BOOLEAN     NOT NULL DEFAULT true,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT uq_alert_rule_name UNIQUE (tenant_id, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_alert_rules_tenant
+            ON alert_rules(tenant_id);
         """,
     ),
 ]
@@ -2785,6 +2834,174 @@ def mark_event_processed(
 
 
 # ---------------------------------------------------------------------------
+# Monitoring: Metrics
+# ---------------------------------------------------------------------------
+
+
+def record_metric(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    metric_name: str,
+    metric_type: str,
+    value: float,
+    labels: dict[str, str] | None = None,
+) -> None:
+    """Record a metric data point."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO metrics (tenant_id, metric_name, metric_type, value, labels)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (str(tenant_id), metric_name, metric_type, value,
+             json.dumps(labels or {})),
+        )
+    conn.commit()
+
+
+def query_metrics(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    metric_name: str,
+    since_seconds: int = 3600,
+    limit: int = 1000,
+) -> list[dict]:
+    """Query metric data points for a tenant within a time window."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM metrics
+            WHERE tenant_id = %s AND metric_name = %s
+              AND recorded_at > NOW() - make_interval(secs => %s)
+            ORDER BY recorded_at DESC LIMIT %s
+            """,
+            (str(tenant_id), metric_name, since_seconds, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Monitoring: Health Checks
+# ---------------------------------------------------------------------------
+
+
+def record_health_check(
+    conn: "psycopg.Connection",
+    *,
+    service_name: str,
+    status: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Record a health check result."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO health_checks (service_name, status, details) "
+            "VALUES (%s, %s, %s)",
+            (service_name, status, json.dumps(details or {})),
+        )
+    conn.commit()
+
+
+def get_latest_health(
+    conn: "psycopg.Connection",
+    *,
+    service_name: str = "",
+) -> list[dict]:
+    """Get the latest health check for each service (or one specific service)."""
+    if service_name:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (service_name) * FROM health_checks "
+                "WHERE service_name = %s ORDER BY service_name, checked_at DESC",
+                (service_name,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    else:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (service_name) * FROM health_checks "
+                "ORDER BY service_name, checked_at DESC"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Monitoring: Alert Rules
+# ---------------------------------------------------------------------------
+
+
+def create_alert_rule(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    name: str,
+    metric_name: str,
+    condition: str,
+    threshold: float,
+    window_seconds: int = 300,
+    notify_channel: str = "",
+) -> dict:
+    """Create an alert rule (upserts on name)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO alert_rules
+                (tenant_id, name, metric_name, condition, threshold,
+                 window_seconds, notify_channel)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+                metric_name = EXCLUDED.metric_name,
+                condition = EXCLUDED.condition,
+                threshold = EXCLUDED.threshold,
+                window_seconds = EXCLUDED.window_seconds,
+                notify_channel = EXCLUDED.notify_channel,
+                enabled = true
+            RETURNING *
+            """,
+            (str(tenant_id), name, metric_name, condition, threshold,
+             window_seconds, notify_channel),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def list_alert_rules(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+) -> list[dict]:
+    """List alert rules for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM alert_rules WHERE tenant_id = %s AND enabled = true "
+            "ORDER BY created_at DESC",
+            (str(tenant_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def disable_alert_rule(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    name: str,
+) -> bool:
+    """Disable an alert rule."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE alert_rules SET enabled = false "
+            "WHERE tenant_id = %s AND name = %s AND enabled = true",
+            (str(tenant_id), name),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+# ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 
@@ -2860,6 +3077,13 @@ __all__ = [
     "mark_invoice_paid",
     "get_invoice",
     "list_invoices",
+    "record_metric",
+    "query_metrics",
+    "record_health_check",
+    "get_latest_health",
+    "create_alert_rule",
+    "list_alert_rules",
+    "disable_alert_rule",
     "store_credential",
     "get_credential",
     "delete_credential",
