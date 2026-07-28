@@ -67,7 +67,7 @@ PYTHON_SANDBOX_BLOCK = (
     "    cpu_seconds: 60\n"
     "    memory_mb: 1024\n"
     "    file_size_mb: 64\n"
-    "    scratch_mb: 64\n"
+    "    scratch_mb: 256\n"
     "    max_processes: 64\n"
     "    max_open_files: 256\n"
     "    max_snapshot_mb: 512\n"
@@ -546,7 +546,7 @@ def _validate(
             "cpu_seconds": 60,
             "memory_mb": 1024,
             "file_size_mb": 64,
-            "scratch_mb": 64,
+            "scratch_mb": 256,
             "max_processes": 64,
             "max_open_files": 256,
             "max_snapshot_mb": 512,

@@ -185,6 +185,7 @@ def test_init_script_mount_plan_has_one_write_surface(tmp_path):
         {"records": file_input, "media": directory_input},
         Path("/opt/runtime"),
         base_prefix=Path("/opt/python/3.13"),
+        sqlite_datasets={"records"},
     )
     assert "--rbind" in script
     assert 'findmnt -Rrn -o TARGET "$dst"' in script
@@ -203,6 +204,8 @@ def test_init_script_mount_plan_has_one_write_surface(tmp_path):
     assert '"/usr/bin/unshare"' in sandbox._SUPERVISOR_SOURCE
     assert "resource.setrlimit(resource.RLIMIT_NPROC" in sandbox._SUPERVISOR_SOURCE
     assert "cd /work" in script
+    assert 'cp ' in script and '"$JAIL/work/records.db"' in script
+    assert '"$JAIL/inputs/records"' not in script
     assert 'mkdir -p "$JAIL/opt/python/3.13"' in script
     assert 'ro_dir /opt/python/3.13 "$JAIL/opt/python/3.13"' in script
 
@@ -221,11 +224,15 @@ def test_system_base_prefix_needs_no_duplicate_mount(tmp_path):
 
 def test_child_env_scrubs_secrets_and_exposes_contract_paths(tmp_path):
     env = sandbox._build_env(
-        {"records": tmp_path / "records.db"},
+        {"records": tmp_path / "records.db", "media": tmp_path / "media"},
         {"PATH": "/bin", "SERVICE_TOKEN": "nope", "HERMES_TIMEZONE": "UTC"},
+        sqlite_datasets={"records"},
     )
     assert "SERVICE_TOKEN" not in env
-    assert json.loads(env["SANDBOX_INPUTS"]) == {"records": "/inputs/records"}
+    assert json.loads(env["SANDBOX_INPUTS"]) == {
+        "media": "/inputs/media",
+        "records": "/work/records.db",
+    }
     assert env["RESULT_PATH"] == "/work/result.json"
     assert env["TMPDIR"] == "/work"
     assert env["HOME"] == "/work"
@@ -345,7 +352,9 @@ def test_xlsx_file_listing_promotes_atomically_and_idempotently(tmp_path):
         f"/media/tgg/hermes/{promoted[0].name}"
     )
     assert "r_12ab34cd" in promoted[0].name
-    assert hashlib.sha256(workbook.read_bytes()).hexdigest() in promoted[0].name
+    assert hashlib.sha256(workbook.read_bytes()).hexdigest()[:12] in promoted[0].name
+    assert promoted[0].name.endswith("_weekly-report.xlsx")
+    assert sandbox._CLIENT_ARTIFACT_NAME.fullmatch(promoted[0].name)
 
     second, error = sandbox._harvest(
         work, "summary", "", "success", sandbox.DEFAULTS, **kwargs
@@ -359,7 +368,6 @@ def test_xlsx_file_listing_promotes_atomically_and_idempotently(tmp_path):
 @pytest.mark.parametrize(
     ("filename", "contents"),
     [
-        ("weekly report.xlsx", b"PK\x03\x04not-promoted"),
         ("weekly-report.xlsx", b"not-a-zip"),
         ("weekly-report.csv", b"PK\x03\x04not-an-xlsx"),
     ],
@@ -387,6 +395,61 @@ def test_file_listing_does_not_promote_invalid_workbooks(
 
     assert all("media_ref" not in item for item in payload["files"])
     assert not retained.exists()
+
+
+def test_promotion_sanitizes_and_caps_original_basename(tmp_path):
+    work = tmp_path / "work"
+    retained = tmp_path / "retained"
+    work.mkdir()
+    workbook = work / ("Weekly report (client) " + "x" * 160 + ".xlsx")
+    with zipfile.ZipFile(workbook, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+
+    payload, error = sandbox._harvest(
+        work,
+        "",
+        "",
+        "success",
+        sandbox.DEFAULTS,
+        run_id="r_12ab34cd",
+        media_retention={
+            "root": str(retained),
+            "media_ref_prefix": "/media/tgg/hermes",
+        },
+    )
+
+    assert error == ""
+    promoted_name = Path(payload["files"][0]["media_ref"]).name
+    assert sandbox._CLIENT_ARTIFACT_NAME.fullmatch(promoted_name)
+    assert len(promoted_name) <= 132
+    assert promoted_name.startswith("sandbox_r_12ab34cd_")
+    assert "_Weekly_report_client_" in promoted_name
+
+
+def test_sqlite_copy_larger_than_scratch_fails_clearly(tmp_path):
+    source = tmp_path / "large.db"
+    connection = sqlite3.connect(source)
+    connection.execute("create table payload (value blob)")
+    connection.execute("insert into payload values (zeroblob(2 * 1024 * 1024))")
+    connection.commit()
+    connection.close()
+
+    mounts, error = sandbox._resolve_datasets(
+        ["cases"],
+        {
+            "datasets": {"cases": {"type": "sqlite", "path": str(source)}},
+            "limits": {
+                "scratch_mb": 1,
+                "file_size_mb": 8,
+                "max_snapshot_mb": 8,
+            },
+        },
+        tmp_path / "inputs",
+    )
+
+    assert mounts == {}
+    assert "dataset 'cases'" in error
+    assert "scratch_mb (1MB)" in error
 
 
 def test_file_listing_omits_client_url_when_base_is_unset(tmp_path):
@@ -522,7 +585,14 @@ def test_jailed_batch_reconciliation_e2e(tmp_path, monkeypatch):
     code = r'''
 import csv, json, os, sqlite3
 inputs = json.loads(os.environ["SANDBOX_INPUTS"])
-actual = dict(sqlite3.connect(inputs["records"]).execute(
+assert inputs["records"] == "/work/records.db"
+assert inputs["sheet"] == "/inputs/sheet"
+database = sqlite3.connect(inputs["records"])
+database.execute("create table writable_probe (value text)")
+database.execute("insert into writable_probe values ('ok')")
+database.commit()
+assert database.execute("select value from writable_probe").fetchone() == ("ok",)
+actual = dict(database.execute(
     "select record_no, state from records"
 ))
 rows = list(csv.DictReader(open(inputs["sheet"], encoding="utf-8")))

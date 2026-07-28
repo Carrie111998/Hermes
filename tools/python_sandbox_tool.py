@@ -57,6 +57,7 @@ _PROBE_TTL = 30.0
 
 _SUPERVISOR_SOURCE = r"""\
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -87,6 +88,14 @@ completed = subprocess.run(
     ],
     check=False,
 )
+
+# Writable sqlite datasets are run inputs, not output artifacts. Remove the
+# reserved copies after the payload exits so they are not exported or promoted.
+for name in json.loads(sys.argv[3]):
+    try:
+        os.unlink(f"/work/{name}.db")
+    except FileNotFoundError:
+        pass
 
 # Preserve regular artifacts only. A payload-controlled symlink must never
 # become a live pointer into the host when /work is exported.
@@ -241,7 +250,11 @@ def _resolve_datasets(
         valid = ", ".join(sorted(available)) or "(none)"
         return {}, f"unknown dataset(s): {', '.join(unknown)}; valid names: {valid}"
     mounts: dict[str, Path] = {}
-    max_mb = _limits(config)["max_snapshot_mb"]
+    limits = _limits(config)
+    max_mb = limits["max_snapshot_mb"]
+    scratch_bytes = limits["scratch_mb"] * 1024 * 1024
+    file_size_bytes = limits["file_size_mb"] * 1024 * 1024
+    sqlite_bytes = 0
     for name in names:
         if not is_python_sandbox_dataset_name(name):
             return {}, f"invalid dataset name: {name!r}"
@@ -257,6 +270,22 @@ def _resolve_datasets(
                 _snapshot_sqlite(configured.resolve(), destination, max_mb)
             except Exception as exc:
                 return {}, f"dataset {name!r}: {exc}"
+            copied_bytes = destination.stat().st_size
+            if copied_bytes > file_size_bytes:
+                destination.unlink(missing_ok=True)
+                return {}, (
+                    f"dataset {name!r} writable sqlite copy is "
+                    f"{copied_bytes / 1024**2:.1f}MB, exceeding file_size_mb "
+                    f"({limits['file_size_mb']}MB)"
+                )
+            sqlite_bytes += copied_bytes
+            if sqlite_bytes > scratch_bytes:
+                destination.unlink(missing_ok=True)
+                return {}, (
+                    f"dataset {name!r} writable sqlite copy makes sqlite inputs "
+                    f"{sqlite_bytes / 1024**2:.1f}MB, exceeding scratch_mb "
+                    f"({limits['scratch_mb']}MB)"
+                )
             mounts[name] = destination
         else:
             # A lexical declaration boundary stops a configured symlink from
@@ -290,6 +319,7 @@ def _generate_init_script(
     max_processes: int = 64,
     cpu_seconds: int = 60,
     scratch_mb: int = 64,
+    sqlite_datasets: set[str] | None = None,
 ) -> str:
     """Generate the mount plan executed as namespace-root."""
     jail = run_dir / "jail"
@@ -337,7 +367,17 @@ def _generate_init_script(
         base_target = f'"$JAIL{base_prefix.as_posix()}"'
         lines.append(f"mkdir -p {base_target}")
         lines.append(f"ro_dir {_q(base_prefix)} {base_target}")
+    sqlite_datasets = set(sqlite_datasets or ())
+    lines.append(
+        f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
+        'tmpfs "$JAIL/work"'
+    )
     for name, source in mounts.items():
+        if name in sqlite_datasets:
+            target = f'"$JAIL/work/{name}.db"'
+            lines.append(f"cp {_q(source)} {target}")
+            lines.append(f"chmod 600 {target}")
+            continue
         target = f'"$JAIL/inputs/{name}"'
         lines.append(f"mkdir -p {target}" if source.is_dir() else f": > {target}")
         lines.append(
@@ -346,8 +386,6 @@ def _generate_init_script(
         )
     lines.extend(
         [
-            f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
-            'tmpfs "$JAIL/work"',
             f'mount --bind {_q(run_dir / "work")} "$JAIL/export"',
             'mount -o remount,bind,ro "$JAIL/export"',
             'mount -t proc -o nosuid,nodev,noexec proc "$JAIL/proc"',
@@ -362,7 +400,8 @@ def _generate_init_script(
             # The untrusted payload cannot ptrace PID 1 to borrow its mount
             # namespace capabilities.
             "exec /venv/bin/python -I /supervisor.py "
-            f"{int(cpu_seconds)} {int(max_processes)}",
+            f"{int(cpu_seconds)} {int(max_processes)} "
+            f"{_q(json.dumps(sorted(sqlite_datasets)))}",
             "",
         ]
     )
@@ -370,15 +409,26 @@ def _generate_init_script(
 
 
 def _build_env(
-    mounts: Mapping[str, Path], source_env: Mapping[str, str] | None = None
+    mounts: Mapping[str, Path],
+    source_env: Mapping[str, str] | None = None,
+    *,
+    sqlite_datasets: set[str] | None = None,
 ) -> dict[str, str]:
     source = dict(source_env or os.environ)
     # Do not inherit execute_code's configurable passthrough allowlist here:
     # this boundary is deliberately fixed and credential-blind.
+    sqlite_datasets = set(sqlite_datasets or ())
     env = {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "SANDBOX_INPUTS": json.dumps(
-            {name: str(python_sandbox_dataset_path(name)) for name in mounts},
+            {
+                name: (
+                    f"/work/{name}.db"
+                    if name in sqlite_datasets
+                    else str(python_sandbox_dataset_path(name))
+                )
+                for name in mounts
+            },
             sort_keys=True,
         ),
         "RESULT_PATH": "/work/result.json",
@@ -504,6 +554,21 @@ _CLIENT_ARTIFACT_RUN_ID = re.compile(r"^r_[a-f0-9]{8}$")
 _ZIP_MAGIC = b"PK\x03\x04"
 
 
+def _retained_workbook_basename(
+    source_name: str, *, run_id: str, digest_prefix: str
+) -> str:
+    """Build a portal-safe retained name that preserves the export basename."""
+    stem = source_name[:-5] if source_name.lower().endswith(".xlsx") else source_name
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "workbook"
+    prefix = f"sandbox_{run_id}_{digest_prefix}_"
+    max_stem = 132 - len(prefix) - len(".xlsx")
+    stem = stem[:max_stem].rstrip("._-") or "workbook"
+    basename = f"{prefix}{stem}.xlsx"
+    if not _CLIENT_ARTIFACT_NAME.fullmatch(basename):
+        raise ValueError(f"retained workbook name violates portal contract: {basename}")
+    return basename
+
+
 def _promote_workbook(
     source: Path,
     *,
@@ -524,7 +589,11 @@ def _promote_workbook(
         return None
 
     hexdigest = digest.hexdigest()
-    basename = f"sandbox_{run_id}_{hexdigest}.xlsx"
+    basename = _retained_workbook_basename(
+        source.name,
+        run_id=run_id,
+        digest_prefix=hexdigest[:12],
+    )
     media_root.mkdir(parents=True, exist_ok=True, mode=0o750)
     target = media_root / basename
     if target.exists():
@@ -600,7 +669,7 @@ def _list_files(
             and _CLIENT_ARTIFACT_NAME.fullmatch(path.name)
         ):
             item["client_url"] = f"{client_url_base}/{run_id}/{path.name}"
-        if promotion_enabled and _CLIENT_ARTIFACT_NAME.fullmatch(path.name):
+        if promotion_enabled and path.suffix.lower() == ".xlsx":
             media_ref = _promote_workbook(
                 path,
                 run_id=run_id,
@@ -797,6 +866,11 @@ def python_sandbox(
         )
 
     limits = _limits(config)
+    sqlite_datasets = {
+        name
+        for name in datasets
+        if _dataset_config(config).get(name, {}).get("type") == "sqlite"
+    }
     wall = _wall_seconds(timeout_seconds, config)
     venv = Path(sys.prefix).resolve()
     init_path = run / "init.sh"
@@ -810,6 +884,7 @@ def python_sandbox(
             limits["max_processes"],
             limits["cpu_seconds"],
             limits["scratch_mb"],
+            sqlite_datasets,
         ),
         encoding="utf-8",
     )
@@ -835,7 +910,7 @@ def python_sandbox(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            env=_build_env(mounts),
+            env=_build_env(mounts, sqlite_datasets=sqlite_datasets),
             preexec_fn=_preexec(limits),
         )
         stdout_head: list[bytes] = []
@@ -976,7 +1051,8 @@ def _handle_python_sandbox(args: dict, **_: Any) -> str:
 
 _BASE_DESCRIPTION = (
     "Run Python offline in a locked sandbox on this machine — no network, "
-    "no shell, read-only data, one scratch directory (/work). Use it for "
+    "no shell, read-only path datasets, one scratch directory (/work). SQLite "
+    "datasets are writable copies at their SANDBOX_INPUTS path under /work. Use it for "
     "batch computation the chat should not do item-by-item: comparing or "
     "reconciling lists across sources, counting or deduplicating more than "
     "~50 items, sums/statistics, and parsing spreadsheets or CSVs. Aggregate "
