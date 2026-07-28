@@ -69,6 +69,14 @@ from agent.dynamic_orchestration import (
     ExecutionOutcome,
     ExecutionDispatchState,
 )
+from agent.dynamic_orchestration.validation import (
+    _MAX_GRAPH_DEPTH as _MAX_GRAPH_DEPTH,
+    _MAX_GRAPH_NODES as _MAX_GRAPH_NODES,
+    _MAX_MAPPING_FIELDS as _MAX_MAPPING_FIELDS,
+    _MAX_TEXT_COLLECTION_ITEMS as _MAX_TEXT_COLLECTION_ITEMS,
+    _mapping_snapshot as _mapping_snapshot,
+    _reject_sensitive as _reject_sensitive,
+)
 __all__ = [
     'json',
     'os',
@@ -157,6 +165,17 @@ __all__ = [
     'task_payload',
     'IterationBombList',
     'HugePrefixMapping',
+    'HostileMapping',
+    'HOSTILE_MAPPING_HOOKS',
+    'HOSTILE_MAPPING_MARKER',
+    'nested_lists',
+    'nested_dicts',
+    '_MAX_GRAPH_DEPTH',
+    '_MAX_GRAPH_NODES',
+    '_MAX_MAPPING_FIELDS',
+    '_MAX_TEXT_COLLECTION_ITEMS',
+    '_mapping_snapshot',
+    '_reject_sensitive',
     'valid_plan',
     'audit',
     'ELIGIBILITY_GATES',
@@ -343,6 +362,71 @@ class HugePrefixMapping(Mapping[str, object]):
     def __getitem__(self, key: str) -> object:
         self.values_read += 1
         raise AssertionError(f"oversized mapping value must not be read: {key}")
+HOSTILE_MAPPING_HOOKS = ("len", "iter", "getitem", "items", "get")
+HOSTILE_MAPPING_MARKER = "HOSTILE_MAPPING_"
+class HostileMapping(Mapping):
+    """A custom ``Mapping`` whose one targeted container hook raises.
+
+    Public ``from_mapping`` boundaries must snapshot decoded mappings and turn a
+    hostile adapter's ``RuntimeError``/``TypeError``/``ValueError`` into a stable
+    ``DomainValidationError`` rather than leaking it. Hooks other than ``mode``
+    delegate to the ``collections.abc.Mapping`` mixin so iteration/item access
+    genuinely reach ``__iter__``/``__getitem__`` exactly as a real adapter would.
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        *,
+        exc: type[BaseException] = RuntimeError,
+        base: Mapping[str, object] | None = None,
+    ) -> None:
+        self.mode = mode
+        self.exc = exc
+        self._base = dict(base or {})
+
+    def __len__(self) -> int:
+        if self.mode == "len":
+            raise self.exc(f"{HOSTILE_MAPPING_MARKER}LEN")
+        return len(self._base)
+
+    def __iter__(self) -> Iterator[str]:
+        if self.mode == "iter":
+            raise self.exc(f"{HOSTILE_MAPPING_MARKER}ITER")
+        return iter(self._base)
+
+    def __getitem__(self, key: str) -> object:
+        if self.mode == "getitem":
+            raise self.exc(f"{HOSTILE_MAPPING_MARKER}GETITEM")
+        return self._base[key]
+
+    def items(self):  # type: ignore[override]
+        if self.mode == "items":
+            raise self.exc(f"{HOSTILE_MAPPING_MARKER}ITEMS")
+        return super().items()
+
+    def get(self, key, default=None):  # type: ignore[override]
+        if self.mode == "get":
+            raise self.exc(f"{HOSTILE_MAPPING_MARKER}GET")
+        return super().get(key, default)
+def nested_lists(depth: int, leaf: object = "leaf") -> object:
+    """Return ``depth`` single-element lists wrapped around ``leaf``.
+
+    ``nested_lists(0)`` is the bare leaf; each level adds one list, so the leaf
+    is walked at graph depth ``depth`` by the sensitive-value scanner.
+    """
+
+    value: object = leaf
+    for _ in range(depth):
+        value = [value]
+    return value
+def nested_dicts(depth: int, leaf: object = "leaf") -> object:
+    """Return ``depth`` single-key dicts wrapped around ``leaf``."""
+
+    value: object = leaf
+    for _ in range(depth):
+        value = {"nested": value}
+    return value
 def valid_plan(
     decision_id: str,
     prior_route: RouteV1 | str,

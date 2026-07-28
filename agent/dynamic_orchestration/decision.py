@@ -37,6 +37,7 @@ from .validation import (
     _PROHIBITED_FIELD_NAMES,
     _SENSITIVE_VALUE_PATTERN,
     _immutable_string_collection,
+    _mapping_snapshot,
     _parse_exact_enum,
     _reject_sensitive,
     _safe_asdict,
@@ -276,6 +277,11 @@ class RouteDecisionV1:
             raise DomainValidationError(
                 "decision.schema_invalid", "route decision must be a mapping"
             )
+        payload = _mapping_snapshot(
+            payload,
+            code="decision.schema_invalid",
+            location="route decision",
+        )
         _reject_sensitive(payload, "decision")
         allowed = {field_.name for field_ in fields(cls)}
         payload_keys = _validated_mapping_keys(
@@ -375,6 +381,11 @@ class RouteDecisionV1:
             )
             trigger = values.get("trigger")
             if isinstance(trigger, Mapping):
+                trigger = _mapping_snapshot(
+                    trigger,
+                    code="decision.trigger_invalid",
+                    location="decision trigger",
+                )
                 if trigger.get("schema_version") == "initial-selection-trigger/v1":
                     values["trigger"] = InitialSelectionTriggerV1.from_mapping(trigger)
                 else:
@@ -415,6 +426,11 @@ class RouteDecisionV1:
                     else:
                         candidate = item
                 elif isinstance(item, Mapping):
+                    item = _mapping_snapshot(
+                        item,
+                        code="candidate.invalid",
+                        location="candidate",
+                    )
                     persisted_route_id = _validated_route_id(item.get("route_id"), "route_id")
                     route_context = (
                         trusted_routes.get(persisted_route_id)

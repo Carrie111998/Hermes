@@ -25,6 +25,7 @@ from .validation import (
     _EFFORT_LABELS,
     _finite_number,
     _immutable_string_collection,
+    _mapping_snapshot,
     _parse_exact_enum,
     _reject_sensitive,
     _safe_asdict,
@@ -70,6 +71,11 @@ class ExecutionIdentityAttestationV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "ExecutionIdentityAttestationV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="execution.schema_invalid",
+            location="execution identity",
+        )
         expected = {field_.name for field_ in fields(cls)}
         unknown = _validated_mapping_keys(
             payload,
@@ -127,6 +133,11 @@ class ExecutionVerificationAttestationV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "ExecutionVerificationAttestationV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="execution.schema_invalid",
+            location="execution verification",
+        )
         expected = {field_.name for field_ in fields(cls)}
         unknown = _validated_mapping_keys(
             payload,
@@ -180,6 +191,11 @@ class ExecutionOutcomeV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "ExecutionOutcomeV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="execution.schema_invalid",
+            location="execution outcome",
+        )
         expected = {field_.name for field_ in fields(cls)}
         unknown = _validated_mapping_keys(
             payload,
@@ -364,6 +380,7 @@ class ExecutionEnvelopeV1:
         trusted_decision: RouteDecisionV1 | None = None,
         trusted_routes: Mapping[str, RouteV1] | None = None,
     ) -> "ExecutionEnvelopeV1":
+        payload = _mapping_snapshot(payload, code="execution.schema_invalid", location="execution envelope")
         expected = {field_.name for field_ in fields(cls) if field_.init}
         keys = _validated_mapping_keys(payload, code="execution.schema_invalid", location="execution envelope")
         if keys - expected:

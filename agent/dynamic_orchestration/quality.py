@@ -22,6 +22,7 @@ from .validation import (
     _canonical_pool_identity,
     _finite_number,
     _immutable_string_collection,
+    _mapping_snapshot,
     _parse_exact_enum,
     _reject_sensitive,
     _safe_asdict,
@@ -101,6 +102,11 @@ class AcceptanceThresholdV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "AcceptanceThresholdV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="quality.threshold_invalid",
+            location="acceptance threshold",
+        )
         expected = {field_.name for field_ in fields(cls)}
         if _validated_mapping_keys(
             payload,
@@ -137,6 +143,11 @@ class CompensationEscalationV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "CompensationEscalationV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="quality.escalation_invalid",
+            location="compensation escalation",
+        )
         expected = {field_.name for field_ in fields(cls)}
         if _validated_mapping_keys(
             payload,
@@ -186,6 +197,11 @@ class IndependentReviewAttestationV1:
         cls,
         payload: Mapping[str, object],
     ) -> "IndependentReviewAttestationV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="quality.independence_invalid",
+            location="review attestation",
+        )
         expected = {field_.name for field_ in fields(cls)}
         if _validated_mapping_keys(
             payload,
@@ -378,6 +394,11 @@ class QualityCompensationPlanV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "QualityCompensationPlanV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="quality.schema_invalid",
+            location="quality plan",
+        )
         payload_keys = _validated_mapping_keys(
             payload,
             code="quality.schema_invalid",

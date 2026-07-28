@@ -18,6 +18,7 @@ from .validation import (
     _ascii_trimmed_nfc,
     _canonical_pool_identity,
     _finite_number,
+    _mapping_snapshot,
     _reject_sensitive,
     _stable_identifier_collection,
     _task_text,
@@ -93,6 +94,11 @@ class InitialSelectionTriggerV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "InitialSelectionTriggerV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="decision.trigger_invalid",
+            location="initial trigger",
+        )
         expected = {field_.name for field_ in fields(cls)}
         if _validated_mapping_keys(
             payload,
@@ -177,6 +183,11 @@ class RuntimeErrorClassificationV1:
                 "classification.capacity_scope_required",
                 "capacity classification must be a mapping with route and pool scope",
             )
+        payload = _mapping_snapshot(
+            payload,
+            code="classification.capacity_scope_required",
+            location="classification",
+        )
         if "provider" in payload or "model" in payload:
             raise DomainValidationError(
                 "classification.capacity_scope_required",
@@ -328,6 +339,11 @@ class CandidateEvaluation:
         *,
         route_context: RouteV1 | None = None,
     ) -> "CandidateEvaluation":
+        payload = _mapping_snapshot(
+            payload,
+            code="candidate.invalid",
+            location="candidate",
+        )
         expected = {
             "route_id",
             "deterministic_status",

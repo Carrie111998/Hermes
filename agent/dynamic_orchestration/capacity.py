@@ -28,6 +28,7 @@ from .validation import (
     _canonical_capacity_provenance_collection,
     _canonical_pool_identity,
     _finite_number,
+    _mapping_snapshot,
     _parse_exact_enum,
     _reject_sensitive,
     _safe_asdict,
@@ -111,6 +112,11 @@ class CapacityValueV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "CapacityValueV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="capacity.schema_invalid",
+            location="capacity value",
+        )
         expected = {field_.name for field_ in fields(cls)}
         unknown = _validated_mapping_keys(
             payload,
@@ -257,6 +263,7 @@ class CapacityObservationV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "CapacityObservationV1":
+        payload = _mapping_snapshot(payload, code="capacity.schema_invalid", location="capacity observation")
         expected = {field_.name for field_ in fields(cls)}
         keys = _validated_mapping_keys(payload, code="capacity.schema_invalid", location="capacity observation")
         if keys - expected:
@@ -396,6 +403,11 @@ class PoolCapacityV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "PoolCapacityV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="capacity.schema_invalid",
+            location="pool capacity",
+        )
         expected = {field_.name for field_ in fields(cls)}
         unknown = _validated_mapping_keys(
             payload,
@@ -568,6 +580,11 @@ class CapacityViewV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "CapacityViewV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="capacity.schema_invalid",
+            location="capacity view",
+        )
         expected = {field_.name for field_ in fields(cls)}
         unknown = _validated_mapping_keys(
             payload,
@@ -958,6 +975,11 @@ class CapacityReservationV1:
         *,
         trusted_route: RouteV1 | None = None,
     ) -> "CapacityReservationV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="reservation.schema_invalid",
+            location="capacity reservation",
+        )
         expected = {field_.name for field_ in fields(cls)}
         keys = _validated_mapping_keys(
             payload,
@@ -1127,6 +1149,11 @@ class CircuitBreakerV1:
         *,
         trusted_route: RouteV1 | None = None,
     ) -> "CircuitBreakerV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="breaker.schema_invalid",
+            location="circuit breaker",
+        )
         expected = {field_.name for field_ in fields(cls)}
         keys = _validated_mapping_keys(
             payload,

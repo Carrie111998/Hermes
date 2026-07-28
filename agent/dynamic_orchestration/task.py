@@ -18,6 +18,7 @@ from .validation import (
     _bounded_non_negative_integer,
     _finite_number,
     _immutable_string_collection,
+    _mapping_snapshot,
     _normalized_policy_identifiers,
     _reject_sensitive,
     _safe_asdict,
@@ -99,6 +100,11 @@ class AuditedModelJustification:
         *,
         reference_time: datetime | None = None,
     ) -> "AuditedModelJustification":
+        payload = _mapping_snapshot(
+            payload,
+            code="task.unexpected_field",
+            location="audited justification",
+        )
         expected = {field_.name for field_ in fields(cls)}
         unknown = _validated_mapping_keys(
             payload,
@@ -266,8 +272,7 @@ class TaskVerificationV1:
         return _dto_from_mapping(cls, payload, "task.verification")
 
 def _dto_from_mapping(dto: type[Any], payload: Mapping[str, object], location: str) -> Any:
-    if not isinstance(payload, Mapping):
-        raise DomainValidationError("task.schema_invalid", f"{location} must be a mapping")
+    payload = _mapping_snapshot(payload, code="task.schema_invalid", location=location)
     expected = {field_.name for field_ in fields(dto)}
     unknown = _validated_mapping_keys(
         payload,
@@ -378,8 +383,11 @@ class TaskEnvelope:
         *,
         reference_time: datetime | None = None,
     ) -> "TaskEnvelope":
-        if not isinstance(payload, Mapping):
-            raise DomainValidationError("task.schema_invalid", "task envelope must be a mapping")
+        payload = _mapping_snapshot(
+            payload,
+            code="task.schema_invalid",
+            location="task envelope",
+        )
         _validated_mapping_keys(
             payload,
             code="task.unexpected_field",
@@ -417,7 +425,13 @@ class TaskEnvelope:
                 values[name] = dto_type.from_mapping(value)
         justification = values.get("audited_model_justification")
         if isinstance(justification, Mapping):
-            audited_payload = dict(justification)
+            audited_payload = dict(
+                _mapping_snapshot(
+                    justification,
+                    code="task.justification_invalid",
+                    location="audited model justification",
+                )
+            )
             if identity_fields:
                 requested_identity = {
                     name: _ascii_trimmed_nfc(

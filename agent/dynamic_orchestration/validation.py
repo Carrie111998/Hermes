@@ -231,28 +231,80 @@ def _reject_sensitive_mapping_key(key: object, location: str) -> None:
         )
     _reject_sensitive(key, location)
 
+def _mapping_snapshot(
+    payload: object,
+    *,
+    code: str,
+    location: str,
+) -> dict[object, object]:
+    """Snapshot a decoded mapping at a public ``from_mapping`` boundary.
+
+    Ordinary decoded ``dict`` input is returned unchanged, so JSON/dict
+    behaviour and error precedence stay identical. Any other ``Mapping`` is
+    copied into a plain ``dict`` while every container hook (``__len__``,
+    iteration, ``__getitem__``) is contained: a hostile custom ``Mapping`` whose
+    hooks raise surfaces a stable :class:`DomainValidationError` instead of
+    leaking its own ``RuntimeError``/``TypeError``/``ValueError``. Values are
+    never coerced and nested containers are handed to their owning validator
+    untouched. Oversized mappings keep the bounded sensitive-key prefix scan and
+    are rejected without a single value being read.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise DomainValidationError(code, f"{location} must be a mapping")
+    if type(payload) is dict:
+        return payload
+    try:
+        size = len(payload)
+    except DomainValidationError:
+        raise
+    except Exception as exc:  # hostile __len__ on a custom Mapping adapter
+        raise DomainValidationError(code, f"{location} must be a mapping") from exc
+    if size > _MAX_MAPPING_FIELDS:
+        # Mirror the overflow branch below without reading any value: iterate at
+        # most N+1 keys, preserve the sensitive-key precedence, then fail closed.
+        try:
+            for key in islice(payload, _MAX_MAPPING_FIELDS + 1):
+                _reject_sensitive_mapping_key(key, location)
+        except DomainValidationError:
+            raise
+        except Exception as exc:  # hostile iteration on a custom Mapping adapter
+            raise DomainValidationError(code, f"{location} must be a mapping") from exc
+        raise DomainValidationError(
+            "contract.payload_too_complex",
+            f"{location} exceeds the maximum field count",
+        )
+    snapshot: dict[object, object] = {}
+    try:
+        for key in islice(payload, _MAX_MAPPING_FIELDS + 1):
+            snapshot[key] = payload[key]
+    except DomainValidationError:
+        raise
+    except Exception as exc:  # hostile iteration or __getitem__ on an adapter
+        raise DomainValidationError(code, f"{location} must be a mapping") from exc
+    return snapshot
+
 def _validated_mapping_keys(
     payload: object,
     *,
     code: str,
     location: str,
 ) -> set[str]:
-    if not isinstance(payload, Mapping):
-        raise DomainValidationError(code, f"{location} must be a mapping")
-    if len(payload) > _MAX_MAPPING_FIELDS:
+    snapshot = _mapping_snapshot(payload, code=code, location=location)
+    if len(snapshot) > _MAX_MAPPING_FIELDS:
         # Preserve sensitive-key precedence at the exact public-contract
         # overflow edge without turning the secret scan into unbounded work.
         # Mapping iteration order defines a deterministic prefix; values are
         # never read, and huge mappings stop after N+1 keys.
-        for key in islice(payload, _MAX_MAPPING_FIELDS + 1):
+        for key in islice(snapshot, _MAX_MAPPING_FIELDS + 1):
             _reject_sensitive_mapping_key(key, location)
         raise DomainValidationError(
             "contract.payload_too_complex",
             f"{location} exceeds the maximum field count",
         )
-    if any(type(key) is not str for key in payload):
+    if any(type(key) is not str for key in snapshot):
         raise DomainValidationError(code, f"{location} field names must be strings")
-    return {str(key) for key in payload}
+    return {str(key) for key in snapshot}
 
 def _ascii_trimmed_nfc(value: object, *, field_name: str, code: str) -> str:
     if type(value) is not str:
@@ -656,7 +708,15 @@ def _reject_sensitive(
                     f"sensitive value prohibited in {location}",
                 )
 
-    walk(value)
+    try:
+        walk(value)
+    except DomainValidationError:
+        raise
+    except Exception as exc:  # hostile container hook on a nested adapter object
+        raise DomainValidationError(
+            "contract.payload_too_complex",
+            f"{location} could not be safely validated",
+        ) from exc
 
 def _safe_asdict(
     value: object,

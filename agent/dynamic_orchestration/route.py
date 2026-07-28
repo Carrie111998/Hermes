@@ -20,6 +20,7 @@ from .validation import (
     _SENSITIVE_VALUE_PATTERN,
     _UNRESERVED,
     _ascii_trimmed_nfc,
+    _mapping_snapshot,
     _normalized_text,
     _reject_sensitive,
     _reject_sensitive_mapping_key,
@@ -214,6 +215,11 @@ class RouteV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object]) -> "RouteV1":
+        payload = _mapping_snapshot(
+            payload,
+            code="route.unexpected_field",
+            location="route",
+        )
         payload_keys = _validated_mapping_keys(
             payload,
             code="route.unexpected_field",

@@ -95,18 +95,19 @@ The independent reviewer verified the then-current source and tests, ran the foc
 - The 5,000+ line focused test was mechanically split into six domain files plus one non-test support module. The semantic node-ID multiset is exactly 375 before and after, with zero missing, extra or duplicate cases; the package compatibility module adds two cases.
 - Combined, hash-seeded, reverse-order, shuffled-module and isolated per-file runs all pass 377 tests.
 
-### L1 — adversarial custom `Mapping` can leak implementation exceptions — accepted residual
+### L1 — adversarial custom `Mapping` can leak implementation exceptions — closed (executor lane)
 
-- **Symbol:** `_validated_mapping_keys` and subsequent mapping access.
-- **Scenario:** a custom `Mapping` whose `__len__`, iterator, `.items()` or `.get()` raises can surface that implementation exception rather than `DomainValidationError`.
-- **Reason accepted:** this pure slice's supported wire boundary is decoded ordinary mappings; fully sandboxing arbitrary user-defined Python `Mapping` implementations would require a larger input-adapter contract. Before runtime wiring, decode/validate adapters must snapshot ordinary JSON objects and convert adapter exceptions into stable domain errors.
-- **Gate:** remains non-blocking LOW only while the PR is draft and unwired.
+- **Symbol:** new `_mapping_snapshot`, `_validated_mapping_keys`, `_reject_sensitive`, and every public `from_mapping` boundary.
+- **Scenario:** a custom `Mapping` whose `__len__`, iteration, `.items()`, `.get()` or `__getitem__` raises could surface that implementation exception rather than `DomainValidationError`.
+- **Fix:** a bounded, hostile-safe input-adapter snapshot (`_mapping_snapshot`) now runs at every public `from_mapping` entry (24 sites across route/task/eligibility/quality/capacity/decision/execution) and at the three nested untrusted-mapping reads (decision trigger, persisted candidate, audited justification). Ordinary decoded `dict` input is returned unchanged (same object), so JSON/dict behaviour and error precedence are identical; any other `Mapping` is copied into a plain `dict` with every container hook contained as a stable `DomainValidationError`, and no value is coerced via `str()`. Oversized mappings keep the bounded key-prefix scan and are rejected without reading a single value. The shared secret scanner `_reject_sensitive` additionally wraps its graph walk so a hostile nested container is contained. Sensitive scanning, graph bounds, canonicalization and fail-closed authority are unchanged.
+- **Evidence:** a RED demonstration that disabled the snapshot and the wrap reproduced 67 leaking assertions; the GREEN implementation closes them. Direct probes across all boundaries × the five hostile hooks × `{RuntimeError, TypeError, ValueError}` raise stable domain errors with no attacker message leak; ordinary `dict`/`OrderedDict`/`MappingProxyType` inputs stay equivalent. Regressions: `test_public_from_mapping_snapshots_contain_hostile_mapping_adapters`, `test_hostile_mapping_exception_types_are_all_contained`, `test_multi_authority_from_mapping_boundaries_contain_hostile_mappings`, `test_nested_hostile_mapping_inside_decoded_payload_is_contained`, `test_sensitive_scanner_contains_hostile_nested_container_adapters`, `test_oversized_hostile_mapping_scans_only_bounded_keys_across_all_peers`, `test_snapshot_preserves_ordinary_decoded_mapping_semantics`, `test_mapping_snapshot_primitive_preserves_dicts_and_rejects_non_mappings`.
+- **Scope boundary (unchanged):** trusted-authority registries (`trusted_routes`, reviewer/execution/threshold maps) remain the future runtime authority/execution gate's responsibility, not this decoded-payload boundary; they were deliberately not broadened.
 
-### L2 — traversal threshold edges are not exhaustively parameterized — partially fixed / residual
+### L2 — traversal threshold edges are not exhaustively parameterized — closed (executor lane)
 
-- **Covered:** oversized scalar, collection overflow, cycle, excessive depth, sensitive mapping key, candidates and registry overflow.
-- **Residual:** exact depth/node `N` versus `N+1`, benign DAG aliases and hostile custom containers are not exhaustively parameterized.
-- **Reason accepted:** current tests cover the failure classes and the PR remains a draft pure-contract slice. Exact edge parameterization is required before production wiring.
+- **Covered previously:** oversized scalar, collection overflow, cycle, excessive depth, sensitive mapping key, candidates and registry overflow.
+- **Fix:** added permanent focused regressions for the exact graph edges — depth `N` versus `N+1` (nested lists and dicts, and through the public `TaskEnvelope` decoded-object boundary), node budget `N` versus `N+1` in the complete-graph rehydration scan, the collection scan edge (deferred to the owning field validator at `N+1`), benign DAG aliases (accepted and de-duplicated, never mistaken for cycles), the alias fan-out node budget, and hostile containers at the boundaries. Tests prove accepted exact-boundary cases and rejected overflow cases with no timing assertion and no flaky recursion. No implementation defect was exposed; the graph budget was already correct, so no owning helper required a behaviour change.
+- **Regressions:** `test_graph_depth_budget_exact_edge_accepts_n_and_rejects_n_plus_one`, `test_graph_depth_budget_enforced_through_public_decoded_object_boundary`, `test_graph_node_budget_exact_edge_in_complete_graph_scan`, `test_benign_dag_aliases_are_accepted_and_cycles_are_rejected`, `test_dag_alias_fanout_cannot_escape_the_complete_graph_node_budget`, `test_graph_collection_scan_exact_edge_defers_oversized_to_field_validator`.
 
 ## Current mechanical evidence
 
@@ -151,10 +152,28 @@ Claude reviewed the exact current worktree read-only after the package replaceme
 - The review's publication BLOCK was mechanical: the monolith deletion and replacement package had to be staged together; the stale zero-byte shared-worktree `index.lock` was verified with no Git process and removed. The full replacement is now staged as one coherent diff.
 - Final code classification after L1 cleanup: `C: 0, H: 0, M: 0, L: 2` accepted only for hostile custom Mapping adapters and incomplete graph-boundary parameterization while the slice remains draft and unwired.
 
+## Executor LOW-closure lane — 2026-07-27
+
+An executor lane closed the two accepted LOW residuals before any runtime wiring, keeping the pure-contract scope. This is executor evidence; Terra's prior 377-test `PASS` remains prior evidence for the earlier snapshot.
+
+- **L1 closed:** a bounded hostile-safe `_mapping_snapshot` adapter boundary was added to every public `from_mapping` (24 sites) plus the three nested untrusted-mapping reads, and `_reject_sensitive` now contains hostile nested containers. No `str()` coercion; bounds stay fail-closed; ordinary decoded `dict` behaviour is byte-identical (the snapshot returns the same object for a plain `dict`).
+- **L2 closed:** exact depth/node `N`/`N+1`, collection-scan, benign DAG-alias and hostile-container regressions were added; no implementation defect was exposed.
+- **Focused suite:** grew from 377 to **518 tests**. Parent-verifiable runs are green under default `pytest`, `PYTHONHASHSEED=1`, `PYTHONHASHSEED=99`, and the isolated per-file runner (`HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh …`: 7 files, 518 passed, 0 failed).
+- **Static gates:** `python -m py_compile` on all package/test modules, `ruff check` (PLW1514 scope), and `git diff --check` all pass.
+- **RED evidence:** temporarily disabling the snapshot and the scanner wrap reproduced 67 leaking L1 assertions; restoring the fix returns to green.
+- **Executor recomputed aggregates (basename-NUL-content, sorted):** 11-module package `1840c2f19865881025193ae20215df14b0889c4112016c389d9403410b5f39b1`; 8-file split/support `307dfb812255fe3ac7dfa13f00a1ef0d6d44686ad738617e92a152befa5d7c0f`. These supersede the prior frozen snapshot hashes above, which described the pre-closure source.
+- **Single-writer footprint:** only `agent/dynamic_orchestration/{validation,route,task,eligibility,quality,capacity,decision,execution}.py`, `tests/agent/_dynamic_orchestration_support.py`, `tests/agent/test_dynamic_orchestration_boundaries.py`, and this review plus `tasks.md` were touched. `state.py`, `policy.py`, the package `__init__.py`, and the other split test files were not modified.
+
 ## Scope boundary
 
 This branch implements pure CapacityView/Reservation/CircuitBreaker/ExecutionEnvelope contracts but does **not** implement provider/gateway dispatch, `CredentialPool.snapshot_for_capacity()`, live observation ingestion, persistent/atomic reservations, breaker storage/transitions, sealed dispatch authority, legacy resolver projection, observability wiring, shadow/canary/rollback activation or runtime E2E. The Hermes PR must remain draft until those layers and their boundary tests exist.
 
+## Parent review of 377→518 hardening — Claude attestation inconclusive
+
+Two bounded Claude Opus review lanes were dispatched for this delta, both read-only. Neither produced a child/tool action or report within the watchdog window; both were terminated without touching the worktree. This is explicitly **not** counted as a Claude PASS.
+
+The parent read the complete 664-line source/test diff and verified the allowlist, uniform `_mapping_snapshot` placement, hostile-hook containment, ordinary dict/OrderedDict/MappingProxyType compatibility, graph edge semantics, and absence of runtime wiring. Parent gates passed twice: 518 tests under default/`PYTHONHASHSEED=1/99`, Ruff, compileall, diff-check and boundary inventory. Parent classification for this mechanical hardening delta: `C: 0, H: 0, M: 0, L: 0`; independent Claude attestation remains inconclusive and runtime tasks remain unchecked.
+
 ## Current verdict
 
-**PASS FOR THE PROPOSED PURE-CONTRACT SLICE — NOT PRODUCTION READY.** Final independent counts are `C: 0, H: 0, M: 0, L: 2`. Every reproduced C/H/M is covered by permanent regressions and green locally. Performance, package extraction, API compatibility, deterministic test preservation, current broad regression, patch-scoped secret scan and final expanded review are complete. Runtime wiring remains blocked by the explicit unchecked tasks and pre-wiring gates above.
+**PASS FOR THE PROPOSED PURE-CONTRACT SLICE — NOT PRODUCTION READY.** The prior independent expanded review classified the 377-test snapshot as `C: 0, H: 0, M: 0, L: 2`; the executor lane then closed both accepted LOWs with permanent regressions, and parent verification of the 518-test delta found no new C/H/M/L finding. This is parent-verified hardening, not a new Claude attestation. Performance, package extraction, API compatibility, deterministic test preservation, current broad regression, patch-scoped secret scan and prior expanded review remain documented above. Runtime wiring remains blocked by the explicit unchecked tasks and pre-wiring gates above — those gates are future work, not defects in this slice.
