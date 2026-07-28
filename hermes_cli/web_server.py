@@ -3040,11 +3040,46 @@ async def get_ssh_ownership(request: Request):
 
 @app.get("/api/health")
 async def get_health():
-    """Lightweight process liveness for desktop/backend readiness probes."""
+    """Lightweight process liveness for desktop/backend readiness probes.
+
+    Includes authority store database status when the Postgres backend is
+    configured, so container health checks and load balancers can gate on
+    DB connectivity without a full business-status round-trip.
+    """
+    from hermes_cli.postgres_authority import get_authority_backend
+
+    backend = get_authority_backend()
+    db_status: dict = {"backend": backend}
+
+    if backend == "postgres":
+        try:
+            from hermes_cli.postgres_authority import (
+                connect, get_schema_version, SCHEMA_VERSION
+            )
+            conn = connect()
+            try:
+                version = get_schema_version(conn)
+            finally:
+                conn.close()
+            db_status.update({
+                "reachable": True,
+                "schema_version": version,
+                "schema_current": version == SCHEMA_VERSION,
+                "required_version": SCHEMA_VERSION,
+            })
+        except Exception as exc:
+            db_status.update({
+                "reachable": False,
+                "error": str(exc).split("\n")[0][:120],
+            })
+    else:
+        db_status["reachable"] = True  # SQLite always local
+
     return {
         "ok": True,
         "version": __version__,
         "auth_required": bool(getattr(app.state, "auth_required", False)),
+        "database": db_status,
     }
 
 

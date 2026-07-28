@@ -12,7 +12,7 @@
 |---------|-------|-----------------|-------|
 | **0.20.0** | Crash Recovery | Proven supervised worker lifecycle | ✅ Released |
 | **0.21.0** | Payment Rails | ≥3 payment rail plugins working | 🔲 Next |
-| **0.22.0** | Postgres Authority Store | HA-capable authority database | 🔲 |
+| **0.22.0** | Postgres Authority Store | HA-capable authority database | 🔶 |
 | **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | 🔲 |
 | **0.24.0** | Billing Engine | Usage metering + invoicing | 🔲 |
 | **0.25.0** | Agent Marketplace | Tool/skill discovery + installation | 🔲 |
@@ -90,16 +90,26 @@ charterforge business payment-rails --test-webhook --rail nevermined
 
 **Goal:** Production-capable authority database with connection pooling
 
-**Status:** 🔶 Postgres authority + DB CLI complete. Alembic migrations pending.
+**Status:** 🔶 Core authority store, fencing, migrations, and health checks complete. Connection pooling pending.
 
 ### Deliverables
 
 - [x] **Postgres Authority Adapter**
   - `hermes_cli/postgres_authority.py` — claim/release/complete operations
+  - `UNIQUE (task_id, organization_id)` enforces one active claim per task+org
+  - `lease_generation` fencing token — stale workers rejected from all writes
+  - `reclaim_task()` — atomic expired-claim replacement with generation increment
+  - Idempotent effect recording via `effect_key UNIQUE`
+  - Full permit model: actor, executor, capability, action_type, target_resource,
+    payload_hash, policy_version, revocation — parity with SQLite authority model
+  - Timestamps as timezone-aware datetime bound parameters (no SQL interpolation)
   - Environment: `AUTHORITY_POSTGRES_URL` or `DATABASE_URL`
-  - Execution permit flow (issue/consume)
-  - Automatic backend detection (postgres vs sqlite)
   - Optional dependency: `charterforge[postgres]`
+
+- [x] **Versioned Schema Migrations**
+  - `_MIGRATIONS` ordered list — fresh install and upgrade paths
+  - `init_schema()` fails closed if DB version > `SCHEMA_VERSION`
+  - `get_schema_version()` for health checks and CI validation
 
 - [x] **Database CLI Commands**
   - `charterforge db init --postgres-url <url>`
@@ -108,39 +118,55 @@ charterforge business payment-rails --test-webhook --rail nevermined
   - Backend auto-detection + forced selection
 
 - [x] **CI Integration**
-  - Postgres service container in GH Actions
-  - Integration tests against real Postgres
+  - Postgres 16 service container in GH Actions
+  - 33 adversarial integration tests against real Postgres (two connections)
+  - `test_authority_store.py` unit tests run without Postgres
 
-- [ ] **Schema Migration**
-  - `alembic` migrations for authority tables
-  - `charterforge db downgrade` implementation
+- [x] **Health Check**
+  - `charterforge business readiness --check` validates Postgres connectivity
+    and schema version via `authority_store_findings()`
+  - `/api/health` endpoint returns `database.reachable`, `schema_version`,
+    `schema_current` when Postgres is configured
 
-- [ ] **Health Check**
-  - `charterforge business readiness --check` validates Postgres connection
-  - Dashboard: `/health` endpoint returns database status
+- [ ] **Schema Migration — downgrade**
+  - `charterforge db downgrade` implementation (currently errors)
+
+- [ ] **Connection Pooling**
+  - `psycopg_pool` or `pgbouncer` integration
+  - Handles 100 concurrent connections
 
 ### Tests
 
-- 16 authority operation tests (postgres_authority.py)
-- 8 db command tests (db_commands.py)
+- 33 Postgres adversarial integration tests (test_postgres_authority.py)
+- 9 unit tests — authority store capabilities + readiness findings (test_authority_store.py)
+- 8 db command tests (test_db_commands.py)
 - Schema isolation per test via unique search_path
-- Backend detection tests
+- Fencing, exclusivity, idempotency, and migration tests proven against live DB
 
 ### Validation
 
 ```bash
 # Initialize Postgres authority store
 docker run -d --name charterforge-db -e POSTGRES_PASSWORD=secret postgres:16
-charterforge db init --postgres postgres://... --authority
+charterforge db init --postgres postgresql://postgres:secret@localhost/charterforge
 charterforge business readiness --check
+
+# Run adversarial test suite
+AUTHORITY_POSTGRES_TEST_URL=postgresql://test:test@localhost/charterforge_test \
+  pytest tests/test_postgres_authority.py -v
 ```
 
 ### Definition of Done
 
-- [ ] Postgres adapter passes all authority store tests
+- [x] Postgres adapter passes all authority store tests (33/33)
+- [x] Claim exclusivity enforced at DB level (UNIQUE constraint + 2-connection test)
+- [x] Stale workers fenced from completion, release, permit issue/consume
+- [x] Effects recorded idempotently with stable key
+- [x] Schema migrations ordered and fail-closed on unknown version
+- [x] Readiness check validates database connectivity and schema version
 - [ ] Migration script tested on representative SQLite database
 - [ ] Connection pooling handles 100 concurrent connections
-- [ ] Readiness check validates database connectivity
+- [ ] `charterforge db downgrade` implemented
 
 ---
 

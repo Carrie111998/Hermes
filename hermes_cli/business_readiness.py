@@ -195,6 +195,70 @@ def email_findings(
     return []
 
 
+def authority_store_findings(config: Mapping[str, Any]) -> list[ReadinessFinding]:
+    """Check authority store connectivity and schema version.
+
+    Returns a finding if:
+    - Postgres is configured but unreachable
+    - The schema version is incompatible (behind or ahead)
+    - psycopg is not installed but the postgres backend is configured
+    """
+    from hermes_cli.postgres_authority import get_authority_backend
+
+    backend = get_authority_backend()
+    if backend != "postgres":
+        return []  # SQLite always available; no connectivity finding needed
+
+    try:
+        from hermes_cli.postgres_authority import connect, get_schema_version, SCHEMA_VERSION
+
+        conn = connect()
+        try:
+            version = get_schema_version(conn)
+        finally:
+            conn.close()
+
+        if version < SCHEMA_VERSION:
+            return [
+                ReadinessFinding(
+                    "authority_store_schema_outdated",
+                    f"Postgres authority schema version {version} < required {SCHEMA_VERSION}",
+                    {"current": version, "required": SCHEMA_VERSION,
+                     "action": "run: charterforge db upgrade"},
+                )
+            ]
+        if version > SCHEMA_VERSION:
+            return [
+                ReadinessFinding(
+                    "authority_store_schema_too_new",
+                    f"Postgres authority schema version {version} > supported {SCHEMA_VERSION}",
+                    {"current": version, "supported": SCHEMA_VERSION,
+                     "action": "upgrade charterforge package"},
+                )
+            ]
+        return []
+
+    except ImportError:
+        return [
+            ReadinessFinding(
+                "authority_store_driver_missing",
+                "Postgres backend configured but psycopg not installed",
+                {"action": "pip install charterforge[postgres]"},
+            )
+        ]
+    except Exception as exc:
+        # Connectivity failure — surface without leaking credentials
+        short = str(exc).split("\n")[0][:120]
+        return [
+            ReadinessFinding(
+                "authority_store_unreachable",
+                "Postgres authority store is not reachable",
+                {"error": short,
+                 "action": "check AUTHORITY_POSTGRES_URL and Postgres service"},
+            )
+        ]
+
+
 def project(
     conn: sqlite3.Connection,
     *,
@@ -225,6 +289,7 @@ def project(
             conn, organization_id=organization_id, charter=charter
         ),
         *email_findings(config, charter=charter),
+        *authority_store_findings(config),
     ]
     deployment = snapshot.get("runtime_deployment") or {}
     autonomy = snapshot.get("autonomy") or {}
