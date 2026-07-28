@@ -1741,6 +1741,51 @@ def test_kanban_guidance_not_in_normal_prompt(monkeypatch, tmp_path):
     assert "kanban_show()" not in prompt
 
 
+def test_kanban_guidance_not_injected_without_env_var_even_with_kanban_tools(monkeypatch, tmp_path):
+    """Regression for #68592: a profile with kanban tools in its toolsets config
+    enables the kanban tool surface (kanban_show is in valid_tool_names), but
+    without HERMES_KANBAN_TASK set the agent is NOT a dispatched kanban worker
+    and must not receive the kanban lifecycle guidance.
+
+    Before the fix, the guidance was injected based solely on kanban_show
+    presence in valid_tool_names, so orchestrator-mode profiles with kanban
+    tools got the worker protocol injected into their system prompt.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    # Simulate a profile that has kanban tools enabled (orchestrator mode)
+    # but is NOT a dispatched kanban worker (no HERMES_KANBAN_TASK).
+    a.valid_tool_names = getattr(a, "valid_tool_names", set()) | {"kanban_show"}
+    agent_kanban_guidance = getattr(a, "_kanban_worker_guidance", None)
+    # The gating in init_agent must have left _kanban_worker_guidance empty
+    # because HERMES_KANBAN_TASK is not set, even though kanban_show is present.
+    assert not agent_kanban_guidance, (
+        "KANBAN_GUIDANCE must not be set when HERMES_KANBAN_TASK is absent, "
+        "even if kanban_show is in valid_tool_names"
+    )
+    prompt = a._build_system_prompt()
+    assert "Kanban task execution protocol" not in prompt
+    assert "kanban_show()" not in prompt
+
+
 def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     """A worker session (HERMES_KANBAN_TASK set) MUST have the full
     lifecycle guidance in its system prompt."""
