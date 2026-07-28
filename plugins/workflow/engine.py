@@ -2388,6 +2388,25 @@ class WorkflowEngine:
                                         rev_state.completed_at = None
                                         rev_state.result = None
                                         print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
+                            # Now wait for the dispatcher to claim the reviewer
+                            # before returning, so the next layer's _monitor_layer
+                            # finds it as "running".
+                            for rev_entry in workflow.nodes[implement_nid].reviews:
+                                rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                                if rev_id and rev_id in states:
+                                    rev_state = states[rev_id]
+                                    if rev_state.kanban_card_id:
+                                        for _ in range(10):  # Wait up to ~30s
+                                            time.sleep(3)
+                                            try:
+                                                card = self.get_card_status(rev_state.kanban_card_id)
+                                                card_status = card.get("status", "").lower()
+                                                if card_status == "running":
+                                                    rev_state.status = "running"
+                                                    print(f"   🔄 {rev_id} claimed by dispatcher — monitoring layer")
+                                                    return True
+                                            except Exception:
+                                                pass
                             return True
                 except Exception:
                     pass
