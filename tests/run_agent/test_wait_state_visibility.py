@@ -53,6 +53,13 @@ def test_emit_wait_notice_updates_spinner_and_activity(tmp_path, monkeypatch):
     assert "waiting on test-model" in summary["last_activity_desc"]
 
 
+def test_activity_summary_exposes_slice_renewal_count(tmp_path, monkeypatch):
+    agent = _make_agent(tmp_path, monkeypatch)
+    agent._budget_renewal_count = 2
+
+    assert agent.get_activity_summary()["iteration_budget_renewals"] == 2
+
+
 def test_emit_wait_notice_without_callback_still_touches_activity(tmp_path, monkeypatch):
     """No thinking_callback bound (gateway sessions) — activity still updates."""
     agent = _make_agent(tmp_path, monkeypatch)

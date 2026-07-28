@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,23 @@ class _FakeClient:
         self.cancelled: list[str] = []
         self.closed = False
         self.__class__.instances.append(self)
+
+    def _proof_receipt(self):
+        return {
+            "schema": "muncho.isolated-worker.proof-receipt.v1",
+            "lease_id": self.kwargs["lease_id"],
+            "edit_generation": 0,
+            "verified_generation": 0,
+            "status": "unverified",
+            "mutation_detection": "unchanged",
+            "changed_paths": [],
+            "pending_paths": [],
+            "verification": None,
+            "applicability": "unknown",
+            "project_root": "",
+            "verify_commands_digest": "",
+            "material_fingerprint": "",
+        }
 
     def start(self, command, *, cwd, timeout_seconds, stdin=b""):
         session_id = f"job-{len(self.started)}"
@@ -48,7 +66,19 @@ class _FakeClient:
             "stderr_b64": "",
             "drained": True,
             "complete": True,
+            "proof_receipt": self._proof_receipt(),
         }
+
+    def proof_status(self):
+        receipt = self._proof_receipt()
+        receipt["mutation_detection"] = "status"
+        return receipt
+
+    def mark_edited(self, paths, *, observed_generation=None):
+        del paths, observed_generation
+        receipt = self._proof_receipt()
+        receipt["mutation_detection"] = "explicit"
+        return receipt
 
     def cancel(self, session_id):
         self.cancelled.append(session_id)
@@ -90,7 +120,9 @@ def test_environment_derives_lease_from_exact_session_and_never_falls_back(
         stdin_data="input",
     )
     result = environment._wait_for_process(process, timeout=2)
-    assert result == {"output": "worker-output", "returncode": 0}
+    assert result["output"] == "worker-output"
+    assert result["returncode"] == 0
+    assert result["isolated_worker_proof_receipt"]["lease_id"] == environment.lease_id
     assert client.started[1]["cwd"] == Path("/workspace")
     assert client.started[1]["timeout_seconds"] == 300
     assert client.started[1]["stdin"] == b"input"
@@ -167,6 +199,85 @@ def test_terminal_factory_uses_config_only_and_preserves_generic_keying(
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     terminal_module._task_env_overrides.clear()
     assert terminal_module._resolve_container_task_id("ordinary-child") == "default"
+
+
+def test_workspace_authority_multi_bind_is_atomic_and_rebind_safe(
+    monkeypatch,
+) -> None:
+    terminal_module._workspace_lease_authorities.clear()
+    terminal_module._workspace_lease_authority_owners.clear()
+    monkeypatch.setattr(
+        terminal_module,
+        "isolated_worker_backend_selected",
+        lambda: True,
+    )
+    try:
+        bound = terminal_module.register_workspace_lease_authorities(
+            ("child-session", "subagent-1"),
+            "root-session",
+        )
+        assert bound == ("child-session", "subagent-1")
+        assert (
+            terminal_module._resolve_container_task_id("child-session")
+            == "root-session"
+        )
+        assert (
+            terminal_module._resolve_container_task_id("subagent-1")
+            == "root-session"
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="workspace_lease_authority_rebind_denied",
+        ):
+            terminal_module.register_workspace_lease_authorities(
+                ("new-child", "child-session"),
+                "different-root",
+            )
+        assert "new-child" not in terminal_module._workspace_lease_authorities
+    finally:
+        terminal_module._workspace_lease_authorities.clear()
+        terminal_module._workspace_lease_authority_owners.clear()
+
+
+def test_runtime_effects_correlate_parallel_identical_commands_by_call_id() -> None:
+    from agent.tool_runtime_effects import (
+        bind_tool_runtime_effect,
+        consume_tool_runtime_effect,
+        record_current_tool_runtime_effect,
+    )
+
+    release_first = threading.Event()
+
+    def record(call_id: str, generation: int, wait: bool) -> None:
+        with bind_tool_runtime_effect(
+            tool_name="terminal",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id=call_id,
+        ):
+            if wait:
+                release_first.wait(2)
+            assert record_current_tool_runtime_effect(
+                {"receipt": {"edit_generation": generation}}
+            )
+
+    first = threading.Thread(target=record, args=("call-1", 1, True))
+    second = threading.Thread(target=record, args=("call-2", 2, False))
+    first.start()
+    second.start()
+    second.join(timeout=2)
+    release_first.set()
+    first.join(timeout=2)
+
+    for call_id, generation in (("call-1", 1), ("call-2", 2)):
+        effect = consume_tool_runtime_effect(
+            tool_name="terminal",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id=call_id,
+        )
+        assert effect == {"receipt": {"edit_generation": generation}}
 
 
 def test_isolated_worker_settings_bridge_from_config_without_lease_override(

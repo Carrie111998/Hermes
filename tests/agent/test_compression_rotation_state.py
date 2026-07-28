@@ -133,6 +133,36 @@ def refresh_state_db(tmp_path: Path):
         db.close()
 
 
+@pytest.fixture
+def empty_workspace_authority_registry():
+    from tools import terminal_tool
+
+    with terminal_tool._workspace_lease_authorities_lock:
+        original_authorities = dict(
+            terminal_tool._workspace_lease_authorities
+        )
+        original_owners = {
+            runtime_id: set(owners)
+            for runtime_id, owners in (
+                terminal_tool._workspace_lease_authority_owners.items()
+            )
+        }
+        terminal_tool._workspace_lease_authorities.clear()
+        terminal_tool._workspace_lease_authority_owners.clear()
+    try:
+        yield terminal_tool
+    finally:
+        with terminal_tool._workspace_lease_authorities_lock:
+            terminal_tool._workspace_lease_authorities.clear()
+            terminal_tool._workspace_lease_authorities.update(
+                original_authorities
+            )
+            terminal_tool._workspace_lease_authority_owners.clear()
+            terminal_tool._workspace_lease_authority_owners.update(
+                original_owners
+            )
+
+
 class TestGoalMigratesOnRotation:
     def test_goal_follows_compression_rotation(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -195,6 +225,83 @@ class TestOrphanRollbackOnCreateFailure:
         assert parent_row is not None
         assert parent_row["ended_at"] is None
         assert db.find_live_compression_child(parent) is None
+
+
+class TestWorkspaceAuthorityFollowsRotation:
+    def test_child_alias_is_live_before_first_post_rotation_tool(
+        self,
+        tmp_path: Path,
+        empty_workspace_authority_registry,
+        monkeypatch,
+    ):
+        terminal_tool = empty_workspace_authority_registry
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_AUTHORITY_ROT"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+        agent._isolated_worker_backend_selected = True
+        agent._workspace_lease_authority = parent
+        agent._track_workspace_lease_persistent_runtime_ids((parent,))
+        terminal_tool.register_workspace_lease_authority(
+            parent,
+            parent,
+            owner_id=agent._workspace_lease_binding_owner_id,
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "isolated_worker_backend_selected",
+            lambda: True,
+        )
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        child = agent.session_id
+
+        assert child != parent
+        assert terminal_tool._resolve_container_task_id(child) == parent
+        assert child in agent._workspace_lease_persistent_runtime_ids
+        assert terminal_tool._workspace_lease_authority_owners[child] == {
+            agent._workspace_lease_binding_owner_id
+        }
+        db.close()
+
+    def test_publication_failure_rolls_back_staged_child_alias(
+        self,
+        tmp_path: Path,
+        empty_workspace_authority_registry,
+    ):
+        terminal_tool = empty_workspace_authority_registry
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_AUTHORITY_ROLLBACK"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+        agent._isolated_worker_backend_selected = True
+        agent._workspace_lease_authority = parent
+        agent._track_workspace_lease_persistent_runtime_ids((parent,))
+        terminal_tool.register_workspace_lease_authority(
+            parent,
+            parent,
+            owner_id=agent._workspace_lease_binding_owner_id,
+        )
+
+        with patch.object(
+            db,
+            "publish_compression_child",
+            side_effect=RuntimeError("publication failed"),
+        ):
+            agent._compress_context(
+                _msgs(),
+                "sys",
+                approx_tokens=120_000,
+            )
+
+        assert agent.session_id == parent
+        assert terminal_tool._workspace_lease_authorities == {
+            parent: parent
+        }
+        assert agent._workspace_lease_persistent_runtime_ids == {
+            parent
+        }
+        db.close()
 
 
 class TestWorkspaceMetadataFollowsRotation:

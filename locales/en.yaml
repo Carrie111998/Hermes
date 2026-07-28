@@ -333,6 +333,7 @@ gateway:
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**Agent Running:** {state}"
+    execution_this_run:    "**Execution this run:** {progress}"
     state_yes:             "Yes ⚡"
     state_no:              "No"
     queued:                "**Queued follow-ups:** {count}"

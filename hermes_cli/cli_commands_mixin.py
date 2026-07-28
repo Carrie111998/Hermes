@@ -934,7 +934,44 @@ class CLICommandsMixin:
             _cprint("  Already on that session.")
             return
 
+        target_authority = self._session_db.get_conversation_root(
+            target_id
+        )
+        if not isinstance(target_authority, str) or not target_authority:
+            raise RuntimeError(
+                "workspace_lease_resume_lineage_unavailable"
+            )
+        # Read and validate the target transcript before mutating either live
+        # identity. A failed read leaves the current conversation untouched.
+        model_history, display_history = self._session_db.get_resume_conversations(
+            target_id
+        )
+        restored = [
+            m
+            for m in (model_history or [])
+            if m.get("role") != "session_meta"
+        ]
+        restored_display = [
+            m
+            for m in (display_history or [])
+            if m.get("role") != "session_meta"
+        ]
+
         old_session_id = self.session_id
+        old_workspace_authority = (
+            getattr(
+                self.agent,
+                "_workspace_lease_authority",
+                None,
+            )
+            if self.agent
+            else None
+        )
+        if (
+            not isinstance(old_workspace_authority, str)
+            or not old_workspace_authority
+        ):
+            old_workspace_authority = old_session_id
         # Flush un-persisted messages before ending the old session (#47202).
         if self.agent:
             try:
@@ -944,6 +981,32 @@ class CLICommandsMixin:
                 )
             except Exception:
                 pass
+            _transition_workspace = getattr(
+                self.agent,
+                "transition_workspace_lease_conversation",
+                None,
+            )
+            if callable(_transition_workspace):
+                _transition_workspace(
+                    target_id,
+                    target_authority,
+                    retain_existing_aliases=False,
+                )
+            if getattr(self.agent, "session_id", None) != target_id:
+                self.agent.session_id = target_id
+            _retire_workspace = getattr(
+                self.agent,
+                "retire_workspace_lease_authority",
+                None,
+            )
+            if callable(_retire_workspace):
+                try:
+                    _retire_workspace(old_workspace_authority)
+                except Exception:
+                    logger.warning(
+                        "Failed to retire resumed-away workspace authority",
+                        exc_info=True,
+                    )
         # End current session
         try:
             self._session_db.end_session(self.session_id, "resumed_other")
@@ -967,14 +1030,8 @@ class CLICommandsMixin:
         # lineage verbatim, used by _display_resumed_history() so timeline
         # events and ancestor rows render correctly (matching the startup
         # --resume path in _preload_resumed_session).
-        model_history, display_history = self._session_db.get_resume_conversations(
-            target_id
-        )
-        restored = [m for m in (model_history or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
-        self._resume_display_history = [
-            m for m in (display_history or []) if m.get("role") != "session_meta"
-        ]
+        self._resume_display_history = restored_display
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -984,7 +1041,6 @@ class CLICommandsMixin:
 
         # Sync the agent if already initialised
         if self.agent:
-            self.agent.session_id = target_id
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
@@ -1116,12 +1172,6 @@ class CLICommandsMixin:
             except Exception:
                 pass
 
-        # End the old session
-        try:
-            self._session_db.end_session(self.session_id, "branched")
-        except Exception:
-            pass
-
         # Create the new session with parent link.
         # Persist a stable ``_branched_from`` marker in model_config so
         # list_sessions_rich() can keep the branch visible in /resume and
@@ -1169,6 +1219,58 @@ class CLICommandsMixin:
         except Exception:
             pass
 
+        try:
+            branch_authority = self._session_db.get_conversation_root(
+                new_session_id
+            )
+            if (
+                not isinstance(branch_authority, str)
+                or not branch_authority
+            ):
+                raise RuntimeError(
+                    "workspace_lease_branch_lineage_unavailable"
+                )
+            if self.agent:
+                _transition_workspace = getattr(
+                    self.agent,
+                    "transition_workspace_lease_conversation",
+                    None,
+                )
+                if callable(_transition_workspace):
+                    _transition_workspace(
+                        new_session_id,
+                        branch_authority,
+                        retain_existing_aliases=True,
+                    )
+                if (
+                    getattr(self.agent, "session_id", None)
+                    != new_session_id
+                ):
+                    self.agent.session_id = new_session_id
+        except Exception as exc:
+            # The parent has not been ended or switched yet. Keep it live and
+            # retire the recoverable branch artifact instead of leaving the
+            # CLI half-transitioned.
+            try:
+                self._session_db.end_session(
+                    new_session_id,
+                    "branch_switch_failed",
+                )
+            except Exception:
+                pass
+            _cprint(f"  Failed to activate branch session: {exc}")
+            return
+
+        # End the old session only after the branch row and workspace claim
+        # are both durable/live.
+        try:
+            self._session_db.end_session(
+                parent_session_id,
+                "branched",
+            )
+        except Exception:
+            pass
+
         # Switch to the new session
         self._transfer_session_yolo(self.session_id, new_session_id)
         self.session_id = new_session_id
@@ -1179,7 +1281,6 @@ class CLICommandsMixin:
 
         # Sync the agent
         if self.agent:
-            self.agent.session_id = new_session_id
             self.agent.session_start = now
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):

@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +97,11 @@ def worker(tmp_path: Path, monkeypatch):
     listener.listen(8)
     stop = threading.Event()
     server = IsolatedWorkerServer(policy)
+    # The production worker attests its exact private tmpfs from mountinfo.
+    # Unit tests use an ordinary temporary directory, so inject the already
+    # separately-tested topology fact at this boundary.
+    monkeypatch.setattr(server, "_attest_quota_topology", lambda: None)
+    monkeypatch.setattr(server, "_quota_sentinel", lambda: (1, 1, 1, 1))
 
     # macOS has neither Linux SO_PEERCRED nor Python getpeereid(). Production
     # remains fail-closed; this fixture supplies the kernel fact so protocol
@@ -123,6 +129,10 @@ def worker(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server, "_spawn_sandboxed", test_spawn)
     thread = threading.Thread(target=server.serve, args=(listener, stop), daemon=True)
     thread.start()
+    ready_deadline = time.monotonic() + 2
+    while not server._usage_reconciled and time.monotonic() < ready_deadline:
+        time.sleep(0.005)
+    assert server._usage_reconciled
     try:
         yield socket_path, roots, lease_ids, server
     finally:
@@ -164,6 +174,22 @@ def _collect(client: IsolatedWorkerClient, session_id: str) -> tuple[str, str, d
     return stdout.decode(), stderr.decode(), final
 
 
+def _run(
+    client: IsolatedWorkerClient,
+    command: str,
+    *,
+    cwd: str = "/workspace",
+    timeout_seconds: int = 3,
+) -> dict:
+    session_id = client.start(
+        command,
+        cwd=Path(cwd),
+        timeout_seconds=timeout_seconds,
+    )
+    _stdout, _stderr, final = _collect(client, session_id)
+    return dict(final["proof_receipt"])
+
+
 def _request(**changes):
     value = {
         "schema": REQUEST_SCHEMA,
@@ -180,6 +206,235 @@ def _request(**changes):
     }
     value.update(changes)
     return value
+
+
+def test_quota_topology_attestation_decodes_exact_tmpfs_mountpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_base = tmp_path / "lease base"
+    lease_base.mkdir(mode=0o700)
+    os.chown(lease_base, os.getuid(), os.getgid())
+    os.chmod(lease_base, 0o700)
+    server = IsolatedWorkerServer(_worker_policy(lease_base))
+    escaped = str(lease_base).replace("\\", "\\134").replace(" ", "\\040")
+    opened = os.fstat(server._lease_base_fd)
+    device = f"{os.major(opened.st_dev)}:{os.minor(opened.st_dev)}"
+    selected_mount_id = 31
+    mountinfo = (
+        f"31 20 {device} / {escaped} rw,nosuid,nodev,relatime - "
+        "tmpfs tmpfs rw,size=4096k,nr_inodes=10\n"
+    )
+    original_read_text = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if str(path) == "/proc/self/mountinfo":
+            return mountinfo
+        if str(path) == f"/proc/self/fdinfo/{server._lease_base_fd}":
+            return f"pos:\t0\nmnt_id:\t{selected_mount_id}\n"
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    filesystem = SimpleNamespace(
+        f_blocks=1,
+        f_frsize=4096,
+        f_files=10,
+    )
+    monkeypatch.setattr(
+        worker_module.os,
+        "fstatvfs",
+        lambda _fd: filesystem,
+    )
+    try:
+        server._attest_quota_topology()
+
+        selected_mount_id = 32
+        mountinfo = (
+            f"31 20 {device} / {escaped} rw,nosuid,nodev - "
+            "tmpfs tmpfs rw\n"
+            f"32 20 {device} / {escaped} rw,nosuid,nodev - "
+            "ext4 /dev/test rw\n"
+        )
+        with pytest.raises(ProtocolError, match="quota_topology_not_tmpfs"):
+            server._attest_quota_topology()
+
+        mountinfo = (
+            f"31 20 {device} / {escaped} rw,nosuid,nodev - "
+            "tmpfs tmpfs rw\n"
+            f"32 20 999999:999999 / {escaped} rw,nosuid,nodev - "
+            "tmpfs tmpfs rw\n"
+        )
+        with pytest.raises(
+            ProtocolError,
+            match="quota_topology_device_mismatch",
+        ):
+            server._attest_quota_topology()
+
+        selected_mount_id = 31
+        mountinfo = (
+            f"31 20 {device} / {escaped} rw,nosuid,nodev,relatime - "
+            "tmpfs tmpfs rw,size=4096k,nr_inodes=10\n"
+        )
+        mountinfo = mountinfo.replace(" - tmpfs ", " - ext4 ")
+        with pytest.raises(ProtocolError, match="quota_topology_not_tmpfs"):
+            server._attest_quota_topology()
+
+        mountinfo = mountinfo.replace(" - ext4 ", " - tmpfs ")
+        mountinfo = mountinfo.replace(",nodev", "")
+        with pytest.raises(
+            ProtocolError,
+            match="quota_topology_mount_flags_invalid",
+        ):
+            server._attest_quota_topology()
+
+        mountinfo = mountinfo.replace(
+            "rw,nosuid,relatime",
+            "rw,nosuid,nodev,noexec,relatime",
+        )
+        with pytest.raises(
+            ProtocolError,
+            match="quota_topology_noexec_invalid",
+        ):
+            server._attest_quota_topology()
+
+        mountinfo = mountinfo.replace(",noexec", "")
+        filesystem.f_blocks = (
+            server.policy.global_quota_bytes // filesystem.f_frsize
+        ) + 1
+        with pytest.raises(
+            ProtocolError,
+            match="quota_topology_byte_capacity_invalid",
+        ):
+            server._attest_quota_topology()
+
+        filesystem.f_blocks = 1
+        filesystem.f_files = server.policy.global_quota_entries + 2
+        with pytest.raises(
+            ProtocolError,
+            match="quota_topology_inode_capacity_invalid",
+        ):
+            server._attest_quota_topology()
+    finally:
+        server.close()
+
+
+def test_startup_reaps_then_reconciles_each_live_lease_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_base = tmp_path / "leases"
+    lease_base.mkdir(mode=0o700)
+    os.chown(lease_base, os.getuid(), os.getgid())
+    os.chmod(lease_base, 0o700)
+    live_id = canonical_lease_id("startup-live")
+    stale_id = canonical_lease_id("startup-stale")
+    for lease_id in (live_id, stale_id):
+        root = lease_base / lease_id
+        root.mkdir(mode=0o700)
+        os.chown(root, os.getuid(), os.getgid())
+        os.chmod(root, 0o700)
+    (lease_base / live_id / "payload").write_text("live", encoding="utf-8")
+    stale = time.time() - 60
+    os.utime(lease_base / stale_id, (stale, stale))
+
+    scans: list[str] = []
+    discoveries = 0
+    original_usage = IsolatedWorkerServer._lease_usage
+    original_discovery = IsolatedWorkerServer._load_existing_leases_locked
+
+    def counted(server, lease):
+        scans.append(lease.lease_id)
+        return original_usage(server, lease)
+
+    def counted_discovery(server, now):
+        nonlocal discoveries
+        discoveries += 1
+        return original_discovery(server, now)
+
+    monkeypatch.setattr(IsolatedWorkerServer, "_lease_usage", counted)
+    monkeypatch.setattr(
+        IsolatedWorkerServer,
+        "_load_existing_leases_locked",
+        counted_discovery,
+    )
+    server = IsolatedWorkerServer(
+        _worker_policy(lease_base, lease_ttl_seconds=1)
+    )
+    assert scans == []
+    monkeypatch.setattr(server, "_attest_quota_topology", lambda: None)
+    monkeypatch.setattr(server, "_quota_sentinel", lambda: (1, 1, 1, 1))
+
+    socket_root = Path(tempfile.mkdtemp(prefix="iw-startup-", dir="/tmp"))
+    socket_path = socket_root / "worker.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    os.chown(socket_path, os.getuid(), os.getgid())
+    os.chmod(socket_path, 0o660)
+    listener.listen(1)
+    stop = threading.Event()
+    stop.set()
+    try:
+        server.serve(listener, stop)
+        assert discoveries == 1
+        assert scans == [live_id]
+        assert live_id in server._leases
+        assert stale_id not in server._leases
+        assert not (lease_base / stale_id).exists()
+        assert server._global_usage_entries == 2
+        assert server._global_usage_bytes == 4
+    finally:
+        listener.close()
+        server.close()
+        shutil.rmtree(socket_root, ignore_errors=True)
+
+
+def test_restart_reconciliation_rejects_exact_aggregate_overage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_base = tmp_path / "leases"
+    lease_base.mkdir(mode=0o700)
+    os.chown(lease_base, os.getuid(), os.getgid())
+    os.chmod(lease_base, 0o700)
+    for name in ("restart-a", "restart-b"):
+        root = lease_base / canonical_lease_id(name)
+        root.mkdir(mode=0o700)
+        os.chown(root, os.getuid(), os.getgid())
+        os.chmod(root, 0o700)
+        (root / "payload").write_bytes(b"x" * 3000)
+
+    server = IsolatedWorkerServer(
+        _worker_policy(
+            lease_base,
+            lease_quota_bytes=4096,
+            global_quota_bytes=4096,
+        )
+    )
+    monkeypatch.setattr(server, "_attest_quota_topology", lambda: None)
+    monkeypatch.setattr(server, "_quota_sentinel", lambda: (1, 1, 1, 1))
+    socket_root = Path(tempfile.mkdtemp(prefix="iw-overage-", dir="/tmp"))
+    socket_path = socket_root / "worker.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    os.chown(socket_path, os.getuid(), os.getgid())
+    os.chmod(socket_path, 0o660)
+    listener.listen(1)
+    stop = threading.Event()
+    stop.set()
+    try:
+        with pytest.raises(ProtocolError, match="global_quota_exceeded"):
+            server.serve(listener, stop)
+        assert server._usage_reconciled
+        assert server._global_usage_bytes == 6000
+        assert server._global_usage_entries == 4
+        assert all(
+            lease.usage_state == worker_module._USAGE_EXACT_IDLE
+            for lease in server._leases.values()
+        )
+    finally:
+        listener.close()
+        server.close()
+        shutil.rmtree(socket_root, ignore_errors=True)
 
 
 def test_protocol_requires_exact_canonical_bounded_frames() -> None:
@@ -339,6 +594,287 @@ def test_two_leases_have_no_cwd_file_or_output_bleed(worker) -> None:
         bravo.close()
 
 
+def test_worker_proof_epoch_edit_verify_invalidate_and_self_mutation(
+    worker,
+) -> None:
+    socket_path, _roots, lease_ids, _server = worker
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    try:
+        initial = client.proof_status()
+        assert initial["edit_generation"] == initial["verified_generation"] == 0
+
+        _run(client, "mkdir repo")
+        edited = _run(
+            client,
+            (
+                "mkdir -p scripts; "
+                "printf '[tool.pytest.ini_options]\\n' > pyproject.toml; "
+                "printf 'value = 1\\n' > app.py; "
+                "printf '#!/bin/bash\\nexit 0\\n' > scripts/run_tests.sh; "
+                "chmod +x scripts/run_tests.sh"
+            ),
+            cwd="/workspace/repo",
+        )
+        assert edited["edit_generation"] > 0
+        assert edited["verified_generation"] < edited["edit_generation"]
+        assert edited["applicability"] == "applicable"
+        assert edited["project_root"] == "/workspace/repo"
+
+        verified = _run(
+            client,
+            "scripts/run_tests.sh",
+            cwd="/workspace/repo",
+        )
+        assert verified["status"] == "passed"
+        assert verified["verified_generation"] == verified["edit_generation"]
+        assert verified["verification"]["canonical_command"] == (
+            "scripts/run_tests.sh"
+        )
+
+        invalidated = _run(
+            client,
+            "printf 'value = 2\\n' > app.py",
+            cwd="/workspace/repo",
+        )
+        assert invalidated["edit_generation"] > verified["edit_generation"]
+        assert invalidated["verified_generation"] < invalidated["edit_generation"]
+        assert invalidated["status"] == "stale"
+
+        _run(
+            client,
+            (
+                "printf '#!/bin/bash\\nprintf \"value = 3\\\\n\" > app.py\\n"
+                "exit 0\\n' > scripts/run_tests.sh; "
+                "chmod +x scripts/run_tests.sh"
+            ),
+            cwd="/workspace/repo",
+        )
+        self_mutating = _run(
+            client,
+            "scripts/run_tests.sh",
+            cwd="/workspace/repo",
+        )
+        assert self_mutating["verification"]["status"] == "passed"
+        assert self_mutating["mutation_detection"] == "changed"
+        assert (
+            self_mutating["verified_generation"]
+            < self_mutating["edit_generation"]
+        )
+        assert self_mutating["status"] == "stale"
+    finally:
+        client.close()
+
+
+def test_concurrent_edit_invalidates_older_verifier(worker) -> None:
+    socket_path, _roots, lease_ids, _server = worker
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    try:
+        _run(client, "mkdir repo")
+        _run(
+            client,
+            (
+                "mkdir -p scripts; "
+                "printf '[tool.pytest.ini_options]\\n' > pyproject.toml; "
+                "printf 'value = 1\\n' > app.py; "
+                "printf '#!/bin/bash\\nsleep 0.4\\nexit 0\\n' "
+                "> scripts/run_tests.sh; chmod +x scripts/run_tests.sh"
+            ),
+            cwd="/workspace/repo",
+        )
+        verifier = client.start(
+            "scripts/run_tests.sh",
+            cwd=Path("/workspace/repo"),
+            timeout_seconds=2,
+        )
+        time.sleep(0.1)
+        edit = client.start(
+            "printf 'value = 2\\n' > app.py",
+            cwd=Path("/workspace/repo"),
+            timeout_seconds=2,
+        )
+        _edit_out, _edit_err, edit_final = _collect(client, edit)
+        _verify_out, _verify_err, verify_final = _collect(client, verifier)
+
+        # The edit finishes while the verifier still owns a writable sibling
+        # sandbox, so finalization must conservatively refuse an exact
+        # snapshot rather than racing that sibling.
+        assert edit_final["proof_receipt"]["mutation_detection"] == "unknown"
+        assert edit_final["proof_receipt"]["status"] in {
+            "stale",
+            "unverified",
+        }
+        receipt = verify_final["proof_receipt"]
+        assert receipt["verification"]["status"] == "passed"
+        assert receipt["verified_generation"] < receipt["edit_generation"]
+        assert receipt["status"] == "stale"
+    finally:
+        client.close()
+
+
+def test_nested_git_verifier_mutating_non_git_workspace_sibling_stays_stale(
+    worker,
+) -> None:
+    socket_path, _roots, lease_ids, _server = worker
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    try:
+        _run(
+            client,
+            (
+                "mkdir -p repo/scripts; "
+                "printf 'value = 1\\n' > outside.py; "
+                "printf '[tool.pytest.ini_options]\\n' > repo/pyproject.toml; "
+                "printf '#!/bin/bash\\nprintf \"value = 2\\\\n\" "
+                "> ../outside.py\\nexit 0\\n' > repo/scripts/run_tests.sh; "
+                "chmod +x repo/scripts/run_tests.sh; "
+                "git -C repo init -q; "
+                "git -C repo add pyproject.toml scripts/run_tests.sh; "
+                "git -C repo -c user.name='Proof Test' "
+                "-c user.email=proof@example.invalid commit -qm initial"
+            ),
+        )
+        before = client.proof_status()
+        receipt = _run(
+            client,
+            "scripts/run_tests.sh",
+            cwd="/workspace/repo",
+        )
+
+        assert receipt["verification"]["status"] == "passed"
+        assert receipt["mutation_detection"] == "changed"
+        assert "/workspace/outside.py" in receipt["changed_paths"]
+        assert receipt["edit_generation"] > before["edit_generation"]
+        assert receipt["verified_generation"] < receipt["edit_generation"]
+        assert receipt["status"] == "stale"
+    finally:
+        client.close()
+
+
+def test_active_sibling_fences_verification_receipt_before_later_mutation(
+    worker,
+) -> None:
+    socket_path, roots, lease_ids, _server = worker
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    try:
+        _run(client, "mkdir repo")
+        _run(
+            client,
+            (
+                "mkdir -p scripts; "
+                "printf '[tool.pytest.ini_options]\\n' > pyproject.toml; "
+                "printf 'value = 1\\n' > app.py; "
+                "printf '#!/bin/bash\\nexit 0\\n' > scripts/run_tests.sh; "
+                "chmod +x scripts/run_tests.sh"
+            ),
+            cwd="/workspace/repo",
+        )
+        passed = _run(
+            client,
+            "scripts/run_tests.sh",
+            cwd="/workspace/repo",
+        )
+        assert passed["status"] == "passed"
+
+        sibling = client.start(
+            (
+                "while [ ! -f mutate-now ]; do sleep 0.02; done; "
+                "printf 'value = 2\\n' > app.py; rm mutate-now"
+            ),
+            cwd=Path("/workspace/repo"),
+            timeout_seconds=3,
+        )
+        verifier = client.start(
+            "scripts/run_tests.sh",
+            cwd=Path("/workspace/repo"),
+            timeout_seconds=2,
+        )
+        _stdout, _stderr, verifier_final = _collect(client, verifier)
+        receipt = verifier_final["proof_receipt"]
+        assert receipt["verification"]["status"] == "passed"
+        assert receipt["mutation_detection"] == "unknown"
+        assert receipt["status"] == "stale"
+        assert receipt["verified_generation"] < receipt["edit_generation"]
+
+        (roots["lease-alpha"] / "repo" / "mutate-now").write_text(
+            "go",
+            encoding="utf-8",
+        )
+        _stdout, _stderr, sibling_final = _collect(client, sibling)
+        assert sibling_final["state"] == "exited"
+        assert (
+            roots["lease-alpha"] / "repo" / "app.py"
+        ).read_text(encoding="utf-8") == "value = 2\n"
+    finally:
+        client.close()
+
+
+def test_proof_sidecar_reload_closes_out_of_band_crash_window(worker) -> None:
+    socket_path, roots, lease_ids, server = worker
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    try:
+        _run(client, "mkdir repo")
+        _run(
+            client,
+            (
+                "mkdir -p scripts; "
+                "printf '[tool.pytest.ini_options]\\n' > pyproject.toml; "
+                "printf 'value = 1\\n' > app.py; "
+                "printf '#!/bin/bash\\nexit 0\\n' > scripts/run_tests.sh; "
+                "chmod +x scripts/run_tests.sh"
+            ),
+            cwd="/workspace/repo",
+        )
+        passed = _run(
+            client,
+            "scripts/run_tests.sh",
+            cwd="/workspace/repo",
+        )
+        assert passed["status"] == "passed"
+
+        # Simulate a crash after material mutation but before command receipt
+        # persistence, then force the next socket status read to reload disk.
+        (roots["lease-alpha"] / "repo" / "app.py").write_text(
+            "value = 99\n",
+            encoding="utf-8",
+        )
+        lease = server._leases[lease_ids["lease-alpha"]]
+        with lease.proof_lock:
+            lease.proof_state = None
+        recovered = client.proof_status()
+        assert recovered["edit_generation"] > passed["edit_generation"]
+        assert recovered["verified_generation"] < recovered["edit_generation"]
+        assert recovered["status"] == "stale"
+    finally:
+        client.close()
+
+
+def test_wrapper_parser_uses_exact_payload_and_nested_virtual_cwd() -> None:
+    wrapped = (
+        "source /workspace/.hermes-runtime/snap >/dev/null 2>&1 || true\n"
+        "builtin cd -- /workspace/nested/repo || exit 126\n"
+        "eval 'scripts/run_tests.sh'\n"
+        "__hermes_ec=$?\n"
+        "umask 077\n"
+        "exit $__hermes_ec"
+    )
+    assert worker_module._executed_payload(wrapped) == "scripts/run_tests.sh"
+    assert worker_module._executed_virtual_cwd(
+        wrapped,
+        Path("/workspace"),
+    ) == Path("/workspace/nested/repo")
+
+    injected = (
+        "printf before\n"
+        "eval 'scripts/run_tests.sh'\n"
+        "__hermes_ec=$?\n"
+        "printf after"
+    )
+    assert worker_module._executed_payload(injected) == injected
+    assert worker_module._executed_virtual_cwd(
+        injected,
+        Path("/workspace"),
+    ) == Path("/workspace")
+
+
 def test_worker_forwards_exact_allowlisted_environment_only(worker, monkeypatch) -> None:
     socket_path, roots, lease_ids, _server = worker
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-cross")
@@ -381,6 +917,58 @@ def test_timeout_and_cancel_are_session_bound(worker) -> None:
         assert cancelled_final["returncode"] is not None
     finally:
         client.close()
+
+
+def test_completed_unpolled_jobs_keep_cross_connection_lease_reservations(
+    worker,
+) -> None:
+    socket_path, _roots, lease_ids, server = worker
+    first = _client(socket_path, lease_ids["lease-alpha"])
+    second = _client(socket_path, lease_ids["lease-alpha"])
+    sessions: list[str] = []
+    lease = server._ensure_lease(lease_ids["lease-alpha"])
+    try:
+        for _index in range(server.policy.maximum_active_jobs_per_lease):
+            sessions.append(
+                first.start(
+                    "printf retained",
+                    cwd=Path("/workspace"),
+                    timeout_seconds=2,
+                )
+            )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with lease.usage_lock:
+                if not lease.active_executions:
+                    break
+            time.sleep(0.01)
+        else:
+            pytest.fail("completed jobs remained active")
+        assert lease.jobs == server.policy.maximum_active_jobs_per_lease
+
+        with pytest.raises(
+            ProtocolError,
+            match="lease_job_capacity_exhausted",
+        ):
+            second.start(
+                "true",
+                cwd=Path("/workspace"),
+                timeout_seconds=1,
+            )
+
+        _collect(first, sessions.pop())
+        admitted = second.start(
+            "true",
+            cwd=Path("/workspace"),
+            timeout_seconds=1,
+        )
+        _stdout, _stderr, final = _collect(second, admitted)
+        assert final["state"] == "exited"
+        for session in sessions:
+            _collect(first, session)
+    finally:
+        first.close()
+        second.close()
 
 
 def test_disconnect_kills_lease_job(worker) -> None:
@@ -479,7 +1067,7 @@ def test_rejected_start_releases_lease_job_reservation(worker, monkeypatch) -> N
 
     with pytest.raises(ProtocolError, match="cwd_invalid"):
         server._start(
-            lease.lease_id,
+            lease,
             {
                 "command": "true",
                 "cwd": "/workspace",
@@ -497,34 +1085,592 @@ def test_workspace_scan_failure_kills_child_instead_of_losing_monitor(
     monkeypatch,
 ) -> None:
     socket_path, _roots, lease_ids, server = worker
-    process_started = threading.Event()
+    two_processes_started = threading.Event()
+    spawn_count = 0
     original_spawn = server._spawn_sandboxed
-    original_usage = server._global_usage
+    original_usage = server._lease_usage
 
     def mark_started(**kwargs):
+        nonlocal spawn_count
         process = original_spawn(**kwargs)
-        process_started.set()
+        spawn_count += 1
+        if spawn_count == 2:
+            two_processes_started.set()
         return process
 
-    def fail_after_start():
-        if process_started.is_set():
+    def fail_after_start(lease):
+        if two_processes_started.is_set():
             raise OSError("workspace changed during scan")
-        return original_usage()
+        return original_usage(lease)
 
     monkeypatch.setattr(server, "_spawn_sandboxed", mark_started)
-    monkeypatch.setattr(server, "_global_usage", fail_after_start)
+    monkeypatch.setattr(server, "_lease_usage", fail_after_start)
+    monkeypatch.setattr(
+        server,
+        "_quota_sentinel",
+        lambda: (0, 0, 0, 0)
+        if two_processes_started.is_set()
+        else (1, 1, 1, 1),
+    )
     client = _client(socket_path, lease_ids["lease-alpha"])
     try:
-        session_id = client.start(
+        first = client.start(
             "sleep 5",
             cwd=Path("/workspace"),
             timeout_seconds=3,
         )
-        _stdout, _stderr, final = _collect(client, session_id)
-        assert final["state"] == "quota_exceeded"
-        assert final["returncode"] is not None
+        second = client.start(
+            "sleep 5",
+            cwd=Path("/workspace"),
+            timeout_seconds=3,
+        )
+        _stdout, _stderr, first_final = _collect(client, first)
+        _stdout, _stderr, second_final = _collect(client, second)
+        assert first_final["state"] == "quota_exceeded"
+        assert second_final["state"] == "quota_exceeded"
+        assert first_final["returncode"] is not None
+        assert second_final["returncode"] is not None
+
+        lease = server._leases[lease_ids["lease-alpha"]]
+        with lease.usage_lock:
+            assert lease.usage_state == worker_module._USAGE_POISONED
+            assert lease.quota_monitor_token is None
+            assert lease.active_executions == []
+        with pytest.raises(ProtocolError, match="lease_usage_poisoned"):
+            client.start(
+                "true",
+                cwd=Path("/workspace"),
+                timeout_seconds=1,
+            )
     finally:
         client.close()
+
+
+def test_exact_idle_start_has_zero_prescan_and_each_last_writer_scans_once(
+    worker,
+    monkeypatch,
+) -> None:
+    socket_path, _roots, lease_ids, server = worker
+    lease = server._ensure_lease(lease_ids["lease-alpha"])
+    scans = 0
+    original = server._lease_usage
+
+    def counted(scanned_lease):
+        nonlocal scans
+        assert scanned_lease is lease
+        scans += 1
+        return original(scanned_lease)
+
+    monkeypatch.setattr(server, "_lease_usage", counted)
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    try:
+        first = client.start(
+            "sleep 0.2",
+            cwd=Path("/workspace"),
+            timeout_seconds=2,
+        )
+        assert scans == 0
+        _stdout, _stderr, first_final = _collect(client, first)
+        assert first_final["state"] == "exited"
+        assert scans == 1
+
+        second = client.start(
+            "sleep 0.2",
+            cwd=Path("/workspace"),
+            timeout_seconds=2,
+        )
+        assert scans == 1
+        _stdout, _stderr, second_final = _collect(client, second)
+        assert second_final["state"] == "exited"
+        assert scans == 2
+        with lease.usage_lock:
+            assert lease.usage_state == worker_module._USAGE_EXACT_IDLE
+            assert lease.quota_monitor_token is None
+    finally:
+        client.close()
+
+
+def test_quota_monitor_uses_changed_sentinel_then_sparse_fallback_cadence(
+    worker,
+    monkeypatch,
+) -> None:
+    _socket_path, _roots, lease_ids, server = worker
+    lease = server._ensure_lease(lease_ids["lease-alpha"])
+    now = 0.0
+    waits: list[float] = []
+    scan_starts: list[float] = []
+
+    class AdvancingWake:
+        def wait(self, delay):
+            nonlocal now
+            waits.append(delay)
+            now += delay
+            if len(waits) == 2:
+                lease.active_executions.clear()
+            return False
+
+        def clear(self):
+            return None
+
+        def set(self):
+            return None
+
+    token = worker_module._QuotaMonitorToken()
+    token.wake = AdvancingWake()
+    monkeypatch.setattr(server, "_quota_clock", lambda: now)
+
+    def sampled(_lease):
+        scan_starts.append(now)
+        return (0, 0)
+
+    monkeypatch.setattr(server, "_lease_usage", sampled)
+    with lease.usage_lock:
+        lease.active_executions.append(object())
+        lease.usage_state = worker_module._USAGE_DIRTY_ACTIVE
+        lease.quota_monitor_token = token
+        lease.quota_last_scan_started_monotonic = 0.0
+        lease.usage_sample_started_monotonic = 0.0
+        lease.quota_sentinel_epoch_seen = 0
+        lease.quota_sentinel_dirty = False
+        lease.quota_near_limit = False
+    with server._leases_lock:
+        server._quota_sentinel_epoch = 1
+        server._quota_dirty_leases[lease.lease_id] = token
+
+    server._quota_monitor_loop_inner(lease, token)
+
+    assert scan_starts == [worker_module._QUOTA_NORMAL_SCAN_INTERVAL_SECONDS]
+    assert waits == [
+        worker_module._QUOTA_NORMAL_SCAN_INTERVAL_SECONDS,
+        worker_module._QUOTA_SPARSE_FALLBACK_SECONDS,
+    ]
+    with lease.usage_lock:
+        assert lease.quota_monitor_token is None
+
+
+def test_quota_pressure_enters_on_projection_and_exits_below_hysteresis(
+    worker,
+) -> None:
+    _socket_path, _roots, lease_ids, server = worker
+    lease = server._ensure_lease(lease_ids["lease-alpha"])
+    with lease.usage_lock:
+        lease.usage_sample = (1_000, 0)
+        lease.usage_sample_started_monotonic = 0.01
+        lease.quota_near_limit = False
+        server._update_quota_pressure_locked(
+            lease,
+            previous_sample=(0, 0),
+            previous_started=0.0,
+        )
+        assert lease.quota_near_limit
+
+        lease.usage_sample = (69_999, 0)
+        lease.usage_sample_started_monotonic = 1.01
+        server._update_quota_pressure_locked(
+            lease,
+            previous_sample=(80_000, 0),
+            previous_started=0.01,
+        )
+        assert not lease.quota_near_limit
+
+
+def test_eight_sibling_writers_share_one_epoch_and_only_last_exit_scans(
+    worker,
+    monkeypatch,
+) -> None:
+    socket_path, roots, lease_ids, server = worker
+    lease = server._ensure_lease(lease_ids["lease-alpha"])
+    scans = 0
+    scans_in_flight = 0
+    maximum_scans_in_flight = 0
+    scan_lock = threading.Lock()
+    original = server._lease_usage
+
+    def counted(scanned_lease):
+        nonlocal scans, scans_in_flight, maximum_scans_in_flight
+        assert scanned_lease is lease
+        with scan_lock:
+            scans += 1
+            scans_in_flight += 1
+            maximum_scans_in_flight = max(
+                maximum_scans_in_flight,
+                scans_in_flight,
+            )
+        try:
+            time.sleep(0.03)
+            return original(scanned_lease)
+        finally:
+            with scan_lock:
+                scans_in_flight -= 1
+
+    monkeypatch.setattr(server, "_lease_usage", counted)
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    sessions: list[str] = []
+    tokens: list[object] = []
+    release = roots["lease-alpha"] / "release"
+    try:
+        for _index in range(8):
+            sessions.append(
+                client.start(
+                    "while [ ! -f release ]; do sleep 0.02; done",
+                    cwd=Path("/workspace"),
+                    timeout_seconds=3,
+                )
+            )
+            with lease.usage_lock:
+                assert len(lease.active_executions) == len(sessions)
+                tokens.append(lease.quota_monitor_token)
+        assert tokens[0] is not None
+        assert all(token is tokens[0] for token in tokens)
+        assert scans == 0
+
+        release.write_text("go", encoding="utf-8")
+        finals = [_collect(client, session)[2] for session in sessions]
+        assert all(final["state"] == "exited" for final in finals)
+        assert scans == 1
+        assert maximum_scans_in_flight == 1
+        with lease.usage_lock:
+            assert lease.active_executions == []
+            assert lease.usage_state == worker_module._USAGE_EXACT_IDLE
+            assert lease.quota_monitor_token is None
+    finally:
+        client.close()
+
+
+def test_quota_monitor_thread_start_failure_poison_kills_and_rejects_retry(
+    worker,
+    monkeypatch,
+) -> None:
+    _socket_path, _roots, lease_ids, server = worker
+    lease = server._ensure_lease(lease_ids["lease-alpha"])
+    captured_processes = []
+    original_spawn = server._spawn_sandboxed
+    original_thread_start = threading.Thread.start
+
+    def capture_spawn(**kwargs):
+        process = original_spawn(**kwargs)
+        captured_processes.append(process)
+        return process
+
+    def fail_quota_monitor_start(thread):
+        target = getattr(thread, "_target", None)
+        if getattr(target, "__name__", "") == "_quota_monitor_loop":
+            raise RuntimeError("injected quota monitor start failure")
+        return original_thread_start(thread)
+
+    monkeypatch.setattr(server, "_spawn_sandboxed", capture_spawn)
+    monkeypatch.setattr(threading.Thread, "start", fail_quota_monitor_start)
+    params = {
+        "command": "sleep 5",
+        "cwd": "/workspace",
+        "stdin_b64": "",
+        "timeout_seconds": 3,
+    }
+    with pytest.raises(ProtocolError, match="quota_monitor_start_failed"):
+        server._start(lease, params, {})
+
+    assert len(captured_processes) == 1
+    assert captured_processes[0].poll() is not None
+    with lease.usage_lock:
+        assert lease.active_executions == []
+        assert lease.usage_state == worker_module._USAGE_POISONED
+        assert lease.quota_monitor_token is None
+    with pytest.raises(ProtocolError, match="lease_usage_poisoned"):
+        server._start(lease, params, {})
+    assert len(captured_processes) == 1
+
+
+def test_execution_thread_start_failure_poison_kills_every_sibling(
+    worker,
+    monkeypatch,
+) -> None:
+    _socket_path, _roots, lease_ids, server = worker
+    lease = server._ensure_lease(lease_ids["lease-alpha"])
+    first_executions = {}
+    params = {
+        "command": "sleep 5",
+        "cwd": "/workspace",
+        "stdin_b64": "",
+        "timeout_seconds": 3,
+    }
+    first_result = server._start(lease, params, first_executions)
+    first_id = first_result["session_id"]
+    first_execution = first_executions[first_id]
+    captured = []
+    original_spawn = server._spawn_sandboxed
+    original_thread_start = threading.Thread.start
+
+    def capture_spawn(**kwargs):
+        process = original_spawn(**kwargs)
+        captured.append(process)
+        return process
+
+    def fail_execution_monitor_start(thread):
+        target = getattr(thread, "_target", None)
+        if getattr(target, "__name__", "") == "monitor_execution":
+            raise RuntimeError("injected execution monitor start failure")
+        return original_thread_start(thread)
+
+    monkeypatch.setattr(server, "_spawn_sandboxed", capture_spawn)
+    monkeypatch.setattr(
+        threading.Thread,
+        "start",
+        fail_execution_monitor_start,
+    )
+    with pytest.raises(
+        ProtocolError,
+        match="execution_monitor_start_failed",
+    ):
+        server._start(lease, params, {})
+
+    assert len(captured) == 1
+    assert captured[0].poll() is not None
+    assert first_execution.complete.wait(2)
+    assert first_execution.process.poll() is not None
+    assert first_execution.state == "quota_exceeded"
+    with lease.usage_lock:
+        assert lease.active_executions == []
+        assert lease.usage_state == worker_module._USAGE_POISONED
+        assert lease.quota_monitor_token is None
+
+    polled = server._poll(
+        lease.lease_id,
+        {
+            "session_id": first_id,
+            "wait_milliseconds": 1000,
+        },
+        first_executions,
+    )
+    assert polled["state"] == "quota_exceeded"
+    assert lease.jobs == 0
+
+
+def test_quota_monitor_scans_only_active_lease_and_short_job_pays_exit_scan(
+    worker,
+    monkeypatch,
+) -> None:
+    socket_path, roots, lease_ids, server = worker
+    alpha_lease = server._ensure_lease(lease_ids["lease-alpha"])
+    bravo_lease = server._ensure_lease(lease_ids["lease-bravo"])
+    for index in range(250):
+        (roots["lease-alpha"] / f"alpha-{index}.txt").write_text(
+            "a",
+            encoding="utf-8",
+        )
+        (roots["lease-bravo"] / f"bravo-{index}.txt").write_text(
+            "b",
+            encoding="utf-8",
+        )
+    server._global_usage()
+
+    counts = {alpha_lease.lease_id: 0, bravo_lease.lease_id: 0}
+    original = server._lease_usage
+
+    def counted(lease):
+        counts[lease.lease_id] += 1
+        return original(lease)
+
+    monkeypatch.setattr(server, "_lease_usage", counted)
+    monkeypatch.setattr(
+        server,
+        "_load_existing_leases_locked",
+        lambda _now: (_ for _ in ()).throw(
+            AssertionError("hot path rediscovered lease roots")
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_proof_authority_usage",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("hot path rescanned proof authority")
+        ),
+    )
+    client = _client(socket_path, lease_ids["lease-alpha"])
+    started = time.monotonic()
+    try:
+        session_id = client.start(
+            "sleep 1",
+            cwd=Path("/workspace"),
+            timeout_seconds=2,
+        )
+        _stdout, _stderr, final = _collect(client, session_id)
+    finally:
+        client.close()
+
+    assert final["state"] == "exited"
+    assert time.monotonic() - started < 2.5
+    # Exact-idle admission performs no walk.  With no physical block/inode
+    # sentinel change, a sub-2s job pays only the last-writer exit scan.
+    assert counts[alpha_lease.lease_id] == 1
+    assert counts[bravo_lease.lease_id] == 0
+
+
+def test_startup_removes_only_exact_owned_proof_temp(tmp_path: Path) -> None:
+    lease_base = tmp_path / "leases"
+    lease_base.mkdir(mode=0o700)
+    os.chown(lease_base, os.getuid(), os.getgid())
+    os.chmod(lease_base, 0o700)
+    proof_root = lease_base / ".hermes-runtime"
+    proof_root.mkdir(mode=0o700)
+    os.chown(proof_root, os.getuid(), os.getgid())
+    os.chmod(proof_root, 0o700)
+    lease_id = canonical_lease_id("orphan-proof-temp")
+    orphan = proof_root / f".{lease_id}.{'a' * 32}.tmp"
+    orphan.write_bytes(b"partial")
+    os.chown(orphan, os.getuid(), os.getgid())
+    orphan.chmod(0o600)
+
+    server = IsolatedWorkerServer(_worker_policy(lease_base))
+    try:
+        assert not orphan.exists()
+    finally:
+        server.close()
+
+
+def test_git_snapshot_uses_porcelain_without_full_tree_walk(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess = worker_module.subprocess
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    (repo / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    (repo / ".gitignore").write_text(
+        "build/\ndist/\nnode_modules/\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "tracked.py", ".gitignore"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Proof Test",
+            "-c",
+            "user.email=proof@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    build = repo / "build"
+    build.mkdir()
+    (build / "source.py").write_text("value = 2\n", encoding="utf-8")
+    dist = repo / "dist"
+    dist.mkdir()
+    (dist / "config.json").write_text('{"value": 3}\n', encoding="utf-8")
+    node_modules = repo / "node_modules"
+    node_modules.mkdir()
+    for index in range(300):
+        (node_modules / f"package-{index}.js").write_text(
+            "module.exports = 1\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        worker_module.os,
+        "walk",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("git material snapshot must not walk the full tree")
+        ),
+    )
+    snapshot = worker_module._material_snapshot(repo, repo)
+    snapshot_files = dict(snapshot.files)
+    assert "build/source.py" in snapshot_files
+    assert "dist/config.json" in snapshot_files
+    assert not any("node_modules" in path for path in snapshot_files)
+
+
+def test_non_git_fallback_covers_soft_build_source_without_walking_hard_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "build").mkdir(parents=True)
+    (workspace / "build" / "source.py").write_text(
+        "value = 1\n",
+        encoding="utf-8",
+    )
+    (workspace / "build" / "artifact.bin").write_bytes(b"ignored")
+    (workspace / "node_modules").mkdir()
+    for index in range(300):
+        (workspace / "node_modules" / f"package-{index}.js").write_text(
+            "module.exports = 1\n",
+            encoding="utf-8",
+        )
+
+    original_scandir = worker_module.os.scandir
+
+    def guarded_scandir(path):
+        if "node_modules" in Path(path).parts:
+            raise AssertionError("hard cache tree was traversed")
+        return original_scandir(path)
+
+    monkeypatch.setattr(worker_module.os, "scandir", guarded_scandir)
+    before = worker_module._material_snapshot(workspace, workspace)
+    (workspace / "build" / "source.py").write_text(
+        "value = 2\n",
+        encoding="utf-8",
+    )
+    (workspace / "build" / "artifact.bin").write_bytes(b"still ignored")
+    after = worker_module._material_snapshot(workspace, workspace)
+
+    assert worker_module._material_fingerprint(before) != (
+        worker_module._material_fingerprint(after)
+    )
+    assert worker_module._changed_material_paths(before, after) == [
+        "/workspace/build/source.py"
+    ]
+    assert "build/artifact.bin" not in dict(after.files)
+    assert not any("node_modules" in path for path, _digest in after.files)
+
+
+def test_nested_dirty_repo_content_changes_combined_fingerprint(
+    tmp_path: Path,
+) -> None:
+    outer = tmp_path / "outer"
+    inner = outer / "embedded"
+    inner.mkdir(parents=True)
+    subprocess = worker_module.subprocess
+    for repo in (outer, inner):
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    (outer / "outer.py").write_text("outer = 1\n", encoding="utf-8")
+    (inner / "inner.py").write_text("inner = 1\n", encoding="utf-8")
+    for repo, path in ((outer, "outer.py"), (inner, "inner.py")):
+        subprocess.run(["git", "-C", str(repo), "add", path], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Proof Test",
+                "-c",
+                "user.email=proof@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+            check=True,
+        )
+
+    (inner / "inner.py").write_text("inner = 2\n", encoding="utf-8")
+    before = worker_module._material_snapshot(outer, inner)
+    (inner / "inner.py").write_text("inner = 3\n", encoding="utf-8")
+    after = worker_module._material_snapshot(outer, inner)
+
+    assert worker_module._material_fingerprint(before) != (
+        worker_module._material_fingerprint(after)
+    )
+    assert "/workspace/embedded/inner.py" in (
+        worker_module._changed_material_paths(before, after)
+    )
 
 
 def test_global_byte_quota_blocks_aggregate_before_spawn(
@@ -563,7 +1709,7 @@ def test_global_byte_quota_blocks_aggregate_before_spawn(
         )
         with pytest.raises(ProtocolError, match="global_quota_exceeded"):
             server._start(
-                alpha.lease_id,
+                alpha,
                 {
                     "command": "true",
                     "cwd": "/workspace",
@@ -602,6 +1748,58 @@ def test_global_entry_quota_counts_all_lease_roots(tmp_path: Path) -> None:
         assert server._lease_usage(bravo) == (2, 0)
         with pytest.raises(ProtocolError, match="global_quota_exceeded"):
             server._global_usage()
+    finally:
+        server.close()
+
+
+def test_failed_new_lease_transaction_removes_root_sidecar_and_cache_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_base = tmp_path / "leases"
+    lease_base.mkdir(mode=0o700)
+    os.chown(lease_base, os.getuid(), os.getgid())
+    os.chmod(lease_base, 0o700)
+    server = IsolatedWorkerServer(_worker_policy(lease_base))
+    monkeypatch.setattr(server, "_quota_sentinel", lambda: (1, 1, 1, 1))
+    lease_id = canonical_lease_id("transactional-create")
+    original_touch = server._touch_lease_locked
+
+    def fail_after_sidecar(_lease, _now=None):
+        raise ProtocolError("injected_post_mkdir_failure")
+
+    try:
+        assert server._global_usage() == (0, 0)
+        monkeypatch.setattr(
+            server,
+            "_touch_lease_locked",
+            fail_after_sidecar,
+        )
+        with pytest.raises(
+            ProtocolError,
+            match="injected_post_mkdir_failure",
+        ):
+            server._ensure_lease(lease_id)
+
+        assert not (lease_base / lease_id).exists()
+        assert lease_id not in server._leases
+        assert server._global_usage_entries == 0
+        assert server._global_usage_bytes == 0
+        assert not server._accounting_poisoned
+        assert not (
+            lease_base
+            / worker_module._PROOF_PRIVATE_DIR
+            / server._proof_state_name(lease_id)
+        ).exists()
+
+        monkeypatch.setattr(
+            server,
+            "_touch_lease_locked",
+            original_touch,
+        )
+        lease = server._ensure_lease(lease_id)
+        assert lease.root.is_dir()
+        assert server._global_usage_entries == 1
     finally:
         server.close()
 

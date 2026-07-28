@@ -481,7 +481,18 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
         "max_effort": "max",
     }
     assert effective["agent"]["background_review_enabled"] is False
-    assert effective["agent"]["verification_ledger_enabled"] is False
+    assert effective["agent"]["verify_on_stop"] is True
+    assert effective["agent"]["verification_ledger_enabled"] is True
+    assert effective["agent"]["gateway_notify_interval"] == 180
+    assert effective["display"]["platforms"]["discord"] == {
+        "tool_progress": "off",
+        "interim_assistant_messages": False,
+        "thinking_progress": False,
+        "show_reasoning": False,
+        "streaming": False,
+        "long_running_notifications": True,
+        "busy_ack_detail": False,
+    }
     assert effective["compression"]["abort_on_summary_failure"] is True
     assert effective["tools"]["tool_search"] == {"enabled": "off"}
     assert "legacy_direct_helper_compat" not in effective["canonical_brain"]
@@ -882,7 +893,8 @@ def test_rendered_unit_is_the_normal_sha_pinned_production_contract() -> None:
         (("delegation", "subagent_auto_approve"), True, "delegation_route"),
         (("kanban", "dispatch_in_gateway"), True, "kanban"),
         (("curator", "enabled"), True, "curator"),
-        (("agent", "verification_ledger_enabled"), True, "agent_policy"),
+        (("agent", "verify_on_stop"), False, "agent_policy"),
+        (("agent", "verification_ledger_enabled"), False, "agent_policy"),
         (
             ("approvals", "plan_owner_user_ids"),
             ["1282940574533423125"],
@@ -923,6 +935,12 @@ def test_rendered_unit_is_the_normal_sha_pinned_production_contract() -> None:
         (("platform_toolsets", "cron"), ["code_execution"], "toolsets"),
         (("platform_toolsets", "discord"), ["code_execution"], "toolsets"),
         (("platforms", "discord"), {"enabled": True}, "platform_boundary"),
+        (("agent", "gateway_notify_interval"), 60, "agent_policy"),
+        (
+            ("display", "platforms", "discord", "tool_progress"),
+            "all",
+            "discord_display_policy",
+        ),
         (
             ("tools", "tool_search"),
             {"enabled": "on", "threshold_pct": 0},
@@ -939,6 +957,71 @@ def test_config_validator_fails_closed_on_runtime_drift(path, value, code) -> No
 
     with pytest.raises(runtime.ProductionContractError, match=code):
         runtime.validate_production_gateway_config(effective)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("verify_on_stop", "auto"),
+        ("verification_ledger_enabled", 1),
+    ],
+)
+def test_overlay_rejects_unreviewed_proof_gate_source_drift(
+    key, value
+) -> None:
+    source = _source_mapping()
+    source["agent"][key] = value
+
+    with pytest.raises(
+        runtime.ProductionContractError,
+        match="production_agent_proof_gate_source_drifted",
+    ):
+        runtime.overlay_production_gateway_config(source)
+
+
+def test_overlay_migrates_prior_sealed_proof_gate_contract() -> None:
+    source = _source_mapping()
+    source["agent"]["verify_on_stop"] = False
+    source["agent"]["verification_ledger_enabled"] = False
+
+    effective = runtime.overlay_production_gateway_config(source)
+
+    assert effective["agent"]["verify_on_stop"] is True
+    assert effective["agent"]["verification_ledger_enabled"] is True
+
+
+def test_overlay_pins_low_noise_discord_and_preserves_unrelated_display() -> None:
+    source = _source_mapping()
+    source["agent"]["gateway_notify_interval"] = 30
+    source["display"] = {
+        "language": "bg",
+        "platforms": {
+            "discord": {
+                "tool_progress": "all",
+                "tool_preview_length": 17,
+            },
+            "telegram": {"tool_progress": "new"},
+        },
+    }
+
+    effective = runtime.overlay_production_gateway_config(source)
+
+    assert effective["agent"]["gateway_notify_interval"] == 180
+    assert effective["display"]["language"] == "bg"
+    assert effective["display"]["platforms"]["telegram"] == {
+        "tool_progress": "new"
+    }
+    assert effective["display"]["platforms"]["discord"] == {
+        "tool_progress": "off",
+        "tool_preview_length": 17,
+        "interim_assistant_messages": False,
+        "thinking_progress": False,
+        "show_reasoning": False,
+        "streaming": False,
+        "long_running_notifications": True,
+        "busy_ack_detail": False,
+    }
+    runtime.validate_production_gateway_config(effective)
 
 
 def test_source_digest_and_strict_yaml_are_fail_closed() -> None:

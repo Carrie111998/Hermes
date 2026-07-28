@@ -327,6 +327,26 @@ class TestPostStopInterruptSwallow:
 
         assert "send it again" in response
 
+    def test_status_only_failure_never_claims_empty_success(self):
+        """Structured status/error must drive the same failure message as flags."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "status": "failed",
+            "error": "boom",
+            "api_calls": 1,
+            "final_response": "",
+        }
+
+        response = _normalize_empty_agent_response(
+            agent_result,
+            "",
+            history_len=10,
+        )
+
+        assert response.startswith("The request failed: boom")
+        assert "completed" not in response.lower()
+
     @pytest.mark.asyncio
     async def test_interrupt_and_clear_session_evicts_cached_agent(self):
         """The control-interrupt path must evict the session's cached agent

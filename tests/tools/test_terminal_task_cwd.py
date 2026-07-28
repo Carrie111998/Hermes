@@ -158,12 +158,13 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
     # (it doesn't propagate to tool-worker threads), so process.kill / stop can
     # still find and terminate this background process.
     assert registry.calls == [{
-        "command": "sleep 1",
-        "cwd": "/workspace/live",
-        "task_id": task_id,
-        "session_key": task_id,
-        "env_vars": {},
-        "use_pty": False,
+            "command": "sleep 1",
+            "cwd": "/workspace/live",
+            "task_id": task_id,
+            "owner_task_id": task_id,
+            "session_key": task_id,
+            "env_vars": {},
+            "use_pty": False,
     }]
 
 

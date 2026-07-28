@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -91,6 +91,7 @@ class _FakeAgent:
         self._session_messages = []
         self._pending_cli_user_message = None
         self._session_persist_lock = threading.RLock()
+        self._workspace_lease_binding_owner_id = "fake-owner"
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
@@ -206,6 +207,101 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_isolated_worker_tracks_session_binding_beyond_turn():
+    agent = _FakeAgent()
+    agent._track_workspace_lease_persistent_runtime_ids = MagicMock()
+
+    with (
+        patch(
+            "tools.terminal_tool.isolated_worker_backend_selected",
+            return_value=True,
+        ),
+        patch(
+            "tools.terminal_tool.register_workspace_lease_authorities",
+            return_value=("sess-1", "task-1"),
+        ) as register,
+        patch(
+            "hermes_cli.goals.GoalManager.begin_model_turn",
+            return_value="",
+        ),
+    ):
+        _build(agent, task_id="task-1")
+
+    assert register.call_count == 2
+    register.assert_has_calls(
+        [
+            call(
+                ("sess-1", "task-1"),
+                "sess-1",
+                owner_id="fake-owner",
+            ),
+            call(
+                ("sess-1", "task-1"),
+                "sess-1",
+                owner_id="fake-owner",
+            ),
+        ]
+    )
+    assert (
+        agent._track_workspace_lease_persistent_runtime_ids.call_count
+        == 2
+    )
+    agent._track_workspace_lease_persistent_runtime_ids.assert_has_calls(
+        [
+            call(("sess-1",)),
+            call(("sess-1",)),
+        ]
+    )
+
+
+def test_lineage_database_failure_publishes_no_workspace_alias():
+    agent = _FakeAgent()
+    agent._session_db = MagicMock()
+    agent._session_db.get_session.side_effect = RuntimeError(
+        "lineage database unavailable"
+    )
+
+    with (
+        patch(
+            "tools.terminal_tool.isolated_worker_backend_selected",
+            return_value=True,
+        ),
+        patch(
+            "tools.terminal_tool.register_workspace_lease_authorities"
+        ) as register,
+        pytest.raises(
+            RuntimeError,
+            match="lineage database unavailable",
+        ),
+    ):
+        _build(agent, task_id="task-1")
+
+    register.assert_not_called()
+
+
+def test_nonisolated_turn_does_not_depend_on_lineage_database_read():
+    agent = _FakeAgent()
+    agent._session_db = MagicMock()
+    agent._session_db.get_session.side_effect = RuntimeError(
+        "lineage database unavailable"
+    )
+
+    with (
+        patch(
+            "tools.terminal_tool.isolated_worker_backend_selected",
+            return_value=False,
+        ),
+        patch(
+            "hermes_cli.goals.GoalManager.begin_model_turn",
+            return_value="",
+        ),
+    ):
+        ctx = _build(agent, task_id="task-1")
+
+    assert ctx.effective_task_id == "task-1"
+    agent._session_db.get_session.assert_not_called()
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():

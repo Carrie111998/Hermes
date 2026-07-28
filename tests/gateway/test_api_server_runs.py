@@ -31,6 +31,7 @@ from tools import approval as approval_mod
 
 OWNER_PASSKEY = "run-owner-passkey-for-tests-only-0123456789"
 AUTH_HEADERS = {"Authorization": "Bearer sk-secret"}
+SECRET_SENTINEL = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +160,39 @@ def _owner_authority(
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_corrupt_previous_response_session_id_is_controlled_500(
+        self,
+        adapter,
+    ):
+        adapter._response_store.put(
+            "resp_corrupt_run_session",
+            {
+                "response": {
+                    "id": "resp_corrupt_run_session",
+                    "status": "completed",
+                },
+                "conversation_history": [],
+                "session_id": " run-alias ",
+            },
+        )
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "previous_response_id": "resp_corrupt_run_session",
+                    },
+                )
+                payload = await resp.json()
+
+        assert resp.status == 500
+        assert payload["error"]["code"] == "invalid_internal_session_id"
+        assert "run-alias" not in str(payload)
+        mock_create.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -424,7 +458,14 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
+                run_authority = adapter._api_request_scope("request")
+                assert (
+                    mock_agent.run_conversation.call_args.kwargs["task_id"]
+                    == run_authority.bind(
+                        "task",
+                        "space-session",
+                    ).internal_key
+                )
                 assert status["session_id"] == "space-session"
 
     @pytest.mark.asyncio
@@ -527,14 +568,19 @@ class TestRunEvents:
             },
             capability_epoch_sha256=epoch,
         )
-        auth_adapter._run_statuses[run_id] = {
+        run_scope = auth_adapter._api_request_scope("run", run_id)
+        approval_session_key = auth_adapter._api_request_scope(
+            "run-approval",
+            run_id,
+        ).internal_key
+        auth_adapter._run_statuses[run_scope] = {
             "run_id": run_id,
             "session_id": session_id,
             "status": "running",
         }
-        auth_adapter._run_approval_sessions[run_id] = run_id
+        auth_adapter._run_approval_sessions[run_scope] = approval_session_key
         with approval_mod._lock:
-            approval_mod._gateway_queues[run_id] = [entry]
+            approval_mod._gateway_queues[approval_session_key] = [entry]
 
         try:
             async with TestClient(TestServer(app)) as cli:
@@ -566,7 +612,10 @@ class TestRunEvents:
             assert not entry.event.is_set()
         finally:
             with approval_mod._lock:
-                approval_mod._gateway_queues.pop(run_id, None)
+                approval_mod._gateway_queues.pop(
+                    approval_session_key,
+                    None,
+                )
 
     @pytest.mark.asyncio
     async def test_run_approval_is_exact_owner_bound_and_out_of_order(self, auth_adapter):
@@ -593,14 +642,22 @@ class TestRunEvents:
             },
             capability_epoch_sha256=epoch,
         )
-        auth_adapter._run_statuses[run_id] = {
+        run_scope = auth_adapter._api_request_scope("run", run_id)
+        approval_session_key = auth_adapter._api_request_scope(
+            "run-approval",
+            run_id,
+        ).internal_key
+        auth_adapter._run_statuses[run_scope] = {
             "run_id": run_id,
             "session_id": session_id,
             "status": "waiting_for_approval",
         }
-        auth_adapter._run_approval_sessions[run_id] = run_id
+        auth_adapter._run_approval_sessions[run_scope] = approval_session_key
         with approval_mod._lock:
-            approval_mod._gateway_queues[run_id] = [first, second]
+            approval_mod._gateway_queues[approval_session_key] = [
+                first,
+                second,
+            ]
 
         authority = _owner_authority(
             session_id=session_id,
@@ -685,7 +742,10 @@ class TestRunEvents:
                 assert first.result == "deny"
         finally:
             with approval_mod._lock:
-                approval_mod._gateway_queues.pop(run_id, None)
+                approval_mod._gateway_queues.pop(
+                    approval_session_key,
+                    None,
+                )
 
 
     @pytest.mark.asyncio
@@ -711,15 +771,16 @@ class TestRunEvents:
 class TestRunLifecycleSweep:
     def test_sweep_keeps_transport_with_active_subscriber(self, adapter):
         run_id = "run_subscribed"
+        run_scope = adapter._api_request_scope("run", run_id)
         queue = asyncio.Queue()
-        adapter._run_streams[run_id] = queue
-        adapter._run_streams_created[run_id] = 0
-        adapter._run_stream_subscribers.add(run_id)
+        adapter._run_streams[run_scope] = queue
+        adapter._run_streams_created[run_scope] = 0
+        adapter._run_stream_subscribers.add(run_scope)
 
         adapter._sweep_orphaned_runs_once(time.time())
 
-        assert adapter._run_streams[run_id] is queue
-        assert run_id in adapter._run_streams_created
+        assert adapter._run_streams[run_scope] is queue
+        assert run_scope in adapter._run_streams_created
 
     @pytest.mark.asyncio
     async def test_expired_live_run_drops_transport_but_keeps_control_state(
@@ -741,9 +802,10 @@ class TestRunLifecycleSweep:
                 )
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
+                run_scope = auth_adapter._api_request_scope("run", run_id)
                 assert agent_ready.wait(timeout=3.0)
 
-                task = auth_adapter._active_run_tasks[run_id]
+                task = auth_adapter._active_run_tasks[run_scope]
                 assert isinstance(task, asyncio.Task)
                 assert not task.done()
 
@@ -756,9 +818,14 @@ class TestRunLifecycleSweep:
                     capability_epoch_sha256="3" * 64,
                 )
                 with approval_mod._lock:
-                    approval_mod._gateway_queues[run_id] = [pending]
+                    approval_session_key = (
+                        auth_adapter._run_approval_sessions[run_scope]
+                    )
+                    approval_mod._gateway_queues[
+                        approval_session_key
+                    ] = [pending]
 
-                auth_adapter._run_streams_created[run_id] -= (
+                auth_adapter._run_streams_created[run_scope] -= (
                     auth_adapter._RUN_STREAM_TTL + 1
                 )
                 # Exercise one real sweeper iteration without waiting 60 seconds.
@@ -769,11 +836,17 @@ class TestRunLifecycleSweep:
                     with pytest.raises(asyncio.CancelledError):
                         await auth_adapter._sweep_orphaned_runs()
 
-                assert auth_adapter._active_run_tasks[run_id] is task
-                assert auth_adapter._active_run_agents[run_id] is mock_agent
-                assert run_id not in auth_adapter._run_streams
-                assert run_id not in auth_adapter._run_streams_created
-                assert auth_adapter._run_approval_sessions[run_id] == run_id
+                assert auth_adapter._active_run_tasks[run_scope] is task
+                assert (
+                    auth_adapter._active_run_agents[run_scope]
+                    is mock_agent
+                )
+                assert run_scope not in auth_adapter._run_streams
+                assert run_scope not in auth_adapter._run_streams_created
+                assert (
+                    auth_adapter._run_approval_sessions[run_scope]
+                    == approval_session_key
+                )
 
                 limited = auth_adapter._concurrency_limited_response()
                 assert limited is not None
@@ -813,17 +886,20 @@ class TestRunLifecycleSweep:
 
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await start_resp.json())["run_id"]
+                run_scope = adapter._api_request_scope("run", run_id)
                 assert agent_ready.wait(timeout=3.0)
-                expired_queue = adapter._run_streams[run_id]
+                expired_queue = adapter._run_streams[run_scope]
                 stream_delta = mock_create.call_args.kwargs["stream_delta_callback"]
 
-                adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL + 1
+                adapter._run_streams_created[run_scope] -= (
+                    adapter._RUN_STREAM_TTL + 1
+                )
                 adapter._sweep_orphaned_runs_once(time.time())
                 before = expired_queue.qsize()
                 stream_delta("must-not-buffer")
                 mock_agent.interrupt("finish test")
                 for _ in range(40):
-                    if run_id not in adapter._active_run_tasks:
+                    if run_scope not in adapter._active_run_tasks:
                         break
                     await asyncio.sleep(0.05)
 
@@ -832,9 +908,14 @@ class TestRunLifecycleSweep:
     @pytest.mark.asyncio
     async def test_expired_orphan_run_state_is_reaped(self, adapter):
         run_id = "run_expired_orphan"
-        adapter._run_streams[run_id] = asyncio.Queue()
-        adapter._run_streams_created[run_id] = 0
-        adapter._run_approval_sessions[run_id] = run_id
+        run_scope = adapter._api_request_scope("run", run_id)
+        approval_session_key = adapter._api_request_scope(
+            "run-approval",
+            run_id,
+        ).internal_key
+        adapter._run_streams[run_scope] = asyncio.Queue()
+        adapter._run_streams_created[run_scope] = 0
+        adapter._run_approval_sessions[run_scope] = approval_session_key
 
         pending = approval_mod._ApprovalEntry({
             "command": "bash -c orphaned",
@@ -842,7 +923,7 @@ class TestRunLifecycleSweep:
             "pattern_keys": ["shell-c"],
         })
         with approval_mod._lock:
-            approval_mod._gateway_queues[run_id] = [pending]
+            approval_mod._gateway_queues[approval_session_key] = [pending]
 
         with patch(
             "gateway.platforms.api_server.asyncio.sleep",
@@ -851,12 +932,12 @@ class TestRunLifecycleSweep:
             with pytest.raises(asyncio.CancelledError):
                 await adapter._sweep_orphaned_runs()
 
-        assert run_id not in adapter._run_streams
-        assert run_id not in adapter._run_streams_created
-        assert run_id not in adapter._run_approval_sessions
+        assert run_scope not in adapter._run_streams
+        assert run_scope not in adapter._run_streams_created
+        assert run_scope not in adapter._run_approval_sessions
         assert pending.event.is_set()
         with approval_mod._lock:
-            assert run_id not in approval_mod._gateway_queues
+            assert approval_session_key not in approval_mod._gateway_queues
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +967,7 @@ class TestStopRun:
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
+                run_scope = adapter._api_request_scope("run", run_id)
                 await task_started.wait()
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -893,12 +975,15 @@ class TestStopRun:
                 allow_task.set()
 
                 for _ in range(20):
-                    if run_id not in adapter._active_run_tasks:
+                    if run_scope not in adapter._active_run_tasks:
                         break
                     await asyncio.sleep(0.05)
 
                 mock_create.assert_not_called()
-                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert (
+                    adapter._run_statuses[run_scope]["status"]
+                    == "cancelled"
+                )
 
     @pytest.mark.asyncio
     async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):
@@ -926,6 +1011,7 @@ class TestStopRun:
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
+                run_scope = adapter._api_request_scope("run", run_id)
                 assert started.wait(timeout=3)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -933,19 +1019,25 @@ class TestStopRun:
                 await asyncio.sleep(0.1)
 
                 assert not run_finished.is_set()
-                assert run_id in adapter._active_run_agents
-                assert run_id in adapter._active_run_tasks
-                assert adapter._run_statuses[run_id]["status"] == "stopping"
+                assert run_scope in adapter._active_run_agents
+                assert run_scope in adapter._active_run_tasks
+                assert (
+                    adapter._run_statuses[run_scope]["status"]
+                    == "stopping"
+                )
 
                 run_can_finish.set()
                 for _ in range(40):
-                    if run_id not in adapter._active_run_tasks:
+                    if run_scope not in adapter._active_run_tasks:
                         break
                     await asyncio.sleep(0.05)
 
-                assert run_id not in adapter._active_run_agents
-                assert run_id not in adapter._active_run_tasks
-                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert run_scope not in adapter._active_run_agents
+                assert run_scope not in adapter._active_run_tasks
+                assert (
+                    adapter._run_statuses[run_scope]["status"]
+                    == "cancelled"
+                )
 
     @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):
@@ -961,13 +1053,14 @@ class TestStopRun:
                 assert resp.status == 202
                 data = await resp.json()
                 run_id = data["run_id"]
+                run_scope = adapter._api_request_scope("run", run_id)
 
                 # Wait for agent to start running in the thread
                 agent_ready.wait(timeout=3.0)
                 await asyncio.sleep(0.1)
 
                 # Verify agent ref is stored
-                assert run_id in adapter._active_run_agents
+                assert run_scope in adapter._active_run_agents
 
                 # Stop the run
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -986,8 +1079,8 @@ class TestStopRun:
 
                 # Refs should be cleaned up
                 await asyncio.sleep(0.5)
-                assert run_id not in adapter._active_run_agents
-                assert run_id not in adapter._active_run_tasks
+                assert run_scope not in adapter._active_run_agents
+                assert run_scope not in adapter._active_run_tasks
 
     @pytest.mark.asyncio
     async def test_stop_nonexistent_run_returns_404(self, adapter):
@@ -1021,11 +1114,12 @@ class TestStopRun:
                 assert resp.status == 202
                 data = await resp.json()
                 run_id = data["run_id"]
+                run_scope = adapter._api_request_scope("run", run_id)
 
                 await asyncio.sleep(0.3)
 
                 # Run should be done, refs cleaned up
-                assert run_id not in adapter._active_run_agents
+                assert run_scope not in adapter._active_run_agents
 
                 # Stop should return 404
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -1133,3 +1227,63 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+                assert status["terminal"] is True
+                assert status["completed"] is False
+                assert status["partial"] is False
+                assert status["interrupted"] is False
+                assert status["failed"] is True
+                assert status["incomplete"] is True
+                assert (
+                    status["turn_exit_reason"]
+                    == "provider_auth_resolution_failed"
+                )
+
+    @pytest.mark.asyncio
+    async def test_provider_auth_secret_absent_from_log_status_and_events(
+        self,
+        adapter,
+        caplog,
+    ):
+        from gateway.platforms.api_server import _ProviderAuthResolutionError
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.side_effect = _ProviderAuthResolutionError(
+                    f"Provider rejected credential {SECRET_SENTINEL}"
+                )
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                events_resp = await asyncio.wait_for(
+                    cli.get(f"/v1/runs/{run_id}/events"),
+                    timeout=5,
+                )
+                events_text = await asyncio.wait_for(
+                    events_resp.text(),
+                    timeout=5,
+                )
+
+        assert status["status"] == "failed"
+        assert SECRET_SENTINEL not in str(status)
+        assert SECRET_SENTINEL not in events_text
+        assert "run.failed" in events_text
+        assert '"completed": false' in events_text
+        assert '"partial": false' in events_text
+        assert '"interrupted": false' in events_text
+        assert '"failed": true' in events_text
+        assert '"incomplete": true' in events_text
+        assert '"turn_exit_reason": "provider_auth_resolution_failed"' in events_text
+        assert all(
+            SECRET_SENTINEL not in record.getMessage()
+            for record in caplog.records
+        )

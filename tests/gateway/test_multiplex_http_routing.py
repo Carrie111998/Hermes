@@ -1,73 +1,121 @@
-"""Phase 1: HTTP-inbound /p/<profile>/ routing for the webhook adapter."""
+"""Webhook ingress enforces one profile per gateway process."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.webhook import (
+    WebhookAdapter,
+    _PROFILE_REJECTED,
+)
+from gateway.run import MultiplexConfigError
 from gateway.session import SessionSource, build_session_key
 
 
 class TestSessionSourceProfileField:
     def test_profile_roundtrips(self):
-        s = SessionSource(
-            platform=Platform.WEBHOOK if hasattr(Platform, "WEBHOOK") else Platform.TELEGRAM,
+        source = SessionSource(
+            platform=Platform.WEBHOOK,
             chat_id="c1",
             chat_type="webhook",
             profile="coder",
         )
-        restored = SessionSource.from_dict(s.to_dict())
-        assert restored.profile == "coder"
+
+        assert SessionSource.from_dict(source.to_dict()).profile == "coder"
 
     def test_profile_absent_not_serialized(self):
-        s = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm")
-        assert "profile" not in s.to_dict()
-
-    def test_source_profile_drives_session_key_namespace(self):
-        s = SessionSource(platform=Platform.TELEGRAM, chat_id="99", chat_type="dm")
-        # build_session_key takes profile explicitly; the adapter passes
-        # source.profile through. Verify the namespace follows it.
-        assert build_session_key(s, profile="coder") == "agent:coder:telegram:dm:99"
-
-
-class TestWebhookProfileResolution:
-    """_resolve_request_profile validates the /p/<profile>/ prefix."""
-
-    def _adapter(self, multiplex: bool, served=("default", "coder")):
-        from gateway.platforms.webhook import WebhookAdapter, _PROFILE_REJECTED
-
-        class _FakeReq:
-            def __init__(self, profile):
-                self.match_info = {"profile": profile} if profile is not None else {}
-
-        cfg = GatewayConfig(multiplex_profiles=multiplex)
-
-        class _Runner:
-            config = cfg
-
-        # Construct minimally; we only call _resolve_request_profile.
-        adapter = WebhookAdapter.__new__(WebhookAdapter)
-        adapter.gateway_runner = _Runner()
-        return adapter, _FakeReq, _PROFILE_REJECTED, served
-
-    def test_no_prefix_returns_none(self):
-        adapter, Req, _REJ, _ = self._adapter(multiplex=True)
-        assert adapter._resolve_request_profile(Req(None)) is None
-
-    def test_prefix_ignored_when_multiplex_off(self):
-        adapter, Req, _REJ, _ = self._adapter(multiplex=False)
-        # Even a bogus profile is ignored (not 404'd) when multiplexing is off.
-        assert adapter._resolve_request_profile(Req("anything")) is None
-
-    def test_known_profile_accepted(self, monkeypatch):
-        adapter, Req, _REJ, served = self._adapter(multiplex=True)
-        monkeypatch.setattr(
-            "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [(n, None) for n in served],
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="c1",
+            chat_type="dm",
         )
-        assert adapter._resolve_request_profile(Req("coder")) == "coder"
 
-    def test_unknown_profile_rejected(self, monkeypatch):
-        adapter, Req, REJ, served = self._adapter(multiplex=True)
-        monkeypatch.setattr(
-            "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [(n, None) for n in served],
+        assert "profile" not in source.to_dict()
+
+    def test_explicit_profile_key_namespace_remains_deterministic(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="99",
+            chat_type="dm",
         )
-        assert adapter._resolve_request_profile(Req("ghost")) is REJ
+
+        assert (
+            build_session_key(source, profile="coder")
+            == "agent:coder:telegram:dm:99"
+        )
+
+
+class _FakeRequest:
+    def __init__(self, profile=None):
+        self.match_info = {"profile": profile} if profile is not None else {}
+
+
+def _adapter(*, multiplex: bool) -> WebhookAdapter:
+    adapter = WebhookAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "host": "127.0.0.1",
+                "port": 0,
+                "routes": {},
+            },
+        )
+    )
+    adapter.gateway_runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=multiplex)
+    )
+    return adapter
+
+
+def test_profile_prefix_is_rejected_in_single_profile_mode():
+    adapter = _adapter(multiplex=False)
+
+    assert adapter._resolve_request_profile(_FakeRequest()) is None
+    assert (
+        adapter._resolve_request_profile(_FakeRequest("other"))
+        is _PROFILE_REJECTED
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_webhook_connect_refuses_multiplex_before_startup_work(
+    monkeypatch,
+):
+    adapter = _adapter(multiplex=True)
+    calls = []
+
+    def forbidden():
+        calls.append("dynamic_routes")
+        raise AssertionError("startup work must remain unreachable")
+
+    monkeypatch.setattr(adapter, "_reload_dynamic_routes", forbidden)
+
+    assert await adapter.connect() is False
+    assert adapter._runner is None
+    assert adapter.fatal_error_code == "webhook_multiplex_unsupported"
+    assert calls == []
+
+    with pytest.raises(
+        MultiplexConfigError,
+        match="one Hermes gateway process per profile",
+    ):
+        adapter._resolve_request_profile(_FakeRequest())
+
+
+@pytest.mark.asyncio
+async def test_connected_webhook_registers_native_routes_only():
+    adapter = _adapter(multiplex=False)
+    assert await adapter.connect() is True
+    try:
+        resources = {
+            resource.canonical
+            for resource in adapter._runner.app.router.resources()
+        }
+        assert "/health" in resources
+        assert "/webhooks/{route_name}" in resources
+        assert all(not path.startswith("/p/") for path in resources)
+    finally:
+        await adapter.disconnect()

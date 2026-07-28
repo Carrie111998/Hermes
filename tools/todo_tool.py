@@ -500,6 +500,48 @@ class TodoStore:
             for item in self._items
         )
 
+    def execution_progress_token(self) -> str:
+        """Return a stable token for structured execution-state progress.
+
+        Prose edits are intentionally excluded: changing task wording is not
+        evidence that execution advanced.  Item identity/status transitions
+        and Canonical control-state transitions are included, so a renewable
+        iteration slice can distinguish real plan movement from an unchanged
+        active-plan loop without interpreting task meaning.
+        """
+
+        # Canonical receipts contain content hashes, event ids, revisions, and
+        # diagnostic details.  Those values are vital audit evidence but are
+        # not execution progress: repeatedly rewording/re-checkpointing the
+        # same active plan must not buy fresh model-call slices.  Likewise,
+        # list order is presentation, not a status transition.
+        canonical_state = {
+            "fenced": self._canonical_fence is not None,
+            "bound": self._canonical_binding is not None,
+            "dirty": self.is_canonical_dirty(),
+            "sync_blocked": (
+                self._canonical_sync_blocked["error_code"]
+                if self._canonical_sync_blocked is not None
+                else None
+            ),
+        }
+        item_states = sorted(
+            (
+                {
+                    "id": item["id"],
+                    "status": item["status"],
+                }
+                for item in self._items
+            ),
+            key=lambda item: (item["id"], item["status"]),
+        )
+        return _sha256_json(
+            {
+                "items": item_states,
+                "canonical_state": canonical_state,
+            }
+        )
+
     def format_for_injection(self) -> Optional[str]:
         """
         Render the todo list for post-compression injection.

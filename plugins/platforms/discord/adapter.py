@@ -1164,6 +1164,7 @@ class DiscordAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_incomplete_processing_outcome = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
@@ -2798,18 +2799,49 @@ class DiscordAdapter(BasePlatformAdapter):
         message_id = str(getattr(getattr(event, "raw_message", None), "id", "") or getattr(event, "message_id", "") or "")
         if not message_id:
             return
-        status = "processed" if outcome == ProcessingOutcome.SUCCESS else ("cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed")
+        status = {
+            ProcessingOutcome.SUCCESS: "processed",
+            ProcessingOutcome.INCOMPLETE: "incomplete",
+            ProcessingOutcome.CANCELLED: "cancelled",
+        }.get(outcome, "failed")
+        preserve_responded = outcome == ProcessingOutcome.SUCCESS
         now = self._utc_now_iso()
 
         def _op(conn):
             conn.execute(
                 "UPDATE discord_messages "
-                "SET status=CASE WHEN status='responded' THEN status ELSE ? END, "
+                "SET status=CASE WHEN ? AND status='responded' THEN status ELSE ? END, "
                 "updated_at=? WHERE message_id=?",
-                (status, now, message_id),
+                (1 if preserve_responded else 0, status, now, message_id),
             )
 
         self._with_discord_recovery_db(_op)
+        if preserve_responded:
+            def _completed_channel(conn):
+                row = conn.execute(
+                    "SELECT status, replied, outage_response, "
+                    "COALESCE(thread_id, channel_id) "
+                    "FROM discord_messages WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+                if not row:
+                    return None
+                row_status, replied, outage, channel_id = row
+                if (
+                    row_status == "responded"
+                    and bool(replied)
+                    and not bool(outage)
+                    and channel_id
+                ):
+                    return str(channel_id)
+                return None
+
+            channel_id = self._with_discord_recovery_db(_completed_channel)
+            if channel_id:
+                # Advance only after both transport delivery and logical agent
+                # success are known.  A delivered partial receipt must remain
+                # behind the cursor for durable task-resume reconciliation.
+                self._advance_discord_recovery_cursor(channel_id, message_id)
 
     def _record_discord_response(
         self,
@@ -2852,18 +2884,6 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         self._with_discord_recovery_db(_op)
-        if completed:
-            def _channel_for_message(conn):
-                row = conn.execute(
-                    "SELECT COALESCE(thread_id, channel_id) FROM discord_messages "
-                    "WHERE message_id=?",
-                    (reply_to,),
-                ).fetchone()
-                return str(row[0]) if row and row[0] else None
-
-            channel_id = self._with_discord_recovery_db(_channel_for_message)
-            if channel_id:
-                self._advance_discord_recovery_cursor(channel_id, reply_to)
 
     def _discord_message_is_persistently_complete(self, message_id: str) -> bool:
         if not message_id:
@@ -3173,6 +3193,8 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._remove_reaction(message, "👀")
             if outcome == ProcessingOutcome.SUCCESS:
                 await self._add_reaction(message, "✅")
+            elif outcome == ProcessingOutcome.INCOMPLETE:
+                await self._add_reaction(message, "⚠️")
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 

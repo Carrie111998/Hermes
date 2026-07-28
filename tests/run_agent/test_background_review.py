@@ -89,15 +89,21 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
             self._session_messages = []
             # Default matches AIAgent.__init__ (agent_init.py): owns its row.
             self._end_session_on_close = True
+            self._owns_runtime_resources = True
 
         def __setattr__(self, name, value):
             object.__setattr__(self, name, value)
             if name == "_end_session_on_close":
                 seen["end_session_on_close"] = value
+            if name == "_owns_runtime_resources":
+                seen["owns_runtime_resources"] = value
 
         def run_conversation(self, **kwargs):
             # By the time the fork runs, the opt-out must already be applied.
             seen["at_run_time"] = self._end_session_on_close
+            seen["owns_resources_at_run_time"] = (
+                self._owns_runtime_resources
+            )
 
         def shutdown_memory_provider(self):
             pass
@@ -118,6 +124,8 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
 
     assert seen.get("end_session_on_close") is False
     assert seen.get("at_run_time") is False
+    assert seen.get("owns_runtime_resources") is False
+    assert seen.get("owns_resources_at_run_time") is False
 
 
 def test_background_review_summarizer_receives_captured_messages_after_close(monkeypatch):

@@ -2444,20 +2444,97 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
-                    agent._session_db.publish_compression_child(
-                        parent_session_id=old_session_id,
-                        child_session_id=new_session_id,
-                        source=agent.platform
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                        model=agent.model,
-                        model_config=agent._session_init_model_config,
-                        system_prompt=new_system_prompt,
-                        messages=compressed,
-                        cwd=getattr(agent, "working_directory", None),
-                        profile_name=_profile_for_child,
-                        compression_lock_holder=_lock_holder,
-                        require_compression_lease=_lock_holder is not None,
+                    _compression_alias_staged = False
+                    _compression_alias_authority = str(
+                        getattr(
+                            agent,
+                            "_workspace_lease_authority",
+                            "",
+                        )
+                        or ""
                     )
+                    _compression_alias_owner = getattr(
+                        agent,
+                        "_workspace_lease_binding_owner_id",
+                        None,
+                    )
+                    if getattr(
+                        agent,
+                        "_isolated_worker_backend_selected",
+                        False,
+                    ):
+                        if not _compression_alias_authority:
+                            raise RuntimeError(
+                                "workspace_lease_authority_missing"
+                            )
+                        from tools.terminal_tool import (
+                            register_workspace_lease_authority,
+                        )
+
+                        register_workspace_lease_authority(
+                            new_session_id,
+                            _compression_alias_authority,
+                            owner_id=(
+                                _compression_alias_owner
+                                if isinstance(
+                                    _compression_alias_owner,
+                                    str,
+                                )
+                                else None
+                            ),
+                        )
+                        _compression_alias_staged = True
+                    try:
+                        agent._session_db.publish_compression_child(
+                            parent_session_id=old_session_id,
+                            child_session_id=new_session_id,
+                            source=agent.platform
+                            or os.environ.get(
+                                "HERMES_SESSION_SOURCE",
+                                "cli",
+                            ),
+                            model=agent.model,
+                            model_config=agent._session_init_model_config,
+                            system_prompt=new_system_prompt,
+                            messages=compressed,
+                            cwd=getattr(
+                                agent,
+                                "working_directory",
+                                None,
+                            ),
+                            profile_name=_profile_for_child,
+                            compression_lock_holder=_lock_holder,
+                            require_compression_lease=(
+                                _lock_holder is not None
+                            ),
+                        )
+                    except Exception:
+                        if _compression_alias_staged:
+                            from tools.terminal_tool import (
+                                unregister_workspace_lease_authority,
+                            )
+
+                            unregister_workspace_lease_authority(
+                                new_session_id,
+                                _compression_alias_authority,
+                                owner_id=(
+                                    _compression_alias_owner
+                                    if isinstance(
+                                        _compression_alias_owner,
+                                        str,
+                                    )
+                                    else None
+                                ),
+                            )
+                        raise
+                    if _compression_alias_staged:
+                        _track_workspace_alias = getattr(
+                            agent,
+                            "_track_workspace_lease_persistent_runtime_ids",
+                            None,
+                        )
+                        if callable(_track_workspace_alias):
+                            _track_workspace_alias((new_session_id,))
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id

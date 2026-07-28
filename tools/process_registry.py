@@ -39,12 +39,13 @@ import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -59,6 +60,14 @@ MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
+
+# During a rolling restart the new process can see an old process's durable
+# delegation row while that old owner is still alive.  A one-shot startup scan
+# cannot recover it yet, so use one profile-scoped, exponentially backed-off
+# timer only while such rows exist.  The maximum bounds recovery latency without
+# turning every long-lived CLI/gateway/TUI process into a hot SQLite poller.
+ASYNC_ABANDONED_RESCAN_INITIAL_SECONDS = 2.0
+ASYNC_ABANDONED_RESCAN_MAX_SECONDS = 30.0
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -90,9 +99,10 @@ def format_uptime_short(seconds: int) -> str:
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
-    id: str                                     # Unique session ID ("proc_xxxxxxxxxxxx")
+    id: str                                     # Unique session ID ("proc_" + UUID hex)
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
+    owner_task_id: str = ""                     # Exact tool-call task that created it
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -157,7 +167,18 @@ class ProcessRegistry:
         "tcsetattr: Inappropriate ioctl for device",
     )
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        auto_restore_async: bool = True,
+        checkpoint_path: str | Path | None = None,
+    ):
+        if type(auto_restore_async) is not bool:
+            raise TypeError("auto_restore_async must be boolean")
+        self._checkpoint_path_lock = threading.Lock()
+        self._checkpoint_path: Optional[Path] = None
+        if checkpoint_path is not None:
+            self.bind_checkpoint_path(checkpoint_path)
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
@@ -171,13 +192,34 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+        self._async_restore_lock = threading.Lock()
+        self._async_restored_homes: set[str] = set()
+        self._async_restore_seen_events: Dict[str, set[str]] = {}
+        self._async_abandoned_watch_ids: Dict[str, set[str]] = {}
+        self._async_abandoned_scan_all: set[str] = set()
+        self._async_abandoned_filters: Dict[
+            str,
+            List[Optional[Callable[[Dict[str, Any]], bool]]],
+        ] = {}
+        self._async_abandoned_stores: Dict[str, Any] = {}
+        self._async_abandoned_rescan_timers: Dict[
+            str,
+            threading.Timer,
+        ] = {}
+        self._async_abandoned_rescan_delays: Dict[str, float] = {}
+        self._async_abandoned_rescans_closed = False
+        # Standalone CLI/test registries retain the historical ambient-home
+        # restore.  The module singleton is deferred: a gateway may serve
+        # several profiles and must supply its already-frozen exact stores
+        # before any marker/SQLite scan occurs.
+        if auto_restore_async:
+            try:
+                self.restore_async_delegation_completions(once=True)
+            except Exception as exc:
+                logger.warning(
+                    "Could not restore async delegation completions: %s",
+                    exc,
+                )
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
@@ -212,6 +254,350 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    def bind_checkpoint_path(self, path: str | Path) -> Path:
+        """Pin crash-recovery I/O to one canonical file for this registry.
+
+        The module-level default remains dynamic for standalone CLI/test
+        registries (many callers intentionally patch ``CHECKPOINT_PATH``).
+        GatewayRunner calls this once with its constructor-frozen canonical
+        profile home before any restore or process write. A second, different
+        binding is rejected so two live runners cannot redirect the shared
+        registry across profile generations.
+        """
+
+        candidate = Path(path).expanduser().resolve(strict=False)
+        with self._checkpoint_path_lock:
+            current = self._checkpoint_path
+            if current is None:
+                self._checkpoint_path = candidate
+            elif current != candidate:
+                raise RuntimeError(
+                    "process registry checkpoint path is already bound to "
+                    f"{current}; refusing rebind to {candidate}"
+                )
+            return self._checkpoint_path
+
+    def _checkpoint_file(self) -> Path:
+        """Return the exact bound file, or the standalone ambient default."""
+
+        with self._checkpoint_path_lock:
+            bound = self._checkpoint_path
+        if bound is not None:
+            return bound
+        return Path(CHECKPOINT_PATH).expanduser()
+
+    def restore_async_delegation_completions(
+        self,
+        *,
+        hermes_home: str | Path | None = None,
+        profile: str | None = None,
+        delivery_store=None,
+        event_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        once: bool = False,
+    ) -> int:
+        """Restore pending delegation events from one explicit profile store.
+
+        Multi-profile hosts call this after enumerating their trusted profile
+        homes.  ``once=True`` is for a full-home startup restore such as the
+        messaging gateway: it suppresses duplicate scans of the same canonical
+        home, including the launch home already restored by ``__init__``.
+
+        A session-specific TUI/Desktop restore must use ``once=False`` plus an
+        ownership ``event_filter``.  Marking a partially filtered home as
+        globally restored would strand another session's still-pending events,
+        so that unsafe combination is rejected explicitly.
+        """
+
+        if once and event_filter is not None:
+            raise ValueError(
+                "once=True cannot be combined with a partial event_filter"
+            )
+        from tools.async_delegation import (
+            _verify_event_delivery_store,
+            live_foreign_delegation_ids,
+            resolve_event_delivery_store,
+        )
+
+        store = delivery_store or resolve_event_delivery_store(
+            hermes_home=hermes_home,
+            profile=profile,
+        )
+        _verify_event_delivery_store(store)
+
+        with self._async_restore_lock:
+            # Observe the old owner *before* recovery.  If it dies between the
+            # recovery liveness check and a later post-check, a post-only signal
+            # says "nothing live" while the durable row is still RUNNING.  The
+            # pre-snapshot guarantees at least one later pass for every row we
+            # actually observed under a live rolling-overlap owner.
+            try:
+                observed_live = live_foreign_delegation_ids(
+                    delivery_store=store,
+                )
+            except Exception:
+                observed_live = set()
+                self._async_abandoned_scan_all.add(store.hermes_home)
+                logger.warning(
+                    "Could not inspect live async-delegation owners for %s; "
+                    "scheduling a conservative bounded recovery rescan",
+                    store.hermes_home,
+                    exc_info=True,
+                )
+            if observed_live or store.hermes_home in self._async_abandoned_scan_all:
+                self._register_async_abandoned_watch_locked(
+                    store,
+                    observed_live,
+                    event_filter,
+                )
+
+            if once and store.hermes_home in self._async_restored_homes:
+                self._schedule_async_abandoned_rescan_locked(store.hermes_home)
+                return 0
+
+            try:
+                restored = self._restore_async_delegation_store_locked(
+                    store,
+                    event_filter=event_filter,
+                    suppress_seen=False,
+                )
+            except Exception:
+                # A transient SQLite/filesystem failure must not make the
+                # one-time startup marker permanent.  Keep a conservative
+                # scan-all registration so the same long-lived process retries.
+                self._async_abandoned_scan_all.add(store.hermes_home)
+                self._register_async_abandoned_watch_locked(
+                    store,
+                    observed_live,
+                    event_filter,
+                )
+                self._schedule_async_abandoned_rescan_locked(store.hermes_home)
+                raise
+            if once:
+                self._async_restored_homes.add(store.hermes_home)
+            self._schedule_async_abandoned_rescan_locked(store.hermes_home)
+            return restored
+
+    def _restore_async_delegation_store_locked(
+        self,
+        store,
+        *,
+        event_filter: Optional[Callable[[Dict[str, Any]], bool]],
+        suppress_seen: bool,
+        delegation_ids: Optional[set[str]] = None,
+        subscriber_filters: Optional[
+            List[Optional[Callable[[Dict[str, Any]], bool]]]
+        ] = None,
+    ) -> int:
+        """Restore one store while tracking queue carriers for rescan de-dup."""
+
+        from tools.async_delegation import restore_undelivered_completions
+
+        seen = self._async_restore_seen_events.setdefault(
+            store.hermes_home,
+            set(),
+        )
+
+        def _accept(evt: Dict[str, Any]) -> bool:
+            delegation_id = str(evt.get("delegation_id") or "")
+            if delegation_ids is not None and delegation_id not in delegation_ids:
+                return False
+            filters = subscriber_filters
+            if filters is None:
+                filters = [event_filter]
+            if filters and None not in filters:
+                accepted = False
+                for subscriber_filter in filters:
+                    if subscriber_filter is None:
+                        accepted = True
+                        break
+                    try:
+                        if subscriber_filter(evt):
+                            accepted = True
+                            break
+                    except Exception:
+                        logger.warning(
+                            "Async delegation %s recovery ownership filter "
+                            "failed; leaving its durable row pending",
+                            delegation_id,
+                            exc_info=True,
+                        )
+                if not accepted:
+                    return False
+            if suppress_seen and delegation_id in seen:
+                return False
+            if delegation_id:
+                seen.add(delegation_id)
+            return True
+
+        return restore_undelivered_completions(
+            self.completion_queue,
+            delivery_store=store,
+            event_filter=_accept,
+        )
+
+    def _register_async_abandoned_watch_locked(
+        self,
+        store,
+        delegation_ids: set[str],
+        event_filter: Optional[Callable[[Dict[str, Any]], bool]],
+    ) -> None:
+        home = store.hermes_home
+        self._async_abandoned_stores[home] = store
+        self._async_abandoned_watch_ids.setdefault(home, set()).update(
+            delegation_ids
+        )
+        filters = self._async_abandoned_filters.setdefault(home, [])
+        if event_filter is None:
+            # An unfiltered CLI/gateway registration subsumes every partial
+            # subscriber for this home.
+            filters[:] = [None]
+        elif None not in filters and all(
+            existing is not event_filter for existing in filters
+        ):
+            filters.append(event_filter)
+
+    def _schedule_async_abandoned_rescan_locked(self, home: str) -> bool:
+        """Ensure at most one bounded abandoned-owner timer for ``home``."""
+
+        if self._async_abandoned_rescans_closed:
+            return False
+        if (
+            not self._async_abandoned_watch_ids.get(home)
+            and home not in self._async_abandoned_scan_all
+        ):
+            return False
+        if home in self._async_abandoned_rescan_timers:
+            return True
+
+        delay = self._async_abandoned_rescan_delays.setdefault(
+            home,
+            ASYNC_ABANDONED_RESCAN_INITIAL_SECONDS,
+        )
+        timer_holder: Dict[str, threading.Timer] = {}
+
+        def _fire() -> None:
+            self._run_async_abandoned_rescan(home, timer_holder["timer"])
+
+        timer = threading.Timer(delay, _fire)
+        timer_holder["timer"] = timer
+        timer.daemon = True
+        self._async_abandoned_rescan_timers[home] = timer
+        try:
+            timer.start()
+        except Exception:
+            self._async_abandoned_rescan_timers.pop(home, None)
+            logger.warning(
+                "Could not start async-delegation recovery rescan for %s",
+                home,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    def _run_async_abandoned_rescan(
+        self,
+        home: str,
+        timer: threading.Timer,
+    ) -> None:
+        """Run one rolling-overlap recovery pass and reschedule if necessary."""
+
+        from tools.async_delegation import live_foreign_delegation_ids
+
+        with self._async_restore_lock:
+            if self._async_abandoned_rescan_timers.get(home) is not timer:
+                return
+            self._async_abandoned_rescan_timers.pop(home, None)
+            if self._async_abandoned_rescans_closed:
+                return
+            store = self._async_abandoned_stores.get(home)
+            if store is None:
+                return
+            watched = set(self._async_abandoned_watch_ids.get(home, set()))
+            scan_all = home in self._async_abandoned_scan_all
+            filters = list(self._async_abandoned_filters.get(home, [None]))
+            try:
+                # Query before recovery/restore for the same death-race reason
+                # as the initial path.  A row observed live here always earns
+                # one more pass, even if it dies a microsecond later.
+                live_before = live_foreign_delegation_ids(
+                    hermes_home=store.hermes_home,
+                    profile=store.profile,
+                )
+                if scan_all:
+                    watched.update(live_before)
+                self._restore_async_delegation_store_locked(
+                    store,
+                    event_filter=None,
+                    suppress_seen=True,
+                    delegation_ids=None if scan_all else watched,
+                    subscriber_filters=filters,
+                )
+            except Exception:
+                self._async_abandoned_rescan_delays[home] = min(
+                    ASYNC_ABANDONED_RESCAN_MAX_SECONDS,
+                    max(
+                        ASYNC_ABANDONED_RESCAN_INITIAL_SECONDS,
+                        self._async_abandoned_rescan_delays.get(
+                            home,
+                            ASYNC_ABANDONED_RESCAN_INITIAL_SECONDS,
+                        )
+                        * 2,
+                    ),
+                )
+                logger.warning(
+                    "Async-delegation recovery rescan failed for %s; retrying "
+                    "with bounded backoff",
+                    home,
+                    exc_info=True,
+                )
+                self._schedule_async_abandoned_rescan_locked(home)
+                return
+
+            remaining = watched.intersection(live_before)
+            self._async_abandoned_scan_all.discard(home)
+            if remaining:
+                self._async_abandoned_watch_ids[home] = remaining
+                self._async_abandoned_rescan_delays[home] = min(
+                    ASYNC_ABANDONED_RESCAN_MAX_SECONDS,
+                    max(
+                        ASYNC_ABANDONED_RESCAN_INITIAL_SECONDS,
+                        self._async_abandoned_rescan_delays.get(
+                            home,
+                            ASYNC_ABANDONED_RESCAN_INITIAL_SECONDS,
+                        )
+                        * 2,
+                    ),
+                )
+                self._schedule_async_abandoned_rescan_locked(home)
+                return
+
+            self._async_abandoned_watch_ids.pop(home, None)
+            self._async_abandoned_filters.pop(home, None)
+            self._async_abandoned_stores.pop(home, None)
+            self._async_abandoned_rescan_delays.pop(home, None)
+
+    def cancel_async_delegation_recovery_rescans(self) -> None:
+        """Cancel registry-owned rescan timers and release subscriber closures."""
+
+        with self._async_restore_lock:
+            self._async_abandoned_rescans_closed = True
+            timers = list(self._async_abandoned_rescan_timers.values())
+            self._async_abandoned_rescan_timers.clear()
+            self._async_abandoned_watch_ids.clear()
+            self._async_abandoned_scan_all.clear()
+            self._async_abandoned_filters.clear()
+            self._async_abandoned_stores.clear()
+            self._async_abandoned_rescan_delays.clear()
+            self._async_restore_seen_events.clear()
+        for timer in timers:
+            try:
+                timer.cancel()
+            except Exception:
+                logger.debug(
+                    "Could not cancel async-delegation recovery timer",
+                    exc_info=True,
+                )
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -694,6 +1080,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        owner_task_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -715,9 +1102,10 @@ class ProcessRegistry:
         safe_command = _rewrite_bg(command)
 
         session = ProcessSession(
-            id=f"proc_{uuid.uuid4().hex[:12]}",
+            id=f"proc_{uuid.uuid4().hex}",
             command=command,
             task_id=task_id,
+            owner_task_id=owner_task_id or task_id,
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
@@ -842,6 +1230,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        owner_task_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -855,9 +1244,10 @@ class ProcessRegistry:
         but it ensures the command runs in the correct sandbox context.
         """
         session = ProcessSession(
-            id=f"proc_{uuid.uuid4().hex[:12]}",
+            id=f"proc_{uuid.uuid4().hex}",
             command=command,
             task_id=task_id,
+            owner_task_id=owner_task_id or task_id,
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
@@ -1324,6 +1714,128 @@ class ProcessRegistry:
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
         return self._refresh_detached_session(session)
+
+    @staticmethod
+    def _process_action_authorized(
+        session: ProcessSession,
+        *,
+        task_id: str,
+        session_key: str,
+        gateway_context_bound: bool,
+    ) -> bool:
+        """Return True only for the exact creating task or gateway session.
+
+        ``task_id`` on ``ProcessSession`` is the sandbox/environment key and
+        may intentionally collapse many callers to ``"default"``.  It is not
+        an authorization identity.  New processes therefore carry the exact
+        ``owner_task_id`` separately.  Old single-session checkpoints without
+        a gateway ``session_key`` may use their historical task key only
+        outside a gateway context; a multiplex host never treats that legacy
+        shared key as proof.
+        """
+
+        caller_task_id = task_id if isinstance(task_id, str) else ""
+        caller_session_key = (
+            session_key if isinstance(session_key, str) else ""
+        )
+        owner_task_id = (
+            session.owner_task_id
+            if isinstance(session.owner_task_id, str)
+            else ""
+        )
+        owner_session_key = (
+            session.session_key
+            if isinstance(session.session_key, str)
+            else ""
+        )
+
+        if (
+            owner_task_id
+            and caller_task_id
+            and caller_task_id == owner_task_id
+        ):
+            return True
+        if (
+            owner_session_key
+            and caller_session_key
+            and caller_session_key == owner_session_key
+        ):
+            return True
+
+        # Compatibility for old CLI-only checkpoints.  Gateway/multi-session
+        # hosts fail closed because their environment task key can be shared by
+        # unrelated profiles.
+        return bool(
+            not gateway_context_bound
+            and not owner_task_id
+            and not owner_session_key
+            and caller_task_id
+            and caller_task_id == session.task_id
+        )
+
+    def perform_authorized_action(
+        self,
+        action: str,
+        session_id: str,
+        *,
+        task_id: str = "",
+        session_key: str = "",
+        gateway_context_bound: bool = False,
+        data: str = "",
+        timeout: Optional[int] = None,
+        offset: int = 0,
+        limit: int = 200,
+    ) -> dict:
+        """Authorize and dispatch one model-facing process action.
+
+        This is the sole boundary used by the ``process`` tool for actions
+        that address a process ID.  Keeping the decision here prevents one
+        action (especially a newly added mutating action) from accidentally
+        bypassing ownership checks.
+        """
+
+        session = self.get(session_id)
+        if session is None:
+            return {
+                "status": "not_found",
+                "error": "No process with that ID",
+            }
+        if not self._process_action_authorized(
+            session,
+            task_id=task_id,
+            session_key=session_key,
+            gateway_context_bound=gateway_context_bound,
+        ):
+            logger.warning(
+                "Denied process %s action for an unowned process",
+                action,
+            )
+            return {
+                "status": "forbidden",
+                "error": (
+                    "Process action is not authorized for the current "
+                    "task or session."
+                ),
+            }
+
+        if action == "poll":
+            return self.poll(session_id)
+        if action == "log":
+            return self.read_log(session_id, offset=offset, limit=limit)
+        if action == "wait":
+            return self.wait(session_id, timeout=timeout)
+        if action == "kill":
+            return self.kill_process(session_id)
+        if action == "write":
+            return self.write_stdin(session_id, data)
+        if action == "submit":
+            return self.submit_stdin(session_id, data)
+        if action == "close":
+            return self.close_stdin(session_id)
+        return {
+            "status": "error",
+            "error": f"Unknown process action: {action}",
+        }
 
     def _reconcile_local_exit(self, session: "ProcessSession") -> None:
         """Reconcile session.exited against the real child process state.
@@ -1948,6 +2460,7 @@ class ProcessRegistry:
 
     def _write_checkpoint(self):
         """Write running process metadata to checkpoint file atomically."""
+        checkpoint_path = self._checkpoint_file()
         try:
             with self._lock:
                 entries = []
@@ -1967,6 +2480,7 @@ class ProcessRegistry:
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
+                            "owner_task_id": s.owner_task_id,
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
@@ -1981,7 +2495,7 @@ class ProcessRegistry:
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            atomic_json_write(checkpoint_path, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -1991,11 +2505,12 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        checkpoint_path = self._checkpoint_file()
+        if not checkpoint_path.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
@@ -2039,6 +2554,12 @@ class ProcessRegistry:
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
+                # Never manufacture an authorization identity for an old
+                # checkpoint.  Legacy ``task_id`` is only a sandbox key and
+                # may be shared by unrelated gateway sessions.  The
+                # authorization boundary may use it for compatibility outside
+                # a gateway context, but a multiplex host must fail closed.
+                owner_task_id=entry.get("owner_task_id", ""),
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,
@@ -2081,8 +2602,10 @@ class ProcessRegistry:
         return recovered
 
 
-# Module-level singleton
-process_registry = ProcessRegistry()
+# Module-level singleton.  Surface owners initialize durable async restoration
+# explicitly: GatewayRunner supplies exact frozen stores; CLI restores its
+# ambient single-profile store; TUI/desktop restores per trusted session.
+process_registry = ProcessRegistry(auto_restore_async=False)
 
 
 def _format_age(seconds: float) -> str:
@@ -2098,6 +2621,22 @@ def _format_age(seconds: float) -> str:
         return f"{m}m" if s == 0 else f"{m}m{s}s"
     h, m = divmod(m, 60)
     return f"{h}h" if m == 0 else f"{h}h{m}m"
+
+
+def _async_delegation_outcome_label(status: str) -> str:
+    """Human-facing terminal label that does not equate ending with success."""
+    normalized = str(status or "unknown").strip().lower()
+    return {
+        "completed": "COMPLETE",
+        "success": "COMPLETE",
+        "partial": "PARTIALLY COMPLETE",
+        "interrupted": "INTERRUPTED",
+        "timeout": "TIMED OUT",
+        "error": "FAILED",
+        "failed": "FAILED",
+        "stalled": "STALLED",
+        "unknown": "OUTCOME UNKNOWN",
+    }.get(normalized, f"ENDED: {normalized.upper()}")
 
 
 def _format_async_delegation(evt: dict) -> str:
@@ -2118,7 +2657,8 @@ def _format_async_delegation(evt: dict) -> str:
     toolsets = evt.get("toolsets")
     role = evt.get("role") or "leaf"
     model = evt.get("model") or "?"
-    status = evt.get("status") or "completed"
+    status = evt.get("status") or "unknown"
+    outcome_label = _async_delegation_outcome_label(status)
     summary = evt.get("summary")
     error = evt.get("error")
     api_calls = evt.get("api_calls", 0)
@@ -2137,7 +2677,7 @@ def _format_async_delegation(evt: dict) -> str:
         n = len(results) if results else len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
         lines = [
-            f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+            f"[ASYNC DELEGATION BATCH {outcome_label} — {deleg_id}]",
             f"A background fan-out of {n} subagent(s) you dispatched earlier "
             "has finished. All ran in parallel and waited on each other; their "
             "consolidated results are below. You may have moved on since "
@@ -2152,7 +2692,10 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(f"Context you provided: {context}")
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        lines.append(
+            f"Role: {role}   Model: {model}   Status: {status}   "
+            f"Total duration: {total_dur}s"
+        )
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
@@ -2163,7 +2706,12 @@ def _format_async_delegation(evt: dict) -> str:
             r_summary = r.get("summary")
             r_error = r.get("error")
             r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
-            icon = "✓" if r_status in ("completed", "success") else "✗"
+            if r_status in ("completed", "success"):
+                icon = "✓"
+            elif r_status == "partial":
+                icon = "⚠"
+            else:
+                icon = "✗"
             lines.append("")
             header = f"--- {icon} TASK {idx + 1}/{n}"
             if r_goal:
@@ -2200,7 +2748,7 @@ def _format_async_delegation(evt: dict) -> str:
         age = f" ({_format_age(completed_at - dispatched_at)} ago)"
 
     lines = [
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
+        f"[ASYNC DELEGATION {outcome_label} — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
         "have moved on since dispatching it; the full task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
@@ -2376,15 +2924,25 @@ def _handle_process(args, **kw):
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
+    try:
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="") or ""
+    except Exception:
+        session_key = ""
+    try:
+        from gateway.session_context import session_context_engaged
+
+        gateway_context_bound = bool(session_context_engaged())
+    except Exception:
+        # A concrete gateway session key is itself sufficient reason to apply
+        # the strict multi-session policy even if the context probe fails.
+        gateway_context_bound = bool(session_key)
+
     if action == "list":
         # Surface session-scoped background processes (e.g. a forgotten
         # preview server) in addition to this task's own — they share the
         # gateway session_key and can block session reset (#29177).
-        try:
-            from tools.approval import get_current_session_key
-            session_key = get_current_session_key(default="") or ""
-        except Exception:
-            session_key = ""
         return json.dumps(
             {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
             ensure_ascii=False,
@@ -2392,24 +2950,21 @@ def _handle_process(args, **kw):
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
-        if action == "poll":
-            return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
-        elif action == "log":
-            return json.dumps(_redact_process_result(process_registry.read_log(
-                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
-        elif action == "wait":
-            return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
-        elif action == "kill":
-            return json.dumps(
-                _redact_process_result(process_registry.kill_process(session_id)),
-                ensure_ascii=False,
-            )
-        elif action == "write":
-            return json.dumps(process_registry.write_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
-        elif action == "submit":
-            return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
-        elif action == "close":
-            return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
+        result = process_registry.perform_authorized_action(
+            action,
+            session_id,
+            task_id=task_id or "",
+            session_key=session_key,
+            gateway_context_bound=gateway_context_bound,
+            data=str(args.get("data", "")),
+            timeout=args.get("timeout"),
+            offset=args.get("offset", 0),
+            limit=args.get("limit", 200),
+        )
+        return json.dumps(
+            _redact_process_result(result),
+            ensure_ascii=False,
+        )
     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
 
 

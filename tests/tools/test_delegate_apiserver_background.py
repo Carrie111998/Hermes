@@ -64,9 +64,42 @@ def _drain_one(timeout=5.0):
 
 
 def _fake_parent():
+    from gateway.api_execution_context import transport_semantic_digest
+
     parent = MagicMock()
     parent._delegate_depth = 0
     parent.session_id = "sess"
+    parent.platform = "api_server"
+    parent.ephemeral_system_prompt = None
+    parent._api_detached_execution_context = {
+        "schema": "hermes.api-detached-execution-context.v1",
+        "gateway_session_key": "memory:stable:customer-7",
+        "request_model": "openai/gpt-5",
+        "request_provider": "openai",
+        "model_options": {
+            "reasoning": {"enabled": True, "effort": "high"},
+            "service_tier": "priority",
+        },
+        "route_alias": "",
+        "route_model": "",
+        "route_provider": "",
+        "route_semantic_sha256": "",
+        "session_model": "",
+        "confirmed_runtime_lock": False,
+        "requested_runtime": {
+            "model": "openai/gpt-5",
+            "provider": "openai",
+        },
+        "route_source": "raw_request",
+        "effective_model": "openai/gpt-5",
+        "effective_provider": "openai",
+        "effective_transport_sha256": transport_semantic_digest(
+            model="openai/gpt-5",
+            provider="openai",
+            base_url="",
+            api_mode="",
+        ),
+    }
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
@@ -138,6 +171,37 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     # id, not the subagent-internal id the child build clobbered
     # HERMES_SESSION_ID with (see clobbering_build_child).
     assert evt["origin_session_id"] == "raw-sid-7"
+    assert evt["api_execution_context"] == (
+        _fake_parent()._api_detached_execution_context
+    )
+
+
+def test_apiserver_ephemeral_prompt_forces_sync_without_durable_row(monkeypatch):
+    """Ephemeral API instructions are never copied into the async ledger."""
+
+    dt = _patch_delegate(monkeypatch)
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-private",
+        session_key="raw-sid-private",
+        session_id="raw-sid-private",
+        async_delivery=False,
+    )
+    parent = _fake_parent()
+    parent.ephemeral_system_prompt = "private one-turn instruction"
+
+    out = dt.delegate_task(
+        goal="must remain private",
+        context="ctx",
+        background=True,
+        parent_agent=parent,
+    )
+
+    parsed = json.loads(out)
+    assert parsed.get("status") != "dispatched"
+    assert "SYNCHRONOUSLY" in parsed["note"]
+    assert "ephemeral system prompt" in parsed["note"]
+    assert process_registry.completion_queue.empty()
 
 
 # ---------------------------------------------------------------------------

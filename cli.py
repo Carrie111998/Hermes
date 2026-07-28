@@ -38,6 +38,7 @@ import tempfile
 import time
 import uuid
 import textwrap
+from dataclasses import dataclass
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
@@ -46,6 +47,25 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _InternalPendingTurn:
+    """One host-authored turn that must remain separate from user input.
+
+    ``runtime_effect`` is deliberately carried out-of-band: neither the
+    synthetic notification text nor any authored message can manufacture it.
+    The durable delivery event stays attached until the resulting turn has
+    returned through the normal persistence boundary.
+    """
+
+    text: str
+    runtime_effect: Optional[Dict[str, Any]]
+    delivery_event: Dict[str, Any]
+
+
+_INTERNAL_DELIVERY_RETRY_MIN_SECONDS = 0.25
+_INTERNAL_DELIVERY_RETRY_STORAGE_ERROR_SECONDS = 1.0
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -4118,6 +4138,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         # Initialize Rich console
         self.console = Console()
+        # The shared registry defers ambient durable-completion scans so a
+        # GatewayRunner can first inject its exact multi-profile inventory.
+        # Interactive CLI is single-profile and explicitly retains the legacy
+        # startup restore.
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.restore_async_delegation_completions(once=True)
+        except Exception:
+            logger.warning(
+                "Could not restore async delegation completions for CLI",
+                exc_info=True,
+            )
         self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
@@ -4486,6 +4519,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._internal_delivery_retry_lock = threading.Lock()
+        self._internal_delivery_retry_timers = {}
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -7799,21 +7834,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         old_session_id = self.session_id
-        _boundary_snapshot = None
-        if self.agent and self.conversation_history:
-            # Deliver the context-engine boundary synchronously and get back
-            # the history snapshot for the deferred provider extraction —
-            # queued below (after rotation) so /new never blocks on the
-            # LLM-bound extraction call.
-            _boundary_snapshot = self._launch_session_boundary_memory_flush(
-                list(self.conversation_history),
-                session_id=old_session_id,
+        old_workspace_authority = (
+            getattr(
+                self.agent,
+                "_workspace_lease_authority",
+                None,
             )
-            self._notify_session_boundary("on_session_finalize")
-        elif self.agent:
-            # First session or empty history — still finalize the old session
-            self._notify_session_boundary("on_session_finalize")
-
+            if self.agent
+            else None
+        ) or old_session_id
+        old_history = list(self.conversation_history)
         if self._session_db and old_session_id:
             # Flush any un-persisted messages from the current turn to the
             # old session *before* rotating.  /new can be called mid-turn
@@ -7828,33 +7858,135 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                 except Exception:
                     pass  # best-effort
+
+        new_session_start = datetime.now()
+        timestamp_str = new_session_start.strftime("%Y%m%d_%H%M%S")
+        short_uuid = uuid.uuid4().hex[:6]
+        new_session_id = f"{timestamp_str}_{short_uuid}"
+        new_reasoning_config = _parse_reasoning_config(
+            CLI_CONFIG["agent"].get("reasoning_effort", "")
+        )
+        new_service_tier = _parse_service_tier_config(
+            CLI_CONFIG["agent"].get("service_tier", "")
+        )
+
+        # Claim the fresh workspace identity before ending or clearing the old
+        # conversation. If either the claim or durable row creation fails,
+        # roll the agent back to the still-live old lineage and leave the CLI
+        # transcript untouched.
+        _transition_workspace = (
+            getattr(
+                self.agent,
+                "transition_workspace_lease_conversation",
+                None,
+            )
+            if self.agent
+            else None
+        )
+        try:
+            if callable(_transition_workspace):
+                _transition_workspace(
+                    new_session_id,
+                    new_session_id,
+                    retain_existing_aliases=False,
+                )
+            elif self.agent:
+                self.agent.session_id = new_session_id
+
+            if self._session_db:
+                if self.agent:
+                    self.agent._session_db_created = False
+                self._session_db.create_session(
+                    session_id=new_session_id,
+                    source=os.environ.get(
+                        "HERMES_SESSION_SOURCE",
+                        "cli",
+                    ),
+                    model=self.model,
+                    model_config={
+                        "max_iterations": self.max_turns,
+                        "reasoning_config": new_reasoning_config,
+                    },
+                )
+                if self.agent:
+                    self.agent._session_db_created = True
+        except Exception as exc:
+            if self.agent:
+                try:
+                    if callable(_transition_workspace):
+                        _transition_workspace(
+                            old_session_id,
+                            old_workspace_authority,
+                            retain_existing_aliases=False,
+                        )
+                    else:
+                        self.agent.session_id = old_session_id
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        "workspace_lease_new_session_rollback_failed"
+                    ) from rollback_exc
+            if not silent:
+                _cprint(f"  Failed to start a new session: {exc}")
+            return
+
+        # The new row is durable and the identity transition can no longer
+        # roll back.  Only now may the old authority's last-owner cleanup
+        # destroy its processes/client.
+        if self.agent:
+            _retire_workspace = getattr(
+                self.agent,
+                "retire_workspace_lease_authority",
+                None,
+            )
+            if callable(_retire_workspace):
+                try:
+                    _retire_workspace(str(old_workspace_authority))
+                except Exception:
+                    logger.warning(
+                        "Failed to retire previous workspace authority",
+                        exc_info=True,
+                    )
+
+        _boundary_snapshot = None
+        if self.agent and old_history:
+            # Deliver the context-engine boundary synchronously and get back
+            # the history snapshot for the deferred provider extraction —
+            # queued below (after rotation) so /new never blocks on the
+            # LLM-bound extraction call.
+            _boundary_snapshot = self._launch_session_boundary_memory_flush(
+                old_history,
+                session_id=old_session_id,
+            )
+            self._notify_session_boundary("on_session_finalize")
+        elif self.agent:
+            # First session or empty history — still finalize the old session
+            self._notify_session_boundary("on_session_finalize")
+
+        if self._session_db and old_session_id:
             try:
-                self._session_db.end_session(old_session_id, "new_session")
+                self._session_db.end_session(
+                    old_session_id,
+                    "new_session",
+                )
             except Exception:
                 pass
             # Don't let immediately-rotated empty sessions pile up in
             # /resume and `hermes sessions list` (gemini-cli#27770 port).
             self._discard_session_if_empty(old_session_id)
 
-        self.session_start = datetime.now()
-        timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-        short_uuid = uuid.uuid4().hex[:6]
-        self.session_id = f"{timestamp_str}_{short_uuid}"
+        self.session_start = new_session_start
+        self.session_id = new_session_id
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
+        self.reasoning_config = new_reasoning_config
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model --session, /fast, one-turn restores) do not carry
         # forward.  Re-derive model/provider and service tier from config.yaml
         # so a session-only switch never leaks into the next session (#48055,
         # #23131).
         self._pending_one_turn_model_restore = None
-        self.service_tier = _parse_service_tier_config(
-            CLI_CONFIG["agent"].get("service_tier", "")
-        )
+        self.service_tier = new_service_tier
         _model_config = CLI_CONFIG.get("model", {})
         _config_model = (
             (_model_config.get("default") or _model_config.get("model") or "")
@@ -7911,7 +8043,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _sync_process_session_id(self.session_id)
 
         if self.agent:
-            self.agent.session_id = self.session_id
+            if getattr(self.agent, "session_id", None) != self.session_id:
+                self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
             self.agent.reset_session_state()
@@ -7927,20 +8060,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.agent._invalidate_system_prompt()
 
             if self._session_db:
-                try:
-                    self.agent._session_db_created = False
-                    self._session_db.create_session(
-                        session_id=self.session_id,
-                        source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                        model=self.model,
-                        model_config={
-                            "max_iterations": self.max_turns,
-                            "reasoning_config": self.reasoning_config,
-                        },
-                    )
-                    self.agent._session_db_created = True
-                except Exception:
-                    pass
                 if title and self._session_db:
                     from hermes_state import SessionDB
                     try:
@@ -10179,6 +10298,301 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             resolved_key = event_key
         return str(resolved_key) == current_key
 
+    def _internal_delivery_retry_state(
+        self,
+    ) -> tuple[threading.Lock, dict[tuple[str, str], threading.Timer]]:
+        """Return this CLI instance's lazily initialized retry registry."""
+
+        lock = getattr(self, "_internal_delivery_retry_lock", None)
+        timers = getattr(self, "_internal_delivery_retry_timers", None)
+        if lock is None or timers is None:
+            # Normal construction initializes both eagerly.  The lazy path
+            # keeps lightweight ``HermesCLI.__new__`` tests and embedders safe.
+            lock = threading.Lock()
+            timers = {}
+            self._internal_delivery_retry_lock = lock
+            self._internal_delivery_retry_timers = timers
+        return lock, timers
+
+    @staticmethod
+    def _internal_delivery_retry_identity(
+        turn: _InternalPendingTurn,
+    ) -> Optional[tuple[str, str]]:
+        """Return a durable-store-scoped identity for one CLI retry carrier."""
+
+        event = turn.delivery_event
+        if event.get("type") != "async_delegation":
+            return None
+        delegation_id = str(event.get("delegation_id") or "")
+        if not delegation_id:
+            return None
+        from tools.async_delegation import (
+            event_has_delivery_store_stamp,
+            get_event_delivery_store,
+        )
+
+        store = get_event_delivery_store(event)
+        if event_has_delivery_store_stamp(event) and store is None:
+            # A present but unresolvable process-local capability is forged or
+            # stale.  It must not become a filesystem lookup or immortal timer.
+            return None
+        store_key = (
+            str(Path(store.hermes_home).expanduser().resolve())
+            if store is not None
+            else "legacy-ambient-store"
+        )
+        return store_key, delegation_id
+
+    def _schedule_internal_delivery_retry(
+        self,
+        turn: _InternalPendingTurn,
+        *,
+        minimum_seconds: float = _INTERNAL_DELIVERY_RETRY_MIN_SECONDS,
+        _delay_override: Optional[float] = None,
+    ) -> bool:
+        """Retain exactly one delayed carrier for a pending durable CLI turn.
+
+        The queue item is consumed before its durable claim is attempted.  A
+        foreign fresh lease or a locally released failed turn would therefore
+        lose the only process-local carrier without this scheduler.  Every
+        timer callback rechecks the authoritative event store before enqueue,
+        waits out renewed leases without hot-spinning, and deduplicates by
+        ``(store, delegation_id)``.
+        """
+
+        try:
+            identity = self._internal_delivery_retry_identity(turn)
+        except Exception:
+            logger.warning(
+                "Could not resolve CLI async-delivery retry identity",
+                exc_info=True,
+            )
+            return False
+        if identity is None:
+            return False
+
+        minimum = max(0.01, float(minimum_seconds))
+        if _delay_override is None:
+            try:
+                from tools.async_delegation import event_delivery_retry_delay
+
+                delay = event_delivery_retry_delay(
+                    turn.delivery_event,
+                    minimum_seconds=minimum,
+                )
+            except Exception:
+                # A transient SQLite failure is not evidence that the durable
+                # row is terminal.  The callback repeats the authoritative
+                # query before it can enqueue the turn.
+                logger.warning(
+                    "Could not inspect CLI async delegation %s retry state; "
+                    "scheduling a conservative recheck",
+                    identity[1],
+                    exc_info=True,
+                )
+                delay = max(
+                    minimum,
+                    _INTERNAL_DELIVERY_RETRY_STORAGE_ERROR_SECONDS,
+                )
+        else:
+            delay = max(minimum, float(_delay_override))
+        if delay is None:
+            return False
+
+        retry_lock, retry_timers = self._internal_delivery_retry_state()
+        timer: threading.Timer
+
+        def _retry() -> None:
+            with retry_lock:
+                if retry_timers.get(identity) is not timer:
+                    return
+                retry_timers.pop(identity, None)
+            if bool(getattr(self, "_should_exit", False)):
+                # The durable row remains pending for restart restoration.
+                return
+            try:
+                from tools.async_delegation import event_delivery_retry_delay
+
+                next_delay = event_delivery_retry_delay(
+                    turn.delivery_event,
+                    minimum_seconds=minimum,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not recheck CLI async delegation %s retry state; "
+                    "retaining its delayed carrier",
+                    identity[1],
+                    exc_info=True,
+                )
+                self._schedule_internal_delivery_retry(
+                    turn,
+                    minimum_seconds=minimum,
+                    _delay_override=max(
+                        minimum,
+                        _INTERNAL_DELIVERY_RETRY_STORAGE_ERROR_SECONDS,
+                    ),
+                )
+                return
+            if next_delay is None:
+                return
+            if next_delay > minimum + 0.001:
+                self._schedule_internal_delivery_retry(
+                    turn,
+                    minimum_seconds=minimum,
+                    _delay_override=next_delay,
+                )
+                return
+            # The timer may outlive a /new boundary.  Re-prove conversation
+            # ownership before bypassing the registry drain and putting the
+            # preserved internal turn directly back on this CLI's queue.
+            if not self._owns_process_notification(turn.delivery_event):
+                return
+            self._pending_input.put(turn)
+
+        delay_seconds = float(delay)
+        retry_deadline = time.monotonic() + delay_seconds
+        timer = threading.Timer(delay_seconds, _retry)
+        timer.daemon = True
+        timer._hermes_retry_deadline = retry_deadline
+        with retry_lock:
+            existing = retry_timers.get(identity)
+            if existing is not None:
+                existing_deadline = float(
+                    getattr(
+                        existing,
+                        "_hermes_retry_deadline",
+                        float("inf"),
+                    )
+                )
+                # Keep the earliest known recheck.  A released local claim can
+                # replace a long foreign-lease timer with a ready-state retry.
+                if existing_deadline <= retry_deadline + 0.001:
+                    return True
+            # Start before replacing the registry entry.  If Timer.start()
+            # fails, an older valid carrier remains registered and uncancelled.
+            try:
+                timer.start()
+            except Exception:
+                logger.warning(
+                    "Could not start CLI async delegation %s retry timer",
+                    identity[1],
+                    exc_info=True,
+                )
+                return False
+            if existing is not None:
+                existing.cancel()
+            retry_timers[identity] = timer
+        return True
+
+    def _settle_internal_delivery_turn(
+        self,
+        turn: _InternalPendingTurn,
+        claim: Optional[str],
+        *,
+        succeeded: bool,
+        stop_renewal=None,
+    ) -> bool:
+        """ACK a persisted CLI turn or release it while retaining a carrier."""
+
+        if stop_renewal is not None:
+            try:
+                stop_renewal()
+            except Exception:
+                logger.warning(
+                    "Could not stop CLI async-delivery claim renewal",
+                    exc_info=True,
+                )
+        if claim is None:
+            self._schedule_internal_delivery_retry(turn)
+            return False
+
+        settled = False
+        try:
+            if succeeded:
+                from tools.async_delegation import complete_event_delivery
+
+                settled = complete_event_delivery(
+                    turn.delivery_event,
+                    claim,
+                )
+            else:
+                from tools.async_delegation import release_event_delivery
+
+                settled = release_event_delivery(
+                    turn.delivery_event,
+                    claim,
+                )
+        except Exception:
+            logger.warning(
+                "Could not %s CLI async delegation %s delivery; "
+                "retaining retry carrier",
+                "acknowledge" if succeeded else "release",
+                str(turn.delivery_event.get("delegation_id") or ""),
+                exc_info=True,
+            )
+        if not succeeded or not settled:
+            self._schedule_internal_delivery_retry(turn)
+        return settled
+
+    def _claim_internal_delivery_turn(
+        self,
+        turn: _InternalPendingTurn,
+        consumer: str,
+    ) -> Optional[tuple[str, Any]]:
+        """Claim one dequeued turn or preserve it behind a delayed carrier."""
+
+        from tools.async_delegation import (
+            begin_event_delivery_renewal,
+            claim_event_delivery,
+        )
+
+        try:
+            claim = claim_event_delivery(
+                turn.delivery_event,
+                consumer,
+            )
+        except Exception:
+            logger.warning(
+                "Could not claim CLI async delegation %s; "
+                "retaining retry carrier",
+                str(turn.delivery_event.get("delegation_id") or ""),
+                exc_info=True,
+            )
+            self._schedule_internal_delivery_retry(turn)
+            return None
+        if claim is None:
+            self._schedule_internal_delivery_retry(turn)
+            return None
+        try:
+            stop_renewal = begin_event_delivery_renewal(
+                turn.delivery_event,
+                claim,
+            )
+        except Exception:
+            logger.warning(
+                "Could not begin CLI async delegation %s claim renewal; "
+                "releasing for retry",
+                str(turn.delivery_event.get("delegation_id") or ""),
+                exc_info=True,
+            )
+            self._settle_internal_delivery_turn(
+                turn,
+                claim,
+                succeeded=False,
+            )
+            return None
+        return claim, stop_renewal
+
+    def _cancel_internal_delivery_retry_timers(self) -> None:
+        """Cancel local timers; authoritative pending rows survive restart."""
+
+        retry_lock, retry_timers = self._internal_delivery_retry_state()
+        with retry_lock:
+            timers = list(retry_timers.values())
+            retry_timers.clear()
+        for timer in timers:
+            timer.cancel()
+
     def _drain_process_notifications(self, consumer: str) -> None:
         """Queue background notifications owned by this visible CLI session.
 
@@ -10188,9 +10602,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         delivered a completion that belongs to this one.
         """
         from tools.process_registry import process_registry
+        from agent.runtime_effects import (
+            RuntimeEffectError,
+            normalize_optional_runtime_effect,
+        )
         from tools.async_delegation import (
             claim_event_delivery,
-            complete_event_delivery,
+            drop_event_delivery,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -10198,11 +10616,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_key=session_key,
             owns_event=self._owns_process_notification,
         ):
-            claim = claim_event_delivery(event, consumer)
-            if claim is None:
+            try:
+                runtime_effect = normalize_optional_runtime_effect(
+                    event.get("runtime_effect")
+                )
+            except RuntimeEffectError:
+                # A malformed host envelope is never converted into a model
+                # turn.  Terminally drop a durable event so restart recovery
+                # cannot replay an untrusted effect forever.
+                claim = claim_event_delivery(event, f"{consumer}-invalid")
+                if (
+                    claim
+                    and event.get("type") == "async_delegation"
+                    and event.get("delegation_id")
+                ):
+                    drop_event_delivery(event, claim)
+                logger.error(
+                    "Discarded malformed runtime effect on CLI notification",
+                    exc_info=True,
+                )
                 continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            self._pending_input.put(
+                _InternalPendingTurn(
+                    text=synthetic_message,
+                    runtime_effect=runtime_effect,
+                    delivery_event=dict(event),
+                )
+            )
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -12741,7 +13181,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        *,
+        runtime_effect: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -12772,6 +13218,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._last_goal_turn_id = ""
         self._last_goal_generation_id = ""
         self._last_goal_turn_failed = False
+        self._last_chat_turn_persisted = False
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -13067,7 +13514,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        runtime_effect=runtime_effect,
                     )
+                    # ``run_conversation`` returns only after its normal turn
+                    # finalization/persistence boundary.  Keep this separate
+                    # from response truthiness: an empty or failed model answer
+                    # can still be a durably recorded turn.
+                    self._last_chat_turn_persisted = True
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -13498,12 +13951,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Notify when iteration budget was hit
             if result and not result.get("completed") and not result.get("interrupted"):
-                _api_calls = result.get("api_calls", 0)
-                if _api_calls >= getattr(self.agent, "max_iterations", 500):
-                    _max_iter = getattr(self.agent, "max_iterations", 500)
+                _turn_exit_reason = str(result.get("turn_exit_reason") or "")
+                if (
+                    result.get("error") == "iteration_budget_exhausted"
+                    or _turn_exit_reason.startswith("max_iterations_reached(")
+                    or _turn_exit_reason
+                    == "budget_exhausted_after_grace_tool_request"
+                ):
+                    _slice_used = result.get(
+                        "iteration_budget_used",
+                        getattr(getattr(self.agent, "iteration_budget", None), "used", 0),
+                    )
+                    _slice_max = result.get(
+                        "iteration_budget_max",
+                        getattr(
+                            getattr(self.agent, "iteration_budget", None),
+                            "max_total",
+                            getattr(self.agent, "max_iterations", 500),
+                        ),
+                    )
                     _cprint(
                         f"\n{_DIM}⚠ Iteration budget reached "
-                        f"({_api_calls}/{_max_iter}) — "
+                        f"({_slice_used}/{_slice_max}) — "
                         f"response may be incomplete{_RST}"
                     )
 
@@ -16169,6 +16638,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Background thread to process inputs and run agent
         def process_loop():
             while not self._should_exit:
+                _delivery_turn = None
+                _delivery_claim = None
+                _stop_delivery_renewal = None
+
+                def _settle_internal_delivery(succeeded: bool) -> None:
+                    nonlocal _delivery_claim, _stop_delivery_renewal
+                    if _delivery_turn is None:
+                        return
+                    # Clear the loop-owned handles before settlement so an
+                    # exception later in the outer turn handler cannot settle
+                    # the same claim twice.
+                    claim = _delivery_claim
+                    stop_renewal = _stop_delivery_renewal
+                    _delivery_claim = None
+                    _stop_delivery_renewal = None
+                    self._settle_internal_delivery_turn(
+                        _delivery_turn,
+                        claim,
+                        succeeded=succeeded,
+                        stop_renewal=stop_renewal,
+                    )
+
                 try:
                     # Check for pending input with timeout
                     try:
@@ -16188,13 +16679,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if not user_input:
                         continue
 
+                    _internal_turn = (
+                        user_input
+                        if isinstance(user_input, _InternalPendingTurn)
+                        else None
+                    )
+                    _runtime_effect = None
+                    if _internal_turn is not None:
+                        _delivery_turn = _internal_turn
+                        delivery_attempt = (
+                            self._claim_internal_delivery_turn(
+                                _delivery_turn,
+                                "cli-turn",
+                            )
+                        )
+                        if delivery_attempt is None:
+                            continue
+                        (
+                            _delivery_claim,
+                            _stop_delivery_renewal,
+                        ) = delivery_attempt
+                        _runtime_effect = _internal_turn.runtime_effect
+                        user_input = _internal_turn.text
+
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
 
                     # Unpack image payload: (text, [Path, ...]) or plain str
                     submit_images = []
-                    if isinstance(user_input, tuple):
+                    if _internal_turn is None and isinstance(user_input, tuple):
                         user_input, submit_images = user_input
 
                     if isinstance(user_input, str):
@@ -16205,7 +16719,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.
-                    _file_drop = _detect_file_drop(user_input) if isinstance(user_input, str) else None
+                    _file_drop = (
+                        _detect_file_drop(user_input)
+                        if _internal_turn is None and isinstance(user_input, str)
+                        else None
+                    )
                     if _file_drop:
                         _drop_path = _file_drop["path"]
                         _remainder = _file_drop["remainder"]
@@ -16225,13 +16743,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # the digit isn't sent to the agent as a message.
                     if (
                         not _file_drop
+                        and _internal_turn is None
                         and self._pending_resume_sessions
                         and isinstance(user_input, str)
                         and self._consume_pending_resume_selection(user_input)
                     ):
                         continue
 
-                    if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
+                    if (
+                        _internal_turn is None
+                        and not _file_drop
+                        and isinstance(user_input, str)
+                        and _looks_like_slash_command(user_input)
+                    ):
                         _cprint(f"\n⚙️  {user_input}")
                         try:
                             if not self.process_command(user_input):
@@ -16260,7 +16784,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     
                     # Expand paste references back to full content
                     _paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
-                    paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
+                    paste_refs = (
+                        list(_paste_ref_re.finditer(user_input))
+                        if _internal_turn is None
+                        and isinstance(user_input, str)
+                        else []
+                    )
                     if paste_refs:
                         user_input = self._expand_paste_references(user_input)
                     print()
@@ -16280,8 +16809,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            runtime_effect=_runtime_effect,
+                        )
                     finally:
+                        _settle_internal_delivery(
+                            bool(
+                                getattr(
+                                    self,
+                                    "_last_chat_turn_persisted",
+                                    False,
+                                )
+                            )
+                        )
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
@@ -16356,6 +16898,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             pass  # Non-fatal — don't break the main loop
 
                 except Exception as e:
+                    _settle_internal_delivery(False)
                     logger.warning("process_loop unhandled error (msg may be lost): %s", e)
         
         # Start processing thread
@@ -16583,6 +17126,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 raise
         finally:
             self._should_exit = True
+            self._cancel_internal_delivery_retry_timers()
             self._pet_stop_anim()
             # Immediate feedback: prompt_toolkit has just torn down the input
             # box + status bar, so without a line here the terminal sits

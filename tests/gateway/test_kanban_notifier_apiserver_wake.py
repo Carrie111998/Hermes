@@ -33,13 +33,22 @@ class SoftFailAdapter:
 class ApiServerLikeAdapter:
     supports_async_delivery = False
 
-    def __init__(self):
+    def __init__(self, profile_home):
+        from gateway.api_request_scope import capture_api_profile_identity
+
+        profile_home.mkdir(parents=True, exist_ok=True)
+        self._api_profile_inventory = (
+            capture_api_profile_identity("default", profile_home),
+        )
         self._host = "127.0.0.1"
         self._port = 8642
         self._api_key = "k"
         self._model_name = "hermes"
         self.handle_message_calls = []
         self.send_calls = 0
+
+    def _freeze_api_profile_inventory(self):
+        return self._api_profile_inventory
 
     async def send(self, chat_id, text, metadata=None):
         self.send_calls += 1
@@ -50,6 +59,22 @@ class ApiServerLikeAdapter:
 
     async def handle_message(self, event):
         self.handle_message_calls.append(event)
+
+    async def _ensure_session_db_async(self):
+        class _LiveSessionDB:
+            @staticmethod
+            def get_session(session_id):
+                return {
+                    "id": session_id,
+                    "ended_at": None,
+                    "end_reason": None,
+                }
+
+            @staticmethod
+            def get_compression_tip(session_id):
+                return session_id
+
+        return _LiveSessionDB()
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
@@ -136,14 +161,14 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kwargs):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
 
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
 
-    adapter = ApiServerLikeAdapter()
+    adapter = ApiServerLikeAdapter(tmp_path / "profile")
     runner = _make_runner({Platform.API_SERVER: adapter})
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
@@ -170,14 +195,14 @@ def test_apiserver_failed_self_post_rewinds_cursor(tmp_path, monkeypatch):
         "api_server", "raw-sid-999", session_id="raw-sid-999",
     )
 
-    async def failing_self_post(adapter, *, text, session_id):
+    async def failing_self_post(adapter, *, text, session_id, **_kwargs):
         raise RuntimeError("self-post exhausted retries")
 
     import gateway.wake as wake_mod
 
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", failing_self_post)
 
-    adapter = ApiServerLikeAdapter()
+    adapter = ApiServerLikeAdapter(tmp_path / "profile")
     runner = _make_runner({Platform.API_SERVER: adapter})
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
@@ -201,7 +226,7 @@ def test_apiserver_self_post_succeeds_after_earlier_failure(tmp_path, monkeypatc
 
     calls = {"n": 0}
 
-    async def flaky_self_post(adapter, *, text, session_id):
+    async def flaky_self_post(adapter, *, text, session_id, **_kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("transient outage")
@@ -210,7 +235,7 @@ def test_apiserver_self_post_succeeds_after_earlier_failure(tmp_path, monkeypatc
 
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", flaky_self_post)
 
-    adapter = ApiServerLikeAdapter()
+    adapter = ApiServerLikeAdapter(tmp_path / "profile")
     runner = _make_runner({Platform.API_SERVER: adapter})
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert calls["n"] == 1

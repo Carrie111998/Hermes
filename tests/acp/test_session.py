@@ -727,6 +727,35 @@ class TestPersistence:
         assert restored.agent.provider == "anthropic"
         assert restored.agent.base_url == "https://anthropic.example/v1"
 
+    def test_restore_refuses_poisoned_legacy_runtime_metadata(self, tmp_path):
+        """A pre-guard DB row cannot inject a credential into ACP replay."""
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(
+            session_id="poisoned-acp-session",
+            source="acp",
+            model="safe-model",
+            model_config={"cwd": "/work"},
+        )
+        secret = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
+        db._conn.execute(
+            "UPDATE sessions SET model_config = ? WHERE id = ?",
+            (
+                json.dumps({"cwd": "/work", "api_key": secret}),
+                "poisoned-acp-session",
+            ),
+        )
+        db._conn.commit()
+        created = []
+        manager = SessionManager(
+            db=db,
+            agent_factory=lambda: created.append(True),
+        )
+
+        restored = manager.get_session("poisoned-acp-session")
+
+        assert restored is None
+        assert created == []
+
     def test_acp_agents_route_human_output_to_stderr(self, tmp_path, monkeypatch):
         """ACP agents must keep stdout clean for JSON-RPC stdio transport."""
 

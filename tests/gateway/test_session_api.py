@@ -11,6 +11,9 @@ from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
 
 
+SECRET_SENTINEL = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
+
+
 @pytest.fixture
 def session_db(tmp_path):
     db = SessionDB(tmp_path / "state.db")
@@ -38,6 +41,8 @@ def auth_adapter(session_db):
 
 def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
@@ -49,6 +54,130 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
+
+
+@pytest.mark.asyncio
+async def test_all_public_session_id_ingress_uses_shared_validation(
+    auth_adapter,
+    session_db,
+):
+    app = _create_session_app(auth_adapter)
+    too_long = "s" * (auth_adapter._MAX_SESSION_HEADER_LEN + 1)
+    async with TestClient(TestServer(app)) as cli:
+        for body in (
+            {"id": ["not", "a", "string"]},
+            {"session_id": "../escape"},
+            {"id": too_long},
+            {"id": None},
+            {"id": " whitespace-alias "},
+        ):
+            response = await cli.post(
+                "/api/sessions",
+                headers={"Authorization": "Bearer sk-test"},
+                json=body,
+            )
+            assert response.status == 400
+
+        session_db.create_session("fork-source", "api_server")
+        for body in (
+            {"id": {"not": "a string"}},
+            {"session_id": "..\\escape"},
+            {"id": too_long},
+            {"id": " fork-alias "},
+        ):
+            response = await cli.post(
+                "/api/sessions/fork-source/fork",
+                headers={"Authorization": "Bearer sk-test"},
+                json=body,
+            )
+            assert response.status == 400
+
+        for invalid_id in (7, "../escape", too_long, None, " run-alias "):
+            response = await cli.post(
+                "/v1/runs",
+                headers={"Authorization": "Bearer sk-test"},
+                json={"input": "do not run", "session_id": invalid_id},
+            )
+            assert response.status == 400
+
+        response = await cli.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer sk-test",
+                "X-Hermes-Session-Id": "../escape",
+            },
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "do not run"}],
+            },
+        )
+        assert response.status == 400
+
+        response = await cli.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer sk-test",
+                "X-Hermes-Session-Id": " header-alias ",
+            },
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "do not run"}],
+            },
+        )
+        assert response.status == 400
+
+        response = await cli.get(
+            f"/api/sessions/{too_long}",
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert response.status == 400
+
+
+@pytest.mark.asyncio
+async def test_url_encoded_whitespace_cannot_alias_existing_session(
+    auth_adapter,
+    session_db,
+):
+    """Every path consumer rejects the same noncanonical decoded ID."""
+
+    session_db.create_session("canonical-session", "api_server")
+    app = _create_session_app(auth_adapter)
+    _register_session_model_route(app, auth_adapter)
+    encoded_alias = "%20canonical-session%20"
+    headers = {"Authorization": "Bearer sk-test"}
+    async with TestClient(TestServer(app)) as cli:
+        with patch.object(
+            auth_adapter,
+            "_run_agent",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            get_response = await cli.get(
+                f"/api/sessions/{encoded_alias}",
+                headers=headers,
+            )
+            chat_response = await cli.post(
+                f"/api/sessions/{encoded_alias}/chat",
+                headers=headers,
+                json={"message": "must not run"},
+            )
+            lock_response = await cli.post(
+                f"/api/sessions/{encoded_alias}/model",
+                headers=headers,
+                json={"model": "hermes-agent"},
+            )
+            delete_response = await cli.delete(
+                f"/api/sessions/{encoded_alias}",
+                headers=headers,
+            )
+
+    assert [
+        get_response.status,
+        chat_response.status,
+        lock_response.status,
+        delete_response.status,
+    ] == [400, 400, 400, 400]
+    mock_run.assert_not_awaited()
+    assert session_db.get_session("canonical-session") is not None
 
 
 @pytest.mark.asyncio
@@ -117,14 +246,21 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
     assert usage["output_tokens"] == 0
     assert usage["total_tokens"] == 0
     assert "runtime" not in usage
+    request_authority = adapter._api_request_scope("request")
     assert observed == {
-        "task_id": "request-session",
+        "task_id": request_authority.bind(
+            "task",
+            "request-session",
+        ).internal_key,
         "context_session_id": "request-session",
         "context_platform": "api_server",
         # Dangerous-action authority is exact-conversation scoped.  The
         # caller-provided gateway key remains the stable memory key, but it
         # must not become the approval namespace for a rotated conversation.
-        "context_session_key": "request-session",
+        "context_session_key": request_authority.bind(
+            "capability-session",
+            "request-session",
+        ).internal_key,
         "child_session_id": "request-session",
     }
 
@@ -258,6 +394,76 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
         {"role": "user", "content": "earlier"},
         {"role": "assistant", "content": "prior answer"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_invalid_agent_session_id_without_aliasing(
+    auth_adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "chat-invalid-result-session",
+        "api_server",
+    )
+    mock_run = AsyncMock(
+        return_value=(
+            {
+                "final_response": "must not be returned",
+                "session_id": " child-alias ",
+            },
+            {"total_tokens": 1},
+        )
+    )
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "next"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            payload = await resp.json()
+
+    assert resp.status == 500
+    assert payload["error"]["code"] == "invalid_internal_session_id"
+    assert "X-Hermes-Session-Id" not in resp.headers
+    assert "child-alias" not in str(payload)
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_reports_invalid_agent_session_id_as_failed(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "chat-stream-invalid-result-session",
+        "api_server",
+    )
+
+    async def fake_run(**kwargs):
+        kwargs["stream_delta_callback"]("partial")
+        return (
+            {
+                "final_response": "partial",
+                "session_id": "../stream-child-alias",
+            },
+            {"total_tokens": 1},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "next"},
+            )
+            body = await resp.text()
+
+    assert resp.status == 200
+    assert "event: run.failed" in body
+    assert '"error_code": "invalid_internal_session_id"' in body
+    assert '"turn_exit_reason": "invalid_internal_session_id"' in body
+    assert "../stream-child-alias" not in body
 
 
 @pytest.mark.asyncio
@@ -552,9 +758,17 @@ async def test_run_agent_returns_controlled_response_on_provider_auth_failure(ad
 
     assert result == {
         "final_response": "⚠️ Provider authentication failed: No credentials found for provider 'nous' — run `hermes auth add nous`",
+        "error": "⚠️ Provider authentication failed: No credentials found for provider 'nous' — run `hermes auth add nous`",
         "messages": [],
         "api_calls": 0,
         "tools": [],
+        "status": "failed",
+        "completed": False,
+        "partial": False,
+        "interrupted": False,
+        "failed": True,
+        "incomplete": True,
+        "turn_exit_reason": "provider_auth_resolution_failed",
     }
     assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -626,6 +840,53 @@ async def test_session_chat_surfaces_controlled_response_on_provider_auth_failur
         payload = await resp.json()
 
     assert payload["message"]["content"] == "⚠️ Provider authentication failed: Auth failed: token expired"
+    assert payload["outcome"] == {
+        "status": "failed",
+        "completed": False,
+        "partial": False,
+        "interrupted": False,
+        "failed": True,
+        "incomplete": True,
+        "turn_exit_reason": "provider_auth_resolution_failed",
+        "terminal_outcome_contradictory": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_chat_redacts_provider_auth_secret_from_response_and_logs(
+    auth_adapter,
+    session_db,
+    monkeypatch,
+    caplog,
+):
+    session_id = session_db.create_session(
+        "auth-secret-fail-session",
+        "api_server",
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError(f"Auth rejected credential {SECRET_SENTINEL}")
+        ),
+    )
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={"message": "hi"},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert SECRET_SENTINEL not in str(payload)
+    assert all(
+        SECRET_SENTINEL not in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def _register_session_model_route(app, adapter):
     app.router.add_post("/api/sessions/{session_id}/model", adapter._handle_session_model_lock)
 
@@ -794,6 +1055,11 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
                 "source": "hermes_browser",
                 "provider": "nous",
                 "model": "x-ai/grok-4.5",
+                "model_options": {
+                    "reasoning": {"enabled": True, "effort": "high"},
+                    "service_tier": "priority",
+                    "credentials": {"api_key": SECRET_SENTINEL},
+                },
                 "require_model_lock": True,
                 "title": "Browser lock",
                 "system_prompt": "browser prompt",
@@ -808,12 +1074,53 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
     assert row["source"] == "hermes_browser"
     assert row["model"] == "x-ai/grok-4.5"
     import json as _json
-    model_config = row.get("model_config")
+    raw_model_config = row.get("model_config")
+    assert SECRET_SENTINEL not in str(raw_model_config)
+    model_config = raw_model_config
     if isinstance(model_config, str):
         model_config = _json.loads(model_config)
     assert model_config["browser_model_lock"]["provider"] == "nous"
     assert model_config["browser_model_lock"]["model"] == "x-ai/grok-4.5"
+    assert model_config["browser_model_lock"]["model_options"] == {
+        "reasoning": {"enabled": True, "effort": "high"},
+        "service_tier": "priority",
+    }
     assert model_config["browser_model_lock"]["confirmed"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_fields",
+    [
+        {"model": SECRET_SENTINEL, "provider": "nous"},
+        {"model": "x-ai/grok-4.5", "provider": SECRET_SENTINEL},
+        {
+            "model": "x-ai/grok-4.5",
+            "provider": "nous",
+            "model_options": {"service_tier": SECRET_SENTINEL},
+        },
+    ],
+)
+async def test_create_session_rejects_secret_shaped_runtime_identifiers(
+    adapter,
+    session_db,
+    unsafe_fields,
+):
+    app = _create_session_app(adapter)
+    body = {
+        "id": "unsafe-create-runtime",
+        "require_model_lock": True,
+        **unsafe_fields,
+    }
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions", json=body)
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_runtime_request"
+    assert SECRET_SENTINEL not in str(payload)
+    assert session_db.get_session("unsafe-create-runtime") is None
 
 
 @pytest.mark.asyncio
@@ -834,7 +1141,11 @@ async def test_session_model_lock_endpoint_persists_and_invalidates_prompt(adapt
                 json={
                     "provider": "nous",
                     "model": "x-ai/grok-4.5",
-                    "model_options": {"reasoning": {"enabled": True, "effort": "high"}},
+                    "model_options": {
+                        "reasoning": {"enabled": True, "effort": "high"},
+                        "service_tier": "priority",
+                        "credentials": {"api_key": SECRET_SENTINEL},
+                    },
                     "require_model_lock": True,
                 },
             )
@@ -849,11 +1160,167 @@ async def test_session_model_lock_endpoint_persists_and_invalidates_prompt(adapt
     assert row["model"] == "x-ai/grok-4.5"
     assert row["system_prompt"] is None
     import json as _json
-    model_config = row.get("model_config")
+    raw_model_config = row.get("model_config")
+    assert SECRET_SENTINEL not in str(raw_model_config)
+    model_config = raw_model_config
     if isinstance(model_config, str):
         model_config = _json.loads(model_config)
     assert model_config["_branched_from"] == "parent-session"
     assert model_config["browser_model_lock"]["provider"] == "nous"
+    assert model_config["browser_model_lock"]["model_options"] == {
+        "reasoning": {"enabled": True, "effort": "high"},
+        "service_tier": "priority",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_fields",
+    [
+        {"model": SECRET_SENTINEL, "provider": "nous"},
+        {"model": "x-ai/grok-4.5", "provider": SECRET_SENTINEL},
+        {
+            "model": "x-ai/grok-4.5",
+            "provider": "nous",
+            "model_options": {"service_tier": SECRET_SENTINEL},
+        },
+    ],
+)
+async def test_session_model_lock_rejects_secret_shaped_runtime_identifiers(
+    adapter,
+    session_db,
+    unsafe_fields,
+):
+    session_id = session_db.create_session(
+        "unsafe-lock-runtime",
+        "api_server",
+        model="safe/original-model",
+    )
+    app = _create_session_app(adapter)
+    _register_session_model_route(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/model",
+            json={
+                "require_model_lock": True,
+                **unsafe_fields,
+            },
+        )
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_runtime_request"
+    assert SECRET_SENTINEL not in str(payload)
+    row = session_db.get_session(session_id)
+    assert row["model"] == "safe/original-model"
+    assert SECRET_SENTINEL not in str(row)
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_rejects_secret_shaped_runtime_tier_before_agent(
+    adapter,
+):
+    app = _create_session_app(adapter)
+    with patch.object(
+        adapter,
+        "_run_agent",
+        new_callable=AsyncMock,
+    ) as mock_run:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "model_options": {
+                        "service_tier": SECRET_SENTINEL,
+                    },
+                },
+            )
+            payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_runtime_request"
+    assert SECRET_SENTINEL not in str(payload)
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/api/sessions/poisoned-runtime/chat",
+        "/api/sessions/poisoned-runtime/chat/stream",
+    ],
+)
+async def test_session_chat_refuses_poisoned_legacy_model_before_agent(
+    adapter,
+    session_db,
+    endpoint,
+):
+    """Directly-written legacy rows still pass through the runtime guard."""
+    session_db.create_session(
+        "poisoned-runtime",
+        "api_server",
+        model="safe-model",
+    )
+    session_db._conn.execute(
+        "UPDATE sessions SET model = ? WHERE id = ?",
+        (SECRET_SENTINEL, "poisoned-runtime"),
+    )
+    session_db._conn.commit()
+    app = _create_session_app(adapter)
+
+    with patch.object(
+        adapter,
+        "_run_agent",
+        new_callable=AsyncMock,
+    ) as mock_run:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(endpoint, json={"message": "do not run"})
+            payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_runtime_request"
+    assert SECRET_SENTINEL not in str(payload)
+    mock_run.assert_not_awaited()
+
+
+def test_session_db_runtime_lock_defensively_normalizes_model_options(
+    session_db,
+):
+    session_id = session_db.create_session(
+        "direct-runtime-lock-session",
+        "api_server",
+        model_config={"_branched_from": "parent-session"},
+    )
+
+    session_db.update_session_runtime_lock(
+        session_id,
+        model="x-ai/grok-4.5",
+        provider="nous",
+        model_options={
+            "reasoning": {"enabled": True, "effort": "high"},
+            "service_tier": "priority",
+            "credentials": {"api_key": SECRET_SENTINEL},
+        },
+        route_source="raw_request",
+        confirmed=True,
+    )
+
+    row = session_db.get_session(session_id)
+    raw_model_config = row.get("model_config")
+    assert SECRET_SENTINEL not in str(raw_model_config)
+    import json as _json
+
+    model_config = raw_model_config
+    if isinstance(model_config, str):
+        model_config = _json.loads(model_config)
+    assert model_config["_branched_from"] == "parent-session"
+    assert model_config["browser_model_lock"]["model_options"] == {
+        "reasoning": {"enabled": True, "effort": "high"},
+        "service_tier": "priority",
+    }
 
 
 @pytest.mark.asyncio

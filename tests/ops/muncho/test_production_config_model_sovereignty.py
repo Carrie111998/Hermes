@@ -115,6 +115,13 @@ def test_plan_is_read_only_and_binds_exact_target(tmp_path, monkeypatch):
     assert plan["after_sha256"] != plan["before_sha256"]
     assert plan["service_restart_performed"] is False
     assert plan["mutations"] == list(module.MUTATIONS)
+    assert "agent.verify_on_stop=true" in plan["mutations"]
+    assert "agent.verification_ledger_enabled=true" in plan["mutations"]
+    assert "agent.gateway_notify_interval=180" in plan["mutations"]
+    assert (
+        "display.platforms.discord=final_answer_first_low_noise"
+        in plan["mutations"]
+    )
 
 
 def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
@@ -135,6 +142,7 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
     assert receipt["ok"] is True
     assert retry_receipt == receipt
     assert receipt["after_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert receipt["mutations"] == list(module.MUTATIONS)
     assert Path(receipt["backup_path"]).read_bytes() == before
     effective = yaml.safe_load(path.read_text())
     assert effective["agent"]["adaptive_reasoning"] == {
@@ -143,8 +151,9 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
     }
     assert effective["agent"]["background_review_enabled"] is False
     assert effective["agent"]["tool_use_enforcement"] is True
-    assert effective["agent"]["verify_on_stop"] is False
-    assert effective["agent"]["verification_ledger_enabled"] is False
+    assert effective["agent"]["verify_on_stop"] is True
+    assert effective["agent"]["verification_ledger_enabled"] is True
+    assert effective["agent"]["gateway_notify_interval"] == 180
     assert effective["agent"]["task_completion_guidance"] is True
     assert effective["agent"]["parallel_tool_call_guidance"] is True
     assert "gpt-5.5" not in effective["agent"]["environment_hint"].casefold()
@@ -191,6 +200,15 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
     }
     assert effective["goals"] == {"max_turns": 0}
     assert effective["command_allowlist"] == []
+    assert effective["display"]["platforms"]["discord"] == {
+        "tool_progress": "off",
+        "interim_assistant_messages": False,
+        "thinking_progress": False,
+        "show_reasoning": False,
+        "streaming": False,
+        "long_running_notifications": True,
+        "busy_ack_detail": False,
+    }
 
     rollback = module.rollback_plan(
         expected_before_sha256=before_sha,
@@ -253,6 +271,71 @@ def test_plan_rejects_partial_or_already_applied_source(tmp_path, monkeypatch):
     )
 
     with pytest.raises(module.ConfigGateError, match="adaptive_source_drifted"):
+        module.build_plan(
+            expected_before_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
+        )
+
+
+def test_target_pins_discord_policy_and_preserves_other_display_preferences():
+    module = _load()
+    source = yaml.safe_load(_config())
+    source["agent"]["gateway_notify_interval"] = 30
+    source["display"] = {
+        "language": "bg",
+        "platforms": {
+            "discord": {
+                "tool_progress": "all",
+                "tool_preview_length": 17,
+            },
+            "telegram": {"tool_progress": "new"},
+        },
+    }
+
+    effective = module._target_mapping(source)
+
+    assert effective["agent"]["gateway_notify_interval"] == 180
+    assert effective["display"]["language"] == "bg"
+    assert effective["display"]["platforms"]["telegram"] == {
+        "tool_progress": "new"
+    }
+    assert effective["display"]["platforms"]["discord"] == {
+        "tool_progress": "off",
+        "tool_preview_length": 17,
+        "interim_assistant_messages": False,
+        "thinking_progress": False,
+        "show_reasoning": False,
+        "streaming": False,
+        "long_running_notifications": True,
+        "busy_ack_detail": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("line", "code"),
+    [
+        (
+            b"  verify_on_stop: false\n",
+            "verify_on_stop_source_drifted",
+        ),
+        (
+            b"  verification_ledger_enabled: false\n",
+            "verification_ledger_source_drifted",
+        ),
+    ],
+)
+def test_plan_rejects_unreviewed_proof_gate_source_state(
+    tmp_path, monkeypatch, line, code
+):
+    module, path = _prepare(tmp_path, monkeypatch)
+    raw = path.read_bytes()
+    path.write_bytes(
+        raw.replace(
+            b"  reasoning_effort: high\n",
+            b"  reasoning_effort: high\n" + line,
+        )
+    )
+
+    with pytest.raises(module.ConfigGateError, match=code):
         module.build_plan(
             expected_before_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
         )

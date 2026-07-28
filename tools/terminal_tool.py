@@ -43,7 +43,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Sequence
 
 from utils import env_var_enabled
 
@@ -989,6 +989,10 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
+_workspace_lease_authorities: Dict[str, str] = {}
+_workspace_lease_authority_owners: Dict[str, set[str]] = {}
+_workspace_lease_authorities_lock = threading.RLock()
+_LEGACY_WORKSPACE_LEASE_OWNER = "__legacy_workspace_lease_owner__"
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
@@ -1203,10 +1207,11 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     session to spin up its own container.  Only overrides containing
     backend-specific image keys or ``env_type`` trigger isolation.
     """
-    if (os.getenv("TERMINAL_ENV", "local").strip().lower() or "local") == "isolated_worker":
+    if isolated_worker_backend_selected():
         if not isinstance(task_id, str) or not task_id or task_id == "default":
             raise ValueError("isolated_worker_requires_exact_session_id")
-        return task_id
+        with _workspace_lease_authorities_lock:
+            return _workspace_lease_authorities.get(task_id, task_id)
 
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
@@ -1217,6 +1222,172 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         if set(overrides.keys()) & _ISOLATION_KEYS:
             return task_id
     return "default"
+
+
+def register_workspace_lease_authority(
+    runtime_task_id: str,
+    workspace_lease_authority: str,
+    *,
+    owner_id: Optional[str] = None,
+) -> None:
+    """Bind a runtime-owned child/task id to its root isolated-worker lease.
+
+    This is deliberately not a model tool or argument.  Delegation/session
+    runtimes call it when they create a child that shares the parent's
+    workspace; terminal and file tools then resolve both identities to one
+    authoritative lease.
+    """
+
+    register_workspace_lease_authorities(
+        (runtime_task_id,),
+        workspace_lease_authority,
+        owner_id=owner_id,
+    )
+
+
+def register_workspace_lease_authorities(
+    runtime_task_ids: Sequence[str],
+    workspace_lease_authority: str,
+    *,
+    owner_id: Optional[str] = None,
+) -> tuple[str, ...]:
+    """Atomically claim runtime identities for one root authority.
+
+    Claims are idempotent per opaque runtime owner. Multiple agents may share
+    the same alias and authority; one owner's release cannot remove another
+    owner's live claim.
+    """
+
+    if (
+        not isinstance(workspace_lease_authority, str)
+        or not workspace_lease_authority
+        or workspace_lease_authority == "default"
+    ):
+        raise ValueError("workspace_lease_authority_invalid")
+    normalized: list[str] = []
+    for runtime_task_id in runtime_task_ids:
+        if (
+            not isinstance(runtime_task_id, str)
+            or not runtime_task_id
+            or runtime_task_id == "default"
+        ):
+            raise ValueError("runtime_task_id_invalid")
+        if runtime_task_id not in normalized:
+            normalized.append(runtime_task_id)
+    if not normalized:
+        raise ValueError("runtime_task_ids_empty")
+    if owner_id is not None and (
+        not isinstance(owner_id, str)
+        or not owner_id
+        or owner_id == _LEGACY_WORKSPACE_LEASE_OWNER
+    ):
+        raise ValueError("workspace_lease_owner_invalid")
+    owner_key = owner_id or _LEGACY_WORKSPACE_LEASE_OWNER
+    with _workspace_lease_authorities_lock:
+        for runtime_task_id in normalized:
+            existing = _workspace_lease_authorities.get(runtime_task_id)
+            if existing is not None and existing != workspace_lease_authority:
+                raise RuntimeError("workspace_lease_authority_rebind_denied")
+        for runtime_task_id in normalized:
+            existing = _workspace_lease_authorities.get(runtime_task_id)
+            _workspace_lease_authorities[runtime_task_id] = (
+                workspace_lease_authority
+            )
+            # The authority map is canonical. If it has no prior entry, do
+            # not retain an orphaned owner set left by test/process recovery.
+            owners = (
+                _workspace_lease_authority_owners.get(runtime_task_id)
+                if existing is not None
+                else None
+            )
+            if owners is None:
+                owners = set()
+                _workspace_lease_authority_owners[runtime_task_id] = owners
+            owners.add(owner_key)
+    return tuple(normalized)
+
+
+def unregister_workspace_lease_authority(
+    runtime_task_id: str,
+    workspace_lease_authority: str,
+    *,
+    owner_id: Optional[str] = None,
+) -> bool:
+    if owner_id is not None and (
+        not isinstance(owner_id, str)
+        or not owner_id
+        or owner_id == _LEGACY_WORKSPACE_LEASE_OWNER
+    ):
+        raise ValueError("workspace_lease_owner_invalid")
+    owner_key = owner_id or _LEGACY_WORKSPACE_LEASE_OWNER
+    with _workspace_lease_authorities_lock:
+        if _workspace_lease_authorities.get(runtime_task_id) != (
+            workspace_lease_authority
+        ):
+            return False
+        owners = _workspace_lease_authority_owners.get(runtime_task_id)
+        if not owners or owner_key not in owners:
+            return False
+        owners.discard(owner_key)
+        if not owners:
+            _workspace_lease_authority_owners.pop(runtime_task_id, None)
+            _workspace_lease_authorities.pop(runtime_task_id, None)
+        return True
+
+
+def workspace_lease_authority_has_live_owners(
+    workspace_lease_authority: str,
+) -> bool:
+    """Return whether any runtime alias still claims this exact authority."""
+
+    with _workspace_lease_authorities_lock:
+        return any(
+            authority == workspace_lease_authority
+            and bool(_workspace_lease_authority_owners.get(runtime_task_id))
+            for runtime_task_id, authority in (
+                _workspace_lease_authorities.items()
+            )
+        )
+
+
+def isolated_worker_proof_status_for_authority(
+    workspace_lease_authority: str,
+) -> dict[str, Any]:
+    """Read worker-owned proof state without inventing a task/session lease."""
+
+    if not workspace_lease_authority or workspace_lease_authority == "default":
+        raise ValueError("workspace_lease_authority_invalid")
+    environment = get_active_env(workspace_lease_authority)
+    reader = getattr(environment, "proof_status", None)
+    if callable(reader):
+        return dict(reader())
+
+    config = _get_env_config()
+    if config.get("env_type") != "isolated_worker":
+        raise RuntimeError("isolated_worker_not_selected")
+    from gateway.isolated_worker import (
+        IsolatedWorkerClient,
+        canonical_lease_id,
+    )
+
+    client = IsolatedWorkerClient(
+        Path(config["isolated_worker_socket"]),
+        lease_id=canonical_lease_id(workspace_lease_authority),
+        expected_server_uid=config["isolated_worker_server_uid"],
+        expected_server_gid=config["isolated_worker_server_gid"],
+        expected_socket_uid=config["isolated_worker_socket_uid"],
+        expected_socket_gid=config["isolated_worker_socket_gid"],
+    )
+    try:
+        return dict(client.proof_status())
+    finally:
+        client.close()
+
+
+def isolated_worker_backend_selected() -> bool:
+    """Resolve the backend after applying the config.yaml → env bridge."""
+
+    return _get_env_config().get("env_type") == "isolated_worker"
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
@@ -1911,6 +2082,35 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
             logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
+def cleanup_workspace_lease_environment_if_unowned(
+    workspace_lease_authority: str,
+) -> bool:
+    """Close authority-keyed processes/client only when no owner remains.
+
+    The owner registry stays locked through exact-key cleanup. A new owner can
+    register only after the old background processes and cached client have
+    been removed, so teardown cannot race a newly-live agent and close shared
+    lineage resources.
+    """
+
+    with _workspace_lease_authorities_lock:
+        if workspace_lease_authority_has_live_owners(
+            workspace_lease_authority
+        ):
+            return False
+        # Isolated-worker terminal calls collapse every conversation alias in
+        # a lineage to the authority root before registering a background
+        # process.  Killing by the current session alias either leaks those
+        # processes after compression/branch or kills them before the last
+        # lineage owner exits.  Keep process cleanup under the same owner
+        # decision as the authority-keyed environment.
+        from tools.process_registry import process_registry
+
+        process_registry.kill_all(task_id=workspace_lease_authority)
+        cleanup_vm(workspace_lease_authority)
+        return True
+
+
 def _atexit_cleanup():
     """Stop cleanup thread and shut down all remaining sandboxes on exit."""
     _stop_cleanup_thread()
@@ -2451,6 +2651,7 @@ def terminal_tool(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
+                        owner_task_id=task_id or "",
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
@@ -2461,6 +2662,7 @@ def terminal_tool(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
+                        owner_task_id=task_id or "",
                         session_key=session_key,
                     )
 
@@ -2834,6 +3036,31 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            if env_type == "isolated_worker":
+                worker_receipt = result.get("isolated_worker_proof_receipt")
+                worker_error = result.get("isolated_worker_proof_error")
+                from agent.tool_runtime_effects import (
+                    record_current_tool_runtime_effect,
+                )
+
+                record_current_tool_runtime_effect(
+                    {
+                        "receipt": (
+                            dict(worker_receipt)
+                            if isinstance(worker_receipt, dict)
+                            else None
+                        ),
+                        "error": (
+                            str(worker_error)
+                            if worker_error
+                            else (
+                                None
+                                if isinstance(worker_receipt, dict)
+                                else "isolated_worker_proof_receipt_missing"
+                            )
+                        ),
+                    },
+                )
             try:
                 from agent.verification_evidence import (
                     record_terminal_result,

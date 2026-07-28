@@ -212,6 +212,20 @@ _PLATFORMS = {
     "api_server": _API_PLATFORM,
     "relay": _RELAY_PLATFORM,
 }
+_PRODUCTION_GATEWAY_NOTIFY_INTERVAL = 180
+_PRODUCTION_DISCORD_DISPLAY_POLICY = {
+    # Production chat is final-answer-first. The relay still emits typing and
+    # one edit-in-place elapsed heartbeat, but raw commands, provisional model
+    # narration, scratch reasoning, and renewable-slice counters stay out of
+    # the Discord transcript.
+    "tool_progress": "off",
+    "interim_assistant_messages": False,
+    "thinking_progress": False,
+    "show_reasoning": False,
+    "streaming": False,
+    "long_running_notifications": True,
+    "busy_ack_detail": False,
+}
 _FORBIDDEN_ENVIRONMENT_NAMES = frozenset(
     {
         "DISCORD_BOT_TOKEN",
@@ -441,9 +455,10 @@ def overlay_production_gateway_config(
     """Return the bounded model-sovereignty overlay.
 
     The operation is semantic-preserving outside the explicitly reviewed
-    config paths.  Arbitrary company settings, sessions, skills, and display
-    preferences are retained.  The reviewed capability topology, toolsets,
-    terminal/browser projection, and API/relay transports are exact.
+    config paths.  Arbitrary company settings, sessions, skills, and unrelated
+    display preferences are retained.  The reviewed production Discord display
+    policy, capability topology, toolsets, terminal/browser projection, and
+    API/relay transports are exact.
     """
 
     if not isinstance(observed, Mapping):
@@ -471,12 +486,33 @@ def overlay_production_gateway_config(
     elif "gpt-5.5" in hint.casefold():
         raise ProductionContractError("production_environment_hint_drifted")
     agent["environment_hint"] = hint
+    for proof_gate_key in ("verify_on_stop", "verification_ledger_enabled"):
+        proof_gate_source = agent.get(proof_gate_key)
+        if (
+            proof_gate_source is not None
+            and type(proof_gate_source) is not bool
+        ):
+            raise ProductionContractError(
+                "production_agent_proof_gate_source_drifted"
+            )
     agent["reasoning_effort"] = "high"
     agent["max_turns"] = 90
+    notify_interval_source = agent.get("gateway_notify_interval")
+    if (
+        notify_interval_source is not None
+        and (
+            type(notify_interval_source) is not int
+            or notify_interval_source < 0
+        )
+    ):
+        raise ProductionContractError(
+            "production_gateway_notify_interval_source_drifted"
+        )
+    agent["gateway_notify_interval"] = _PRODUCTION_GATEWAY_NOTIFY_INTERVAL
     agent["adaptive_reasoning"] = {"enabled": True, "max_effort": "max"}
     agent["tool_use_enforcement"] = True
-    agent["verify_on_stop"] = False
-    agent["verification_ledger_enabled"] = False
+    agent["verify_on_stop"] = True
+    agent["verification_ledger_enabled"] = True
     agent["background_review_enabled"] = False
 
     compression = _mapping(target, "compression")
@@ -644,6 +680,21 @@ def overlay_production_gateway_config(
         raise ProductionContractError("production_mac_ops_edge_invalid") from exc
     target["mac_ops_edge"] = mac_ops
 
+    display = target.setdefault("display", {})
+    if not isinstance(display, dict):
+        raise ProductionContractError("production_display_config_invalid")
+    display_platforms = display.setdefault("platforms", {})
+    if not isinstance(display_platforms, dict):
+        raise ProductionContractError(
+            "production_display_platforms_config_invalid"
+        )
+    discord_display = display_platforms.setdefault("discord", {})
+    if not isinstance(discord_display, dict):
+        raise ProductionContractError(
+            "production_discord_display_config_invalid"
+        )
+    discord_display.update(copy.deepcopy(_PRODUCTION_DISCORD_DISPLAY_POLICY))
+
     platforms = copy.deepcopy(_PLATFORMS)
     target["platforms"] = platforms
     gateway = target.setdefault("gateway", {})
@@ -676,11 +727,13 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
         (
             agent.get("reasoning_effort") != "high",
             agent.get("max_turns") != 90,
+            agent.get("gateway_notify_interval")
+            != _PRODUCTION_GATEWAY_NOTIFY_INTERVAL,
             agent.get("adaptive_reasoning")
             != {"enabled": True, "max_effort": "max"},
             agent.get("tool_use_enforcement") is not True,
-            agent.get("verify_on_stop") is not False,
-            agent.get("verification_ledger_enabled") is not False,
+            agent.get("verify_on_stop") is not True,
+            agent.get("verification_ledger_enabled") is not True,
             agent.get("background_review_enabled") is not False,
             agent.get("task_completion_guidance") is not True,
             agent.get("parallel_tool_call_guidance") is not True,
@@ -867,6 +920,23 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
         MacOpsEdgeClientConfig.from_mapping(mac_ops)
     except (TypeError, ValueError) as exc:
         raise ProductionContractError("production_mac_ops_edge_not_exact") from exc
+
+    display = raw.get("display")
+    display_platforms = (
+        display.get("platforms") if isinstance(display, Mapping) else None
+    )
+    discord_display = (
+        display_platforms.get("discord")
+        if isinstance(display_platforms, Mapping)
+        else None
+    )
+    if not isinstance(discord_display, Mapping) or any(
+        discord_display.get(key) != expected
+        for key, expected in _PRODUCTION_DISCORD_DISPLAY_POLICY.items()
+    ):
+        raise ProductionContractError(
+            "production_discord_display_policy_not_exact"
+        )
 
     if raw.get("platforms") != _PLATFORMS:
         raise ProductionContractError("production_platform_boundary_not_exact")

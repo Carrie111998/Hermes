@@ -27,13 +27,9 @@ AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
 through this adapter by pointing at http://localhost:8642/v1 and
 authenticating with API_SERVER_KEY.
 
-When ``gateway.multiplex_profiles`` is on, the default profile owns this
-listener and secondary profiles are reached via a URL prefix — same contract
-as the webhook adapter:
-
-    GET  /p/<profile>/v1/models
-    POST /p/<profile>/v1/chat/completions
-    ...
+One API-server listener serves exactly one process-frozen profile. Legacy
+same-process multiplex configuration fails closed before the listener starts;
+profile URL prefixes are not registered.
 
 Requires:
 - aiohttp (already available in the gateway)
@@ -47,7 +43,8 @@ import hmac
 import inspect
 import ipaddress
 import json
-from contextlib import contextmanager, nullcontext
+import math
+from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 import logging
@@ -65,15 +62,21 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-# Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
-# names a profile this gateway does not serve (→ 404). Distinct from None
-# (no prefix / multiplexing off → handle as the default profile).
+# Sentinel returned by _resolve_request_profile when a forbidden profile
+# prefix is supplied. Distinct from None (native single-profile route).
 _PROFILE_REJECTED = object()
 
-# Profile selected by the /p/<profile>/ URL prefix for the current request.
-# Set by the profile-prefix middleware; read by handlers / _run_agent.
+# Legacy request-profile context retained for handler compatibility. The
+# single-profile middleware always binds None.
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
+)
+# Immutable host-owned tenant authority captured by the profile middleware.
+# Background owners copy/pass this value explicitly; raw public IDs never
+# become process-local cache/control keys on the listener.
+_api_request_authority: ContextVar[Optional["APIRequestScope"]] = ContextVar(
+    "api_server_request_authority",
+    default=None,
 )
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
@@ -97,6 +100,22 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from agent.terminal_outcome import (
+    TerminalOutcomeKind,
+    normalize_terminal_outcome,
+)
+from gateway.api_request_scope import (
+    APIProfileGenerationError,
+    APIProfileIdentity,
+    APIRequestScope,
+    APIRequestScopeError,
+    capture_api_profile_identity,
+    freeze_api_profile_inventory,
+    resolve_api_request_scope,
+    validate_api_profile_inventory,
+    verify_api_profile_identity,
+    verify_api_request_scope,
+)
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -181,6 +200,78 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 MAX_SYSTEMD_CREDENTIAL_BYTES = 8_192
+MAX_API_SESSION_ID_LENGTH = 256
+
+
+class _InvalidInternalAPISessionID(ValueError):
+    """An agent/store supplied a session ID outside the public ID contract."""
+
+
+def _canonical_api_session_id(value: object, *, required: bool) -> str:
+    """Return one path/header-safe API session ID or raise ``ValueError``.
+
+    Public request IDs and trusted-looking internal IDs deliberately share
+    this exact syntax boundary.  Internal provenance is not a reason to let a
+    malformed value reach a header, persistence key, cache namespace, or
+    response-chain lookup.
+    """
+
+    if value is None or value == "":
+        if not required:
+            return ""
+        raise ValueError("API session ID is required")
+    if not isinstance(value, str):
+        raise ValueError("API session ID must be a string")
+    session_id = value.strip()
+    from gateway.session import _is_path_unsafe
+
+    if (
+        session_id != value
+        or not session_id
+        or len(session_id) > MAX_API_SESSION_ID_LENGTH
+        or re.search(r"[\r\n\x00]", session_id)
+        or _is_path_unsafe(session_id)
+    ):
+        raise ValueError("Invalid API session ID")
+    return session_id
+
+
+def _validate_internal_api_session_id(
+    value: object,
+    *,
+    source: str,
+) -> str:
+    """Fail closed on malformed agent/store continuity state.
+
+    The exception contains no attacker-controlled value, so callers may safely
+    translate it to a controlled 500/SSE failure without leaking the rejected
+    identifier.
+    """
+
+    try:
+        return _canonical_api_session_id(value, required=True)
+    except ValueError as exc:
+        logger.error("Rejected malformed internal API session ID from %s", source)
+        raise _InvalidInternalAPISessionID(
+            "Internal API session continuity state is invalid."
+        ) from exc
+
+
+def _effective_internal_api_session_id(
+    result: object,
+    *,
+    fallback: str,
+    source: str,
+) -> str:
+    """Validate a result session ID, or the already-authoritative fallback."""
+
+    if isinstance(result, Mapping) and "session_id" in result:
+        value = result["session_id"]
+        value_source = f"{source}.session_id"
+    else:
+        value = fallback
+        value_source = f"{source}.fallback"
+    return _validate_internal_api_session_id(value, source=value_source)
 
 def _effective_uid_for_systemd_credential() -> int:
     """Return the POSIX effective UID or reject this Linux-only boundary."""
@@ -487,61 +578,32 @@ def _session_stream_outcome(result: Any) -> Dict[str, Any]:
     no contrary flags.  Every other non-complete outcome is explicit and can
     never acquire a successful terminal event or ``finish_reason=stop``.
     """
-    invalid_outcome = {
-        "status": "failed",
-        "assistant_event": "assistant.failed",
-        "run_event": "run.failed",
-        "completed": False,
-        "partial": False,
-        "interrupted": False,
-        "failed": True,
-        "incomplete": True,
-        "finish_reason": "error",
-        "turn_exit_reason": "invalid_agent_result",
-    }
-    if not isinstance(result, Mapping):
-        return invalid_outcome
-
-    outcome_flags = ("completed", "partial", "interrupted", "failed", "incomplete")
-    if any(
-        flag in result and type(result[flag]) is not bool
-        for flag in outcome_flags
-    ):
-        return invalid_outcome
-
-    partial = result.get("partial", False)
-    interrupted = result.get("interrupted", False)
-    failed = result.get("failed", False)
-    explicitly_incomplete = result.get("incomplete", False)
-    # Older callers did not return ``completed``.  Preserve that compatibility,
-    # but never allow an internally inconsistent failed/partial result to claim
-    # completion at the API boundary.
-    completed = result.get(
-        "completed",
-        not (partial or interrupted or failed or explicitly_incomplete),
-    )
-    completed = completed and not (
-        partial or interrupted or failed or explicitly_incomplete
-    )
-    incomplete = not completed
-    exit_reason = result.get("turn_exit_reason")
+    outcome = normalize_terminal_outcome(result)
+    result_mapping = result if isinstance(result, Mapping) else {}
+    exit_reason = result_mapping.get("turn_exit_reason")
     if not isinstance(exit_reason, str) or not exit_reason:
-        exit_reason = None
+        exit_reason = (
+            "invalid_agent_result"
+            if not outcome.valid
+            else (outcome.reason or outcome.kind.value)
+        )
 
-    if failed:
+    if outcome.kind is TerminalOutcomeKind.FAILED:
         status = "failed"
         assistant_event = "assistant.failed"
         run_event = "run.failed"
-    elif interrupted:
+    elif outcome.kind is TerminalOutcomeKind.INTERRUPTED:
         status = "interrupted"
         assistant_event = "assistant.partial"
         run_event = "run.partial"
-    elif partial:
-        status = "partial"
-        assistant_event = "assistant.partial"
-        run_event = "run.partial"
-    elif incomplete:
-        status = "incomplete"
+    elif outcome.kind is TerminalOutcomeKind.PARTIAL:
+        raw_status = str(result_mapping.get("status") or "").strip().lower()
+        status = (
+            "partial"
+            if result_mapping.get("partial") is True
+            or raw_status == "partial"
+            else "incomplete"
+        )
         assistant_event = "assistant.partial"
         run_event = "run.partial"
     else:
@@ -549,12 +611,12 @@ def _session_stream_outcome(result: Any) -> Dict[str, Any]:
         assistant_event = "assistant.completed"
         run_event = "run.completed"
 
-    if completed:
+    if outcome.completed:
         finish_reason = "stop"
     elif (
-        partial
+        outcome.partial
         and (
-            result.get("outcome_code") == "output_truncated"
+            result_mapping.get("outcome_code") == "output_truncated"
             or exit_reason == "text_response(finish_reason=length)"
         )
     ):
@@ -568,14 +630,394 @@ def _session_stream_outcome(result: Any) -> Dict[str, Any]:
         "status": status,
         "assistant_event": assistant_event,
         "run_event": run_event,
-        "completed": completed,
-        "partial": partial,
-        "interrupted": interrupted,
-        "failed": failed,
-        "incomplete": incomplete,
+        "completed": outcome.completed,
+        "partial": outcome.partial,
+        "interrupted": outcome.interrupted,
+        "failed": outcome.failed,
+        "incomplete": outcome.incomplete,
         "finish_reason": finish_reason,
         "turn_exit_reason": exit_reason,
+        "terminal_outcome_contradictory": outcome.contradictory,
     }
+
+
+def _terminal_failure_outcome_fields(
+    turn_exit_reason: str,
+) -> Dict[str, Any]:
+    """Return the shared, exclusive terminal flags for one failed turn."""
+
+    return {
+        "completed": False,
+        "partial": False,
+        "interrupted": False,
+        "failed": True,
+        "incomplete": True,
+        "turn_exit_reason": turn_exit_reason,
+    }
+
+
+_DURABLE_WAKE_RESPONSE_SCHEMA = "hermes.api-durable-wake-response.v1"
+_DURABLE_WAKE_RESPONSE_HEADERS = frozenset(
+    {
+        "X-Hermes-Session-Id",
+        "X-Hermes-Session-Key",
+        "X-Hermes-Completed",
+        "X-Hermes-Partial",
+        "X-Hermes-Error",
+    }
+)
+
+
+def _canonical_json_http_response(
+    body: Dict[str, Any],
+    *,
+    status: int,
+    headers: Optional[Dict[str, str]] = None,
+) -> "web.Response":
+    """Serialize strict JSON before a durable owner commits it."""
+
+    encoded = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return web.Response(
+        body=encoded,
+        status=status,
+        headers=dict(headers or {}),
+        content_type="application/json",
+    )
+
+
+def _durable_wake_response_record(
+    body: Dict[str, Any],
+    *,
+    status: int,
+    terminal_status: Optional[int] = None,
+    headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Build the bounded canonical value committed by the durable CAS."""
+
+    if status < 200 or status >= 300:
+        raise ValueError("only successful durable wake responses may commit")
+    safe_headers: Dict[str, str] = {}
+    for key, value in headers.items():
+        if key not in _DURABLE_WAKE_RESPONSE_HEADERS:
+            raise ValueError(f"unsupported durable wake response header: {key}")
+        if not isinstance(value, str):
+            raise ValueError("durable wake response headers must be strings")
+        safe_headers[key] = value
+    record = {
+        "schema": _DURABLE_WAKE_RESPONSE_SCHEMA,
+        "status": status,
+        "terminal_status": (
+            status if terminal_status is None else terminal_status
+        ),
+        "headers": safe_headers,
+        "body": body,
+    }
+    # Prove serializability before the owner CAS.  The persistence helper
+    # repeats this check at the storage boundary.
+    json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return record
+
+
+def _durable_wake_replay_response(record: object) -> "web.Response":
+    """Reconstruct the exact canonical HTTP result of a completed wake."""
+
+    if not isinstance(record, dict) or set(record) != {
+        "schema",
+        "status",
+        "terminal_status",
+        "headers",
+        "body",
+    }:
+        raise ValueError("durable wake response record is malformed")
+    if record.get("schema") != _DURABLE_WAKE_RESPONSE_SCHEMA:
+        raise ValueError("durable wake response schema is unsupported")
+    status = record.get("status")
+    terminal_status = record.get("terminal_status")
+    headers = record.get("headers")
+    body = record.get("body")
+    if (
+        not isinstance(status, int)
+        or isinstance(status, bool)
+        or status < 200
+        or status >= 300
+        or not isinstance(terminal_status, int)
+        or isinstance(terminal_status, bool)
+        or terminal_status < 100
+        or terminal_status > 599
+        or not isinstance(headers, dict)
+        or not isinstance(body, dict)
+    ):
+        raise ValueError("durable wake response record is malformed")
+    if any(
+        key not in _DURABLE_WAKE_RESPONSE_HEADERS
+        or not isinstance(value, str)
+        for key, value in headers.items()
+    ):
+        raise ValueError("durable wake response headers are malformed")
+    return _canonical_json_http_response(
+        body,
+        status=status,
+        headers=headers,
+    )
+
+
+def _durable_wake_uncertain_response(
+    *,
+    session_id: str,
+    reason: str = "",
+) -> "web.Response":
+    """Return a terminal 2xx settlement without invoking a model or tools."""
+
+    logger.error(
+        "Durable API wake settled as uncertain for session %s: %s",
+        session_id,
+        _redact_api_error_text(
+            reason or "outcome may include effects",
+            limit=300,
+        ),
+    )
+    body = {
+        "object": "hermes.durable_wake",
+        "status": "partial",
+        "completed": False,
+        "partial": True,
+        "interrupted": False,
+        "failed": False,
+        "incomplete": True,
+        "turn_exit_reason": "durable_wake_uncertain",
+        "error_code": "durable_wake_outcome_uncertain",
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+    return _canonical_json_http_response(
+        body,
+        status=200,
+        headers={
+            "X-Hermes-Session-Id": session_id,
+            "X-Hermes-Completed": "false",
+            "X-Hermes-Partial": "true",
+        },
+    )
+
+
+def _durable_wake_in_progress_response(reason: str = "") -> "web.Response":
+    """Ask the internal self-poster to retry while another owner is live."""
+
+    body = _openai_error(
+        "Durable wake execution is already in progress.",
+        err_type="server_error",
+        code="durable_wake_in_progress",
+    )
+    if reason:
+        body["error"]["hermes"] = {"status": "in_progress"}
+    return _canonical_json_http_response(
+        body,
+        status=429,
+        headers={"Retry-After": "1"},
+    )
+
+
+def _durable_wake_deferred_response(
+    *,
+    message: str,
+    code: str,
+) -> "web.Response":
+    """Return a non-ACK response for a safely retryable durable carrier."""
+
+    return _canonical_json_http_response(
+        _openai_error(
+            message,
+            err_type="server_error",
+            code=code,
+        ),
+        status=429,
+        headers={"Retry-After": "1"},
+    )
+
+
+def _abandon_durable_wake_execution(
+    execution: Dict[str, Any],
+    *,
+    reason: str,
+) -> bool:
+    """Best-effort owner-CAS to uncertainty without masking the cause."""
+
+    from tools.async_delegation import abandon_durable_wake_execution
+
+    try:
+        return abandon_durable_wake_execution(
+            delegation_id=execution["delegation_id"],
+            idempotency_key=execution["idempotency_key"],
+            claim_id=execution["claim_id"],
+            reason=reason,
+            store=execution["store"],
+        )
+    except BaseException:
+        logger.exception(
+            "Failed to abandon durable API wake claim %s",
+            execution.get("claim_id", ""),
+        )
+        return False
+
+
+def _settle_durable_wake_uncertainty(
+    execution: Dict[str, Any],
+    *,
+    session_id: str,
+    disposition_reason: str,
+    response_reason: str,
+) -> "web.Response":
+    """ACK uncertainty only after its owner-CAS is durably observable."""
+
+    if _abandon_durable_wake_execution(
+        execution,
+        reason=disposition_reason,
+    ):
+        return _durable_wake_uncertain_response(
+            session_id=session_id,
+            reason=response_reason,
+        )
+    return _durable_wake_deferred_response(
+        message=(
+            "Durable wake terminal settlement is temporarily unavailable."
+        ),
+        code="durable_wake_settlement_unavailable",
+    )
+
+
+def _chat_completion_http_parts(
+    *,
+    result: Any,
+    usage: Mapping[str, Any],
+    completion_id: str,
+    model_name: str,
+    created: int,
+    session_id: str,
+    gateway_session_key: str,
+) -> tuple[Dict[str, Any], int, Dict[str, str]]:
+    """Build one non-streaming chat-completion response without I/O."""
+
+    outcome = _session_stream_outcome(result)
+    result_mapping = result if isinstance(result, Mapping) else {}
+    final_response = _resolve_media_to_data_urls(
+        result_mapping.get("final_response") or ""
+    )
+    raw_err_msg = result_mapping.get("error")
+    err_msg = (
+        _redact_api_error_text(raw_err_msg)
+        if raw_err_msg
+        else raw_err_msg
+    )
+    finish_reason = outcome["finish_reason"]
+
+    try:
+        effective_session_id = _effective_internal_api_session_id(
+            result_mapping,
+            fallback=session_id,
+            source="chat_completion_result",
+        )
+    except _InvalidInternalAPISessionID:
+        return _invalid_internal_session_id_error(), 500, {}
+    response_headers = {
+        "X-Hermes-Session-Id": effective_session_id,
+    }
+    if gateway_session_key:
+        response_headers["X-Hermes-Session-Key"] = gateway_session_key
+
+    if not final_response and outcome["incomplete"]:
+        err_body = _openai_error(
+            err_msg or "Agent run did not produce a response.",
+            err_type="server_error",
+            code="agent_incomplete",
+        )
+        err_body["error"]["hermes"] = {
+            "status": outcome["status"],
+            "completed": outcome["completed"],
+            "partial": outcome["partial"],
+            "interrupted": outcome["interrupted"],
+            "failed": outcome["failed"],
+            "incomplete": outcome["incomplete"],
+            "turn_exit_reason": outcome["turn_exit_reason"],
+            "terminal_outcome_contradictory": outcome[
+                "terminal_outcome_contradictory"
+            ],
+        }
+        err_body["usage"] = {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+        response_headers["X-Hermes-Completed"] = "false"
+        response_headers["X-Hermes-Partial"] = (
+            "true" if outcome["partial"] else "false"
+        )
+        return err_body, 502, response_headers
+
+    response_data = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": final_response,
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
+    if outcome["incomplete"]:
+        response_data["hermes"] = {
+            "status": outcome["status"],
+            "completed": outcome["completed"],
+            "partial": outcome["partial"],
+            "interrupted": outcome["interrupted"],
+            "failed": outcome["failed"],
+            "incomplete": outcome["incomplete"],
+            "turn_exit_reason": outcome["turn_exit_reason"],
+            "terminal_outcome_contradictory": outcome[
+                "terminal_outcome_contradictory"
+            ],
+            "error": err_msg,
+            "error_code": (
+                "output_truncated"
+                if finish_reason == "length"
+                else "agent_error"
+            ),
+        }
+        response_headers["X-Hermes-Completed"] = "false"
+        response_headers["X-Hermes-Partial"] = (
+            "true" if outcome["partial"] else "false"
+        )
+        if err_msg:
+            response_headers["X-Hermes-Error"] = _redact_api_error_text(
+                err_msg,
+                limit=200,
+            )
+    return response_data, 200, response_headers
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -670,15 +1112,42 @@ def _request_service_tier(model_options: Any) -> Any:
     if not isinstance(model_options, dict):
         return _REQUEST_OPTION_MISSING
     if "service_tier" in model_options:
-        raw_tier = model_options.get("service_tier")
-        if raw_tier is None:
-            return None
-        if isinstance(raw_tier, str):
-            return raw_tier.strip() or None
-        return raw_tier
+        from gateway.api_execution_context import normalize_service_tier
+
+        return normalize_service_tier(
+            model_options.get("service_tier"),
+            field="model_options.service_tier",
+        )
     if "fast" in model_options:
-        return "priority" if _coerce_request_bool(model_options.get("fast"), default=False) else None
+        fast = model_options.get("fast")
+        if not isinstance(fast, bool):
+            from gateway.api_execution_context import ApiExecutionContextError
+
+            raise ApiExecutionContextError(
+                "model_options.fast must be a boolean"
+            )
+        return "priority" if fast else None
     return _REQUEST_OPTION_MISSING
+
+
+def _normalize_persisted_api_model_options(value: Any) -> Dict[str, Any]:
+    """Return only the non-secret model options safe for durable storage."""
+
+    from gateway.api_execution_context import normalize_model_options
+
+    return normalize_model_options(value)
+
+
+def _invalid_runtime_request_response(exc: Exception) -> "web.Response":
+    """Return a controlled 400 for unsafe model-routing metadata."""
+
+    return web.json_response(
+        _openai_error(
+            str(exc),
+            code="invalid_runtime_request",
+        ),
+        status=400,
+    )
 
 
 def _apply_runtime_agent_overrides(
@@ -766,16 +1235,30 @@ def _request_agent_overrides(
     if not isinstance(body, dict):
         return {}
 
+    from gateway.api_execution_context import (
+        normalize_model_identifier,
+        normalize_model_options,
+        normalize_provider_slug,
+    )
+
     overrides: Dict[str, Any] = {}
-    provider = _clean_request_string(body.get("provider"))
+    provider = normalize_provider_slug(
+        body.get("provider"),
+        field="provider",
+    )
     if provider:
         overrides["requested_provider"] = provider
 
-    model = _clean_request_string(body.get("model"))
+    model = normalize_model_identifier(
+        body.get("model"),
+        field="model",
+    )
     if model and model != virtual_model and (provider or allow_bare_model):
         overrides["requested_model"] = model
 
     model_options = body.get("model_options")
+    if model_options is not None:
+        normalize_model_options(model_options)
     if isinstance(model_options, dict):
         overrides["model_options"] = dict(model_options)
     return overrides
@@ -1369,6 +1852,25 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _invalid_internal_session_id_error() -> Dict[str, Any]:
+    """Return the fixed, non-reflective error for corrupt internal IDs."""
+
+    return _openai_error(
+        "Internal session continuity state is invalid.",
+        err_type="server_error",
+        code="invalid_internal_session_id",
+    )
+
+
+def _invalid_internal_session_id_response() -> "web.Response":
+    """Translate corrupt internal continuity state to a controlled HTTP 500."""
+
+    return web.json_response(
+        _invalid_internal_session_id_error(),
+        status=500,
+    )
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -1478,11 +1980,18 @@ else:
 
 
 class _IdempotencyCache:
-    """In-memory idempotency cache with TTL and basic LRU semantics."""
+    """In-memory idempotency cache with TTL and basic LRU semantics.
+
+    ``key`` is deliberately opaque/hashable rather than necessarily a string.
+    HTTP callers namespace a client-supplied key by adapter, selected profile,
+    conversation session, and long-term-memory scope before it reaches this
+    cache.  A module-global bare key would otherwise let one profile/session
+    reuse another tenant's completed response.
+    """
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
         from collections import OrderedDict
         self._store = OrderedDict()
-        self._inflight: Dict[tuple[str, str], "asyncio.Task[Any]"] = {}
+        self._inflight: Dict[tuple[object, str], "asyncio.Task[Any]"] = {}
         self._ttl = ttl_seconds
         self._max = max_items
 
@@ -1494,7 +2003,7 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
-    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+    async def get_or_set(self, key: object, fingerprint: str, compute_coro):
         self._purge()
         item = self._store.get(key)
         if item and item["fp"] == fingerprint:
@@ -1523,6 +2032,25 @@ class _IdempotencyCache:
 
 
 _idem_cache = _IdempotencyCache()
+
+
+def _scoped_idempotency_cache_key(
+    key: str,
+    *,
+    adapter_scope: str,
+    request_scope: APIRequestScope,
+    session_id: str,
+    gateway_session_key: str,
+) -> tuple[str, str, str, str, str]:
+    """Close one idempotency key inside its execution/tenant boundaries."""
+
+    return (
+        str(adapter_scope or ""),
+        request_scope.bind("idempotency-tenant", "").internal_key,
+        str(session_id or ""),
+        str(gateway_session_key or ""),
+        str(key or ""),
+    )
 
 
 def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
@@ -1610,6 +2138,10 @@ class _ProviderAuthResolutionError(RuntimeError):
     closed OpenAI client"), which a bare `except RuntimeError` there would
     otherwise mislabel as an auth failure.
     """
+
+
+class _DetachedApiContinuityError(RuntimeError):
+    """A trusted detached wake no longer matches its originating API route."""
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -1720,33 +2252,68 @@ class APIServerAdapter(BasePlatformAdapter):
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
-        self._response_store = ResponseStore()
+        # Responses API state belongs to the process-frozen profile. Keep the
+        # historical attribute for compatibility; any cached store is keyed by
+        # a canonical, host-validated profile home.
+        from hermes_constants import get_hermes_home
+        from hermes_cli.profiles import get_active_profile_name
+
+        default_response_identity = capture_api_profile_identity(
+            get_active_profile_name() or "default",
+            Path(get_hermes_home()),
+        )
+        default_response_home = default_response_identity.canonical_home
+        # Marker bootstrap is deliberately complete before SQLite opens. This
+        # prevents an early resource from silently binding a replacement home
+        # during the constructor-to-listener startup window.
+        self._response_store = ResponseStore(
+            db_path=str(
+                Path(default_response_home) / "response_store.db"
+            )
+        )
+        self._response_store_default_home = default_response_home
+        self._response_store_default_identity = default_response_identity
+        self._response_stores_by_home: Dict[str, ResponseStore] = {}
+        self._response_stores_lock = threading.RLock()
+        # The cache is adapter-local, then each request key is additionally
+        # scoped by profile/session.  Keep the historical module cache only as
+        # a fallback for lightweight ``__new__`` test doubles.
+        self._idempotency_cache = _IdempotencyCache()
+        self._idempotency_adapter_scope = uuid.uuid4().hex
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        self._run_streams: Dict[
+            APIRequestScope,
+            "asyncio.Queue[Optional[Dict]]",
+        ] = {}
         # Creation timestamps for orphaned-run TTL sweep
-        self._run_streams_created: Dict[str, float] = {}
+        self._run_streams_created: Dict[APIRequestScope, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
-        self._run_stream_subscribers: set[str] = set()
+        self._run_stream_subscribers: set[APIRequestScope] = set()
         # Active run agent/task references for stop support
-        self._active_run_agents: Dict[str, Any] = {}
-        self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        self._active_run_agents: Dict[APIRequestScope, Any] = {}
+        self._active_run_tasks: Dict[
+            APIRequestScope,
+            "asyncio.Task",
+        ] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
-        self._stopping_run_ids: set[str] = set()
+        self._stopping_run_ids: set[APIRequestScope] = set()
         # Pollable run status for dashboards and external control-plane UIs.
-        self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        self._run_statuses: Dict[APIRequestScope, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
-        self._run_approval_sessions: Dict[str, str] = {}
+        self._run_approval_sessions: Dict[APIRequestScope, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._session_dbs: Dict[str, Any] = {}
+        self._owned_session_db_ids: set[int] = set()
+        self._session_dbs_lock = threading.RLock()
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
         # server requests; "*" is the process-wide fallback), mirroring
         # GatewayRunner._last_resolved_model in run.py — recovers from a
         # transient empty model resolution (#35314) instead of building an
         # agent with model="" that 400s every call until manual retry.
-        self._last_resolved_model: Dict[str, str] = {}
-        self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
+        self._last_resolved_model: Dict[APIRequestScope, str] = {}
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1767,15 +2334,31 @@ class APIServerAdapter(BasePlatformAdapter):
         self._api_active_agents: Dict[int, Any] = {}
         # Keep one agent per exact API conversation so consecutive turns retain
         # the byte-stable cached prompt prefix.
-        self._api_agent_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._api_agent_cache: "OrderedDict[APIRequestScope, Dict[str, Any]]" = (
+            OrderedDict()
+        )
         self._api_agent_cache_lock = threading.RLock()
         self._api_deferred_agent_releases: set[int] = set()
         self._api_agent_run_locks = tuple(
             threading.RLock() for _ in range(API_AGENT_SESSION_LOCK_STRIPES)
         )
-        self._api_pending_clarifications: Dict[str, Dict[str, Any]] = {}
+        # Frozen when the listener first starts.  A profile directory's
+        # canonical path + filesystem generation is part of every internal
+        # request key.  New/recreated profiles require a gateway restart;
+        # they are never adopted into a live listener.
+        self._api_profile_inventory: Optional[
+            tuple[APIProfileIdentity, ...]
+        ] = None
+        self._api_profile_inventory_lock = threading.RLock()
+        self._api_pending_clarifications: Dict[
+            APIRequestScope,
+            Dict[str, Any],
+        ] = {}
         self._api_clarifications_lock = threading.RLock()
-        self._api_pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._api_pending_approvals: Dict[
+            APIRequestScope,
+            Dict[str, Any],
+        ] = {}
         self._api_consumed_approval_nonces: Dict[str, float] = {}
         self._api_approvals_lock = threading.RLock()
         # Back-reference to the owning GatewayRunner (set by gateway/run.py)
@@ -1787,7 +2370,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
 
-    def _api_agent_run_lock_for(self, session_id: Optional[str]) -> threading.RLock:
+    def _api_agent_run_lock_for(
+        self,
+        session_id: Optional[str],
+        *,
+        request_authority: Optional[APIRequestScope] = None,
+    ) -> threading.RLock:
         """Return a bounded lock that serializes one conversation's turns.
 
         A cached AIAgent has mutable per-turn callbacks and transcript state, so
@@ -1796,8 +2384,12 @@ class APIServerAdapter(BasePlatformAdapter):
         serializes two requests and cannot merge their cache entries.
         """
 
-        cache_key = str(session_id or "")
-        digest = hashlib.sha256(cache_key.encode()).digest()
+        cache_key = self._api_request_scope(
+            "agent-session",
+            session_id,
+            authority=request_authority,
+        )
+        digest = hashlib.sha256(cache_key.internal_key.encode()).digest()
         index = int.from_bytes(digest[:2], "big") % len(self._api_agent_run_locks)
         return self._api_agent_run_locks[index]
 
@@ -1898,8 +2490,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         header_value = str(
             request.headers.get("X-Hermes-Session-Id", "") or ""
-        ).strip()
-        query_value = str(request.query.get("session_id", "") or "").strip()
+        )
+        query_value = str(request.query.get("session_id", "") or "")
         if header_value and query_value and header_value != query_value:
             return "", web.json_response(
                 _openai_error(
@@ -1909,29 +2501,51 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
         session_id = header_value or query_value
-        if not session_id:
-            if required:
-                return "", web.json_response(
-                    _openai_error(
-                        "X-Hermes-Session-Id or session_id is required",
-                        code="session_id_required",
-                    ),
-                    status=400,
-                )
-            return "", None
-
-        from gateway.session import _is_path_unsafe
-
-        if (
-            len(session_id) > self._MAX_SESSION_HEADER_LEN
-            or re.search(r"[\r\n\x00]", session_id)
-            or _is_path_unsafe(session_id)
-        ):
+        validated, error = self._validate_api_session_id_value(
+            session_id,
+            required=required,
+        )
+        if error is not None and not session_id and required:
             return "", web.json_response(
-                _openai_error("Invalid API session ID", code="invalid_session_id"),
+                _openai_error(
+                    "X-Hermes-Session-Id or session_id is required",
+                    code="session_id_required",
+                ),
                 status=400,
             )
-        return session_id, None
+        return validated, error
+
+    def _validate_api_session_id_value(
+        self,
+        value: object,
+        *,
+        required: bool,
+    ) -> tuple[str, Optional["web.Response"]]:
+        """Validate every public session ID before it reaches path/state code."""
+
+        try:
+            return _canonical_api_session_id(
+                value,
+                required=required,
+            ), None
+        except ValueError:
+            code = (
+                "session_id_required"
+                if required and (value is None or value == "")
+                else "invalid_session_id"
+            )
+            message = (
+                "API session ID is required"
+                if code == "session_id_required"
+                else "Invalid API session ID"
+            )
+            return "", web.json_response(
+                _openai_error(
+                    message,
+                    code=code,
+                ),
+                status=400,
+            )
 
     @staticmethod
     def _public_api_approval(state: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2162,11 +2776,21 @@ class APIServerAdapter(BasePlatformAdapter):
         *,
         approval_session_key: str = "",
         cancel_core: bool = False,
+        request_authority: Optional[APIRequestScope] = None,
     ) -> None:
         """Drop one conversation's public approvals and optionally deny waits."""
 
         normalized_session = str(session_id or "")
         normalized_key = str(approval_session_key or "")
+        session_scope = (
+            self._api_request_scope(
+                "approval-session",
+                normalized_session,
+                authority=request_authority,
+            )
+            if normalized_session
+            else None
+        )
         approvals_lock = getattr(self, "_api_approvals_lock", None)
         pending = getattr(self, "_api_pending_approvals", None)
         if approvals_lock is not None and pending is not None:
@@ -2175,7 +2799,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     approval_id
                     for approval_id, state in pending.items()
                     if (
-                        state.get("session_id") == normalized_session
+                        (
+                            session_scope is not None
+                            and state.get("_request_scope") == session_scope
+                        )
                         or (
                             normalized_key
                             and state.get("_approval_session_key")
@@ -2199,8 +2826,15 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str,
         approval_session_key: str,
         event_callback=None,
+        request_authority: Optional[APIRequestScope] = None,
     ):
         """Build the exact-ID approval bridge used by ordinary API turns."""
+
+        session_scope = self._api_request_scope(
+            "approval-session",
+            session_id,
+            authority=request_authority,
+        )
 
         def _notify(approval_data: Dict[str, Any]) -> None:
             from agent.redact import redact_sensitive_text
@@ -2259,13 +2893,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "created_at": time.time(),
                 "response_endpoint": f"/v1/approvals/{approval_id}/response",
                 "_approval_session_key": approval_session_key,
+                "_request_scope": session_scope,
                 "_authority_generation": core_state.get(
                     "_authority_generation"
                 ),
                 "_event_callback": event_callback,
             }
+            approval_scope = session_scope.bind(
+                "approval-id",
+                approval_id,
+            )
             with self._api_approvals_lock:
-                self._api_pending_approvals[approval_id] = state
+                self._api_pending_approvals[approval_scope] = state
             if event_callback is not None:
                 try:
                     event_callback(
@@ -2281,11 +2920,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _notify
 
-    @staticmethod
-    def _api_clarify_scope(session_id: Optional[str]) -> str:
+    def _api_clarify_scope(
+        self,
+        session_id: Optional[str],
+        *,
+        request_authority: Optional[APIRequestScope] = None,
+    ) -> str:
         """Namespace API clarify entries away from native gateway sessions."""
 
-        return "api_server:" + str(session_id or "")
+        return self._api_request_scope(
+            "clarify-session",
+            session_id,
+            authority=request_authority,
+        ).internal_key
 
     def _clear_api_clarify_scope(self, scope: str) -> None:
         """Cancel one API conversation's pending clarify requests."""
@@ -2352,12 +2999,17 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str],
         *,
         expected_agent: Any = None,
+        request_authority: Optional[APIRequestScope] = None,
     ) -> Any:
         """Atomically remove and return one exact cached agent."""
 
-        cache_key = str(session_id or "")
-        if not cache_key:
+        if not session_id:
             return None
+        cache_key = self._api_request_scope(
+            "agent-session",
+            session_id,
+            authority=request_authority,
+        )
         with self._api_agent_cache_lock:
             entry = self._api_agent_cache.get(cache_key)
             if entry is None:
@@ -2373,6 +3025,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str],
         *,
         reason: str,
+        request_authority: Optional[APIRequestScope] = None,
     ) -> None:
         """Interrupt and evict every process-local owner of one API session."""
 
@@ -2380,13 +3033,21 @@ class APIServerAdapter(BasePlatformAdapter):
         if not normalized_session:
             return
 
-        cached_agent = self._pop_cached_api_agent(normalized_session)
+        session_scope = self._api_request_scope(
+            "agent-session",
+            normalized_session,
+            authority=request_authority,
+        )
+        cached_agent = self._pop_cached_api_agent(
+            normalized_session,
+            request_authority=request_authority,
+        )
         with self._api_agent_cache_lock:
             active_agents = [
                 agent
                 for agent in self._api_active_agents.values()
-                if str(getattr(agent, "session_id", "") or "")
-                == normalized_session
+                if getattr(agent, "_api_agent_session_scope", None)
+                == session_scope
             ]
 
         owned_agents = {
@@ -2395,9 +3056,15 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent is not None
         }
         if not owned_agents:
-            self._clear_api_approval_scope(normalized_session)
+            self._clear_api_approval_scope(
+                normalized_session,
+                request_authority=request_authority,
+            )
             self._clear_api_clarify_scope(
-                self._api_clarify_scope(normalized_session)
+                self._api_clarify_scope(
+                    normalized_session,
+                    request_authority=request_authority,
+                )
             )
             return
 
@@ -2412,7 +3079,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._clear_api_clarify_scope(
                 str(
                     getattr(agent, "_api_clarify_scope", "")
-                    or self._api_clarify_scope(normalized_session)
+                    or self._api_clarify_scope(
+                        normalized_session,
+                        request_authority=request_authority,
+                    )
                 )
             )
             self._clear_api_approval_scope(
@@ -2421,6 +3091,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     getattr(agent, "_api_approval_session_key", "") or ""
                 ),
                 cancel_core=True,
+                request_authority=(
+                    getattr(agent, "_api_request_authority", None)
+                    or request_authority
+                ),
             )
             self._release_api_cached_agent(agent)
 
@@ -2454,6 +3128,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         session_id: Optional[str],
         notify_callback=None,
+        *,
+        request_authority: Optional[APIRequestScope] = None,
     ):
         """Bridge the synchronous clarify tool to authenticated API control.
 
@@ -2464,15 +3140,24 @@ class APIServerAdapter(BasePlatformAdapter):
         endpoint.  No prompt text is classified or routed here.
         """
 
-        scope = self._api_clarify_scope(session_id)
+        session_scope = self._api_request_scope(
+            "clarify-session",
+            session_id,
+            authority=request_authority,
+        )
+        scope = session_scope.internal_key
 
         def _clarify(question: str, choices) -> str:
             from tools import clarify_gateway
 
             clarify_id = uuid.uuid4().hex
+            core_clarify_id = session_scope.bind(
+                "clarification-core",
+                clarify_id,
+            ).internal_key
             normalized_choices = list(choices) if choices else None
             clarify_gateway.register(
-                clarify_id=clarify_id,
+                clarify_id=core_clarify_id,
                 session_key=scope,
                 question=question,
                 choices=normalized_choices,
@@ -2489,9 +3174,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     f"/v1/clarifications/{clarify_id}/response"
                 ),
                 "_scope": scope,
+                "_request_scope": session_scope,
+                "_core_clarify_id": core_clarify_id,
             }
+            clarification_scope = session_scope.bind(
+                "clarification-id",
+                clarify_id,
+            )
             with self._api_clarifications_lock:
-                self._api_pending_clarifications[clarify_id] = public_state
+                self._api_pending_clarifications[
+                    clarification_scope
+                ] = public_state
 
             if notify_callback is not None:
                 try:
@@ -2504,7 +3197,7 @@ class APIServerAdapter(BasePlatformAdapter):
             timeout = clarify_gateway.get_clarify_timeout()
             try:
                 response = clarify_gateway.wait_for_response(
-                    clarify_id,
+                    core_clarify_id,
                     timeout=float(timeout),
                 )
                 if response is None or response == "":
@@ -2512,7 +3205,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return response
             finally:
                 with self._api_clarifications_lock:
-                    self._api_pending_clarifications.pop(clarify_id, None)
+                    self._api_pending_clarifications.pop(
+                        clarification_scope,
+                        None,
+                    )
 
         return _clarify
 
@@ -2533,6 +3229,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent: Any,
         result: Any,
         execution_error: Optional[Exception],
+        request_authority: Optional[APIRequestScope] = None,
     ) -> Any:
         """Refresh a successful cache entry or fence a terminally failed one.
 
@@ -2557,15 +3254,27 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._pop_cached_api_agent(
                 requested_session_id,
                 expected_agent=agent,
+                request_authority=(
+                    getattr(agent, "_api_request_authority", None)
+                    or request_authority
+                ),
             )
 
+        cache_key = self._api_request_scope(
+            "agent-session",
+            requested_session_id,
+            authority=(
+                getattr(agent, "_api_request_authority", None)
+                or request_authority
+            ),
+        )
         message_count = self._api_session_message_count(requested_session_id)
         with self._api_agent_cache_lock:
-            entry = self._api_agent_cache.get(requested_session_id)
+            entry = self._api_agent_cache.get(cache_key)
             if entry is not None and entry.get("agent") is agent:
                 entry["message_count"] = message_count
                 entry["last_used"] = time.monotonic()
-                self._api_agent_cache.move_to_end(requested_session_id)
+                self._api_agent_cache.move_to_end(cache_key)
         return None
 
     def active_agent_work_count(self) -> int:
@@ -2869,18 +3578,43 @@ class APIServerAdapter(BasePlatformAdapter):
         request: "web.Request",
         platform_name: str,
     ) -> Optional[Any]:
+        authority = _api_request_authority.get()
+        profile = (
+            authority.profile
+            if authority is not None
+            else (_api_request_profile.get() or "default")
+        )
+        named_multiplex_profile = bool(
+            self._api_multiplex_enabled() and profile != "default"
+        )
+
         injected = request.app.get("platform_event_adapters")
         if isinstance(injected, dict):
-            adapter = injected.get(platform_name)
+            scoped_injected = injected.get(profile)
+            if isinstance(scoped_injected, dict):
+                adapter = scoped_injected.get(platform_name)
+            elif named_multiplex_profile:
+                adapter = None
+            else:
+                adapter = injected.get(platform_name)
             if adapter is not None:
                 return adapter
 
-        adapter = request.app.get(f"{platform_name}_adapter")
-        if adapter is not None:
-            return adapter
+        if not named_multiplex_profile:
+            adapter = request.app.get(f"{platform_name}_adapter")
+            if adapter is not None:
+                return adapter
 
         runner = self.gateway_runner or request.app.get("gateway_runner")
-        adapters = getattr(runner, "adapters", None)
+        if named_multiplex_profile:
+            profile_adapters = getattr(runner, "_profile_adapters", {})
+            adapters = (
+                profile_adapters.get(profile)
+                if isinstance(profile_adapters, dict)
+                else None
+            )
+        else:
+            adapters = getattr(runner, "adapters", None)
         if not adapters:
             return None
 
@@ -2983,94 +3717,267 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(result if isinstance(result, dict) else {})
 
     # ------------------------------------------------------------------
-    # Multi-profile multiplexing (/p/<profile>/…)
+    # Frozen single-profile listener authority
     # ------------------------------------------------------------------
 
-    def _resolve_request_profile(self, request: "web.Request"):
-        """Resolve + validate the /p/<profile>/ URL prefix on an API request.
-
-        Returns:
-          - ``None`` when no profile prefix is present, or multiplexing is off
-            (the prefix is ignored; request handled as the default profile).
-          - the profile name (str) when present, multiplexing is on, and the
-            profile is one this gateway serves.
-          - ``_PROFILE_REJECTED`` when a prefix is present but the profile is
-            unknown/unconfigured (handler/middleware returns 404).
-        """
-        profile = (request.match_info.get("profile") or "").strip()
-        if not profile:
-            return None
+    def _api_multiplex_enabled(self) -> bool:
         runner = getattr(self, "gateway_runner", None)
         cfg = getattr(runner, "config", None)
-        if not getattr(cfg, "multiplex_profiles", False):
-            # Prefix supplied but multiplexing is off — ignore it, behave as
-            # the single-profile gateway (don't 404 a would-be valid route).
-            return None
+        if bool(getattr(cfg, "multiplex_profiles", False)):
+            # GatewayRunner rejects this at construction. Keep the adapter
+            # boundary equally strict for direct/embedded construction where
+            # a caller attaches a runner-like object only after __init__.
+            from gateway.run import _require_single_profile_gateway_process
+
+            _require_single_profile_gateway_process(cfg)
+        return False
+
+    def _freeze_api_profile_inventory(
+        self,
+    ) -> tuple[APIProfileIdentity, ...]:
+        """Return the one listener-lifetime profile inventory snapshot."""
+
+        lock = getattr(self, "_api_profile_inventory_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._api_profile_inventory_lock = lock
+        with lock:
+            frozen = getattr(self, "_api_profile_inventory", None)
+            if frozen is not None:
+                # The tuple was validated when GatewayRunner injected it (or
+                # when this standalone adapter captured it).  Per-request
+                # scope resolution reverifies the selected identity, so
+                # reopening every served profile marker here would add
+                # all-profile I/O to every request.
+                return frozen
+
+            runner = getattr(self, "gateway_runner", None)
+            runner_freeze = getattr(
+                runner,
+                "_freeze_served_profile_inventory",
+                None,
+            )
+            if callable(runner_freeze):
+                # GatewayRunner is the sole owner of the listener snapshot.
+                # Keep the exact tuple (and exact identity objects) it hands
+                # us; validation below verifies it without creating a second
+                # authority snapshot.
+                frozen = runner_freeze()
+                frozen = validate_api_profile_inventory(frozen)
+            else:
+                # A directly constructed adapter (unit tests and supported
+                # standalone embedding) has no GatewayRunner to own this
+                # lifecycle, so it must bootstrap its own one-time snapshot.
+                from hermes_cli.profiles import profiles_to_serve
+
+                frozen = freeze_api_profile_inventory(
+                    profiles_to_serve(
+                        multiplex=False,
+                    )
+                )
+                frozen = validate_api_profile_inventory(frozen)
+            self._rebind_startup_response_store(frozen)
+            self._api_profile_inventory = frozen
+            return frozen
+
+    def _rebind_startup_response_store(
+        self,
+        inventory: tuple[APIProfileIdentity, ...],
+    ) -> None:
+        """Reopen a pre-listener ResponseStore after profile replacement."""
+
+        original_identity = getattr(
+            self,
+            "_response_store_default_identity",
+            None,
+        )
+        original_store = getattr(self, "_response_store", None)
+        if original_identity is None or original_store is None:
+            return
+        current_identity = next(
+            (
+                identity
+                for identity in inventory
+                if identity.profile == original_identity.profile
+            ),
+            None,
+        )
+        if current_identity is None:
+            current_identity = next(
+                (
+                    identity
+                    for identity in inventory
+                    if identity.canonical_home
+                    == original_identity.canonical_home
+                ),
+                None,
+            )
+        if current_identity is None:
+            raise APIRequestScopeError(
+                "API ResponseStore owner is not in the listener inventory"
+            )
+        if current_identity == original_identity:
+            return
+
+        replacement = ResponseStore(
+            max_size=getattr(
+                original_store,
+                "_max_size",
+                MAX_STORED_RESPONSES,
+            ),
+            db_path=str(
+                Path(current_identity.canonical_home) / "response_store.db"
+            ),
+        )
         try:
-            from hermes_cli.profiles import profiles_to_serve
-
-            served = {name for name, _ in profiles_to_serve(multiplex=True)}
+            original_store.close()
         except Exception:
-            return _PROFILE_REJECTED
-        if profile not in served:
-            return _PROFILE_REJECTED
-        return profile
+            replacement.close()
+            raise
+        # Publish the replacement only after both its open and the old
+        # handle's close succeeded. A failed close must never leave adapter
+        # attributes pointing at the replacement we just closed.
+        self._response_store = replacement
+        self._response_store_default_home = current_identity.canonical_home
+        self._response_store_default_identity = current_identity
 
-    @staticmethod
-    def _profile_scope(profile: Optional[str]):
-        """Enter the multiplex profile runtime scope, or a no-op when unset.
+    def _api_request_scope(
+        self,
+        kind: str,
+        raw_id: object = "",
+        *,
+        authority: Optional[APIRequestScope] = None,
+    ) -> APIRequestScope:
+        """Bind an internal identity to the current host-owned request scope.
 
-        When no ``/p/<profile>/`` prefix was given AND multiplexing is active,
-        enter the DEFAULT profile's scope instead of a no-op: api_server is a
-        port-binding platform that lives on the default profile, and with
-        multiplex fail-closed ``get_secret`` active, an unscoped agent run
-        raises ``UnscopedSecretError`` on its first credential read (#61276).
-        Single-profile gateways keep the no-op — ``get_secret`` falls through
-        to ``os.environ`` there, unchanged.
+        Middleware supplies the immutable authority on real HTTP paths.
+        Direct/internal callers fall back to the same served-profile
+        validation so tests and non-HTTP entry points cannot mint a profile
+        from an arbitrary path.
         """
-        if not profile:
-            try:
-                from agent.secret_scope import is_multiplex_active
 
-                if is_multiplex_active():
-                    from gateway.run import _profile_runtime_scope
-                    from hermes_constants import get_hermes_home
+        base = authority or _api_request_authority.get()
+        if base is not None:
+            return base.bind(kind, raw_id)
 
-                    return _profile_runtime_scope(get_hermes_home())
-            except Exception:
-                pass
-            return nullcontext()
+        inventory = self._freeze_api_profile_inventory()
+        if len(inventory) != 1:
+            raise APIRequestScopeError(
+                "single-profile API listener requires exactly one frozen "
+                "profile identity"
+            )
+        identity = inventory[0]
+        verify_api_profile_identity(identity)
+        return APIRequestScope(
+            canonical_home=identity.canonical_home,
+            source_home=identity.source_home,
+            profile=identity.profile,
+            profile_generation=identity.profile_generation,
+            kind=kind,
+            raw_id=str(raw_id or ""),
+        )
+
+    def _api_internal_session_key(
+        self,
+        raw_key: object,
+        *,
+        kind: str,
+        authority: Optional[APIRequestScope] = None,
+    ) -> str:
+        return self._api_request_scope(
+            kind,
+            raw_key,
+            authority=authority,
+        ).internal_session_key(raw_key, kind=kind)
+
+    def _resolve_request_profile(self, request: "web.Request"):
+        """Reject profile-prefixed requests; one listener owns one profile."""
+
+        self._api_multiplex_enabled()
+        profile = (request.match_info.get("profile") or "").strip()
+        return _PROFILE_REJECTED if profile else None
+
+    def _profile_scope(self, profile: Optional[str]):
+        """Enter one exact listener-frozen profile runtime scope."""
+
+        inventory = self._freeze_api_profile_inventory()
+        if len(inventory) != 1:
+            raise APIRequestScopeError(
+                "single-profile API listener requires exactly one frozen "
+                "profile identity"
+            )
+        identity = inventory[0]
+        requested = str(profile or "").strip()
+        if requested and requested != identity.profile:
+            raise APIRequestScopeError(
+                f"API profile {requested!r} is not served by this listener"
+            )
+        verify_api_profile_identity(identity)
         from gateway.run import _profile_runtime_scope
-        from hermes_cli.profiles import get_profile_dir
 
-        return _profile_runtime_scope(get_profile_dir(profile))
+        return _profile_runtime_scope(Path(identity.canonical_home))
 
     def _make_profile_prefix_middleware(self):
-        """Reject unknown /p/<profile>/ prefixes and scope the request home."""
+        """Bind the listener's one frozen profile for the whole request."""
 
         @web.middleware
         async def profile_prefix_middleware(request: "web.Request", handler):
-            profile = self._resolve_request_profile(request)
-            if profile is _PROFILE_REJECTED:
+            try:
+                self._api_multiplex_enabled()
+                inventory = self._freeze_api_profile_inventory()
+                if len(inventory) != 1:
+                    raise APIRequestScopeError(
+                        "single-profile API listener requires exactly one "
+                        "frozen profile identity"
+                    )
+                identity = inventory[0]
+                verify_api_profile_identity(identity)
+                authority = APIRequestScope(
+                    canonical_home=identity.canonical_home,
+                    source_home=identity.source_home,
+                    profile=identity.profile,
+                    profile_generation=identity.profile_generation,
+                    kind="request",
+                    raw_id="",
+                )
+            except APIProfileGenerationError:
+                return web.json_response(
+                    _openai_error(
+                        "API profile changed after listener startup; restart "
+                        "the gateway before serving more requests.",
+                        err_type="server_error",
+                        code="profile_restart_required",
+                    ),
+                    status=503,
+                )
+            except APIRequestScopeError:
                 return web.json_response(
                     {"error": "Unknown or unconfigured profile"},
                     status=404,
                 )
-            token = _api_request_profile.set(profile)
+
+            profile_token = _api_request_profile.set(None)
+            authority_token = _api_request_authority.set(authority)
             try:
-                with self._profile_scope(profile):
+                # Both multiplex and single-profile listeners execute under
+                # the exact frozen home.  Leaving the single-profile branch
+                # ambient would let a retargeted HERMES_HOME/config alias read
+                # tenant B while its database authority remained tenant A.
+                from gateway.run import _profile_runtime_scope
+
+                runtime_scope = _profile_runtime_scope(
+                    Path(authority.canonical_home)
+                )
+                with runtime_scope:
                     return await handler(request)
             finally:
-                _api_request_profile.reset(token)
+                _api_request_authority.reset(authority_token)
+                _api_request_profile.reset(profile_token)
 
         return profile_prefix_middleware
 
     def _http_route_table(self) -> List[tuple]:
-        """Return (method, path, handler) rows registered by ``connect()``.
-
-        Kept as a method so multiplex tests can assert the /p/<profile>/
-        mirrors without starting a real aiohttp listener.
-        """
+        """Return native (method, path, handler) rows registered by ``connect()``."""
         routes: List[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
@@ -3090,6 +3997,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("GET", "/api/delegations/{delegation_id}", self._handle_get_delegation),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3129,7 +4037,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # 256 chars is well above any realistic stable channel identifier
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
-    _MAX_SESSION_HEADER_LEN = 256
+    _MAX_SESSION_HEADER_LEN = MAX_API_SESSION_ID_LENGTH
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -3187,7 +4095,34 @@ class APIServerAdapter(BasePlatformAdapter):
     # Session DB helper
     # ------------------------------------------------------------------
 
-    def _open_and_cache_session_db(self, home) -> Optional[Any]:
+    def _session_db_pool_key(
+        self,
+        home: Path,
+        *,
+        request_authority: Optional[APIRequestScope] = None,
+    ) -> tuple[str, APIRequestScope]:
+        authority = (
+            request_authority
+            or _api_request_authority.get()
+            or self._api_request_scope("request")
+        )
+        canonical_home = str(Path(home).expanduser().resolve())
+        if canonical_home != authority.canonical_home:
+            raise APIRequestScopeError(
+                "SessionDB home does not match immutable API request scope"
+            )
+        verify_api_request_scope(authority)
+        return (
+            authority.bind("session-db", "").internal_key,
+            authority,
+        )
+
+    def _open_and_cache_session_db(
+        self,
+        home,
+        *,
+        request_authority: Optional[APIRequestScope] = None,
+    ) -> Optional[Any]:
         """Sync core: return the cached SessionDB for ``home``, opening it once.
 
         Shared by the sync (``_ensure_session_db``) and async
@@ -3198,16 +4133,30 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         from hermes_state import SessionDB
 
-        key = str(home)
-        cache = getattr(self, "_session_dbs", None)
-        if cache is None:
-            cache = {}
-            self._session_dbs = cache
-        db = cache.get(key)
-        if db is None:
-            db = SessionDB(db_path=home / "state.db")
-            cache[key] = db
-        return db
+        canonical_home = Path(home).expanduser().resolve()
+        key, _authority = self._session_db_pool_key(
+            canonical_home,
+            request_authority=request_authority,
+        )
+        lock = getattr(self, "_session_dbs_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._session_dbs_lock = lock
+        with lock:
+            cache = getattr(self, "_session_dbs", None)
+            if cache is None:
+                cache = {}
+                self._session_dbs = cache
+            db = cache.get(key)
+            if db is None:
+                db = SessionDB(db_path=canonical_home / "state.db")
+                cache[key] = db
+                owned = getattr(self, "_owned_session_db_ids", None)
+                if owned is None:
+                    owned = set()
+                    self._owned_session_db_ids = owned
+                owned.add(id(db))
+            return db
 
     def _ensure_session_db(self):
         """Lazily initialise and return the SessionDB for the active profile home.
@@ -3215,20 +4164,26 @@ class APIServerAdapter(BasePlatformAdapter):
         Sessions are persisted to ``state.db`` so that ``hermes sessions list``
         shows API-server conversations alongside CLI and gateway ones.
 
-        Under multiplex ``/p/<profile>/`` requests the profile runtime scope
-        redirects ``get_hermes_home()``, so each profile gets its own DB —
-        never the default profile's file. Synchronous: used by ``_create_agent``
-        (itself sync, and run in both loop and worker contexts). Request
-        handlers use ``_ensure_session_db_async`` to keep the SQLite open off
-        the event loop.
+        The listener middleware binds the process-frozen profile runtime scope,
+        so the DB cannot drift with ambient configuration. Synchronous: used by
+        ``_create_agent`` (itself sync, and run in both loop and worker
+        contexts). Request handlers use ``_ensure_session_db_async`` to keep
+        the SQLite open off the event loop.
         """
-        # Explicit override (tests / manual wiring) wins.
-        if self._session_db is not None:
+        # Explicit override (tests / manual wiring) is safe only when one
+        # profile owns the listener.  A shared override must never leak into a
+        # named multiplex profile.
+        if self._session_db is not None and not self._api_multiplex_enabled():
             return self._session_db
         try:
-            from hermes_constants import get_hermes_home
-
-            return self._open_and_cache_session_db(get_hermes_home())
+            authority = (
+                _api_request_authority.get()
+                or self._api_request_scope("request")
+            )
+            return self._open_and_cache_session_db(
+                Path(authority.canonical_home),
+                request_authority=authority,
+            )
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
@@ -3242,23 +4197,32 @@ class APIServerAdapter(BasePlatformAdapter):
         construction runs in the worker. A single-flight lock prevents duplicate
         concurrent construction for the same home.
         """
-        if self._session_db is not None:
+        if self._session_db is not None and not self._api_multiplex_enabled():
             return self._session_db
         try:
-            from hermes_constants import get_hermes_home
-
-            home = get_hermes_home()
-            key = str(home)
+            authority = (
+                _api_request_authority.get()
+                or self._api_request_scope("request")
+            )
+            home = Path(authority.canonical_home)
+            pool_key, _ = self._session_db_pool_key(
+                home,
+                request_authority=authority,
+            )
+            lock = getattr(self, "_session_dbs_lock", None)
             cache = getattr(self, "_session_dbs", None)
-            if cache is not None and cache.get(key) is not None:
-                return cache[key]
-            if self._session_db_lock is None:
-                self._session_db_lock = asyncio.Lock()
-            async with self._session_db_lock:
-                cache = getattr(self, "_session_dbs", None)
-                if cache is not None and cache.get(key) is not None:
-                    return cache[key]
-                return await asyncio.to_thread(self._open_and_cache_session_db, home)
+            if lock is not None and cache is not None:
+                with lock:
+                    cached = cache.get(pool_key)
+                if cached is not None:
+                    return cached
+            # The same thread lock used by synchronous callers is the
+            # single-flight authority inside this worker call.
+            return await asyncio.to_thread(
+                self._open_and_cache_session_db,
+                home,
+                request_authority=authority,
+            )
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
@@ -3314,9 +4278,315 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _resolve_route(self, model_alias: Any) -> Optional[Dict[str, Any]]:
         """Return the model_routes entry for *model_alias*, or None."""
-        if not self._model_routes or not isinstance(model_alias, str):
+        routes = self._active_model_routes()
+        if not routes or not isinstance(model_alias, str):
             return None
-        return self._model_routes.get(model_alias)
+        route = routes.get(model_alias)
+        return dict(route) if isinstance(route, dict) else None
+
+    def _active_api_server_extra(self) -> Dict[str, Any]:
+        """Return API settings for the process-frozen request profile."""
+
+        if not _api_request_profile.get():
+            return {
+                "model_routes": self._model_routes,
+                "direct_model_requests": self._direct_model_requests,
+            }
+        try:
+            from gateway.run import _load_gateway_config
+
+            cfg = _load_gateway_config()
+        except Exception:
+            logger.warning(
+                "Could not load profile-scoped API model settings",
+                exc_info=True,
+            )
+            return {}
+        if not isinstance(cfg, dict):
+            return {}
+        gateway_cfg = cfg.get("gateway")
+        gateway_cfg = gateway_cfg if isinstance(gateway_cfg, dict) else {}
+        gateway_platforms = gateway_cfg.get("platforms")
+        gateway_platforms = (
+            gateway_platforms
+            if isinstance(gateway_platforms, dict)
+            else {}
+        )
+        top_platforms = cfg.get("platforms")
+        top_platforms = (
+            top_platforms if isinstance(top_platforms, dict) else {}
+        )
+
+        # Mirror GatewayConfig's accepted YAML shapes.  Merge the ordinary
+        # nested form first, then the top-level compatibility form, then the
+        # direct gateway.api_server form.  A named profile must never inherit
+        # the listener adapter's default-profile routes when its own config is
+        # absent.
+        out: Dict[str, Any] = {}
+        for node in (
+            gateway_platforms.get("api_server"),
+            top_platforms.get("api_server"),
+            gateway_cfg.get("api_server"),
+        ):
+            if not isinstance(node, dict):
+                continue
+            extra = node.get("extra")
+            if isinstance(extra, dict):
+                out.update(extra)
+            for key in (
+                "model_routes",
+                "direct_model_requests",
+                "model_name",
+            ):
+                if key in node:
+                    out[key] = node.get(key)
+        return out
+
+    def _active_model_routes(self) -> Dict[str, Dict[str, Any]]:
+        extra = self._active_api_server_extra()
+        raw = extra.get("model_routes")
+        if raw is self._model_routes:
+            return self._model_routes
+        return self._parse_model_routes(raw)
+
+    def _direct_model_requests_enabled(self) -> bool:
+        extra = self._active_api_server_extra()
+        return _coerce_request_bool(
+            extra.get("direct_model_requests"),
+            default=False,
+        )
+
+    def _active_model_name(self) -> str:
+        """Return the model advertised by the immutable request profile."""
+
+        if not self._api_multiplex_enabled():
+            return self._model_name
+        authority = _api_request_authority.get()
+        profile = (
+            authority.profile
+            if authority is not None
+            else (_api_request_profile.get() or "default")
+        )
+        extra = self._active_api_server_extra()
+        explicit = extra.get("model_name")
+        if isinstance(explicit, str) and explicit.strip():
+            return self._resolve_model_name(explicit)
+        if profile == "default":
+            # Preserve the listener owner's explicit environment/config
+            # resolution when the default profile has no per-profile override.
+            return self._model_name
+        return self._resolve_model_name("")
+
+    def _route_alias_for_execution_context(
+        self,
+        route: Optional[Dict[str, Any]],
+        *candidates: Any,
+    ) -> str:
+        """Find the non-secret config reference for a resolved route."""
+
+        if not isinstance(route, dict):
+            return ""
+        routes = self._active_model_routes()
+        for candidate in candidates:
+            if isinstance(candidate, str) and routes.get(candidate) == route:
+                return candidate
+        for alias, configured in routes.items():
+            if configured == route:
+                return alias
+        return ""
+
+    def _build_api_detached_execution_context(
+        self,
+        *,
+        agent: Any,
+        gateway_session_key: Optional[str],
+        ephemeral_system_prompt: Optional[str],
+        requested_model: Optional[str],
+        requested_provider: Optional[str],
+        model_options: Optional[Dict[str, Any]],
+        route: Optional[Dict[str, Any]],
+        session_model: Optional[str],
+        requested_runtime: Optional[Dict[str, Any]],
+        route_source: str,
+        confirmed_runtime_lock: bool,
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        """Capture the safe replayable portion of one API execution contract."""
+
+        if isinstance(ephemeral_system_prompt, str) and ephemeral_system_prompt:
+            return (
+                None,
+                "the originating API turn has an ephemeral system prompt "
+                "that must never be persisted",
+            )
+        route_alias = self._route_alias_for_execution_context(
+            route,
+            requested_model,
+            (requested_runtime or {}).get("raw_model")
+            if isinstance(requested_runtime, dict)
+            else None,
+            (requested_runtime or {}).get("model")
+            if isinstance(requested_runtime, dict)
+            else None,
+        )
+        if (
+            isinstance(route, dict)
+            and not route_alias
+            and (route.get("api_key") or route.get("base_url"))
+        ):
+            return (
+                None,
+                "the originating API route contains request-local transport "
+                "state without a safe model-route alias",
+            )
+
+        from gateway.api_execution_context import (
+            ApiExecutionContextError,
+            SCHEMA,
+            normalize_api_execution_context,
+            transport_semantic_digest,
+        )
+
+        try:
+            route_semantic_sha256 = (
+                transport_semantic_digest(
+                    model=route.get("model"),
+                    provider=route.get("provider"),
+                    base_url=route.get("base_url"),
+                    api_mode="",
+                )
+                if route_alias and isinstance(route, dict)
+                else ""
+            )
+            effective_transport_sha256 = transport_semantic_digest(
+                model=getattr(agent, "model", ""),
+                provider=getattr(agent, "provider", ""),
+                base_url=getattr(agent, "base_url", ""),
+                api_mode=getattr(agent, "api_mode", ""),
+            )
+            context = normalize_api_execution_context(
+                {
+                    "schema": SCHEMA,
+                    "gateway_session_key": str(gateway_session_key or ""),
+                    "request_model": str(requested_model or ""),
+                    "request_provider": str(requested_provider or ""),
+                    "model_options": model_options or {},
+                    "route_alias": route_alias,
+                    "route_model": (
+                        str(route.get("model") or "")
+                        if route_alias and isinstance(route, dict)
+                        else ""
+                    ),
+                    "route_provider": (
+                        str(route.get("provider") or "")
+                        if route_alias and isinstance(route, dict)
+                        else ""
+                    ),
+                    "route_semantic_sha256": route_semantic_sha256,
+                    "session_model": str(session_model or ""),
+                    "confirmed_runtime_lock": bool(confirmed_runtime_lock),
+                    "requested_runtime": requested_runtime or {},
+                    "route_source": str(route_source or "global"),
+                    "effective_model": str(
+                        getattr(agent, "model", "") or ""
+                    ),
+                    "effective_provider": str(
+                        getattr(agent, "provider", "") or ""
+                    ),
+                    "effective_transport_sha256": (
+                        effective_transport_sha256
+                    ),
+                },
+                allow_none=False,
+            )
+        except ApiExecutionContextError as exc:
+            return None, f"the API execution context is not safely replayable: {exc}"
+        return context, ""
+
+    def _route_from_api_execution_context(
+        self,
+        context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        alias = str(context.get("route_alias") or "")
+        if not alias:
+            return None
+        route = self._resolve_route(alias)
+        if not isinstance(route, dict):
+            raise _DetachedApiContinuityError(
+                f"detached API model route no longer exists: {alias}"
+            )
+        current_model = self._clean_runtime_id(route.get("model"))
+        current_provider = self._clean_runtime_id(
+            route.get("provider"),
+            max_len=80,
+        )
+        try:
+            from gateway.api_execution_context import (
+                transport_semantic_digest,
+            )
+
+            current_semantic_sha256 = transport_semantic_digest(
+                model=route.get("model"),
+                provider=route.get("provider"),
+                base_url=route.get("base_url"),
+                api_mode="",
+            )
+        except Exception as exc:
+            raise _DetachedApiContinuityError(
+                f"detached API model route became unsafe: {alias}"
+            ) from exc
+        if (
+            current_model != str(context.get("route_model") or "")
+            or current_provider != str(context.get("route_provider") or "")
+            or current_semantic_sha256
+            != str(context.get("route_semantic_sha256") or "")
+        ):
+            raise _DetachedApiContinuityError(
+                f"detached API model route changed before completion: {alias}"
+            )
+        return route
+
+    def _assert_api_execution_context_matches_agent(
+        self,
+        context: Optional[Dict[str, Any]],
+        agent: Any,
+    ) -> None:
+        if context is None:
+            return
+        expected_model = str(context.get("effective_model") or "")
+        expected_provider = str(context.get("effective_provider") or "")
+        actual_model = self._clean_runtime_id(getattr(agent, "model", ""))
+        actual_provider = self._clean_runtime_id(
+            getattr(agent, "provider", ""),
+            max_len=80,
+        )
+        try:
+            from gateway.api_execution_context import (
+                transport_semantic_digest,
+            )
+
+            actual_transport_sha256 = transport_semantic_digest(
+                model=getattr(agent, "model", ""),
+                provider=getattr(agent, "provider", ""),
+                base_url=getattr(agent, "base_url", ""),
+                api_mode=getattr(agent, "api_mode", ""),
+            )
+        except Exception as exc:
+            raise _DetachedApiContinuityError(
+                "detached API completion resolved an unsafe transport"
+            ) from exc
+        if (
+            (expected_model and actual_model != expected_model)
+            or (expected_provider and actual_provider != expected_provider)
+            or actual_transport_sha256
+            != str(context.get("effective_transport_sha256") or "")
+        ):
+            raise _DetachedApiContinuityError(
+                "detached API completion resolved a different model route "
+                f"(expected {expected_provider or '<default>'}/"
+                f"{expected_model or '<default>'}, got "
+                f"{actual_provider or '<default>'}/"
+                f"{actual_model or '<default>'})"
+            )
 
     @staticmethod
     def _clean_runtime_id(value: Any, *, max_len: int = 200) -> str:
@@ -3340,10 +4610,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @classmethod
     def _runtime_options_from_model_options(cls, model_options: Any) -> Dict[str, Any]:
-        if not isinstance(model_options, dict):
-            return {}
+        from gateway.api_execution_context import normalize_model_options
+
+        canonical_options = normalize_model_options(model_options)
         runtime_options: Dict[str, Any] = {}
-        reasoning = model_options.get("reasoning")
+        reasoning = canonical_options.get("reasoning")
         if isinstance(reasoning, dict):
             enabled = reasoning.get("enabled")
             effort = cls._clean_runtime_id(reasoning.get("effort"), max_len=32)
@@ -3353,23 +4624,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_options["reasoning_config"] = {"enabled": True, "effort": effort}
             elif enabled is True:
                 runtime_options["reasoning_config"] = {"enabled": True}
-        service_tier = cls._clean_runtime_id(model_options.get("service_tier"), max_len=32)
+        service_tier = canonical_options.get("service_tier")
         if service_tier:
             runtime_options["service_tier"] = service_tier
-        elif _coerce_request_bool(model_options.get("fast"), default=False):
-            runtime_options["service_tier"] = "priority"
         return runtime_options
 
     def _session_runtime_request_from_body(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        raw_model = self._clean_runtime_id(body.get("model") or body.get("model_id"))
-        raw_provider = self._clean_runtime_id(body.get("provider") or body.get("provider_id"), max_len=80)
+        from gateway.api_execution_context import (
+            normalize_model_identifier,
+            normalize_model_options,
+            normalize_provider_slug,
+        )
+
+        raw_model = normalize_model_identifier(
+            body.get("model") or body.get("model_id"),
+            field="model",
+        )
+        raw_provider = normalize_provider_slug(
+            body.get("provider") or body.get("provider_id"),
+            field="provider",
+        )
+        raw_model_options = body.get("model_options")
+        normalize_model_options(raw_model_options)
         prefixed_provider, split_model = self._split_provider_prefixed_model(raw_model)
-        provider = raw_provider or prefixed_provider
+        provider = raw_provider or normalize_provider_slug(
+            prefixed_provider,
+            field="model provider prefix",
+        )
         model = split_model or raw_model
         alias_route = self._resolve_route(raw_model) or self._resolve_route(model)
         route = dict(alias_route) if isinstance(alias_route, dict) else None
         route_source = "model_routes" if route else "global"
-        if not route and model and model != self._model_name:
+        if not route and model and model != self._active_model_name():
             route = {"model": model}
             if provider:
                 route["provider"] = provider
@@ -3377,7 +4663,9 @@ class APIServerAdapter(BasePlatformAdapter):
         elif not route and provider and model:
             route = {"model": model, "provider": provider}
             route_source = "raw_request"
-        runtime_options = self._runtime_options_from_model_options(body.get("model_options"))
+        runtime_options = self._runtime_options_from_model_options(
+            raw_model_options
+        )
         requested = {"provider": provider, "model": model, "raw_model": raw_model}
         return {
             "requested": requested,
@@ -3385,7 +4673,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "route_source": route_source,
             "runtime_options": runtime_options,
             "require_model_lock": _coerce_request_bool(body.get("require_model_lock"), default=False),
-            "model_options": body.get("model_options") if isinstance(body.get("model_options"), dict) else {},
+            "model_options": (
+                dict(raw_model_options)
+                if isinstance(raw_model_options, dict)
+                else {}
+            ),
         }
 
     def _runtime_lock_error(self, runtime_request: Dict[str, Any]) -> Optional["web.Response"]:
@@ -3422,11 +4714,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return False
         try:
+            safe_model_options = _normalize_persisted_api_model_options(
+                runtime_request.get("model_options")
+            )
             db.update_session_runtime_lock(
                 session_id,
                 model=model or None,
                 provider=provider or None,
-                model_options=runtime_request.get("model_options") or {},
+                model_options=safe_model_options,
                 route_source=runtime_request.get("route_source") or "",
                 confirmed=bool(runtime_request.get("require_model_lock")),
             )
@@ -3455,18 +4750,35 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(session, dict):
             return None
-        model_config = self._parse_session_model_config(session.get("model_config"))
+        from gateway.api_execution_context import (
+            normalize_model_identifier,
+            normalize_model_options,
+            normalize_provider_slug,
+            normalize_route_source,
+        )
+        from hermes_state import normalize_session_model_config
+
+        model_config = normalize_session_model_config(
+            session.get("model_config"),
+            field="persisted API session.model_config",
+        ) or {}
         lock = model_config.get("browser_model_lock")
-        if not isinstance(lock, dict) or not _coerce_request_bool(lock.get("confirmed"), default=False):
+        if not isinstance(lock, dict) or lock.get("confirmed") is not True:
             return None
-        model = self._clean_runtime_id(lock.get("model"))
-        provider = self._clean_runtime_id(lock.get("provider"), max_len=80)
+        model = normalize_model_identifier(
+            lock.get("model"),
+            field="persisted model lock model",
+        )
+        provider = normalize_provider_slug(
+            lock.get("provider"),
+            field="persisted model lock provider",
+        )
         if not model and not provider:
             return None
-        persisted_route_source = self._clean_runtime_id(
+        persisted_route_source = normalize_route_source(
             lock.get("route_source"),
-            max_len=64,
-        ).lower()
+            field="persisted model lock route_source",
+        )
         route: Optional[Dict[str, Any]] = None
         if persisted_route_source == "model_routes":
             route = self._resolve_route(model) if model else None
@@ -3479,6 +4791,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if isinstance(body.get("model_options"), dict)
             else lock.get("model_options")
         )
+        safe_model_options = normalize_model_options(model_options)
         return {
             "requested": {
                 "provider": provider,
@@ -3487,9 +4800,11 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             "route": route or None,
             "route_source": "session_model_lock",
-            "runtime_options": self._runtime_options_from_model_options(model_options),
+            "runtime_options": self._runtime_options_from_model_options(
+                safe_model_options
+            ),
             "require_model_lock": True,
-            "model_options": model_options if isinstance(model_options, dict) else {},
+            "model_options": safe_model_options,
             "persisted_lock": True,
         }
 
@@ -3544,7 +4859,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return "hermes_browser" if text == "browser" else text
         return "api_server"
 
-    def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    def _session_model_override_for(
+        self,
+        session_key: Optional[str],
+        *,
+        request_authority: Optional[APIRequestScope] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
         The gateway tracks per-session ``/model`` switches in
@@ -3557,20 +4877,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         try:
             from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
+
+            runner = self.gateway_runner or _gateway_runner_ref()
             if runner is None:
                 return None
+            internal_key = self._api_internal_session_key(
+                session_key,
+                kind="runner-model",
+                authority=request_authority,
+            )
             try:
                 rehydrate = getattr(runner, "_rehydrate_session_model_override", None)
                 if callable(rehydrate):
-                    rehydrate(session_key)
+                    rehydrate(internal_key)
             except Exception:
                 logger.debug(
                     "api_server failed to rehydrate session /model override for %s",
                     session_key,
                     exc_info=True,
                 )
-            override = runner._session_model_overrides.get(session_key)
+            override = runner._session_model_overrides.get(internal_key)
             return dict(override) if isinstance(override, dict) else None
         except Exception:
             return None
@@ -3627,6 +4953,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         clarify_notify_callback=None,
         reuse_cached_agent: bool = True,
+        request_authority: Optional[APIRequestScope] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3672,6 +4999,20 @@ class APIServerAdapter(BasePlatformAdapter):
             GatewayRunner,
         )
         from hermes_cli.tools_config import _get_platform_tools
+
+        request_authority = (
+            request_authority
+            or _api_request_authority.get()
+            or self._api_request_scope("request")
+        )
+        agent_session_scope = request_authority.bind(
+            "agent-session",
+            session_id,
+        )
+        internal_memory_key = request_authority.internal_session_key(
+            gateway_session_key,
+            kind="memory",
+        )
 
         # Catch RuntimeError ONLY around this call, not the wider
         # _create_agent()+run_conversation() span --
@@ -3763,6 +5104,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session_row_model = _clean_request_string(session_model)
         session_override = None
         if not confirmed_runtime_lock and not self._require_capability_canary:
+            # The request authority is already installed in the copied
+            # request/executor context.  Keep this call positional so existing
+            # platform/test extension seams that replace this hook with a
+            # one-argument callable remain compatible.
             session_override = self._session_model_override_for(session_key)
         if session_override:
             override_model = _clean_request_string(session_override.get("model")) or model
@@ -3876,10 +5221,24 @@ class APIServerAdapter(BasePlatformAdapter):
         # (/v1/responses, /v1/runs when no explicit session is supplied).
         # Keying on session_id would leave one permanent dict entry per
         # stateless request, growing unbounded for the life of the process.
-        _resolved_key = gateway_session_key or ""
+        _resolved_key = (
+            request_authority.bind(
+                "last-model",
+                gateway_session_key,
+            )
+            if gateway_session_key
+            else None
+        )
+        _global_resolved_key = request_authority.bind(
+            "last-model-global",
+            "*",
+        )
         if not model:
-            _recovered = (self._last_resolved_model.get(_resolved_key)
-                          or self._last_resolved_model.get("*"))
+            _recovered = (
+                self._last_resolved_model.get(_resolved_key)
+                if _resolved_key is not None
+                else None
+            ) or self._last_resolved_model.get(_global_resolved_key)
             if _recovered:
                 logger.warning(
                     "Empty model resolved for session=%s — recovering "
@@ -3889,9 +5248,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 model = _recovered
         elif model:
-            if _resolved_key:
+            if _resolved_key is not None:
                 self._last_resolved_model[_resolved_key] = model
-            self._last_resolved_model["*"] = model
+            self._last_resolved_model[_global_resolved_key] = model
 
         user_config = _load_gateway_config()
         if self._require_capability_canary:
@@ -3938,9 +5297,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         cache_keys = GatewayRunner._extract_cache_busting_config(user_config)
         cache_keys["api.isolated_runtime"] = isolated_runtime
-        from hermes_constants import get_hermes_home
-
-        hermes_home = str(get_hermes_home().expanduser().resolve())
+        hermes_home = request_authority.canonical_home
         cache_keys["api.profile_home_sha256"] = hashlib.sha256(
             hermes_home.encode()
         ).hexdigest()
@@ -3973,13 +5330,14 @@ class APIServerAdapter(BasePlatformAdapter):
         clarify_callback = self._make_api_clarify_callback(
             session_id,
             notify_callback=clarify_notify_callback,
+            request_authority=request_authority,
         )
 
-        cache_key = str(session_id or "")
+        cache_key = agent_session_scope if session_id else None
         current_message_count = self._api_session_message_count(session_id)
         stale_agent = None
         cached_agent = None
-        if reuse_cached_agent and cache_key:
+        if reuse_cached_agent and cache_key is not None:
             now = time.monotonic()
             with self._api_agent_cache_lock:
                 entry = self._api_agent_cache.get(cache_key)
@@ -4023,7 +5381,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 fallback_model,
             )
             self._attest_capability_agent_policy(cached_agent)
-            cached_agent._api_clarify_scope = self._api_clarify_scope(session_id)
+            cached_agent._api_clarify_scope = self._api_clarify_scope(
+                session_id,
+                request_authority=request_authority,
+            )
+            cached_agent._api_request_authority = request_authority
+            cached_agent._api_agent_session_scope = agent_session_scope
             logger.debug(
                 "Reusing API agent for session %s (sig=%s)",
                 cache_key,
@@ -4050,7 +5413,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
-            "gateway_session_key": gateway_session_key,
+            "gateway_session_key": internal_memory_key or None,
             "skip_memory": isolated_runtime,
             "skip_context_files": isolated_runtime,
         }
@@ -4058,7 +5421,14 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
-        agent._api_clarify_scope = self._api_clarify_scope(session_id)
+        agent._api_clarify_scope = self._api_clarify_scope(
+            session_id,
+            request_authority=request_authority,
+        )
+        agent._api_request_authority = request_authority
+        agent._api_agent_session_scope = agent_session_scope
+        agent._api_raw_gateway_session_key = gateway_session_key
+        agent._api_internal_memory_key = internal_memory_key
         agent._api_cache_signature = cache_signature
         agent._api_cache_session_id = session_id
         self._attest_capability_agent_policy(agent)
@@ -4076,7 +5446,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ),
         }
         evicted_agents: List[Any] = []
-        if reuse_cached_agent and cache_key:
+        if reuse_cached_agent and cache_key is not None:
             now = time.monotonic()
             with self._api_agent_cache_lock:
                 replaced = self._api_agent_cache.pop(cache_key, None)
@@ -4086,6 +5456,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "agent": agent,
                     "signature": cache_signature,
                     "session_id": session_id,
+                    "request_scope": agent_session_scope,
                     "message_count": current_message_count,
                     "last_used": now,
                 }
@@ -4165,24 +5536,14 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — list hermes-agent and any configured model_routes aliases.
-
-        Under ``/p/<profile>/v1/models`` (multiplex on) the advertised primary
-        model id follows that profile's name/config, not the default adapter's
-        cached ``_model_name``.
-        """
+        """GET /v1/models — list hermes-agent and configured route aliases."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         now = int(time.time())
-        # Middleware already entered the profile runtime scope when a /p/
-        # prefix was present, so get_active_profile_name() resolves correctly.
-        model_name = (
-            self._resolve_model_name("")
-            if _api_request_profile.get()
-            else self._model_name
-        )
+        # Middleware already entered the frozen profile runtime scope.
+        model_name = self._active_model_name()
         models = [
             {
                 "id": model_name,
@@ -4197,7 +5558,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Expose configured model route aliases so clients can discover them.
         # Only the alias and resolved model name are exposed — never provider
         # credentials.
-        for alias, route_cfg in self._model_routes.items():
+        for alias, route_cfg in self._active_model_routes().items():
             if alias == model_name:
                 continue  # already listed above
             models.append({
@@ -4263,7 +5624,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
-            "model": self._model_name,
+            "model": self._active_model_name(),
             "auth": {
                 "type": "bearer",
                 "required": self._api_auth_configured(),
@@ -4309,6 +5670,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "delegation_status": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -4353,6 +5715,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "delegation_status": {
+                    "method": "GET",
+                    "path": "/api/delegations/{delegation_id}",
+                },
             },
         })
 
@@ -4379,12 +5745,16 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if session_err is not None:
             return session_err
+        approval_scope = self._api_request_scope(
+            "approval-session",
+            session_id,
+        )
 
         with self._api_approvals_lock:
             candidates = [
                 dict(state)
                 for state in self._api_pending_approvals.values()
-                if state.get("session_id") == session_id
+                if state.get("_request_scope") == approval_scope
                 and state.get("status") == "pending"
             ]
 
@@ -4406,16 +5776,25 @@ class APIServerAdapter(BasePlatformAdapter):
         with self._api_approvals_lock:
             for state in candidates:
                 approval_id = str(state.get("id", "") or "")
+                approval_entry_scope = approval_scope.bind(
+                    "approval-id",
+                    approval_id,
+                )
                 approval_key = str(
                     state.get("_approval_session_key", "") or ""
                 )
-                current = self._api_pending_approvals.get(approval_id)
+                current = self._api_pending_approvals.get(
+                    approval_entry_scope
+                )
                 if (
                     current is None
-                    or current.get("session_id") != session_id
+                    or current.get("_request_scope") != approval_scope
                     or approval_id not in live_ids_by_key.get(approval_key, set())
                 ):
-                    self._api_pending_approvals.pop(approval_id, None)
+                    self._api_pending_approvals.pop(
+                        approval_entry_scope,
+                        None,
+                    )
                     continue
                 pending.append(self._public_api_approval(current))
 
@@ -4445,6 +5824,10 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if session_err is not None:
             return session_err
+        approval_scope = self._api_request_scope(
+            "approval-session",
+            session_id,
+        )
 
         approval_id = str(request.match_info.get("approval_id", "") or "")
         if re.fullmatch(r"[0-9a-f]{32}", approval_id) is None:
@@ -4452,6 +5835,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Invalid approval ID", code="invalid_approval_id"),
                 status=400,
             )
+        approval_entry_scope = approval_scope.bind(
+            "approval-id",
+            approval_id,
+        )
         body, body_err = await self._read_json_body(request)
         if body_err is not None:
             return body_err
@@ -4465,8 +5852,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
         with self._api_approvals_lock:
-            state = self._api_pending_approvals.get(approval_id)
-            if state is None or state.get("session_id") != session_id:
+            state = self._api_pending_approvals.get(approval_entry_scope)
+            if (
+                state is None
+                or state.get("_request_scope") != approval_scope
+            ):
                 # Do not reveal whether the opaque ID exists in another session.
                 return web.json_response(
                     _openai_error(
@@ -4529,7 +5919,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         ):
             with self._api_approvals_lock:
-                self._api_pending_approvals.pop(approval_id, None)
+                self._api_pending_approvals.pop(
+                    approval_entry_scope,
+                    None,
+                )
             return web.json_response(
                 _openai_error(
                     "Approval authority epoch is stale",
@@ -4567,10 +5960,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 return authority_err
 
         with self._api_approvals_lock:
-            current = self._api_pending_approvals.get(approval_id)
+            current = self._api_pending_approvals.get(
+                approval_entry_scope
+            )
             if (
                 current is not state
-                or current.get("session_id") != session_id
+                or current.get("_request_scope") != approval_scope
                 or current.get("status") != "pending"
             ):
                 return web.json_response(
@@ -4590,7 +5985,10 @@ class APIServerAdapter(BasePlatformAdapter):
             choice,
         )
         with self._api_approvals_lock:
-            self._api_pending_approvals.pop(approval_id, None)
+            self._api_pending_approvals.pop(
+                approval_entry_scope,
+                None,
+            )
         if resolved != 1:
             return web.json_response(
                 _openai_error(
@@ -4639,13 +6037,17 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if session_err is not None:
             return session_err
+        clarify_scope = self._api_request_scope(
+            "clarify-session",
+            session_id,
+        )
 
         with self._api_clarifications_lock:
             pending = [
                 self._public_api_clarification(state)
                 for state in self._api_pending_clarifications.values()
                 if state.get("status") == "pending"
-                and state.get("session_id") == session_id
+                and state.get("_request_scope") == clarify_scope
             ]
         pending.sort(key=lambda item: float(item.get("created_at", 0.0) or 0.0))
         return web.json_response({"object": "list", "data": pending})
@@ -4673,6 +6075,10 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if session_err is not None:
             return session_err
+        clarify_scope = self._api_request_scope(
+            "clarify-session",
+            session_id,
+        )
 
         clarify_id = str(request.match_info.get("clarify_id", "") or "")
         if re.fullmatch(r"[0-9a-f]{32}", clarify_id) is None:
@@ -4680,13 +6086,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Invalid clarification ID"),
                 status=400,
             )
+        clarification_entry_scope = clarify_scope.bind(
+            "clarification-id",
+            clarify_id,
+        )
         body, body_err = await self._read_json_body(request)
         if body_err is not None:
             return body_err
 
         with self._api_clarifications_lock:
-            state = self._api_pending_clarifications.get(clarify_id)
-            if state is None or state.get("session_id") != session_id:
+            state = self._api_pending_clarifications.get(
+                clarification_entry_scope
+            )
+            if (
+                state is None
+                or state.get("_request_scope") != clarify_scope
+            ):
                 return web.json_response(
                     _openai_error(
                         f"Clarification not found: {clarify_id}",
@@ -4751,20 +6166,31 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=400,
                     )
             state["status"] = "resolving"
+            core_clarify_id = str(
+                state.get("_core_clarify_id") or ""
+            )
 
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
 
-            resolved = resolve_gateway_clarify(clarify_id, response_text)
+            resolved = resolve_gateway_clarify(
+                core_clarify_id,
+                response_text,
+            )
         except Exception:
             resolved = False
             logger.exception("Failed to resolve API clarification")
 
         if not resolved:
             with self._api_clarifications_lock:
-                current = self._api_pending_clarifications.get(clarify_id)
+                current = self._api_pending_clarifications.get(
+                    clarification_entry_scope
+                )
                 if current is state:
-                    self._api_pending_clarifications.pop(clarify_id, None)
+                    self._api_pending_clarifications.pop(
+                        clarification_entry_scope,
+                        None,
+                    )
             return web.json_response(
                 _openai_error(
                     "Clarification expired before the response was accepted",
@@ -4773,14 +6199,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        run_id = str(state.get("_run_id", "") or "")
-        if run_id:
+        run_scope = state.get("_run_scope")
+        if isinstance(run_scope, APIRequestScope):
+            run_id = run_scope.public_id
             self._set_run_status(
                 run_id,
                 "running",
+                run_scope=run_scope,
                 last_event="clarify.responded",
             )
-            run_queue = self._run_streams.get(run_id)
+            run_queue = self._run_streams.get(run_scope)
             if run_queue is not None:
                 try:
                     run_queue.put_nowait({
@@ -4973,6 +6401,12 @@ class APIServerAdapter(BasePlatformAdapter):
         return body, None
 
     async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        session_id, validation_error = self._validate_api_session_id_value(
+            session_id,
+            required=True,
+        )
+        if validation_error is not None:
+            return None, validation_error
         db = await self._ensure_session_db_async()
         if db is None:
             return None, web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
@@ -4994,6 +6428,179 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
+
+    async def _handle_get_delegation(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Expose durable delivery/wake state without mutating chat history."""
+
+        if not self._api_auth_configured():
+            return web.json_response(
+                _openai_error(
+                    "Delegation status requires API key authentication",
+                    code="delegation_auth_required",
+                ),
+                status=403,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        delegation_id = str(
+            request.match_info.get("delegation_id") or ""
+        )
+        if not re.fullmatch(r"deleg_[0-9a-f]{32}", delegation_id):
+            return web.json_response(
+                _openai_error(
+                    "Invalid delegation ID",
+                    code="invalid_delegation_id",
+                ),
+                status=400,
+            )
+
+        authority = (
+            _api_request_authority.get()
+            or self._api_request_scope("request")
+        )
+        verify_api_request_scope(authority)
+        from tools.async_delegation import (
+            EventDeliveryStore,
+            get_durable_delegation,
+        )
+
+        store = EventDeliveryStore(
+            hermes_home=authority.canonical_home,
+            source_home=authority.source_home,
+            profile=authority.profile,
+            profile_generation=authority.profile_generation,
+        )
+        try:
+            record = await asyncio.to_thread(
+                get_durable_delegation,
+                delegation_id,
+                store=store,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to read durable delegation status for %s",
+                delegation_id,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Delegation status is unavailable because its durable "
+                    "record is malformed",
+                    err_type="server_error",
+                    code="delegation_status_corrupt",
+                ),
+                status=500,
+            )
+        if record is None:
+            return web.json_response(
+                _openai_error(
+                    "Delegation not found",
+                    code="delegation_not_found",
+                ),
+                status=404,
+            )
+
+        allowed_states = {
+            "running",
+            "stalling",
+            "finalizing",
+            "completed",
+            "failed",
+            "interrupted",
+            "partial",
+            "stalled",
+            "unknown",
+            "error",
+        }
+        state = record.get("state") if isinstance(record, Mapping) else None
+        delivery_state = (
+            record.get("delivery_state")
+            if isinstance(record, Mapping)
+            else None
+        )
+        wake_state = (
+            record.get("wake_state")
+            if isinstance(record, Mapping)
+            else None
+        )
+        delivery_attempts = (
+            record.get("delivery_attempts")
+            if isinstance(record, Mapping)
+            else None
+        )
+        timestamps = (
+            record.get("dispatched_at"),
+            record.get("completed_at"),
+        ) if isinstance(record, Mapping) else (None, None)
+        valid_timestamp = lambda value: (
+            value is None
+            or (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            )
+        )
+        if (
+            not isinstance(record, Mapping)
+            or record.get("delegation_id") != delegation_id
+            or state not in allowed_states
+            or delivery_state not in {"pending", "delivered", "dropped"}
+            or wake_state not in {
+                "not_started",
+                "running",
+                "completed",
+                "uncertain",
+            }
+            or not isinstance(delivery_attempts, int)
+            or isinstance(delivery_attempts, bool)
+            or delivery_attempts < 0
+            or not all(valid_timestamp(value) for value in timestamps)
+            or not isinstance(
+                record.get("delivery_disposition_reason", ""),
+                str,
+            )
+            or not isinstance(
+                record.get("wake_disposition_reason", ""),
+                str,
+            )
+        ):
+            logger.error(
+                "Durable delegation status row failed validation for %s",
+                delegation_id,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Delegation status is unavailable because its durable "
+                    "record is malformed",
+                    err_type="server_error",
+                    code="delegation_status_corrupt",
+                ),
+                status=500,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.async_delegation.status",
+                "delegation_id": delegation_id,
+                "state": state,
+                "dispatched_at": record.get("dispatched_at"),
+                "completed_at": record.get("completed_at"),
+                "delivery_state": delivery_state,
+                "delivery_attempts": delivery_attempts,
+                "delivery_disposition_reason": _redact_api_error_text(
+                    record.get("delivery_disposition_reason") or "",
+                    limit=500,
+                ),
+                "wake_state": wake_state,
+                "wake_disposition_reason": _redact_api_error_text(
+                    record.get("wake_disposition_reason") or "",
+                    limit=500,
+                ),
+            }
+        )
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -5044,32 +6651,60 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
 
-        raw_id = body.get("id") or body.get("session_id")
-        session_id = str(raw_id).strip() if raw_id else f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        from gateway.session import _is_path_unsafe
-        if not session_id or re.search(r'[\r\n\x00]', session_id) or _is_path_unsafe(session_id):
-            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
-        if len(session_id) > self._MAX_SESSION_HEADER_LEN:
-            return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
+        if "id" in body:
+            raw_id = body["id"]
+        else:
+            raw_id = body.get("session_id")
+        if raw_id is None and "id" not in body and "session_id" not in body:
+            session_id = f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        else:
+            session_id, id_err = self._validate_api_session_id_value(
+                raw_id,
+                required=True,
+            )
+            if id_err is not None:
+                return id_err
 
-        model = body.get("model") or self._model_name
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
         source = self._normalize_session_source(body.get("source") or "api_server")
-        runtime_request = self._session_runtime_request_from_body(body)
+        try:
+            runtime_request = self._session_runtime_request_from_body(body)
+            from gateway.api_execution_context import (
+                normalize_model_identifier,
+            )
+
+            default_model_name = normalize_model_identifier(
+                self._active_model_name(),
+                field="default session model",
+            )
+        except ValueError as exc:
+            return _invalid_runtime_request_response(exc)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
         requested = runtime_request.get("requested") or {}
-        model_name = self._clean_runtime_id(requested.get("model")) or (str(model) if model else None)
+        model_name = requested.get("model") or default_model_name or None
         model_config = None
         if requested.get("model") or requested.get("provider"):
+            try:
+                safe_model_options = _normalize_persisted_api_model_options(
+                    runtime_request.get("model_options")
+                )
+            except ValueError as exc:
+                return web.json_response(
+                    _openai_error(
+                        str(exc),
+                        code="invalid_model_options",
+                    ),
+                    status=400,
+                )
             model_config = {
                 "browser_model_lock": {
                     "provider": requested.get("provider") or "",
                     "model": requested.get("model") or "",
-                    "model_options": runtime_request.get("model_options") or {},
+                    "model_options": safe_model_options,
                     "route_source": runtime_request.get("route_source") or "",
                     "confirmed": bool(runtime_request.get("require_model_lock")),
                     "updated_at": time.time(),
@@ -5236,9 +6871,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
-            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
+        if "id" in body:
+            raw_fork_id = body["id"]
+        else:
+            raw_fork_id = body.get("session_id")
+        if (
+            raw_fork_id is None
+            and "id" not in body
+            and "session_id" not in body
+        ):
+            fork_id = f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        else:
+            fork_id, id_err = self._validate_api_session_id_value(
+                raw_fork_id,
+                required=True,
+            )
+            if id_err is not None:
+                return id_err
         if await asyncio.to_thread(db.get_session, fork_id):
             return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
@@ -5300,10 +6949,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # provider/credentials come along) or threads through as
         # session_model when it is a raw string; per-request body values
         # come after that.
-        runtime_request = self._effective_session_runtime_request(
-            session=session,
-            body=body,
-        )
+        try:
+            runtime_request = self._effective_session_runtime_request(
+                session=session,
+                body=body,
+            )
+        except ValueError as exc:
+            return _invalid_runtime_request_response(exc)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
@@ -5328,11 +6980,26 @@ class APIServerAdapter(BasePlatformAdapter):
             if runtime_request.get("model_options"):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
-            stored_model = session.get("model") if isinstance(session, dict) else None
+            try:
+                from gateway.api_execution_context import (
+                    normalize_model_identifier,
+                )
+
+                stored_model = normalize_model_identifier(
+                    session.get("model")
+                    if isinstance(session, dict)
+                    else None,
+                    field="stored API session model",
+                ) or None
+            except ValueError as exc:
+                return _invalid_runtime_request_response(exc)
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
-            agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
+            agent_overrides = _request_agent_overrides(
+                body,
+                virtual_model=self._active_model_name(),
+            )
             selection_error = self._request_route_conflict_error(
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
@@ -5360,13 +7027,18 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         outcome = _session_stream_outcome(result)
         result_mapping = result if isinstance(result, Mapping) else {}
-        effective_session_id = result_mapping.get("session_id")
-        if not isinstance(effective_session_id, str) or not effective_session_id:
-            effective_session_id = session_id
+        try:
+            effective_session_id = _effective_internal_api_session_id(
+                result_mapping,
+                fallback=session_id,
+                source="session_chat_result",
+            )
+        except _InvalidInternalAPISessionID:
+            return _invalid_internal_session_id_response()
         final_response = _resolve_media_to_data_urls(
             result_mapping.get("final_response", "") or ""
         )
-        headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
+        headers = {"X-Hermes-Session-Id": effective_session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
         if outcome["incomplete"]:
@@ -5399,6 +7071,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "failed": outcome["failed"],
             "incomplete": outcome["incomplete"],
             "turn_exit_reason": outcome["turn_exit_reason"],
+            "terminal_outcome_contradictory": outcome[
+                "terminal_outcome_contradictory"
+            ],
         }
         if not final_response and outcome["incomplete"]:
             error_payload = _openai_error(
@@ -5411,7 +7086,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             {
                 "object": "hermes.session.chat.completion",
-                "session_id": effective_session_id or session_id,
+                "session_id": effective_session_id,
                 "message": {"role": "assistant", "content": final_response},
                 "usage": usage,
                 "runtime": runtime,
@@ -5443,10 +7118,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
         # Runtime selection — mirrors _handle_session_chat (lock wins,
         # otherwise session-persisted model then per-request values).
-        runtime_request = self._effective_session_runtime_request(
-            session=session,
-            body=body,
-        )
+        try:
+            runtime_request = self._effective_session_runtime_request(
+                session=session,
+                body=body,
+            )
+        except ValueError as exc:
+            return _invalid_runtime_request_response(exc)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
@@ -5471,11 +7149,26 @@ class APIServerAdapter(BasePlatformAdapter):
             if runtime_request.get("model_options"):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
-            stored_model = session.get("model") if isinstance(session, dict) else None
+            try:
+                from gateway.api_execution_context import (
+                    normalize_model_identifier,
+                )
+
+                stored_model = normalize_model_identifier(
+                    session.get("model")
+                    if isinstance(session, dict)
+                    else None,
+                    field="stored API session model",
+                ) or None
+            except ValueError as exc:
+                return _invalid_runtime_request_response(exc)
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
-            agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
+            agent_overrides = _request_agent_overrides(
+                body,
+                virtual_model=self._active_model_name(),
+            )
             selection_error = self._request_route_conflict_error(
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
@@ -5591,9 +7284,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 final_response = _resolve_media_to_data_urls(
                     result_mapping.get("final_response", "") or ""
                 )
-                effective_session_id = result_mapping.get("session_id")
-                if not isinstance(effective_session_id, str) or not effective_session_id:
-                    effective_session_id = session_id
+                effective_session_id = _effective_internal_api_session_id(
+                    result_mapping,
+                    fallback=session_id,
+                    source="session_chat_stream_result",
+                )
                 turn_messages = (
                     self._turn_transcript_messages(
                         history, user_message, result_mapping
@@ -5626,6 +7321,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "failed": outcome["failed"],
                     "incomplete": outcome["incomplete"],
                     "turn_exit_reason": outcome["turn_exit_reason"],
+                    "terminal_outcome_contradictory": outcome[
+                        "terminal_outcome_contradictory"
+                    ],
                 }
                 await queue.put(_event_payload(outcome["assistant_event"], {
                     "session_id": effective_session_id,
@@ -5666,6 +7364,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         else None,
                     }))
                     return
+                invalid_internal_session_id = isinstance(
+                    exc,
+                    _InvalidInternalAPISessionID,
+                )
                 failure = _session_stream_outcome(None)
                 shared_failure = {
                     "status": failure["status"],
@@ -5674,18 +7376,39 @@ class APIServerAdapter(BasePlatformAdapter):
                     "interrupted": failure["interrupted"],
                     "failed": failure["failed"],
                     "incomplete": failure["incomplete"],
-                    "turn_exit_reason": "api_run_exception",
+                    "turn_exit_reason": (
+                        "invalid_internal_session_id"
+                        if invalid_internal_session_id
+                        else "api_run_exception"
+                    ),
+                    "terminal_outcome_contradictory": failure[
+                        "terminal_outcome_contradictory"
+                    ],
                 }
-                error_text = _redact_api_error_text(exc)
+                error_text = (
+                    "Internal session continuity state is invalid."
+                    if invalid_internal_session_id
+                    else _redact_api_error_text(exc)
+                )
                 await queue.put(_event_payload(failure["assistant_event"], {
                     "message_id": message_id,
                     "content": "",
+                    "error_code": (
+                        "invalid_internal_session_id"
+                        if invalid_internal_session_id
+                        else "agent_error"
+                    ),
                     **shared_failure,
                 }))
                 await queue.put(_event_payload(failure["run_event"], {
                     "message_id": message_id,
                     "messages": [],
                     "error": error_text,
+                    "error_code": (
+                        "invalid_internal_session_id"
+                        if invalid_internal_session_id
+                        else "agent_error"
+                    ),
                     **shared_failure,
                 }))
                 terminal_emitted = True
@@ -5767,7 +7490,10 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        runtime_request = self._session_runtime_request_from_body(body)
+        try:
+            runtime_request = self._session_runtime_request_from_body(body)
+        except ValueError as exc:
+            return _invalid_runtime_request_response(exc)
         runtime_request["require_model_lock"] = True
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
@@ -5871,8 +7597,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # only allowed when the API key is configured and the request is
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
-        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
+        raw_provided_session_id = request.headers.get(
+            "X-Hermes-Session-Id",
+            "",
+        )
+        provided_session_id = raw_provided_session_id.strip()
+        if raw_provided_session_id:
             if not self._api_auth_configured():
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
@@ -5886,23 +7616,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=403,
                 )
-            # Sanitize: reject control characters that could enable header
-            # injection, and path-traversal-shaped IDs that would escape the
-            # sessions directory when interpolated into on-disk artifact
-            # filenames (session snapshots, request dumps). Mirrors the native
-            # gateway's entry-boundary guard (gateway.session._is_path_unsafe).
-            from gateway.session import _is_path_unsafe
-            if re.search(r'[\r\n\x00]', provided_session_id) or _is_path_unsafe(provided_session_id):
-                return web.json_response(
-                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
-                    status=400,
-                )
-            if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
-                return web.json_response(
-                    {"error": {"message": "Session ID too long", "type": "invalid_request_error"}},
-                    status=400,
-                )
-            session_id = provided_session_id
+            session_id, session_id_error = self._validate_api_session_id_value(
+                raw_provided_session_id,
+                required=True,
+            )
+            if session_id_error is not None:
+                return session_id_error
             try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
@@ -5923,19 +7642,133 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        # Host runtime effects never come from the OpenAI-compatible JSON
+        # body or a readable effect header.  The sole ingress is a one-use,
+        # process-local capability minted by gateway.wake after it has
+        # resolved the live compression tip and conversation-root authority.
+        runtime_effect = None
+        internal_wake_envelope: Optional[Dict[str, Any]] = None
+        internal_idempotency_key = ""
+        wake_authority: Optional[APIRequestScope] = None
+        from gateway.wake import (
+            INTERNAL_WAKE_TOKEN_HEADER,
+            InternalWakeTokenError,
+            consume_internal_wake_token,
+        )
+
+        internal_wake_token = request.headers.get(
+            INTERNAL_WAKE_TOKEN_HEADER,
+            "",
+        ).strip()
+        if internal_wake_token:
+            internal_idempotency_key = request.headers.get(
+                "Idempotency-Key",
+                "",
+            ).strip()
+            if (
+                not provided_session_id
+                or not isinstance(user_message, str)
+                or stream
+                or not internal_idempotency_key
+                or system_prompt is not None
+                or len(conversation_messages) != 1
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Invalid internal wake capability",
+                        code="invalid_internal_wake",
+                    ),
+                    status=403,
+                )
+            try:
+                wake_authority = (
+                    _api_request_authority.get()
+                    or self._api_request_scope(
+                        "internal-wake",
+                        session_id,
+                    )
+                )
+                internal_wake_envelope = consume_internal_wake_token(
+                    internal_wake_token,
+                    session_id=session_id,
+                    text=user_message,
+                    idempotency_key=internal_idempotency_key,
+                    gateway_session_key=gateway_session_key or "",
+                    profile=wake_authority.profile,
+                    source_home=wake_authority.source_home,
+                    canonical_home=wake_authority.canonical_home,
+                    profile_generation=(
+                        wake_authority.profile_generation
+                    ),
+                    return_envelope=True,
+                )
+                runtime_effect = (
+                    internal_wake_envelope or {}
+                ).get("runtime_effect")
+            except InternalWakeTokenError:
+                logger.warning(
+                    "Rejected invalid/replayed internal wake capability for "
+                    "session %s",
+                    session_id,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Invalid or expired internal wake capability",
+                        code="invalid_internal_wake",
+                    ),
+                    status=403,
+                )
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", self._model_name)
+        model_name = body.get("model", self._active_model_name())
         created = int(time.time())
 
         # Per-client model routing: if the requested model matches a
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
         route = self._resolve_route(model_name)
-        agent_overrides = _request_agent_overrides(
-            body,
-            virtual_model=self._model_name,
-            allow_bare_model=self._direct_model_requests,
+        try:
+            agent_overrides = _request_agent_overrides(
+                body,
+                virtual_model=self._active_model_name(),
+                allow_bare_model=self._direct_model_requests_enabled(),
+            )
+        except ValueError as exc:
+            return _invalid_runtime_request_response(exc)
+        api_execution_context = (
+            (internal_wake_envelope or {}).get("execution_context")
         )
+        wake_session_model = None
+        wake_requested_runtime = None
+        wake_route_source = "global"
+        wake_confirmed_runtime_lock = False
+        if api_execution_context is not None:
+            route = self._route_from_api_execution_context(
+                api_execution_context
+            )
+            agent_overrides = {
+                "requested_model": (
+                    api_execution_context.get("request_model") or None
+                ),
+                "requested_provider": (
+                    api_execution_context.get("request_provider") or None
+                ),
+                "model_options": dict(
+                    api_execution_context.get("model_options") or {}
+                ),
+            }
+            wake_session_model = (
+                api_execution_context.get("session_model") or None
+            )
+            wake_requested_runtime = dict(
+                api_execution_context.get("requested_runtime") or {}
+            )
+            wake_route_source = str(
+                api_execution_context.get("route_source") or "global"
+            )
+            wake_confirmed_runtime_lock = bool(
+                api_execution_context.get("confirmed_runtime_lock")
+            )
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -5943,8 +7776,124 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_provider=agent_overrides.get("requested_provider"),
             route=route,
         )
+
+        durable_wake_execution: Optional[Dict[str, Any]] = None
+        if (internal_wake_envelope or {}).get("durable_wake_required"):
+            envelope = internal_wake_envelope or {}
+            delegation_id = str(
+                envelope.get("durable_delegation_id") or ""
+            ).strip()
+            execution_owner = str(
+                envelope.get("durable_execution_owner") or ""
+            ).strip()
+            profile_identity = envelope.get("profile_identity")
+            expected_profile_identity = (
+                {
+                    "profile": wake_authority.profile,
+                    "source_home": wake_authority.source_home,
+                    "canonical_home": wake_authority.canonical_home,
+                    "profile_generation": wake_authority.profile_generation,
+                }
+                if wake_authority is not None
+                else None
+            )
+            if (
+                execution_owner != "api"
+                or not delegation_id
+                or not internal_idempotency_key
+                or profile_identity != expected_profile_identity
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Invalid durable wake capability",
+                        code="invalid_internal_wake",
+                    ),
+                    status=403,
+                )
+            from tools.async_delegation import (
+                EventDeliveryStore,
+                claim_durable_wake_execution,
+            )
+
+            store = EventDeliveryStore(
+                hermes_home=wake_authority.canonical_home,
+                source_home=wake_authority.source_home,
+                profile=wake_authority.profile,
+                profile_generation=wake_authority.profile_generation,
+            )
+            try:
+                durable_claim = claim_durable_wake_execution(
+                    delegation_id=delegation_id,
+                    idempotency_key=internal_idempotency_key,
+                    store=store,
+                )
+            except BaseException as exc:
+                if isinstance(
+                    exc,
+                    (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                ):
+                    raise
+                logger.exception(
+                    "Durable API wake claim failed for %s",
+                    delegation_id,
+                )
+                return _durable_wake_deferred_response(
+                    message=(
+                        "Durable wake claim storage is temporarily "
+                        "unavailable."
+                    ),
+                    code="durable_wake_claim_unavailable",
+                )
+            if durable_claim.state == "completed":
+                try:
+                    return _durable_wake_replay_response(
+                        durable_claim.response
+                    )
+                except (TypeError, ValueError):
+                    logger.exception(
+                        "Durable API wake replay is malformed for %s",
+                        delegation_id,
+                    )
+                    return _durable_wake_deferred_response(
+                        message=(
+                            "Durable wake terminal settlement is "
+                            "temporarily unavailable."
+                        ),
+                        code="durable_wake_settlement_unavailable",
+                    )
+            if durable_claim.state == "in_progress":
+                return _durable_wake_in_progress_response(
+                    durable_claim.reason
+                )
+            if durable_claim.state == "uncertain":
+                return _durable_wake_uncertain_response(
+                    session_id=session_id,
+                    reason=durable_claim.reason,
+                )
+            durable_wake_execution = {
+                "delegation_id": delegation_id,
+                "idempotency_key": internal_idempotency_key,
+                "claim_id": durable_claim.claim_id,
+                "store": store,
+            }
+
         if selection_error:
-            return web.json_response(_openai_error(selection_error), status=400)
+            if durable_wake_execution is not None:
+                return _settle_durable_wake_uncertainty(
+                    durable_wake_execution,
+                    session_id=session_id,
+                    disposition_reason=(
+                        "durable wake execution context conflicts with the "
+                        "target session route"
+                    ),
+                    response_reason=(
+                        "durable wake route selection was rejected"
+                    ),
+                )
+            return web.json_response(
+                _openai_error(selection_error),
+                status=400,
+            )
 
         if stream:
             reservation = self._reserve_agent_run()
@@ -6052,6 +8001,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         clarify_notify_callback=_on_clarify,
                         approval_event_callback=_on_approval,
+                        runtime_effect=runtime_effect,
+                        session_model=wake_session_model,
+                        requested_runtime=wake_requested_runtime,
+                        route_source=wake_route_source,
+                        confirmed_runtime_lock=wake_confirmed_runtime_lock,
+                        api_execution_context=api_execution_context,
                     )
                 )
             except Exception:
@@ -6071,11 +8026,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
         reservation = self._reserve_agent_run()
         if reservation is None:
+            if durable_wake_execution is not None:
+                from tools.async_delegation import (
+                    release_durable_wake_execution,
+                )
+                try:
+                    released = release_durable_wake_execution(
+                        delegation_id=durable_wake_execution["delegation_id"],
+                        idempotency_key=durable_wake_execution[
+                            "idempotency_key"
+                        ],
+                        claim_id=durable_wake_execution["claim_id"],
+                        store=durable_wake_execution["store"],
+                    )
+                except BaseException:
+                    logger.exception(
+                        "Durable wake capacity claim release failed"
+                    )
+                    released = False
+                if released:
+                    return self._concurrency_limit_response()
+                return _settle_durable_wake_uncertainty(
+                    durable_wake_execution,
+                    session_id=session_id,
+                    disposition_reason=(
+                        "durable wake capacity release owner-CAS failed "
+                        "before the agent started"
+                    ),
+                    response_reason=(
+                        "durable wake capacity claim could not be released"
+                    ),
+                )
             return self._concurrency_limit_response()
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent_from_reservation(
+            computed_result, computed_usage = await self._run_agent_from_reservation(
                 reservation,
                 user_message=user_message,
                 conversation_history=history,
@@ -6084,11 +8070,54 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                runtime_effect=runtime_effect,
+                session_model=wake_session_model,
+                requested_runtime=wake_requested_runtime,
+                route_source=wake_route_source,
+                confirmed_runtime_lock=wake_confirmed_runtime_lock,
+                api_execution_context=api_execution_context,
             )
+            # Validate before ``IdempotencyCache.get_or_set`` can retain the
+            # result.  The response builder repeats the check when replaying a
+            # previously cached value.
+            if durable_wake_execution is None:
+                _effective_internal_api_session_id(
+                    computed_result,
+                    fallback=session_id,
+                    source="chat_completion_result_before_cache",
+                )
+            return computed_result, computed_usage
 
         idempotency_key = request.headers.get("Idempotency-Key")
         try:
-            if idempotency_key:
+            if durable_wake_execution is not None:
+                # The durable owner CAS is the idempotency authority.  Never
+                # hide the live execution behind the process-local cache:
+                # cancellation and completion must settle this exact claim.
+                result, usage = await _compute_completion()
+            elif idempotency_key:
+                cache_key = _scoped_idempotency_cache_key(
+                    idempotency_key,
+                    adapter_scope=getattr(
+                        self,
+                        "_idempotency_adapter_scope",
+                        f"legacy-adapter:{id(self)}",
+                    ),
+                    request_scope=(
+                        _api_request_authority.get()
+                        or self._api_request_scope("request")
+                    ),
+                    session_id=(
+                        str(
+                            (internal_wake_envelope or {}).get(
+                                "origin_session_id"
+                            )
+                            or ""
+                        )
+                        or session_id
+                    ),
+                    gateway_session_key=gateway_session_key,
+                )
                 fp = _make_request_fingerprint(
                     body,
                     keys=[
@@ -6101,10 +8130,38 @@ class APIServerAdapter(BasePlatformAdapter):
                         "stream",
                     ],
                 )
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                cache = getattr(self, "_idempotency_cache", _idem_cache)
+                result, usage = await cache.get_or_set(
+                    cache_key,
+                    fp,
+                    _compute_completion,
+                )
             else:
                 result, usage = await _compute_completion()
-        except Exception as e:
+        except _InvalidInternalAPISessionID:
+            return _invalid_internal_session_id_response()
+        except BaseException as e:
+            if durable_wake_execution is not None:
+                settled_response = _settle_durable_wake_uncertainty(
+                    durable_wake_execution,
+                    session_id=session_id,
+                    disposition_reason=(
+                        "durable wake agent execution ended before its "
+                        "canonical response was committed"
+                    ),
+                    response_reason="durable wake agent execution failed",
+                )
+                if isinstance(
+                    e,
+                    (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                ):
+                    raise
+                return settled_response
+            if isinstance(
+                e,
+                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+            ):
+                raise
             logger.error("Error running agent for chat completions: %s", e, exc_info=True)
             return web.json_response(
                 _openai_error(f"Internal server error: {e}", err_type="server_error"),
@@ -6113,92 +8170,83 @@ class APIServerAdapter(BasePlatformAdapter):
         finally:
             reservation.release()
 
-        outcome = _session_stream_outcome(result)
-        result_mapping = result if isinstance(result, Mapping) else {}
-        final_response = _resolve_media_to_data_urls(
-            result_mapping.get("final_response") or ""
-        )
-        raw_err_msg = result_mapping.get("error")
-        err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
-        finish_reason = outcome["finish_reason"]
-
-        effective_session_id = result_mapping.get("session_id")
-        if not isinstance(effective_session_id, str) or not effective_session_id:
-            effective_session_id = session_id
-        response_headers = {
-            "X-Hermes-Session-Id": effective_session_id,
-        }
-        if gateway_session_key:
-            response_headers["X-Hermes-Session-Key"] = gateway_session_key
-
-        # Hard-fail path: no usable assistant text AND a real failure → 5xx
-        # with OpenAI-style error envelope so SDK clients raise instead of
-        # silently rendering the internal failure string as message.content.
-        if not final_response and outcome["incomplete"]:
-            err_body = _openai_error(
-                err_msg or "Agent run did not produce a response.",
-                err_type="server_error",
-                code="agent_incomplete",
+        try:
+            response_data, response_status, response_headers = (
+                _chat_completion_http_parts(
+                    result=result,
+                    usage=usage,
+                    completion_id=completion_id,
+                    model_name=model_name,
+                    created=created,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key or "",
+                )
             )
-            err_body["error"]["hermes"] = {
-                "status": outcome["status"],
-                "completed": outcome["completed"],
-                "partial": outcome["partial"],
-                "interrupted": outcome["interrupted"],
-                "failed": outcome["failed"],
-                "incomplete": outcome["incomplete"],
-                "turn_exit_reason": outcome["turn_exit_reason"],
-            }
-            response_headers["X-Hermes-Completed"] = "false"
-            response_headers["X-Hermes-Partial"] = (
-                "true" if outcome["partial"] else "false"
-            )
-            return web.json_response(err_body, status=502, headers=response_headers)
+            if durable_wake_execution is None:
+                return web.json_response(
+                    response_data,
+                    status=response_status,
+                    headers=response_headers,
+                )
 
-        # Soft-partial path: we have *some* text but the run did not complete
-        # (e.g. truncation with partial buffered output). Still 200 but signal
-        # truncation via finish_reason="length" + Hermes-specific extras.
-        response_data = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_response,
-                    },
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-        }
-        if outcome["incomplete"]:
-            response_data["hermes"] = {
-                "status": outcome["status"],
-                "completed": outcome["completed"],
-                "partial": outcome["partial"],
-                "interrupted": outcome["interrupted"],
-                "failed": outcome["failed"],
-                "incomplete": outcome["incomplete"],
-                "turn_exit_reason": outcome["turn_exit_reason"],
-                "error": err_msg,
-                "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
-            }
-            response_headers["X-Hermes-Completed"] = "false"
-            response_headers["X-Hermes-Partial"] = (
-                "true" if outcome["partial"] else "false"
+            response_record = _durable_wake_response_record(
+                response_data,
+                # The internal self-poster treats a 2xx as terminal ACK.  The
+                # original normalized HTTP status is retained verbatim in the
+                # durable record while known failed/interrupted/partial
+                # outcomes remain explicit in the response body and headers.
+                status=200,
+                terminal_status=response_status,
+                headers=response_headers,
             )
-            if err_msg:
-                response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
+            # Construct the live response before committing, so a
+            # serialization failure cannot strand a completed durable row
+            # whose first owner never had a response to send.
+            live_response = _durable_wake_replay_response(response_record)
+            from tools.async_delegation import (
+                complete_durable_wake_execution,
+            )
 
-        return web.json_response(response_data, headers=response_headers)
+            completed = complete_durable_wake_execution(
+                delegation_id=durable_wake_execution["delegation_id"],
+                idempotency_key=durable_wake_execution["idempotency_key"],
+                claim_id=durable_wake_execution["claim_id"],
+                response=response_record,
+                store=durable_wake_execution["store"],
+            )
+            if not completed:
+                return _settle_durable_wake_uncertainty(
+                    durable_wake_execution,
+                    session_id=session_id,
+                    disposition_reason=(
+                        "durable wake completion owner-CAS failed; outcome "
+                        "may include effects"
+                    ),
+                    response_reason=(
+                        "durable wake completion could not be committed"
+                    ),
+                )
+            return live_response
+        except BaseException as exc:
+            if durable_wake_execution is not None:
+                settled_response = _settle_durable_wake_uncertainty(
+                    durable_wake_execution,
+                    session_id=session_id,
+                    disposition_reason=(
+                        "durable wake response serialization or completion "
+                        "failed; outcome may include effects"
+                    ),
+                    response_reason=(
+                        "durable wake response could not be committed"
+                    ),
+                )
+                if isinstance(
+                    exc,
+                    (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                ):
+                    raise
+                return settled_response
+            raise
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -6326,6 +8374,18 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                _effective_internal_api_session_id(
+                    result,
+                    fallback=session_id or "",
+                    source="chat_completion_stream_result",
+                )
+            except _InvalidInternalAPISessionID as exc:
+                agent_error = exc
+                result = None
+                logger.error(
+                    "Agent task %s returned an invalid internal session ID",
+                    completion_id,
+                )
             except Exception as exc:
                 agent_error = exc
                 logger.error(
@@ -6350,8 +8410,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": str(agent_error),
                 }
             outcome = _session_stream_outcome(outcome_input)
+            invalid_internal_session_id = isinstance(
+                agent_error,
+                _InvalidInternalAPISessionID,
+            )
             raw_err_msg = (
-                str(agent_error)
+                "Internal session continuity state is invalid."
+                if invalid_internal_session_id
+                else str(agent_error)
                 if agent_error is not None
                 else result_mapping.get("error")
             )
@@ -6385,9 +8451,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     "interrupted": outcome["interrupted"],
                     "failed": outcome["failed"],
                     "incomplete": outcome["incomplete"],
-                    "turn_exit_reason": outcome["turn_exit_reason"],
+                    "turn_exit_reason": (
+                        "invalid_internal_session_id"
+                        if invalid_internal_session_id
+                        else outcome["turn_exit_reason"]
+                    ),
+                    "terminal_outcome_contradictory": outcome[
+                        "terminal_outcome_contradictory"
+                    ],
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": (
+                        "invalid_internal_session_id"
+                        if invalid_internal_session_id
+                        else "output_truncated"
+                        if finish_reason == "length"
+                        else "agent_error"
+                    ),
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
@@ -6442,6 +8521,82 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    def _response_store_home_for_request(self) -> Path:
+        """Return the host-authoritative home for the current API request.
+
+        Response persistence consumes the same immutable authority as every
+        other API cache/control domain; it never re-resolves a caller path.
+        """
+        scope = self._api_request_scope("response-store")
+        verify_api_request_scope(scope)
+        return Path(scope.canonical_home)
+
+    def _response_store_for_request(self) -> ResponseStore:
+        """Resolve and lazily open the current profile's Responses database."""
+        response_scope = self._api_request_scope("response-store")
+        verify_api_request_scope(response_scope)
+        home = Path(response_scope.canonical_home)
+        # The immutable listener inventory selects the only permissible
+        # profile.  The active per-task runtime scope must independently agree
+        # before opening state, so a stale ContextVar cannot redirect a
+        # default-route operation into another tenant (or vice versa).
+        from hermes_constants import get_hermes_home
+
+        active_runtime_home = Path(get_hermes_home()).expanduser().resolve()
+        if active_runtime_home != home:
+            raise RuntimeError(
+                f"API profile {response_scope.profile!r} does not match the "
+                f"active runtime home {active_runtime_home}"
+            )
+        home_key = str(home)
+        pool_key = response_scope.bind(
+            "response-store",
+            "",
+        ).internal_key
+        default_store = getattr(self, "_response_store", None)
+        default_home = str(
+            getattr(self, "_response_store_default_home", "") or ""
+        )
+
+        # Preserve the historical attribute as the default store.  A number
+        # of integrations and lightweight test doubles replace it directly,
+        # so it remains authoritative for the home it was created for.
+        if default_store is not None and (
+            home_key == default_home
+            or (not default_home and not _api_request_profile.get())
+        ):
+            cache = getattr(self, "_response_stores_by_home", None)
+            lock = getattr(self, "_response_stores_lock", None)
+            if cache is not None:
+                if lock is None:
+                    cache[pool_key] = default_store
+                else:
+                    with lock:
+                        cache[pool_key] = default_store
+            return default_store
+
+        lock = getattr(self, "_response_stores_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._response_stores_lock = lock
+        with lock:
+            cache = getattr(self, "_response_stores_by_home", None)
+            if cache is None:
+                cache = {}
+                self._response_stores_by_home = cache
+            response_store = cache.get(pool_key)
+            if response_store is None:
+                response_store = ResponseStore(
+                    max_size=getattr(
+                        default_store,
+                        "_max_size",
+                        MAX_STORED_RESPONSES,
+                    ),
+                    db_path=str(home / "response_store.db"),
+                )
+                cache[pool_key] = response_store
+            return response_store
+
     async def _write_sse_responses(
         self,
         request: "web.Request",
@@ -6459,6 +8614,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str,
         gateway_session_key: Optional[str] = None,
         cleanup_ref: Optional[list] = None,
+        response_store: Optional[ResponseStore] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -6487,6 +8643,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tombstone confirms; only then may it become terminal.
         """
         import queue as _q
+
+        if response_store is None:
+            response_store = self._response_store_for_request()
 
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -6561,14 +8720,22 @@ class APIServerAdapter(BasePlatformAdapter):
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
-            self._response_store.put(response_id, {
+            persisted_session_id = _validate_internal_api_session_id(
+                (
+                    session_id
+                    if session_id_snapshot is None
+                    else session_id_snapshot
+                ),
+                source="responses_stream_snapshot",
+            )
+            response_store.put(response_id, {
                 "response": response_env,
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
-                "session_id": session_id_snapshot or session_id,
+                "session_id": persisted_session_id,
             })
             if conversation and response_env.get("status") == "completed":
-                self._response_store.set_conversation(conversation, response_id)
+                response_store.set_conversation(conversation, response_id)
 
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
@@ -6980,11 +9147,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Pick up agent result + usage from the completed task.
             result: Any = None
+            effective_session_id = session_id
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
                 outcome_input = result
                 result_mapping = result if isinstance(result, Mapping) else {}
+                effective_session_id = _effective_internal_api_session_id(
+                    result_mapping,
+                    fallback=session_id,
+                    source="responses_stream_result",
+                )
                 # If the agent produced a final_response but no text
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
@@ -6996,6 +9169,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     final_response_text = agent_final
                 if result_mapping.get("error"):
                     agent_error = _redact_api_error_text(result_mapping["error"])
+            except _InvalidInternalAPISessionID:
+                logger.error(
+                    "Agent returned an invalid internal session ID for "
+                    "Responses stream %s",
+                    response_id,
+                )
+                agent_error = "Internal session continuity state is invalid."
+                outcome_input = {
+                    "completed": False,
+                    "failed": True,
+                    "turn_exit_reason": "invalid_internal_session_id",
+                    "error": agent_error,
+                }
+                result_mapping = {}
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
@@ -7101,6 +9288,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "type": "server_error",
                 }
                 failed_env["hermes"] = outcome_fields
+                if (
+                    outcome["turn_exit_reason"]
+                    == "invalid_internal_session_id"
+                ):
+                    failed_env["error"][
+                        "code"
+                    ] = "invalid_internal_session_id"
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -7169,11 +9363,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # _build_response_conversation_history (result["_compressed"]);
                 # here we only propagate a compression-rotated session_id so
                 # previous_response_id chaining resumes the child session.
-                _result_sid = result.get("session_id") if isinstance(result, dict) else None
                 _persist_response_snapshot(
                     completed_env,
                     conversation_history_snapshot=full_history,
-                    session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
+                    session_id_snapshot=effective_session_id,
                 )
                 terminal_snapshot_persisted = True
                 await _write_event("response.completed", {
@@ -7288,9 +9481,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
 
+        response_store = self._response_store_for_request()
+
         # Resolve conversation name to latest response_id
         if conversation:
-            previous_response_id = self._response_store.get_conversation(conversation)
+            previous_response_id = response_store.get_conversation(conversation)
             # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
@@ -7339,11 +9534,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
-            stored_session_id = stored.get("session_id")
+            if "session_id" in stored:
+                try:
+                    stored_session_id = _validate_internal_api_session_id(
+                        stored["session_id"],
+                        source="responses_previous_response",
+                    )
+                except _InvalidInternalAPISessionID:
+                    return _invalid_internal_session_id_response()
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
@@ -7392,15 +9594,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
+        # Preserve creation-request idempotency when no session existed before
+        # this call: the execution session itself is newly generated on every
+        # HTTP retry, so it cannot be the cache namespace in that case.
+        idempotency_session_scope = (
+            provided_session_id
+            or stored_session_id
+            or (f"conversation:{conversation}" if conversation else "new-response")
+        )
         session_id = provided_session_id or stored_session_id or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
-        agent_overrides = _request_agent_overrides(
-            body,
-            virtual_model=self._model_name,
-            allow_bare_model=self._direct_model_requests,
-        )
+        try:
+            agent_overrides = _request_agent_overrides(
+                body,
+                virtual_model=self._active_model_name(),
+                allow_bare_model=self._direct_model_requests_enabled(),
+            )
+        except ValueError as exc:
+            return _invalid_runtime_request_response(exc)
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -7497,7 +9710,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
-            model_name = body.get("model", self._model_name)
+            model_name = body.get("model", self._active_model_name())
             created_at = int(time.time())
 
             return await self._write_sse_responses(
@@ -7516,6 +9729,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 cleanup_ref=cleanup_ref,
+                response_store=response_store,
             )
 
         reservation = self._reserve_agent_run()
@@ -7523,7 +9737,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._concurrency_limit_response()
 
         async def _compute_response():
-            return await self._run_agent_from_reservation(
+            computed_result, computed_usage = await self._run_agent_from_reservation(
                 reservation,
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -7533,10 +9747,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 **agent_overrides,
                 route=route,
             )
+            # Keep corrupt result continuity state out of the idempotency cache.
+            _effective_internal_api_session_id(
+                computed_result,
+                fallback=session_id,
+                source="responses_result_before_cache",
+            )
+            return computed_result, computed_usage
 
         idempotency_key = request.headers.get("Idempotency-Key")
         try:
             if idempotency_key:
+                cache_key = _scoped_idempotency_cache_key(
+                    idempotency_key,
+                    adapter_scope=getattr(
+                        self,
+                        "_idempotency_adapter_scope",
+                        f"legacy-adapter:{id(self)}",
+                    ),
+                    request_scope=(
+                        _api_request_authority.get()
+                        or self._api_request_scope("request")
+                    ),
+                    session_id=idempotency_session_scope,
+                    gateway_session_key=gateway_session_key,
+                )
                 fp = _make_request_fingerprint(
                     body,
                     keys=[
@@ -7548,11 +9783,21 @@ class APIServerAdapter(BasePlatformAdapter):
                         "provider",
                         "model_options",
                         "tools",
+                        "conversation_history",
+                        "truncation",
+                        "store",
                     ],
                 )
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+                cache = getattr(self, "_idempotency_cache", _idem_cache)
+                result, usage = await cache.get_or_set(
+                    cache_key,
+                    fp,
+                    _compute_response,
+                )
             else:
                 result, usage = await _compute_response()
+        except _InvalidInternalAPISessionID:
+            return _invalid_internal_session_id_response()
         except Exception as e:
             logger.error("Error running agent for responses: %s", e, exc_info=True)
             return web.json_response(
@@ -7589,10 +9834,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # response and the X-Hermes-Session-Id header.  Without this,
         # previous_response_id chaining keeps resuming the pre-rotation
         # session and re-triggers compression on every subsequent request.
-        _effective_session_id = session_id
-        _result_sid = result.get("session_id") if isinstance(result, dict) else None
-        if isinstance(_result_sid, str) and _result_sid:
-            _effective_session_id = _result_sid
+        try:
+            _effective_session_id = _effective_internal_api_session_id(
+                result_mapping,
+                fallback=session_id,
+                source="responses_result",
+            )
+        except _InvalidInternalAPISessionID:
+            return _invalid_internal_session_id_response()
 
         # Build output items from the current turn only.  AIAgent returns a
         # full transcript in result["messages"], while older/mocked paths may
@@ -7620,7 +9869,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": response_status,
             "created_at": created_at,
-            "model": body.get("model", self._model_name),
+            "model": body.get("model", self._active_model_name()),
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -7649,7 +9898,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
-            self._response_store.put(response_id, {
+            response_store.put(response_id, {
                 "response": response_data,
                 "conversation_history": full_history,
                 "instructions": instructions,
@@ -7658,7 +9907,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
             if conversation and outcome["completed"]:
-                self._response_store.set_conversation(conversation, response_id)
+                response_store.set_conversation(conversation, response_id)
 
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:
@@ -7681,7 +9930,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         response_id = request.match_info["response_id"]
-        stored = self._response_store.get(response_id)
+        stored = self._response_store_for_request().get(response_id)
         if stored is None:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -7694,7 +9943,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         response_id = request.match_info["response_id"]
-        deleted = self._response_store.delete(response_id)
+        deleted = self._response_store_for_request().delete(response_id)
         if not deleted:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -8286,6 +10535,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 session_key=session_key,
                 session_id=session_id,
+                # The request middleware is the authority for multiplex
+                # profile selection.  Carry that trusted label into the
+                # detached delegation owner alongside the already scoped,
+                # canonical HERMES_HOME so a later wake can prove both refer
+                # to the same served profile.
+                profile=str(
+                    getattr(_api_request_authority.get(), "profile", "")
+                    or _api_request_profile.get()
+                    or ""
+                ),
                 capability_epoch_sha256=capability_epoch_sha256,
                 async_delivery=False,
             ),
@@ -8749,6 +11008,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     getattr(agent, "_api_approval_session_key", "") or ""
                 ),
                 cancel_core=True,
+                request_authority=getattr(
+                    agent,
+                    "_api_request_authority",
+                    None,
+                ),
             )
 
         try:
@@ -8800,6 +11064,8 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         clarify_notify_callback=None,
         approval_event_callback=None,
+        runtime_effect: Optional[dict] = None,
+        api_execution_context: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -8816,6 +11082,27 @@ class APIServerAdapter(BasePlatformAdapter):
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
         """
+        from agent.runtime_effects import normalize_optional_runtime_effect
+
+        runtime_effect = normalize_optional_runtime_effect(runtime_effect)
+        from gateway.api_execution_context import (
+            normalize_api_execution_context,
+        )
+
+        api_execution_context = normalize_api_execution_context(
+            api_execution_context
+        )
+        # Freeze the host-owned tenant authority before any background or
+        # executor handoff.  ContextVars are copied as a defence in depth, but
+        # all lifecycle keys below receive this exact immutable value.
+        request_authority = (
+            _api_request_authority.get()
+            or self._api_request_scope("request")
+        )
+        bound_session_key = request_authority.bind(
+            "capability-session",
+            session_id or gateway_session_key or "",
+        ).internal_key
         if cleanup_ref is not None:
             pending_state = {
                 "status": "authority_creation_pending",
@@ -8835,7 +11122,6 @@ class APIServerAdapter(BasePlatformAdapter):
         def _run():
             from gateway.session_context import clear_session_vars
             from tools.approval import (
-                clear_session_local,
                 register_gateway_notify,
                 reset_current_session_key,
                 set_current_session_key,
@@ -8844,23 +11130,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Cached agents carry mutable callbacks/transcript state.  Serialize
             # exact-session turns from cache lookup through final cache fencing.
-            with self._api_agent_run_lock_for(session_id):
+            with self._api_agent_run_lock_for(
+                session_id,
+                request_authority=request_authority,
+            ):
                 try:
                     # The long-term-memory key may span conversation rotations;
                     # dangerous-action authority must be exact-conversation
                     # scoped instead.
-                    bound_session_key = session_id or gateway_session_key or ""
-                    stable_memory_key = str(gateway_session_key or "")
-                    if (
-                        stable_memory_key
-                        and stable_memory_key != bound_session_key
-                    ):
-                        # Older API versions used the long-lived memory key as
-                        # their local approval namespace.  Fence any residual
-                        # process-local authority before the exact conversation
-                        # starts.  No durable authority envelope is issued for
-                        # this memory-only key in the new runtime.
-                        clear_session_local(stable_memory_key)
                     approval_token = None
                     approval_notify_registered = False
                     try:
@@ -8918,6 +11195,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=str(session_id or ""),
                                 approval_session_key=bound_session_key,
                                 event_callback=approval_event_callback,
+                                request_authority=request_authority,
                             )
                             register_gateway_notify(
                                 bound_session_key,
@@ -8939,6 +11217,42 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_model=session_model,
                                 confirmed_runtime_lock=confirmed_runtime_lock,
                                 clarify_notify_callback=clarify_notify_callback,
+                                request_authority=request_authority,
+                            )
+                            self._assert_api_execution_context_matches_agent(
+                                api_execution_context,
+                                agent,
+                            )
+                            (
+                                captured_api_execution_context,
+                                detached_ineligible_reason,
+                            ) = self._build_api_detached_execution_context(
+                                agent=agent,
+                                gateway_session_key=gateway_session_key,
+                                ephemeral_system_prompt=ephemeral_system_prompt,
+                                requested_model=requested_model,
+                                requested_provider=requested_provider,
+                                model_options=model_options,
+                                route=route,
+                                session_model=session_model,
+                                requested_runtime=requested_runtime,
+                                route_source=route_source,
+                                confirmed_runtime_lock=confirmed_runtime_lock,
+                            )
+                            if (
+                                api_execution_context is not None
+                                and captured_api_execution_context
+                                != api_execution_context
+                            ):
+                                raise _DetachedApiContinuityError(
+                                    "detached API execution context changed "
+                                    "before completion"
+                                )
+                            agent._api_detached_execution_context = (
+                                captured_api_execution_context
+                            )
+                            agent._api_detached_ineligible_reason = (
+                                detached_ineligible_reason
                             )
                             owned_agent_ref[0] = agent
                             agent._api_approval_session_key = bound_session_key
@@ -8946,12 +11260,22 @@ class APIServerAdapter(BasePlatformAdapter):
                                 self._api_active_agents[id(agent)] = agent
                             if agent_ref is not None:
                                 agent_ref[0] = agent
-                            effective_task_id = session_id or str(uuid.uuid4())
+                            effective_task_id = request_authority.bind(
+                                "task",
+                                session_id or str(uuid.uuid4()),
+                            ).internal_key
                             self._attest_capability_agent_policy(agent)
+                            conversation_kwargs = {
+                                "user_message": user_message,
+                                "conversation_history": conversation_history,
+                                "task_id": effective_task_id,
+                            }
+                            if runtime_effect is not None:
+                                conversation_kwargs["runtime_effect"] = (
+                                    runtime_effect
+                                )
                             result = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
+                                **conversation_kwargs
                             )
                             if isinstance(result, Mapping) and not isinstance(result, dict):
                                 result = dict(result)
@@ -8971,12 +11295,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             }
                             # Include the effective session ID in the result so
                             # callers can track compression-triggered rotations.
-                            _eff_sid = getattr(agent, "session_id", session_id)
-                            if (
-                                isinstance(result, dict)
-                                and isinstance(_eff_sid, str)
-                                and _eff_sid
-                            ):
+                            _eff_sid = _validate_internal_api_session_id(
+                                getattr(agent, "session_id", session_id),
+                                source="agent.session_id",
+                            )
+                            if isinstance(result, dict):
                                 result["session_id"] = _eff_sid
                             _compacted_in_place = bool(
                                 getattr(agent, "_last_compaction_in_place", False)
@@ -9074,19 +11397,26 @@ class APIServerAdapter(BasePlatformAdapter):
                                     result["runtime"] = runtime
                                 usage["runtime"] = runtime
                         except _ProviderAuthResolutionError as exc:
+                            safe_error = _redact_api_error_text(exc, limit=500)
                             logger.warning(
                                 "Provider authentication failed for session=%s: %s",
                                 session_id or "",
-                                exc,
+                                safe_error,
+                            )
+                            error_msg = (
+                                "⚠️ Provider authentication failed: "
+                                f"{safe_error}"
                             )
                             result = {
-                                "final_response": (
-                                    "⚠️ Provider authentication failed: "
-                                    f"{exc}"
-                                ),
+                                "final_response": error_msg,
+                                "error": error_msg,
                                 "messages": [],
                                 "api_calls": 0,
                                 "tools": [],
+                                "status": "failed",
+                                **_terminal_failure_outcome_fields(
+                                    "provider_auth_resolution_failed"
+                                ),
                             }
                             usage = {
                                 "input_tokens": 0,
@@ -9115,31 +11445,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                     self._clear_api_approval_scope(
                                         session_id,
                                         approval_session_key=bound_session_key,
+                                        request_authority=request_authority,
                                     )
-                                    try:
-                                        if (
-                                            stable_memory_key
-                                            and stable_memory_key
-                                            != bound_session_key
-                                        ):
-                                            # A legacy/internal caller must not
-                                            # be able to leave fresh authority
-                                            # under the memory scope during this
-                                            # exact-conversation turn.
-                                            clear_session_local(
-                                                stable_memory_key,
-                                                retire_capability_epoch_sha256=(
-                                                    bound_capability_epoch_sha256
-                                                ),
-                                            )
-                                    finally:
-                                        clear_session_vars(tokens)
+                                    clear_session_vars(tokens)
 
                     evicted_agent = self._finalize_api_agent_cache_after_turn(
                         requested_session_id=session_id,
                         agent=agent,
                         result=result,
                         execution_error=execution_error,
+                        request_authority=request_authority,
                     )
                     return (
                         result,
@@ -9154,6 +11469,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     evicted = self._pop_cached_api_agent(
                         session_id,
                         expected_agent=owned_agent_ref[0],
+                        request_authority=request_authority,
                     )
                     if evicted is not None:
                         self._release_api_cached_agent(evicted)
@@ -9194,7 +11510,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
-        executor_future = loop.run_in_executor(None, _run)
+        # ``run_in_executor`` does not propagate ContextVars.  The API profile
+        # middleware owns both profile-home and secret authority, so every
+        # worker submission receives a fresh snapshot from this exact request.
+        request_context = contextvars.copy_context()
+        executor_future = loop.run_in_executor(
+            None,
+            request_context.run,
+            _run,
+        )
         completion_owner = asyncio.create_task(
             _own_execution_and_cleanup(executor_future)
         )
@@ -9211,10 +11535,23 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+    def _set_run_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        run_scope: Optional[APIRequestScope] = None,
+        request_authority: Optional[APIRequestScope] = None,
+        **fields: Any,
+    ) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
+        run_scope = run_scope or self._api_request_scope(
+            "run",
+            run_id,
+            authority=request_authority,
+        )
         now = time.time()
-        current = self._run_statuses.get(run_id, {})
+        current = self._run_statuses.get(run_scope, {})
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -9223,18 +11560,32 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
-        self._run_statuses[run_id] = current
+        self._run_statuses[run_scope] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        *,
+        run_scope: Optional[APIRequestScope] = None,
+        request_authority: Optional[APIRequestScope] = None,
+    ):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        run_scope = run_scope or self._api_request_scope(
+            "run",
+            run_id,
+            authority=request_authority,
+        )
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
-                self._run_statuses.get(run_id, {}).get("status", "running"),
+                self._run_statuses.get(run_scope, {}).get("status", "running"),
+                run_scope=run_scope,
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
+            q = self._run_streams.get(run_scope)
             if q is None:
                 return
             try:
@@ -9331,6 +11682,15 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be an object"),
+                status=400,
+            )
+        request_authority = (
+            _api_request_authority.get()
+            or self._api_request_scope("request")
+        )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -9365,10 +11725,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._response_store_for_request().get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
-                stored_session_id = stored.get("session_id")
+                if "session_id" in stored:
+                    try:
+                        stored_session_id = _validate_internal_api_session_id(
+                            stored["session_id"],
+                            source="runs_previous_response",
+                        )
+                    except _InvalidInternalAPISessionID:
+                        return _invalid_internal_session_id_response()
                 if instructions is None:
                     instructions = stored.get("instructions")
 
@@ -9387,9 +11754,25 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        session_id = body.get("session_id") or stored_session_id
+        if "session_id" in body:
+            session_id, session_err = self._validate_api_session_id_value(
+                body.get("session_id"),
+                required=True,
+            )
+            if session_err is not None:
+                return session_err
+        elif stored_session_id is not None:
+            session_id = stored_session_id
+        else:
+            session_id = ""
         route = self._resolve_route(body.get("model"))
-        agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
+        try:
+            agent_overrides = _request_agent_overrides(
+                body,
+                virtual_model=self._active_model_name(),
+            )
+        except ValueError as exc:
+            return _invalid_runtime_request_response(exc)
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -9406,32 +11789,40 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
+        run_scope = request_authority.bind("run", run_id)
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
-        approval_session_key = run_id
+        approval_session_key = request_authority.bind(
+            "run-approval",
+            run_id,
+        ).internal_key
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = created_at
-        self._run_approval_sessions[run_id] = approval_session_key
+        self._run_streams[run_scope] = q
+        self._run_streams_created[run_scope] = created_at
+        self._run_approval_sessions[run_scope] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(
+            run_id,
+            loop,
+            run_scope=run_scope,
+        )
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
+            if self._run_streams.get(run_scope) is q:
                 q.put_nowait(event)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
-            if run_id not in self._run_streams:
+            if run_scope not in self._run_streams:
                 return
             try:
                 loop.call_soon_threadsafe(_put_event_if_active, {
@@ -9446,15 +11837,22 @@ class APIServerAdapter(BasePlatformAdapter):
         def _clarify_notify(payload: Dict[str, Any]) -> None:
             clarify_id = str(payload.get("id", "") or "")
             if clarify_id:
+                clarification_scope = request_authority.bind(
+                    "clarification-id",
+                    clarify_id,
+                )
                 with self._api_clarifications_lock:
-                    state = self._api_pending_clarifications.get(clarify_id)
+                    state = self._api_pending_clarifications.get(
+                        clarification_scope
+                    )
                     if state is not None:
-                        state["_run_id"] = run_id
+                        state["_run_scope"] = run_scope
 
             def _publish() -> None:
                 self._set_run_status(
                     run_id,
                     "waiting_for_clarification",
+                    run_scope=run_scope,
                     last_event="clarify.request",
                 )
                 try:
@@ -9475,21 +11873,22 @@ class APIServerAdapter(BasePlatformAdapter):
         self._set_run_status(
             run_id,
             "queued",
+            run_scope=run_scope,
             created_at=created_at,
             session_id=session_id,
-            model=body.get("model", self._model_name),
+            model=body.get("model", self._active_model_name()),
         )
-
-        # Background task outlives the HTTP response (and thus the middleware
-        # profile scope). Capture now and re-enter inside the task/executor.
-        request_profile = _api_request_profile.get()
 
         async def _run_and_close():
             terminalized = False
             agent = None
             try:
-                self._set_run_status(run_id, "running")
-                if run_id in self._stopping_run_ids:
+                self._set_run_status(
+                    run_id,
+                    "running",
+                    run_scope=run_scope,
+                )
+                if run_scope in self._stopping_run_ids:
                     _put_event_if_active(
                         {
                             "event": "run.cancelled",
@@ -9506,6 +11905,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._set_run_status(
                         run_id,
                         "cancelled",
+                        run_scope=run_scope,
                         completed=False,
                         partial=False,
                         interrupted=True,
@@ -9602,6 +12002,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
+                        run_scope=run_scope,
                         last_event="approval.request",
                         pending_approval_id=approval_id,
                     )
@@ -9629,6 +12030,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._set_run_status(
                             run_id,
                             "cleanup_blocked",
+                            run_scope=run_scope,
                             completed=False,
                             incomplete=True,
                             terminal=False,
@@ -9667,14 +12069,21 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
-                    effective_task_id = session_id or run_id
+                    effective_task_id = request_authority.bind(
+                        "task",
+                        session_id or run_id,
+                    ).internal_key
                     approval_token = None
                     session_tokens = []
                     cleanup_handle: Optional[_APIServerCleanupHandle] = None
                     result: Any = None
                     execution_error: Optional[Exception] = None
                     stop_requested_before_execution_finished = False
-                    with self._profile_scope(request_profile):
+                    from gateway.run import _profile_runtime_scope
+
+                    with _profile_runtime_scope(
+                        Path(request_authority.canonical_home)
+                    ):
                         try:
                             try:
                                 # Bind approval/session identity for this API run via
@@ -9711,6 +12120,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     self._set_run_status(
                                         run_id,
                                         "running",
+                                        run_scope=run_scope,
                                         model_release_receipt=dict(
                                             model_release_receipt
                                         ),
@@ -9733,9 +12143,40 @@ class APIServerAdapter(BasePlatformAdapter):
                                     route=route,
                                     clarify_notify_callback=_clarify_notify,
                                     reuse_cached_agent=False,
+                                    request_authority=request_authority,
                                 )
-                                self._active_run_agents[run_id] = agent
-                                if run_id in self._stopping_run_ids:
+                                (
+                                    agent._api_detached_execution_context,
+                                    agent._api_detached_ineligible_reason,
+                                ) = self._build_api_detached_execution_context(
+                                    agent=agent,
+                                    gateway_session_key=gateway_session_key,
+                                    ephemeral_system_prompt=(
+                                        ephemeral_system_prompt
+                                    ),
+                                    requested_model=agent_overrides.get(
+                                        "requested_model"
+                                    ),
+                                    requested_provider=agent_overrides.get(
+                                        "requested_provider"
+                                    ),
+                                    model_options=agent_overrides.get(
+                                        "model_options"
+                                    ),
+                                    route=route,
+                                    session_model=None,
+                                    requested_runtime=None,
+                                    route_source=(
+                                        "model_routes"
+                                        if route is not None
+                                        else "raw_request"
+                                        if agent_overrides
+                                        else "global"
+                                    ),
+                                    confirmed_runtime_lock=False,
+                                )
+                                self._active_run_agents[run_scope] = agent
+                                if run_scope in self._stopping_run_ids:
                                     agent.interrupt(
                                         "Stop requested via API before run start"
                                     )
@@ -9762,7 +12203,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # while exact capability revoke is blocking must not
                             # rewrite an already model-completed outcome.
                             stop_requested_before_execution_finished = (
-                                run_id in self._stopping_run_ids
+                                run_scope in self._stopping_run_ids
                             )
                             try:
                                 if cleanup_handle is not None:
@@ -9816,7 +12257,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         await asyncio.shield(retry_task)
                     return outcome
 
-                executor_future = loop.run_in_executor(None, _run_sync)
+                run_context = contextvars.copy_context()
+                executor_future = loop.run_in_executor(
+                    None,
+                    run_context.run,
+                    _run_sync,
+                )
                 completion_owner = asyncio.create_task(
                     _own_run_sync(executor_future)
                 )
@@ -9833,6 +12279,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._set_run_status(
                         run_id,
                         "cleanup_blocked",
+                        run_scope=run_scope,
                         completed=False,
                         incomplete=True,
                         terminal=False,
@@ -9864,12 +12311,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._set_run_status(
                         run_id,
                         "cancelled",
+                        run_scope=run_scope,
                         terminal=True,
                         last_event="run.cancelled",
                         **cancelled_fields,
                     )
                     terminalized = True
                     return
+                _effective_internal_api_session_id(
+                    result,
+                    fallback=session_id,
+                    source="run_result",
+                )
                 outcome = _session_stream_outcome(result)
                 result_mapping = result if isinstance(result, Mapping) else {}
                 final_response = result_mapping.get("final_response", "") or ""
@@ -9910,12 +12363,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     terminal_event["error"] = error_msg
                     status_fields["error"] = error_msg
                 _put_event_if_active(terminal_event)
-                self._set_run_status(run_id, outcome["status"], **status_fields)
+                self._set_run_status(
+                    run_id,
+                    outcome["status"],
+                    run_scope=run_scope,
+                    **status_fields,
+                )
                 terminalized = True
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
                     "stopping",
+                    run_scope=run_scope,
                     completed=False,
                     partial=False,
                     interrupted=True,
@@ -9925,6 +12384,37 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.stopping",
                 )
                 raise
+            except _InvalidInternalAPISessionID:
+                error_msg = "Internal session continuity state is invalid."
+                failure_fields = {
+                    "error": error_msg,
+                    "error_code": "invalid_internal_session_id",
+                    "terminal": True,
+                    "completed": False,
+                    "partial": False,
+                    "interrupted": False,
+                    "failed": True,
+                    "incomplete": True,
+                    "turn_exit_reason": "invalid_internal_session_id",
+                    "last_event": "run.failed",
+                }
+                self._set_run_status(
+                    run_id,
+                    "failed",
+                    run_scope=run_scope,
+                    **failure_fields,
+                )
+                _put_event_if_active({
+                    "event": "run.failed",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    **{
+                        key: value
+                        for key, value in failure_fields.items()
+                        if key not in {"terminal", "last_event"}
+                    },
+                })
+                terminalized = True
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
                 # not route through _run_agent() (see that method's own
@@ -9933,28 +12423,51 @@ class APIServerAdapter(BasePlatformAdapter):
                 # message the other endpoints give a provider auth/credential
                 # failure, instead of falling through to the generic
                 # except-Exception branch below.
-                logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-                error_msg = f"⚠️ Provider authentication failed: {exc}"
+                safe_error = _redact_api_error_text(exc, limit=500)
+                logger.warning(
+                    "Provider authentication failed for run=%s: %s",
+                    run_id,
+                    safe_error,
+                )
+                error_msg = (
+                    "⚠️ Provider authentication failed: "
+                    f"{safe_error}"
+                )
+                failure_outcome = _terminal_failure_outcome_fields(
+                    "provider_auth_resolution_failed"
+                )
+                failure_fields = {
+                    "error": error_msg,
+                    "terminal": True,
+                    "last_event": "run.failed",
+                    **failure_outcome,
+                }
                 self._set_run_status(
                     run_id,
                     "failed",
-                    error=error_msg,
-                    last_event="run.failed",
+                    run_scope=run_scope,
+                    **failure_fields,
                 )
                 try:
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": error_msg,
+                        **{
+                            key: value
+                            for key, value in failure_fields.items()
+                            if key not in {"terminal", "last_event", "status"}
+                        },
                     })
                 except Exception:
                     pass
+                terminalized = True
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
                 self._set_run_status(
                     run_id,
                     "failed",
+                    run_scope=run_scope,
                     error=_redact_api_error_text(exc),
                     terminal=True,
                     completed=False,
@@ -9989,11 +12502,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         _put_event_if_active(None)
                     except Exception:
                         pass
-                    self._active_run_agents.pop(run_id, None)
-                    self._active_run_tasks.pop(run_id, None)
-                    self._run_approval_sessions.pop(run_id, None)
+                    self._active_run_agents.pop(run_scope, None)
+                    self._active_run_tasks.pop(run_scope, None)
+                    self._run_approval_sessions.pop(run_scope, None)
                     self._release_api_cached_agent(agent)
-                    self._stopping_run_ids.discard(run_id)
+                    self._stopping_run_ids.discard(run_scope)
 
         try:
             task = asyncio.create_task(_run_and_close())
@@ -10001,7 +12514,7 @@ class APIServerAdapter(BasePlatformAdapter):
             reservation.release()
             raise
         task.add_done_callback(lambda _task: reservation.release())
-        self._active_run_tasks[run_id] = task
+        self._active_run_tasks[run_scope] = task
         # The registered task now owns the run's liveness.  Release the
         # pre-registration reservation synchronously so drain/concurrency
         # accounting never counts this one logical run twice while the event
@@ -10031,7 +12544,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
+        run_scope = self._api_request_scope("run", run_id)
+        status = self._run_statuses.get(run_scope)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -10046,17 +12560,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        run_scope = self._api_request_scope("run", run_id)
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
-            if run_id in self._run_streams:
+            if run_scope in self._run_streams:
                 break
             await asyncio.sleep(0.05)
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
-        self._run_stream_subscribers.add(run_id)
+        q = self._run_streams[run_scope]
+        self._run_stream_subscribers.add(run_scope)
 
         response = web.StreamResponse(
             status=200,
@@ -10084,9 +12599,9 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            self._run_stream_subscribers.discard(run_scope)
+            self._run_streams.pop(run_scope, None)
+            self._run_streams_created.pop(run_scope, None)
 
         return response
 
@@ -10113,7 +12628,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return session_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
+        request_authority = (
+            _api_request_authority.get()
+            or self._api_request_scope("request")
+        )
+        run_scope = request_authority.bind("run", run_id)
+        status = self._run_statuses.get(run_scope)
         if status is None or str(status.get("session_id", "") or "") != session_id:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -10163,8 +12683,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        approval_session_key = self._run_approval_sessions.get(run_id)
-        if approval_session_key != run_id:
+        approval_session_key = self._run_approval_sessions.get(run_scope)
+        expected_approval_key = request_authority.bind(
+            "run-approval",
+            run_id,
+        ).internal_key
+        if approval_session_key != expected_approval_key:
             return web.json_response(
                 _openai_error(
                     f"Run has no active approval session: {run_id}",
@@ -10257,10 +12781,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._set_run_status(
             run_id,
             "running",
+            run_scope=run_scope,
             last_event="approval.responded",
             pending_approval_id=None,
         )
-        q = self._run_streams.get(run_id)
+        q = self._run_streams.get(run_scope)
         if q is not None:
             try:
                 q.put_nowait({
@@ -10291,8 +12816,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        agent = self._active_run_agents.get(run_id)
-        task = self._active_run_tasks.get(run_id)
+        run_scope = self._api_request_scope("run", run_id)
+        agent = self._active_run_agents.get(run_scope)
+        task = self._active_run_tasks.get(run_scope)
 
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
@@ -10300,12 +12826,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._set_run_status(
             run_id,
             "stopping",
+            run_scope=run_scope,
             completed=False,
             incomplete=True,
             terminal=False,
             last_event="run.stopping",
         )
-        self._stopping_run_ids.add(run_id)
+        self._stopping_run_ids.add(run_scope)
 
         if agent is not None:
             try:
@@ -10340,41 +12867,44 @@ class APIServerAdapter(BasePlatformAdapter):
             "incomplete",
         }
         stale = [
-            run_id
-            for run_id, created_at in list(self._run_streams_created.items())
+            run_scope
+            for run_scope, created_at in list(self._run_streams_created.items())
             if now - created_at > self._RUN_STREAM_TTL
-            and run_id not in self._run_stream_subscribers
+            and run_scope not in self._run_stream_subscribers
         ]
-        for run_id in stale:
+        for run_scope in stale:
             logger.debug(
-                "[api_server] sweeping expired run transport %s", run_id
+                "[api_server] sweeping expired run transport %s",
+                run_scope.public_id,
             )
-            task = self._active_run_tasks.get(run_id)
+            task = self._active_run_tasks.get(run_scope)
             task_done = task is None or task.done()
-            if task_done and run_id not in self._active_run_agents:
+            if task_done and run_scope not in self._active_run_agents:
                 try:
                     from tools.approval import unregister_gateway_notify
 
-                    approval_session_key = self._run_approval_sessions.get(run_id)
+                    approval_session_key = self._run_approval_sessions.get(
+                        run_scope
+                    )
                     if approval_session_key:
                         unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
-                self._run_approval_sessions.pop(run_id, None)
-                self._stopping_run_ids.discard(run_id)
+                self._run_approval_sessions.pop(run_scope, None)
+                self._stopping_run_ids.discard(run_scope)
             # Transport age only bounds buffering.  A live task, agent, epoch,
             # or cleanup handle remains owned by the exact terminal path.
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            self._run_streams.pop(run_scope, None)
+            self._run_streams_created.pop(run_scope, None)
 
         stale_statuses = [
-            run_id
-            for run_id, status in list(self._run_statuses.items())
+            run_scope
+            for run_scope, status in list(self._run_statuses.items())
             if status.get("status") in terminal_statuses
             and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
         ]
-        for run_id in stale_statuses:
-            self._run_statuses.pop(run_id, None)
+        for run_scope in stale_statuses:
+            self._run_statuses.pop(run_scope, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -10428,6 +12958,17 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
 
+        try:
+            self._api_multiplex_enabled()
+        except RuntimeError as exc:
+            self._set_fatal_error(
+                "api_server_multiplex_unsupported",
+                str(exc),
+                retryable=False,
+            )
+            logger.error("[%s] Refusing multiplex API server: %s", self.name, exc)
+            return False
+
         if not self._api_key_passes_startup_guard():
             # A rejected API_SERVER_KEY is a configuration error, not a
             # transient blip — the key will not become valid on its own. A
@@ -10452,6 +12993,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Capture profile path + directory generation before the listener
+            # is reachable.  The snapshot is immutable for this adapter
+            # lifetime; profile additions/replacements require a full gateway
+            # restart and cannot inherit old in-memory or SQLite handles.
+            self._freeze_api_profile_inventory()
             mws = [
                 mw
                 for mw in (
@@ -10464,12 +13010,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
-            # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
-            # the profile-prefix middleware validates the prefix and scopes
-            # config/credentials to that profile when multiplexing is on.
+            # One process owns one profile and exposes only native routes.
+            # Shared ingress must route to separate per-profile processes.
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
-                self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
@@ -10627,6 +13171,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     getattr(agent, "_api_approval_session_key", "") or ""
                 ),
                 cancel_core=True,
+                request_authority=getattr(
+                    agent,
+                    "_api_request_authority",
+                    None,
+                ),
             )
 
         # Graceful shutdown is itself an authority boundary.  Keep retrying
@@ -10709,29 +13258,93 @@ class APIServerAdapter(BasePlatformAdapter):
                 (
                     str(state.get("session_id", "") or ""),
                     str(state.get("_approval_session_key", "") or ""),
+                    state.get("_request_scope"),
                 )
                 for state in pending_approvals.values()
             }
-        for session_id, approval_session_key in approval_scopes:
+        for session_id, approval_session_key, request_scope in approval_scopes:
             self._clear_api_approval_scope(
                 session_id,
                 approval_session_key=approval_session_key,
                 cancel_core=True,
+                request_authority=(
+                    request_scope
+                    if isinstance(request_scope, APIRequestScope)
+                    else None
+                ),
             )
 
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
-        if self._response_store is not None and not api_cleanup_handles:
+        session_dbs_lock = getattr(
+            self,
+            "_session_dbs_lock",
+            threading.RLock(),
+        )
+        with session_dbs_lock:
+            session_dbs = getattr(self, "_session_dbs", {})
+            owned_session_db_ids = set(
+                getattr(self, "_owned_session_db_ids", set())
+            )
+            owned_session_dbs = {
+                id(db): db
+                for db in session_dbs.values()
+                if db is not None and id(db) in owned_session_db_ids
+            }
+            injected_session_db = getattr(self, "_session_db", None)
+            if (
+                injected_session_db is not None
+                and id(injected_session_db) in owned_session_db_ids
+            ):
+                owned_session_dbs[id(injected_session_db)] = (
+                    injected_session_db
+                )
+            session_dbs.clear()
+            owned_ids = getattr(self, "_owned_session_db_ids", None)
+            if owned_ids is not None:
+                owned_ids.clear()
+        for session_db in owned_session_dbs.values():
             try:
-                self._response_store.close()
+                session_db.close()
             except Exception:
                 logger.debug(
-                    "Failed to close response store for %s", self.name, exc_info=True,
+                    "Failed to close SessionDB for %s",
+                    self.name,
+                    exc_info=True,
                 )
+        if not api_cleanup_handles:
+            response_stores: Dict[int, ResponseStore] = {}
+            default_response_store = getattr(self, "_response_store", None)
+            if default_response_store is not None:
+                response_stores[id(default_response_store)] = default_response_store
+            response_stores_lock = getattr(
+                self,
+                "_response_stores_lock",
+                threading.RLock(),
+            )
+            with response_stores_lock:
+                profile_response_stores = getattr(
+                    self,
+                    "_response_stores_by_home",
+                    {},
+                )
+                for response_store in profile_response_stores.values():
+                    if response_store is not None:
+                        response_stores[id(response_store)] = response_store
+                profile_response_stores.clear()
+            for response_store in response_stores.values():
+                try:
+                    response_store.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close response store for %s",
+                        self.name,
+                        exc_info=True,
+                    )
         elif api_cleanup_handles:
             logger.error(
-                "[%s] ResponseStore retained because exact cleanup is unresolved",
+                "[%s] ResponseStores retained because exact cleanup is unresolved",
                 self.name,
             )
         self._app = None

@@ -3754,14 +3754,20 @@ def run_job(
             _last_desc = _activity.get("last_activity_desc", "unknown")
             _secs_ago = _activity.get("seconds_since_activity", 0)
             _cur_tool = _activity.get("current_tool")
-            _iter_n = _activity.get("api_call_count", 0)
-            _iter_max = _activity.get("max_iterations", 0)
+            _api_calls_total = _activity.get("api_call_count", 0)
+            _slice_used = _activity.get("budget_used", 0)
+            _slice_max = _activity.get("budget_max", 0)
+            _renewals = _activity.get("iteration_budget_renewals", 0)
+            _lease_used = _activity.get("execution_lease_used", 0)
+            _lease_max = _activity.get("execution_lease_max", 0)
 
             logger.error(
                 "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
-                "| last_activity=%s | iteration=%s/%s | tool=%s",
+                "| last_activity=%s | api_calls_total=%s | slice=%s/%s "
+                "| renewals=%s | execution_lease=%s/%s | tool=%s",
                 job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
+                _last_desc, _api_calls_total, _slice_used, _slice_max,
+                _renewals, _lease_used, _lease_max,
                 _cur_tool or "none",
             )
             if hasattr(agent, "interrupt"):

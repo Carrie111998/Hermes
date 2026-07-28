@@ -95,6 +95,16 @@ class FakeChannel:
 @pytest.fixture
 def adapter(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    # gateway.run's production bootstrap can tighten the Discord target policy
+    # during collection of another test module.  These recovery-ledger tests
+    # use synthetic channels and exercise a different boundary.
+    monkeypatch.setitem(
+        DiscordAdapter.send.__globals__,
+        "_discord_policy_public_target_error",
+        lambda *_args, **_kwargs: None,
+    )
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = DiscordAdapter(config)
     bot_user = SimpleNamespace(id=999, bot=True, display_name="Hermes", name="hermes")
@@ -730,6 +740,37 @@ def test_final_delivery_remains_complete_after_processing_hook(adapter):
     assert adapter._discord_message_is_persistently_complete("91") is True
 
 
+def test_incomplete_agent_receipt_overrides_successful_delivery(adapter):
+    message = make_message(message_id=911)
+    event = MessageEvent(
+        text=message.content,
+        message_type=MessageType.TEXT,
+        raw_message=message,
+        message_id=str(message.id),
+    )
+
+    adapter._record_discord_processing_start(event, emoji_ack=False)
+    adapter._record_discord_response(
+        reply_to="911",
+        result=SimpleNamespace(success=True, message_id="9011"),
+        content="The implementation is partial; validation is blocked.",
+        final=True,
+    )
+    adapter._record_discord_processing_complete(
+        event,
+        ProcessingOutcome.INCOMPLETE,
+    )
+
+    status = adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT status FROM discord_messages WHERE message_id='911'"
+        ).fetchone()[0]
+    )
+    assert status == "incomplete"
+    assert adapter._discord_message_is_persistently_complete("911") is False
+    assert adapter._discord_recovery_cursor("123") is None
+
+
 def test_preview_delivery_does_not_mark_message_complete(adapter):
     adapter._record_discord_response(
         reply_to="92",
@@ -962,13 +1003,25 @@ async def test_cursor_does_not_advance_past_incomplete_dispatched_message(adapte
 
 def test_final_delivery_advances_channel_cursor(adapter):
     message = make_message(message_id=103, channel=FakeChannel(channel_id=123))
-    adapter._record_discord_message_seen(message, status="processing")
+    event = MessageEvent(
+        text=message.content,
+        message_type=MessageType.TEXT,
+        raw_message=message,
+        message_id=str(message.id),
+    )
+    adapter._record_discord_processing_start(event, emoji_ack=False)
 
     adapter._record_discord_response(
         reply_to="103",
         result=SimpleNamespace(success=True, message_id="9010"),
         content="done",
         final=True,
+    )
+    assert adapter._discord_recovery_cursor("123") is None
+
+    adapter._record_discord_processing_complete(
+        event,
+        ProcessingOutcome.SUCCESS,
     )
 
     assert adapter._discord_recovery_cursor("123") == "103"

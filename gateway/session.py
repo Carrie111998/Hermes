@@ -790,20 +790,52 @@ def build_session_context_prompt(
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
-def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+def sanitize_model_override(
+    override: Optional[Dict[str, Any]],
+    *,
+    reject_unsafe: bool = True,
+) -> Optional[Dict[str, str]]:
     """Return a copy of *override* containing only persistable, non-secret keys.
 
     Returns ``None`` when the input is empty/not a dict or no persistable
     values remain, so callers can store the result directly on
-    ``SessionEntry.model_override``.
+    ``SessionEntry.model_override``. New writes reject unsafe runtime
+    identifiers. Legacy routing rows are loaded with ``reject_unsafe=False``:
+    one poisoned override is discarded as a unit instead of being replayed.
     """
     if not isinstance(override, dict):
         return None
-    cleaned = {
-        k: str(v)
-        for k, v in override.items()
-        if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
-    }
+    from gateway.api_execution_context import (
+        canonicalize_session_endpoint,
+        normalize_model_identifier,
+        normalize_session_provider_identifier,
+    )
+
+    try:
+        cleaned: Dict[str, str] = {}
+        if override.get("model") not in (None, ""):
+            cleaned["model"] = normalize_model_identifier(
+                override["model"],
+                field="session model override.model",
+                allow_empty=False,
+            )
+        if override.get("provider") not in (None, ""):
+            cleaned["provider"] = normalize_session_provider_identifier(
+                override["provider"],
+                field="session model override.provider",
+                allow_empty=False,
+            )
+        if override.get("base_url") not in (None, ""):
+            cleaned["base_url"] = canonicalize_session_endpoint(
+                override["base_url"]
+            )
+    except ValueError:
+        if reject_unsafe:
+            raise
+        logger.warning(
+            "Discarding unsafe persisted session model override"
+        )
+        return None
     return cleaned or None
 
 
@@ -959,7 +991,12 @@ class SessionEntry:
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
-            result["model_override"] = sanitize_model_override(self.model_override)
+            safe_override = sanitize_model_override(
+                self.model_override,
+                reject_unsafe=False,
+            )
+            if safe_override:
+                result["model_override"] = safe_override
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -1033,7 +1070,10 @@ class SessionEntry:
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
-            model_override=sanitize_model_override(data.get("model_override")),
+            model_override=sanitize_model_override(
+                data.get("model_override"),
+                reject_unsafe=False,
+            ),
         )
 
 
@@ -1266,6 +1306,9 @@ class SessionStore:
         before_capability_epoch_rotation_fn: (
             CapabilityEpochRotationCallback | None
         ) = None,
+        db_path: Path | None = None,
+        primary_profile_name: str | None = None,
+        served_profile_names: Optional[set[str]] = None,
     ):
         self.sessions_dir = sessions_dir
         self.config = config
@@ -1299,6 +1342,31 @@ class SessionStore:
         self._before_capability_epoch_rotation_fn = (
             before_capability_epoch_rotation_fn
         )
+        if primary_profile_name is None:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                primary_profile_name = (
+                    get_active_profile_name() or "default"
+                )
+            except Exception:
+                primary_profile_name = "default"
+        self._primary_profile_name = str(
+            primary_profile_name or "default"
+        )
+        self._served_profile_names = frozenset(
+            str(name)
+            for name in (
+                served_profile_names
+                if served_profile_names is not None
+                else {self._primary_profile_name}
+            )
+            if str(name)
+        )
+        if self._primary_profile_name not in self._served_profile_names:
+            raise ValueError(
+                "primary SessionStore profile is not in its frozen served set"
+            )
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
         # backward compatibility; disable via gateway.write_sessions_json.
@@ -1310,7 +1378,11 @@ class SessionStore:
         self._db = None
         try:
             from hermes_state import SessionDB
-            self._db = SessionDB()
+            self._db = (
+                SessionDB(Path(db_path))
+                if db_path is not None
+                else SessionDB()
+            )
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
 
@@ -1651,12 +1723,13 @@ class SessionStore:
         if not getattr(self.config, "multiplex_profiles", False):
             return None
         if source is not None and source.profile:
-            return source.profile
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            return get_active_profile_name() or "default"
-        except Exception:
-            return None
+            profile = str(source.profile)
+            if profile not in self._served_profile_names:
+                raise ValueError(
+                    f"Profile {profile!r} is not served by this SessionStore"
+                )
+            return profile
+        return self._primary_profile_name
 
     @staticmethod
     def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
@@ -1669,13 +1742,8 @@ class SessionStore:
         namespace = parts[1] or "main"
         return "default" if namespace == "main" else namespace
 
-    @staticmethod
-    def _active_profile_name() -> str:
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            return get_active_profile_name() or "default"
-        except Exception:
-            return "default"
+    def _active_profile_name(self) -> str:
+        return self._primary_profile_name
 
     def _recovered_row_allowed_for_active_profile(
         self,

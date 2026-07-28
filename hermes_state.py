@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -38,7 +39,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -107,6 +108,196 @@ def _scrub_surrogates(value: Any) -> Any:
     well-formed text.
     """
     return _sanitize_surrogates(value) if isinstance(value, str) else value
+
+
+def _normalize_session_model_config(
+    value: Any,
+    *,
+    field: str = "session.model_config",
+) -> Optional[Dict[str, Any]]:
+    """Validate durable runtime metadata before it reaches ``sessions``.
+
+    ``model_config`` also carries harmless lineage and UI fields, so retain
+    unknown JSON-safe keys while rejecting secret-shaped material anywhere in
+    the object. Fields that are later replayed as execution configuration are
+    additionally canonicalized through the same helpers used by the API
+    detached-execution envelope.
+    """
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a JSON object") from exc
+    else:
+        parsed = value
+    if not isinstance(parsed, Mapping):
+        raise ValueError(f"{field} must be a JSON object")
+
+    from gateway.api_execution_context import (
+        canonicalize_session_endpoint,
+        normalize_api_mode,
+        normalize_model_identifier,
+        normalize_model_options,
+        normalize_provider_slug,
+        normalize_route_source,
+        normalize_session_provider_identifier,
+        normalize_service_tier,
+        validate_nonsecret_durable_metadata,
+    )
+
+    validate_nonsecret_durable_metadata(parsed, field=field)
+    config: Dict[str, Any] = dict(parsed)
+
+    if "model" in config and config["model"] is not None:
+        config["model"] = normalize_model_identifier(
+            config["model"],
+            field=f"{field}.model",
+        )
+    if "provider" in config and config["provider"] is not None:
+        config["provider"] = normalize_session_provider_identifier(
+            config["provider"],
+            field=f"{field}.provider",
+        )
+    if "billing_provider" in config and config["billing_provider"] is not None:
+        config["billing_provider"] = normalize_provider_slug(
+            config["billing_provider"],
+            field=f"{field}.billing_provider",
+        )
+    if "base_url" in config and config["base_url"] is not None:
+        config["base_url"] = canonicalize_session_endpoint(
+            config["base_url"]
+        )
+    if "api_mode" in config and config["api_mode"] is not None:
+        config["api_mode"] = normalize_api_mode(
+            config["api_mode"],
+            field=f"{field}.api_mode",
+        )
+    if "service_tier" in config:
+        normalized_tier = normalize_service_tier(
+            config.get("service_tier"),
+            field=f"{field}.service_tier",
+        )
+        # Key presence is the durable "explicitly disable priority" marker;
+        # TUI resume distinguishes it from an absent key (inherit profile).
+        config["service_tier"] = normalized_tier or "normal"
+    if "reasoning_config" in config:
+        reasoning = config.get("reasoning_config")
+        if reasoning is None:
+            config["reasoning_config"] = None
+        else:
+            config["reasoning_config"] = normalize_model_options(
+                {"reasoning": reasoning}
+            ).get("reasoning")
+    if "model_options" in config:
+        config["model_options"] = normalize_model_options(
+            config.get("model_options")
+        )
+
+    if "browser_model_lock" in config:
+        raw_lock = config.get("browser_model_lock")
+        if not isinstance(raw_lock, Mapping):
+            raise ValueError(
+                f"{field}.browser_model_lock must be a JSON object"
+            )
+        confirmed = raw_lock.get("confirmed", False)
+        if not isinstance(confirmed, bool):
+            raise ValueError(
+                f"{field}.browser_model_lock.confirmed must be a boolean"
+            )
+        lock: Dict[str, Any] = {
+            "provider": normalize_provider_slug(
+                raw_lock.get("provider"),
+                field=f"{field}.browser_model_lock.provider",
+            ),
+            "model": normalize_model_identifier(
+                raw_lock.get("model"),
+                field=f"{field}.browser_model_lock.model",
+            ),
+            "model_options": normalize_model_options(
+                raw_lock.get("model_options")
+            ),
+            "route_source": normalize_route_source(
+                raw_lock.get("route_source"),
+                field=f"{field}.browser_model_lock.route_source",
+            ),
+            "confirmed": confirmed,
+        }
+        if "updated_at" in raw_lock:
+            updated_at = raw_lock.get("updated_at")
+            if (
+                isinstance(updated_at, bool)
+                or not isinstance(updated_at, (int, float))
+                or not math.isfinite(float(updated_at))
+            ):
+                raise ValueError(
+                    f"{field}.browser_model_lock.updated_at must be finite"
+                )
+            lock["updated_at"] = float(updated_at)
+        config["browser_model_lock"] = lock
+
+    if "gateway_runtime" in config:
+        raw_runtime = config.get("gateway_runtime")
+        if not isinstance(raw_runtime, Mapping):
+            raise ValueError(
+                f"{field}.gateway_runtime must be a JSON object"
+            )
+        runtime: Dict[str, Any] = {}
+        if raw_runtime.get("provider") not in (None, ""):
+            runtime["provider"] = normalize_provider_slug(
+                raw_runtime["provider"],
+                field=f"{field}.gateway_runtime.provider",
+                allow_empty=False,
+            )
+        if raw_runtime.get("base_url") not in (None, ""):
+            runtime["base_url"] = canonicalize_session_endpoint(
+                raw_runtime["base_url"]
+            )
+        if raw_runtime.get("api_mode") not in (None, ""):
+            runtime["api_mode"] = normalize_api_mode(
+                raw_runtime["api_mode"],
+                field=f"{field}.gateway_runtime.api_mode",
+                allow_empty=False,
+            )
+        if "fallback_active" in raw_runtime:
+            fallback_active = raw_runtime.get("fallback_active")
+            if not isinstance(fallback_active, bool):
+                raise ValueError(
+                    f"{field}.gateway_runtime.fallback_active must be a boolean"
+                )
+            runtime["fallback_active"] = fallback_active
+        config["gateway_runtime"] = runtime
+
+    return config
+
+
+def _serialized_session_model_config(
+    value: Any,
+    *,
+    field: str = "session.model_config",
+) -> Optional[str]:
+    config = _normalize_session_model_config(value, field=field)
+    if not config:
+        return None
+    return json.dumps(
+        config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def normalize_session_model_config(
+    value: Any,
+    *,
+    field: str = "session.model_config",
+) -> Optional[Dict[str, Any]]:
+    """Public read-boundary wrapper for replaying stored session runtime."""
+
+    return _normalize_session_model_config(value, field=field)
 
 
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
@@ -3744,6 +3935,20 @@ class SessionDB:
         crash before the gateway re-records the peer can't strand the child
         without a recoverable routing mapping (#59527).
         """
+        if model is not None:
+            from gateway.api_execution_context import (
+                normalize_model_identifier,
+            )
+
+            model = normalize_model_identifier(
+                model,
+                field="session.model",
+            )
+        model_config_json = _serialized_session_model_config(
+            model_config,
+            field="session.model_config",
+        )
+
         def _do(conn):
             conn.execute(
                 """INSERT INTO sessions (
@@ -3773,7 +3978,7 @@ class SessionDB:
                     chat_type,
                     thread_id,
                     model,
-                    json.dumps(model_config) if model_config else None,
+                    model_config_json,
                     system_prompt,
                     parent_session_id,
                     cwd,
@@ -4252,6 +4457,21 @@ class SessionDB:
         one transaction. Readers can therefore observe either the live parent or
         a complete child, never an ended parent with a missing/empty child.
         """
+        from gateway.api_execution_context import normalize_model_identifier
+
+        safe_model = (
+            normalize_model_identifier(
+                model,
+                field="compression child.model",
+            )
+            if model is not None
+            else None
+        )
+        safe_model_config_json = _serialized_session_model_config(
+            model_config,
+            field="compression child.model_config",
+        )
+
         def _do(conn):
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
@@ -4290,8 +4510,8 @@ class SessionDB:
                 (
                     child_session_id,
                     source,
-                    model,
-                    json.dumps(model_config) if model_config else None,
+                    safe_model,
+                    safe_model_config_json,
                     system_prompt,
                     parent_session_id,
                     cwd or parent["cwd"],
@@ -4842,10 +5062,24 @@ class SessionDB:
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
         """
+        safe_model_config_json = _serialized_session_model_config(
+            model_config_json,
+            field="session.model_config",
+        )
+        if model is not None:
+            from gateway.api_execution_context import (
+                normalize_model_identifier,
+            )
+
+            model = normalize_model_identifier(
+                model,
+                field="session.model",
+            )
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                (model_config_json, model, session_id),
+                (safe_model_config_json, model, session_id),
             )
         self._execute_write(_do)
 
@@ -4869,19 +5103,42 @@ class SessionDB:
         switch explicitly replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
         """
+        from gateway.api_execution_context import normalize_model_identifier
+
+        model = normalize_model_identifier(
+            model,
+            field="session.model",
+            allow_empty=False,
+        )
+
         def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            config = _normalize_session_model_config(
+                raw,
+                field="stored session.model_config",
+            )
+            if config is not None:
+                config.pop("browser_model_lock", None)
             conn.execute(
                 """UPDATE sessions SET
                    model = ?,
-                   model_config = CASE
-                       WHEN model_config IS NULL THEN NULL
-                       WHEN json_valid(model_config)
-                           THEN json_remove(model_config, '$.browser_model_lock')
-                       ELSE model_config
-                   END,
+                   model_config = ?,
                    system_prompt = NULL
                    WHERE id = ?""",
-                (model, session_id),
+                (
+                    model,
+                    _serialized_session_model_config(
+                        config,
+                        field="stored session.model_config",
+                    ),
+                    session_id,
+                ),
             )
         self._execute_write(_do)
 
@@ -4901,12 +5158,34 @@ class SessionDB:
         ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
         so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
         """
+        from gateway.api_execution_context import (
+            normalize_model_identifier,
+            normalize_model_options,
+            normalize_provider_slug,
+            normalize_route_source,
+        )
+
+        safe_model = normalize_model_identifier(
+            model,
+            field="session.runtime_lock.model",
+        )
+        safe_provider = normalize_provider_slug(
+            provider,
+            field="session.runtime_lock.provider",
+        )
+        safe_model_options = normalize_model_options(model_options)
+        safe_route_source = normalize_route_source(
+            route_source,
+            field="session.runtime_lock.route_source",
+        )
+        if not isinstance(confirmed, bool):
+            raise ValueError("session.runtime_lock.confirmed must be a boolean")
         lock = {
-            "provider": provider or "",
-            "model": model or "",
-            "model_options": model_options or {},
-            "route_source": route_source or "",
-            "confirmed": bool(confirmed),
+            "provider": safe_provider,
+            "model": safe_model,
+            "model_options": safe_model_options,
+            "route_source": safe_route_source,
+            "confirmed": confirmed,
             "updated_at": time.time(),
         }
 
@@ -4918,16 +5197,10 @@ class SessionDB:
             if row is None:
                 return
             raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
-            config: Dict[str, Any] = {}
-            if isinstance(raw, str) and raw.strip():
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        config = parsed
-                except Exception:
-                    config = {}
-            elif isinstance(raw, dict):
-                config = dict(raw)
+            config = _normalize_session_model_config(
+                raw,
+                field="stored session.model_config",
+            ) or {}
             config["browser_model_lock"] = lock
             conn.execute(
                 """UPDATE sessions SET
@@ -4935,7 +5208,14 @@ class SessionDB:
                    model = COALESCE(?, model),
                    system_prompt = NULL
                    WHERE id = ?""",
-                (json.dumps(config), model, session_id),
+                (
+                    _serialized_session_model_config(
+                        config,
+                        field="stored session.model_config",
+                    ),
+                    None if model is None else safe_model,
+                    session_id,
+                ),
             )
         self._execute_write(_do)
 
@@ -4957,6 +5237,30 @@ class SessionDB:
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
         behavior of ``update_session_model`` (see #48173, #48248).
         """
+        from gateway.api_execution_context import (
+            canonicalize_session_endpoint,
+            normalize_durable_slug,
+            normalize_provider_slug,
+        )
+
+        safe_provider = normalize_provider_slug(
+            provider,
+            field="session.billing_provider",
+        )
+        safe_base_url = (
+            canonicalize_session_endpoint(base_url)
+            if base_url is not None
+            else None
+        )
+        safe_billing_mode = (
+            normalize_durable_slug(
+                billing_mode,
+                field="session.billing_mode",
+            )
+            if billing_mode is not None
+            else None
+        )
+
         def _do(conn):
             conn.execute(
                 """UPDATE sessions SET
@@ -4965,7 +5269,12 @@ class SessionDB:
                    billing_mode = COALESCE(?, billing_mode),
                    system_prompt = NULL
                    WHERE id = ?""",
-                (provider, base_url, billing_mode, session_id),
+                (
+                    safe_provider,
+                    safe_base_url,
+                    safe_billing_mode,
+                    session_id,
+                ),
             )
         self._execute_write(_do)
 
@@ -4998,6 +5307,42 @@ class SessionDB:
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
         """
+        from gateway.api_execution_context import (
+            canonicalize_session_endpoint,
+            normalize_durable_slug,
+            normalize_model_identifier,
+            normalize_provider_slug,
+        )
+
+        model = (
+            normalize_model_identifier(
+                model,
+                field="session usage.model",
+            )
+            if model is not None
+            else None
+        )
+        billing_provider = (
+            normalize_provider_slug(
+                billing_provider,
+                field="session usage.billing_provider",
+            )
+            if billing_provider is not None
+            else None
+        )
+        billing_base_url = (
+            canonicalize_session_endpoint(billing_base_url)
+            if billing_base_url is not None
+            else None
+        )
+        billing_mode = (
+            normalize_durable_slug(
+                billing_mode,
+                field="session usage.billing_mode",
+            )
+            if billing_mode is not None
+            else None
+        )
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
@@ -5181,6 +5526,56 @@ class SessionDB:
         sess_provider = row["billing_provider"] if row is not None else None
         sess_base_url = row["billing_base_url"] if row is not None else None
         sess_billing_mode = row["billing_mode"] if row is not None else None
+        from gateway.api_execution_context import (
+            canonicalize_session_endpoint,
+            normalize_durable_slug,
+            normalize_model_identifier,
+            normalize_provider_slug,
+        )
+
+        # Old databases may predate the admission boundary. Never copy an
+        # unsafe legacy route into the per-model usage ledger.
+        try:
+            sess_model = (
+                normalize_model_identifier(
+                    sess_model,
+                    field="stored session usage.model",
+                )
+                if sess_model is not None
+                else None
+            )
+        except ValueError:
+            sess_model = None
+        try:
+            sess_provider = (
+                normalize_provider_slug(
+                    sess_provider,
+                    field="stored session usage.billing_provider",
+                )
+                if sess_provider is not None
+                else None
+            )
+        except ValueError:
+            sess_provider = None
+        try:
+            sess_base_url = (
+                canonicalize_session_endpoint(sess_base_url)
+                if sess_base_url is not None
+                else None
+            )
+        except ValueError:
+            sess_base_url = None
+        try:
+            sess_billing_mode = (
+                normalize_durable_slug(
+                    sess_billing_mode,
+                    field="stored session usage.billing_mode",
+                )
+                if sess_billing_mode is not None
+                else None
+            )
+        except ValueError:
+            sess_billing_mode = None
 
         # Aux-task rows (task != '') must NOT inherit the session's main-loop
         # route: an aux call may use a completely different provider/model
@@ -5282,6 +5677,39 @@ class SessionDB:
         accounting failed.
         """
         if not session_id or not task:
+            return
+        from gateway.api_execution_context import (
+            canonicalize_session_endpoint,
+            normalize_model_identifier,
+            normalize_provider_slug,
+        )
+
+        try:
+            model = (
+                normalize_model_identifier(
+                    model,
+                    field="auxiliary usage.model",
+                )
+                if model is not None
+                else None
+            )
+            billing_provider = (
+                normalize_provider_slug(
+                    billing_provider,
+                    field="auxiliary usage.billing_provider",
+                )
+                if billing_provider is not None
+                else None
+            )
+            billing_base_url = (
+                canonicalize_session_endpoint(billing_base_url)
+                if billing_base_url is not None
+                else None
+            )
+        except ValueError:
+            logger.warning(
+                "Skipping auxiliary usage accounting with unsafe route metadata"
+            )
             return
         # FK on session_model_usage.session_id → sessions.id: ensure the row
         # exists (same INSERT OR IGNORE guard update_token_counts uses — the
@@ -9126,6 +9554,50 @@ class SessionDB:
                     clean_session[field] = self._import_text_or_none(
                         clean_session.get(field), field
                     )
+                from gateway.api_execution_context import (
+                    canonicalize_session_endpoint,
+                    normalize_durable_slug,
+                    normalize_model_identifier,
+                    normalize_provider_slug,
+                )
+
+                clean_session["model"] = (
+                    normalize_model_identifier(
+                        clean_session["model"],
+                        field="import session.model",
+                    )
+                    if clean_session.get("model") is not None
+                    else None
+                )
+                clean_session["billing_provider"] = (
+                    normalize_provider_slug(
+                        clean_session["billing_provider"],
+                        field="import session.billing_provider",
+                    )
+                    if clean_session.get("billing_provider") is not None
+                    else None
+                )
+                clean_session["billing_base_url"] = (
+                    canonicalize_session_endpoint(
+                        clean_session["billing_base_url"]
+                    )
+                    if clean_session.get("billing_base_url") is not None
+                    else None
+                )
+                clean_session["billing_mode"] = (
+                    normalize_durable_slug(
+                        clean_session["billing_mode"],
+                        field="import session.billing_mode",
+                    )
+                    if clean_session.get("billing_mode") is not None
+                    else None
+                )
+                clean_session["model_config"] = (
+                    _serialized_session_model_config(
+                        clean_session.get("model_config"),
+                        field="import session.model_config",
+                    )
+                )
 
                 clean_messages: List[Dict[str, Any]] = []
                 for message_index, message in enumerate(messages):

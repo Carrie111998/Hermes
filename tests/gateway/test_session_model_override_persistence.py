@@ -204,8 +204,8 @@ def test_runner_rehydrate_noop_without_persisted_override(store_factory):
     assert runner._session_model_overrides == {}
 
 
-def test_runner_rehydrate_survives_credential_resolution_failure(store_factory):
-    """Missing credentials degrade to a credential-less override, not a crash."""
+def test_runner_rehydrate_rejects_credential_resolution_failure(store_factory):
+    """A durable partial route must not fall through to unrelated credentials."""
     store = store_factory()
     entry = store.get_or_create_session(_make_source())
     session_key = entry.session_key
@@ -218,9 +218,131 @@ def test_runner_rehydrate_survives_credential_resolution_failure(store_factory):
     ):
         runner._rehydrate_session_model_override(session_key)
 
-    override = runner._session_model_overrides[session_key]
-    assert override["model"] == "gpt-5o"
-    assert override.get("api_key") is None
+    assert runner._session_model_overrides == {}
+
+
+def test_runner_rehydrate_rejects_providerless_legacy_override(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, {"model": "gpt-5o"})
+    runner = _make_runner(store)
+
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider"
+    ) as resolver:
+        runner._rehydrate_session_model_override(entry.session_key)
+
+    resolver.assert_not_called()
+    assert runner._session_model_overrides == {}
+
+
+def test_runner_rehydrate_rejects_endpoint_mismatch_before_key_install(
+    store_factory,
+):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(
+        entry.session_key,
+        {
+            "model": "gpt-5o",
+            "provider": "openai",
+            "base_url": "https://attacker.example/v1",
+        },
+    )
+    runner = _make_runner(store)
+
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "api_key": "sk-fresh-from-keychain",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.openai.com/v1",
+            "provider": "openai",
+        },
+    ):
+        runner._rehydrate_session_model_override(entry.session_key)
+
+    assert runner._session_model_overrides == {}
+
+
+@pytest.mark.parametrize(
+    ("stored_url", "live_url"),
+    [
+        ("https://API.EXAMPLE:443/v1/", "https://api.example/v1"),
+        ("http://127.0.0.1:4141/v1", "http://127.0.0.1:4141/v1/"),
+        ("acp://COPILOT/", "acp://copilot"),
+        ("moa://LOCAL", "moa://local/"),
+    ],
+)
+def test_runner_rehydrate_binds_canonical_full_endpoint(
+    store_factory,
+    stored_url,
+    live_url,
+):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(
+        entry.session_key,
+        {
+            "model": "gpt-5o",
+            "provider": "custom:local-(127.0.0.1:4141)",
+            "base_url": stored_url,
+        },
+    )
+    runner = _make_runner(store)
+
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "api_key": "fresh-runtime-key",
+            "api_mode": "chat_completions",
+            "base_url": live_url,
+            "provider": "custom",
+        },
+    ):
+        runner._rehydrate_session_model_override(entry.session_key)
+
+    override = runner._session_model_overrides[entry.session_key]
+    assert override["provider"] == "custom:local-(127.0.0.1:4141)"
+    assert override["base_url"] == live_url
+    assert override["api_key"] == "fresh-runtime-key"
+
+
+@pytest.mark.parametrize(
+    "live_url",
+    [
+        "https://api.example:8443/v1",
+        "https://api.example/v2",
+        "https://api.example/v1?api-version=2",
+    ],
+)
+def test_runner_rehydrate_rejects_port_path_or_query_mismatch(
+    store_factory,
+    live_url,
+):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(
+        entry.session_key,
+        {
+            "model": "gpt-5o",
+            "provider": "custom:azure",
+            "base_url": "https://api.example/v1?api-version=1",
+        },
+    )
+    runner = _make_runner(store)
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "api_key": "fresh-runtime-key",
+            "api_mode": "chat_completions",
+            "base_url": live_url,
+            "provider": "custom",
+        },
+    ):
+        runner._rehydrate_session_model_override(entry.session_key)
+
+    assert runner._session_model_overrides == {}
 
 
 def test_sanitize_model_override():
@@ -232,3 +354,18 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+    assert sanitize_model_override(
+        {
+            "model": "m",
+            "provider": "custom:local-(127.0.0.1:4141)",
+            "base_url": "acp://COPILOT/",
+        }
+    ) == {
+        "model": "m",
+        "provider": "custom:local-(127.0.0.1:4141)",
+        "base_url": "acp://copilot",
+    }
+    with pytest.raises(ValueError):
+        sanitize_model_override(
+            {"model": "m", "provider": "openai", "base_url": "https://u:p@example/v1"}
+        )

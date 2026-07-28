@@ -121,6 +121,21 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    def _command_profile_home_for_source(self, source: SessionSource) -> Path:
+        """Return the verified canonical home for a request-local command."""
+        resolver = getattr(self, "_resolve_profile_home_for_source", None)
+        frozen = getattr(self, "_primary_profile_identity", None)
+        if callable(resolver) and frozen is not None:
+            return Path(resolver(source))
+        # Compatibility for intentionally bare, non-multiplex test runners.
+        # A real multiplex runner must have frozen authority and may not
+        # degrade to ambient profile state.
+        if bool(getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+            raise RuntimeError("multiplex command profile authority is unavailable")
+        from gateway.run import _gateway_config_home
+
+        return Path(_gateway_config_home())
+
     async def _run_fenced_session_transition(
         self,
         event: MessageEvent,
@@ -703,7 +718,12 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
-        from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _format_activity_progress,
+            _load_gateway_config,
+            _resolve_gateway_model,
+        )
 
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
@@ -718,7 +738,7 @@ class GatewaySlashCommandsMixin:
         is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
         # Count pending /queue follow-ups (slot + overflow).
-        adapter = self.adapters.get(source.platform) if source else None
+        adapter = self._adapter_for_source(source) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
         def _clean_str(value: Any) -> str:
@@ -832,6 +852,22 @@ class GatewaySlashCommandsMixin:
         elif context_used:
             context_line = t("gateway.status.context_used", used=f"{context_used:,}")
 
+        execution_line = ""
+        if is_running and callable(getattr(agent, "get_activity_summary", None)):
+            try:
+                progress = _format_activity_progress(
+                    agent.get_activity_summary(),
+                    include_slice=True,
+                    include_renewals=True,
+                )
+                if progress:
+                    execution_line = t(
+                        "gateway.status.execution_this_run",
+                        progress=progress,
+                    )
+            except Exception:
+                execution_line = ""
+
         lines = [
             t("gateway.status.header"),
             "",
@@ -851,10 +887,12 @@ class GatewaySlashCommandsMixin:
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
+        if execution_line:
+            lines.append(execution_line)
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:
-            adapter = self.adapters.get(Platform.MATRIX)
+            adapter = self._adapter_for_source(source)
             scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
             thread = source.thread_id or "none"
             lines.extend([
@@ -1575,7 +1613,7 @@ class GatewaySlashCommandsMixin:
         # assistant.threads.setStatus survives a gateway restart or a turn
         # that died without a final send (#32295). Best-effort clear so
         # /stop always dismisses a phantom "is thinking...".
-        adapter = getattr(self, "adapters", {}).get(source.platform)
+        adapter = self._adapter_for_source(source)
         if adapter and hasattr(adapter, "_stop_typing_with_metadata"):
             try:
                 await adapter._stop_typing_with_metadata(
@@ -1892,7 +1930,7 @@ class GatewaySlashCommandsMixin:
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
-        from gateway.run import _hermes_home, _load_gateway_config
+        from gateway.run import _load_gateway_config
         import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags_detailed,
@@ -1904,11 +1942,7 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         source = event.source
-        _command_profile_home = None
-        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            _command_profile_home = getattr(
-                self, "_resolve_profile_home_for_source"
-            )(source)
+        _command_profile_home = self._command_profile_home_for_source(source)
 
         # Parse --provider, --global, --session, --once, and --refresh flags
         parsed_flags = parse_model_flags_detailed(raw_args)
@@ -1945,7 +1979,7 @@ class GatewaySlashCommandsMixin:
         user_provs = None
         custom_provs = None
         excluded_provs = []
-        config_path = (_command_profile_home or _hermes_home) / "config.yaml"
+        config_path = _command_profile_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
@@ -2698,11 +2732,11 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
-        from gateway.run import _hermes_home, _load_gateway_config
-        from hermes_constants import display_hermes_home
+        from gateway.run import _load_gateway_config
 
         args = event.get_command_args().strip().lower()
-        config_path = _hermes_home / 'config.yaml'
+        profile_home = self._command_profile_home_for_source(event.source)
+        config_path = profile_home / "config.yaml"
 
         try:
             config = _load_gateway_config()
@@ -2712,7 +2746,10 @@ class GatewaySlashCommandsMixin:
             personalities = {}
 
         if not personalities:
-            return t("gateway.personality.none_configured", path=display_hermes_home())
+            return t(
+                "gateway.personality.none_configured",
+                path=str(profile_home),
+            )
 
         if not args:
             lines = [t("gateway.personality.header")]
@@ -2744,7 +2781,7 @@ class GatewaySlashCommandsMixin:
                 atomic_config_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
-            self._ephemeral_system_prompt = ""
+            self._evict_cached_agent(self._session_key_for_source(event.source))
             return t("gateway.personality.cleared")
         elif args in personalities:
             new_prompt = _resolve_prompt(personalities[args])
@@ -2758,8 +2795,10 @@ class GatewaySlashCommandsMixin:
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
 
-            # Update in-memory so it takes effect on the very next message.
-            self._ephemeral_system_prompt = new_prompt
+            # Turns load the selected profile's config locally. Evict only
+            # this profile/session so the changed system prompt takes effect
+            # without mutating the runner's primary startup snapshot.
+            self._evict_cached_agent(self._session_key_for_source(event.source))
 
             return t("gateway.personality.set_to", name=args)
 
@@ -2832,7 +2871,11 @@ class GatewaySlashCommandsMixin:
             if state is None:
                 return t("gateway.goal.no_goal_set")
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = (
+                    self._adapter_for_source(event.source)
+                    if event.source
+                    else None
+                )
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
@@ -2850,7 +2893,11 @@ class GatewaySlashCommandsMixin:
             had = mgr.has_goal()
             mgr.clear()
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = (
+                    self._adapter_for_source(event.source)
+                    if event.source
+                    else None
+                )
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
@@ -2917,7 +2964,11 @@ class GatewaySlashCommandsMixin:
 
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.
-        adapter = self.adapters.get(event.source.platform) if event.source else None
+        adapter = (
+            self._adapter_for_source(event.source)
+            if event.source
+            else None
+        )
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
@@ -3037,7 +3088,7 @@ class GatewaySlashCommandsMixin:
         # Evict the cached agent so the next turn rebuilds from the active-only
         # transcript and memory providers refresh their per-session caches.
         try:
-            session_key = build_session_key(source)
+            session_key = self._session_key_for_source(source)
             self._evict_cached_agent(session_key)
         except Exception as e:
             logger.debug("undo: cached-agent eviction skipped: %s", e)
@@ -3129,7 +3180,7 @@ class GatewaySlashCommandsMixin:
         platform = event.source.platform
         voice_key = self._voice_key(platform, chat_id)
 
-        adapter = self.adapters.get(platform)
+        adapter = self._adapter_for_source(event.source)
 
         tokens = args.split()
 
@@ -3174,7 +3225,7 @@ class GatewaySlashCommandsMixin:
                 "context": "context listener",
             }
             # Append voice channel info if connected
-            adapter = self.adapters.get(event.source.platform)
+            adapter = self._adapter_for_source(event.source)
             guild_id = self._get_guild_id(event)
             if guild_id and hasattr(adapter, "get_voice_channel_info"):
                 info = adapter.get_voice_channel_info(guild_id)
@@ -3411,12 +3462,20 @@ class GatewaySlashCommandsMixin:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
-    def _save_gateway_config_key(self, key_path: str, value) -> bool:
+    def _save_gateway_config_key(
+        self,
+        key_path: str,
+        value,
+        *,
+        config_home: Optional[Path] = None,
+    ) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
         and their interactive pickers)."""
         import yaml
-        from gateway.run import _hermes_home
-        config_path = _hermes_home / "config.yaml"
+        from gateway.run import _gateway_config_home
+
+        home = Path(config_home) if config_home is not None else _gateway_config_home()
+        config_path = home / "config.yaml"
         try:
             user_config = {}
             if config_path.exists():
@@ -3441,6 +3500,7 @@ class GatewaySlashCommandsMixin:
         platform_key: str,
         value: str,
         persist_global: bool = False,
+        config_home: Optional[Path] = None,
     ) -> str:
         """Apply a /reasoning argument (typed or picked) and return the reply.
 
@@ -3454,15 +3514,17 @@ class GatewaySlashCommandsMixin:
 
         # Display toggle (per-platform)
         if value in {"show", "on"}:
-            self._show_reasoning = True
             self._save_gateway_config_key(
-                f"display.platforms.{platform_key}.show_reasoning", True
+                f"display.platforms.{platform_key}.show_reasoning",
+                True,
+                config_home=config_home,
             )
             return t("gateway.reasoning.display_set_on", platform=platform_key)
         if value in {"hide", "off"}:
-            self._show_reasoning = False
             self._save_gateway_config_key(
-                f"display.platforms.{platform_key}.show_reasoning", False
+                f"display.platforms.{platform_key}.show_reasoning",
+                False,
+                config_home=config_home,
             )
             return t("gateway.reasoning.display_set_off", platform=platform_key)
 
@@ -3470,7 +3532,6 @@ class GatewaySlashCommandsMixin:
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
             self._set_session_reasoning_override(session_key, None)
-            self._reasoning_config = self._load_reasoning_config()
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
 
@@ -3478,9 +3539,12 @@ class GatewaySlashCommandsMixin:
         if parsed is None:
             return t("gateway.reasoning.unknown_arg", arg=value)
 
-        self._reasoning_config = parsed
         if persist_global:
-            if self._save_gateway_config_key("agent.reasoning_effort", value):
+            if self._save_gateway_config_key(
+                "agent.reasoning_effort",
+                value,
+                config_home=config_home,
+            ):
                 self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
                 return t("gateway.reasoning.set_global", effort=value)
@@ -3573,18 +3637,19 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         args, persist_global = self._parse_reasoning_command_args(raw_args)
+        config_home = self._command_profile_home_for_source(event.source)
         # Normalize the source (Telegram DM topic recovery) before deriving
         # the override key so storage matches the key the next message turn
         # reads — same fix as /model (#30479).
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(_reasoning_source)
-        self._show_reasoning = self._load_show_reasoning()
+        show_reasoning = self._load_show_reasoning()
         # Use the session's effective model (session /model override wins over
         # config default) so per-model reasoning_overrides display correctly.
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
         )
-        self._reasoning_config = self._resolve_session_reasoning_config(
+        reasoning_config = self._resolve_session_reasoning_config(
             source=event.source,
             session_key=session_key,
             model=_session_model,
@@ -3592,7 +3657,7 @@ class GatewaySlashCommandsMixin:
 
         if not raw_args:
             # Show current state
-            rc = self._reasoning_config
+            rc = reasoning_config
             if rc is None:
                 level = t("gateway.reasoning.level_default")
                 current_effort = "medium"
@@ -3604,7 +3669,7 @@ class GatewaySlashCommandsMixin:
                 current_effort = level
             display_state = (
                 t("gateway.reasoning.display_on")
-                if self._show_reasoning
+                if show_reasoning
                 else t("gateway.reasoning.display_off")
             )
             has_session_override = session_key in (getattr(self, "_session_reasoning_overrides", {}) or {})
@@ -3620,7 +3685,10 @@ class GatewaySlashCommandsMixin:
 
             async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
                 return self._apply_reasoning_selection(
-                    session_key, _picker_platform_key, value
+                    session_key,
+                    _picker_platform_key,
+                    value,
+                    config_home=config_home,
                 )
 
             picker_sent = await self._try_send_choice_picker(
@@ -3648,7 +3716,11 @@ class GatewaySlashCommandsMixin:
         # Typed argument path — same applier the picker uses.
         platform_key = _platform_config_key(event.source.platform)
         return self._apply_reasoning_selection(
-            session_key, platform_key, args, persist_global=persist_global
+            session_key,
+            platform_key,
+            args,
+            persist_global=persist_global,
+            config_home=config_home,
         )
 
     async def _handle_memory_command(self, event: MessageEvent) -> str:
@@ -3659,7 +3731,6 @@ class GatewaySlashCommandsMixin:
         Gate changes persist to config.yaml and evict the cached agent so the
         new setting takes effect on the next message.
         """
-        from gateway.run import _hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
@@ -3667,7 +3738,9 @@ class GatewaySlashCommandsMixin:
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
         session_key = self._session_key_for_source(event.source)
-        config_path = _hermes_home / "config.yaml"
+        config_path = (
+            self._command_profile_home_for_source(event.source) / "config.yaml"
+        )
 
         def _set_approval(enabled: bool):
             import yaml
@@ -3709,14 +3782,15 @@ class GatewaySlashCommandsMixin:
         the write-approval ``diff <id>``; the CLI also has an unrelated
         ``hermes skills diff <name>`` that diffs a bundled skill vs stock.)
         """
-        from gateway.run import _hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
         session_key = self._session_key_for_source(event.source)
-        config_path = _hermes_home / "config.yaml"
+        config_path = (
+            self._command_profile_home_for_source(event.source) / "config.yaml"
+        )
 
         gate_on = wa.write_approval_enabled(wa.SKILLS)
         wants_toggle = bool(args) and args[0].lower() in {"approval", "mode"}
@@ -3769,7 +3843,8 @@ class GatewaySlashCommandsMixin:
         # normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(raw_args)
         session_key = self._session_key_for_source(event.source)
-        self._service_tier = self._resolve_session_service_tier(
+        config_home = self._command_profile_home_for_source(event.source)
+        service_tier = self._resolve_session_service_tier(
             session_key=session_key
         )
 
@@ -3790,9 +3865,12 @@ class GatewaySlashCommandsMixin:
                 label = t("gateway.fast.label_normal")
             else:
                 return t("gateway.fast.unknown_arg", arg=value)
-            self._service_tier = tier
             if persist:
-                if self._save_gateway_config_key("agent.service_tier", saved_value):
+                if self._save_gateway_config_key(
+                    "agent.service_tier",
+                    saved_value,
+                    config_home=config_home,
+                ):
                     # Global write supersedes any session override.
                     self._set_session_service_tier_override(
                         session_key, None, clear=True
@@ -3809,7 +3887,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.fast.session_only", label=label)
 
         if not args or args == "status":
-            is_fast = self._service_tier == "priority"
+            is_fast = service_tier == "priority"
             status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
 
             async def _on_fast_choice(_chat_id: str, value: str) -> str:
@@ -3904,9 +3982,11 @@ class GatewaySlashCommandsMixin:
         ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
-        from gateway.run import _hermes_home, _load_gateway_config, _platform_config_key
+        from gateway.run import _load_gateway_config, _platform_config_key
 
-        config_path = _hermes_home / "config.yaml"
+        config_path = (
+            self._command_profile_home_for_source(event.source) / "config.yaml"
+        )
         platform_key = _platform_config_key(event.source.platform)
 
         # --- check config gate ------------------------------------------------
@@ -3973,10 +4053,16 @@ class GatewaySlashCommandsMixin:
         are respected but not modified here — edit config.yaml directly for
         per-platform control.
         """
-        from gateway.run import _hermes_home, _load_gateway_config, _platform_config_key, _resolve_gateway_model
+        from gateway.run import (
+            _load_gateway_config,
+            _platform_config_key,
+            _resolve_gateway_model,
+        )
         from gateway.runtime_footer import resolve_footer_config
 
-        config_path = _hermes_home / "config.yaml"
+        config_path = (
+            self._command_profile_home_for_source(event.source) / "config.yaml"
+        )
         platform_key = _platform_config_key(event.source.platform)
 
         # --- parse argument -------------------------------------------------
@@ -4187,6 +4273,9 @@ class GatewaySlashCommandsMixin:
                 # the gateway session entry now points at the new id and
                 # must remain open for the next user turn.
                 tmp_agent._end_session_on_close = False
+                # The compressor borrows the gateway session identity; it does
+                # not own the live process/browser/workspace resources.
+                tmp_agent._owns_runtime_resources = False
 
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
@@ -5644,7 +5733,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.approve.no_pending")
 
         # Resume typing indicator — agent is about to continue processing.
-        _adapter = self.adapters.get(source.platform)
+        _adapter = self._adapter_for_source(source)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
@@ -5744,7 +5833,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.deny.no_pending")
 
         # Resume typing indicator — agent continues (with BLOCKED result).
-        _adapter = self.adapters.get(source.platform)
+        _adapter = self._adapter_for_source(source)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 

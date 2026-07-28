@@ -2,6 +2,8 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli import HermesCLI
 
 
@@ -13,6 +15,9 @@ def _make_cli():
     cli_obj.conversation_history = []
     cli_obj.agent = None
     cli_obj._session_db = MagicMock()
+    cli_obj._session_db.get_conversation_root.side_effect = (
+        lambda session_id: session_id
+    )
     cli_obj._pending_resume_sessions = None
     # _handle_resume_command now triggers _display_resumed_history (#31695),
     # which reads self.resume_display. "minimal" short-circuits the recap so
@@ -431,4 +436,88 @@ class TestResumeFlushesBeforeEndSession:
             [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
             conversation_history=[{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
         )
+        agent.transition_workspace_lease_conversation.assert_called_once_with(
+            "target",
+            "target",
+            retain_existing_aliases=False,
+        )
         cli_obj._session_db.end_session.assert_called_once()
+
+    def test_resume_history_read_failure_leaves_current_session_untouched(
+        self,
+    ):
+        cli_obj = _make_cli()
+        agent = MagicMock()
+        agent.session_id = cli_obj.session_id
+        cli_obj.agent = agent
+        cli_obj.conversation_history = [
+            {"role": "user", "content": "current"}
+        ]
+        cli_obj._session_db.get_session.return_value = {
+            "id": "target",
+            "title": "T",
+        }
+        cli_obj._session_db.resolve_resume_session_id.return_value = (
+            "target"
+        )
+        cli_obj._session_db.get_resume_conversations.side_effect = (
+            RuntimeError("history unavailable")
+        )
+
+        with (
+            patch(
+                "hermes_cli.main._resolve_session_by_name_or_id",
+                return_value="target",
+            ),
+            patch("cli._cprint"),
+            pytest.raises(RuntimeError, match="history unavailable"),
+        ):
+            cli_obj._handle_resume_command("/resume target")
+
+        assert cli_obj.session_id == "current_session"
+        assert agent.session_id == "current_session"
+        agent.transition_workspace_lease_conversation.assert_not_called()
+        cli_obj._session_db.end_session.assert_not_called()
+
+    def test_resume_authority_failure_leaves_current_session_live(self):
+        cli_obj = _make_cli()
+        agent = MagicMock()
+        agent.session_id = cli_obj.session_id
+        agent.transition_workspace_lease_conversation.side_effect = (
+            RuntimeError("workspace claim conflict")
+        )
+        cli_obj.agent = agent
+        cli_obj.conversation_history = [
+            {"role": "user", "content": "current"}
+        ]
+        cli_obj._session_db.get_session.return_value = {
+            "id": "target",
+            "title": "T",
+        }
+        cli_obj._session_db.resolve_resume_session_id.return_value = (
+            "target"
+        )
+        cli_obj._session_db.get_resume_conversations.return_value = (
+            [{"role": "user", "content": "target"}],
+            [{"role": "user", "content": "target"}],
+        )
+
+        with (
+            patch(
+                "hermes_cli.main._resolve_session_by_name_or_id",
+                return_value="target",
+            ),
+            patch("cli._cprint"),
+            pytest.raises(
+                RuntimeError,
+                match="workspace claim conflict",
+            ),
+        ):
+            cli_obj._handle_resume_command("/resume target")
+
+        assert cli_obj.session_id == "current_session"
+        assert agent.session_id == "current_session"
+        assert cli_obj.conversation_history == [
+            {"role": "user", "content": "current"}
+        ]
+        cli_obj._session_db.end_session.assert_not_called()

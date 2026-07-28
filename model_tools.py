@@ -1232,6 +1232,8 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1376,17 +1378,25 @@ def handle_function_call(
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
-            result = run_tool_execution_middleware(
-                function_name,
-                function_args,
-                _dispatch,
-                original_args=_tool_original_args,
-                task_id=task_id or "",
+            from agent.tool_runtime_effects import bind_tool_runtime_effect
+
+            with bind_tool_runtime_effect(
+                tool_name=function_name,
                 session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
                 turn_id=turn_id or "",
-                api_request_id=api_request_id or "",
-            )
+                tool_call_id=tool_call_id or "",
+            ):
+                result = run_tool_execution_middleware(
+                    function_name,
+                    function_args,
+                    _dispatch,
+                    original_args=_tool_original_args,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    api_request_id=api_request_id or "",
+                )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:

@@ -53,6 +53,16 @@ def emits(server, monkeypatch):
 
 def _relay(server, event_type, **payload):
     """Drive _on_tool_progress the way the delegate relay does."""
+    # A real relay is wired by a registered parent session.  Keep that source
+    # identity present even in tests that clear/reopen only the child window.
+    server._sessions.setdefault(
+        "parent-sid",
+        {
+            "agent": object(),
+            "profile_home": None,
+            "session_key": "parent-key",
+        },
+    )
     server._on_tool_progress(
         "parent-sid",
         event_type,
@@ -64,6 +74,10 @@ def _relay(server, event_type, **payload):
         task_index=0,
         **payload,
     )
+
+
+def _launch_child_state_key(server, child_key="child-1"):
+    return server._child_profile_state_key(child_key, None)
 
 
 def test_no_live_child_session_no_mirror(server, emits):
@@ -123,7 +137,7 @@ def test_live_child_session_gets_native_stream(server, emits):
 def test_window_closed_midrun_drops_state_then_fresh_turn_on_reopen(server, emits):
     server._sessions["live-1"] = {"session_key": "child-1", "agent": None}
     _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
-    assert "child-1" in server._child_mirrors
+    assert _launch_child_state_key(server) in server._child_mirrors
 
     # Window closes → live session gone → state dropped on the next event.
     server._sessions.clear()
@@ -140,6 +154,74 @@ def test_window_closed_midrun_drops_state_then_fresh_turn_on_reopen(server, emit
     ]
 
 
+def test_late_event_without_parent_profile_fails_closed(server, emits, tmp_path):
+    """A torn-down parent must not route its late alpha event by raw child key."""
+    beta_home = tmp_path / "beta"
+    server._sessions["beta-watch"] = {
+        "session_key": "shared-child",
+        "profile_home": str(beta_home),
+        "agent": None,
+    }
+
+    server._on_tool_progress(
+        "missing-parent",
+        "subagent.text",
+        None,
+        "late alpha token",
+        None,
+        child_session_id="shared-child",
+        goal="late callback",
+        task_count=1,
+        task_index=0,
+    )
+
+    assert not [event for event in emits if event[1] == "beta-watch"]
+    assert server._active_child_runs == {}
+    assert server._child_mirrors == {}
+
+
+def test_explicit_profile_liveness_never_falls_back_to_legacy_raw_key(
+    server,
+    tmp_path,
+):
+    server._active_child_runs["shared-child"] = server.time.time()
+
+    assert server._child_run_active("shared-child") is True
+    assert (
+        server._child_run_active(
+            "shared-child",
+            profile_home=tmp_path / "alpha",
+        )
+        is False
+    )
+
+
+def test_invalid_explicit_profile_home_fails_closed(server, emits):
+    server._active_child_runs["shared-child"] = server.time.time()
+    server._sessions["watch"] = {
+        "agent": None,
+        "session_key": "shared-child",
+    }
+    payload = {"child_session_id": "shared-child", "text": "must not route"}
+
+    assert (
+        server._child_run_active(
+            "shared-child",
+            profile_home=[],
+        )
+        is False
+    )
+    server._mirror_subagent_to_child(
+        "subagent.text",
+        payload,
+        profile_home=[],
+    )
+
+    assert not [event for event in emits if event[1] == "watch"]
+    assert server._child_mirrors == {}
+    assert set(server._active_child_runs) == {"shared-child"}
+
+
 def test_upgraded_child_session_not_mirrored(server, emits):
     """A watch window upgraded to a full session (agent built) owns a real
     native stream — mirroring on top would interleave two turns on one sid."""
@@ -150,18 +232,19 @@ def test_upgraded_child_session_not_mirrored(server, emits):
     assert [(e, s) for e, s, _ in emits] == [("subagent.tool", "parent-sid")]
     assert server._child_mirrors == {}
     # Liveness registry still updates — it serves resume, not the mirror.
-    assert "child-1" in server._active_child_runs
+    assert _launch_child_state_key(server) in server._active_child_runs
 
 
 def test_stale_child_run_not_reported_active(server, emits):
     """A leaked registry entry (lost completion event) must age out instead of
     pinning running=true on every future lazy resume of that child."""
-    server._active_child_runs["child-1"] = 0.0  # epoch — ancient
+    state_key = _launch_child_state_key(server)
+    server._active_child_runs[state_key] = 0.0  # epoch — ancient
 
-    assert server._child_run_active("child-1") is False
+    assert server._child_run_active("child-1", profile_home=None) is False
 
     _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
-    assert server._child_run_active("child-1") is True
+    assert server._child_run_active("child-1", profile_home=None) is True
 
 
 def test_prompt_submit_rejected_while_child_run_active(server, emits):
@@ -184,7 +267,7 @@ def test_prompt_submit_rejected_while_child_run_active(server, emits):
     # Run completes → the same submit upgrades into a real conversation
     # (passes the guard; fails later only because this test stubs no agent).
     _relay(server, "subagent.complete", child_session_id="child-1", status="completed", summary="ok")
-    assert server._child_run_active("child-1") is False
+    assert server._child_run_active("child-1", profile_home=None) is False
 
 
 def test_active_child_runs_registry_tracks_liveness(server, emits):
@@ -192,13 +275,14 @@ def test_active_child_runs_registry_tracks_liveness(server, emits):
     open), and completion clears it — lazy watch resumes read this registry to
     report running=true while the child is silent inside a long tool call."""
     _relay(server, "subagent.start", preview="go", child_session_id="child-1")
-    assert "child-1" in server._active_child_runs
+    state_key = _launch_child_state_key(server)
+    assert state_key in server._active_child_runs
 
     _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
-    assert "child-1" in server._active_child_runs
+    assert state_key in server._active_child_runs
 
     _relay(server, "subagent.complete", child_session_id="child-1", status="completed", summary="ok")
-    assert "child-1" not in server._active_child_runs
+    assert state_key not in server._active_child_runs
 
 
 def test_start_mirrors_as_immediate_header_line(server, emits):

@@ -31,9 +31,19 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     ``@pytest.mark.real_agent_prewarm``.
     """
     if request.node.get_closest_marker("real_agent_prewarm"):
-        yield
-        return
-    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        pass
+    else:
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    # Poller behavior tests below invoke _notification_poller_loop directly.
+    # Incidental pollers started by unrelated session-init tests are daemon
+    # consumers of a process-global queue and can outlive their test, stealing
+    # the next file's completion event. Keep those starts inert at the module
+    # boundary while preserving direct loop coverage.
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda *a, **k: threading.Event(),
+    )
     yield
 
 
@@ -324,6 +334,10 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
 
 
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.banner.get_update_result",
+        lambda timeout=0.5: None,
+    )
     session = _session(
         agent=None,
         agent_ready=threading.Event(),
@@ -642,6 +656,16 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server,
+        "_restore_session_async_delegation_completions",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda *_args, **_kwargs: threading.Event(),
+    )
 
     ready = threading.Event()
     sid = "test-sid"
@@ -655,8 +679,16 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
     finally:
-        server._sessions.pop(sid, None)
+        record = server._sessions.pop(sid, None)
+        if record is not None:
+            stop_event = record.pop("_notif_stop", None)
+            if stop_event is not None:
+                stop_event.set()
+            owner = record.pop("_owned_session_db", None)
+            if owner is not None:
+                owner.close()
 
     assert seen == [str(profile_home)]
 
@@ -697,6 +729,16 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server,
+        "_restore_session_async_delegation_completions",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda *_args, **_kwargs: threading.Event(),
+    )
 
     ready = threading.Event()
     sid = "test-secret-sid"
@@ -710,8 +752,16 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
     finally:
-        server._sessions.pop(sid, None)
+        record = server._sessions.pop(sid, None)
+        if record is not None:
+            stop_event = record.pop("_notif_stop", None)
+            if stop_event is not None:
+                stop_event.set()
+            owner = record.pop("_owned_session_db", None)
+            if owner is not None:
+                owner.close()
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
 
@@ -2037,9 +2087,20 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     monkeypatch.setattr(
         server, "_session_info", lambda agent, *a: {"model": "test", "tools": {}, "skills": {}}
     )
-    monkeypatch.setattr(
-        server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None
-    )
+
+    def fake_init_session(sid, key, agent, history, cols=80, **_kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "cols": cols,
+            "created_at": time.time(),
+            "history": history,
+            "history_lock": threading.Lock(),
+            "last_active": time.time(),
+            "running": False,
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
 
     try:
         # eager_build: this asserts the synchronously-built agent binds to the
@@ -2180,7 +2241,15 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         return types.SimpleNamespace(model="test/model")
 
     monkeypatch.setenv("TERMINAL_CWD", str(launch_cwd))
-    monkeypatch.setattr(server, "_profile_home", lambda _profile: profile_home)
+    monkeypatch.setattr(
+        server,
+        "_profile_target",
+        lambda profile: (
+            ("worker", profile_home)
+            if profile == "worker"
+            else (None, None)
+        ),
+    )
     monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
     monkeypatch.setattr(server, "_get_db", lambda: launch_db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
@@ -2298,6 +2367,22 @@ def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
 
     assert "service_tier_override" in overrides
     assert overrides["service_tier_override"] == ""
+
+
+def test_stored_session_runtime_overrides_rejects_poisoned_legacy_metadata():
+    """Rows written before the admission guard must not become runtime authority."""
+    overrides = server._stored_session_runtime_overrides(
+        {
+            "model": "safe-model",
+            "billing_provider": "anthropic",
+            "model_config": {
+                "provider": "anthropic",
+                "api_key": "sk-proj-abcdef1234567890abcdef1234567890abcdef12",
+            },
+        }
+    )
+
+    assert overrides == {}
 
 
 def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
@@ -3839,6 +3924,53 @@ class _RecordingAgent:
     def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
         self._turns.append(prompt)
         return {"final_response": "", "messages": []}
+
+
+def test_run_prompt_submit_complete_storage_error_retains_retry_carrier(
+    monkeypatch,
+    tmp_path,
+):
+    import tools.async_delegation as async_delegation
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "complete-storage-error",
+        "session_key": "session-a",
+    }
+    scheduled = []
+    monkeypatch.setattr(
+        async_delegation,
+        "begin_event_delivery_renewal",
+        lambda *_args, **_kwargs: lambda: None,
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        Mock(side_effect=OSError("complete storage failed")),
+    )
+    monkeypatch.setattr(
+        server,
+        "_schedule_async_notification_retry",
+        lambda candidate: scheduled.append(candidate) or True,
+    )
+    session = _session(
+        session_key="session-a",
+        agent=_RecordingAgent([]),
+        running=True,
+    )
+
+    server._run_prompt_submit(
+        "rid-a",
+        "sid-a",
+        session,
+        "delegation result",
+        delivery_event=event,
+        delivery_claim="consumer-claim",
+    )
+
+    assert scheduled == [event]
+    assert session["running"] is False
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])
@@ -9577,7 +9709,15 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
         def close(self):
             seen["closed"] = True
 
-    monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
+    monkeypatch.setattr(
+        server,
+        "_profile_target",
+        lambda profile: (
+            ("mlperf", profile_home)
+            if profile == "mlperf"
+            else (None, None)
+        ),
+    )
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
     monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
 
@@ -9618,7 +9758,15 @@ def test_session_most_recent_honors_params_profile(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
+    monkeypatch.setattr(
+        server,
+        "_profile_target",
+        lambda profile: (
+            ("mlperf", profile_home)
+            if profile == "mlperf"
+            else (None, None)
+        ),
+    )
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
     monkeypatch.setattr("hermes_state.SessionDB", ProfileDB2)
 
@@ -9646,7 +9794,15 @@ def test_session_create_reports_requested_profile_name(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
     monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
     monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
-    monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
+    monkeypatch.setattr(
+        server,
+        "_profile_target",
+        lambda profile: (
+            ("mlperf", profile_home)
+            if profile == "mlperf"
+            else (None, None)
+        ),
+    )
     monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
     monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
     _clear()
@@ -9678,7 +9834,15 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
         def close(self):
             captured["closed"] = True
 
-    monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
+    monkeypatch.setattr(
+        server,
+        "_profile_target",
+        lambda profile: (
+            ("mlperf", profile_home)
+            if profile == "mlperf"
+            else (None, None)
+        ),
+    )
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
 

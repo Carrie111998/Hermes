@@ -5,6 +5,7 @@ import importlib
 import sys
 import time
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,24 @@ import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+
+
+@pytest.fixture(autouse=True)
+def _reset_gateway_listener_authority():
+    """Each test models a fresh gateway listener process."""
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    async_delegation._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        async_delegation._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -113,6 +132,46 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
             }
         )
         return SendResult(success=True, message_id=message_id)
+
+
+class FailedMetadataEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(
+            success=False,
+            error="message no longer exists",
+            error_kind="not_found",
+        )
+
+
+class UncertainMetadataEditProgressCaptureAdapter(
+    MetadataEditProgressCaptureAdapter
+):
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(
+            success=False,
+            error="connection dropped after dispatch",
+            error_kind="dispatch_uncertain",
+        )
 
 
 class RetryableFirstEditProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -347,11 +406,31 @@ class DelayedInterimAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, hermes_home):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
+    profile_home = Path(hermes_home)
+    profile_home.mkdir(parents=True, exist_ok=True)
+    from gateway.api_request_scope import freeze_api_profile_inventory
+    from tools.async_delegation import (
+        register_frozen_event_delivery_inventory,
+    )
+    from tools.process_registry import process_registry
+
+    inventory = freeze_api_profile_inventory((("default", profile_home),))
+    register_frozen_event_delivery_inventory(inventory)
+    process_registry.bind_checkpoint_path(
+        Path(inventory[0].canonical_home) / "processes.json"
+    )
+
     runner = object.__new__(GatewayRunner)
+    runner._served_profile_identity_inventory = inventory
+    runner._primary_profile_identity = inventory[0]
+    runner._served_profile_identities_by_name = {"default": inventory[0]}
+    runner._gateway_state_db_path = (
+        Path(inventory[0].canonical_home) / "state.db"
+    )
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -407,7 +486,7 @@ async def test_gateway_approval_callback_uses_lexically_captured_source(
     )
 
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     source = SessionSource(
         platform=Platform.DISCORD,
         chat_id="222222222222222222",
@@ -445,7 +524,7 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     import tools.terminal_tool  # noqa: F401 - register terminal emoji for this fake-agent test
 
     adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
@@ -491,7 +570,7 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = MetadataEditProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
@@ -530,7 +609,7 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -580,7 +659,7 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.SLACK)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -626,7 +705,7 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypa
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.FEISHU)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -707,7 +786,7 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
     (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
 
     adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -977,7 +1056,7 @@ async def _run_with_agent(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = adapter_cls(platform=platform)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -1350,6 +1429,73 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_failed_transformed_stream_edit_does_not_claim_already_sent(
+    monkeypatch, tmp_path
+):
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-failed-edit",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=FailedMetadataEditProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is not True
+    assert result["final_response"].endswith("[plugin appended this]")
+
+
+@pytest.mark.asyncio
+async def test_uncertain_transformed_stream_edit_is_partial_without_resend(
+    monkeypatch, tmp_path
+):
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-uncertain-edit",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=UncertainMetadataEditProgressCaptureAdapter,
+    )
+
+    assert result["already_sent"] is True
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["failed"] is False
+    assert result["incomplete_reason"] == (
+        "transformed_stream_edit_dispatch_uncertain"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path):
     QueuedCommentaryAgent.calls = 0
     adapter, result = await _run_with_agent(
@@ -1548,7 +1694,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     import tools.terminal_tool  # noqa: F401 - register terminal tool metadata
 
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1609,7 +1755,7 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1766,7 +1912,7 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1819,7 +1965,7 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1867,7 +2013,7 @@ async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1929,7 +2075,7 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})

@@ -4812,6 +4812,8 @@ class TestRenewableIterationSlices:
     ):
         self._prepare(agent)
         exact_tools = agent.tools
+        agent._emit_wait_notice = MagicMock(wraps=agent._emit_wait_notice)
+        agent._emit_status = MagicMock(wraps=agent._emit_status)
         agent.client.chat.completions.create.side_effect = [
             self._tool_response(
                 self._tool_call(
@@ -4856,6 +4858,14 @@ class TestRenewableIterationSlices:
             result["api_calls"],
             result["iteration_budget_renewals"],
         ) == ("verified final", True, False, 3, 1)
+        assert any(
+            "renewed the execution slice" in str(call.args[0])
+            for call in agent._emit_wait_notice.call_args_list
+        )
+        assert all(
+            "renewed the execution slice" not in str(call.args[0])
+            for call in agent._emit_status.call_args_list
+        )
         assert [
             call.kwargs.get("tool_choice")
             for call in agent.client.chat.completions.create.call_args_list
@@ -4964,6 +4974,66 @@ class TestRenewableIterationSlices:
             for call in agent.client.chat.completions.create.call_args_list
             if call.kwargs["messages"][0]["role"] == "system"
         } == {agent._cached_system_prompt}
+
+    def test_unchanged_active_plan_gets_one_correction_then_stops_renewing(
+        self,
+        agent,
+    ):
+        from agent.iteration_budget import ExecutionLease
+
+        self._prepare(agent)
+        lease = ExecutionLease(max_total=8)
+        agent.execution_lease = lease
+        agent._owns_execution_lease = False
+        agent._emit_wait_notice = MagicMock(
+            wraps=agent._emit_wait_notice
+        )
+        agent.client.chat.completions.create.side_effect = [
+            self._tool_response(
+                self._tool_call(
+                    "todo",
+                    {
+                        "todos": [
+                            {
+                                "id": "1",
+                                "content": "unchanged work",
+                                "status": "pending",
+                            }
+                        ]
+                    },
+                    call_id,
+                )
+            )
+            for call_id in ("c1", "c2", "c3", "c4")
+        ]
+
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            result = agent.run_conversation("do it")
+
+        assert result["api_calls"] == 4
+        assert lease.used == 4
+        assert result["iteration_budget_renewals"] == 2
+        assert result["iteration_budget_stalled_boundaries"] == 2
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["partial"] is True
+        assert result["error"] == "iteration_budget_exhausted"
+        assert result["turn_exit_reason"] == (
+            "budget_exhausted_after_grace_tool_request"
+        )
+        assert agent._todo_store.has_active_items() is True
+        assert any(
+            "allowing one bounded correction slice" in str(call.args[0])
+            for call in agent._emit_wait_notice.call_args_list
+        )
+        assert any(
+            "stopping renewal" in str(call.args[0])
+            for call in agent._emit_wait_notice.call_args_list
+        )
+        assert [
+            call.kwargs.get("tool_choice")
+            for call in agent.client.chat.completions.create.call_args_list
+        ] == [None, "required", "required", "required"]
 
     def test_interrupt_before_renewal_preserves_open_plan_and_alternation(
         self, agent

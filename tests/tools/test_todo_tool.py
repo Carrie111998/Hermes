@@ -54,6 +54,97 @@ class TestHasItems:
         store.write([{"id": "1", "content": "x", "status": "blocked"}])
         assert store.has_active_items() is False
 
+    def test_execution_progress_token_ignores_prose_but_tracks_status(self):
+        store = TodoStore()
+        store.write(
+            [{"id": "1", "content": "first wording", "status": "pending"}]
+        )
+        pending_token = store.execution_progress_token()
+
+        store.write(
+            [{"id": "1", "content": "rewritten wording", "status": "pending"}]
+        )
+        assert store.execution_progress_token() == pending_token
+
+        store.write(
+            [
+                {
+                    "id": "1",
+                    "content": "rewritten wording",
+                    "status": "in_progress",
+                }
+            ]
+        )
+        assert store.execution_progress_token() != pending_token
+
+    def test_execution_progress_token_ignores_item_order(self):
+        store = TodoStore()
+        store.write(
+            [
+                {"id": "1", "content": "first", "status": "pending"},
+                {"id": "2", "content": "second", "status": "in_progress"},
+            ]
+        )
+        token = store.execution_progress_token()
+
+        store.write(
+            [
+                {"id": "2", "content": "second", "status": "in_progress"},
+                {"id": "1", "content": "first", "status": "pending"},
+            ]
+        )
+        assert store.execution_progress_token() == token
+
+    def test_execution_progress_token_ignores_canonical_receipt_churn(self):
+        store = TodoStore()
+        items = [{"id": "1", "content": "task", "status": "pending"}]
+        store.write(items)
+        store.bind_canonical_workspace(
+            case_id="case-1",
+            plan_id="plan-1",
+            plan_revision=1,
+            plan_state="active",
+            plan_event_id="event-1",
+            canonical_content_sha256="a" * 64,
+            workspace_todos_sha256="b" * 64,
+            items=items,
+        )
+        token = store.execution_progress_token()
+
+        store.bind_canonical_workspace(
+            case_id="case-1",
+            plan_id="plan-1",
+            plan_revision=2,
+            plan_state="active",
+            plan_event_id="event-2",
+            canonical_content_sha256="c" * 64,
+            workspace_todos_sha256="d" * 64,
+            items=items,
+        )
+        assert store.execution_progress_token() == token
+
+    def test_execution_progress_token_ignores_fence_diagnostics(self):
+        checkpoint = {
+            "case_id": "case-1",
+            "plan": {"plan_id": "plan-1", "revision": 2},
+        }
+        tokens = []
+        for details in (
+            {"reason": "timeout", "attempt": 1},
+            {"reason": "timeout", "attempt": 2},
+        ):
+            store = TodoStore()
+            store.fence_canonical_uncertainty(
+                checkpoint=checkpoint,
+                effective_checkpoint=checkpoint,
+                items=[],
+                checkpoint_sha256="e" * 64,
+                details=details,
+            )
+            tokens.append(store.execution_progress_token())
+
+        assert tokens[0] == tokens[1]
+
 
 class TestFormatForInjection:
     def test_empty_returns_none(self):

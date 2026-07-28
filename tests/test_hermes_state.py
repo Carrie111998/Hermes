@@ -492,7 +492,9 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["model"] == "glm-5.2"
         assert session["billing_provider"] == "custom:zai"
-        assert session["billing_base_url"] == "https://api.z.ai/api/coding/paas/v4/"
+        # Durable endpoints use one canonical spelling so equivalent provider
+        # routes cannot split usage rows or fail exact replay binding.
+        assert session["billing_base_url"] == "https://api.z.ai/api/coding/paas/v4"
         assert session["api_call_count"] == 1
 
     def test_accounted_primary_route_is_not_rewritten_by_later_fallback(self, db):
@@ -7799,4 +7801,3 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-

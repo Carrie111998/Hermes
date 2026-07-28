@@ -151,6 +151,10 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_notification_retry_lock = threading.Lock()
+_notification_retry_timers: dict[tuple[str, str], threading.Timer] = {}
+_NOTIFICATION_RETRY_MIN_SECONDS = 0.25
+_NOTIFICATION_RETRY_STORAGE_ERROR_SECONDS = 1.0
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -752,6 +756,65 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         pass
 
 
+class _SessionDBHandle:
+    """Idempotent owner for one non-launch SessionDB handle.
+
+    A profile agent needs a long-lived handle, but ``AIAgent.close()`` only
+    finalizes the row; it does not close the SQLite connection.  Keeping the
+    close-once token on the registered gateway session makes teardown the
+    single lifecycle owner while remaining safe under build/close races.
+    """
+
+    def __init__(self, db):
+        self.db = db
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            db = self.db
+            self.db = None
+        if db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+def _publish_built_agent(
+    sid: str,
+    session: dict,
+    agent,
+    db_handle: _SessionDBHandle | None,
+) -> bool:
+    """Atomically publish a deferred build and its owned profile DB."""
+
+    with _sessions_lock:
+        if _sessions.get(sid) is not session:
+            return False
+        session["agent"] = agent
+        if db_handle is not None:
+            session["_owned_session_db"] = db_handle
+        return True
+
+
+def _adopt_registered_agent_db(
+    sid: str,
+    agent,
+    db_handle: _SessionDBHandle | None,
+) -> dict | None:
+    """Attach ``db_handle`` iff ``sid`` still owns ``agent``."""
+
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None or session.get("agent") is not agent:
+            return None
+        if db_handle is not None:
+            session["_owned_session_db"] = db_handle
+        return session
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
@@ -772,12 +835,20 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
             unregister_gateway_notify(key)
     except Exception:
         pass
+    db_handle = session.pop("_owned_session_db", None)
     try:
-        agent = session.get("agent")
-        if agent is not None and hasattr(agent, "close"):
-            agent.close()
-    except Exception:
-        pass
+        try:
+            agent = session.get("agent")
+            if agent is not None and hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+    finally:
+        # Agent.close() may use its SessionDB to stamp end_reason, so close the
+        # connection only after the agent has finished its own finalization.
+        if db_handle is not None:
+            with contextlib.suppress(Exception):
+                db_handle.close()
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
@@ -923,6 +994,7 @@ def _close_sessions_for_transport(
 
 
 def _shutdown_sessions() -> None:
+    _cancel_notification_retry_timers()
     with _sessions_lock:
         sids = list(_sessions)
     for sid in sids:
@@ -1115,7 +1187,7 @@ def _profile_db(params: dict | None = None):
     """
     profile = None
     if isinstance(params, dict):
-        profile = (params.get("profile") or "").strip() or None
+        profile = params.get("profile")
     db, owns = _db_for_profile(profile)
     try:
         yield db
@@ -1128,11 +1200,11 @@ def _profile_db(params: dict | None = None):
 def _response_profile_name(profile: str | None = None) -> str:
     """Profile name to report on session.* payloads.
 
-    Prefer the RPC's requested profile when it is a real non-launch profile;
-    otherwise the process launch profile.
+    Prefer the RPC's validated canonical profile name; otherwise report the
+    process launch profile.
     """
-    name = (profile or "").strip()
-    if name and _profile_home(name) is not None:
+    name, _home = _profile_target(profile)
+    if name:
         return name
     return _current_profile_name()
 
@@ -1150,21 +1222,55 @@ def _db_unavailable_error(rid, *, code: int):
 # (a ContextVar override) for the duration of the call so config/skills/model and
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
-def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    name = (profile or "").strip()
-    if not name:
-        return None
+def _profile_target(
+    profile: str | None,
+) -> tuple[str | None, Path | None]:
+    """Validate one RPC profile and return its canonical name/home override.
+
+    ``None``/blank retains the historical launch-profile behavior.  Any
+    supplied value is an untrusted *name*, never a path: normalize it through
+    the profile registry, enforce the identifier/reserved-name policy, and
+    require the named profile to exist before its directory can become
+    filesystem authority.  The returned home is ``None`` only when the
+    validated profile is the process launch profile (no ContextVar override is
+    needed); the canonical name is retained so downstream delivery restore can
+    revalidate that authority.
+    """
+
+    if profile is None:
+        return None, None
+    if not isinstance(profile, str):
+        raise _ProfileRequestError("profile must be a string name")
+    raw = profile.strip()
+    if not raw:
+        return None, None
     try:
         from hermes_cli import profiles as profiles_mod
 
-        home = Path(profiles_mod.get_profile_dir(name))
-    except Exception:
-        return None
-    # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
-        return None
-    return home if (home / "state.db").exists() or home.exists() else None
+        name = profiles_mod.normalize_profile_name(raw)
+        profiles_mod.validate_profile_name(name)
+        if not profiles_mod.profile_exists(name):
+            raise _ProfileRequestError(
+                f"profile {name!r} does not exist"
+            )
+        home = (
+            Path(profiles_mod.get_profile_dir(name))
+            .expanduser()
+            .resolve()
+        )
+    except _ProfileRequestError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise _ProfileRequestError(str(exc)) from exc
+
+    launch_home = Path(_hermes_home).expanduser().resolve()
+    return name, None if home == launch_home else home
+
+
+def _profile_home(profile: str | None) -> Path | None:
+    """Resolve a validated named profile, or None for the launch profile."""
+
+    return _profile_target(profile)[1]
 
 
 def _profile_scoped(handler):
@@ -1178,7 +1284,9 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        home = _profile_home(
+            params.get("profile") if isinstance(params, dict) else None
+        )
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -1586,6 +1694,10 @@ def _err(rid, code: int, msg: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
 
 
+class _ProfileRequestError(ValueError):
+    """Invalid or unavailable named profile supplied at RPC ingress."""
+
+
 def method(name: str):
     def dec(fn):
         _methods[name] = fn
@@ -1622,7 +1734,10 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    return fn(rid, params)
+    try:
+        return fn(rid, params)
+    except _ProfileRequestError as exc:
+        return _err(rid, 4004, f"invalid profile: {exc}")
 
 
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -1811,7 +1926,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # to a full agent mid-stream and silently kill the mirror (the mirror bails
     # once agent is set). Once the child completes, the guard lifts and the next
     # prompt/RPC builds the agent normally so the user can talk to the session.
-    if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+    if session.get("lazy") and _child_run_active(
+        str(session.get("session_key") or ""),
+        profile_home=session.get("profile_home"),
+    ):
         return
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
@@ -1834,6 +1952,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        agent = None
+        session_db_handle = None
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -1849,12 +1969,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
                 except Exception:
                     pass
-                try:
-                    from hermes_state import SessionDB
+                from hermes_state import SessionDB
 
-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-                except Exception:
-                    session_db = None
+                session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                session_db_handle = _SessionDBHandle(session_db)
 
             try:
                 from tui_gateway.entry import ensure_mcp_discovery_started
@@ -1893,9 +2011,25 @@ def _start_agent_build(sid: str, session: dict) -> None:
             finally:
                 _clear_session_context(tokens)
 
-            # Session DB row deferred to first run_conversation() call.
-            # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
+            # Session DB row is deferred to first run_conversation() call.
+            # Publish the agent and its DB owner atomically: if teardown already
+            # detached the record, this build owns both resources and must
+            # discard them instead of attaching to the stale dict.
+            if not _publish_built_agent(
+                sid,
+                current,
+                agent,
+                session_db_handle,
+            ):
+                try:
+                    agent._end_session_on_close = False
+                    if hasattr(agent, "close"):
+                        agent.close()
+                except Exception:
+                    pass
+                if session_db_handle is not None:
+                    session_db_handle.close()
+                return
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -1948,8 +2082,20 @@ def _start_agent_build(sid: str, session: dict) -> None:
             except Exception:
                 pass
             with _sessions_lock:
-                if sid in _sessions:
-                    _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+                notification_session = _sessions.get(sid)
+            if notification_session is not None:
+                _restore_session_async_delegation_completions(
+                    sid,
+                    notification_session,
+                )
+                with _sessions_lock:
+                    if _sessions.get(sid) is notification_session:
+                        notification_session["_notif_stop"] = (
+                            _start_notification_poller(
+                                sid,
+                                notification_session,
+                            )
+                        )
             _notify_session_boundary("on_session_reset", key, _session_source(current))
 
             info = _session_info(agent, current)
@@ -1964,6 +2110,38 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
+            # If publication already happened, detach only the exact resources
+            # built by this thread.  A concurrent teardown may have won first;
+            # AIAgent.close and _SessionDBHandle.close are both idempotent.
+            with _sessions_lock:
+                if (
+                    _sessions.get(sid) is current
+                    and current.get("agent") is agent
+                ):
+                    current["agent"] = None
+                    if current.get("_owned_session_db") is session_db_handle:
+                        current.pop("_owned_session_db", None)
+                stop_event = current.pop("_notif_stop", None)
+            if stop_event is not None:
+                with contextlib.suppress(Exception):
+                    stop_event.set()
+            if notify_registered:
+                try:
+                    from tools.approval import unregister_gateway_notify
+
+                    unregister_gateway_notify(key)
+                except Exception:
+                    pass
+                notify_registered = False
+            if agent is not None:
+                try:
+                    agent._end_session_on_close = False
+                    if hasattr(agent, "close"):
+                        agent.close()
+                except Exception:
+                    pass
+            if session_db_handle is not None:
+                session_db_handle.close()
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
@@ -2406,7 +2584,12 @@ def _ensure_session_db_row(session: dict) -> None:
             # Self-describing rows: aggregators that merge multiple profile DBs
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
-            profile_name=Path(profile_home).name if profile_home else None,
+            profile_name=(
+                session.get("profile_name")
+                or Path(profile_home).name
+                if profile_home
+                else None
+            ),
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
@@ -3071,28 +3254,39 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         return {}
 
     raw_config = row.get("model_config")
-    model_config: dict = {}
-    if isinstance(raw_config, dict):
-        model_config = raw_config
-    elif isinstance(raw_config, str) and raw_config.strip():
-        try:
-            parsed = json.loads(raw_config)
-            if isinstance(parsed, dict):
-                model_config = parsed
-        except Exception:
-            logger.debug("failed to parse stored session model_config", exc_info=True)
+    try:
+        from gateway.api_execution_context import (
+            normalize_model_identifier,
+            normalize_provider_slug,
+        )
+        from hermes_state import normalize_session_model_config
+
+        model_config = normalize_session_model_config(
+            raw_config,
+            field="resumed session.model_config",
+        ) or {}
+        model = normalize_model_identifier(
+            row.get("model") or model_config.get("model"),
+            field="resumed session.model",
+        )
+        billing_provider = normalize_provider_slug(
+            model_config.get("billing_provider")
+            or row.get("billing_provider"),
+            field="resumed session.billing_provider",
+        )
+    except ValueError:
+        logger.warning(
+            "Discarding unsafe stored session runtime metadata"
+        )
+        return {}
 
     overrides: dict = {}
-    model = str(row.get("model") or model_config.get("model") or "").strip()
     # ``billing_provider`` is only the billing bucket — for a custom endpoint it is the
     # bare class ``"custom"``, which agent_init treats as non-routable, so restoring it as
     # the provider override makes ``session.resume`` fail with "No LLM provider configured".
     # Only restore an explicit provider; otherwise leave it unset so resume falls back to
     # the configured default, matching the working CLI path.
     explicit_provider = str(model_config.get("provider") or "").strip()
-    billing_provider = str(
-        model_config.get("billing_provider") or row.get("billing_provider") or ""
-    ).strip()
     provider = explicit_provider
     if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
         provider = billing_provider
@@ -3124,7 +3318,17 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             logger.debug(
                 "custom provider identity recovery failed", exc_info=True
             )
-        provider = healed or ("" if not base_url else provider)
+        provider = healed or ""
+        if not provider:
+            base_url = ""
+            api_mode = ""
+
+    if not provider:
+        # A model-only row can safely use the profile's currently configured
+        # provider, but a persisted endpoint/protocol has no credential-bound
+        # identity and must not participate in replay.
+        base_url = ""
+        api_mode = ""
 
     if model:
         # Use the same dict-shaped override that live /model switches use so a
@@ -3138,6 +3342,10 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             "base_url": base_url or None,
             "api_mode": api_mode or None,
         }
+        # Replay provenance is control-plane state, not model metadata.  Keep it
+        # beside the override so it cannot leak into session records, UI payloads,
+        # or later /model state that legitimately accepts user-selected values.
+        overrides["durable_replay"] = True
     if provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
@@ -4455,13 +4663,15 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "update_behind": None,
         "update_command": "",
         "usage": _session_usage_snapshot(session),
-        "profile_name": _response_profile_name(
-            Path(session["profile_home"]).name
-            if isinstance(session, dict) and session.get("profile_home")
-            else None
-        )
-        if isinstance(session, dict) and session.get("profile_home")
-        else _current_profile_name(),
+        "profile_name": (
+            str(session.get("profile_name"))
+            if isinstance(session, dict) and session.get("profile_name")
+            else (
+                Path(session["profile_home"]).name
+                if isinstance(session, dict) and session.get("profile_home")
+                else _current_profile_name()
+            )
+        ),
     }
     try:
         from hermes_cli import __version__, __release_date__
@@ -4743,6 +4953,9 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         _emit("tool.complete", sid, payload)
 
 
+_LIVE_PROFILE_UNSPECIFIED = object()
+
+
 def _on_tool_progress(
     sid: str,
     event_type: str,
@@ -4881,7 +5094,24 @@ def _on_tool_progress(
         # catch-all. The mirror keys off the child sid and is unaffected.
         if event_type != "subagent.text":
             _emit(event_type, sid, payload)
-        _mirror_subagent_to_child(event_type, payload)
+        try:
+            with _sessions_lock:
+                parent_session = _sessions.get(sid)
+        except Exception:
+            parent_session = None
+        # The relay is only authoritative when its parent gateway session is
+        # still registered.  A late callback from a torn-down parent has lost
+        # the profile identity that disambiguates equal durable session keys;
+        # routing it through the historical unscoped lookup could leak an
+        # alpha child event into a beta watch window.  Keep emitting the parent
+        # event above for compatibility, but fail closed for child state.
+        if parent_session is None:
+            return
+        _mirror_subagent_to_child(
+            event_type,
+            payload,
+            profile_home=parent_session.get("profile_home"),
+        )
 
 
 # ── Child-session live mirror ────────────────────────────────────────
@@ -4893,47 +5123,86 @@ def _on_tool_progress(
 # persists. Translate the relayed events into the native stream events the
 # window already renders — emitted on the CHILD sid, routed to its transport
 # by write_json — so the window shows a real midstream turn.
-_child_mirrors: dict[str, dict] = {}
+_child_mirrors: dict[object, dict] = {}
 _child_mirrors_lock = threading.Lock()
 # Stored child session ids with a delegation run currently in flight (refreshed
 # on every relayed subagent.* event, popped on subagent.complete). Lets a lazy
 # watch resume report running=true so the window shows a busy indicator even
 # while the child is silent inside a long tool call (no events for 25s+).
-_active_child_runs: dict[str, float] = {}
+_active_child_runs: dict[object, float] = {}
 # Staleness bound for the registry: entries refresh on every relayed event, so
 # anything this quiet means the completion event was lost (callback raised,
 # parent crashed) — don't let a leaked entry pin "running" forever.
 _CHILD_RUN_STALE_S = 3600.0
 
 
-def _child_run_active(child_key: str) -> bool:
-    ts = _active_child_runs.get(child_key)
+def _child_profile_state_key(
+    child_key: str,
+    profile_home: str | Path | None | object,
+) -> object | None:
+    if profile_home is _LIVE_PROFILE_UNSPECIFIED:
+        return child_key
+    try:
+        canonical_home = Path(
+            profile_home if profile_home is not None else _hermes_home
+        ).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    return str(canonical_home), child_key
+
+
+def _child_run_active(
+    child_key: str,
+    *,
+    profile_home: str | Path | None | object = _LIVE_PROFILE_UNSPECIFIED,
+) -> bool:
+    state_key = _child_profile_state_key(child_key, profile_home)
+    if state_key is None:
+        return False
+    ts = _active_child_runs.get(state_key)
     return ts is not None and (time.time() - ts) < _CHILD_RUN_STALE_S
 
 
-def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
+def _mirror_subagent_to_child(
+    event_type: str,
+    payload: dict,
+    *,
+    profile_home: str | Path | None | object = _LIVE_PROFILE_UNSPECIFIED,
+) -> None:
     child_key = str(payload.get("child_session_id") or "")
     if not child_key:
+        return
+    state_key = _child_profile_state_key(child_key, profile_home)
+    if state_key is None:
         return
     # Liveness registry first — it must be accurate even when no window is
     # open, so a window opened mid-run can immediately know the child is busy.
     if event_type == "subagent.complete":
-        _active_child_runs.pop(child_key, None)
+        _active_child_runs.pop(state_key, None)
     else:
-        _active_child_runs[child_key] = time.time()
+        _active_child_runs[state_key] = time.time()
     # Mirror only into a live watch session (keyed by session_key; its live sid
     # differs from the stored id) that has NOT been upgraded to a full agent.
     # No window / closed → nothing to mirror; an upgraded session owns a real
     # native stream and mirroring on top would interleave two turns on one sid.
     # Either way drop state so a reopened window starts a fresh synthetic turn.
-    live = _find_live_session_by_key(child_key)
+    if profile_home is _LIVE_PROFILE_UNSPECIFIED:
+        live = _find_live_session_by_key(child_key)
+    else:
+        live = _find_live_session_by_key(
+            child_key,
+            profile_home=profile_home,
+        )
     if live is None or live[1].get("agent") is not None:
         with _child_mirrors_lock:
-            _child_mirrors.pop(child_key, None)
+            _child_mirrors.pop(state_key, None)
         return
     csid = live[0]
     with _child_mirrors_lock:
-        st = _child_mirrors.setdefault(child_key, {"seq": 0, "open_tool": None, "started": False})
+        st = _child_mirrors.setdefault(
+            state_key,
+            {"seq": 0, "open_tool": None, "started": False},
+        )
         if not st["started"]:
             st["started"] = True
             _emit("message.start", csid)
@@ -4969,7 +5238,7 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
                 _emit("tool.complete", csid, st["open_tool"])
             summary = str(payload.get("summary") or payload.get("text") or "")
             _emit("message.complete", csid, {"text": summary})
-            _child_mirrors.pop(child_key, None)
+            _child_mirrors.pop(state_key, None)
 
 
 def _agent_cbs(sid: str) -> dict:
@@ -5648,6 +5917,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    durable_replay: bool = False,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5738,7 +6008,11 @@ def _make_agent(
             )
             if recovered:
                 requested_provider = recovered
-            if override_base_url:
+            elif durable_replay:
+                raise RuntimeError(
+                    "Stored custom session runtime no longer matches configuration"
+                )
+            if override_base_url and not durable_replay:
                 # Failing identity recovery, still hand the base_url to the
                 # direct-alias branch so pool/env credentials resolve for it.
                 resolve_kwargs["explicit_base_url"] = override_base_url
@@ -5747,6 +6021,10 @@ def _make_agent(
         resolution = _resolve_runtime_with_fallback(resolve_kwargs)
         runtime = resolution.runtime
         if resolution.used_fallback:
+            if durable_replay:
+                raise RuntimeError(
+                    "Stored session provider is unavailable; refusing fallback"
+                )
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
@@ -5754,11 +6032,41 @@ def _make_agent(
             # The switch already resolved concrete credentials/endpoint; honor
             # persisted overrides only while using that original runtime. They
             # must not leak into a different fallback provider/model pair.
-            if override_base_url:
+            if durable_replay:
+                from gateway.api_execution_context import (
+                    canonicalize_session_endpoint,
+                    normalize_api_mode,
+                )
+
+                if override_base_url:
+                    stored_endpoint = canonicalize_session_endpoint(
+                        override_base_url
+                    )
+                    live_endpoint = canonicalize_session_endpoint(
+                        runtime.get("base_url")
+                    )
+                    if not live_endpoint or stored_endpoint != live_endpoint:
+                        raise RuntimeError(
+                            "Stored session endpoint no longer matches provider"
+                        )
+                if override_api_mode:
+                    stored_mode = normalize_api_mode(
+                        override_api_mode,
+                        field="stored session api_mode",
+                    )
+                    live_mode = normalize_api_mode(
+                        runtime.get("api_mode"),
+                        field="resolved session api_mode",
+                    )
+                    if stored_mode != live_mode:
+                        raise RuntimeError(
+                            "Stored session API mode no longer matches provider"
+                        )
+            elif override_base_url:
                 runtime["base_url"] = override_base_url
-            if override_api_key:
+            if override_api_key and not durable_replay:
                 runtime["api_key"] = override_api_key
-            if override_api_mode:
+            if override_api_mode and not durable_replay:
                 runtime["api_mode"] = override_api_mode
     else:
         model, requested_provider = _resolve_startup_runtime()
@@ -5835,6 +6143,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    profile_name: str | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -5862,6 +6171,7 @@ def _init_session(
             # launch profile. SessionBranch copies the parent's value so the
             # child stays on the same state.db.
             "profile_home": profile_home,
+            "profile_name": profile_name,
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
@@ -5938,8 +6248,20 @@ def _init_session(
         pass
     _wire_callbacks(sid)
     with _sessions_lock:
-        if sid in _sessions:
-            _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+        notification_session = _sessions.get(sid)
+    if notification_session is not None:
+        _restore_session_async_delegation_completions(
+            sid,
+            notification_session,
+        )
+        with _sessions_lock:
+            if _sessions.get(sid) is notification_session:
+                notification_session["_notif_stop"] = (
+                    _start_notification_poller(
+                        sid,
+                        notification_session,
+                    )
+                )
     _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
@@ -6847,8 +7169,7 @@ def _(rid, params: dict) -> dict:
     # profile must build its agent + persist against THAT profile's home/state.db,
     # not the dashboard's launch profile. Stored on the session so _start_agent_build
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
+    profile, profile_home = _profile_target(params.get("profile"))
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -6911,6 +7232,7 @@ def _(rid, params: dict) -> dict:
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "profile_name": profile,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -7150,6 +7472,7 @@ def _deferred_session_record(
     close_on_disconnect: bool = False,
     display_history_prefix: list | None = None,
     profile_home: Path | None = None,
+    profile_name: str | None = None,
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
@@ -7180,6 +7503,7 @@ def _deferred_session_record(
         "model_override": model_override,
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
+        "profile_name": profile_name,
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,
@@ -7200,7 +7524,10 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(
+            session_key,
+            profile_home=record.get("profile_home"),
+        )
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -7225,6 +7552,29 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+class _ResumeDBOwnership:
+    """Close a non-launch resume DB unless a registered session adopted it."""
+
+    def __init__(self, db, *, owned: bool):
+        self.db = db
+        self.owned = owned
+        self.handle = _SessionDBHandle(db) if owned else None
+
+    def transfer_to_session(self, sid: str, agent) -> dict | None:
+        session = _adopt_registered_agent_db(sid, agent, self.handle)
+        if session is None:
+            return None
+        self.owned = False
+        return session
+
+    def close(self) -> None:
+        if not self.owned or self.db is None:
+            return
+        self.owned = False
+        if self.handle is not None:
+            self.handle.close()
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
@@ -7236,26 +7586,60 @@ def _(rid, params: dict) -> dict:
         cols = 80
     # ``profile`` (app-global remote mode): resume a session that lives in another
     # local profile's state.db. None/own profile → the launch profile (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
+    profile, profile_home = _profile_target(params.get("profile"))
 
-    # In a profile scope, the agent OWNS a long-lived db handle bound to that
-    # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
+    # Non-launch handles begin as a bounded read scope. Lazy/deferred/fast/error
+    # exits close them; only a successfully built eager AIAgent adopts the
+    # handle for long-lived message persistence.
     if profile_home is not None:
         from hermes_state import SessionDB
 
-        db = SessionDB(db_path=profile_home / "state.db")
+        try:
+            db = SessionDB(db_path=profile_home / "state.db")
+        except Exception as exc:
+            return _err(rid, 5000, f"resume failed: {exc}")
+        db_ownership = _ResumeDBOwnership(db, owned=True)
     else:
         db = _get_db()
+        db_ownership = _ResumeDBOwnership(db, owned=False)
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
+    try:
+        return _resume_session_with_db(
+            rid,
+            params,
+            target=target,
+            cols=cols,
+            profile=profile,
+            profile_home=profile_home,
+            db=db,
+            db_ownership=db_ownership,
+        )
+    finally:
+        db_ownership.close()
+
+
+def _resume_session_with_db(
+    rid,
+    params: dict,
+    *,
+    target: str,
+    cols: int,
+    profile: str | None,
+    profile_home: Path | None,
+    db,
+    db_ownership: _ResumeDBOwnership,
+) -> dict:
     found = db.get_session(target)
     if not found:
         found = db.get_session_by_title(target)
         if found:
             target = found["id"]
-        elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
+        elif is_truthy_value(params.get("lazy", False)) and _child_run_active(
+            target,
+            profile_home=profile_home,
+        ):
             # Race: a watch window opened on a freshly-spawned subagent. The
             # child relays `subagent.start` (which carries child_session_id and
             # triggers the window) BEFORE its first run_conversation() flushes
@@ -7307,14 +7691,20 @@ def _(rid, params: dict) -> dict:
         # A lazy watch session never owns a run loop, so its payload's running
         # flag is always False — overlay the child-run registry so a reconnecting
         # watch window keeps its busy indicator while the child is still mid-run.
-        if session.get("agent") is None and _child_run_active(target):
+        if session.get("agent") is None and _child_run_active(
+            target,
+            profile_home=profile_home,
+        ):
             payload["running"] = True
             payload["status"] = "streaming"
         return payload
 
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(
+            target,
+            profile_home=profile_home,
+        )
         if live is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
@@ -7356,13 +7746,17 @@ def _(rid, params: dict) -> dict:
             source=source,
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
+            profile_name=profile,
             lazy=True,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
-        child_running = _child_run_active(target)
+        child_running = _child_run_active(
+            target,
+            profile_home=profile_home,
+        )
         # User-visible messages use the VERBATIM display projection (child-only,
         # no ancestors — matching the repaired read above), so model-invisible
         # rows persisted by #65919 (verification candidates collapsed by
@@ -7450,6 +7844,7 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             display_history_prefix=prefix,
             profile_home=profile_home,
+            profile_name=profile,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
         )
@@ -7550,10 +7945,19 @@ def _(rid, params: dict) -> dict:
     # live session while we were building. Re-check under the lock; if it won,
     # discard our just-built agent and reuse theirs (no worker/poller wired yet).
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(
+            target,
+            profile_home=profile_home,
+        )
         if live is not None:
             try:
                 if hasattr(agent, "close"):
+                    # This redundant build shares the target session identity
+                    # with the resume winner. It never owned the winner's
+                    # process/browser/sandbox namespace or durable session row;
+                    # close only its private client/history state.
+                    agent._owns_runtime_resources = False
+                    agent._end_session_on_close = False
                     agent.close()
             except Exception:
                 pass
@@ -7590,25 +7994,66 @@ def _(rid, params: dict) -> dict:
                     cwd=profile_resume_cwd,
                     session_db=db,
                     source=source,
+                    profile_home=(
+                        str(profile_home)
+                        if profile_home is not None
+                        else None
+                    ),
+                    profile_name=profile,
                 )
             finally:
                 if init_home_token is not None:
                     reset_hermes_home_override(init_home_token)
                 if init_secret_token is not None:
                     reset_secret_scope(init_secret_token)
+            # Ownership changes only after _init_session has registered this
+            # exact agent.  Until then the outer resume scope closes the DB on
+            # duplicate-winner and initialization-error exits.
+            registered = db_ownership.transfer_to_session(sid, agent)
+            if registered is None:
+                raise RuntimeError("session registration lost during resume")
             if sid in _sessions:
                 if stored_runtime_overrides.get("model_override") is not None:
-                    _sessions[sid]["model_override"] = stored_runtime_overrides[
+                    registered["model_override"] = stored_runtime_overrides[
                         "model_override"
                     ]
-                _sessions[sid]["display_history_prefix"] = display_history_prefix
+                registered["display_history_prefix"] = display_history_prefix
                 # Remember the profile home so each turn re-binds HERMES_HOME (the
                 # agent persists to its own db, but mid-turn home reads — memory,
                 # skills — must resolve to the resumed profile too).
                 if profile_home is not None:
-                    _sessions[sid]["profile_home"] = str(profile_home)
-                _sessions[sid]["active_session_lease"] = lease
+                    registered["profile_home"] = str(profile_home)
+                registered["active_session_lease"] = lease
         except Exception as e:
+            failed_session = None
+            with _sessions_lock:
+                candidate = _sessions.get(sid)
+                if candidate is not None and candidate.get("agent") is agent:
+                    failed_session = _sessions.pop(sid)
+            if failed_session is not None:
+                failed_handle = failed_session.pop("_owned_session_db", None)
+                worker = failed_session.get("slash_worker")
+                if worker is not None:
+                    with contextlib.suppress(Exception):
+                        worker.close()
+                stop_event = failed_session.get("_notif_stop")
+                if stop_event is not None:
+                    with contextlib.suppress(Exception):
+                        stop_event.set()
+            else:
+                failed_handle = None
+            with contextlib.suppress(Exception):
+                from tools.approval import unregister_gateway_notify
+
+                unregister_gateway_notify(target)
+            try:
+                agent._end_session_on_close = False
+                if hasattr(agent, "close"):
+                    agent.close()
+            except Exception:
+                pass
+            if failed_handle is not None:
+                failed_handle.close()
             if lease is not None:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
@@ -7738,10 +8183,37 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+def _find_live_session_by_key(
+    session_key: str,
+    *,
+    profile_home: str | Path | None | object = _LIVE_PROFILE_UNSPECIFIED,
+) -> tuple[str, dict] | None:
+    """Find a live durable session, optionally scoped to its canonical home.
+
+    Omitting ``profile_home`` preserves the historical key-only lookup used by
+    legacy/internal callers.  Resume/reuse paths always pass it explicitly
+    (including ``None`` for the launch profile), because durable session ids
+    are only unique inside one profile's ``state.db``.
+    """
+
+    expected_home: Path | None = None
+    if profile_home is not _LIVE_PROFILE_UNSPECIFIED:
+        try:
+            expected_home = Path(
+                profile_home if profile_home is not None else _hermes_home
+            ).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            return None
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
             continue
+        if expected_home is not None:
+            try:
+                session_home = _session_home(session).expanduser().resolve()
+            except (OSError, TypeError, ValueError):
+                continue
+            if session_home != expected_home:
+                continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
     return None
@@ -7856,8 +8328,11 @@ def _live_session_payload(
         running = bool(session.get("running"))
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript; the DB has its own
-    # lock, so read it outside the session history lock.
-    history = _live_visible_history(session, _get_db(), in_memory_history)
+    # lock, so read it outside the session history lock. Resolve through the
+    # live session's profile DB; using the launch handle here can project a
+    # same-key transcript from another profile into a remote resume payload.
+    with _session_db(session) as db:
+        history = _live_visible_history(session, db, in_memory_history)
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
@@ -7954,6 +8429,7 @@ def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
+    _profile, profile_home = _profile_target(params.get("profile"))
     # Block deletion of any session currently bound to a live TUI session
     # in this process.  The picker hides the active session anyway, but a
     # racing caller could still target it.  Snapshot via ``list(...)``
@@ -7969,8 +8445,6 @@ def _(rid, params: dict) -> dict:
     active = {s.get("session_key") for s in snapshot if s.get("session_key")}
     if target in active:
         return _err(rid, 4023, "cannot delete an active session")
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
     with _profile_db(params) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5036)
@@ -10328,7 +10802,8 @@ def _(rid, params: dict) -> dict:
                 # just the parent-backfill) so it holds even when the parent row
                 # predates the profile_name column.
                 profile_name=(
-                    Path(session["profile_home"]).name
+                    session.get("profile_name")
+                    or Path(session["profile_home"]).name
                     if session.get("profile_home")
                     else None
                 ),
@@ -10347,6 +10822,8 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             return _err(rid, 5008, f"branch failed: {e}")
+    agent = None
+    branch_db_handle = None
     try:
         # Bind the branched AGENT to the parent's profile, mirroring
         # session.create/resume: home override so config/skills/memory resolve
@@ -10361,6 +10838,7 @@ def _(rid, params: dict) -> dict:
             from hermes_state import SessionDB
 
             branch_db = SessionDB(db_path=Path(parent_home) / "state.db")
+            branch_db_handle = _SessionDBHandle(branch_db)
         home_token = (
             set_hermes_home_override(parent_home) if parent_home else None
         )
@@ -10386,13 +10864,47 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                profile_name=session.get("profile_name"),
             )
+            registered = _adopt_registered_agent_db(
+                new_sid,
+                agent,
+                branch_db_handle,
+            )
+            if registered is None:
+                raise RuntimeError("branch session registration lost")
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
-        if new_sid in _sessions:
-            _sessions[new_sid]["active_session_lease"] = lease
+        registered["active_session_lease"] = lease
     except Exception as e:
+        failed_session = None
+        with _sessions_lock:
+            candidate = _sessions.get(new_sid)
+            if candidate is not None and candidate.get("agent") is agent:
+                failed_session = _sessions.pop(new_sid)
+        if failed_session is not None:
+            failed_handle = failed_session.pop("_owned_session_db", None)
+            worker = failed_session.get("slash_worker")
+            if worker is not None:
+                with contextlib.suppress(Exception):
+                    worker.close()
+        else:
+            failed_handle = None
+        if agent is not None:
+            with contextlib.suppress(Exception):
+                agent._end_session_on_close = False
+            if hasattr(agent, "close"):
+                with contextlib.suppress(Exception):
+                    agent.close()
+        if failed_handle is not None:
+            failed_handle.close()
+        if branch_db_handle is not None:
+            branch_db_handle.close()
+        with contextlib.suppress(Exception):
+            from tools.approval import unregister_gateway_notify
+
+            unregister_gateway_notify(new_key)
         if lease is not None:
             lease.release()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
@@ -10816,7 +11328,10 @@ def _(rid, params: dict) -> dict:
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        if session.get("lazy") and _child_run_active(
+            str(session.get("session_key") or ""),
+            profile_home=session.get("profile_home"),
+        ):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         if truncate_user_ordinal is not None:
             try:
@@ -10958,117 +11473,107 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     poller must skip events it doesn't own so a detached result surfaces in the
     launching session, not whichever poller happened to dequeue first.
     """
-    evt_ui_sid = str(evt.get("origin_ui_session_id") or "")
-    if evt_ui_sid:
-        if evt_ui_sid == str(sid or "") and not session.get("_finalized"):
-            return False
-        try:
-            with _sessions_lock:
-                owner_live = evt_ui_sid in _sessions and not _sessions[evt_ui_sid].get("_finalized")
-        except Exception:
-            owner_live = False
-        if owner_live:
-            return True
-        # If the exact UI tab is gone, fall through to durable session_key
-        # routing. That avoids wrong-session delivery while still allowing a
-        # resumed continuation with the same durable key/lineage to claim it.
-
-    evt_key = str(evt.get("session_key") or "")
-    if not evt_key:
-        return False
-
-    current_keys = {
-        str(session.get("session_key") or ""),
-        _session_lookup_key(session, fallback=sid),
-    }
-
-    # Compression can rotate AIAgent.session_id while the detached child is
-    # still running. Resolve the event's original key to its continuation tip so
-    # an event captured before or after compression still maps to the same live
-    # desktop session instead of becoming an orphan that any poller may consume.
-    resolved_key = evt_key
-    try:
-        db = _get_db()
-        if db is not None:
-            resolved_key = db.resolve_resume_session_id(evt_key) or evt_key
-    except Exception:
-        resolved_key = evt_key
-
-    # If the key has a live continuation, prefer that continuation over the
-    # compressed parent. Otherwise a stale parent tab could consume the event
-    # before the real current conversation sees it.
-    if resolved_key != evt_key:
-        if resolved_key in current_keys:
-            return False
-        try:
-            with _sessions_lock:
-                continuation_live = any(
-                    not s.get("_finalized")
-                    and (
-                        str(s.get("session_key") or "") == resolved_key
-                        or _session_lookup_key(s, fallback="") == resolved_key
-                    )
-                    for s in _sessions.values()
-                )
-        except Exception:
-            continuation_live = False
-        if continuation_live:
-            return True
-
-    if evt_key in current_keys:
-        return False
+    # Ownership is ranked rather than boolean because a pre-compression parent
+    # and its live continuation can both match the same raw durable key.  The
+    # resolved continuation must win over that stale raw parent, while an exact
+    # live UI origin remains the strongest signal.  Store/profile authorization
+    # is part of every rank, so equal ids in two profiles cannot cross-deliver.
+    current_rank = _session_notification_ownership_rank(sid, session, evt)
 
     try:
         with _sessions_lock:
-            snapshot = list(_sessions.values())
+            snapshot = list(_sessions.items())
     except Exception:
         # If we can't safely enumerate live sessions, fail open so we don't
         # crash the poller thread or drop the event.
         return False
 
-    return any(
-        s is not session
-        and not s.get("_finalized")
-        and (
-            str(s.get("session_key") or "") in {evt_key, resolved_key}
-            or _session_lookup_key(s, fallback="") in {evt_key, resolved_key}
+    best_other_rank = 0
+    for other_sid, other_session in snapshot:
+        if other_session is session or other_session.get("_finalized"):
+            continue
+        other_rank = _session_notification_ownership_rank(
+            other_sid, other_session, evt
         )
-        for s in snapshot
-    )
+        best_other_rank = max(best_other_rank, other_rank)
+        if other_rank > current_rank:
+            return True
+    # A tie stays with the poller that already holds the queue carrier.  That
+    # avoids ping-pong between duplicate live views of the same durable
+    # session, without allowing a weaker stale-parent match to beat a resolved
+    # continuation.
+    return False
 
 
-def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool:
-    """True iff *this* session PROVABLY owns ``evt``.
+def _session_notification_ownership_rank(
+    sid: str,
+    session: dict,
+    evt: dict,
+) -> int:
+    """Return the strength of this session's authorized ownership proof.
 
-    Positive ownership — the mirror of ``_notification_event_belongs_elsewhere``
-    minus its orphan-adoption fallback. An event owns-matches when its
-    ``origin_ui_session_id`` is this live session, or its ``session_key``
-    (raw or resolved through the compression chain) matches this session's
-    key/lineage. Used as the fail-closed gate for every addressed notification:
-    "not provably elsewhere" is NOT good enough to inject a payload into this
-    chat (#55578).
+    ``3`` is an exact live UI origin, ``2`` is the resolved compression tip,
+    ``1`` is a raw durable-key match, and ``0`` means no authorized ownership.
+    The distinction lets a live continuation outrank its still-open stale
+    parent without weakening profile-scoped delivery.
     """
     if session.get("_finalized"):
-        return False
+        return 0
+    # A restored/live durable event may carry an opaque, process-local stamp
+    # naming the profile store that owns its delivery row.  Session ids and UI
+    # ids are not globally unique across profiles, so neither is sufficient to
+    # authorize injection on an app-global desktop backend.  Preserve legacy
+    # behavior only for genuinely unstamped in-memory events; a present but
+    # unresolvable stamp is forged/stale and therefore fails closed.
+    try:
+        from tools.async_delegation import (
+            event_has_delivery_store_stamp,
+            get_event_delivery_store,
+        )
+
+        if event_has_delivery_store_stamp(evt):
+            delivery_store = get_event_delivery_store(evt)
+            if delivery_store is None:
+                return 0
+            event_home = Path(delivery_store.hermes_home).expanduser().resolve()
+            session_home = _session_home(session).expanduser().resolve()
+            if event_home != session_home:
+                return 0
+    except Exception:
+        return 0
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
-        return True
+        return 3
     evt_key = str(evt.get("session_key") or "")
     if not evt_key:
-        return False
+        return 0
     current_keys = {
         str(session.get("session_key") or ""),
         _session_lookup_key(session, fallback=sid),
     }
-    if evt_key in current_keys:
-        return True
     try:
-        db = _get_db()
-        resolved_key = (
-            db.resolve_resume_session_id(evt_key) if db is not None else evt_key
-        ) or evt_key
+        with _session_db(session) as db:
+            resolved_key = (
+                db.resolve_resume_session_id(evt_key)
+                if db is not None
+                else evt_key
+            ) or evt_key
     except Exception:
         resolved_key = evt_key
-    return resolved_key in current_keys
+    if resolved_key != evt_key and resolved_key in current_keys:
+        return 2
+    if evt_key in current_keys:
+        return 1
+    return 0
+
+
+def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool:
+    """True iff *this* session has a positive authorized ownership proof.
+
+    This is the fail-closed injection gate.  Cross-session arbitration uses
+    the richer rank above so a compression continuation can beat a stale raw
+    parent; callers that only need authorization use the boolean projection.
+    """
+    return _session_notification_ownership_rank(sid, session, evt) > 0
 
 
 def _notification_event_requires_owner(evt: dict) -> bool:
@@ -11114,6 +11619,197 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
         # and the second completion's status update is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
     return (evt_sid, evt_type)
+
+
+def _notification_retry_identity(evt: dict) -> tuple[str, str] | None:
+    """Return a profile-scoped durable identity for one retry carrier."""
+
+    if evt.get("type") != "async_delegation":
+        return None
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return None
+    from tools.async_delegation import (
+        event_has_delivery_store_stamp,
+        get_event_delivery_store,
+    )
+
+    store = get_event_delivery_store(evt)
+    if event_has_delivery_store_stamp(evt) and store is None:
+        # A present but unresolvable capability is forged/stale.  Never turn it
+        # into a filesystem lookup or an immortal retry timer.
+        return None
+    store_key = (
+        str(Path(store.hermes_home).expanduser().resolve())
+        if store is not None
+        else "legacy-ambient-store"
+    )
+    return store_key, delegation_id
+
+
+def _schedule_async_notification_retry(
+    evt: dict,
+    *,
+    minimum_seconds: float = _NOTIFICATION_RETRY_MIN_SECONDS,
+    _delay_override: float | None = None,
+) -> bool:
+    """Keep exactly one delayed queue carrier for a pending durable event.
+
+    Claims are leases.  A restored event can arrive while an older consumer
+    still has a fresh lease, and a failed TUI turn can release the only carrier
+    after dequeuing it.  This scheduler rechecks the authoritative profile row
+    before every enqueue, deduplicates by ``(store, delegation_id)``, and waits
+    out a renewed foreign lease without spinning the shared completion queue.
+    """
+
+    try:
+        identity = _notification_retry_identity(evt)
+    except Exception:
+        logger.warning(
+            "Could not resolve async notification retry identity",
+            exc_info=True,
+        )
+        return False
+    if identity is None:
+        return False
+
+    minimum = max(0.01, float(minimum_seconds))
+    if _delay_override is None:
+        try:
+            from tools.async_delegation import event_delivery_retry_delay
+
+            delay = event_delivery_retry_delay(
+                evt,
+                minimum_seconds=minimum,
+            )
+        except Exception:
+            # A transient SQLite error is not evidence that the durable row is
+            # terminal.  Retry the read conservatively; the callback performs
+            # the same authoritative check before it ever re-enqueues.
+            logger.warning(
+                "Could not inspect async delegation %s retry state; "
+                "scheduling a conservative recheck",
+                identity[1],
+                exc_info=True,
+            )
+            delay = max(minimum, _NOTIFICATION_RETRY_STORAGE_ERROR_SECONDS)
+    else:
+        delay = max(minimum, float(_delay_override))
+    if delay is None:
+        return False
+
+    timer: threading.Timer
+
+    def _retry() -> None:
+        with _notification_retry_lock:
+            if _notification_retry_timers.get(identity) is not timer:
+                return
+            _notification_retry_timers.pop(identity, None)
+        try:
+            from tools.async_delegation import event_delivery_retry_delay
+
+            next_delay = event_delivery_retry_delay(
+                evt,
+                minimum_seconds=minimum,
+            )
+        except Exception:
+            logger.warning(
+                "Could not recheck async delegation %s retry state; "
+                "retaining its delayed carrier",
+                identity[1],
+                exc_info=True,
+            )
+            _schedule_async_notification_retry(
+                evt,
+                minimum_seconds=minimum,
+                _delay_override=max(
+                    minimum,
+                    _NOTIFICATION_RETRY_STORAGE_ERROR_SECONDS,
+                ),
+            )
+            return
+        if next_delay is None:
+            return
+        # A value larger than the ready-state minimum means another consumer
+        # still owns a fresh (possibly renewed) lease.  Wait out that lease;
+        # otherwise this callback is the single carrier allowed back on queue.
+        if next_delay > minimum + 0.001:
+            _schedule_async_notification_retry(
+                evt,
+                minimum_seconds=minimum,
+                _delay_override=next_delay,
+            )
+            return
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(evt)
+
+    delay_seconds = float(delay)
+    retry_deadline = time.monotonic() + delay_seconds
+    timer = threading.Timer(delay_seconds, _retry)
+    timer.daemon = True
+    timer._hermes_retry_deadline = retry_deadline
+    with _notification_retry_lock:
+        existing = _notification_retry_timers.get(identity)
+        if existing is not None:
+            existing_deadline = float(
+                getattr(existing, "_hermes_retry_deadline", float("inf"))
+            )
+            # Keep the earliest known recheck.  A failed active turn may have
+            # just released a claim while a duplicate carrier was already
+            # waiting out its former five-minute lease; in that case replace
+            # the long timer with the now-ready short retry.
+            if existing_deadline <= retry_deadline + 0.001:
+                return True
+        # Start while holding the registry lock.  An immediate callback blocks
+        # on this same lock until the new timer is published.  More
+        # importantly, a failed Timer.start leaves the old valid carrier
+        # untouched instead of canceling it and then losing both.
+        try:
+            timer.start()
+        except Exception:
+            logger.warning(
+                "Could not start async delegation %s retry timer",
+                identity[1],
+                exc_info=True,
+            )
+            return False
+        if existing is not None:
+            existing.cancel()
+        _notification_retry_timers[identity] = timer
+    return True
+
+
+def _release_notification_delivery_for_retry(
+    evt: dict,
+    claim: str | None,
+) -> bool:
+    """Release a failed claim and retain a carrier even on storage failure."""
+
+    released = False
+    try:
+        from tools.async_delegation import release_event_delivery
+
+        released = release_event_delivery(evt, claim)
+    except Exception:
+        logger.warning(
+            "Could not release async delegation %s delivery claim; "
+            "retaining a conservative retry carrier",
+            str(evt.get("delegation_id") or ""),
+            exc_info=True,
+        )
+    _schedule_async_notification_retry(evt)
+    return released
+
+
+def _cancel_notification_retry_timers() -> None:
+    """Cancel process-local retry carriers; durable rows survive restart."""
+
+    with _notification_retry_lock:
+        timers = list(_notification_retry_timers.values())
+        _notification_retry_timers.clear()
+    for timer in timers:
+        timer.cancel()
 
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
@@ -11399,11 +12095,14 @@ def _notification_poller_loop(
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        _claim, _runtime_effect = _claim_notification_turn(
+            evt,
+            "tui-poller",
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            _schedule_async_notification_retry(evt)
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -11415,12 +12114,25 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    runtime_effect=_runtime_effect,
+                    delivery_event=evt,
+                    delivery_claim=_claim,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                if _claim:
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        text,
+                        runtime_effect=_runtime_effect,
+                        delivery_event=evt,
+                        delivery_claim=_claim,
+                    )
+                else:
+                    _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _release_notification_delivery_for_retry(evt, _claim)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -11477,11 +12189,14 @@ def _notification_poller_loop(
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        _claim, _runtime_effect = _claim_notification_turn(
+            evt,
+            "tui-poller",
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            _schedule_async_notification_retry(evt)
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -11493,12 +12208,25 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    runtime_effect=_runtime_effect,
+                    delivery_event=evt,
+                    delivery_claim=_claim,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                if _claim:
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        text,
+                        runtime_effect=_runtime_effect,
+                        delivery_event=evt,
+                        delivery_claim=_claim,
+                    )
+                else:
+                    _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _release_notification_delivery_for_retry(evt, _claim)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -11510,6 +12238,52 @@ def _notification_poller_loop(
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
         process_registry.completion_queue.put(evt)
+
+
+def _claim_notification_turn(
+    evt: dict,
+    consumer: str,
+) -> tuple[str | None, dict | None]:
+    """Validate host metadata and claim one notification for a durable turn."""
+
+    from agent.runtime_effects import (
+        RuntimeEffectError,
+        normalize_optional_runtime_effect,
+    )
+    from tools.async_delegation import (
+        claim_event_delivery,
+        drop_event_delivery,
+    )
+
+    try:
+        runtime_effect = normalize_optional_runtime_effect(
+            evt.get("runtime_effect")
+        )
+    except RuntimeEffectError:
+        try:
+            claim = claim_event_delivery(evt, f"{consumer}-invalid")
+            if claim:
+                drop_event_delivery(evt, claim)
+        except Exception:
+            logger.error(
+                "Could not quarantine malformed TUI notification delivery",
+                exc_info=True,
+            )
+        logger.error(
+            "Discarded malformed runtime effect on TUI notification",
+            exc_info=True,
+        )
+        return None, None
+
+    try:
+        claim = claim_event_delivery(evt, consumer)
+    except Exception:
+        logger.warning(
+            "Could not claim TUI notification delivery; deferring retry",
+            exc_info=True,
+        )
+        claim = None
+    return claim, runtime_effect
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -11606,6 +12380,54 @@ def _wire_desktop_ui() -> None:
     _desktop_ui_wired = True
 
 
+def _restore_session_async_delegation_completions(
+    sid: str,
+    session: dict,
+) -> int:
+    """Restore only durable completions provably owned by one TUI session.
+
+    App-global desktop backends host sessions from multiple Hermes profiles in
+    one process.  The ProcessRegistry queue is shared, but each delegation row
+    belongs to the profile ``state.db`` captured by this trusted in-memory
+    session record.  Restore through the registry's explicit store seam before
+    starting this session's poller, and filter by the same positive ownership
+    predicate used for live queue delivery.
+    """
+
+    try:
+        from tools.process_registry import process_registry
+
+        profile_home = session.get("profile_home")
+        profile_name = session.get("profile_name")
+        if profile_home and not profile_name:
+            # A non-launch filesystem path is not sufficient authority. New
+            # RPC-created sessions always retain the normalized, registry-
+            # validated profile identity; fail closed for an ad-hoc/legacy
+            # record that cannot be revalidated.
+            logger.warning(
+                "Refusing async delegation restore for TUI session %s: "
+                "non-launch profile home has no validated profile identity",
+                sid,
+            )
+            return 0
+        return process_registry.restore_async_delegation_completions(
+            hermes_home=_session_home(session),
+            profile=profile_name,
+            event_filter=lambda evt: _session_owns_notification_event(
+                sid,
+                session,
+                evt,
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "Failed to restore async delegation completions for TUI session %s",
+            sid,
+            exc_info=True,
+        )
+        return 0
+
+
 def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
     _wire_agent_terminal_output()
@@ -11623,7 +12445,15 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
+    runtime_effect: dict | None = None,
+    delivery_event: dict | None = None,
+    delivery_claim: str | None = None,
 ) -> None:
+    # Revalidate at the turn boundary.  The only authority accepted here is
+    # host metadata passed separately from the synthetic model-visible text.
+    from agent.runtime_effects import normalize_optional_runtime_effect
+
+    runtime_effect = normalize_optional_runtime_effect(runtime_effect)
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -11653,6 +12483,16 @@ def _run_prompt_submit(
         goal_turn_session_id = ""
         goal_turn_handled = False
         conversation_invoked = False
+        delivery_turn_persisted = False
+        delivery_history_handoff_complete = False
+        stop_delivery_renewal = None
+        if delivery_event is not None and delivery_claim is not None:
+            from tools.async_delegation import begin_event_delivery_renewal
+
+            stop_delivery_renewal = begin_event_delivery_renewal(
+                delivery_event,
+                delivery_claim,
+            )
 
         def _capture_goal_turn_authority(result_value=None) -> None:
             nonlocal goal_turn_id, goal_generation_id, goal_turn_session_id
@@ -11890,6 +12730,7 @@ def _run_prompt_submit(
                 "persist_user_message": (
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
+                "runtime_effect": runtime_effect,
             }
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
@@ -11971,6 +12812,7 @@ def _run_prompt_submit(
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            delivery_history_handoff_complete = True
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -12063,6 +12905,11 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            # The agent has returned through its durable turn boundary, the
+            # session history handoff is complete, and the terminal frame has
+            # been emitted.  Only now may the originating durable completion
+            # be acknowledged.
+            delivery_turn_persisted = delivery_history_handoff_complete
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -12286,6 +13133,37 @@ def _run_prompt_submit(
             # frame paths retire the marker as they emit).
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
+            if stop_delivery_renewal is not None:
+                stop_delivery_renewal()
+            if delivery_event is not None and delivery_claim is not None:
+                if delivery_turn_persisted:
+                    try:
+                        from tools.async_delegation import (
+                            complete_event_delivery,
+                        )
+
+                        delivery_settled = complete_event_delivery(
+                            delivery_event,
+                            delivery_claim,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not acknowledge async delegation %s "
+                            "delivery; retaining retry carrier",
+                            str(
+                                delivery_event.get("delegation_id")
+                                or ""
+                            ),
+                            exc_info=True,
+                        )
+                        delivery_settled = False
+                    if not delivery_settled:
+                        _schedule_async_notification_retry(delivery_event)
+                else:
+                    _release_notification_delivery_for_retry(
+                        delivery_event,
+                        delivery_claim,
+                    )
             _emit_settled_session_info(sid, session, agent)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
@@ -12347,18 +13225,34 @@ def _run_prompt_submit(
                             process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
+                _claim, _runtime_effect = _claim_notification_turn(
+                    _evt,
+                    "tui-post-turn",
                 )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    _schedule_async_notification_retry(_evt)
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
+                    if _claim:
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            synth,
+                            runtime_effect=_runtime_effect,
+                            delivery_event=_evt,
+                            delivery_claim=_claim,
+                        )
+                    else:
+                        _run_prompt_submit(rid, sid, session, synth)
                 except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
+                    _release_notification_delivery_for_retry(
+                        _evt,
+                        _claim,
+                    )
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",
