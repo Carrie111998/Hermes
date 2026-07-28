@@ -15,6 +15,7 @@ import {
   type MessagingPlatformInfo,
   updateMessagingPlatform
 } from '@/hermes'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { type Translations, useI18n } from '@/i18n'
 import { openExternalLink } from '@/lib/external-link'
 import { ExternalLink, Save, Trash2 } from '@/lib/icons'
@@ -22,6 +23,8 @@ import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { runGatewayRestart } from '@/store/system-actions'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { useStore } from '@nanostores/react'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -110,6 +113,12 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const [query, setQuery] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [saving, setSaving] = useState<string | null>(null)
+  // The profile this config will be read from / written to. Writes are routed
+  // to this profile's backend (its own HERMES_HOME) via profileScoped() in the
+  // API layer — this just makes the target visible so a save can never
+  // silently mutate the wrong profile (#72031).
+  const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const [pendingSave, setPendingSave] = useState<MessagingPlatformInfo | null>(null)
   const platformIds = useMemo(() => platforms?.map(p => p.id) ?? [], [platforms])
   const [selectedId, setSelectedId] = useRouteEnumParam('platform', platformIds, platformIds[0] ?? '')
 
@@ -218,7 +227,7 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     }
   }
 
-  async function handleSave(platform: MessagingPlatformInfo) {
+  async function commitSave(platform: MessagingPlatformInfo) {
     const env = trimEdits(edits[platform.id] || {})
 
     if (Object.keys(env).length === 0) {
@@ -242,6 +251,19 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     } finally {
       setSaving(null)
     }
+  }
+
+  async function handleSave(platform: MessagingPlatformInfo) {
+    const env = trimEdits(edits[platform.id] || {})
+
+    if (Object.keys(env).length === 0) {
+      return
+    }
+
+    // Surface the destination profile before mutating it. The save itself
+    // routes to activeProfile's backend, so confirming here prevents a
+    // silent write to the wrong profile (#72031).
+    setPendingSave(platform)
   }
 
   async function handleClear(platform: MessagingPlatformInfo, key: string) {
@@ -307,6 +329,7 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
           >
             {selected && (
               <PlatformDetail
+                activeProfile={activeProfile}
                 edits={edits[selected.id] || {}}
                 onClear={key => void handleClear(selected, key)}
                 onEdit={(key, value) =>
@@ -324,6 +347,17 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
             )}
           </DetailColumn>
         </MasterDetail>
+      )}
+      {pendingSave && (
+        <ConfirmDialog
+          cancelLabel={t.common.cancel}
+          confirmLabel={t.common.confirm}
+          description={m.saveScopeBody(activeProfile)}
+          onClose={() => setPendingSave(null)}
+          onConfirm={() => void commitSave(pendingSave)}
+          open
+          title={m.saveScopeTitle(pendingSave.name)}
+        />
       )}
     </PageSearchShell>
   )
@@ -357,12 +391,14 @@ function PlatformRow({
 }
 
 function PlatformDetail({
+  activeProfile,
   edits,
   onClear,
   onEdit,
   platform,
   saving
 }: {
+  activeProfile: string
   edits: Record<string, string>
   onClear: (key: string) => void
   onEdit: (key: string, value: string) => void
@@ -396,6 +432,13 @@ function PlatformDetail({
           <PlatformHint platform={platform} />
         </div>
       </header>
+
+      {/* Profile scope: this config is read from / written to the active
+          profile's HERMES_HOME. Making the target explicit is the visible half
+          of the #72031 fix — the save confirm dialog is the warning half. */}
+      <div className="mt-3 flex items-center gap-2 rounded-md border border-(--ui-border-subtle) bg-(--ui-row-active-background) px-3 py-2 text-xs text-(--ui-text-secondary)">
+        <span className="font-medium text-foreground">{activeProfile === 'default' ? m.configScopeDefault : m.configScope(activeProfile)}</span>
+      </div>
 
       {platform.error_message && <ErrorBanner>{platform.error_message}</ErrorBanner>}
 
