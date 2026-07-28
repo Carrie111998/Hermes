@@ -1648,6 +1648,25 @@ class TransformedStreamAgent:
         }
 
 
+class SecretTransformedStreamAgent:
+    SECRET = "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback:
+            self.stream_delta_callback("safe original answer")
+        return {
+            "final_response": f"safe original answer\n\nCredential: {self.SECRET}",
+            "response_previewed": True,
+            "response_transformed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 @pytest.mark.asyncio
 async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path):
     """When a transform_llm_output hook modifies the response after streaming,
@@ -1679,6 +1698,32 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_transformed_response_edit_forces_secret_redaction(monkeypatch, tmp_path):
+    """The post-stream plugin edit cannot bypass final-output sanitization."""
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SecretTransformedStreamAgent,
+        session_id="sess-secret-transformed-stream",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    payloads = [call["content"] for call in adapter.sent + adapter.edits]
+    assert all(SecretTransformedStreamAgent.SECRET not in payload for payload in payloads)
+    assert any("***" in payload for payload in payloads)
 
 
 @pytest.mark.asyncio
@@ -1821,6 +1866,30 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
     assert QueuedFailedEmptyAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_fallback_send_forces_secret_redaction(monkeypatch, tmp_path):
+    """The pre-follow-up final send uses the assistant egress sanitizer."""
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+    QueuedSecretAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedSecretAgent,
+        session_id="sess-queued-secret",
+        pending_text="queued follow-up",
+        config_data={"display": {"interim_assistant_messages": False}},
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+    )
+
+    assert result["final_response"] == "second response"
+    payloads = [call["content"] for call in adapter.sent]
+    assert all(QueuedSecretAgent.SECRET not in payload for payload in payloads)
+    assert any("github...6789" in payload for payload in payloads)
 
 
 @pytest.mark.asyncio
@@ -2137,75 +2206,6 @@ class TerminalCommandAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
-@pytest.mark.asyncio
-async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
-    """Terminal progress on a markdown-capable (supports_code_blocks) gateway
-    renders a bare fenced code block — no language tag (Slack mrkdwn would print
-    'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
-    command is collapsed to a single line capped at tool_preview_length so a long
-    or multi-line command doesn't render as a huge block (#42634)."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = TerminalCommandAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    import tools.terminal_tool  # noqa: F401 - register terminal emoji
-
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id=None,
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-terminal-code-block",
-        session_key="agent:main:telegram:dm:12345",
-    )
-
-    assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    # Bare fenced block, no language tag (no '```bash').
-    assert "```" in all_content
-    assert "```bash" not in all_content
-    # Non-verbose collapses to the first line + truncation marker — the later
-    # command lines must NOT appear (this was the "huge block" regression).
-    assert "set -euo pipefail" in all_content
-    assert "npm install -g hyperframes@latest" not in all_content
-    assert "node --version" not in all_content
-    # No truncated quoted preview for the terminal command.
-    assert 'terminal: "' not in all_content
-
-
-@pytest.mark.asyncio
-async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
-    """Verbose mode on a markdown-capable gateway renders the FULL multi-line
-    command in a bare fenced block (no truncation, no 'bash' tag).  This is the
-    parity guarantee for #42634: verbose keeps full detail, non-verbose caps."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = TerminalCommandAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 class SecretTerminalCommandAgent:
     SECRET = "opaqueProgressCredentialValue123"
     CMD = f"OPENAI_API_KEY={SECRET}"
@@ -2755,8 +2755,65 @@ async def test_terminal_progress_flush_uses_source_transport(
 
 
 @pytest.mark.asyncio
+async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
+    """Terminal progress on a markdown-capable (supports_code_blocks) gateway
+    renders a bare fenced code block — no language tag (Slack mrkdwn would print
+    'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
+    command is collapsed to a single line capped at tool_preview_length so a long
+    or multi-line command doesn't render as a huge block (#42634)."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TerminalCommandAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-terminal-code-block",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    # Bare fenced block, no language tag (no '```bash').
+    assert "```" in all_content
+    assert "```bash" not in all_content
+    # Non-verbose collapses to the first line + truncation marker — the later
+    # command lines must NOT appear (this was the "huge block" regression).
+    assert "set -euo pipefail" in all_content
+    assert "npm install -g hyperframes@latest" not in all_content
+    assert "node --version" not in all_content
+    # No truncated quoted preview for the terminal command.
+    assert 'terminal: "' not in all_content
+
+
+@pytest.mark.asyncio
 async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
-    """Verbose markdown progress retains the complete multi-line command."""
+    """Verbose mode on a markdown-capable gateway renders the FULL multi-line
+    command in a bare fenced block (no truncation, no 'bash' tag).  This is the
+    parity guarantee for #42634: verbose keeps full detail, non-verbose caps."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
 
     fake_dotenv = types.ModuleType("dotenv")
