@@ -1485,6 +1485,94 @@ def _positive_int(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _windows_from_tool_result(out: dict) -> list:
+    """Normalise windows from any cua-driver response envelope.
+
+    cua-driver 0.7.0+ can return windows in any of these locations depending
+    on transport (MCP vs CLI) and version:
+
+    - ``structuredContent.windows``  (MCP 0.6.x)
+    - ``data.windows``               (MCP 0.7.0+)
+    - ``data._legacy_windows``       (MCP 0.7.0+)
+    - ``windows``                    (CLI direct 0.7.0+)
+    - ``_legacy_windows``            (CLI direct 0.7.0+)
+
+    Walks the known paths in priority order and returns the first
+    non-empty list found.  Returns ``[]`` when no window list exists.
+    """
+    if not isinstance(out, dict):
+        return []
+
+    for path in [
+        ["structuredContent", "windows"],
+        ["data", "windows"],
+        ["data", "_legacy_windows"],
+        ["windows"],
+        ["_legacy_windows"],
+    ]:
+        val = out
+        for key in path:
+            if not isinstance(val, dict):
+                val = None
+                break
+            val = val.get(key)
+        if isinstance(val, list):
+            src = " → ".join(path)
+            if src != "structuredContent → windows":
+                logger.debug(
+                    "cua-driver windows found in %r (not structuredContent.windows)",
+                    src,
+                )
+            return val
+    return []
+
+
+def _apps_from_tool_result(out: dict) -> list:
+    """Normalise apps from any cua-driver response envelope.
+
+    Same envelope problem as ``_windows_from_tool_result``.
+    """
+    if not isinstance(out, dict):
+        return []
+
+    for path in [
+        ["structuredContent", "apps"],
+        ["data", "apps"],
+        ["apps"],
+    ]:
+        val = out
+        for key in path:
+            if not isinstance(val, dict):
+                val = None
+                break
+            val = val.get(key)
+        if isinstance(val, list):
+            return val
+    return []
+
+
+def _apps_from_windows(windows: list) -> list:
+    """Derive app list from windows when list_apps tools are unavailable.
+
+    Deduplicates by (name, pid).  Returns a list of dicts with ``name``
+    and ``pid`` keys.
+    """
+    seen: set = set()
+    apps: list = []
+    for w in windows:
+        if not isinstance(w, dict):
+            continue
+        name = str(w.get("app_name", "")).strip()
+        pid = w.get("pid")
+        if not name or pid is None:
+            continue
+        key = (name, pid)
+        if key not in seen:
+            seen.add(key)
+            apps.append({"name": name, "pid": pid})
+    return apps
+
+
 def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalise cua-driver ``list_windows`` entries, dropping unusable ones.
 
@@ -1702,7 +1790,7 @@ class CuaDriverBackend(ComputerUseBackend):
             "list_windows",
             {"on_screen_only": True, "session": self._session_id},
         )
-        raw_windows = (out.get("structuredContent") or {}).get("windows") or []
+        raw_windows = _windows_from_tool_result(out)
         windows = _ingest_windows(raw_windows)
         windows.sort(key=lambda w: w["z_index"], reverse=True)
         if windows:
@@ -1725,7 +1813,7 @@ class CuaDriverBackend(ComputerUseBackend):
             logger.error("cua-driver CLI re-fetch for list_windows returned an error")
             self._clear_active_target()
             return []
-        raw_windows = (cli_out.get("structuredContent") or {}).get("windows") or []
+        raw_windows = _windows_from_tool_result(cli_out)
         windows = _ingest_windows(raw_windows)
         windows.sort(key=lambda w: w["z_index"], reverse=True)
         return windows
@@ -2395,16 +2483,16 @@ class CuaDriverBackend(ComputerUseBackend):
     # ── Introspection ──────────────────────────────────────────────
     def list_apps(self) -> List[Dict[str, Any]]:
         out = self._session.call_tool("list_apps", {"session": self._session_id})
-        structured = out.get("structuredContent")
-        if isinstance(structured, dict) and isinstance(structured.get("apps"), list):
-            return structured["apps"]
 
-        # Older drivers and direct CLI fallbacks may put apps in data instead.
+        # Normalise across all known cua-driver envelope shapes.
+        apps = _apps_from_tool_result(out)
+        if apps:
+            return apps
+
+        # Older drivers and direct CLI fallbacks may put apps in data directly.
         data = out.get("data")
         if isinstance(data, list):
             return data
-        if isinstance(data, dict) and isinstance(data.get("apps"), list):
-            return data["apps"]
         # Old text-only drivers retain a small, name/PID-only fallback.
         if isinstance(data, str):
             apps = []
@@ -2413,6 +2501,11 @@ class CuaDriverBackend(ComputerUseBackend):
                 if m:
                     apps.append({"name": m.group(1).strip(), "pid": int(m.group(2))})
             return apps
+
+        # Last resort: derive apps from window list.
+        windows = self._load_windows()
+        if windows:
+            return _apps_from_windows(windows)
         return []
 
     def list_windows(self) -> List[Dict[str, Any]]:
