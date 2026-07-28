@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -647,6 +648,156 @@ def board_metadata_path(board: Optional[str] = None) -> Path:
 
 
 _BOARD_METADATA_UNSET = object()
+_BOARD_METADATA_LOCK_TIMEOUT_SECONDS = 10.0
+_BOARD_METADATA_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_BOARD_METADATA_THREAD_LOCKS_GUARD = threading.Lock()
+_BOARD_METADATA_LOCK_STATE = threading.local()
+
+
+def _board_metadata_lock_path(board: Optional[str] = None) -> Path:
+    """Return a stable lock path that survives board remove/recreate cycles."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    return boards_root() / f".{slug}.metadata.lock"
+
+
+def _board_metadata_thread_lock(path: Path) -> threading.RLock:
+    try:
+        key = str(path.resolve(strict=False))
+    except OSError:
+        key = str(path)
+    with _BOARD_METADATA_THREAD_LOCKS_GUARD:
+        return _BOARD_METADATA_THREAD_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextlib.contextmanager
+def _board_metadata_lock(
+    board: Optional[str] = None,
+    *,
+    timeout_seconds: float = _BOARD_METADATA_LOCK_TIMEOUT_SECONDS,
+):
+    """Serialize one board's metadata read-modify-write across processes.
+
+    The board profile allowlist is an execution-admission policy. If locking is
+    unavailable or contention exceeds the bounded timeout, metadata mutation
+    fails closed instead of risking a stale write that silently widens access.
+    """
+    lock_path = _board_metadata_lock_path(board)
+    try:
+        key = str(lock_path.resolve(strict=False))
+    except OSError:
+        key = str(lock_path)
+    held = getattr(_BOARD_METADATA_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _BOARD_METADATA_LOCK_STATE.held = held
+    owner = held.get(key)
+    current_pid = os.getpid()
+    if owner is not None and owner[0] == current_pid:
+        held[key] = (current_pid, owner[1] + 1)
+        try:
+            yield
+        finally:
+            held[key] = (current_pid, held[key][1] - 1)
+        return
+    if owner is not None:
+        # ``threading.local`` state survives ``fork()``. A child must never
+        # inherit the parent's reentrancy exemption and skip the kernel lock.
+        held.pop(key, None)
+
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    thread_lock = _board_metadata_thread_lock(lock_path)
+    if not thread_lock.acquire(timeout=max(0.1, deadline - time.monotonic())):
+        raise TimeoutError(
+            f"timed out waiting for board metadata lock: {lock_path}"
+        )
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            acquired = False
+            try:
+                while True:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+
+                            if os.fstat(lock_file.fileno()).st_size == 0:
+                                lock_file.write(b"\0")
+                                lock_file.flush()
+                            lock_file.seek(0)
+                            msvcrt.locking(
+                                lock_file.fileno(), msvcrt.LK_NBLCK, 1
+                            )
+                        elif os.name == "posix":
+                            import fcntl
+
+                            fcntl.flock(
+                                lock_file.fileno(),
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                        else:  # pragma: no cover - unsupported runtime
+                            raise RuntimeError(
+                                "cross-process board metadata locking is unavailable"
+                            )
+                        acquired = True
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for board metadata lock: {lock_path}"
+                            ) from exc
+                        time.sleep(0.05)
+
+                held[key] = (current_pid, 1)
+                try:
+                    yield
+                finally:
+                    held.pop(key, None)
+            finally:
+                if acquired:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+
+                            lock_file.seek(0)
+                            msvcrt.locking(
+                                lock_file.fileno(), msvcrt.LK_UNLCK, 1
+                            )
+                        else:
+                            import fcntl
+
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+    finally:
+        thread_lock.release()
+
+
+def _atomic_write_board_metadata(path: Path, meta: Mapping[str, Any]) -> None:
+    """Atomically replace board.json after fsyncing a same-directory temp file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}."
+        f"{secrets.token_hex(4)}"
+    )
+    fd: Optional[int] = None
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(meta, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _normalize_allowed_profiles(value: Any) -> Optional[list[str]]:
@@ -786,32 +937,38 @@ def write_board_metadata(
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta = read_board_metadata(slug)
-    # Preserve existing DB-derived fields — they get re-computed each
-    # read but shouldn't be written into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    if description is not None:
-        meta["description"] = str(description)
-    if icon is not None:
-        meta["icon"] = str(icon)
-    if color is not None:
-        meta["color"] = str(color)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    if default_workdir is not None:
-        meta["default_workdir"] = str(default_workdir) if default_workdir else None
-    if allowed_profiles is not _BOARD_METADATA_UNSET:
-        meta["allowed_profiles"] = _normalize_allowed_profiles(allowed_profiles)
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    existed_before_lock = slug == DEFAULT_BOARD or board_exists(slug)
+    with _board_metadata_lock(slug):
+        if existed_before_lock and not board_exists(slug):
+            # The board disappeared while this writer waited for the lock.
+            # Reject the stale update instead of silently recreating a board
+            # that another process just removed. Calls that began with no
+            # board still retain the historical implicit-create behaviour.
+            raise ValueError(f"board {slug!r} does not exist")
+        meta = read_board_metadata(slug)
+        # Preserve existing DB-derived fields — they get re-computed each
+        # read but shouldn't be written into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        if description is not None:
+            meta["description"] = str(description)
+        if icon is not None:
+            meta["icon"] = str(icon)
+        if color is not None:
+            meta["color"] = str(color)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        if default_workdir is not None:
+            meta["default_workdir"] = (
+                str(default_workdir) if default_workdir else None
+            )
+        if allowed_profiles is not _BOARD_METADATA_UNSET:
+            meta["allowed_profiles"] = _normalize_allowed_profiles(allowed_profiles)
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        path = board_metadata_path(slug)
+        _atomic_write_board_metadata(path, meta)
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -835,17 +992,20 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
-        normed,
-        name=name,
-        description=description,
-        icon=icon,
-        color=color,
-        default_workdir=default_workdir,
-        allowed_profiles=allowed_profiles,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
+    with _board_metadata_lock(normed):
+        meta = write_board_metadata(
+            normed,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            default_workdir=default_workdir,
+            allowed_profiles=allowed_profiles,
+        )
+        # Keep create atomic with remove: otherwise a remover could archive the
+        # metadata before init_db() and the trailing DB touch would resurrect a
+        # metadata-less board.
+        init_db(board=normed)
     return meta
 
 
@@ -910,36 +1070,39 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         raise ValueError("board slug is required")
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
-        raise ValueError(f"board {normed!r} does not exist")
+    with _board_metadata_lock(normed):
+        d = board_dir(normed)
+        if not d.exists():
+            raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
+        # If the user removed the currently-active board, revert to default.
+        if get_current_board() == normed:
+            clear_current_board()
 
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        # A concurrent connect(board=normed) after the rename/delete recreates
+        # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
+        # dropped first so the schema init pass re-runs on that fresh file.
+        _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        # Avoid collision on rapid double-archives.
-        suffix = 1
-        while target.exists():
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    else:
-        import shutil
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            # Avoid collision on rapid double-archives.
+            suffix = 1
+            while target.exists():
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {
+                "slug": normed,
+                "action": "archived",
+                "new_path": str(target),
+            }
+
         shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
-
 
 # ---------------------------------------------------------------------------
 # Data classes
