@@ -848,3 +848,199 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+    # ── Extended JSON Schema validation (issue #73175) ────────────────
+
+    def test_validator_rejects_enum_violation(self):
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_enum_test",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function", "function": {
+                "name": "mcp_enum_test",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["low", "medium", "high"]},
+                    },
+                    "required": ["mode"],
+                },
+            }},
+            toolset="mcp-enum",
+        )
+        # Valid enum value → dispatch.
+        assert validate_deferred_call_args("mcp_enum_test", {"mode": "low"}) is None
+        # Invalid enum value → rejection.
+        err = validate_deferred_call_args("mcp_enum_test", {"mode": "urgent"})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid arguments" in parsed["error"]
+        assert "urgent" in parsed["error"]
+
+    def test_validator_rejects_additional_properties(self):
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_extra_test",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function", "function": {
+                "name": "mcp_extra_test",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                    "required": ["name"],
+                },
+            }},
+            toolset="mcp-extra",
+        )
+        # Valid call → dispatch.
+        assert validate_deferred_call_args("mcp_extra_test", {"name": "x"}) is None
+        # Unexpected property → rejection.
+        err = validate_deferred_call_args("mcp_extra_test", {"name": "x", "unexpected": "accepted"})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid arguments" in parsed["error"]
+
+    def test_validator_tolerates_type_coercion(self):
+        """Type mismatches pass through — coerce_tool_args handles them."""
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_type_coerce",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function", "function": {
+                "name": "mcp_type_coerce",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["count"],
+                },
+            }},
+            toolset="mcp-coerce",
+        )
+        # String where integer expected → tolerated (coerce_tool_args handles).
+        assert validate_deferred_call_args("mcp_type_coerce", {"count": "42"}) is None
+
+    def test_validator_catches_pattern_violation(self):
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_pattern_test",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function", "function": {
+                "name": "mcp_pattern_test",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "pattern": "^[A-Z]{3}-\\d{4}$"},
+                    },
+                    "required": ["code"],
+                },
+            }},
+            toolset="mcp-pattern",
+        )
+        assert validate_deferred_call_args("mcp_pattern_test", {"code": "ABC-1234"}) is None
+        err = validate_deferred_call_args("mcp_pattern_test", {"code": "bad"})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid arguments" in parsed["error"]
+
+    def test_validator_catches_nested_required(self):
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_nested_test",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function", "function": {
+                "name": "mcp_nested_test",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "options": {
+                            "type": "object",
+                            "properties": {
+                                "endpoint": {"type": "string"},
+                            },
+                            "required": ["endpoint"],
+                        },
+                    },
+                    "required": ["options"],
+                },
+            }},
+            toolset="mcp-nested",
+        )
+        assert validate_deferred_call_args(
+            "mcp_nested_test", {"options": {"endpoint": "/api"}}) is None
+        err = validate_deferred_call_args(
+            "mcp_nested_test", {"options": {}})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid arguments" in parsed["error"]
+
+    def test_validator_catches_numeric_range(self):
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_range_test",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function", "function": {
+                "name": "mcp_range_test",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "temperature": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    },
+                    "required": ["temperature"],
+                },
+            }},
+            toolset="mcp-range",
+        )
+        assert validate_deferred_call_args("mcp_range_test", {"temperature": 0.5}) is None
+        err = validate_deferred_call_args("mcp_range_test", {"temperature": 99.0})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid arguments" in parsed["error"]
+
+    def test_validator_catches_string_length(self):
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_length_test",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function", "function": {
+                "name": "mcp_length_test",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1, "maxLength": 10},
+                    },
+                    "required": ["name"],
+                },
+            }},
+            toolset="mcp-length",
+        )
+        assert validate_deferred_call_args("mcp_length_test", {"name": "hello"}) is None
+        err = validate_deferred_call_args("mcp_length_test", {"name": ""})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid arguments" in parsed["error"]

@@ -29,7 +29,7 @@ import json
 import logging
 import socket
 import threading
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 
 from tui_gateway import server
 
@@ -283,8 +283,14 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(ws: Any, on_ready: "Optional[Callable[[], Awaitable[None]]]" = None) -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+
+    ``on_ready`` is an optional async callback invoked after ``gateway.ready``
+    is sent and before the message loop starts. Used by the web server to
+    defer heavy background initialization (e.g. cron scheduler start) until
+    the desktop backend connection is established (#73435).
+    """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -319,6 +325,14 @@ async def handle_ws(ws: Any) -> None:
             # Track this peer for session-less global broadcasts (skin.changed
             # from the background watcher) — write_json can't route those.
             server.register_live_transport(transport)
+            # Fire the deferred on_ready callback (e.g. start cron scheduler)
+            # AFTER gateway.ready is delivered so heavy initialization never
+            # blocks the desktop backend's WebSocket handshake (#73435).
+            if on_ready is not None:
+                try:
+                    await on_ready()
+                except Exception as _ready_exc:
+                    _log.warning("on_ready callback failed: %s", _ready_exc)
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1

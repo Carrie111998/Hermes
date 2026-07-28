@@ -950,14 +950,23 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
     round-trip. Valid calls (and any call we can't confidently validate)
     dispatch untouched, so this can never block a legitimate invocation.
 
-    Only *key absence* of schema-``required`` fields counts as invalid.
-    No type checking, no null rejection — nullable/typed edge cases are the
-    tool's own business, and ``coerce_tool_args`` already handles type repair
-    downstream. Returns a JSON error string when invalid, ``None`` when the
-    call should dispatch.
+    Extended with full JSON Schema validation (jsonschema) for non-type
+    constraints: enum, additionalProperties, pattern, nested required,
+    min/max length, and numeric range violations are all caught before
+    dispatch. Type mismatches (e.g. ``"42"`` for an integer field) are
+    intentionally tolerated — ``coerce_tool_args`` handles type coercion
+    downstream, and the validator should not be the only source of type
+    repair for deferred tools (issue #73175).
+
+    Returns a JSON error string when invalid, ``None`` when the call should
+    dispatch.
     """
     try:
         from tools.registry import registry as _registry
+
+        import jsonschema
+        from jsonschema.exceptions import ValidationError as JsSchemaError
+
         schema = _registry.get_schema(name)
         if not isinstance(schema, dict):
             return None
@@ -967,23 +976,47 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         params = fn.get("parameters")
         if not isinstance(params, dict):
             return None
+
+        # 1. Fast-path: check top-level required keys (preserves the exact
+        #    error format models already know from the ironclaw#5149 fix).
         required = params.get("required")
-        if not isinstance(required, list) or not required:
-            return None
-        missing = [r for r in required if isinstance(r, str) and r not in args]
-        if not missing:
-            return None
-        return json.dumps({
-            "error": (
-                f"tool_call to '{name}' is missing required argument(s): "
-                f"{', '.join(missing)}. The tool was NOT invoked."
-            ),
-            "parameters": params,
-            "hint": (
-                "Retry tool_call with 'arguments' matching the parameters "
-                "schema above."
-            ),
-        }, ensure_ascii=False)
+        if isinstance(required, list) and required:
+            missing = [r for r in required if isinstance(r, str) and r not in args]
+            if missing:
+                return json.dumps({
+                    "error": (
+                        f"tool_call to '{name}' is missing required argument(s): "
+                        f"{', '.join(missing)}. The tool was NOT invoked."
+                    ),
+                    "parameters": params,
+                    "hint": (
+                        "Retry tool_call with 'arguments' matching the parameters "
+                        "schema above."
+                    ),
+                }, ensure_ascii=False)
+
+        # 2. Full JSON Schema validation (enum, additionalProperties, pattern,
+        #    nested required, min/max length, numeric range, etc.).
+        #    Type errors (validator == 'type') are tolerated — coerce_tool_args
+        #    handles type coercion downstream, and rejecting type-mismatches
+        #    here would break calls that Hermes can and should repair.
+        try:
+            jsonschema.validate(args, params)
+        except JsSchemaError as e:
+            if e.validator == "type":
+                return None
+            return json.dumps({
+                "error": (
+                    f"tool_call to '{name}' has invalid arguments: {e.message}"
+                ),
+                "parameters": params,
+                "hint": (
+                    "Retry tool_call with 'arguments' matching the parameters "
+                    "schema above."
+                ),
+            }, ensure_ascii=False)
+
+        return None
     except Exception:  # pragma: no cover — never block dispatch on validator bugs
         logger.debug("validate_deferred_call_args failed for %s", name, exc_info=True)
         return None

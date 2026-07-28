@@ -168,6 +168,30 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     provider.start(stop_event, interval=interval)
 
 
+def _ensure_deferred_cron_started() -> None:
+    """Start the desktop cron scheduler if not already running.
+
+    Called from the on_ready callback of the first WebSocket connection
+    so heavy synchronous init (config I/O, SQLite schema init, GIL contention
+    on Windows) happens AFTER gateway.ready is delivered -- preventing a
+    ~45s event loop stall during desktop backend startup (#73435).
+    """
+    if getattr(app.state, "_cron_started", False):
+        return
+    with app.state._cron_start_lock:
+        if app.state._cron_started:
+            return
+        cron_thread = threading.Thread(
+            target=_start_desktop_cron_ticker,
+            args=(app.state._cron_stop,),
+            daemon=True,
+            name="desktop-cron-ticker",
+        )
+        cron_thread.start()
+        app.state._cron_started = True
+        _log.info("Deferred desktop cron scheduler started")
+
+
 def _warm_gateway_module() -> None:
     try:
         import hermes_cli.gateway  # noqa: F401
@@ -18579,7 +18603,12 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    # Defer heavy background init (cron scheduler) until AFTER
+    # gateway.ready is delivered, preventing event loop stall (#73435).
+    async def _on_ready() -> None:
+        _ensure_deferred_cron_started()
+
+    await handle_ws(ws, on_ready=_on_ready)
 
 
 # ---------------------------------------------------------------------------
