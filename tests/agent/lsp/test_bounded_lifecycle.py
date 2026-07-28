@@ -474,6 +474,64 @@ def test_cancelled_spawn_cleanup_failure_is_retained_and_retried(monkeypatch):
         assert service._loop.stop() is True
 
 
+def test_failed_spawn_with_live_tree_retains_tombstone(monkeypatch):
+    service = make_service(clock=lambda: 0.0)
+    created = []
+
+    class SpawnClient(FakeClient):
+        async def start(self) -> None:
+            raise RuntimeError("startup failed after child spawned")
+
+        @property
+        def process_alive(self) -> bool:
+            return False
+
+        @property
+        def process_tree_alive(self) -> bool:
+            return self.running
+
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            if self.shutdown_calls >= 2:
+                self.running = False
+                self.state = "stopped"
+
+    def make_client(**_kwargs):
+        client = SpawnClient()
+        created.append(client)
+        return client
+
+    srv = SimpleNamespace(
+        server_id="fake",
+        seed_first_push=False,
+        build_spawn=lambda root, _ctx: SimpleNamespace(
+            workspace_root=root,
+            command=["fake"],
+            env=None,
+            cwd=root,
+            initialization_options=None,
+            seed_diagnostics_on_first_push=False,
+        ),
+    )
+    monkeypatch.setattr(manager_module, "LSPClient", make_client)
+
+    async def scenario():
+        assert await service._reserve_spawn(srv, ("fake", "/repo"), "/repo") is None
+        with service._state_lock:
+            entry = service._entries[("fake", "/repo")]
+            assert entry.state == "retiring"
+            assert entry.client is created[0]
+        service.begin_shutdown()
+        await service._shutdown_async()
+
+    service._loop.run(scenario(), timeout=2.0)
+    assert created[0].shutdown_calls == 2
+    assert created[0].process_tree_alive is False
+    assert service.is_closed() is True
+    assert service.get_status()["clients"] == []
+    assert service._loop.stop() is True
+
+
 def test_generation_bound_release_is_idempotent_and_cannot_touch_replacement():
     now = [10.0]
     service = make_service(clock=lambda: now[0])

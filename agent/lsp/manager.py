@@ -1114,6 +1114,27 @@ class LSPService:
 
     async def _spawn_entry(self, entry: _ClientEntry, srv: Any) -> Optional[LSPClient]:
         client: Optional[LSPClient] = None
+
+        def cleanup_incomplete(target: LSPClient) -> bool:
+            return bool(
+                getattr(
+                    target,
+                    "process_tree_alive",
+                    getattr(target, "process_alive", target.is_running),
+                )
+            )
+
+        def retain_cleanup_tombstone(target: LSPClient, detail: Any) -> None:
+            with self._state_lock:
+                current = self._entries.get(entry.key)
+                if current is entry:
+                    entry.client = target
+                    entry.state = "retiring"
+                    entry.pending_eviction = "spawn-cleanup-failed"
+            logger.warning(
+                "LSP spawn cleanup incomplete for %s: %s", entry.key, detail
+            )
+
         try:
             ctx = ServerContext(
                 workspace_root=entry.workspace_root,
@@ -1154,6 +1175,8 @@ class LSPService:
                     publish = True
             if not publish:
                 await client.shutdown()
+                if cleanup_incomplete(client):
+                    retain_cleanup_tombstone(client, "live process tree")
                 return None
             eventlog.log_active(srv.server_id, entry.workspace_root)
             logger.info(
@@ -1171,17 +1194,10 @@ class LSPService:
                     asyncio.CancelledError,
                     Exception,
                 ) as cleanup_exc:  # includes cancellation
-                    with self._state_lock:
-                        current = self._entries.get(entry.key)
-                        if current is entry:
-                            entry.client = client
-                            entry.state = "retiring"
-                            entry.pending_eviction = "spawn-cleanup-failed"
-                    logger.warning(
-                        "LSP cancelled spawn cleanup failed for %s: %s",
-                        entry.key,
-                        cleanup_exc,
-                    )
+                    retain_cleanup_tombstone(client, cleanup_exc)
+                else:
+                    if cleanup_incomplete(client):
+                        retain_cleanup_tombstone(client, "live process tree")
             raise
         except Exception as exc:  # noqa: BLE001
             eventlog.log_spawn_failed(srv.server_id, entry.workspace_root, exc)
@@ -1194,17 +1210,10 @@ class LSPService:
                 try:
                     await client.shutdown()
                 except (asyncio.CancelledError, Exception) as cleanup_exc:
-                    with self._state_lock:
-                        current = self._entries.get(entry.key)
-                        if current is entry:
-                            entry.client = client
-                            entry.state = "retiring"
-                            entry.pending_eviction = "spawn-cleanup-failed"
-                    logger.warning(
-                        "LSP failed-spawn cleanup failed for %s: %s",
-                        entry.key,
-                        cleanup_exc,
-                    )
+                    retain_cleanup_tombstone(client, cleanup_exc)
+                else:
+                    if cleanup_incomplete(client):
+                        retain_cleanup_tombstone(client, "live process tree")
             return None
         finally:
             with self._state_lock:
