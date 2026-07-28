@@ -1425,6 +1425,26 @@ def _validated_image_type(path: Path, declared: str | None) -> tuple[str, str]:
     return mime, ext
 
 
+def _validated_captured_media_type(path: Path) -> tuple[str, str, str | None]:
+    """Classify retained outbound media without weakening image validation."""
+    try:
+        mime, _ = _validated_image_type(path, None)
+        return "image", mime, None
+    except MediaRetentionError as image_error:
+        if path.suffix.lower() != ".xlsx":
+            raise image_error
+    with path.open("rb") as handle:
+        if handle.read(4) != b"PK\x03\x04":
+            raise MediaRetentionError(
+                f"retained workbook is not a supported xlsx document: {path.name}"
+            )
+    return (
+        "document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        path.name,
+    )
+
+
 def _contained_existing_file(value: Any, roots: Sequence[Path]) -> Path:
     if isinstance(value, Mapping):
         value = value.get("path") or value.get("filePath") or value.get("localPath") or value.get("url")
@@ -2760,7 +2780,9 @@ def deliver_management_replies(
                 continue
             try:
                 media_path = _resolve_captured_media_path(send["path"], retention)
-                media_mime, _ = _validated_image_type(media_path, None)
+                media_type, media_mime, media_file_name = (
+                    _validated_captured_media_type(media_path)
+                )
                 media_identity = hashlib.sha256(media_path.read_bytes()).hexdigest()
             except (OSError, MediaRetentionError):
                 summary["suppressed"] += 1
@@ -2784,8 +2806,10 @@ def deliver_management_replies(
             endpoint = "send-media"
             body_payload.update({
                 "filePath": str(media_path),
-                "mediaType": "image",
+                "mediaType": media_type,
             })
+            if media_file_name:
+                body_payload["fileName"] = media_file_name
             if send.get("caption"):
                 body_payload["caption"] = send["caption"]
             # The bridge's media route currently consumes a scalar native id.

@@ -129,6 +129,97 @@ def _retention_config(tmp_path: Path, source_root: Path, media_root: Path) -> Pa
     return path
 
 
+class _ReplyResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self):
+        return b'{"success":true,"messageId":"WA-DOC"}'
+
+
+def test_retained_xlsx_media_ref_delivers_as_document_and_images_are_unchanged(
+    tmp_path, monkeypatch
+):
+    management_chat = "management@g.us"
+    constitution = tmp_path / "constitution.yaml"
+    constitution.write_text(
+        "selectors:\n"
+        "- job_type: tgg_management\n"
+        "  match:\n"
+        "    source.platform: whatsapp\n"
+        f"    source.chat_id: {management_chat}\n",
+        encoding="utf-8",
+    )
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    workbook = retained / "sandbox_r_12ab34cd_deadbeef.xlsx"
+    _xlsx(workbook)
+    image = retained / "case-photo.png"
+    image.write_bytes(_png_bytes())
+    config = _retention_config(tmp_path, retained, retained)
+    data = yaml.safe_load(config.read_text())
+    data["pa"]["constitution_path"] = str(constitution)
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    sent: list[dict] = []
+
+    def fake_urlopen(request, timeout=0):
+        sent.append(json.loads(request.data))
+        return _ReplyResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    def deliver(path: str, message_id: str):
+        raw = _message(message_id, management_chat)
+        raw["timestamp"] = "2026-07-21T04:01:00+00:00"
+        record = consumer.InboxRecord(
+            seq=1,
+            message_id=message_id,
+            chat_id=management_chat,
+            start_offset=0,
+            end_offset=1,
+            raw=raw,
+        )
+        return consumer.deliver_management_replies(
+            inbox,
+            config_path=config,
+            captured_outbound=[
+                {
+                    "kind": "send",
+                    "args": [management_chat, f"MEDIA:{path}"],
+                    "kwargs": {"reply_to": message_id},
+                }
+            ],
+            batch_records=[record],
+            gate_changed_at="2026-07-21T04:00:00+00:00",
+            handled_groups=[{"message_ids": [message_id], "turn_id": "turn"}],
+        )
+
+    assert deliver(
+        f"/media/tgg/hermes/{workbook.name}", "DOC-MSG"
+    )["delivered"] == 1
+    assert sent[-1] == {
+        "chatId": management_chat,
+        "replyTo": "DOC-MSG",
+        "filePath": str(workbook),
+        "mediaType": "document",
+        "fileName": workbook.name,
+    }
+
+    assert deliver(str(image), "IMAGE-MSG")["delivered"] == 1
+    assert sent[-1] == {
+        "chatId": management_chat,
+        "replyTo": "IMAGE-MSG",
+        "filePath": str(image),
+        "mediaType": "image",
+    }
+
+
 def test_media_retention_is_atomic_idempotent_and_provenance_bound(tmp_path, monkeypatch):
     source_root = tmp_path / "capture"
     source_root.mkdir()

@@ -49,6 +49,9 @@ PYTHON_SANDBOX_BLOCK = (
     "python_sandbox:\n"
     "  enabled: true\n"
     "  artifact_url_base: https://systems.papercut-labs.com/api/view/sandbox-artifacts\n"
+    "  media_retention:\n"
+    "    root: /home/pclaw/.systems-pcl/data/media/tgg/hermes\n"
+    "    media_ref_prefix: /media/tgg/hermes\n"
     "  datasets:\n"
     "    cases:\n"
     "      type: sqlite\n"
@@ -521,6 +524,10 @@ def _validate(
     assert config["python_sandbox"] == {
         "enabled": True,
         "artifact_url_base": "https://systems.papercut-labs.com/api/view/sandbox-artifacts",
+        "media_retention": {
+            "root": "/home/pclaw/.systems-pcl/data/media/tgg/hermes",
+            "media_ref_prefix": "/media/tgg/hermes",
+        },
         "datasets": {
             "cases": {
                 "type": "sqlite",
@@ -547,6 +554,15 @@ def _validate(
         "artifact_ttl_days": 7,
         "max_runs_kept": 40,
     }
+    assert (
+        config["python_sandbox"]["media_retention"]["root"]
+        == config["python_sandbox"]["datasets"]["media"]["path"]
+        == config["pa"]["media_retention"]["media_root"]
+    )
+    assert (
+        config["python_sandbox"]["media_retention"]["media_ref_prefix"]
+        == config["pa"]["media_retention"]["media_ref_prefix"]
+    )
 
     # Chat-scoped inbound allowlist, staged in BOTH blocks (the top-level block
     # bridges into extra and wins; extra has no env fallback for the allowlist).
@@ -716,8 +732,9 @@ def _validate(
     assert "python_sandbox is your batch-computation tool" in mgmt_joined
     assert "more than ~50 items" in mgmt_joined
     assert "never hand-simulate a batch computation" in mgmt_joined
+    assert "MEDIA:<media_ref>" in mgmt_joined
     assert "client_url" in mgmt_joined
-    assert "client-shareable workbook link" in mgmt_joined
+    assert "secondary link only if the client asks for a link" in mgmt_joined
     assert "python-sandbox" in mgmt_brief["enabled_toolsets"]
     # Register + grounded answers.
     assert "you are TGG's operations coordinator" in mgmt_joined

@@ -11,5 +11,5 @@
       operations), or judgment calls on individual messages. If the sandbox
       reports unavailable, say so and fall back — never hand-simulate a batch
       computation over more than ~50 items without flagging the degradation.
-      When an exported workbook files[] entry includes client_url, return
-      that URL as the client-shareable workbook link.'
+      Attach an exported workbook with MEDIA:<media_ref> from its files[] entry.
+      Include client_url as a secondary link only if the client asks for a link.'

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -500,6 +501,60 @@ _CLIENT_ARTIFACT_NAME = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.xlsx$"
 )
 _CLIENT_ARTIFACT_RUN_ID = re.compile(r"^r_[a-f0-9]{8}$")
+_ZIP_MAGIC = b"PK\x03\x04"
+
+
+def _promote_workbook(
+    source: Path,
+    *,
+    run_id: str,
+    media_root: Path,
+    media_ref_prefix: str,
+) -> str | None:
+    """Atomically promote one validated workbook into retained media."""
+    try:
+        with source.open("rb") as handle:
+            if handle.read(len(_ZIP_MAGIC)) != _ZIP_MAGIC:
+                return None
+            handle.seek(0)
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+
+    hexdigest = digest.hexdigest()
+    basename = f"sandbox_{run_id}_{hexdigest}.xlsx"
+    media_root.mkdir(parents=True, exist_ok=True, mode=0o750)
+    target = media_root / basename
+    if target.exists():
+        try:
+            existing = hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError:
+            existing = ""
+        if existing == hexdigest:
+            os.chmod(target, 0o640)
+            return f"{media_ref_prefix.rstrip('/')}/{basename}"
+
+    tmp = media_root / f".{basename}.{uuid.uuid4().hex}.tmp"
+    try:
+        with source.open("rb") as src, tmp.open("xb") as dst:
+            copied_digest = hashlib.sha256()
+            for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                dst.write(chunk)
+                copied_digest.update(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+        if copied_digest.hexdigest() != hexdigest:
+            return None
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, target)
+        return f"{media_ref_prefix.rstrip('/')}/{basename}"
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _list_files(
@@ -507,6 +562,7 @@ def _list_files(
     *,
     run_id: str | None = None,
     artifact_url_base: Any = None,
+    media_retention: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     files = []
     client_url_base = (
@@ -516,6 +572,16 @@ def _list_files(
     )
     valid_run_id = isinstance(run_id, str) and bool(
         _CLIENT_ARTIFACT_RUN_ID.fullmatch(run_id)
+    )
+    retention = media_retention if isinstance(media_retention, Mapping) else {}
+    media_root_value = retention.get("root") or retention.get("media_root")
+    media_ref_prefix = retention.get("media_ref_prefix")
+    promotion_enabled = (
+        valid_run_id
+        and isinstance(media_root_value, str)
+        and bool(media_root_value.strip())
+        and isinstance(media_ref_prefix, str)
+        and media_ref_prefix.startswith("/media/")
     )
     for path in sorted(work.rglob("*")):
         try:
@@ -534,6 +600,15 @@ def _list_files(
             and _CLIENT_ARTIFACT_NAME.fullmatch(path.name)
         ):
             item["client_url"] = f"{client_url_base}/{run_id}/{path.name}"
+        if promotion_enabled and _CLIENT_ARTIFACT_NAME.fullmatch(path.name):
+            media_ref = _promote_workbook(
+                path,
+                run_id=run_id,
+                media_root=Path(media_root_value).expanduser(),
+                media_ref_prefix=media_ref_prefix,
+            )
+            if media_ref:
+                item["media_ref"] = media_ref
         try:
             with path.open("rb") as handle:
                 item["lines"] = sum(1 for _ in handle)
@@ -552,6 +627,7 @@ def _harvest(
     *,
     run_id: str | None = None,
     artifact_url_base: Any = None,
+    media_retention: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     stdout, stdout_truncated = _cap_head_tail(_clean(stdout))
     stderr = _clean(stderr)[-STDERR_CAP:]
@@ -596,6 +672,7 @@ def _harvest(
                 work,
                 run_id=run_id,
                 artifact_url_base=artifact_url_base,
+                media_retention=media_retention,
             ),
             "truncated": {
                 "stdout": stdout_truncated,
@@ -846,6 +923,7 @@ def python_sandbox(
         limits,
         run_id=run_id,
         artifact_url_base=config.get("artifact_url_base"),
+        media_retention=config.get("media_retention"),
     )
     payload.update(
         {
@@ -904,8 +982,8 @@ _BASE_DESCRIPTION = (
     "~50 items, sums/statistics, and parsing spreadsheets or CSVs. Aggregate "
     "in code. Print only counts, totals, and up to ~20 examples. Write the "
     "structured answer to RESULT_PATH as JSON (8KB cap); keep large detail "
-    "in /work files. A files[] client_url is the client-shareable link for "
-    "that workbook."
+    "in /work files. A promoted workbook's files[] media_ref is its native "
+    "attachment reference; client_url is its secondary shareable link."
 )
 
 PYTHON_SANDBOX_SCHEMA = {

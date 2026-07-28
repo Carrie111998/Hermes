@@ -386,6 +386,9 @@ memory:
 python_sandbox:
   enabled: true
   artifact_url_base: https://systems.papercut-labs.com/api/view/sandbox-artifacts
+  media_retention:
+    root: /home/pclaw/.systems-pcl/data/media/tgg/hermes
+    media_ref_prefix: /media/tgg/hermes
   datasets:
     cases:
       type: sqlite

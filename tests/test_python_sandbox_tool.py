@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -311,6 +312,81 @@ def test_xlsx_file_listing_includes_configured_client_url(tmp_path):
             "lines": 1,
         }
     ]
+
+
+def test_xlsx_file_listing_promotes_atomically_and_idempotently(tmp_path):
+    work = tmp_path / "work"
+    retained = tmp_path / "retained"
+    work.mkdir()
+    workbook = work / "weekly-report.xlsx"
+    with zipfile.ZipFile(workbook, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+
+    kwargs = {
+        "run_id": "r_12ab34cd",
+        "artifact_url_base": "https://portal.example/artifacts",
+        "media_retention": {
+            "root": str(retained),
+            "media_ref_prefix": "/media/tgg/hermes",
+        },
+    }
+    first, error = sandbox._harvest(
+        work, "summary", "", "success", sandbox.DEFAULTS, **kwargs
+    )
+    promoted = list(retained.glob("*.xlsx"))
+    assert error == ""
+    assert len(promoted) == 1
+    assert promoted[0].read_bytes() == workbook.read_bytes()
+    assert promoted[0].stat().st_mode & 0o777 == 0o640
+    assert first["files"][0]["client_url"].endswith(
+        "/r_12ab34cd/weekly-report.xlsx"
+    )
+    assert first["files"][0]["media_ref"] == (
+        f"/media/tgg/hermes/{promoted[0].name}"
+    )
+    assert "r_12ab34cd" in promoted[0].name
+    assert hashlib.sha256(workbook.read_bytes()).hexdigest() in promoted[0].name
+
+    second, error = sandbox._harvest(
+        work, "summary", "", "success", sandbox.DEFAULTS, **kwargs
+    )
+    assert error == ""
+    assert second["files"][0]["media_ref"] == first["files"][0]["media_ref"]
+    assert list(retained.glob("*.xlsx")) == promoted
+    assert not list(retained.glob("*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents"),
+    [
+        ("weekly report.xlsx", b"PK\x03\x04not-promoted"),
+        ("weekly-report.xlsx", b"not-a-zip"),
+        ("weekly-report.csv", b"PK\x03\x04not-an-xlsx"),
+    ],
+)
+def test_file_listing_does_not_promote_invalid_workbooks(
+    tmp_path, filename, contents
+):
+    work = tmp_path / "work"
+    retained = tmp_path / "retained"
+    work.mkdir()
+    (work / filename).write_bytes(contents)
+
+    payload, _ = sandbox._harvest(
+        work,
+        "",
+        "",
+        "success",
+        sandbox.DEFAULTS,
+        run_id="r_12ab34cd",
+        media_retention={
+            "root": str(retained),
+            "media_ref_prefix": "/media/tgg/hermes",
+        },
+    )
+
+    assert all("media_ref" not in item for item in payload["files"])
+    assert not retained.exists()
 
 
 def test_file_listing_omits_client_url_when_base_is_unset(tmp_path):
