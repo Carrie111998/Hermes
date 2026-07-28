@@ -191,3 +191,82 @@ def test_strip_mode_still_strips_boundary_underscore_emphasis():
 
     output = _render_to_text(renderable)
     assert "say hi and bold now" in output
+
+
+# -- Fenced code blocks must survive strip mode literally (issue #73212) ----
+
+def test_strip_mode_preserves_dunder_underscores_inside_fenced_code():
+    """The reporter's exact repro: __name__ must not become name."""
+    renderable = _render_final_assistant_content(
+        "```python\nprint(type(executor).__name__)\n```",
+        mode="strip",
+    )
+    output = _render_to_text(renderable)
+    assert "__name__" in output
+    # The language tag must not appear as a stray visible line.
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    assert lines[0] != "python"
+
+
+def test_strip_mode_preserves_dunder_main_guard_inside_fenced_code():
+    renderable = _render_final_assistant_content(
+        '```python\nif __name__ == "__main__":\n    main()\n```',
+        mode="strip",
+    )
+    output = _render_to_text(renderable)
+    assert '__name__ == "__main__"' in output
+
+
+def test_strip_mode_drops_language_tag_line(monkeypatch):
+    """The opening fence's language tag must not be rendered as a plain
+    visible line of output (it was previously left behind verbatim once
+    the backtick fence markers were stripped)."""
+    from cli import _strip_markdown_syntax
+    rendered = _strip_markdown_syntax("```python\nx = 1\n```")
+    lines = [l for l in rendered.splitlines() if l.strip()]
+    assert "python" not in lines
+
+
+def test_strip_mode_preserves_asterisk_emphasis_markers_inside_fenced_code():
+    """Code that happens to contain single/double asterisks (e.g. **kwargs,
+    a docstring with *args) must not have them stripped as Markdown
+    emphasis -- only prose outside code fences gets that treatment."""
+    from cli import _strip_markdown_syntax
+    rendered = _strip_markdown_syntax(
+        "```python\ndef f(*args, **kwargs):\n    pass\n```"
+    )
+    assert "def f(*args, **kwargs):" in rendered
+
+
+def test_strip_mode_preserves_backtick_fence_markers_would_have_removed():
+    """Sanity: without fence-awareness, the bare '(```+|~~~+)' removal
+    regex would strip ALL backtick fences anywhere, including a fence
+    that legitimately appears inside another fenced block's content
+    (e.g. an assistant explaining Markdown syntax). The extracted block's
+    raw text must round-trip untouched."""
+    from cli import _strip_markdown_syntax
+    source = "```text\nUse ``` to start a code fence.\n```"
+    rendered = _strip_markdown_syntax(source)
+    assert "```" in rendered
+
+
+def test_strip_mode_prose_dunder_stripping_still_works_outside_code():
+    """Regression: this fix must not disable emphasis stripping for
+    prose outside code fences -- only protect literal code content."""
+    renderable = _render_final_assistant_content(
+        "say __bold__ now",
+        mode="strip",
+    )
+    output = _render_to_text(renderable)
+    assert "say bold now" in output
+
+
+def test_strip_mode_multiple_fenced_blocks_each_preserved_independently():
+    from cli import _strip_markdown_syntax
+    source = (
+        "First:\n```python\n__version__ = \"1.0\"\n```\n"
+        "Second:\n```python\n__author__ = \"x\"\n```"
+    )
+    rendered = _strip_markdown_syntax(source)
+    assert "__version__" in rendered
+    assert "__author__" in rendered

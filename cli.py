@@ -2786,9 +2786,35 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
+_FENCED_CODE_BLOCK_RE = re.compile(
+    r"^([ \t]{0,3})(```+|~~~+)[ \t]*([^\n`~]*)\n(.*?)^\1\2[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
 def _strip_markdown_syntax(text: str) -> str:
     """Best-effort markdown marker removal for plain-text display."""
     plain = _rich_text_from_ansi(text or "").plain
+
+    # Extract fenced code blocks BEFORE any prose-markdown stripping below.
+    # Code content must survive byte-for-byte: the emphasis-stripping regexes
+    # further down (`__x__` -> `x`, `*x*` -> `x`) don't know Python from
+    # prose, so a real docstring/dunder like `__name__` or `__main__` was
+    # being silently corrupted into `name`/`main` when it appeared inside a
+    # fenced block in `strip` mode -- code that ran fine got displayed (and,
+    # if copied, executed) with different semantics (issue #73212). Pull
+    # each fenced block out into a placeholder, run the existing prose
+    # stripping on what's left, then splice the untouched code back in. The
+    # opening fence's language tag (e.g. "python") is dropped entirely in
+    # this plain-text mode rather than left as a stray visible line.
+    code_blocks: list[str] = []
+
+    def _extract_fence(match: "re.Match[str]") -> str:
+        code_blocks.append(match.group(4))
+        return f"\x00FENCE{len(code_blocks) - 1}\x00"
+
+    plain = _FENCED_CODE_BLOCK_RE.sub(_extract_fence, plain)
+
     # Avoid stripping cron-style expressions like "* * * * *" as if they were
     # Markdown horizontal rules. CommonMark treats three or more "*" as an HR,
     # but in Hermes output it's common to display cron schedules verbatim.
@@ -2813,6 +2839,11 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", plain)
     plain = re.sub(r"~~([^~]+)~~", r"\1", plain)
     plain = re.sub(r"\n{3,}", "\n\n", plain)
+
+    # Splice the untouched code blocks back in.
+    for i, code in enumerate(code_blocks):
+        plain = plain.replace(f"\x00FENCE{i}\x00", code.rstrip("\n"))
+
     return plain.strip("\n")
 
 
