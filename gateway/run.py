@@ -9923,6 +9923,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _agent, context="shutdown idle-cache"
                     )
 
+            # Drain completion-batch flush tasks before adapter teardown
+            # so they get a last chance to deliver (or be cancelled cleanly
+            # with all waiters resolved as retryable).
+            _flush_tasks = [
+                _t for _t in list(self._background_tasks)
+                if _t is not self._stop_task
+                and _t is not self._restart_task
+            ]
+            if _flush_tasks:
+                for _t in _flush_tasks:
+                    if not _t.done():
+                        _t.cancel()
+                _drain_deadline = time.monotonic() + 3.0
+                for _t in _flush_tasks:
+                    try:
+                        _remaining = max(0.0, _drain_deadline - time.monotonic())
+                        await asyncio.wait_for(
+                            asyncio.shield(_t),
+                            timeout=_remaining,
+                        )
+                    except (asyncio.CancelledError, TimeoutError):
+                        pass
+
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 
@@ -9940,6 +9963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            # Cancel any remaining background tasks after adapters are down.
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
                     continue
@@ -18600,16 +18624,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if delivered is not None:
                         break
 
-                # P1 fix: _deliver_completion_notification returns None
-                # when the event has no gateway route or is a lifecycle
-                # duplicate — these are NOT retryable.  False means
-                # temporary adapter failure and IS retryable.  None is
-                # surfaced as-is so the watcher's existing retry-or-exit
-                # logic handles each case correctly.
-                # We only escalate None → False when we have fresh claimed
-                # identities AND the adapter was reachable on a prior
-                # attempt, which we detect by consulting the adapter set.
-
                 if delivered is True:
                     self._record_coalesced_completion_siblings(
                         [evt for _text, evt, _future in entries]
@@ -18623,6 +18637,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for _text, _evt, future in entries:
                     if not future.done():
                         future.set_result(delivered)
+        except asyncio.CancelledError:
+            # Shutdown or lifecycle cancellation — detach the batch,
+            # resolve every waiter as retryable (False) so callers retry
+            # or surface correctly, then re-raise.
+            stale = self._completion_notification_batches.pop(key, [])
+            if self._completion_notification_batch_tasks.get(key) is current_task:
+                self._completion_notification_batch_tasks.pop(key, None)
+            for _text, _evt, future in stale:
+                if not future.done():
+                    future.set_result(False)
+            raise
         finally:
             if self._completion_notification_batch_tasks.get(key) is current_task:
                 self._completion_notification_batch_tasks.pop(key, None)
@@ -18633,8 +18658,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Fan in concurrent process completions that share one conversation.
 
         Completions are grouped by route for up to
-        ``_completion_notification_batch_window`` seconds (or until the
-        threshold is reached), then delivered as one synthetic turn.
+        ``_completion_notification_batch_window`` seconds, then delivered
+        as one synthetic turn.
         Single completions pay the full batching window — there is no
         zero-latency shortcut because true zero-latency requires limiting
         coalescing to work already available in the same loop tick.

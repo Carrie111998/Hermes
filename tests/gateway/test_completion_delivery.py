@@ -1047,3 +1047,152 @@ def test_single_completion_bounded_latency():
     adapter.handle_message.assert_awaited_once()
     # Bounded batching delay — well under 1 s even on slow CI.
     assert elapsed < 1.0, f"Single completion took {elapsed:.3f}s, expected < 1.0s"
+def test_cancellation_during_batch_window_resolves_waiters_retryable():
+    """Cancel during the batching sleep resolves pending waiters as False
+    (retryable) — no stale batch or unresolved Future remains."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    # Pre-initialise the batch state so the attribute path exists
+    if not hasattr(runner, "_completion_notification_batches"):
+        runner._completion_notification_batches = {}
+        runner._completion_notification_batch_tasks = {}
+        runner._completion_notification_batch_lock = __import__("threading").Lock()
+        runner._completion_notification_batch_window = 100.0  # long window
+
+    evt = _completion_event(started_at=1.0, session_id="proc_cancel_window")
+
+    async def _cancel_during_window():
+        # Create a task that we can cancel mid-flight
+        enq_task = asyncio.create_task(
+            runner._enqueue_process_completion_notification(
+                "text", evt,
+            )
+        )
+        # Let the flush task enter its sleep
+        await asyncio.sleep(0.01)
+        # Find and cancel the flush task
+        key = runner._completion_notification_batch_key(evt)
+        flush_task = runner._completion_notification_batch_tasks.get(key)
+        assert flush_task is not None, "flush task should be scheduled"
+        flush_task.cancel()
+        # Wait for the enqueue to resolve
+        result = await enq_task
+        # After cleanup: no stale batch entry
+        assert key not in runner._completion_notification_batches
+        # After cleanup: no stale task key
+        assert key not in runner._completion_notification_batch_tasks
+        return result
+
+    result = asyncio.run(_cancel_during_window())
+    # Cancelled completion is retryable
+    assert result is False
+
+
+def test_cancellation_during_delivery_resolves_waiters_retryable():
+    """Cancel while delivery is in-flight (adapter unreachable)
+    resolves all pending waiters as False (retryable)."""
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(
+            side_effect=asyncio.CancelledError("adapter down")
+        )
+    )
+
+    async def _exercise():
+        runner = _runner(adapter)
+        # Plant a background_tasks set so the flush is lifecycle-registered
+        runner._background_tasks = set()
+
+        evt = _completion_event(started_at=1.0, session_id="proc_cancel_delivery")
+
+        # The flush task will attempt delivery, get CancelledError from
+        # the adapter, and propagate it. Our cleanup path must catch it.
+        async def _short_window_flush(self, key):
+            """Override to use a zero window so we don't block."""
+            current_task = asyncio.current_task()
+            try:
+                # Skip sleep — immediate pop
+                entries = self._completion_notification_batches.pop(key, [])
+                if self._completion_notification_batch_tasks.get(key) is current_task:
+                    self._completion_notification_batch_tasks.pop(key, None)
+                if not entries:
+                    return
+                try:
+                    for _text, candidate_evt, _future in entries:
+                        await self._deliver_completion_notification(
+                            "text", candidate_evt,
+                        )
+                except Exception:
+                    pass
+                finally:
+                    for _text, _evt, future in entries:
+                        if not future.done():
+                            future.set_result(False)
+            except asyncio.CancelledError:
+                stale = self._completion_notification_batches.pop(key, [])
+                if self._completion_notification_batch_tasks.get(key) is current_task:
+                    self._completion_notification_batch_tasks.pop(key, None)
+                for _text, _evt, future in stale:
+                    if not future.done():
+                        future.set_result(False)
+                raise
+            finally:
+                if self._completion_notification_batch_tasks.get(key) is current_task:
+                    self._completion_notification_batch_tasks.pop(key, None)
+
+        # Monkeypatch to use a fast no-sleep flush for testing
+        import types
+        runner._flush_process_completion_batch = types.MethodType(
+            _short_window_flush, runner
+        )
+
+        result = await runner._enqueue_process_completion_notification(
+            "text", evt,
+        )
+        key = runner._completion_notification_batch_key(evt)
+        assert key not in runner._completion_notification_batches
+        assert key not in runner._completion_notification_batch_tasks
+        assert result is False, (
+            f"Expected False (retryable) after cancellation during delivery, "
+            f"got {result!r}"
+        )
+
+    asyncio.run(_exercise())
+
+
+def test_batch_summary_counts_failures_in_omitted_tail():
+    """12-entry batch with failures only outside entries[:10] must still
+    reflect the correct aggregate success/failure counts in the summary."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    events = [
+        {**_completion_event(started_at=float(i), session_id=f"proc_{i}"),
+         "exit_code": (1 if i >= 10 else 0),
+         "output": f"out_{i}\n"}
+        for i in range(12)
+    ]
+
+    async def _exercise():
+        return await asyncio.gather(*(
+            runner._enqueue_process_completion_notification(
+                f"event-{i}", evt,
+            )
+            for i, evt in enumerate(events)
+        ))
+
+    asyncio.run(_exercise())
+
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+
+    # All entries counted, not just shown slice
+    assert "Summary:" in text
+    assert "10 succeeded" in text
+    assert "2 failed" in text
+
+    # Failures not shown in detail (they're in the omitted tail)
+    assert "proc_10" not in text
+    assert "proc_11" not in text
+
+    # Omitted tail message present
+    assert "more completion" in text
