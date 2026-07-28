@@ -475,13 +475,19 @@ def _notify_session_boundary(
 ) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.lifecycle import finalize_session, invoke_hook
 
-        _invoke_hook(
-            event_type,
-            session_id=session_id,
-            platform=_resolve_agent_platform(platform),
-        )
+        if event_type == "on_session_finalize":
+            finalize_session(
+                session_id=session_id,
+                platform=_resolve_agent_platform(platform),
+            )
+        else:
+            invoke_hook(
+                event_type,
+                session_id=session_id,
+                platform=_resolve_agent_platform(platform),
+            )
     except Exception:
         pass
 
@@ -504,6 +510,33 @@ def _claim_active_session_slot(
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
         return None, None
+
+
+def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
+    """Claim this session's cap slot on its first real turn; None when ok.
+
+    session.create / session.resume deliberately do NOT claim one. Every
+    desktop tile paint, background reconnect-resume and abandoned draft opens a
+    session just to paint a composer, and a slot held by one of those is
+    invisible everywhere: an unprompted draft has no DB row, and the sidebar
+    filters it out with min_messages=1. Idle desktop tabs therefore silently
+    starved the messaging gateway, which shares this cap — five parked tabs on
+    a websocket-flappy host locked a Discord bot out of a 5-slot cap while
+    running no agents at all. Claiming on the first turn mirrors the lazy
+    contract _ensure_session_db_row already uses for the row itself, and keeps
+    the invariant that anything holding a slot is something the user can see.
+    """
+    if session.get("active_session_lease") is not None:
+        return None
+    lease, limit_message = _claim_active_session_slot(
+        str(session.get("session_key") or ""),
+        live_session_id=sid,
+        surface=_session_source(session),
+    )
+    if limit_message is not None:
+        return limit_message
+    session["active_session_lease"] = lease
+    return None
 
 
 def _release_active_session_slot(session: dict | None) -> None:
@@ -660,7 +693,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # the user Ctrl‑C's mid‑turn.
     if agent is not None:
         try:
-            from hermes_cli.plugins import invoke_hook
+            from hermes_cli.lifecycle import invoke_hook
 
             invoke_hook(
                 "on_session_end",
@@ -974,6 +1007,24 @@ def _reap_idle_sessions() -> None:
     for sid in victims:
         _close_session_by_id(sid, end_reason="idle_timeout")
     _enforce_session_cap()
+    _reclaim_orphaned_leases()
+
+
+def _reclaim_orphaned_leases() -> None:
+    """Hand the registry the lease ids we still own so it can drop the rest."""
+    try:
+        from hermes_cli.active_sessions import release_orphaned_leases
+
+        with _sessions_lock:
+            live = {
+                lease.lease_id
+                for session in _sessions.values()
+                if (lease := session.get("active_session_lease")) is not None
+            }
+        if dropped := release_orphaned_leases(live):
+            logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
+    except Exception:
+        logger.debug("orphaned lease reclaim failed", exc_info=True)
 
 
 # Soft LRU cap on in-memory sessions. The 6h TTL reaper above only frees
@@ -6991,11 +7042,7 @@ def _(rid, params: dict) -> dict:
 
     ready = threading.Event()
     now = time.time()
-    lease, limit_message = _claim_active_session_slot(
-        key, live_session_id=sid, surface=source
-    )
-    if limit_message is not None:
-        return _err(rid, 4090, limit_message)
+    lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
 
     with _sessions_lock:
         _sessions[sid] = {
@@ -7439,11 +7486,7 @@ def _(rid, params: dict) -> dict:
     if is_truthy_value(params.get("lazy", False)):
         sid = uuid.uuid4().hex[:8]
         source = _resolve_session_source(str(params.get("source") or "").strip() or None)
-        lease, limit_message = _claim_active_session_slot(
-            target, live_session_id=sid, surface=source
-        )
-        if limit_message is not None:
-            return _err(rid, 4090, limit_message)
+        lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         try:
             db.reopen_session(target)
             # The child's OWN conversation only — include_ancestors would prepend
@@ -7520,11 +7563,7 @@ def _(rid, params: dict) -> dict:
     if not is_truthy_value(params.get("eager_build", False)):
         sid = uuid.uuid4().hex[:8]
         source = _resolve_session_source(str(params.get("source") or "").strip() or None)
-        lease, limit_message = _claim_active_session_slot(
-            target, live_session_id=sid, surface=source
-        )
-        if limit_message is not None:
-            return _err(rid, 4090, limit_message)
+        lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         # Interactive resume routes approvals/clarify through gateway prompts;
         # the deferred build wires the remaining per-session callbacks.
         _enable_gateway_prompts()
@@ -7599,11 +7638,7 @@ def _(rid, params: dict) -> dict:
     # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
     sid = uuid.uuid4().hex[:8]
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
-    lease, limit_message = _claim_active_session_slot(
-        target, live_session_id=sid, surface=source
-    )
-    if limit_message is not None:
-        return _err(rid, 4090, limit_message)
+    lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
     _enable_gateway_prompts()
     home_token = (
         set_hermes_home_override(str(profile_home)) if profile_home is not None else None
@@ -10122,13 +10157,20 @@ def _(rid, params: dict) -> dict:
     removed = 0
     with session["history_lock"]:
         history = session.get("history", [])
-        while history and history[-1].get("role") in {"assistant", "tool"}:
-            history.pop()
-            removed += 1
-        if history and history[-1].get("role") == "user":
-            history.pop()
-            removed += 1
-        if removed:
+        # Truncate from the last *real* user turn (no display_kind). Popping
+        # only trailing assistant/tool then one user left timeline markers
+        # (async_delegation_complete, model_switch, …) as the undo target —
+        # so session.undo removed bookkeeping instead of the last exchange.
+        # Match list_recent_user_messages / CLI turn counting.
+        last_user_idx = None
+        for i in range(len(history) - 1, -1, -1):
+            msg = history[i]
+            if msg.get("role") == "user" and not msg.get("display_kind"):
+                last_user_idx = i
+                break
+        if last_user_idx is not None:
+            removed = len(history) - last_user_idx
+            del history[last_user_idx:]
             session["history_version"] = int(session.get("history_version", 0)) + 1
     return _ok(rid, {"removed": removed})
 
@@ -10410,11 +10452,7 @@ def _(rid, params: dict) -> dict:
         new_key = _new_session_key()
         new_sid = uuid.uuid4().hex[:8]
         source = _session_source(session)
-        lease, limit_message = _claim_active_session_slot(
-            new_key, live_session_id=new_sid, surface=source
-        )
-        if limit_message is not None:
-            return _err(rid, 4090, limit_message)
+        lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         branch_name = params.get("name", "")
         try:
             if branch_name:
@@ -10919,6 +10957,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
+        return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -10969,7 +11009,10 @@ def _(rid, params: dict) -> dict:
             except (TypeError, ValueError):
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
-            user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
+            user_indices = [
+                i for i, m in enumerate(history)
+                if m.get("role") == "user" and not m.get("display_kind")
+            ]
             # Reject out-of-range ordinals on BOTH ends. A negative value would
             # otherwise sail past the upper-bound check and hit Python's negative
             # indexing below (user_indices[-1] -> the LAST user turn), silently
@@ -15719,10 +15762,16 @@ def _(rid, params: dict) -> dict:
         history = session.get("history", [])
         if not history:
             return _err(rid, 4018, "no previous user message to retry")
-        # Walk backwards to find the last user message
+        # Walk backwards to the last *real* user turn. Timeline bookkeeping
+        # rows (display_kind set) are durable role=user but no client counts
+        # them as user turns — same predicate as CLI resume/count and the
+        # prompt.submit ordinal fix. Without this, /retry re-sends opaque
+        # markers (model_switch / async_delegation_complete / auto_continue)
+        # and truncates only the marker instead of the failed exchange.
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
-            if history[i].get("role") == "user":
+            msg = history[i]
+            if msg.get("role") == "user" and not msg.get("display_kind"):
                 last_user_idx = i
                 break
         if last_user_idx is None:
@@ -17719,6 +17768,16 @@ def _(rid, params: dict) -> dict:
                 if isinstance(duration, (int, float)) and not isinstance(duration, bool)
                 else 3.0
             )
+            # voice.max_recording_seconds — hard cap on a single recording's
+            # length. Same guard as the silence params: non-numeric / bool /
+            # missing falls back to the documented 120 default, while an
+            # explicit numeric value <= 0 disables the cap (0.0).
+            max_rec = voice_cfg.get("max_recording_seconds")
+            safe_max_rec = (
+                (max_rec if max_rec > 0 else 0.0)
+                if isinstance(max_rec, (int, float)) and not isinstance(max_rec, bool)
+                else 120.0
+            )
             started = start_continuous(
                 on_transcript=lambda t: _voice_emit("voice.transcript", {"text": t}),
                 on_status=lambda s: _voice_emit("voice.status", {"state": s}),
@@ -17728,6 +17787,7 @@ def _(rid, params: dict) -> dict:
                 silence_threshold=safe_threshold,
                 silence_duration=safe_duration,
                 auto_restart=False,
+                max_recording_seconds=safe_max_rec,
             )
             if started is False:
                 return _ok(rid, {"status": "busy"})
@@ -17855,12 +17915,17 @@ def _(rid, params: dict) -> dict:
                 removed = 0
                 with session["history_lock"]:
                     history = session.get("history", [])
-                    while history and history[-1].get("role") in {"assistant", "tool"}:
-                        history.pop()
-                        removed += 1
-                    if history and history[-1].get("role") == "user":
-                        history.pop()
-                        removed += 1
+                    # Truncate from the last *real* user turn (no display_kind).
+                    # Same predicate as list_recent_user_messages / /undo / /retry.
+                    last_user_idx = None
+                    for i in range(len(history) - 1, -1, -1):
+                        msg = history[i]
+                        if msg.get("role") == "user" and not msg.get("display_kind"):
+                            last_user_idx = i
+                            break
+                    if last_user_idx is not None:
+                        removed = len(history) - last_user_idx
+                        del history[last_user_idx:]
                     if removed:
                         session["history_version"] = (
                             int(session.get("history_version", 0)) + 1
