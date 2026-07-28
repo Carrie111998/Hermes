@@ -6066,7 +6066,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Pending state tracked in PendingCompletionRegistry instead of
         # the old dict-of-lists approach.
         self._completion_registry = self.PendingCompletionRegistry()
-        self._completion_notification_batch_tasks: dict = {}
+        self._flush_tasks_by_route: dict = {}
         self._completion_notification_batch_lock = threading.Lock()
         self._completion_notification_batch_window = 0.1
         self._batch_window_sleep = asyncio.sleep
@@ -22335,14 +22335,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
-        """Deliver once per live gateway, or return False for a retry.
+    ) -> "CompletionDisposition":
+        """Deliver once per live gateway.
 
-        ``True`` means this caller reached adapter acceptance, ``False`` means
-        injection failed and the claim was released for retry, and ``None``
-        means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
-        guarantee is claimed.
+        Returns ``CompletionDisposition.DELIVERED`` after adapter acceptance,
+        ``RETRY`` after a retryable failure, and ``DROP_UNROUTABLE`` when the
+        event has no gateway route or another caller already owns it.
+        No cross-process exactly-once guarantee is claimed.
         """
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
@@ -22357,13 +22356,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not claim_completion_delivery(
                         durable_delegation_id, durable_claim_id,
                     ):
-                        return None
+                        return self.CompletionDisposition.DROP_UNROUTABLE
                 except Exception as exc:
                     logger.warning(
                         "Could not claim durable async completion %s: %s",
                         durable_delegation_id, exc,
                     )
-                    return False
+                    return self.CompletionDisposition.RETRY
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 # Pre-flight (#65838-class): adapter acceptance is NOT proof of
@@ -22392,7 +22391,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Could not drop durable completion claim",
                                 exc_info=True,
                             )
-                    return None
+                    return self.CompletionDisposition.DROP_UNROUTABLE
                 if verdict == "retry":
                     if durable_claim_id:
                         try:
@@ -22406,21 +22405,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Could not release durable completion claim",
                                 exc_info=True,
                             )
-                    return False
+                    return self.CompletionDisposition.RETRY
         if identity is not None:
             with self._completion_delivery_lock:
                 if (
                     identity in self._completion_deliveries_inflight
                     or identity in self._completion_deliveries_delivered
                 ):
-                    return None
+                    return self.CompletionDisposition.DROP_UNROUTABLE
                 self._completion_deliveries_inflight.add(identity)
 
         accepted = False
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
-            if injection_result is not True:
-                return injection_result
+            if injection_result is True:
+                pass  # accepted, proceed below
+            elif injection_result is False:
+                return self.CompletionDisposition.RETRY
+            else:
+                return self.CompletionDisposition.DROP_UNROUTABLE
             accepted = True
 
             if identity is not None:
@@ -22448,7 +22451,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Could not acknowledge durable async completion %s: %s",
                         durable_delegation_id, exc,
                     )
-            return True
+            return self.CompletionDisposition.DELIVERED
         finally:
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:
@@ -22525,7 +22528,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     try:
                         delivered = await self._deliver_completion_notification(synth_text, evt)
-                        if delivered is False:
+                        if delivered is self.CompletionDisposition.RETRY:
                             _pr.completion_queue.put(evt)
                     except Exception as e:
                         _pr.completion_queue.put(evt)
@@ -22647,7 +22650,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not hasattr(self, "_completion_registry"):
             self._completion_registry = self.PendingCompletionRegistry()
-            self._completion_notification_batch_tasks = {}
+            self._flush_tasks_by_route = {}
             self._completion_notification_batch_lock = __import__("threading").Lock()
             self._completion_notification_batch_window = 0.1
             self._completion_route_keys = {}
@@ -22668,7 +22671,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_route_keys[identity] = key
 
         with self._completion_notification_batch_lock:
-            if key not in self._completion_notification_batch_tasks:
+            if key not in self._flush_tasks_by_route:
                 task = asyncio.create_task(
                     self._flush_process_completion_batch(key)
                 )
@@ -22676,7 +22679,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _bg_tasks is not None:
                     _bg_tasks.add(task)
                     task.add_done_callback(_bg_tasks.discard)
-                self._completion_notification_batch_tasks[key] = task
+                self._flush_tasks_by_route[key] = task
 
         return await future
 
@@ -22698,8 +22701,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             await self._batch_window_sleep(self._completion_notification_batch_window)
 
-            if self._completion_notification_batch_tasks.get(key) is current_task:
-                self._completion_notification_batch_tasks.pop(key, None)
+            if self._flush_tasks_by_route.get(key) is current_task:
+                self._flush_tasks_by_route.pop(key, None)
 
             # Collect PENDING identities for this route key
             identities = [
@@ -22738,10 +22741,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delivered = await self._deliver_completion_notification(
                         synth_text, candidate_evt,
                     )
-                    if delivered is not None:
+                    if delivered is not self.CompletionDisposition.DROP_UNROUTABLE:
                         break
 
-                if delivered is True:
+                if delivered is self.CompletionDisposition.DELIVERED:
                     delivered_disposition = self.CompletionDisposition.DELIVERED
                     for reg in claimed:
                         self._completion_registry.deliver(reg["identity"])
@@ -22756,7 +22759,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     > self._completion_delivery_retention
                                 ):
                                     self._completion_deliveries_delivered.popitem(last=False)
-                elif delivered is False:
+                elif delivered is self.CompletionDisposition.RETRY:
                     delivered_disposition = self.CompletionDisposition.RETRY
                     for reg in claimed:
                         self._completion_registry.retry(reg["identity"])
@@ -22780,8 +22783,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._completion_registry.resolve_futures(claimed, self.CompletionDisposition.RETRY)
             raise
         finally:
-            if self._completion_notification_batch_tasks.get(key) is current_task:
-                self._completion_notification_batch_tasks.pop(key, None)
+            if self._flush_tasks_by_route.get(key) is current_task:
+                self._flush_tasks_by_route.pop(key, None)
 
     async def _coalesce_and_inject_watch_events(
         self, watch_events: list,
