@@ -2186,7 +2186,9 @@ class TestWebServerEndpoints:
         assert row["profile"] == "default"
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
-        assert data["recents"]["total"] >= 1
+        # Pagination reports "was this window capped?" per profile, not an exact
+        # COUNT(*) — one row against a 20-row cap means nothing more to load.
+        assert data["recents"]["profiles_truncated"]["default"] is False
 
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget
@@ -3658,6 +3660,42 @@ class TestWebServerEndpoints:
             assert any(field["key"] == "IRC_SERVER" and field["required"] for field in ids["ircfake"]["env_vars"])
         finally:
             platform_registry.unregister("ircfake")
+
+    def test_messaging_catalog_prefers_plugin_label_over_enum_pseudo_member(self):
+        """A plugin platform that leaked into Platform.__members__ as a pseudo-
+        member must still render with its plugin label, not a title-cased id.
+
+        Regression: Platform("<plugin id>") caches a pseudo-member in the enum;
+        the catalog iterated the enum FIRST and claimed the id with no plugin
+        metadata, so bundled plugin platforms (irc, ntfy, photon, …) rendered
+        as nameless "Irc"/"Ntfy" cards with empty descriptions.
+        """
+        from gateway.config import Platform
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        entry = PlatformEntry(
+            name="pseudofake",
+            label="Pseudo Fake (plugin label)",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        platform_registry.register(entry)
+        try:
+            # Materialize the enum pseudo-member the way any earlier config
+            # read would (Platform(value) on a registered plugin platform).
+            member = Platform("pseudofake")
+            assert member.value == "pseudofake"
+            assert "PSEUDOFAKE" in Platform.__members__
+
+            resp = self.client.get("/api/messaging/platforms")
+            ids = {row["id"]: row for row in resp.json()["platforms"]}
+            assert "pseudofake" in ids
+            assert ids["pseudofake"]["name"] == "Pseudo Fake (plugin label)"
+        finally:
+            platform_registry.unregister("pseudofake")
+            Platform._value2member_map_.pop("pseudofake", None)
+            Platform._member_map_.pop("PSEUDOFAKE", None)
 
     def test_update_messaging_platform_saves_env_and_enablement(self):
         from hermes_cli.config import load_config, load_env
@@ -5288,6 +5326,29 @@ class TestBuildSchemaFromConfig:
         options = set(CONFIG_SCHEMA["memory.provider"]["options"])
         missing = set(list_memory_provider_names()) - options
         assert missing == set(), f"discovered providers missing from schema options: {missing}"
+
+    def test_timezone_field_is_searchable_select(self):
+        """timezone must ship as a searchable, clearable select of IANA ids.
+
+        Desktop renders this via SearchableSelect (Popover + cmdk); the old
+        free-text input let users type invalid timezone strings (#68970).
+        Invariants, not snapshots: valid IANA entries present, sorted, no
+        blank entry server-side (the clear item is client-side via
+        ``clearable``), and never empty even without tzdata (UTC fallback).
+        """
+        from hermes_cli.web_server import CONFIG_SCHEMA, _timezone_options
+
+        entry = CONFIG_SCHEMA["timezone"]
+        assert entry["type"] == "select"
+        assert entry.get("searchable") is True
+        assert entry.get("clearable") is True
+        options = entry["options"]
+        assert len(options) >= 1
+        assert options == sorted(options)
+        assert "" not in options
+        assert "UTC" in options
+        # Fallback path: never returns an empty list.
+        assert len(_timezone_options()) >= 1
 
     def test_dynamic_merge_recomputes_memory_provider_options(self, monkeypatch):
         """The per-request schema merge re-discovers memory providers.
