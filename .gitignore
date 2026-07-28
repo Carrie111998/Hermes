@@ -161,3 +161,33 @@ infographic/
 apps/desktop/app.asar
 apps/desktop/main.cjs
 apps/desktop/release.bak/
+
+# Tauri desktop build output
+apps/desktop-tauri/dist/
+apps/desktop-tauri/build/
+apps/desktop-tauri/release/
+apps/desktop-tauri/release.bak/
+apps/desktop-tauri/src-tauri/target/
+
+# Tauri: compiled tsc artifacts (same as desktop)
+apps/desktop-tauri/src/**/*.js
+apps/desktop-tauri/src/**/*.js.map
+apps/desktop-tauri/src/**/*.d.ts
+!apps/desktop-tauri/src/global.d.ts
+!apps/desktop-tauri/src/vite-env.d.ts
+
+# Tauri: bundled Electron artifacts (migration leftovers)
+apps/desktop-tauri/app.asar
+apps/desktop-tauri/main.cjs
+
+# Tauri: embedded data
+apps/desktop-tauri/.hermes/
+
+# Tauri: medic-scraper leftovers, PR assets, demo pages — not part of core
+apps/desktop-tauri/medic-job-board/
+apps/desktop-tauri/medic-dashboard.html
+apps/desktop-tauri/medic-jobs-data.js
+apps/desktop-tauri/medic-jobs-data.json
+apps/desktop-tauri/preview-demo.html
+apps/desktop-tauri/pr-assets/
+apps/desktop-tauri/public/ds-assets/
