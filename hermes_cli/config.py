@@ -2460,6 +2460,11 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
+        # Operator-approved per-task capability lanes. The model can request only
+        # explore/engineer/review; each configured entry must contain provider,
+        # model, and reasoning_effort. Raw credentials and transport overrides
+        # are intentionally rejected from lane entries.
+        "lanes": {},
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap

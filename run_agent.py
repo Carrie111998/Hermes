@@ -6899,6 +6899,7 @@ class AIAgent:
             role=function_args.get("role"),
             background=(not _is_subagent),
             parent_agent=self,
+            lane=function_args.get("lane"),
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,

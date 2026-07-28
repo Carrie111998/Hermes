@@ -29,7 +29,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
@@ -38,6 +38,12 @@ from toolsets import TOOLSETS
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+
+# Model-facing capability lanes. The model can select only one of these stable
+# task classes; provider/model/effort remain operator-owned in config.yaml.
+DELEGATION_LANES = ("explore", "engineer", "review")
+_LANE_CONFIG_FIELDS = frozenset({"provider", "model", "reasoning_effort"})
+_REASONING_EFFORT_UNSET = object()
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -1205,6 +1211,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Any = _REASONING_EFFORT_UNSET,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1432,14 +1439,18 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: lane override > global delegation override > parent.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (
+            delegation_cfg.get("reasoning_effort")
+            if override_reasoning_effort is _REASONING_EFFORT_UNSET
+            else override_reasoning_effort
+        )
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1448,7 +1459,7 @@ def _build_child_agent(
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                    "Unknown delegation reasoning_effort '%s', inheriting parent level",
                     delegation_effort,
                 )
     except Exception as exc:
@@ -2279,6 +2290,10 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                "lane": getattr(child, "_delegate_lane", None),
+                "reasoning_effort": getattr(
+                    child, "_delegate_lane_reasoning_effort", None
+                ),
                 "timeout_seconds": child_timeout if is_timeout else None,
                 "timed_out_after_seconds": duration if is_timeout else None,
                 "timeout_phase": (
@@ -2382,6 +2397,10 @@ def _run_single_child(
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
+            "lane": getattr(child, "_delegate_lane", None),
+            "reasoning_effort": getattr(
+                child, "_delegate_lane_reasoning_effort", None
+            ),
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
             "tokens": {
@@ -2762,13 +2781,18 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    lane: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, and lane)
+      - Batch:  provide tasks array [{goal, context, role, lane}, ...]
+
+    ``lane`` is a model-facing capability class, never a raw model override.
+    It resolves provider/model/reasoning_effort exclusively from the operator's
+    ``delegation.lanes`` config. Per-task lane beats the top-level default.
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2834,16 +2858,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2878,6 +2892,23 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Copy caller-owned task dicts, then resolve all lane routing before child
+    # construction. A missing/malformed lane therefore fails closed without
+    # partially spawning a batch. Unique lanes share one credential resolution.
+    task_list = [dict(task) for task in task_list]
+    try:
+        task_routes = _resolve_task_lane_routing(
+            cfg,
+            task_list,
+            top_lane=lane,
+            parent_agent=parent_agent,
+        )
+    except ValueError as exc:
+        return tool_error(str(exc))
+    for task, route in zip(task_list, task_routes):
+        if route["lane"] is not None:
+            task["lane"] = route["lane"]
 
     overall_start = time.monotonic()
     results = []
@@ -2923,6 +2954,13 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        route = task_routes[i]
+        creds = route["credentials"]
+        lane_effort = (
+            route["reasoning_effort"]
+            if route["lane"] is not None
+            else _REASONING_EFFORT_UNSET
+        )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -2940,9 +2978,14 @@ def delegate_task(
             override_api_mode=creds["api_mode"],
             override_request_overrides=creds.get("request_overrides"),
             override_max_tokens=creds.get("max_output_tokens"),
+            override_reasoning_effort=lane_effort,
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+        )
+        child._delegate_lane = route["lane"]
+        child._delegate_lane_reasoning_effort = (
+            route["reasoning_effort"] if route["lane"] is not None else None
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3580,6 +3623,129 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _configured_lane_names(cfg: dict) -> List[str]:
+    """Return syntactically valid configured lane names in stable enum order."""
+    raw_lanes = cfg.get("lanes") if isinstance(cfg, dict) else None
+    if not isinstance(raw_lanes, dict):
+        return []
+    configured = []
+    for name in DELEGATION_LANES:
+        if not isinstance(raw_lanes.get(name), dict):
+            continue
+        try:
+            _validated_lane_config(cfg, name)
+        except ValueError:
+            continue
+        configured.append(name)
+    return configured
+
+
+def _normalize_requested_lane(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            "Delegation lane must be one of: " + ", ".join(DELEGATION_LANES) + "."
+        )
+    lane = value.strip()
+    if lane not in DELEGATION_LANES:
+        raise ValueError(
+            f"Unknown delegation lane {value!r}; allowed lanes: "
+            + ", ".join(DELEGATION_LANES)
+            + "."
+        )
+    return lane
+
+
+def _validated_lane_config(cfg: dict, lane: str) -> dict:
+    raw_lanes = cfg.get("lanes")
+    if not isinstance(raw_lanes, dict):
+        raise ValueError(
+            f"Delegation lane '{lane}' is not configured under delegation.lanes.{lane}."
+        )
+    raw_spec = raw_lanes.get(lane)
+    if not isinstance(raw_spec, dict):
+        raise ValueError(
+            f"Delegation lane '{lane}' is not configured under delegation.lanes.{lane}."
+        )
+
+    unsupported = sorted(set(raw_spec) - _LANE_CONFIG_FIELDS)
+    if unsupported:
+        raise ValueError(
+            f"Delegation lane '{lane}' has unsupported fields: "
+            + ", ".join(unsupported)
+            + ". Only provider, model, and reasoning_effort are allowed."
+        )
+
+    provider = raw_spec.get("provider")
+    model = raw_spec.get("model")
+    effort = raw_spec.get("reasoning_effort", _REASONING_EFFORT_UNSET)
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError(f"Delegation lane '{lane}' requires a non-empty provider.")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError(f"Delegation lane '{lane}' requires a non-empty model.")
+    if effort is _REASONING_EFFORT_UNSET:
+        raise ValueError(f"Delegation lane '{lane}' requires reasoning_effort.")
+
+    from hermes_constants import parse_reasoning_effort
+
+    if parse_reasoning_effort(effort) is None:
+        raise ValueError(
+            f"Delegation lane '{lane}' has invalid reasoning_effort {effort!r}."
+        )
+
+    return {
+        "provider": provider.strip(),
+        "model": model.strip(),
+        "reasoning_effort": effort,
+    }
+
+
+def _resolve_task_lane_routing(
+    cfg: dict,
+    task_list: List[Dict[str, Any]],
+    *,
+    top_lane: Any,
+    parent_agent,
+) -> List[Dict[str, Any]]:
+    """Resolve operator-owned routing once per unique lane before child build.
+
+    The model supplies only a stable capability lane. Provider, model, and
+    reasoning effort come exclusively from ``delegation.lanes``. A requested
+    lane that is missing or malformed fails closed before any child is built.
+    Calls without a lane preserve the legacy global override/inheritance path.
+    """
+    normalized_top = _normalize_requested_lane(top_lane)
+    requested_lanes: List[Optional[str]] = []
+    for task in task_list:
+        raw_task_lane = task.get("lane") if "lane" in task else normalized_top
+        requested_lanes.append(
+            _normalize_requested_lane(raw_task_lane)
+            if raw_task_lane is not None
+            else normalized_top
+        )
+
+    cache: Dict[Optional[str], Dict[str, Any]] = {}
+    routes: List[Dict[str, Any]] = []
+    for lane in requested_lanes:
+        if lane not in cache:
+            if lane is None:
+                cache[lane] = {
+                    "lane": None,
+                    "credentials": _resolve_delegation_credentials(cfg, parent_agent),
+                    "reasoning_effort": None,
+                }
+            else:
+                lane_cfg = _validated_lane_config(cfg, lane)
+                cache[lane] = {
+                    "lane": lane,
+                    "credentials": _resolve_delegation_credentials(lane_cfg, parent_agent),
+                    "reasoning_effort": lane_cfg["reasoning_effort"],
+                }
+        routes.append(cache[lane])
+    return routes
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -3728,7 +3894,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent model is NOT selectable directly per call. Without a lane, children inherit the parent model (plus its fallback chain) unless all subagents are pinned via delegation.provider / delegation.model. When delegation.lanes is configured, the model may select only an operator-approved capability lane; provider, model, and reasoning effort still come exclusively from config.yaml.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3788,19 +3954,39 @@ def _build_role_param_description() -> str:
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
-    Plugged into ToolEntry.dynamic_schema_overrides so every
-    get_definitions() pass rewrites the description fields to the user's
-    actual limits.
+    Descriptions expose live concurrency/depth limits. Capability-lane fields
+    are present only when the operator configured at least one valid lane name,
+    and their enum is narrowed to exactly those configured names.
     """
-    overrides_params = {
-        **DELEGATE_TASK_SCHEMA["parameters"],
-    }
-    # Deep-copy properties so we don't mutate the static schema dict.
-    overrides_params["properties"] = {
-        k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
-    }
-    overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
-    overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    import copy
+
+    overrides_params = cast(
+        Dict[str, Any], copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
+    )
+    properties = cast(Dict[str, Any], overrides_params["properties"])
+    properties["tasks"]["description"] = _build_tasks_param_description()
+    properties["role"]["description"] = _build_role_param_description()
+
+    configured_lanes = _configured_lane_names(_load_config())
+    task_properties = cast(
+        Dict[str, Any], properties["tasks"]["items"]["properties"]
+    )
+    if configured_lanes:
+        lane_description = (
+            "Operator-controlled capability lane; configured lanes: "
+            + ", ".join(configured_lanes)
+            + ". Provider, model, and reasoning effort are resolved only from config."
+        )
+        properties["lane"]["enum"] = configured_lanes
+        properties["lane"]["description"] = (
+            lane_description
+            + " In batch mode this is the default and an item-level lane may override it."
+        )
+        task_properties["lane"]["enum"] = configured_lanes
+        task_properties["lane"]["description"] = lane_description
+    else:
+        properties.pop("lane", None)
+        task_properties.pop("lane", None)
 
     return {
         "description": _build_top_level_description(),
@@ -3842,6 +4028,15 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "lane": {
+                "type": "string",
+                "enum": list(DELEGATION_LANES),
+                "description": (
+                    "Operator-controlled capability lane. The lane selects provider, "
+                    "model, and reasoning effort from config; it never accepts raw "
+                    "model identifiers. In batch mode this is the default lane."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3851,6 +4046,14 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "lane": {
+                            "type": "string",
+                            "enum": list(DELEGATION_LANES),
+                            "description": (
+                                "Per-task capability lane override. Provider, model, "
+                                "and reasoning effort are resolved only from config."
+                            ),
                         },
                         "role": {
                             "type": "string",
@@ -3909,7 +4112,19 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     return not is_subagent
 
 
-_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
+_MODEL_HIDDEN_TASK_FIELDS = {
+    "acp_command",
+    "acp_args",
+    "model",
+    "provider",
+    "reasoning_effort",
+    "base_url",
+    "api_key",
+    "request_overrides",
+    "max_output_tokens",
+    "command",
+    "args",
+}
 
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:
@@ -3943,6 +4158,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
+        lane=args.get("lane"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

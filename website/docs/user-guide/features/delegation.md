@@ -140,18 +140,75 @@ process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
 
-## Model Override
+## Model routing
 
-You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:
+### One model for every subagent
+
+Set `delegation.model` and `delegation.provider` to route all subagents through one model:
 
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
-  model: "google/gemini-flash-2.0"    # Cheaper model for subagents
-  provider: "openrouter"              # Optional: route subagents to a different provider
+  model: "google/gemini-flash-2.0"
+  provider: "openrouter"
+  reasoning_effort: "low"
 ```
 
-If omitted, subagents use the same model as the parent.
+Without these keys, subagents inherit the parent's provider, model, reasoning level, and fallback chain.
+
+### Capability lanes
+
+Capability lanes let one batch use different operator-approved model presets without exposing raw model identifiers to the LLM. `delegate_task` accepts only three stable classes: `explore`, `engineer`, and `review`.
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  lanes:
+    explore:
+      provider: "xai"
+      model: "grok-4.5"
+      reasoning_effort: "low"
+    engineer:
+      provider: "openai-codex"
+      model: "gpt-5.6-luna"
+      reasoning_effort: "medium"
+    review:
+      provider: "xiaomi"
+      model: "mimo-v2.5"
+      reasoning_effort: "low"
+```
+
+Use a lane for one task:
+
+```python
+delegate_task(
+    goal="Implement the validated API change",
+    lane="engineer",
+)
+```
+
+Or mix lanes in one batch. An item-level lane overrides the top-level default:
+
+```python
+delegate_task(
+    lane="engineer",
+    tasks=[
+        {"goal": "Compare three implementation options", "lane": "explore"},
+        {"goal": "Implement the selected option"},
+        {"goal": "Review the implementation", "lane": "review"},
+    ],
+)
+```
+
+Lane routing is fail-closed:
+
+- The effective schema advertises only lane names present under `delegation.lanes`.
+- Each lane must define `provider`, `model`, and `reasoning_effort`.
+- Lane entries cannot contain API keys, base URLs, request overrides, commands, or ACP arguments.
+- An unknown, unavailable, or malformed lane fails before Hermes constructs any child in the batch.
+- Calls without `lane` keep the existing global override and parent-inheritance behavior.
+
+Each result records the resolved `lane`, `model`, and lane `reasoning_effort`. Credentials never enter the result or transcript.
 
 ## Inherited Tool Access
 
