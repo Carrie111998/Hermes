@@ -145,6 +145,48 @@ def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
         assert t.block_kind == "dependency"
 
 
+def test_codex_dependency_block_stays_terminal(kanban_home: Path) -> None:
+    """An explicit Codex block never returns an atomic mission to the queue."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="atomic mission", assignee="codex")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="superseded dependency",
+            kind="dependency",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.unblock_task(conn, tid) is False
+        promoted, reason = kb.promote_task(
+            conn,
+            tid,
+            actor="operator",
+            force=True,
+        )
+        assert promoted is False
+        assert reason == "terminal Codex missions cannot be promoted"
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_reassigned_unstarted_codex_block_stays_terminal(
+    kanban_home: Path,
+) -> None:
+    """The created event preserves Codex identity when no run exists yet."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="unstarted atomic mission",
+            assignee="codex",
+        )
+        assert kb.block_task(conn, task_id)
+        assert kb.assign_task(conn, task_id, "orchestrator")
+
+        assert kb.unblock_task(conn, task_id) is False
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
     with kb.connect_closing() as conn:

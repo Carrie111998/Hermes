@@ -138,6 +138,128 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def is_atomic_codex_mission(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether a task is or was owned by the atomic Codex lane."""
+    row = conn.execute(
+        """
+        SELECT EXISTS(
+            SELECT 1
+              FROM tasks
+             WHERE id = ?
+               AND lower(trim(COALESCE(assignee, ''))) = 'codex'
+        ) OR EXISTS(
+            SELECT 1
+              FROM task_runs
+             WHERE task_id = ?
+               AND lower(trim(COALESCE(profile, ''))) = 'codex'
+        )
+        """,
+        (task_id, task_id),
+    ).fetchone()
+    if row and row[0]:
+        return True
+    historical_assignments = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('created', 'assigned') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for event in historical_assignments:
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        assignee = payload.get("assignee")
+        if isinstance(assignee, str) and assignee.strip().casefold() == "codex":
+            return True
+    return False
+
+
+def is_terminal_atomic_codex_mission(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether an atomic Codex mission was delivered or remains blocked."""
+    if not is_atomic_codex_mission(conn, task_id):
+        return False
+    row = conn.execute(
+        """
+        SELECT EXISTS(
+                   SELECT 1
+                     FROM task_events
+                    WHERE task_id = ?
+                      AND kind = 'completed'
+               ) AS delivered,
+               (
+                   SELECT kind
+                     FROM task_events
+                    WHERE task_id = ?
+                      AND kind IN (
+                          'blocked',
+                          'dependency_wait',
+                          'block_loop_detected',
+                          'unblocked'
+                      )
+                    ORDER BY id DESC
+                    LIMIT 1
+               ) AS latest_block_kind
+        """,
+        (task_id, task_id),
+    ).fetchone()
+    return bool(
+        row
+        and (
+            row["delivered"]
+            or (
+                row["latest_block_kind"]
+                and row["latest_block_kind"] != "unblocked"
+            )
+        )
+    )
+
+
+def _generated_from_task_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'created' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        source = payload.get("from_decompose_of")
+        if isinstance(source, str) and source:
+            return source
+    return None
+
+
+def is_terminal_atomic_codex_work(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Cover a terminal Codex root and all generated descendants."""
+    current_id: Optional[str] = task_id
+    visited: set[str] = set()
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        if is_terminal_atomic_codex_mission(conn, current_id):
+            return True
+        current_id = _generated_from_task_id(conn, current_id)
+    return False
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
@@ -4027,6 +4149,8 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if is_terminal_atomic_codex_work(conn, task_id):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4092,6 +4216,14 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if is_terminal_atomic_codex_work(conn, task_id):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"reason": "terminal_atomic_codex_mission"},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5511,11 +5643,13 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, assignee, block_kind, block_recurrences "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        atomic_codex_mission = is_atomic_codex_mission(conn, task_id)
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -5528,7 +5662,7 @@ def block_task(
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        if kind == "dependency" and not atomic_codex_mission:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5579,7 +5713,7 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
+        if recurrences >= BLOCK_RECURRENCE_LIMIT and not atomic_codex_mission:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
@@ -5715,6 +5849,8 @@ def promote_task(
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+    if is_terminal_atomic_codex_mission(conn, task_id):
+        return False, "terminal Codex missions cannot be promoted"
 
     if not force:
         parents = conn.execute(
@@ -5766,6 +5902,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        if is_terminal_atomic_codex_mission(conn, task_id):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -5854,6 +5992,8 @@ def specify_triage_task(
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        if is_terminal_atomic_codex_mission(conn, task_id):
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -6011,6 +6151,8 @@ def decompose_triage_task(
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        if is_atomic_codex_mission(conn, task_id):
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
@@ -8274,6 +8416,8 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if is_terminal_atomic_codex_work(conn, row["id"]):
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an

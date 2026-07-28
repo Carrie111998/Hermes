@@ -77,7 +77,12 @@ def _patch_list_profiles(names: list[str]):
 
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        tid = kb.create_task(
+            conn,
+            title="plan a multi-step feature",
+            assignee="planner",
+            triage=True,
+        )
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -88,12 +93,16 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         ],
     })
 
-    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    patches = _patch_list_profiles(
+        ["orchestrator", "planner", "researcher", "engineer"]
+    )
     for p in patches:
         p.start()
     try:
         with _patch_aux_client(llm_payload), _patch_extra_body():
             outcome = decomp.decompose_task(tid, author="me")
+        with kb.connect() as conn:
+            dispatch = kb.dispatch_once(conn, dry_run=True)
     finally:
         for p in patches:
             p.stop()
@@ -111,6 +120,218 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+    assert any(task_id == c0.id for task_id, _, _ in dispatch.spawned)
+
+
+def test_historical_codex_mission_cannot_be_decomposed(kanban_home):
+    """The guard survives stale triage status and later reassignment."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="already delivered",
+            assignee="codex",
+        )
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="superseded")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='triage', assignee='orchestrator' "
+                "WHERE id=?",
+                (tid,),
+            )
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+
+    assert outcome.ok is False
+    assert "atomic" in outcome.reason
+    call_llm.assert_not_called()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE child_id=?",
+            (tid,),
+        ).fetchone()[0] == 0
+
+
+def test_blocked_codex_mission_is_not_redecomposed_or_dispatched(kanban_home):
+    """A delivered Codex mission stays atomic after a repeated block.
+
+    This reproduces the production loop: worker block, external unblock,
+    same-cause re-block, auto-decompose, then duplicate child dispatch.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="deliver the existing PR",
+            assignee="codex",
+        )
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="PR already delivered",
+            kind="needs_input",
+        )
+        if kb.unblock_task(conn, tid):
+            assert kb.claim_task(conn, tid, claimer="worker") is not None
+            assert kb.block_task(
+                conn,
+                tid,
+                reason="PR already delivered",
+                kind="needs_input",
+            )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "obsolete split",
+        "tasks": [
+            {
+                "title": "Repeat research",
+                "body": "Re-open work that was already delivered.",
+                "assignee": "research",
+                "parents": [],
+            },
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "codex", "research"])
+    for p in patches:
+        p.start()
+    try:
+        outcomes = []
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            for triage_id in decomp.list_triage_ids():
+                outcomes.append(
+                    decomp.decompose_task(
+                        triage_id,
+                        author="auto-decomposer",
+                    )
+                )
+        with kb.connect() as conn:
+            dispatch = kb.dispatch_once(conn, dry_run=True)
+            root = kb.get_task(conn, tid)
+            children = conn.execute(
+                "SELECT id FROM tasks WHERE id != ?",
+                (tid,),
+            ).fetchall()
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert root is not None
+    assert root.status == "blocked"
+    assert outcomes == []
+    assert children == []
+    assert dispatch.spawned == []
+
+
+def test_existing_generated_child_of_terminal_codex_mission_is_not_claimed(
+    kanban_home,
+):
+    """Legacy duplicate children are inert even if they are already ready."""
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="delivered Codex mission",
+            assignee="codex",
+        )
+        assert kb.claim_task(conn, root_id, claimer="worker") is not None
+        assert kb.block_task(conn, root_id, reason="delivered")
+
+        child_id = kb.create_task(
+            conn,
+            title="obsolete Research duplicate",
+            assignee="research",
+            created_by="auto-decomposer",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', assignee='orchestrator' "
+                "WHERE id=?",
+                (root_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, kind, payload, created_at) "
+                "VALUES (?, 'created', ?, 1)",
+                (
+                    child_id,
+                    jsonlib.dumps({"from_decompose_of": root_id}),
+                ),
+            )
+
+        dispatch = kb.dispatch_once(conn, dry_run=True)
+        claim = kb.claim_task(conn, child_id, claimer="worker")
+
+    assert dispatch.spawned == []
+    assert claim is None
+
+
+def test_legacy_reviewer_descendant_of_terminal_codex_mission_is_inert(
+    kanban_home,
+):
+    """The terminal guard follows obsolete Coding to Reviewer chains."""
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="delivered Codex mission",
+            assignee="codex",
+        )
+        assert kb.block_task(conn, root_id, reason="PR already delivered")
+
+        coding_id = kb.create_task(
+            conn,
+            title="obsolete Coding child",
+            assignee="coding",
+            created_by="auto-decomposer",
+        )
+        reviewer_id = kb.create_task(
+            conn,
+            title="obsolete Reviewer grandchild",
+            assignee="reviewer",
+            created_by="legacy-recovery",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events "
+                "(task_id, kind, payload, created_at) "
+                "VALUES (?, 'created', ?, 1), (?, 'created', ?, 2)",
+                (
+                    coding_id,
+                    jsonlib.dumps({"from_decompose_of": root_id}),
+                    reviewer_id,
+                    jsonlib.dumps({"from_decompose_of": coding_id}),
+                ),
+            )
+
+        claim = kb.claim_task(conn, reviewer_id, claimer="worker")
+
+    assert claim is None
+
+
+def test_completed_codex_mission_cannot_be_claimed_after_stale_requeue(
+    kanban_home,
+):
+    """A delivered Codex mission stays terminal even if its status regresses."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="already delivered Codex mission",
+            assignee="codex",
+        )
+        assert kb.claim_task(conn, task_id, claimer="worker") is not None
+        assert kb.complete_task(conn, task_id, summary="PR delivered")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', completed_at=NULL WHERE id=?",
+                (task_id,),
+            )
+
+        dispatch = kb.dispatch_once(conn, dry_run=True)
+        claim = kb.claim_task(conn, task_id, claimer="worker")
+
+    assert dispatch.spawned == []
+    assert claim is None
 
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):

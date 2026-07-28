@@ -283,8 +283,18 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        atomic_codex_mission = (
+            task is not None
+            and kb.is_atomic_codex_mission(conn, task_id)
+        )
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
+    if atomic_codex_mission:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "Codex missions are atomic and cannot be decomposed",
+        )
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
@@ -465,4 +475,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        return [
+            row.id
+            for row in rows
+            if not kb.is_atomic_codex_mission(conn, row.id)
+        ]

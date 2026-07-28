@@ -52,6 +52,28 @@ def test_specify_promotes_triage_to_todo(kanban_home):
     assert "**Goal**" in (task.body or "")
 
 
+def test_specify_fresh_codex_triage_task_preserves_atomic_assignee(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = _create_triage(
+            conn,
+            title="rough Codex mission",
+            assignee="codex",
+        )
+        ok = kb.specify_triage_task(
+            conn,
+            task_id,
+            body="Implement and self-review this mission.",
+            author="operator",
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert ok is True
+    assert task.status == "ready"
+    assert task.assignee == "codex"
+
+
 def test_specify_with_open_parent_lands_in_todo_not_ready(kanban_home):
     # Parent-gated specified tasks must not jump the dispatcher — they go
     # to todo and wait for parent completion like any other gated task.
