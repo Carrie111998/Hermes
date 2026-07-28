@@ -26,6 +26,7 @@ from session_bridge.claude_registrar import (
     PtyCleanupResult,
     WindowsConPtyFactory,
     _PtyReadinessTimeout,
+    _PtyResponseTimeout,
     _WinPtyProcess,
     _claude_main_repl_ready,
     _registrar_pywinpty_process_type,
@@ -1246,6 +1247,31 @@ def test_winpty_timed_reader_returns_live_provider_limit_without_global_timeout(
     assert output.strip() == limited
     assert time.monotonic() - started < 0.5
     assert process.calls == 1
+
+
+def test_winpty_response_timeout_reports_bounded_main_repl_phase() -> None:
+    prompt = "registration prompt"
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                [
+                    prompt
+                    + "\r\n\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m"
+                ]
+            )
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+    with pytest.raises(_PtyResponseTimeout) as failure:
+        _WinPtyProcess(Process()).read_until(0.05, prompt=prompt)
+
+    assert failure.value.reason == "main_repl_after_prompt"
 
 
 def test_winpty_reader_drains_extra_output_after_registered_before_acceptance() -> None:

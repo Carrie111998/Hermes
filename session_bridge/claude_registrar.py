@@ -77,6 +77,14 @@ class _PtyReadinessTimeout(TimeoutError):
         self.reason = reason
 
 
+class _PtyResponseTimeout(TimeoutError):
+    """Bounded, non-transcript diagnostic for a Claude response timeout."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Claude PTY response timed out: {reason}")
+        self.reason = reason
+
+
 def _canonical_claude_startup_settings(theme: object) -> str:
     """Return the sole isolated startup setting accepted by the registrar."""
 
@@ -701,7 +709,9 @@ class _WinPtyProcess:
                 joined = "".join(chunks)
                 if candidate_seen:
                     return _normalized_terminal_output(joined, prompt)
-                raise TimeoutError
+                raise _PtyResponseTimeout(
+                    _response_timeout_reason(joined, prompt=prompt)
+                )
             try:
                 value = timed_read(4096, remaining)
             except EOFError:
@@ -1320,6 +1330,12 @@ class ClaudeNativeRegistrar:
                 "creation_ambiguous",
                 f"Claude TUI readiness blocked: {exc.reason}",
             )
+        except _PtyResponseTimeout as exc:
+            pending = (
+                "retry",
+                "creation_ambiguous",
+                f"Claude registration response blocked: {exc.reason}",
+            )
         except TimeoutError:
             pending = ("retry", "creation_ambiguous", "registration result ambiguous")
         except RuntimeError:
@@ -1710,6 +1726,31 @@ def _readiness_timeout_reason(
     if not _claude_main_repl_ready(readiness_output):
         return "main_repl_footer_missing"
     return "main_repl_unsettled"
+
+
+def _response_timeout_reason(output: str, *, prompt: str | None) -> str:
+    """Classify response timeout phase without retaining terminal content."""
+
+    if _known_claude_input_modal_visible(output):
+        return "known_input_modal"
+    if _claude_main_repl_ready(output):
+        cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace(
+            "\r", ""
+        )
+        prompt_echoed = prompt is not None and (
+            prompt in cleaned or prompt.replace("\n", "") in cleaned
+        )
+        return (
+            "main_repl_after_prompt"
+            if prompt_echoed
+            else "main_repl_without_prompt_echo"
+        )
+    normalized = _normalized_terminal_output(output, prompt)
+    if not normalized.strip():
+        return "no_response_output"
+    if _bracketed_paste_enabled(output):
+        return "response_pending"
+    return "terminal_input_disabled"
 
 
 def _workspace_trust_prompt_end(output: str) -> int | None:
