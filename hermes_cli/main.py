@@ -4561,6 +4561,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_trading_loop(args):
+    """Govern a bounded, persistent trading-research loop."""
+    from hermes_cli.trading_research_loop import trading_loop_command
+
+    return trading_loop_command(args)
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -15962,6 +15969,14 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # trading-loop command — bounded trading-research governance
+    # =========================================================================
+    from hermes_cli.trading_research_loop import build_parser as _build_trading_loop_parser
+
+    trading_loop_parser = _build_trading_loop_parser(subparsers)
+    trading_loop_parser.set_defaults(func=cmd_trading_loop)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
