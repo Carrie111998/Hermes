@@ -10904,6 +10904,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return switched
 
     @staticmethod
+    def _event_for_pending_text(
+        pending_event: Optional[MessageEvent],
+        pending_text: Optional[str],
+        source: SessionSource,
+    ) -> Optional[MessageEvent]:
+        """Give string-only interrupt/steer turns normal lifecycle identity."""
+        if pending_event is not None or not pending_text:
+            return pending_event
+        return MessageEvent(
+            text=pending_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            metadata={"_synthetic_pending_followup": True},
+        )
+
+    @staticmethod
     def _run_lifecycle_outcome_from_result(result: Any) -> str:
         if isinstance(result, dict):
             if result.get("timed_out"):
@@ -22932,6 +22948,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
+                "failed": result_holder[0].get("failed", False) if result_holder[0] else False,
+                "timed_out": result_holder[0].get("timed_out", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 # Soft lock-contention defer (#69870 consumer): distinct from
@@ -23541,6 +23559,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 pending_event = None
                 pending = None
+
+            pending_event = self._event_for_pending_text(
+                pending_event,
+                pending,
+                source,
+            )
 
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])

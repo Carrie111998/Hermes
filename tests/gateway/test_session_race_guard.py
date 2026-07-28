@@ -236,6 +236,31 @@ async def test_discord_start_cancellation_marks_stopped_and_releases_session_slo
     assert session_key not in getattr(runner, "_active_session_leases", {})
 
 
+def test_string_only_followup_gets_a_lifecycle_event():
+    runner, _adapter, original = _make_discord_runner_and_event()
+
+    event = runner._event_for_pending_text(None, "continue with this", original.source)
+
+    assert event is not None
+    assert event.text == "continue with this"
+    assert event.message_type == MessageType.TEXT
+    assert event.source is original.source
+    assert event.metadata.get("_synthetic_pending_followup") is True
+
+
+def test_nonempty_agent_result_preserves_failure_and_timeout_flags():
+    import inspect
+
+    source = inspect.getsource(GatewayRunner._run_agent_inner)
+    titled_return = source.index("# Auto-generate session title")
+    return_start = source.index('"final_response": final_response', titled_return)
+    return_end = source.index('"tools": tools_holder[0]', return_start)
+    nonempty_result = source[return_start:return_end]
+
+    assert '"failed"' in nonempty_result
+    assert '"timed_out"' in nonempty_result
+
+
 @pytest.mark.asyncio
 async def test_non_discord_agent_run_does_not_emit_run_lifecycle():
     runner = _make_runner()
