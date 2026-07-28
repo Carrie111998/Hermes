@@ -179,14 +179,22 @@ def _get_langfuse() -> Optional[Langfuse]:
     # to post them, by which point the warning is buried under whatever
     # else the process is logging.  Catch it here, surface it once, and
     # short-circuit via the same _INIT_FAILED path as the empty case.
-    placeholder_issues = [
-        msg
-        for msg in (
-            _validate_langfuse_key("HERMES_LANGFUSE_PUBLIC_KEY", public_key),
-            _validate_langfuse_key("HERMES_LANGFUSE_SECRET_KEY", secret_key),
-        )
-        if msg
-    ]
+    # When a custom HERMES_LANGFUSE_BASE_URL is configured (not the
+    # default cloud.langfuse.com), skip prefix validation — the custom
+    # endpoint may issue credentials with a different key format.
+    # See issue #72484.
+    _base_url = _env("HERMES_LANGFUSE_BASE_URL") or _env("LANGFUSE_BASE_URL") or ""
+    _is_custom_endpoint = bool(_base_url) and "cloud.langfuse.com" not in _base_url
+    placeholder_issues = []
+    if not _is_custom_endpoint:
+        placeholder_issues = [
+            msg
+            for msg in (
+                _validate_langfuse_key("HERMES_LANGFUSE_PUBLIC_KEY", public_key),
+                _validate_langfuse_key("HERMES_LANGFUSE_SECRET_KEY", secret_key),
+            )
+            if msg
+        ]
     if placeholder_issues:
         logger.warning(
             "Langfuse plugin: credentials look like placeholders, traces will "
