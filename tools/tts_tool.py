@@ -1035,6 +1035,77 @@ def _tts_response_format_from_path(output_path: str) -> str:
     return "mp3"
 
 
+def _is_response_format_rejection(exc: Exception) -> bool:
+    """Check if an API exception was caused by an unsupported ``response_format``."""
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 422):
+        return False
+    return "response_format" in str(exc)
+
+
+def _create_speech_with_format_fallback(
+    client: Any, create_kwargs: Dict[str, Any], output_path: str
+) -> Any:
+    """Call ``client.audio.speech.create()``, retrying as ``mp3`` on format rejection."""
+    initially_requested = create_kwargs.get("response_format")
+    try:
+        return client.audio.speech.create(**create_kwargs)
+    except Exception as exc:
+        if initially_requested in (None, "mp3") or not _is_response_format_rejection(exc):
+            raise
+        logger.info(
+            "TTS backend rejected response_format=%r (HTTP %s) — retrying as mp3; "
+            "the .ogg container is repaired after synthesis.",
+            initially_requested,
+            getattr(exc, "status_code", "?"),
+        )
+        retry_kwargs = dict(create_kwargs, response_format="mp3")
+        # Fresh idempotency key: the retry is a distinct request.
+        retry_kwargs["extra_headers"] = {"x-idempotency-key": str(uuid.uuid4())}
+        return client.audio.speech.create(**retry_kwargs)
+
+
+def _repair_mp3_in_ogg_container(output_path: str) -> None:
+    """Repair a ``.ogg`` file that actually contains MP3 bytes.
+
+    After a response_format fallback (opus → mp3), the backend writes valid
+    MP3 bytes into the ``.ogg`` path. This function detects MP3-in-ogg by
+    peeking at the file header and, if needed, transcodes to real Ogg/Opus
+    via ffmpeg.
+
+    Does nothing if ffmpeg is unavailable or the file already looks like a
+    real Ogg container.
+    """
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        return
+    with open(output_path, "rb") as f:
+        header = f.read(4)
+
+    is_mp3_container = (
+        header[:3] == b"ID3"  # ID3v2 tag at start
+        or (len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0)  # MPEG sync word
+    )
+    if not is_mp3_container:
+        return
+
+    if not _has_ffmpeg():
+        logger.warning("ffmpeg not found — cannot repair .ogg container; file may play incorrectly")
+        return
+
+    logger.info(
+        "TTS wrote mp3 bytes into a .ogg path — transcoding to real Ogg/Opus"
+    )
+    mp3_path = output_path + ".mp3"
+    os.rename(output_path, mp3_path)
+    try:
+        opus_path = _convert_to_opus(mp3_path)
+        if opus_path and os.path.exists(opus_path):
+            os.replace(opus_path, output_path)
+    finally:
+        if os.path.exists(mp3_path):
+            os.unlink(mp3_path)
+
+
 # ===========================================================================
 # Provider: OpenAI TTS (also used by every OpenAI-compatible TTS endpoint —
 # DeepInfra delegates here via _generate_deepinfra_tts).
@@ -1132,9 +1203,20 @@ def _generate_openai_tts(
         }
         if speed != 1.0:
             create_kwargs["speed"] = max(0.25, min(4.0, speed))
-        response = client.audio.speech.create(**create_kwargs)
+        response = _create_speech_with_format_fallback(client, create_kwargs, output_path)
 
         response.stream_to_file(output_path)
+
+        # Post-synthesis container repair: when a backend rejects the native
+        # response_format (e.g. opus) and we fell back to mp3, the file now
+        # has mp3 bytes in a .ogg container.  ``_repair_mp3_in_ogg_container``
+        # peeks at the file header first and only transcodes when it detects
+        # mp3-in-ogg, so calling it unconditionally on ``.ogg`` paths is safe
+        # — backends that honoured the native format produce real Ogg data
+        # and the header check is a no-op.
+        if output_path.endswith(".ogg"):
+            _repair_mp3_in_ogg_container(output_path)
+
         return output_path
     finally:
         close = getattr(client, "close", None)
