@@ -1451,6 +1451,50 @@ def _tts_response_format_from_path(output_path: str) -> str:
     return "mp3"
 
 
+def _is_response_format_rejection(exc: Exception) -> bool:
+    """True when a speech.create() error is a backend rejecting response_format.
+
+    Several self-hosted OpenAI-compatible speech servers (Speaches/Kokoro,
+    etc.) implement only ``mp3``/``wav``/``flac``/``pcm`` and 4xx a request for
+    ``response_format="opus"`` outright — ``{"type": "literal_error", "loc":
+    ["body", "response_format"], ...}`` with HTTP 400/422 — before any audio
+    bytes exist. The class-level ``_repair_ogg_container`` hook only helps
+    backends that *ignore* the parameter and write playable bytes; a rejection
+    never reaches it. This predicate is intentionally narrow so unrelated
+    4xx errors still propagate.
+    """
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 422):
+        return False
+    return "response_format" in str(exc)
+
+
+def _openai_speech_create_with_format_fallback(client, create_kwargs: Dict[str, Any]):
+    """Call ``audio.speech.create``; on a response_format rejection, retry mp3.
+
+    Native opus (or whatever the extension implies) is always requested first,
+    so backends that support it are unaffected. When the backend rejects the
+    format, we retry exactly once as ``mp3`` — a format the OpenAI speech API
+    contract guarantees — and let the downstream ``_repair_ogg_container`` step
+    transcode those mp3 bytes into a real Ogg/Opus container. The retry carries
+    a fresh idempotency key because it is a distinct request.
+    """
+    try:
+        return client.audio.speech.create(**create_kwargs)
+    except Exception as exc:
+        requested = create_kwargs.get("response_format")
+        if requested in (None, "mp3") or not _is_response_format_rejection(exc):
+            raise
+        logger.warning(
+            "TTS backend rejected response_format=%r — retrying as 'mp3' "
+            "(the .ogg container is rebuilt post-synthesis).",
+            requested,
+        )
+        retry_kwargs = dict(create_kwargs, response_format="mp3")
+        retry_kwargs["extra_headers"] = {"x-idempotency-key": str(uuid.uuid4())}
+        return client.audio.speech.create(**retry_kwargs)
+
+
 # ===========================================================================
 # Provider: OpenAI TTS (also used by every OpenAI-compatible TTS endpoint —
 # DeepInfra delegates here via _generate_deepinfra_tts).
@@ -1559,7 +1603,7 @@ def _generate_openai_tts(
             create_kwargs["instructions"] = instructions
         if language:
             create_kwargs["extra_body"] = {"lang_code": language}
-        response = client.audio.speech.create(**create_kwargs)
+        response = _openai_speech_create_with_format_fallback(client, create_kwargs)
 
         response.stream_to_file(output_path)
         return output_path
