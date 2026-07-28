@@ -659,11 +659,17 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        reset_status_ids: Optional[List[str]] = None,
+    ) -> None:
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
             removed_ids=removed_ids,
+            reset_status_ids=reset_status_ids,
         )
 
     def _is_terminal_auth_failure(
@@ -2023,6 +2029,7 @@ class CredentialPool:
         with self._lock:
             count = 0
             new_entries = []
+            reset_ids = []
             for entry in self._entries:
                 if entry.last_status or entry.last_status_at or entry.last_error_code:
                     new_entries.append(
@@ -2037,11 +2044,12 @@ class CredentialPool:
                         )
                     )
                     count += 1
+                    reset_ids.append(entry.id)
                 else:
                     new_entries.append(entry)
             if count:
                 self._entries = new_entries
-                self._persist()
+                self._persist(reset_status_ids=reset_ids)
             return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:

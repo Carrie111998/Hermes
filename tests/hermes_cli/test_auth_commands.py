@@ -807,10 +807,12 @@ def test_auth_remove_prefers_exact_numeric_label_over_index(tmp_path, monkeypatc
 
 def test_auth_reset_clears_provider_statuses(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    now = time.time()
     _write_auth_store(
         tmp_path,
         {
             "version": 1,
+            "suppressed_sources": {"anthropic": ["claude_code", "hermes_pkce"]},
             "credential_pool": {
                 "anthropic": [
                     {
@@ -819,17 +821,23 @@ def test_auth_reset_clears_provider_statuses(tmp_path, monkeypatch, capsys):
                         "auth_type": "api_key",
                         "priority": 0,
                         "source": "manual",
-                        "access_token": "sk-ant-api-primary",
+                        "access_token": "test-anthropic-key-primary",
                         "last_status": "exhausted",
-                        "last_status_at": 1711230000.0,
-                        "last_error_code": 402,
+                        "last_status_at": now,
+                        "last_error_code": 429,
+                        "last_error_reason": "rate_limit_error",
+                        "last_error_message": "Rate limit reached",
+                        "last_error_reset_at": now + 3600,
                     }
                 ]
             },
         },
     )
 
+    from agent.credential_pool import load_pool
     from hermes_cli.auth_commands import auth_reset_command
+
+    assert load_pool("anthropic").has_available() is False
 
     class _Args:
         provider = "anthropic"
@@ -844,6 +852,13 @@ def test_auth_reset_clears_provider_statuses(tmp_path, monkeypatch, capsys):
     assert entry["last_status"] is None
     assert entry["last_status_at"] is None
     assert entry["last_error_code"] is None
+    assert entry["last_error_reason"] is None
+    assert entry["last_error_message"] is None
+    assert entry["last_error_reset_at"] is None
+
+    selected = load_pool("anthropic").select()
+    assert selected is not None
+    assert selected.id == "cred-1"
 
 
 def test_clear_provider_auth_removes_provider_pool_entries(tmp_path, monkeypatch):

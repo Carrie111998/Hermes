@@ -587,6 +587,58 @@ def test_write_pool_stale_snapshot_keeps_newer_disk_cooldown(
     assert persisted["last_error_code"] == error_code
 
 
+def test_write_pool_explicit_status_reset_overrides_binding_disk_cooldown(classic_env):
+    """An operator reset must not be mistaken for a stale healthy snapshot."""
+    from hermes_cli.auth import write_credential_pool
+
+    benched_at = time.time()
+    _write(classic_env / "auth.json", _make_auth_store(pool={
+        "openrouter": [
+            _pool_entry(
+                last_status="exhausted",
+                last_status_at=benched_at,
+                last_error_code=429,
+                last_error_reset_at=benched_at + 3600,
+            ),
+            _pool_entry(
+                id="cred-y",
+                label="key-y",
+                access_token="sk-y",
+                last_status="exhausted",
+                last_status_at=benched_at,
+                last_error_code=429,
+                last_error_reset_at=benched_at + 3600,
+            ),
+        ],
+    }))
+
+    write_credential_pool(
+        "openrouter",
+        [
+            _pool_entry(),
+            _pool_entry(id="cred-y", label="key-y", access_token="sk-y"),
+        ],
+        reset_status_ids=["cred-x"],
+    )
+
+    data = json.loads((classic_env / "auth.json").read_text())
+    persisted = {
+        entry["id"]: entry
+        for entry in data["credential_pool"]["openrouter"]
+    }
+    reset_entry = persisted["cred-x"]
+    assert reset_entry.get("last_status") is None
+    assert reset_entry.get("last_status_at") is None
+    assert reset_entry.get("last_error_code") is None
+    assert reset_entry.get("last_error_reset_at") is None
+
+    untouched_entry = persisted["cred-y"]
+    assert untouched_entry["last_status"] == "exhausted"
+    assert untouched_entry["last_status_at"] == benched_at
+    assert untouched_entry["last_error_code"] == 429
+    assert untouched_entry["last_error_reset_at"] == benched_at + 3600
+
+
 def test_write_pool_expired_disk_cooldown_is_not_resurrected(classic_env):
     """An expired on-disk cooldown is NOT re-adopted onto the snapshot.
 
