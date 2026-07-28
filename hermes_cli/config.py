@@ -834,18 +834,66 @@ def _ensure_default_soul_md(home: Path) -> None:
     the old comment-only scaffold (seeded by older install.sh / install.ps1 /
     docker images, which shadowed the runtime default) get upgraded in place to
     DEFAULT_SOUL_MD. A SOUL.md the user actually customized is never touched.
+
+    Defensive: if the file exists but cannot be read, we bail without writing
+    — better stale than erased (#73355).
     """
     soul_path = home / "SOUL.md"
     if soul_path.exists():
         try:
             existing = soul_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            # Can't read the file — don't overwrite. Better to leave a stale
+            # (possibly unreadable) file than to silently erase user content.
             return
         if not is_legacy_template_soul(existing):
+            # User has customized content — preserve it.
             return
-        # Legacy empty template -> upgrade to the real default in place.
-    soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
-    _secure_file(soul_path)
+        # Legacy empty template — back it up before upgrading (#73355).
+        _backup_soul_md_before_upgrade(soul_path, existing)
+        soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+        _secure_file(soul_path)
+    else:
+        # File genuinely absent — seed the default.
+        soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+        _secure_file(soul_path)
+
+
+# Sentinel value written as the first line of a backed-up SOUL.md so the
+# restore helper can reliably distinguish a pre-upgrade backup from a file
+# the user manually dropped in the backups/ directory.
+_SOUL_BACKUP_MARKER = "# hermes-soul-backup\n"
+
+
+def _backup_soul_md_before_upgrade(soul_path: Path, existing_content: str) -> None:
+    """Copy the soon-to-be-upgraded SOUL.md into HERMES_HOME/.hermes_backup/.
+
+    This is a lightweight, zero-dependency safety net for #73355: if an
+    update or race condition later wipes the SOUL.md, the user (or an
+    automated repair) can recover from this backup.
+
+    We keep only the most recent backup per profile to avoid unbounded growth.
+    """
+    import datetime as _dt
+
+    backup_dir = soul_path.parent / ".hermes_backup"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return  # Best-effort — never block the upgrade.
+
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = backup_dir / f"soul-{stamp}.md.bak"
+
+    # Write the marker + original content so automated repair tools can
+    # identify this as a pre-upgrade backup.
+    try:
+        backup_path.write_text(
+            _SOUL_BACKUP_MARKER + existing_content,
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # Best-effort.
 
 
 # Home paths whose directory skeleton has been created this process — see

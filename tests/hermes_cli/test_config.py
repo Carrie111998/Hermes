@@ -91,6 +91,58 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == mixed
 
+    def test_legacy_upgrade_creates_soul_backup(self, tmp_path):
+        # Upgrading a legacy template SOUL.md should back up the original
+        # content into .hermes_backup/ before overwriting (#73355).
+        from hermes_cli.config import _SOUL_BACKUP_MARKER
+        from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            soul_path = tmp_path / "SOUL.md"
+            soul_path.write_text(_LEGACY_TEMPLATE_SOULS[0] + "\n", encoding="utf-8")
+            ensure_hermes_home()
+
+            backup_dir = tmp_path / ".hermes_backup"
+            assert backup_dir.is_dir(), ".hermes_backup dir should be created"
+            backups = list(backup_dir.glob("soul-*.md.bak"))
+            assert len(backups) >= 1, "Expected at least one backup file"
+            backup_content = backups[0].read_text(encoding="utf-8")
+            assert backup_content.startswith(_SOUL_BACKUP_MARKER)
+            assert _LEGACY_TEMPLATE_SOULS[0].strip() in backup_content
+
+    def test_soul_backup_not_created_for_custom_soul(self, tmp_path):
+        # A custom SOUL.md that is NOT a legacy template should not trigger
+        # a backup, because it is never overwritten.
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            soul_path = tmp_path / "SOUL.md"
+            soul_path.write_text("My custom persona text", encoding="utf-8")
+            ensure_hermes_home()
+
+            backup_dir = tmp_path / ".hermes_backup"
+            assert not backup_dir.exists(), (
+                ".hermes_backup should NOT be created when SOUL.md is custom"
+            )
+
+    def test_soul_read_error_does_not_overwrite(self, tmp_path):
+        # If reading SOUL.md raises an OSError (e.g. permission denied),
+        # _ensure_default_soul_md must NOT fall through to write_text
+        # and erase the user's content (#73355).
+        from hermes_cli.config import _ensure_default_soul_md
+
+        soul_path = tmp_path / "SOUL.md"
+        soul_path.write_text("my real soul content", encoding="utf-8")
+
+        # Make it unreadable
+        soul_path.chmod(0o000)
+        try:
+            _ensure_default_soul_md(tmp_path)
+        finally:
+            # Restore permissions so we can read it back
+            soul_path.chmod(0o644)
+
+        # Content must be untouched — no overwrite happened
+        assert soul_path.read_text(encoding="utf-8") == "my real soul content"
+
     def test_existing_named_profile_still_bootstraps_subdirs(self, tmp_path):
         profile_home = tmp_path / ".hermes" / "profiles" / "coder"
         profile_home.mkdir(parents=True)
