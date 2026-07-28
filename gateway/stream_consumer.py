@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from gateway.delivery_metadata import mark_terminal_delivery
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
@@ -327,6 +328,16 @@ class GatewayStreamConsumer:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            platform = getattr(self.adapter, "platform", None)
+            platform_name = str(getattr(platform, "value", platform) or "").lower()
+            if platform_name == "webhook":
+                delivery_identity = self._initial_reply_to_id or self.chat_id
+                meta = mark_terminal_delivery(
+                    meta,
+                    outcome="success",
+                    correlation_id=delivery_identity,
+                    delivery_id=delivery_identity,
+                )
         return meta or None
 
     @property

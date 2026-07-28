@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
 
@@ -53,6 +54,11 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.delivery_metadata import (
+    TERMINAL_DELIVERY_METADATA_KEY,
+    mark_terminal_delivery,
+    project_terminal_delivery,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -393,7 +399,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 pass
         if self.gateway_runner and _is_known_platform:
             return await self._deliver_cross_platform(
-                deliver_type, content, delivery
+                deliver_type,
+                content,
+                delivery,
+                source_metadata=metadata,
             )
 
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
@@ -846,6 +855,10 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            # Internal turn identity is generated after inbound idempotency
+            # admission. It is never selected by request content and remains
+            # stable for every send/retry belonging to this accepted turn.
+            "_hermes_delivery_id": uuid.uuid4().hex,
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -1321,7 +1334,12 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _deliver_cross_platform(
-        self, platform_name: str, content: str, delivery: dict
+        self,
+        platform_name: str,
+        content: str,
+        delivery: dict,
+        *,
+        source_metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Route response to another platform (telegram, discord, etc.)."""
         if not self.gateway_runner:
@@ -1373,5 +1391,29 @@ class WebhookAdapter(BasePlatformAdapter):
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
         if thread_id:
             metadata = {"thread_id": thread_id}
+
+        terminal_delivery = project_terminal_delivery(source_metadata)
+        internal_delivery_id = delivery.get("_hermes_delivery_id")
+        if terminal_delivery is not None and isinstance(internal_delivery_id, str):
+            correlation_id = extra.get(
+                "correlation_id",
+                terminal_delivery["correlation_id"],
+            )
+            terminal_delivery = project_terminal_delivery(
+                mark_terminal_delivery(
+                    None,
+                    outcome=terminal_delivery["outcome"],
+                    correlation_id=correlation_id,
+                    delivery_id=internal_delivery_id,
+                )
+            )
+        else:
+            # A terminal callback without the server-owned accepted-turn
+            # identity is not safe to deduplicate. Drop the marker so a
+            # final-only target fails closed instead of posting ambiguously.
+            terminal_delivery = None
+        if terminal_delivery is not None:
+            metadata = dict(metadata) if metadata else {}
+            metadata[TERMINAL_DELIVERY_METADATA_KEY] = terminal_delivery
 
         return await adapter.send(chat_id, content, metadata=metadata)
