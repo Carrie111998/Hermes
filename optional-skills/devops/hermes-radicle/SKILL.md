@@ -3,7 +3,7 @@ name: hermes-radicle
 description: "Use this skill when working with Radicle repositories for peer-to-peer Git collaboration — `rad init`, `rad clone`, patches, issues, node ops, sync, remotes, and session repo detection."
 version: 1.0.0
 author: Joey Stanford
-license: CC-BY-SA-4.0
+license: MIT
 compatibility: "Radicle installed and `rad auth` complete; Radicle node running (`rad node start`). Optional: `gh` CLI for GitHub mirroring."
 triggers:
   - radicle
@@ -129,6 +129,10 @@ When sharing repo locations, use markdown with both GitHub and radicle URLs:
 Use the helper script `~/repos/rad-enable-repo/rad-enable-repo.sh` to wire GitHub origin push alongside Radicle in one shot. Run it from inside an existing Git repo after `rad init`.
 
 **Current Configuration:** This repo (hermes-radicle) is configured with dual push to both GitHub and Radicle via the `rad` remote. Use `git push rad main` to update both simultaneously.
+
+**Branch-name caveat (this repo family):** Not every repo tracks the same default branch. Most use `main`, but some (e.g. `decentralized-manifesto`) only have `master`. A plain `git push` pushes the *current* checked-out branch, so stay on the right one and use `git pull origin <branch> && git push` — swap in `master` where the repo uses it. A `git push origin main` from a `master`-only repo fails with `error: src refspec main does not match any` against *all* pushurls (GitHub, Nostr, Radicle); that's the tell that you're on the wrong branch name.
+
+**Fail-closed push:** Because `origin` carries multiple pushurls (GitHub + Nostr + Radicle), `git push` aborts at the first failed pushurl. If the Radicle node is down, the GitHub push fails too. Fall back to `git push origin <branch>` (GitHub/Nostr only), then `git push rad <branch>` once the node is back (`rad node start`).
 
 ## Rationale
 
