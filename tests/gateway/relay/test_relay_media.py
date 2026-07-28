@@ -272,6 +272,28 @@ def test_client_recognizes_rehost_urls():
     assert c.is_relay_media_url("https://cdn.discordapp.com/a/b.png") is False
 
 
+def test_client_rejects_cross_origin_relay_paths():
+    """External origins with /relay/media/ in path must not match (GH-71559)."""
+    c = RelayMediaClient("https://connector.example", "gw1", "sec")
+    # Same origin → match
+    assert c.is_relay_media_url("https://connector.example/relay/media/abc") is True
+    # Different origin, same path → must NOT match
+    assert c.is_relay_media_url("https://evil.example/relay/media/abc") is False
+    assert c.is_relay_media_url("https://cdn.example/files/relay/media/photo.png") is False
+    # Different port → must NOT match
+    assert c.is_relay_media_url("https://connector.example:9999/relay/media/abc") is False
+    # Different scheme → must NOT match
+    assert c.is_relay_media_url("http://connector.example/relay/media/abc") is False
+    # Path prefix must start at /relay/media/, not just contain it
+    assert c.is_relay_media_url("https://connector.example/api/relay/media/abc") is False
+
+
+def test_client_rejects_empty_or_missing_base():
+    c = RelayMediaClient("", "gw1", "sec")
+    assert c.is_relay_media_url("https://c.example/relay/media/abc") is False
+    assert c.is_relay_media_url("") is False
+
+
 @pytest.mark.asyncio
 async def test_client_upload_rejects_oversize_and_missing(tmp_path: Path):
     c = RelayMediaClient("https://c.example", "gw1", "sec")
