@@ -1267,6 +1267,78 @@ class TestAnthropicStreamCallbacks:
 
         assert touch_calls.count("receiving stream response") == len(events)
 
+    def test_anthropic_partial_read_error_does_not_retry(self, monkeypatch):
+        """Anthropic text/reasoning/tool deltas survive a real ReadError
+        without a second provider request."""
+        import httpx
+
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+            api_mode="chat_completions",
+            model="claude-test",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+
+        class _PartialStream:
+            response = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(type="text_delta", text="Recovered text"),
+                )
+                yield SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(
+                        type="thinking_delta", thinking="Recovered reasoning"
+                    ),
+                )
+                yield SimpleNamespace(
+                    type="content_block_start",
+                    content_block=SimpleNamespace(
+                        type="tool_use", name="terminal"
+                    ),
+                )
+                yield SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(
+                        type="input_json_delta", partial_json='{"cmd":'
+                    ),
+                )
+                raise httpx.ReadError("incomplete chunked read")
+
+        agent._anthropic_client = MagicMock()
+        agent._anthropic_client.messages.stream.return_value = _PartialStream()
+        agent._create_request_anthropic_client = (
+            lambda *a, **k: agent._anthropic_client
+        )
+
+        response = agent._interruptible_streaming_api_call({})
+
+        message = response.choices[0].message
+        assert agent._anthropic_client.messages.stream.call_count == 1
+        assert response.id == PARTIAL_STREAM_STUB_ID
+        assert "Recovered text" in message.content
+        assert "Stream stalled mid tool-call (terminal)" in message.content
+        assert message.reasoning_content == "Recovered reasoning"
+        assert message.tool_calls is None
+
     @patch("run_agent.AIAgent._rebuild_anthropic_client")
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     def test_anthropic_stream_parser_valueerror_retries_before_delivery(
@@ -1284,6 +1356,7 @@ class TestAnthropicStreamCallbacks:
             api_key="test-key",
             base_url="https://api.minimax.io/anthropic",
             provider="minimax",
+            api_mode="chat_completions",
             model="MiniMax-M2.7",
             quiet_mode=True,
             skip_context_files=True,
@@ -1341,6 +1414,7 @@ class TestAnthropicStreamCallbacks:
             api_key="test-key",
             base_url="https://api.minimax.io/anthropic",
             provider="minimax",
+            api_mode="chat_completions",
             model="MiniMax-M2.7",
             quiet_mode=True,
             skip_context_files=True,
@@ -1378,6 +1452,7 @@ class TestAnthropicStreamCallbacks:
             api_key="test-key",
             base_url="https://api.anthropic.com",
             provider="anthropic",
+            api_mode="chat_completions",
             model="claude-test",
             quiet_mode=True,
             skip_context_files=True,
@@ -1424,6 +1499,7 @@ class TestAnthropicStreamCallbacks:
             api_key="test-key",
             base_url="https://api.anthropic.com",
             provider="anthropic",
+            api_mode="chat_completions",
             model="claude-test",
             quiet_mode=True,
             skip_context_files=True,
@@ -1584,25 +1660,17 @@ class TestPartialToolCallWarning:
         )
 
 
-class TestSilentRetryMidToolCall:
-    """Regression: when the stream dies mid tool-call JSON after text was
-    already delivered, we previously stubbed the turn with a "retry manually"
-    warning.  Now: if the error is a transient connection error AND a tool
-    call was in flight, silently retry the stream (the user sees a brief
-    reconnect marker + duplicated preamble, which is strictly better than
-    a lost action).  If no tool call was in flight, or the error isn't
-    transient, the existing stub-with-warning behaviour is preserved.
-    """
+class TestPartialToolCallNoRetry:
+    """A transport drop after any observable tool-call delta is terminal for
+    this provider request; retrying could duplicate a paid side effect."""
 
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_silent_retry_recovers_tool_call(
+    def test_partial_tool_call_transport_error_does_not_retry(
         self, mock_close, mock_create, mock_replace,
     ):
-        """First attempt: text + partial tool-call + connection drop.
-        Second attempt: text + complete tool-call.  Response should contain
-        the recovered tool call; no warning stub should be returned."""
+        """A real RemoteProtocolError returns one warning stub and no call 2."""
         from run_agent import AIAgent
         import httpx as _httpx
 
@@ -1616,23 +1684,11 @@ class TestSilentRetryMidToolCall:
             yield _make_stream_chunk(tool_calls=[
                 _make_tool_call_delta(index=0, arguments='{"path": "/tmp/x", '),
             ])
-            raise _httpx.RemoteProtocolError("peer closed connection")
-
-        def _second_stream():
-            yield _make_stream_chunk(content="Let me write the audit: ")
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_1", name="write_file"),
-            ])
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(
-                    index=0, arguments='{"path": "/tmp/x", "content": "hi"}',
-                ),
-            ])
-            yield _make_stream_chunk(finish_reason="tool_calls")
+            raise _httpx.RemoteProtocolError("incomplete chunked read")
 
         def _pick_stream(*a, **kw):
             attempts["n"] += 1
-            return _first_stream() if attempts["n"] == 1 else _second_stream()
+            return _first_stream()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = _pick_stream
@@ -1663,41 +1719,144 @@ class TestSilentRetryMidToolCall:
             else:
                 _os.environ["HERMES_STREAM_RETRIES"] = _prev
 
-        assert attempts["n"] == 2, (
-            f"Expected silent retry (2 attempts), got {attempts['n']}"
+        assert attempts["n"] == 1, (
+            f"Partial tool-call transport error must not retry, got {attempts['n']} calls"
         )
-        # Response should carry the recovered tool call, not a warning stub.
         msg = response.choices[0].message
-        tool_calls = getattr(msg, "tool_calls", None)
-        assert tool_calls, (
-            f"Silent retry should recover the tool call, got tool_calls={tool_calls!r} "
-            f"content={getattr(msg, 'content', None)!r}"
-        )
-        _tc0 = tool_calls[0]
-        _name = (
-            _tc0["function"]["name"] if isinstance(_tc0, dict)
-            else _tc0.function.name
-        )
-        assert _name == "write_file"
-        # User saw a reconnect marker between attempts.
-        assert any("reconnecting" in d.lower() for d in fired_deltas), (
-            f"Expected a reconnect marker delta, fired_deltas={fired_deltas}"
-        )
-        # Stub-path warning must NOT appear (this was the whole point).
+        assert getattr(msg, "tool_calls", None) is None
         joined = "".join(fired_deltas)
-        assert "Stream stalled" not in joined, (
-            f"Stub-path warning leaked into silent-retry path: {joined!r}"
+        assert "Stream stalled mid tool-call" in joined, (
+            f"Partial tool-call warning was not surfaced: {joined!r}"
         )
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_partial_text_read_error_does_not_retry(self, mock_close, mock_create):
+        """httpx.ReadError after a text delta is terminal, like an incomplete
+        chunked read, and the already generated body is retained."""
+        from run_agent import AIAgent
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+        import httpx as _httpx
+
+        attempts = {"n": 0}
+
+        def _stream():
+            yield _make_stream_chunk(content="The first half")
+            raise _httpx.ReadError("incomplete chunked read")
+
+        def _create(*args, **kwargs):
+            attempts["n"] += 1
+            return _stream()
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = _create
+        mock_create.return_value = mock_client
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert attempts["n"] == 1
+        assert response.id == PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].message.content == "The first half"
+        assert response.choices[0].message.tool_calls is None
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_partial_reasoning_read_error_does_not_retry(
+        self, mock_close, mock_create, monkeypatch,
+    ):
+        """A reasoning-only delta is observable and survives without call two."""
+        import httpx as _httpx
+
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+        from run_agent import AIAgent
+
+        def _stream():
+            yield _make_stream_chunk(reasoning_content="Recovered reasoning")
+            raise _httpx.ReadError("incomplete chunked read")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = _stream()
+        mock_create.return_value = mock_client
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert mock_client.chat.completions.create.call_count == 1
+        assert response.id == PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].message.reasoning_content == "Recovered reasoning"
+        assert response.choices[0].message.tool_calls is None
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_read_error_before_first_delta_retries(
+        self, mock_close, mock_create, monkeypatch,
+    ):
+        """An eventless ReadError keeps the existing bounded retry path."""
+        import httpx as _httpx
+
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+        from run_agent import AIAgent
+
+        attempts = {"n": 0}
+
+        def _create(*_args, **_kwargs):
+            attempts["n"] += 1
+
+            def _stream():
+                if attempts["n"] == 1:
+                    raise _httpx.ReadError("incomplete chunked read")
+                yield _make_stream_chunk(content="Recovered", finish_reason="stop")
+
+            return _stream()
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = _create
+        mock_create.return_value = mock_client
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert attempts["n"] == 2
+        assert response.id != PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].message.content == "Recovered"
 
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_silent_retry_exhausted_falls_back_to_stub(
+    def test_partial_tool_call_transport_error_returns_stub(
         self, mock_close, mock_create, mock_replace,
     ):
-        """When all retry attempts fail with connection errors, fall back
-        to the original stub-with-warning behaviour so the user isn't left
-        with zero signal."""
+        """A partial tool-call transport error returns one warning stub."""
         from run_agent import AIAgent
         import httpx as _httpx
 
@@ -1737,7 +1896,8 @@ class TestSilentRetryMidToolCall:
             else:
                 _os.environ["HERMES_STREAM_RETRIES"] = _prev
 
-        # After retries exhaust, the stub-with-warning path must engage.
+        # The first observed partial immediately takes the warning-stub path.
+        assert mock_client.chat.completions.create.call_count == 1
         content = response.choices[0].message.content or ""
         assert "Stream stalled mid tool-call" in content, (
             f"Exhausted-retry fallback dropped the user-visible warning: {content!r}"

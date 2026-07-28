@@ -2344,13 +2344,14 @@ def run_conversation(
                                     response_invalid = True
                                     error_details.append("response.output is empty")
                 elif agent.api_mode == "anthropic_messages":
-                    _tv = agent._get_transport()
-                    if not _tv.validate_response(response):
-                        response_invalid = True
-                        if response is None:
-                            error_details.append("response is None")
-                        else:
-                            error_details.append("response.content invalid (not a non-empty list)")
+                    if getattr(response, "id", "") != PARTIAL_STREAM_STUB_ID:
+                        _tv = agent._get_transport()
+                        if not _tv.validate_response(response):
+                            response_invalid = True
+                            if response is None:
+                                error_details.append("response is None")
+                            else:
+                                error_details.append("response.content invalid (not a non-empty list)")
                 elif agent.api_mode == "bedrock_converse":
                     _btv = agent._get_transport()
                     if not _btv.validate_response(response):
@@ -2562,8 +2563,11 @@ def run_conversation(
                     else:
                         finish_reason = "stop"
                 elif agent.api_mode == "anthropic_messages":
-                    _tfr = agent._get_transport()
-                    finish_reason = _tfr.map_finish_reason(response.stop_reason)
+                    if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
+                        finish_reason = response.choices[0].finish_reason
+                    else:
+                        _tfr = agent._get_transport()
+                        finish_reason = _tfr.map_finish_reason(response.stop_reason)
                 elif agent.api_mode == "bedrock_converse":
                     # Bedrock response already normalized at dispatch — use transport
                     _bt_fr = agent._get_transport()
@@ -2710,7 +2714,9 @@ def run_conversation(
                     # would have been appended in the non-truncated path.
                     _trunc_msg = None
                     _trunc_transport = agent._get_transport()
-                    if agent.api_mode == "anthropic_messages":
+                    if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
+                        _trunc_result = response.choices[0].message
+                    elif agent.api_mode == "anthropic_messages":
                         _trunc_result = _trunc_transport.normalize_response(
                             response, strip_tool_prefix=agent._is_anthropic_oauth
                         )
@@ -2720,6 +2726,65 @@ def run_conversation(
 
                     _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
                     _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
+
+                    # A partial-stream stub already contains the delivered
+                    # body. Never continue it: re-calling the provider would
+                    # replay paid output (and a dropped tool call). A real
+                    # output-cap response keeps the existing continuation path.
+                    _partial_stream_response = (
+                        getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                        and not _trunc_has_tool_calls
+                    )
+                    if _partial_stream_response:
+                        _partial_response = agent._strip_think_blocks(
+                            "".join([
+                                *truncated_response_parts,
+                                _trunc_content or "",
+                            ])
+                        ).strip()
+                        _dropped_tools = getattr(response, "_dropped_tool_names", None) or []
+                        if _dropped_tools and "Stream stalled mid tool-call" not in _partial_response:
+                            _tool_list = ", ".join(_dropped_tools[:3])
+                            if len(_dropped_tools) > 3:
+                                _tool_list += f", +{len(_dropped_tools) - 3} more"
+                            _partial_response = (
+                                f"{_partial_response}\n\n"
+                                f"⚠ Stream stalled mid tool-call ({_tool_list}); "
+                                "the action was not executed. Ask me to retry if "
+                                "you want to continue."
+                            ).strip()
+                        if not _partial_response:
+                            _partial_response = (
+                                "⚠ Stream interrupted before a complete response "
+                                "was received."
+                            )
+                        _partial_message = agent._build_assistant_message(
+                            _trunc_msg, finish_reason
+                        )
+                        if not (
+                            (_partial_message.get("content") or "").strip()
+                            or _partial_message.get("tool_calls")
+                            or (_partial_message.get("reasoning") or "").strip()
+                            or (
+                                _partial_message.get("reasoning_content") or ""
+                            ).strip()
+                            or _partial_message.get("reasoning_details")
+                        ):
+                            _partial_message["content"] = _partial_response
+                        messages.append(_partial_message)
+                        agent._cleanup_task_resources(effective_task_id)
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _partial_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "failed": False,
+                            "error": (
+                                "network_stream_interrupted_after_partial_response"
+                            ),
+                        }
 
                     # ── Detect thinking-budget exhaustion ──────────────
                     # When the model spends ALL output tokens on reasoning

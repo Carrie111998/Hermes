@@ -2323,8 +2323,8 @@ def _build_partial_stream_stub(
     Used when the SSE stream ends without a ``finish_reason`` after
     delivering content (text-only drops, tool-call-arg drops).  The stub
     is tagged ``PARTIAL_STREAM_STUB_ID`` with ``FINISH_REASON_LENGTH`` so
-    the conversation loop enters its continuation/retry path instead of
-    silently accepting truncated output as a complete turn (#32086).
+    the conversation loop persists and returns the recovered partial once
+    instead of silently accepting it or calling the provider again (#32086).
     """
     mock_message = SimpleNamespace(
         role=role,
@@ -2566,7 +2566,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _reset_stale_streak(agent)
         return result["response"]
 
-    result = {"response": None, "error": None, "partial_tool_names": []}
+    result: dict[str, Any] = {
+        "response": None,
+        "error": None,
+        "partial_tool_names": [],
+    }
+    # Stream iterators raise after yielding. Preserve anything already
+    # observed so the caller can return it once without replaying the request.
+    partial_observed = threading.Event()
+    partial_content_parts: list[str] = []
+    partial_reasoning_parts: list[str] = []
 
     # Cross-turn stale-stream circuit breaker (#58962) — see the canonical
     # comment block above ``_stale_streak()``.  Raises past the give-up
@@ -2675,7 +2684,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._close_request_openai_client(request_client, reason=reason)
 
     first_delta_fired = {"done": False}
-    deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
     # Wall-clock timestamp of the last real streaming chunk.  The outer
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
@@ -2981,16 +2989,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
                 reasoning_parts.append(reasoning_text)
+                partial_observed.set()
+                partial_reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
                 content_parts.append(delta.content)
+                partial_observed.set()
+                partial_content_parts.append(delta.content)
                 if not tool_calls_acc:
                     _fire_first_delta()
                     agent._fire_stream_delta(delta.content)
-                    deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
@@ -3011,6 +3022,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             # Accumulate tool call deltas — notify display on first name
             if delta and delta.tool_calls:
+                partial_observed.set()
                 for tc_delta in delta.tool_calls:
                     raw_idx = tc_delta.index if tc_delta.index is not None else 0
                     delta_id = tc_delta.id or ""
@@ -3325,9 +3337,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 if event_type == "content_block_start":
                     block = getattr(event, "content_block", None)
                     if block and getattr(block, "type", None) == "tool_use":
+                        partial_observed.set()
                         has_tool_use = True
                         tool_name = getattr(block, "name", None)
                         if tool_name:
+                            if tool_name not in result["partial_tool_names"]:
+                                result["partial_tool_names"].append(tool_name)
                             _fire_first_delta()
                             agent._fire_tool_gen_started(tool_name)
 
@@ -3337,15 +3352,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         delta_type = getattr(delta, "type", None)
                         if delta_type == "text_delta":
                             text = getattr(delta, "text", "")
-                            if text and not has_tool_use:
-                                _fire_first_delta()
-                                agent._fire_stream_delta(text)
-                                deltas_were_sent["yes"] = True
+                            if text:
+                                partial_observed.set()
+                                partial_content_parts.append(text)
+                                if not has_tool_use:
+                                    _fire_first_delta()
+                                    agent._fire_stream_delta(text)
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
+                                partial_observed.set()
+                                partial_reasoning_parts.append(thinking_text)
                                 _fire_first_delta()
                                 agent._fire_reasoning_delta(thinking_text)
+                        elif delta_type == "input_json_delta":
+                            partial_observed.set()
 
             # Return the native Anthropic Message for downstream processing.
             # If the stream was interrupted (the event loop broke out above on
@@ -3441,116 +3462,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
                     _is_conn_err = isinstance(
-                        e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
+                        e,
+                        (
+                            _httpx.ConnectError,
+                            _httpx.ReadError,
+                            _httpx.RemoteProtocolError,
+                            ConnectionError,
+                        ),
                     )
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
-                    # If the stream died AFTER some tokens were delivered:
-                    # normally we don't retry (the user already saw text,
-                    # retrying would duplicate it).  BUT: if a tool call
-                    # was in-flight when the stream died, silently aborting
-                    # discards the tool call entirely.  In that case we
-                    # prefer to retry — the user sees a brief
-                    # "reconnecting" marker + duplicated preamble text,
-                    # which is strictly better than a failed action with
-                    # a "retry manually" message.  Limit this to transient
-                    # connection errors (Clawdbot-style narrow gate): no
-                    # tool has executed yet within this API call, so
-                    # silent retry is safe wrt side-effects.
-                    if deltas_were_sent["yes"]:
-                        _partial_tool_in_flight = bool(
-                            result.get("partial_tool_names")
+                    # Once any output is observable, retrying would replay paid
+                    # output and may duplicate a tool call. Only an eventless
+                    # stream may use the bounded retry path below.
+                    if partial_observed.is_set():
+                        logger.warning(
+                            "Streaming failed after partial delivery, not retrying: %s",
+                            e,
                         )
-                        _is_sse_conn_err_preview = False
-                        if not _is_timeout and not _is_conn_err:
-                            from openai import APIError as _APIError
-                            if isinstance(e, _APIError) and not getattr(e, "status_code", None):
-                                _err_lower_preview = str(e).lower()
-                                _SSE_PREVIEW_PHRASES = (
-                                    "connection lost",
-                                    "connection reset",
-                                    "connection closed",
-                                    "connection terminated",
-                                    "network error",
-                                    "network connection",
-                                    "terminated",
-                                    "peer closed",
-                                    "broken pipe",
-                                    "upstream connect error",
-                                )
-                                _is_sse_conn_err_preview = any(
-                                    phrase in _err_lower_preview
-                                    for phrase in _SSE_PREVIEW_PHRASES
-                                )
-                        _is_transient = (
-                            _is_timeout
-                            or _is_conn_err
-                            or _is_sse_conn_err_preview
-                            or _is_stream_parse_err
-                        )
-                        _can_silent_retry = (
-                            _partial_tool_in_flight
-                            and _is_transient
-                            and _stream_attempt < _max_stream_retries
-                        )
-                        if not _can_silent_retry:
-                            # Either no tool call was in-flight (so the
-                            # turn was a pure text response — current
-                            # stub-with-recovered-text behaviour is
-                            # correct), or retries are exhausted, or the
-                            # error isn't transient.  Fall through to the
-                            # stub path.
-                            logger.warning(
-                                "Streaming failed after partial delivery, not retrying: %s", e
-                            )
-                            result["error"] = e
-                            return
-                        # Tool call was in-flight AND error is transient:
-                        # retry silently.  Clear per-attempt state so the
-                        # next stream starts clean.  Fire a "reconnecting"
-                        # marker so the user sees why the preamble is
-                        # about to be re-streamed.  Structured WARNING is
-                        # emitted by ``_emit_stream_drop`` below; no
-                        # additional INFO line needed.
-                        try:
-                            agent._fire_stream_delta(
-                                "\n\n⚠ Connection dropped mid tool-call; "
-                                "reconnecting…\n\n"
-                            )
-                        except Exception:
-                            pass
-                        # Reset the streamed-text buffer so the retry's
-                        # fresh preamble doesn't get double-recorded in
-                        # _current_streamed_assistant_text (which would
-                        # pollute the interim-visible-text comparison).
-                        try:
-                            agent._reset_stream_delivery_tracking()
-                        except Exception:
-                            pass
-                        # Reset in-memory accumulators so the next
-                        # attempt's chunks don't concat onto the dead
-                        # stream's partial JSON.
-                        result["partial_tool_names"] = []
-                        deltas_were_sent["yes"] = False
-                        first_delta_fired["done"] = False
-                        agent._emit_stream_drop(
-                            error=e,
-                            attempt=_stream_attempt + 2,
-                            max_attempts=_max_stream_retries + 1,
-                            mid_tool_call=True,
-                            diag=request_client_holder.get("diag"),
-                        )
-                        _cancel_current_stream_attempt("stream_mid_tool_retry_cleanup")
-                        _close_request_client_once("stream_mid_tool_retry_cleanup")
-                        # #67142: anthropic streams on a request-local client,
-                        # already worker-owned-closed by _close_request_client_once
-                        # above; the next attempt builds a fresh one. The shared
-                        # _anthropic_client is never closed from inside a request.
-                        # #70773: same FD-recycle corruption vector for OpenAI.
-                        # The shared client will be replaced lazily by
-                        # _ensure_primary_openai_client on the next attempt.
-                        continue
+                        result["error"] = e
+                        return
 
                     # SSE error events from proxies (e.g. OpenRouter sends
                     # {"error":{"message":"Network connection lost."}}) are
@@ -3827,11 +3759,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _stale_elapsed, _stream_stale_timeout,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
+            _stale_action = (
+                "preserving partial response"
+                if partial_observed.is_set()
+                else "reconnecting"
+            )
             agent._buffer_status(
                 f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                 f"(model: {api_kwargs.get('model', 'unknown')}, "
                 f"context: ~{_est_ctx:,} tokens). "
-                f"Reconnecting..."
+                f"{_stale_action.capitalize()}..."
             )
             try:
                 _cancel_current_stream_attempt("stale_stream_kill")
@@ -3867,10 +3804,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             last_chunk_time["t"] = time.time()
             agent._emit_wait_notice(
                 f"⚠ no output from provider for {int(_stale_elapsed)}s — "
-                f"reconnecting..."
+                f"{_stale_action}..."
             )
             agent._touch_activity(
-                f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
+                f"stale stream detected after {int(_stale_elapsed)}s, "
+                f"{_stale_action}"
             )
 
         if agent._interrupt_requested:
@@ -3900,15 +3838,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
-        if deltas_were_sent["yes"]:
-            # Streaming failed AFTER some tokens were already delivered to
-            # the platform.  Re-raising would let the outer retry loop make
-            # Return a partial response stub with finish_reason="length"
-            # so the conversation loop's continuation machinery fires.
-            # tool_calls=None prevents auto-execution of incomplete calls.
+        if partial_observed.is_set():
+            # Return observed output once. tool_calls=None guarantees an
+            # incomplete tool call cannot execute, and the conversation loop
+            # treats this stub as terminal instead of calling the provider.
             _partial_text = (
-                getattr(agent, "_current_streamed_assistant_text", "") or ""
+                "".join(partial_content_parts)
+                or getattr(agent, "_current_streamed_assistant_text", "")
+                or ""
             ).strip() or None
+            _partial_reasoning = (
+                "".join(partial_reasoning_parts)
+                or getattr(agent, "_current_streamed_reasoning_text", "")
+                or None
+            )
 
             # Append a user-visible warning if tool calls were dropped so
             # the user and model both know what was attempted.
@@ -3938,15 +3881,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 logger.warning(
                     "Partial stream delivered before error; returning "
                     "length-truncated stub with %s chars of recovered "
-                    "content so the loop can continue from where the "
-                    "stream died: %s",
+                    "content as a terminal partial response: %s",
                     len(_partial_text or ""),
                     result["error"],
                 )
                 _stub_finish_reason = FINISH_REASON_LENGTH
             _stub_msg = SimpleNamespace(
                 role="assistant", content=_partial_text, tool_calls=None,
-                reasoning_content=None,
+                reasoning_content=_partial_reasoning,
             )
             # Detect provider output-layer content filtering (e.g. MiniMax
             # "output new_sensitive (1027)", Azure/OpenAI content_filter,
@@ -3954,8 +3896,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # swallowed into a finish_reason=length stub, so classify it HERE
             # while we still have it and stamp the stub.  Retrying such a
             # content-deterministic filter on the same primary just re-hits
-            # the filter — the conversation loop reads this tag and activates
-            # the fallback chain instead of burning continuation retries.
+            # the filter. Keep the tag as diagnostic evidence while returning
+            # the partial body without another provider call.
             # error_classifier is the single source of truth for "what counts
             # as a content filter" (#32421).
             _content_filter_terminated = False

@@ -168,7 +168,7 @@ class TestStreamInterruptBeforeRetry:
     @patch("run_agent.AIAgent._abort_request_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_stale_stream_attempt_cannot_emit_late_chunks_after_retry(
+    def test_stale_stream_attempt_returns_partial_tool_warning_without_retry(
         self,
         mock_close,
         mock_create,
@@ -176,11 +176,12 @@ class TestStreamInterruptBeforeRetry:
         mock_replace,
         monkeypatch,
     ):
-        """A stale attempt must not keep writing deltas after it is killed.
+        """A stale attempt must not write late deltas or trigger call two.
 
         This reproduces the race where the outer stale detector aborts an SSE
         connection, but the old iterator still yields one more chunk before
-        surfacing the connection error that triggers the retry.
+        surfacing the connection error. Once a tool delta is observed, the
+        request returns a terminal partial warning instead of retrying.
         """
         import httpx
         import time
@@ -211,21 +212,8 @@ class TestStreamInterruptBeforeRetry:
                 yield _make_stream_chunk(content="old late ")
                 raise httpx.RemoteProtocolError("peer closed connection")
 
-        retry_chunks = [
-            _make_stream_chunk(content="new final"),
-            _make_stream_chunk(finish_reason="stop", model="test/model"),
-        ]
-        class RetryStream:
-            response = SimpleNamespace(headers={})
-
-            def __iter__(self):
-                return iter(retry_chunks)
-
         mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = [
-            LateChunkAfterStaleStream(),
-            RetryStream(),
-        ]
+        mock_client.chat.completions.create.return_value = LateChunkAfterStaleStream()
         mock_create.return_value = mock_client
 
         agent = _make_agent()
@@ -236,7 +224,14 @@ class TestStreamInterruptBeforeRetry:
         response = agent._interruptible_streaming_api_call({})
 
         delivered = "".join(deltas)
+        message = response.choices[0].message
+        content = message.content or ""
+
+        assert mock_client.chat.completions.create.call_count == 1
         assert "old late" not in delivered
-        assert "new final" in delivered
-        assert response.choices[0].message.content == "new final"
+        assert "old late" not in content
+        assert "Stream stalled mid tool-call (terminal)" in delivered
+        assert "Stream stalled mid tool-call (terminal)" in content
+        assert message.tool_calls is None
+        assert getattr(response, "_dropped_tool_names", None) == ["terminal"]
         assert mock_abort.called

@@ -12,7 +12,7 @@ application-data record over the SQLite header.
 
 Fix (mirrors the #67142 Anthropic ownership discipline):
 
-1. The three in-request cleanup sites (stale watchdog, mid-tool retry,
+1. The three in-request cleanup sites (stale watchdog, terminal partial,
    stream retry) no longer touch the shared client at all — the
    request-local client is closed via ``_close_request_client_once`` and
    the shared client is replaced lazily by ``_ensure_primary_openai_client``
@@ -155,11 +155,11 @@ class TestStaleWatchdogNeverClosesSharedClient:
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_mid_tool_retry_cleanup_does_not_replace_primary(
+    def test_mid_tool_partial_cleanup_does_not_replace_primary(
         self, mock_close, mock_create, mock_replace, monkeypatch,
     ):
-        """Connection drop mid tool-call → silent retry closes only the
-        request-local client; the shared primary is left alone."""
+        """Connection drop mid tool-call → terminal partial cleanup closes
+        only the request-local client; the shared primary is left alone."""
         from tests.run_agent.test_streaming import _make_tool_call_delta
 
         monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
@@ -173,18 +173,9 @@ class TestStaleWatchdogNeverClosesSharedClient:
             ])
             raise httpx.RemoteProtocolError("peer closed connection")
 
-        def _second_stream():
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_1", name="terminal"),
-            ])
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, arguments='{"command": "ls"}'),
-            ])
-            yield _make_stream_chunk(finish_reason="tool_calls")
-
         def _pick_stream(*a, **kw):
             attempts["n"] += 1
-            return _first_stream() if attempts["n"] == 1 else _second_stream()
+            return _first_stream()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = _pick_stream
@@ -193,8 +184,9 @@ class TestStaleWatchdogNeverClosesSharedClient:
         agent = _make_agent()
         response = agent._interruptible_streaming_api_call({})
 
-        assert attempts["n"] == 2
-        assert response.choices[0].message.tool_calls
+        assert attempts["n"] == 1
+        assert response.choices[0].message.tool_calls is None
+        assert mock_close.call_count >= 1
         mock_replace.assert_not_called()
 
 
