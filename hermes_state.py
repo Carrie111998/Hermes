@@ -3419,15 +3419,56 @@ class SessionDB:
         index).  Runs as a single write transaction.  Other scopes are
         untouched.
         """
+        self.replace_gateway_routing_entries_preserving_newer(
+            entries, scope=scope, snapshot_at=None
+        )
+
+    def replace_gateway_routing_entries_preserving_newer(
+        self,
+        entries: Dict[str, str],
+        *,
+        scope: str = "",
+        snapshot_at: Optional[float] = None,
+    ) -> None:
+        """Replace routing rows while preserving concurrent newer handoffs.
+
+        ``SessionStore`` whole-index saves are based on an in-memory snapshot.
+        Out-of-band handoffs can commit newer durable routes between that
+        snapshot and this write.  Keep any existing row whose ``updated_at`` is
+        newer than the snapshot timestamp, so a stale whole-index writer cannot
+        delete or rewind routes it did not observe.  When ``snapshot_at`` is
+        ``None`` this is an ordinary full replacement for compatibility.
+        """
         now = time.time()
+        clean_entries = {k: v for k, v in entries.items() if k and v}
 
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
-            if entries:
+            if snapshot_at is None:
+                conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
+            else:
+                conn.execute(
+                    "DELETE FROM gateway_routing WHERE scope = ? AND updated_at <= ?",
+                    (scope, snapshot_at),
+                )
+            if clean_entries:
                 conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v],
+                    """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(scope, session_key) DO UPDATE SET
+                           entry_json = CASE
+                               WHEN ? IS NULL OR gateway_routing.updated_at <= ?
+                               THEN excluded.entry_json
+                               ELSE gateway_routing.entry_json
+                           END,
+                           updated_at = CASE
+                               WHEN ? IS NULL OR gateway_routing.updated_at <= ?
+                               THEN excluded.updated_at
+                               ELSE gateway_routing.updated_at
+                           END""",
+                    [
+                        (scope, k, v, now, snapshot_at, snapshot_at, snapshot_at, snapshot_at)
+                        for k, v in clean_entries.items()
+                    ],
                 )
 
         self._execute_write(_do)

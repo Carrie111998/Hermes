@@ -14,6 +14,7 @@ import logging
 import os
 import json
 import threading
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -1285,19 +1286,22 @@ class SessionStore:
 
     def _save(self) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
-        data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        data, generation, snapshot_at = self._snapshot_routing_locked()
+        self._persist_routing_data(data, generation, snapshot_at)
 
-    def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
-        """Capture immutable routing data and a monotonic generation."""
+    def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int, float]:
+        """Capture immutable routing data, generation, and snapshot time."""
         self._routing_generation = getattr(self, "_routing_generation", 0) + 1
         return (
             {key: entry.to_dict() for key, entry in self._entries.items()},
             self._routing_generation,
+            time.time(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+    def _persist_routing_data(
+        self, data: Dict[str, Any], generation: int, snapshot_at: float
+    ) -> None:
+        """Serialize whole-index writers without clobbering newer handoffs."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
@@ -1308,13 +1312,24 @@ class SessionStore:
             db_saved = False
             _db = getattr(self, "_db", None)
             if _db:
-                replacer = getattr(_db, "replace_gateway_routing_entries", None)
+                replacer = getattr(
+                    _db, "replace_gateway_routing_entries_preserving_newer", None
+                )
+                if not callable(replacer):
+                    replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
                     try:
-                        replacer(
-                            {k: json.dumps(v) for k, v in data.items()},
-                            scope=self._routing_scope(),
-                        )
+                        entries_json = {k: json.dumps(v) for k, v in data.items()}
+                        try:
+                            replacer(
+                                entries_json,
+                                scope=self._routing_scope(),
+                                snapshot_at=snapshot_at,
+                            )
+                        except TypeError:
+                            # Compatibility for mocked/older SessionDB objects in tests
+                            # and downgraded installs.
+                            replacer(entries_json, scope=self._routing_scope())
                         db_saved = True
                     except Exception as exc:
                         logger.warning(
@@ -1367,8 +1382,8 @@ class SessionStore:
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
         with self._lock:
-            data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+            data, generation, snapshot_at = self._snapshot_routing_locked()
+        self._persist_routing_data(data, generation, snapshot_at)
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
 

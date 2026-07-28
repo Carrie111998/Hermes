@@ -289,7 +289,7 @@ def test_legacy_and_off_lock_saves_share_one_serialization_lock(tmp_path):
     write_count = 0
     count_lock = threading.Lock()
 
-    def replace(entries, *, scope):
+    def replace(entries, *, scope, snapshot_at=None):
         nonlocal write_count, persisted
         with count_lock:
             write_count += 1
@@ -299,7 +299,7 @@ def test_legacy_and_off_lock_saves_share_one_serialization_lock(tmp_path):
             assert release_first_write.wait(timeout=10)
         persisted = dict(entries)
 
-    db.replace_gateway_routing_entries.side_effect = replace
+    db.replace_gateway_routing_entries_preserving_newer.side_effect = replace
     store = _make_store(tmp_path, db)
     source_a = _source()
     source_b = SessionSource(
@@ -333,7 +333,7 @@ def test_save_serialization_snapshots_latest_routing_index(tmp_path):
     write_count = 0
     count_lock = threading.Lock()
 
-    def replace(entries, *, scope):
+    def replace(entries, *, scope, snapshot_at=None):
         nonlocal write_count, persisted
         with count_lock:
             write_count += 1
@@ -343,7 +343,7 @@ def test_save_serialization_snapshots_latest_routing_index(tmp_path):
             assert release_first_write.wait(timeout=10)
         persisted = dict(entries)
 
-    db.replace_gateway_routing_entries.side_effect = replace
+    db.replace_gateway_routing_entries_preserving_newer.side_effect = replace
     store = _make_store(tmp_path, db)
     source_a = _source()
     source_b = SessionSource(
@@ -387,3 +387,57 @@ def test_recovery_rejects_other_profile_row(tmp_path, monkeypatch):
 
     assert entry.session_id != "foreign-session"
     db.reopen_session.assert_not_called()
+
+def test_atomic_routing_replace_preserves_external_handoff_after_snapshot(tmp_path):
+    """A durable handoff committed after snapshot must survive replacement."""
+    db = _db_with_rows({})
+    persisted: dict[str, str] = {}
+
+    def replace_preserving(entries, *, scope, snapshot_at):
+        # Simulate SessionDB's durable write boundary. An external watchdog
+        # commits key_b after SessionStore took its stale snapshot and before
+        # replace reaches SQLite. The atomic DB operation must not delete it.
+        persisted.setdefault(key_b, json.dumps(entry_b.to_dict()))
+        persisted.update(entries)
+
+    db.replace_gateway_routing_entries_preserving_newer.side_effect = replace_preserving
+    store = _make_store(tmp_path, db)
+    source_a = _source()
+    source_b = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="67890",
+        chat_type="dm",
+        user_id="67890",
+    )
+    key_a = store._generate_session_key(source_a)
+    key_b = store._generate_session_key(source_b)
+    entry_a = _seed_entry(store, key_a, "sid-a")
+    entry_b = SessionEntry(
+        session_key=key_b,
+        session_id="sid-b-external",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+
+    store._save_entries()
+
+    assert set(persisted) == {key_a, key_b}
+    assert json.loads(persisted[key_a])["session_id"] == entry_a.session_id
+    assert json.loads(persisted[key_b])["session_id"] == entry_b.session_id
+    db.replace_gateway_routing_entries.assert_not_called()
+
+
+def test_atomic_routing_replace_receives_snapshot_timestamp(tmp_path):
+    """SessionStore passes snapshot time to the DB atomic replace boundary."""
+    db = _db_with_rows({})
+    store = _make_store(tmp_path, db)
+    key = store._generate_session_key(_source())
+    _seed_entry(store, key, "sid-a")
+
+    store._save_entries()
+
+    kwargs = db.replace_gateway_routing_entries_preserving_newer.call_args.kwargs
+    assert kwargs["scope"] == store._routing_scope()
+    assert isinstance(kwargs["snapshot_at"], float)

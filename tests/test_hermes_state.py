@@ -7156,3 +7156,48 @@ class TestLoneSurrogatePersistence:
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
 
+def test_gateway_routing_replace_preserves_rows_newer_than_snapshot(db):
+    snapshot_at = 1000.0
+    scope = "gateway-scope"
+
+    def seed_rows(conn):
+        # old-key existed before the SessionStore snapshot and should be
+        # replaced by the snapshot contents.
+        conn.execute(
+            """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (scope, "old-key", '{"session_id":"old"}', snapshot_at - 1),
+        )
+        # These rows simulate handoffs committed after the snapshot but before
+        # the whole-index replace reaches SQLite. They must survive, including
+        # the same-key case where a stale snapshot would otherwise rewind the
+        # route to an ended session.
+        conn.execute(
+            """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (scope, "external-key", '{"session_id":"external"}', snapshot_at + 1),
+        )
+        conn.execute(
+            """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (scope, "same-key", '{"session_id":"external-new"}', snapshot_at + 1),
+        )
+
+    db._execute_write(seed_rows)
+
+    db.replace_gateway_routing_entries_preserving_newer(
+        {
+            "old-key": '{"session_id":"replacement"}',
+            "same-key": '{"session_id":"stale-snapshot"}',
+        },
+        scope=scope,
+        snapshot_at=snapshot_at,
+    )
+
+    rows = db.load_gateway_routing_entries(scope=scope)
+    assert rows == {
+        "old-key": '{"session_id":"replacement"}',
+        "external-key": '{"session_id":"external"}',
+        "same-key": '{"session_id":"external-new"}',
+    }
+

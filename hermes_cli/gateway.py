@@ -1252,17 +1252,19 @@ def _recover_pending_systemd_restart(
 
 
 def _parse_launchd_pid_from_list_output(output: str) -> int | None:
-    """Extract the PID from ``launchctl list <label>`` output.
+    """Extract the PID from ``launchctl list/print`` output.
 
-    When launchd is actively supervising a process, the output includes a
-    ``"PID" = <number>;`` line.  When the service definition is only *registered*
-    but not running (macOS 26+ with an unmanageable domain, fallback active),
-    the output lacks a PID field entirely.  Returns ``None`` when no PID is
-    found or the PID is non-positive (e.g. ``-1`` for a recently-crashed service).
+    When launchd is actively supervising a process, ``launchctl list`` includes
+    a ``"PID" = <number>;`` line. ``launchctl print system/<label>`` instead
+    uses lower-case plist-style keys such as ``pid = <number>``. When the
+    service definition is only *registered* but not running (macOS 26+ with an
+    unmanageable domain, fallback active), the output lacks a PID field
+    entirely. Returns ``None`` when no PID is found or the PID is non-positive
+    (e.g. ``-1`` for a recently-crashed service).
     """
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.startswith('"PID"') or stripped.startswith("PID"):
+        if stripped.startswith('"PID"') or stripped.startswith("PID") or stripped.startswith("pid ="):
             parts = stripped.split("=", 1)
             if len(parts) == 2:
                 val = parts[1].strip().rstrip(";").strip('"')
@@ -1274,15 +1276,52 @@ def _parse_launchd_pid_from_list_output(output: str) -> int | None:
     return None
 
 
+def _launchd_system_gateway_plist_path() -> Path:
+    """Return the optional system LaunchDaemon plist path for the gateway."""
+    return Path("/Library/LaunchDaemons") / f"{get_launchd_label()}.plist"
+
+
+def _probe_system_launchd_gateway() -> tuple[bool, int | None, str]:
+    """Probe a system LaunchDaemon gateway installed outside Hermes' default.
+
+    Hermes' built-in macOS installer manages a per-user LaunchAgent under
+    ``~/Library/LaunchAgents``. Some deployments intentionally use a system
+    LaunchDaemon under ``/Library/LaunchDaemons`` instead (for boot-time
+    startup, external disk readiness wrappers, etc.). ``launchctl list`` from a
+    user shell does not report that daemon, so explicitly inspect the system
+    domain before declaring the gateway detached.
+    """
+    plist_path = _launchd_system_gateway_plist_path()
+    if not plist_path.exists():
+        return False, None, ""
+    label = get_launchd_label()
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"system/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, None, ""
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        return False, None, output
+    return True, _parse_launchd_pid_from_list_output(output), output
+
+
 def _probe_launchd_service_running() -> bool:
     """Return True when launchd is actively supervising the gateway process.
 
-    ``launchctl list <label>`` returns exit 0 whenever the service definition is
-    registered with launchd — even when ``state = not running`` (macOS 26+).
-    We additionally require a PID in the output to confirm launchd is actually
-    managing a live process, not just holding a static definition.
+    ``launchctl list <label>`` returns exit 0 whenever a user LaunchAgent
+    definition is registered with launchd — even when ``state = not running``
+    (macOS 26+). We additionally require a PID in the output to confirm launchd
+    is actually managing a live process, not just holding a static definition.
+
+    If the user LaunchAgent is absent or not running, also recognise Techsafe's
+    system LaunchDaemon deployment in ``/Library/LaunchDaemons``.
     """
-    if not get_launchd_plist_path().exists():
+    if not get_launchd_plist_path().exists() and not _launchd_system_gateway_plist_path().exists():
         return False
     try:
         result = subprocess.run(
@@ -1292,10 +1331,12 @@ def _probe_launchd_service_running() -> bool:
             timeout=10,
         )
     except subprocess.TimeoutExpired:
-        return False
-    if result.returncode != 0:
-        return False
-    return _parse_launchd_pid_from_list_output(result.stdout) is not None
+        result = None
+    if result is not None and result.returncode == 0:
+        if _parse_launchd_pid_from_list_output(result.stdout) is not None:
+            return True
+    system_loaded, system_pid, _ = _probe_system_launchd_gateway()
+    return bool(system_loaded and system_pid is not None)
 
 
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
@@ -1360,7 +1401,7 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
     if is_macos():
         return GatewayRuntimeSnapshot(
             manager="launchd",
-            service_installed=get_launchd_plist_path().exists(),
+            service_installed=get_launchd_plist_path().exists() or _launchd_system_gateway_plist_path().exists(),
             service_running=_probe_launchd_service_running(),
             gateway_pids=gateway_pids,
             service_scope="launchd",
@@ -4510,6 +4551,13 @@ def launchd_status(deep: bool = False):
     # even when no fallback process is currently running.
     launchd_unsupported = _launchd_unsupported_marker_exists()
 
+    system_service_listed, system_launchd_pid, _system_launchd_output = _probe_system_launchd_gateway()
+    if launchd_pid is None and system_launchd_pid is not None:
+        launchd_pid = system_launchd_pid
+        service_listed = True
+        if fallback_pid == launchd_pid:
+            fallback_pid = None
+
     # ── Report ──
     print(f"Launchd plist: {plist_path}")
     if launchd_plist_is_current():
@@ -4520,8 +4568,13 @@ def launchd_status(deep: bool = False):
 
     if service_listed:
         if launchd_pid is not None:
-            print(f"✓ Gateway is supervised by launchd (PID {launchd_pid})")
-            print("  Auto-start at login and auto-restart on crash are available.")
+            if system_service_listed and launchd_pid == system_launchd_pid:
+                print(f"✓ Gateway is supervised by system launchd LaunchDaemon (PID {launchd_pid})")
+                print(f"  System plist: {_launchd_system_gateway_plist_path()}")
+                print("  Auto-start at boot and auto-restart on crash are available.")
+            else:
+                print(f"✓ Gateway is supervised by launchd (PID {launchd_pid})")
+                print("  Auto-start at login and auto-restart on crash are available.")
             if launchd_unsupported:
                 print("  (launchd domain was previously unavailable but is now working)")
         elif launchd_unsupported:
