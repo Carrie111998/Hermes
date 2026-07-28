@@ -529,6 +529,63 @@ class TestBuildSessionContextPrompt:
 
         assert "WhatsApp" in prompt or "whatsapp" in prompt.lower()
 
+    @pytest.mark.parametrize("platform", [Platform.WHATSAPP, Platform.WHATSAPP_CLOUD, Platform.SIGNAL])
+    def test_owner_line_shown_for_owner_gated_platforms(self, platform):
+        """The **Owner:** line must render for every platform gated into owner
+        detection (Req 3 / signalfix.md Gate C) — not just WhatsApp. Signal DMs
+        resolve ``is_owner`` via the generic ``_is_owner()`` fallback against
+        ``SIGNAL_ALLOWED_USERS``, so Signal must get the same prompt-level
+        owner disclosure as WhatsApp once ``source.is_owner`` is set."""
+        config = GatewayConfig(platforms={platform: PlatformConfig(enabled=True, token="")})
+        source = SessionSource(
+            platform=platform,
+            chat_id="dm-1",
+            chat_type="dm",
+            user_name="Some User",
+            is_owner=True,
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Owner:**" in prompt
+        assert "yes" in prompt.lower()
+
+    def test_owner_line_omitted_for_non_gated_platform(self):
+        """Platforms that haven't opted into owner detection must not show the
+        line at all — even if ``is_owner`` were somehow set."""
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")},
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="dm-1",
+            chat_type="dm",
+            user_name="Some User",
+            is_owner=True,
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Owner:**" not in prompt
+
+    def test_owner_line_omitted_in_shared_multi_user_session(self):
+        """Owner status must not ride the cache-shared prompt in a multi-user
+        session for any gated platform — including Signal — since the marker
+        would be sender-agnostic and stale."""
+        config = GatewayConfig(platforms={Platform.SIGNAL: PlatformConfig(enabled=True, token="")})
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group-1",
+            chat_type="group",
+            thread_id="thread-1",
+            is_owner=True,
+        )
+        ctx = build_session_context(source, config)
+        ctx.shared_multi_user_session = True
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Owner:**" not in prompt
+
     def test_multi_user_thread_prompt(self):
         """Shared thread sessions show multi-user note instead of single user."""
         config = GatewayConfig(
