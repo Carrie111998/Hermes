@@ -1,0 +1,3 @@
+name: test-pre-tool-call-block
+version: 0.1.0
+description: Minimal reproduction — blocks all terminal calls via pre_tool_call hook
