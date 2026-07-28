@@ -89,6 +89,29 @@ def _xlsx(path: Path) -> None:
         archive.writestr("xl/workbook.xml", "<workbook/>")
 
 
+def _docx(path: Path, *, macro_enabled: bool = False) -> None:
+    content_type = (
+        "application/vnd.ms-word.document.macroenabled.main+xml"
+        if macro_enabled
+        else "application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.document.main+xml"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Override PartName="/word/document.xml" '
+                f'ContentType="{content_type}"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr("word/document.xml", "<document/>")
+        if macro_enabled:
+            archive.writestr("word/vbaProject.bin", b"macro")
+
+
 def _retention_config(tmp_path: Path, source_root: Path, media_root: Path) -> Path:
     path = tmp_path / "retention-config.yaml"
     path.write_text(yaml.safe_dump({
@@ -257,39 +280,189 @@ def test_mixed_spreadsheet_and_image_still_retains_image(tmp_path, monkeypatch):
     assert convergence[0]["media"][0]["mime"] == "image/png"
 
 
-def test_unsupported_document_still_bypasses_retention(tmp_path, monkeypatch):
+def test_pdf_only_retention_is_idempotent_and_completes(tmp_path):
     capture = tmp_path / "capture"
     capture.mkdir()
     document = capture / "brief.pdf"
     document.write_bytes(b"%PDF-1.7\nfixture")
     retained = tmp_path / "retained"
     config = _retention_config(tmp_path, capture, retained)
-    convergence = []
-    monkeypatch.setattr(
-        consumer,
-        "_converge_retained_media",
-        lambda *args, **kwargs: convergence.append((args, kwargs)),
-    )
-    raw = _message("DOC-UNSUPPORTED")
+    raw = _message("PDF-1")
     raw.update(
         {
             "hasMedia": True,
             "mediaType": "document",
             "mediaUrls": [str(document)],
-            "mediaMimes": ["application/pdf"],
+            "mediaMimes": ["application/octet-stream"],
+        }
+    )
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [raw])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.retention_candidates(limit=1)[0]
+
+    expected = {
+        "retained": 1,
+        "bytes": document.stat().st_size,
+        "operation": False,
+        "validated_documents": 1,
+    }
+    assert consumer.retain_record_media(record, config_path=config) == expected
+    first_files = list(retained.glob("*.pdf"))
+    assert len(first_files) == 1
+    assert "_document_0_" in first_files[0].name
+    assert first_files[0].read_bytes() == document.read_bytes()
+    assert consumer.retain_record_media(record, config_path=config) == expected
+    assert list(retained.glob("*.pdf")) == first_files
+
+    assert consumer.ensure_record_media_retained(
+        inbox, record, config_path=config
+    ) == expected
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT retention_state,retained_media_count,retention_attempts "
+            "FROM ingress_events WHERE message_id='PDF-1'"
+        ).fetchone()
+    assert tuple(row) == ("complete", 1, 1)
+
+    document.write_bytes(b"%PDF-1.7\nchanged")
+    with pytest.raises(consumer.MediaRetentionError, match="ordinal 0 changed"):
+        consumer.retain_record_media(record, config_path=config)
+
+
+def test_docx_only_retention_completes(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    document = capture / "brief.docx"
+    _docx(document)
+    retained = tmp_path / "retained"
+    config = _retention_config(tmp_path, capture, retained)
+    raw = _message("DOCX-1")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(document)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ],
+        }
+    )
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [raw])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.retention_candidates(limit=1)[0]
+
+    result = consumer.ensure_record_media_retained(
+        inbox, record, config_path=config
+    )
+
+    assert result == {
+        "retained": 1,
+        "bytes": document.stat().st_size,
+        "operation": False,
+        "validated_documents": 1,
+    }
+    files = list(retained.glob("*.docx"))
+    assert len(files) == 1
+    assert files[0].read_bytes() == document.read_bytes()
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT retention_state,retained_media_count "
+            "FROM ingress_events WHERE message_id='DOCX-1'"
+        ).fetchone()
+    assert tuple(row) == ("complete", 1)
+
+
+def test_macro_document_refusal_is_durable_and_recorded(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    document = capture / "active.docm"
+    _docx(document, macro_enabled=True)
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    source = tmp_path / "events.jsonl"
+    raw = _message("DOCM-REFUSED")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(document)],
+            "mediaMimes": [
+                "application/vnd.ms-word.document.macroenabled.12"
+            ],
+        }
+    )
+    _write_jsonl(source, [raw])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.retention_candidates(limit=1)[0]
+
+    result = consumer.ensure_record_media_retained(
+        inbox, record, config_path=config
+    )
+
+    assert result["refused"] is True
+    assert inbox.retention_candidates(limit=1) == []
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT retention_state,retention_last_error "
+            "FROM ingress_events WHERE message_id='DOCM-REFUSED'"
+        ).fetchone()
+    assert row["retention_state"] == "bypassed"
+    assert "macro-enabled document formats are refused" in row["retention_last_error"]
+
+
+def test_mixed_pdf_and_image_keeps_systems_ledger_image_only(
+    tmp_path, monkeypatch
+):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    document = capture / "brief.pdf"
+    document.write_bytes(b"%PDF-1.7\nfixture")
+    image = capture / "evidence.png"
+    image.write_bytes(_png_bytes())
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    convergence = []
+    monkeypatch.setattr(
+        consumer,
+        "_converge_retained_media",
+        lambda *_args, **kwargs: convergence.append(kwargs["payload"]) or {
+            "ok": True,
+            "data": {"ledgerChanged": False, "observationsChanged": False},
+        },
+    )
+    raw = _message("PDF-IMAGE")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(document), str(image)],
+            "mediaMimes": ["application/pdf", "image/png"],
         }
     )
     record = consumer.InboxRecord(
-        1, "DOC-UNSUPPORTED", "test-group@g.us", 0, 1, raw
+        1, "PDF-IMAGE", "test-group@g.us", 0, 1, raw
     )
 
-    assert consumer.retain_record_media(record, config_path=config) == {
-        "retained": 0,
-        "bytes": 0,
-        "operation": False,
-    }
-    assert convergence == []
-    assert not retained.exists()
+    result = consumer.retain_record_media(record, config_path=config)
+
+    assert result["retained"] == 2
+    assert result["operation"] is True
+    assert result["validated_documents"] == 1
+    assert len(list((tmp_path / "retained").glob("*.pdf"))) == 1
+    assert len(list((tmp_path / "retained").glob("*.png"))) == 1
+    assert len(convergence) == 1
+    assert len(convergence[0]["media"]) == 1
+    assert convergence[0]["media"][0]["mime"] == "image/png"
 
 
 def test_spreadsheet_without_declared_mime_is_permanently_refused(tmp_path):

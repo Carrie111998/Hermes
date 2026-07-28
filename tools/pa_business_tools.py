@@ -1137,13 +1137,35 @@ _TGG_SPREADSHEET_CANONICAL_MIME = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".csv": "text/csv",
 }
+_TGG_DOCUMENT_EXTENSIONS = frozenset({".pdf", ".docx"})
+_TGG_DOCUMENT_MACRO_EXTENSIONS = frozenset({".docm", ".dotm"})
+_TGG_DOCUMENT_MIMES = {
+    ".pdf": frozenset({"application/pdf"}),
+    ".docx": frozenset(
+        {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
+    ),
+}
+_TGG_DOCUMENT_CANONICAL_MIME = {
+    ".pdf": "application/pdf",
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ),
+}
+_TGG_OCTET_STREAM_MIME = "application/octet-stream"
 _TGG_XLSX_MAIN_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+)
+_TGG_DOCX_MAIN_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "wordprocessingml.document.main+xml"
 )
 _TGG_SPREADSHEET_MACRO_MARKERS = ("macroenabled", "vbaproject", "macrosheet")
 _TGG_SPREADSHEET_MAX_ZIP_ENTRIES = 20_000
 _TGG_SPREADSHEET_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 _TGG_SPREADSHEET_MAX_FILE_BYTES = 64 * 1024 * 1024
+_TGG_RETAINABLE_DOCUMENT_MAX_FILE_BYTES = _TGG_SPREADSHEET_MAX_FILE_BYTES
 _TGG_SPREADSHEET_MAX_JOB_NUMBERS = 10_000
 _TGG_JOB_HEADER_NAMES = frozenset(
     {"job no", "job number", "job no.", "job number."}
@@ -1218,6 +1240,116 @@ def _sniff_tgg_xlsx(path: Path) -> bool:
     return _TGG_XLSX_MAIN_CONTENT_TYPE in declared_types
 
 
+def _sniff_tgg_pdf(path: Path) -> bool:
+    """Return whether the file starts with the PDF header signature."""
+    with path.open("rb") as handle:
+        return handle.read(5) == b"%PDF-"
+
+
+def _sniff_tgg_docx(path: Path) -> bool:
+    """Validate an OOXML Word document without extracting active content."""
+    with path.open("rb") as handle:
+        if handle.read(4) not in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}:
+            return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if (
+                len(infos) > _TGG_SPREADSHEET_MAX_ZIP_ENTRIES
+                or sum(info.file_size for info in infos)
+                > _TGG_SPREADSHEET_MAX_UNCOMPRESSED_BYTES
+            ):
+                return False
+            names = {info.filename.lower() for info in infos}
+            if (
+                "[content_types].xml" not in names
+                or "word/document.xml" not in names
+            ):
+                return False
+            if any(
+                marker in name
+                for name in names
+                for marker in ("vbaproject", "macros")
+            ):
+                return False
+            content_types = archive.read("[Content_Types].xml")
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return False
+    try:
+        root = ElementTree.fromstring(content_types)
+    except ElementTree.ParseError:
+        return False
+    declared_types = {
+        str(element.attrib.get("ContentType") or "").lower()
+        for element in root.iter()
+    }
+    if any(
+        marker in content_type
+        for content_type in declared_types
+        for marker in _TGG_SPREADSHEET_MACRO_MARKERS
+    ):
+        return False
+    return _TGG_DOCX_MAIN_CONTENT_TYPE in declared_types
+
+
+def validate_tgg_retainable_document(
+    path: str | Path,
+    *,
+    declared_mime: str,
+) -> str:
+    """Validate an allowlisted spreadsheet, PDF, or Word document."""
+    candidate = Path(path).expanduser().resolve(strict=True)
+    if not candidate.is_file():
+        raise ValueError("INVALID_MEDIA_REF: document is not a regular file")
+    if candidate.stat().st_size > _TGG_RETAINABLE_DOCUMENT_MAX_FILE_BYTES:
+        raise ValueError("DOCUMENT_TOO_LARGE: file exceeds the media gate limit")
+    suffix = candidate.suffix.lower()
+    mime = str(declared_mime or "").split(";", 1)[0].strip().lower()
+    if suffix in {".xlsm", ".xltm"} | _TGG_DOCUMENT_MACRO_EXTENSIONS:
+        raise ValueError(
+            "UNSUPPORTED_MEDIA_TYPE: macro-enabled document formats are refused"
+        )
+    allowed_extensions = _TGG_SPREADSHEET_EXTENSIONS | _TGG_DOCUMENT_EXTENSIONS
+    if suffix not in allowed_extensions:
+        raise ValueError("UNSUPPORTED_MEDIA_TYPE: document format is not allowlisted")
+
+    if suffix == ".xlsx":
+        sniffed = _sniff_tgg_xlsx(candidate)
+        allowed_mimes = _TGG_SPREADSHEET_MIMES[suffix]
+        canonical_mime = _TGG_SPREADSHEET_CANONICAL_MIME[suffix]
+    elif suffix == ".csv":
+        sniffed = _sniff_tgg_csv(candidate)
+        allowed_mimes = _TGG_SPREADSHEET_MIMES[suffix]
+        canonical_mime = _TGG_SPREADSHEET_CANONICAL_MIME[suffix]
+    elif suffix == ".pdf":
+        sniffed = _sniff_tgg_pdf(candidate)
+        allowed_mimes = _TGG_DOCUMENT_MIMES[suffix]
+        canonical_mime = _TGG_DOCUMENT_CANONICAL_MIME[suffix]
+    else:
+        sniffed = _sniff_tgg_docx(candidate)
+        allowed_mimes = _TGG_DOCUMENT_MIMES[suffix]
+        canonical_mime = _TGG_DOCUMENT_CANONICAL_MIME[suffix]
+
+    octet_stream_allowed = suffix in {".csv", ".pdf", ".docx"}
+    if mime not in allowed_mimes and not (
+        octet_stream_allowed and mime == _TGG_OCTET_STREAM_MIME
+    ):
+        raise ValueError(
+            "PROVENANCE_DIVERGENCE: document MIME does not match extension"
+        )
+    if not sniffed:
+        raise ValueError(
+            "PROVENANCE_DIVERGENCE: document MIME does not match bytes"
+        )
+    return canonical_mime
+
+
 def validate_tgg_spreadsheet(
     path: str | Path,
     *,
@@ -1230,24 +1362,20 @@ def validate_tgg_spreadsheet(
     PROVENANCE_DIVERGENCE contract as retained case images.
     """
     candidate = Path(path).expanduser().resolve(strict=True)
-    if not candidate.is_file():
-        raise ValueError("INVALID_MEDIA_REF: spreadsheet is not a regular file")
-    if candidate.stat().st_size > _TGG_SPREADSHEET_MAX_FILE_BYTES:
-        raise ValueError("SPREADSHEET_TOO_LARGE: file exceeds the media gate limit")
     suffix = candidate.suffix.lower()
-    mime = str(declared_mime or "").split(";", 1)[0].strip().lower()
     if suffix not in _TGG_SPREADSHEET_EXTENSIONS:
         raise ValueError("UNSUPPORTED_MEDIA_TYPE: spreadsheet format is not allowlisted")
-    if mime not in _TGG_SPREADSHEET_MIMES[suffix]:
-        raise ValueError(
-            "PROVENANCE_DIVERGENCE: spreadsheet MIME does not match extension"
+    try:
+        return validate_tgg_retainable_document(
+            candidate, declared_mime=declared_mime
         )
-    sniff = _sniff_tgg_xlsx if suffix == ".xlsx" else _sniff_tgg_csv
-    if not sniff(candidate):
-        raise ValueError(
-            "PROVENANCE_DIVERGENCE: spreadsheet MIME does not match bytes"
-        )
-    return _TGG_SPREADSHEET_CANONICAL_MIME[suffix]
+    except ValueError as exc:
+        message = str(exc)
+        if message.startswith("DOCUMENT_TOO_LARGE:"):
+            raise ValueError(
+                message.replace("DOCUMENT_TOO_LARGE:", "SPREADSHEET_TOO_LARGE:", 1)
+            ) from exc
+        raise
 
 
 def _xlsx_column_index(cell_ref: str) -> int:

@@ -16,12 +16,19 @@ After the reviewed tree is staged at `/home/pclaw/apps/hermes-pcl`, install the 
 cd /home/pclaw/apps/hermes-pcl
 /home/pclaw/apps/hermes-pcl/.venv/bin/pip install -e '.[sandbox]'
 /home/pclaw/apps/hermes-pcl/.venv/bin/python - <<'PY'
-import numpy, openpyxl, pandas
-print(numpy.__version__, pandas.__version__, openpyxl.__version__)
+import docx, numpy, openpyxl, pandas, pypdf
+print(
+    numpy.__version__,
+    pandas.__version__,
+    openpyxl.__version__,
+    pypdf.__version__,
+    docx.__version__,
+)
 PY
 ```
 
-Expected versions: numpy 2.4.3, pandas 3.0.5, openpyxl 3.1.5.
+Expected versions: numpy 2.4.3, pandas 3.0.5, openpyxl 3.1.5,
+pypdf 6.14.2, python-docx 1.2.0.
 
 ## Stage, verify, and flip
 

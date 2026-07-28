@@ -333,7 +333,16 @@ def _initial_retention_state(item: Mapping[str, Any]) -> str:
                 if isinstance(value, Mapping)
                 else str(value or "")
             ).suffix.lower()
-            if suffix in {".xlsx", ".csv", ".xlsm", ".xltm"}:
+            if suffix in {
+                ".xlsx",
+                ".csv",
+                ".xlsm",
+                ".xltm",
+                ".pdf",
+                ".docx",
+                ".docm",
+                ".dotm",
+            }:
                 return "pending"
     return "bypassed"
 
@@ -1444,8 +1453,10 @@ def _event_media(item: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
     return result
 
 
-def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[int, Any, str]]:
-    """Return spreadsheet-like documents with their provider-declared MIME."""
+def _event_retainable_documents(
+    item: Mapping[str, Any],
+) -> list[tuple[int, Any, str]]:
+    """Return retainable documents with their provider-declared MIME."""
     values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths") or []
     if isinstance(values, (str, bytes, Mapping)):
         values = [values]
@@ -1465,7 +1476,16 @@ def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[int, Any, str]]:
             else value
         )
         suffix = Path(str(raw_path or "")).suffix.lower()
-        if suffix not in {".xlsx", ".csv", ".xlsm", ".xltm"}:
+        if suffix not in {
+            ".xlsx",
+            ".csv",
+            ".xlsm",
+            ".xltm",
+            ".pdf",
+            ".docx",
+            ".docm",
+            ".dotm",
+        }:
             continue
         declared = ""
         if isinstance(value, Mapping):
@@ -1479,7 +1499,7 @@ def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[int, Any, str]]:
             declared = str(declared_mimes[index] or "")
         if not declared:
             raise PermanentMediaRefusal(
-                "PROVENANCE_DIVERGENCE: spreadsheet has no provider-declared MIME"
+                "PROVENANCE_DIVERGENCE: document has no provider-declared MIME"
             )
         result.append((index, value, declared))
     return result
@@ -1547,7 +1567,7 @@ def _converge_retained_media(
 def _retain_record_media_impl(
     record: InboxRecord, *, config_path: Path
 ) -> dict[str, Any]:
-    """Retain one event's images and converge its configured system ledger.
+    """Retain one event's documents/images and converge image ledger entries.
 
     Files land before the idempotent operation.  Therefore a crash after the
     rename or operation is safe to replay, while changed bytes/MIME at the
@@ -1567,49 +1587,56 @@ def _retain_record_media_impl(
     source_key = f"whatsapp-capture-v1:{identity_digest}"
     filename_prefix = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:24]
     root: Path = config["root"]
-    spreadsheets = _event_spreadsheets(item)
+    documents = _event_retainable_documents(item)
+    retained_documents = 0
+    document_bytes = 0
     retained_spreadsheets = 0
-    spreadsheet_bytes = 0
-    if spreadsheets:
-        from tools.pa_business_tools import validate_tgg_spreadsheet
+    if documents:
+        from tools.pa_business_tools import validate_tgg_retainable_document
 
         root.mkdir(parents=True, exist_ok=True, mode=0o750)
         _assert_media_headroom(
             config_path,
             _media_root_metrics(config_path, inspect=True, count_root=False),
         )
-        for ordinal, raw_path, declared_mime in spreadsheets:
+        for ordinal, raw_path, declared_mime in documents:
             source = _contained_existing_file(raw_path, config["source_roots"])
             try:
-                validate_tgg_spreadsheet(source, declared_mime=declared_mime)
+                validate_tgg_retainable_document(
+                    source, declared_mime=declared_mime
+                )
             except ValueError as exc:
                 raise PermanentMediaRefusal(str(exc)) from exc
             content = source.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
             extension = source.suffix.lower()
+            retention_kind = (
+                "spreadsheet" if extension in {".xlsx", ".csv"} else "document"
+            )
             target = (
                 root
                 / (
-                    f"{filename_prefix}_spreadsheet_{ordinal}_"
+                    f"{filename_prefix}_{retention_kind}_{ordinal}_"
                     f"{digest[:24]}{extension}"
                 )
             ).resolve()
             if not target.is_relative_to(root):
                 raise MediaRetentionError(
-                    "derived spreadsheet retention target escapes configured root"
+                    "derived document retention target escapes configured root"
                 )
-            ordinal_candidates = list(
-                root.glob(f"{filename_prefix}_spreadsheet_{ordinal}_*")
-            )
+            ordinal_candidates = [
+                *root.glob(f"{filename_prefix}_spreadsheet_{ordinal}_*"),
+                *root.glob(f"{filename_prefix}_document_{ordinal}_*"),
+            ]
             if ordinal_candidates and target not in ordinal_candidates:
                 raise MediaRetentionError(
-                    "PROVENANCE_DIVERGENCE: retained spreadsheet ordinal "
+                    "PROVENANCE_DIVERGENCE: retained document ordinal "
                     f"{ordinal} changed"
                 )
             if target.exists():
                 if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                     raise MediaRetentionError(
-                        "PROVENANCE_DIVERGENCE: retained spreadsheet ordinal "
+                        "PROVENANCE_DIVERGENCE: retained document ordinal "
                         f"{ordinal} changed"
                     )
             else:
@@ -1629,17 +1656,22 @@ def _retain_record_media_impl(
                 finally:
                     with contextlib.suppress(FileNotFoundError):
                         tmp.unlink()
-            retained_spreadsheets += 1
-            spreadsheet_bytes += len(content)
+            retained_documents += 1
+            document_bytes += len(content)
+            retained_spreadsheets += int(retention_kind == "spreadsheet")
     media = _event_media(item)
     if not media:
-        if retained_spreadsheets:
-            return {
-                "retained": retained_spreadsheets,
-                "bytes": spreadsheet_bytes,
+        if retained_documents:
+            result = {
+                "retained": retained_documents,
+                "bytes": document_bytes,
                 "operation": False,
-                "validated_spreadsheets": len(spreadsheets),
             }
+            if retained_documents != retained_spreadsheets:
+                result["validated_documents"] = len(documents)
+            if retained_spreadsheets:
+                result["validated_spreadsheets"] = retained_spreadsheets
+            return result
         coarse_kind = str(
             item.get("mediaType") or item.get("mimeType") or ""
         ).split("/", 1)[0].strip().lower()
@@ -1719,12 +1751,17 @@ def _retain_record_media_impl(
             raise
         raise MediaRetentionError(f"media retention convergence failed: {exc}") from exc
     return {
-        "retained": retained_spreadsheets + len(retained),
-        "bytes": spreadsheet_bytes + total_bytes,
+        "retained": retained_documents + len(retained),
+        "bytes": document_bytes + total_bytes,
         "operation": True,
         **(
-            {"validated_spreadsheets": len(spreadsheets)}
-            if spreadsheets
+            {"validated_documents": len(documents)}
+            if retained_documents != retained_spreadsheets
+            else {}
+        ),
+        **(
+            {"validated_spreadsheets": retained_spreadsheets}
+            if retained_spreadsheets
             else {}
         ),
     }

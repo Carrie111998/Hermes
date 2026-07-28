@@ -1065,6 +1065,76 @@ def test_tgg_spreadsheet_gate_refuses_mime_bytes_mismatch(tmp_path):
         )
 
 
+def test_tgg_retainable_document_gate_accepts_pdf_and_docx_octet_stream(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    pdf = tmp_path / "brief.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nfixture")
+    docx = tmp_path / "brief.docx"
+    with zipfile.ZipFile(docx, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Override PartName="/word/document.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.'
+                'wordprocessingml.document.main+xml"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr("word/document.xml", "<document/>")
+
+    assert pbt.validate_tgg_retainable_document(
+        pdf, declared_mime="application/octet-stream"
+    ) == "application/pdf"
+    assert pbt.validate_tgg_retainable_document(
+        docx, declared_mime="application/octet-stream"
+    ).endswith("wordprocessingml.document")
+
+
+@pytest.mark.parametrize("suffix", [".pdf", ".docx", ".csv"])
+def test_tgg_retainable_document_gate_refuses_bad_octet_stream_sniff(
+    tmp_path, suffix
+):
+    import tools.pa_business_tools as pbt
+
+    document = tmp_path / f"bad{suffix}"
+    document.write_bytes(b"MZ" + b"\x00" * 100)
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt.validate_tgg_retainable_document(
+            document, declared_mime="application/octet-stream"
+        )
+
+
+def test_tgg_retainable_document_gate_accepts_csv_octet_stream(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(
+        "Job No.,Status\nAM/JOB/2607/0001,Open\n", encoding="utf-8"
+    )
+
+    assert pbt.validate_tgg_retainable_document(
+        csv_file, declared_mime="application/octet-stream"
+    ) == "text/csv"
+
+
+@pytest.mark.parametrize("suffix", [".docm", ".dotm"])
+def test_tgg_retainable_document_gate_refuses_macro_word_formats(
+    tmp_path, suffix
+):
+    import tools.pa_business_tools as pbt
+
+    document = tmp_path / f"active{suffix}"
+    document.write_bytes(b"PK\x03\x04")
+    with pytest.raises(ValueError, match="macro-enabled document formats"):
+        pbt.validate_tgg_retainable_document(
+            document,
+            declared_mime="application/vnd.ms-word.document.macroenabled.12",
+        )
+
+
 def test_tgg_case_photo_provenance_gate_is_unchanged(tmp_path):
     import tools.pa_business_tools as pbt
 
