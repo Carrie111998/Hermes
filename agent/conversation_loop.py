@@ -4827,14 +4827,25 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    #
+                    # Honor the classifier's explicit `should_fallback`
+                    # signal: when it is False, the error is deterministic
+                    # for this model/output (e.g., malformed tool-call
+                    # arguments that any provider will reproduce, or a
+                    # provider-side account policy block). Skipping the
+                    # fallback cascade in those cases prevents burning a
+                    # fallback slot on a guaranteed re-failure. See #16022
+                    # and the existing `should_fallback=False` paths in
+                    # `error_classifier.py` (provider_policy_blocked,
+                    # invalid_encrypted_content).
+                    if classified.should_fallback and agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if classified.should_fallback and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0

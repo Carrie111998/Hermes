@@ -1295,6 +1295,10 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
         assert result.should_compress is False
+        # The malformed arguments came from this model run; any fallback
+        # provider re-running the same model would reproduce them, so the
+        # classifier signals the loop to skip the fallback cascade. #16022
+        assert result.should_fallback is False
 
     def test_400_openrouter_wrapped_invalid_tool_call_arguments_is_format_error(self):
         """OpenRouter metadata.raw tool-call validation errors stay format errors."""
@@ -1314,6 +1318,46 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
         assert result.should_compress is False
+        assert result.should_fallback is False
+
+    def test_400_invalid_function_call_arguments_wording_also_classified(self):
+        """`function_call arguments` provider variant must match the same
+        guard as `tool_call arguments`. #58233 documents this wording from
+        upstream providers; without explicit coverage the regex list was
+        the only defence and silently missed the function-call spelling.
+        """
+        e = MockAPIError(
+            "Bad Request",
+            status_code=400,
+            body={"error": {"message": "invalid function_call arguments: expected valid JSON object"}},
+        )
+        result = classify_api_error(e, approx_tokens=180000, context_length=200000, num_messages=300)
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is False
+        assert result.should_fallback is False
+
+    def test_400_openrouter_wrapped_invalid_function_call_arguments_is_format_error(self):
+        """OpenRouter wrapping of the `function_call arguments` variant
+        must also stay a non-compressing format error and skip fallback.
+        """
+        e = MockAPIError(
+            "Provider returned error",
+            status_code=400,
+            body={
+                "error": {
+                    "message": "Provider returned error",
+                    "metadata": {
+                        "raw": '{"error":{"message":"function_call arguments are invalid: JSON parse failed"}}'
+                    },
+                }
+            },
+        )
+        result = classify_api_error(e, provider="openrouter", approx_tokens=180000, context_length=200000)
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is False
+        assert result.should_fallback is False
 
     def test_400_flat_body_generic_large_session_still_context_overflow(self):
         """Flat body with generic 'Error' message + large session → context overflow.
