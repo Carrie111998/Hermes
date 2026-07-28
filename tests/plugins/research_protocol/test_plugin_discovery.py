@@ -1,5 +1,10 @@
 """Discovery contract for the opt-in research protocol plugin."""
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
 import yaml
 
@@ -72,6 +77,78 @@ def test_research_protocol_explicit_enable_registers_exact_pr2_surface(
     assert loaded.hooks_registered == []
     assert loaded.middleware_registered == []
     assert loaded.commands_registered == []
+
+
+def test_enabled_discovery_without_fcntl_registers_unavailable_tools(tmp_path):
+    """Windows-like discovery must load the plugin and fail closed at runtime."""
+    hermes_home = tmp_path / "hermes-home"
+    _configure_plugins(
+        hermes_home,
+        {
+            "enabled": [PLUGIN_KEY],
+            "entries": {
+                PLUGIN_KEY: {
+                    "artifact_root": str(tmp_path / "artifacts"),
+                }
+            },
+        },
+    )
+    script = """
+import builtins
+import importlib
+
+original_import = builtins.__import__
+original_import_module = importlib.import_module
+
+
+def import_without_fcntl(name, *args, **kwargs):
+    if name == "fcntl":
+        raise ModuleNotFoundError("No module named 'fcntl'")
+    return original_import(name, *args, **kwargs)
+
+
+def import_module_without_fcntl(name, *args, **kwargs):
+    if name == "fcntl":
+        raise ModuleNotFoundError("No module named 'fcntl'")
+    return original_import_module(name, *args, **kwargs)
+
+
+builtins.__import__ = import_without_fcntl
+importlib.import_module = import_module_without_fcntl
+
+from hermes_cli.plugins import PluginManager
+from tools.registry import registry
+
+manager = PluginManager()
+manager.discover_and_load()
+loaded = manager._plugins["research-protocol"]
+assert loaded.enabled is True
+assert loaded.error is None
+assert set(loaded.tools_registered) == {
+    "plan_context_read",
+    "plan_artifact_write",
+    "plan_approval_request",
+}
+assert all(
+    registry.get_entry(name) is not None
+    and registry.get_entry(name).check_fn is not None
+    and not registry.get_entry(name).check_fn()
+    for name in loaded.tools_registered
+)
+"""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env.pop("HERMES_BUNDLED_PLUGINS", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("enabled", [None, "", {}, [], PLUGIN_KEY])

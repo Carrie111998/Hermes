@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -14,6 +14,11 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    fcntl: Any = importlib.import_module("fcntl")
+except ImportError:  # pragma: no cover - covered by isolated Windows-like discovery
+    fcntl = None
 
 from pydantic import BaseModel, ValidationError
 
@@ -97,6 +102,7 @@ def _secure_storage_capabilities_available() -> bool:
     supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
     return (
         os.name == "posix"
+        and fcntl is not None
         and hasattr(os, "O_DIRECTORY")
         and hasattr(os, "O_NOFOLLOW")
         and all(function in supports_dir_fd for function in _REQUIRED_DIR_FD_FUNCTIONS)
@@ -385,6 +391,8 @@ class ArtifactStore:
 
     @staticmethod
     def _acquire_lock(lock_directory_fd: int, name: str) -> int:
+        if fcntl is None:
+            raise ArtifactSecurityError("artifact locking is unavailable")
         flags = (
             os.O_RDWR
             | os.O_CREAT
