@@ -23,7 +23,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from hermes_constants import get_default_hermes_root
+from hermes_constants import (
+    get_default_hermes_root,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -862,20 +866,38 @@ def _create_materialized_task(
         )
         else "scratch"
     )
-    task_id = kanban_db.create_task(
-        conn,
-        title=str(fields["title"]),
-        body=str(fields["body"]),
-        assignee=fields["assignee"],
-        created_by="hermes-qualification",
-        parents=tuple(fields["parents"]),
-        board=board,
-        workflow_template_id=fields["workflow_template_id"],
-        current_step_key=fields["current_step_key"],
-        work_contract_id=contract_id,
-        work_item_kind=fields["work_item_kind"],
-        workspace_kind=workspace_kind,
-    )
+    project_id = None
+    project_home_token = None
+    try:
+        if fields["work_item_kind"] == "card":
+            from hermes_cli import projects_db
+
+            project_home_token = set_hermes_home_override(get_default_hermes_root())
+            with projects_db.connect_closing() as project_conn:
+                project = projects_db.get_active_project_for_board(project_conn, board)
+            if project is not None and not project.primary_path:
+                raise WorkContractError(
+                    f"board-bound project {project.id} has no primary path"
+                )
+            project_id = project.id if project is not None else None
+        task_id = kanban_db.create_task(
+            conn,
+            title=str(fields["title"]),
+            body=str(fields["body"]),
+            assignee=fields["assignee"],
+            created_by="hermes-qualification",
+            parents=tuple(fields["parents"]),
+            board=board,
+            workflow_template_id=fields["workflow_template_id"],
+            current_step_key=fields["current_step_key"],
+            work_contract_id=contract_id,
+            work_item_kind=fields["work_item_kind"],
+            workspace_kind=workspace_kind,
+            project_id=project_id,
+        )
+    finally:
+        if project_home_token is not None:
+            reset_hermes_home_override(project_home_token)
     epic_id = fields.get("epic_id")
     if epic_id:
         kanban_db.add_epic_membership(

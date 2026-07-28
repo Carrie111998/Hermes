@@ -2041,6 +2041,37 @@ def _project_is_bound_to_product_board(
         return False
 
 
+def _can_preserve_project_worktree_on_adoption(
+    *,
+    workspace_kind: Optional[str],
+    workspace_path: Optional[str],
+    branch_name: Optional[str],
+    project_primary_path: Optional[str],
+    task_id: str,
+) -> bool:
+    """Return whether an adopted project can keep its existing worktree."""
+    if (
+        workspace_kind != "worktree"
+        or not workspace_path
+        or not str(branch_name or "").strip()
+        or not project_primary_path
+    ):
+        return False
+    try:
+        expected = (
+            Path(project_primary_path).expanduser().resolve(strict=False)
+            / ".worktrees"
+            / task_id
+        ).resolve(strict=False)
+        current_path = Path(str(workspace_path)).expanduser()
+        if not current_path.is_absolute():
+            return False
+        current = current_path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return current == expected
+
+
 def _repair_product_workflow_metadata_if_needed(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3340,9 +3371,12 @@ def resolve_product_preflight(
             workspace_path = row["workspace_path"]
             branch_name = row["branch_name"]
             if project_id:
+                from hermes_constants import get_default_hermes_root
                 from hermes_cli import projects_db as _pdb
 
-                with _pdb.connect_closing() as project_conn:
+                with _pdb.connect_closing(
+                    get_default_hermes_root() / "projects.db"
+                ) as project_conn:
                     project = _pdb.get_project(project_conn, project_id)
                 if project is None:
                     raise ValueError(f"unknown project: {project_id}")
@@ -3356,13 +3390,20 @@ def resolve_product_preflight(
                 if project_id != row["project_id"]:
                     if not project.primary_path:
                         raise ValueError("repair project has no primary path")
-                    workspace_kind = "worktree"
-                    workspace_path = os.path.join(
-                        project.primary_path, ".worktrees", task_id,
-                    )
-                    branch_name = _pdb.branch_name_for(
-                        project, task_id, title=row["title"],
-                    )
+                    if not _can_preserve_project_worktree_on_adoption(
+                        workspace_kind=row["workspace_kind"],
+                        workspace_path=row["workspace_path"],
+                        branch_name=row["branch_name"],
+                        project_primary_path=project.primary_path,
+                        task_id=task_id,
+                    ):
+                        workspace_kind = "worktree"
+                        workspace_path = os.path.join(
+                            project.primary_path, ".worktrees", task_id,
+                        )
+                        branch_name = _pdb.branch_name_for(
+                            project, task_id, title=row["title"],
+                        )
 
             next_status = _column_status_for_step(meta, phase)
             if next_status not in VALID_STATUSES or next_status in {
