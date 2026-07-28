@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import { resetLiveRuntimeTracking } from '@/app/contrib/hooks/use-background-sync'
 import { resetSidebarBatchCapability } from '@/hermes'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
+import { clearArtifactRegistry } from '@/store/artifacts'
 import { resetSessionsLimit } from '@/store/layout'
 import {
   $unreadFinishedSessionIds,
@@ -14,10 +15,9 @@ import {
   setMessagingSessions,
   setMessagingTruncated,
   setSelectedStoredSessionId,
-  setSessionProfileTotals,
+  setSessionProfilesTruncated,
   setSessions,
-  setSessionsLoading,
-  setSessionsTotal
+  setSessionsLoading
 } from '@/store/session'
 import { clearAllSessionStates } from '@/store/session-states'
 
@@ -43,8 +43,7 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // "batched sidebar endpoint missing" capability verdict across the switch.
   resetSidebarBatchCapability()
   setSessions([])
-  setSessionsTotal(0)
-  setSessionProfileTotals({})
+  setSessionProfilesTruncated({})
   setCronSessions([])
   setMessagingSessions([])
   setMessagingPlatformTotals({})
@@ -62,6 +61,10 @@ export function wipeSessionListsForGatewaySwitch(): void {
   setSelectedStoredSessionId(null)
   setMessages([])
   setFreshDraftReady(true)
+
+  // Artifacts are keyed by sessions on the previous backend, so both the
+  // registry and any rail tab pointing into it go with them.
+  clearArtifactRegistry()
 
   // Narrowed: account/marketplace/onboarding caches are global, not gateway-
   // scoped, so a mode swap must not refetch them.

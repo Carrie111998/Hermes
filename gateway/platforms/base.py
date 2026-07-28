@@ -2693,6 +2693,30 @@ class BasePlatformAdapter(ABC):
         """
         return len
 
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        """Per-chat max message length, in ``message_len_fn_for_chat`` units.
+
+        Default: the adapter-scalar ``MAX_MESSAGE_LENGTH`` (4096 when absent) —
+        for a native adapter every chat lives on the same platform so the
+        scalar is already correct. The relay adapter overrides this: one relay
+        adapter fronts N platforms with different caps (Discord 2000 vs
+        Telegram 4096 vs Slack 39000), and the right cap depends on which
+        platform the chat's inbound arrived from.
+        """
+        try:
+            return int(getattr(self, "MAX_MESSAGE_LENGTH", 4096) or 4096)
+        except (TypeError, ValueError):
+            return 4096
+
+    def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
+        """Per-chat length function (companion to max_message_length_for_chat).
+
+        Default: the adapter-wide ``message_len_fn``. The relay adapter
+        overrides it so a Telegram-fronted chat measures UTF-16 units while a
+        Discord-fronted chat on the same adapter measures codepoints.
+        """
+        return self.message_len_fn
+
     @property
     def enforces_own_access_policy(self) -> bool:
         """Whether this adapter gates inbound access before dispatch.
@@ -6049,6 +6073,12 @@ class BasePlatformAdapter(ABC):
         self._background_tasks.clear()
         self._expected_cancelled_tasks.clear()
         self._session_tasks.clear()
+        # Flush pending messages to disk before clearing (#72680).
+        try:
+            from gateway.shutdown_flush import flush_pending_to_file
+            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+        except Exception:
+            pass
         self._pending_messages.clear()
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
