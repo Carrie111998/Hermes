@@ -6883,6 +6883,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 agent, context="shutdown finalize"
             )
 
+    def _preserve_pending_messages_on_shutdown(self) -> None:
+        """Best-effort dump of unpersisted pending messages before teardown.
+
+        Guards against silent data loss when the session SQLite/FTS store is
+        corrupt (#72680): messages that could not be written to disk live only
+        in ``self._pending_messages`` (memory=N, disk=0). The normal shutdown
+        path calls ``self._pending_messages.clear()`` unconditionally, which
+        destroys them. Instead of losing them, we serialize a recovery snapshot
+        to a JSON file outside the broken DB so an operator can salvage the
+        conversations after repairing state.db.
+
+        Failures here are non-fatal — shutdown must never block on a best-effort
+        backup, so every step is individually guarded.
+        """
+        pending = getattr(self, "_pending_messages", None)
+        if not pending:
+            return
+        try:
+            import json
+            import os
+            from datetime import datetime, timezone
+
+            hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+            out_dir = os.path.join(hermes_home, "shutdown-recovery")
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            out_path = os.path.join(out_dir, f"pending_messages_{stamp}.json")
+            snapshot: dict = {}
+            for _key, _evt in pending.items():
+                try:
+                    snapshot[_key] = _evt if isinstance(_evt, (dict, list, str, int, float, bool, type(None))) else str(_evt)
+                except Exception:
+                    continue
+            with open(out_path, "w", encoding="utf-8") as _fh:
+                json.dump(
+                    {
+                        "reason": "shutdown-with-unpersisted-messages",
+                        "issue": "#72680",
+                        "count": len(snapshot),
+                        "messages": snapshot,
+                    },
+                    _fh,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            logger.warning(
+                "Preserved %d unpersisted pending message(s) to %s "
+                "(possible FTS corruption — recover after repairing state.db)",
+                len(snapshot),
+                out_path,
+            )
+        except Exception as _e:
+            logger.debug("Pending-message shutdown preservation skipped: %s", _e)
+
     def _should_emit_long_running_notification(
         self,
         session_key: Optional[str],
@@ -9943,6 +9997,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts.clear()
             if hasattr(self, "_active_session_leases"):
                 self._active_session_leases.clear()
+            # Best-effort preservation of unpersisted messages before teardown.
+            # When the FTS/SQLite index is corrupt (#72680), messages accumulate
+            # in _pending_messages (disk=0, memory=N) and a plain .clear() here
+            # discards them permanently. Serialize to an external JSON file so
+            # an operator can recover them after fixing the DB, instead of
+            # losing them silently.
+            self._preserve_pending_messages_on_shutdown()
             self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
