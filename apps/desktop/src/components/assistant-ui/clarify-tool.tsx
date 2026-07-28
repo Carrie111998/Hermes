@@ -30,6 +30,7 @@ import {
   type ClarifyQuestion,
   type ClarifyRequest,
   clearClarifyRequest,
+  hasMalformedStructuredChoices,
   normalizeChoices,
   RECOMMENDED_LABEL,
   sessionClarifyRequest,
@@ -47,6 +48,7 @@ interface ClarifyArgs {
   choices?: string[] | null
   multiSelect?: boolean
   questions?: { question: string; choices?: string[] | null; multiSelect?: boolean }[]
+  choicesMalformed?: boolean
 }
 
 interface ClarifyResult {
@@ -69,10 +71,11 @@ function readClarifyArgs(args: unknown): ClarifyArgs {
   const row = parseMaybeObject(args)
   const rawChoices = row.choices
   const choices = normalizeChoices(rawChoices)
+  const choicesMalformed = hasMalformedStructuredChoices(rawChoices, choices)
 
   const question = stringField(row, 'question')
 
-  if (rawChoices != null && choices.length === 0 && question) {
+  if (choicesMalformed && question) {
     warnDroppedChoices('tool_args', question, rawChoices)
   }
 
@@ -109,7 +112,8 @@ function readClarifyArgs(args: unknown): ClarifyArgs {
     question,
     choices: choices.length > 0 ? choices : null,
     multiSelect: row.multi_select === true,
-    questions
+    questions,
+    choicesMalformed
   }
 }
 
@@ -435,6 +439,7 @@ function ClarifyToolSinglePending({
 
   const hasChoices = choices.length > 0
   const multiSelect = hasChoices && Boolean(matchingRequest?.multiSelect ?? fromArgs.multiSelect)
+  const choicesMalformed = Boolean(fromArgs.choicesMalformed || matchingRequest?.choicesMalformed)
 
   const [draft, setDraft] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -689,6 +694,27 @@ function ClarifyToolSinglePending({
     return (
       <ClarifyShell aria-label={copy.loadingQuestion} className="my-1.5 grid min-h-12 place-items-center" role="status">
         <Loader2 aria-hidden className="size-4 animate-spin text-(--ui-text-tertiary)" />
+      </ClarifyShell>
+    )
+  }
+
+  if (choicesMalformed) {
+    return (
+      <ClarifyShell className="grid gap-2 px-2.5 py-2" data-clarify-malformed="">
+        <div className="flex items-start gap-2">
+          <span className="flex-1 whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
+            {question}
+          </span>
+          <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
+        </div>
+        <p className="text-sm text-destructive" role="alert">
+          {copy.invalidChoices}
+        </p>
+        <div className="flex justify-end">
+          <Button disabled={submitting} onClick={() => void respond('')} size="xs" type="button" variant="text">
+            {copy.skip}
+          </Button>
+        </div>
       </ClarifyShell>
     )
   }
