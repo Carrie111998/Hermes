@@ -7,6 +7,7 @@ packet processing pipeline end-to-end.
 Requires: PyNaCl>=1.5.0, discord.py[voice] (opus codec)
 """
 
+import math
 import struct
 import time
 import pytest
@@ -132,6 +133,39 @@ def _make_voice_receiver(secret_key, dave_session=None, bot_ssrc=9999,
     receiver = VoiceReceiver(vc, allowed_user_ids=allowed_user_ids)
     receiver.start()
     return receiver
+
+
+def _opus_tone_payloads(frame_count=30, amplitude=1000, frequency=440.0):
+    """Encode deterministic speech-energy PCM through the real Opus codec."""
+    encoder = discord.opus.Encoder()
+    payloads = []
+    samples_per_frame = discord.opus.Encoder.SAMPLES_PER_FRAME
+    for frame_index in range(frame_count):
+        pcm = bytearray()
+        for sample_offset in range(samples_per_frame):
+            sample_index = frame_index * samples_per_frame + sample_offset
+            sample = round(
+                amplitude
+                * math.sin(2 * math.pi * frequency * sample_index / 48000)
+            )
+            pcm.extend(struct.pack("<hh", sample, sample))
+        payloads.append(encoder.encode(bytes(pcm), samples_per_frame))
+    return payloads
+
+
+def _send_opus_tone(receiver, secret_key, ssrc, frame_count=30, seq_start=1):
+    for seq, opus_payload in enumerate(
+        _opus_tone_payloads(frame_count=frame_count), start=seq_start,
+    ):
+        receiver._on_packet(
+            _build_encrypted_rtp_packet(
+                secret_key,
+                opus_payload,
+                ssrc=ssrc,
+                seq=seq,
+                timestamp=960 * seq,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -365,32 +399,26 @@ class TestRTPPaddingStrip:
 class TestFullVoiceFlow:
     """End-to-end: encrypt → receive → buffer → silence detect → complete."""
 
-    def test_single_utterance_flow(self):
-        """Encrypt packets → buffer → silence → check_silence returns utterance."""
+    def test_join_warmup_opus_silence_is_rejected(self):
+        """Real encrypted Opus comfort frames never become an STT utterance."""
         key = _make_secret_key()
         receiver = _make_voice_receiver(key)
         receiver.map_ssrc(100, 42)
 
-        # Send enough packets to exceed MIN_SPEECH_DURATION (0.5s)
-        # At 48kHz stereo 16-bit, each Opus silence frame decodes to ~3840 bytes
-        # Need 96000 bytes = ~25 frames
         for seq in range(1, 30):
             packet = _build_encrypted_rtp_packet(
                 key, b'\xf8\xff\xfe', ssrc=100, seq=seq, timestamp=960 * seq
             )
             receiver._on_packet(packet)
 
-        # Simulate silence by setting last_packet_time in the past
         receiver._last_packet_time[100] = time.monotonic() - 3.0
 
         completed = receiver.check_silence()
-        assert len(completed) == 1
-        user_id, pcm_data = completed[0]
-        assert user_id == 42
-        assert len(pcm_data) > 0
+        assert completed == []
+        assert len(receiver._buffers[100]) == 0
 
     def test_utterance_with_ssrc_automap(self):
-        """No SPEAKING event → auto-map sole allowed user → utterance processed."""
+        """First real Opus utterance survives the gate and SSRC auto-map."""
         key = _make_secret_key()
         members = [
             SimpleNamespace(id=9999, name="Bot"),
@@ -401,9 +429,9 @@ class TestFullVoiceFlow:
         )
         # No map_ssrc call — simulating missing SPEAKING event
 
-        for seq in range(1, 30):
+        for seq, opus_payload in enumerate(_opus_tone_payloads(), start=1):
             packet = _build_encrypted_rtp_packet(
-                key, b'\xf8\xff\xfe', ssrc=100, seq=seq, timestamp=960 * seq
+                key, opus_payload, ssrc=100, seq=seq, timestamp=960 * seq
             )
             receiver._on_packet(packet)
 
@@ -502,11 +530,7 @@ class TestSPEAKINGHook:
         receiver = _make_voice_receiver(key)
         receiver.map_ssrc(100, 42)
 
-        for seq in range(1, 30):
-            packet = _build_encrypted_rtp_packet(
-                key, b'\xf8\xff\xfe', ssrc=100, seq=seq, timestamp=960 * seq
-            )
-            receiver._on_packet(packet)
+        _send_opus_tone(receiver, key, ssrc=100)
 
         receiver._last_packet_time[100] = time.monotonic() - 3.0
         completed = receiver.check_silence()
@@ -529,11 +553,7 @@ class TestAuthFiltering:
         )
         receiver.map_ssrc(100, 42)
 
-        for seq in range(1, 30):
-            packet = _build_encrypted_rtp_packet(
-                key, b'\xf8\xff\xfe', ssrc=100, seq=seq, timestamp=960 * seq
-            )
-            receiver._on_packet(packet)
+        _send_opus_tone(receiver, key, ssrc=100)
 
         receiver._last_packet_time[100] = time.monotonic() - 3.0
         completed = receiver.check_silence()
@@ -553,11 +573,7 @@ class TestAuthFiltering:
         )
         # No map_ssrc — SSRC unknown, auto-map should reject
 
-        for seq in range(1, 30):
-            packet = _build_encrypted_rtp_packet(
-                key, b'\xf8\xff\xfe', ssrc=100, seq=seq, timestamp=960 * seq
-            )
-            receiver._on_packet(packet)
+        _send_opus_tone(receiver, key, ssrc=100)
 
         receiver._last_packet_time[100] = time.monotonic() - 3.0
         completed = receiver.check_silence()
@@ -574,11 +590,7 @@ class TestAuthFiltering:
             key, allowed_user_ids=None, members=members,
         )
 
-        for seq in range(1, 30):
-            packet = _build_encrypted_rtp_packet(
-                key, b'\xf8\xff\xfe', ssrc=100, seq=seq, timestamp=960 * seq
-            )
-            receiver._on_packet(packet)
+        _send_opus_tone(receiver, key, ssrc=100)
 
         receiver._last_packet_time[100] = time.monotonic() - 3.0
         completed = receiver.check_silence()
@@ -621,11 +633,7 @@ class TestRejoinFlow:
         receiver2 = _make_voice_receiver(key)
         receiver2.map_ssrc(200, 42)  # new SSRC after rejoin
 
-        for seq in range(1, 30):
-            packet = _build_encrypted_rtp_packet(
-                key, b'\xf8\xff\xfe', ssrc=200, seq=seq, timestamp=960 * seq
-            )
-            receiver2._on_packet(packet)
+        _send_opus_tone(receiver2, key, ssrc=200)
 
         receiver2._last_packet_time[200] = time.monotonic() - 3.0
         completed = receiver2.check_silence()
@@ -653,11 +661,7 @@ class TestRejoinFlow:
         )
         # No map_ssrc — simulating missing SPEAKING event
 
-        for seq in range(1, 30):
-            packet = _build_encrypted_rtp_packet(
-                new_key, b'\xf8\xff\xfe', ssrc=300, seq=seq, timestamp=960 * seq
-            )
-            receiver2._on_packet(packet)
+        _send_opus_tone(receiver2, new_key, ssrc=300)
 
         receiver2._last_packet_time[300] = time.monotonic() - 3.0
         completed = receiver2.check_silence()
@@ -748,11 +752,7 @@ class TestEchoPreventionFlow:
         assert len(receiver._buffers.get(100, b"")) == 0
 
         receiver.resume()
-        for seq in range(5, 35):
-            packet = _build_encrypted_rtp_packet(
-                key, b'\xf8\xff\xfe', ssrc=100, seq=seq, timestamp=960 * seq
-            )
-            receiver._on_packet(packet)
+        _send_opus_tone(receiver, key, ssrc=100, seq_start=5)
 
         assert len(receiver._buffers[100]) > 0
         receiver._last_packet_time[100] = time.monotonic() - 3.0

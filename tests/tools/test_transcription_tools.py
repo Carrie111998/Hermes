@@ -484,6 +484,25 @@ class TestTranscribeOpenAIExtended:
         assert result["transcript"] == "hello"
         mock_client.close.assert_called_once()
 
+    def test_provider_language_hint_is_forwarded(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+        monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = {"text": "bonjour"}
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client), \
+             patch(
+                 "tools.transcription_tools._load_stt_config",
+                 return_value={"openai": {"language": "fr"}},
+             ):
+            from tools.transcription_tools import _transcribe_openai
+            result = _transcribe_openai(sample_wav, "gpt-4o-transcribe")
+
+        assert result["success"] is True
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["language"] == "fr"
+
     def test_permission_error(self, monkeypatch, sample_wav):
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
 
