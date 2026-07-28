@@ -400,10 +400,11 @@ platforms:
     reply_to_mode: "first"
 
     extra:
-      # Whether to reply in a thread (default: true).
-      # When false, channel messages get direct channel replies instead
-      # of threads. Messages inside existing threads still reply in-thread.
-      reply_in_thread: true
+      # Where top-level channel replies appear (default: true).
+      # true: always start a thread; false: always reply in the channel;
+      # auto: keep short conversation in-channel and thread involved requests.
+      # Messages inside existing threads always remain in-thread.
+      reply_in_thread: auto
 
       # Also post thread replies to the main channel
       # (Slack's "Also send to channel" feature).
@@ -450,7 +451,7 @@ platforms:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `platforms.slack.reply_to_mode` | `"first"` | Threading mode for multi-part messages: `"off"`, `"first"`, or `"all"` |
-| `platforms.slack.extra.reply_in_thread` | `true` | When `false`, channel messages get direct replies instead of threads. Messages inside existing threads still reply in-thread. |
+| `platforms.slack.extra.reply_in_thread` | `true` | Top-level channel reply surface. `true` always starts a thread, `false` always replies in-channel, and `"auto"` keeps compact conversation in-channel while routing explicit thread requests and clearly involved incoming prompts (analysis, debugging, planning, multi-part/code-heavy requests) into a thread. Explicit “reply here” / “thread this” directions win. Messages inside existing threads always remain in-thread. |
 | `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |
 | `platforms.slack.extra.rich_blocks` | `false` | When `true`, agent messages are rendered as [Block Kit](https://docs.slack.dev/block-kit/) blocks (headers, dividers, true nested lists, and native tables). A plain-text fallback is always sent. Tables over Slack's limits fall back to aligned monospace. No app reinstall required — it's a send-side change only. |
 | `platforms.slack.extra.feedback_buttons` | `false` | When `true` with `rich_blocks`, appends Slack-native feedback controls to final replies. |

@@ -650,6 +650,28 @@ def _resolve_progress_thread_id(
     return None
 
 
+def _slack_progress_uses_thread(
+    reply_in_thread: Any,
+    source_thread_id: Any,
+) -> bool:
+    """Match Slack progress routing to the adapter's configured reply mode.
+
+    Adaptive routing records its per-message decision in ``source.thread_id``:
+    thread-worthy and existing-thread turns carry an ID, while conversational
+    in-channel turns do not. Legacy boolean and string forms retain their
+    existing meaning.
+    """
+    if isinstance(reply_in_thread, bool):
+        return reply_in_thread
+    value = str(reply_in_thread if reply_in_thread is not None else "true")
+    value = value.strip().lower()
+    if value == "auto":
+        return source_thread_id is not None
+    if value in {"false", "off", "no", "0", "channel"}:
+        return False
+    return True
+
+
 def _has_platform_display_override(user_config: dict, platform_key: str, setting: str) -> bool:
     """Return True when display.platforms.<platform> explicitly sets setting."""
     display = user_config.get("display") if isinstance(user_config, dict) else None
@@ -20905,10 +20927,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _slack_adapter_for_progress = self._adapter_for_source(source)
             if _slack_adapter_for_progress is not None:
                 try:
-                    _progress_reply_in_thread = bool(
+                    _progress_reply_in_thread = _slack_progress_uses_thread(
                         _slack_adapter_for_progress.config.extra.get(
                             "reply_in_thread", True
-                        )
+                        ),
+                        source.thread_id,
                     )
                 except Exception:
                     _progress_reply_in_thread = True
