@@ -1,7 +1,7 @@
 ---
 name: workflow-engine
-description: "Use when creating or running multi-agent DAG pipelines with workflow_start — fire-and-forget orchestration across agents."
-version: 3.0.0
+description: "Use when running multi-agent DAG pipelines via workflow_start — fire-and-forget orchestration across agents."
+version: 3.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -45,7 +45,7 @@ workflow_start(
     context={"topic": "Should we adopt X?"},
     inputs={"detail_level": "deep"},
     board="my-board",  # optional board override
-    attachments=["/path/to/design.png"],
+    attachments={"/path/to/design.png"},
 )
 ```
 
