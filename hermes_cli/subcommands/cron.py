@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
 
 
@@ -39,6 +40,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id",
     )
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
+    cron_create.add_argument(
+        "--reasoning-effort",
+        choices=("none", *VALID_REASONING_EFFORTS),
+        help="Optional per-job reasoning effort override",
+    )
     cron_create.add_argument(
         "--skill",
         dest="skills",
@@ -81,6 +87,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
+    cron_edit.add_argument(
+        "--reasoning-effort",
+        choices=("none", *VALID_REASONING_EFFORTS, "default"),
+        help="Per-job reasoning effort override. Use 'default' to clear it.",
+    )
     cron_edit.add_argument(
         "--skill",
         dest="skills",

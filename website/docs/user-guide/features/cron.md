@@ -49,6 +49,8 @@ hermes cron create "every 1h" "Use both skills and combine the result" \
   --skill blogwatcher \
   --skill maps \
   --name "Skill combo"
+hermes cron create "every 6h" "Review error logs and summarize anomalies" \
+  --reasoning-effort low
 ```
 
 ### Through natural conversation
@@ -152,6 +154,8 @@ hermes cron edit <job_id> --skill blogwatcher --skill maps
 hermes cron edit <job_id> --add-skill maps
 hermes cron edit <job_id> --remove-skill blogwatcher
 hermes cron edit <job_id> --clear-skills
+hermes cron edit <job_id> --reasoning-effort high
+hermes cron edit <job_id> --reasoning-effort default
 ```
 
 Notes:
@@ -160,6 +164,8 @@ Notes:
 - `--add-skill` appends to the existing list without replacing it
 - `--remove-skill` removes specific attached skills
 - `--clear-skills` removes all attached skills
+- `--reasoning-effort` is optional on the standalone CLI; accepted values stay in sync with the levels Hermes exposes globally, plus `none`
+- on `edit`, `--reasoning-effort default` clears the per-job override and falls back to configured reasoning
 
 ## Lifecycle actions
 
@@ -523,6 +529,31 @@ Outputs are concatenated in the order listed.
 - Multi-stage pipelines (collect → filter → format → deliver)
 - Dependent tasks where step N's work depends on step N−1's output
 - Fan-out/fan-in patterns where one job aggregates results from several others
+
+## Model and reasoning overrides
+
+Cron jobs normally inherit the global model/provider and the configured reasoning for their effective model from `~/.hermes/config.yaml`, but you can override them per job through the `cronjob` tool's `model` object. You can send only `model.reasoning_effort` if you just want to change the thinking level without pinning a different model.
+
+```python
+cronjob(
+    action="create",
+    prompt="Summarize new issues and PRs.",
+    schedule="every 2h",
+    model={
+        "provider": "openrouter",
+        "model": "openai/gpt-5",
+        "reasoning_effort": "low",
+    },
+)
+```
+
+Notes:
+
+- omit `model.reasoning_effort` to inherit configured reasoning, including any per-model override
+- set `model.reasoning_effort="none"` to disable reasoning for that job
+- accepted enabled levels stay in sync with Hermes' canonical reasoning-effort list
+- on `action="update"`, set `model.reasoning_effort="default"` to clear the per-job override and fall back to config again
+- if you set `model.model` without `model.provider`, Hermes pins the current main provider when the job is created so future runs stay stable
 
 ## Provider recovery
 

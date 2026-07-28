@@ -158,6 +158,9 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        reasoning_effort = job.get("reasoning_effort")
+        if reasoning_effort:
+            print(f"    Thinking:  {reasoning_effort}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
         workdir = job.get("workdir")
@@ -345,6 +348,7 @@ def cron_create(args):
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
@@ -366,6 +370,8 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("reasoning_effort"):
+        print(f"  Thinking: {job_data['reasoning_effort']}")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -409,6 +415,7 @@ def cron_edit(args):
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
         skills=final_skills,
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
@@ -432,6 +439,8 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("reasoning_effort"):
+        print(f"  Thinking: {updated['reasoning_effort']}")
     return 0
 
 

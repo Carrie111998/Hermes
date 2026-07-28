@@ -1,5 +1,6 @@
 """Tests for hermes_cli.cron command handling."""
 
+import argparse
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -8,6 +9,30 @@ import pytest
 from cron.jobs import create_job, get_job, list_jobs
 from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
+from hermes_cli.subcommands.cron import build_cron_parser
+
+
+def _build_cron_parser():
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_cron_parser(subparsers, cmd_cron=lambda args: args)
+    return parser
+
+
+def test_cron_parser_accepts_canonical_reasoning_efforts_and_default_clear():
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    parser = _build_cron_parser()
+    for effort in ("none", *VALID_REASONING_EFFORTS):
+        args = parser.parse_args(
+            ["cron", "create", "every 1h", "Check", "--reasoning-effort", effort]
+        )
+        assert args.reasoning_effort == effort
+
+    args = parser.parse_args(
+        ["cron", "edit", "job-1", "--reasoning-effort", "default"]
+    )
+    assert args.reasoning_effort == "default"
 
 
 @pytest.fixture()
@@ -351,6 +376,7 @@ def test_cron_create_success_prints_job_details(monkeypatch, capsys):
                 "script": "scripts/build_docs.py",
                 "no_agent": True,
                 "workdir": "/tmp/repo",
+                "reasoning_effort": "max",
             },
         },
     )
@@ -378,6 +404,7 @@ def test_cron_create_success_prints_job_details(monkeypatch, capsys):
     assert "Script: scripts/build_docs.py" in out
     assert "Mode: no-agent" in out
     assert "Workdir: /tmp/repo" in out
+    assert "Thinking: max" in out
     assert "Next run: 2026-06-01T00:00:00Z" in out
 
 

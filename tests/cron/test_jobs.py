@@ -251,6 +251,26 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_create_persists_normalized_reasoning_effort(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Check server status",
+            schedule="every 1h",
+            reasoning_effort=" MAX ",
+        )
+
+        assert job["reasoning_effort"] == "max"
+        assert get_job(job["id"])["reasoning_effort"] == "max"
+
+    def test_create_rejects_invalid_reasoning_effort(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="reasoning_effort must be one of"):
+            create_job(
+                prompt="Check server status",
+                schedule="every 1h",
+                reasoning_effort="turbo",
+            )
+
+        assert load_jobs() == []
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")
@@ -357,6 +377,27 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_normalizes_and_clears_reasoning_effort(self, tmp_cron_dir):
+        job = create_job(prompt="Check", schedule="every 1h")
+
+        updated = update_job(job["id"], {"reasoning_effort": " HIGH "})
+        assert updated["reasoning_effort"] == "high"
+
+        cleared = update_job(job["id"], {"reasoning_effort": None})
+        assert cleared["reasoning_effort"] is None
+
+    def test_update_rejects_invalid_reasoning_effort_without_mutating(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Check",
+            schedule="every 1h",
+            reasoning_effort="low",
+        )
+
+        with pytest.raises(ValueError, match="reasoning_effort must be one of"):
+            update_job(job["id"], {"reasoning_effort": "turbo"})
+
+        assert get_job(job["id"])["reasoning_effort"] == "low"
 
     def test_update_schedule(self, tmp_cron_dir):
         job = create_job(prompt="Daily report", schedule="every 1h")

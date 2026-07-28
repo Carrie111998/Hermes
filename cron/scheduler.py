@@ -3211,7 +3211,7 @@ def run_job(
 
         # Reasoning config is resolved after provider authentication so an auth
         # fallback can first replace the primary model with its configured model.
-        from hermes_constants import resolve_reasoning_config
+        from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
@@ -3336,9 +3336,23 @@ def run_job(
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        reasoning_config = resolve_reasoning_config(
-            _cfg if isinstance(_cfg, dict) else {}, str(model)
+        stored_effort = job.get("reasoning_effort")
+        stored_reasoning = parse_reasoning_effort(stored_effort)
+        has_stored_effort = stored_effort is False or (
+            stored_effort is not None and bool(str(stored_effort).strip())
         )
+        if has_stored_effort and stored_reasoning is not None:
+            reasoning_config = stored_reasoning
+        else:
+            if has_stored_effort:
+                logger.warning(
+                    "Job '%s': invalid stored reasoning_effort %r; inheriting configured level",
+                    job_id,
+                    stored_effort,
+                )
+            reasoning_config = resolve_reasoning_config(
+                _cfg if isinstance(_cfg, dict) else {}, str(model)
+            )
 
         # Provider/model-drift fail-closed guard (#44585).
         #

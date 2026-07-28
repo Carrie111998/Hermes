@@ -1195,6 +1195,58 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("stored_effort", "global_effort", "expected"),
+        [
+            ("low", "high", {"enabled": True, "effort": "low"}),
+            ("none", "high", {"enabled": False}),
+            ("turbo", "high", {"enabled": True, "effort": "high"}),
+            (None, False, {"enabled": False}),
+        ],
+    )
+    def test_run_job_reasoning_override_precedence(
+        self, tmp_path, stored_effort, global_effort, expected
+    ):
+        import yaml
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"agent": {"reasoning_effort": global_effort}}),
+            encoding="utf-8",
+        )
+        job = {
+            "id": "reasoning-job",
+            "name": "reasoning",
+            "prompt": "hello",
+        }
+        if stored_effort is not None:
+            job["reasoning_effort"] = stored_effort
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["reasoning_config"] == expected
+
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
         For cron, that abnormal-empty explainer must be treated as empty so it
