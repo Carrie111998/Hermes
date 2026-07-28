@@ -938,7 +938,6 @@ def test_claude_visibility_delayed_indexing_polls_after_one_real_registrar_launc
     item = _registrar_claim()
     factory = _ClaudeFactory()
     source = _ClaudeSource([None, _registrar_projection(item)])
-    ticks = iter([0.0, 0.0, 0.1, 0.1])
     result = ClaudeNativeRegistrar(
         _ClaudeStore(),
         source,
@@ -946,7 +945,7 @@ def test_claude_visibility_delayed_indexing_polls_after_one_real_registrar_launc
         startup_theme="light",
         pty_factory=factory,
         clock=lambda: 100.0,
-        monotonic=lambda: next(ticks),
+        monotonic=lambda: 0.0,
         sleep=lambda _seconds: None,
         discovery_timeout=1.0,
     ).process(item)

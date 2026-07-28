@@ -3669,7 +3669,8 @@ def main(
                     codex_thread_id=args.codex_thread_id,
                     expected_error_code=args.expected_error_code,
                     confirmation=args.confirm,
-                )
+                ),
+                expected_error_code=args.expected_error_code,
             )
             _emit(payload)
             return EXIT_OK
@@ -4537,7 +4538,11 @@ def _public_sidebar_hydration_status(
     }
 
 
-def _public_sidebar_bound_retry_result(raw: Mapping[str, Any]) -> dict[str, Any]:
+def _public_sidebar_bound_retry_result(
+    raw: Mapping[str, Any],
+    *,
+    expected_error_code: str,
+) -> dict[str, Any]:
     status = raw.get("status")
     state = raw.get("state")
     job_id = raw.get("job_id")
@@ -4545,13 +4550,14 @@ def _public_sidebar_bound_retry_result(raw: Mapping[str, Any]) -> dict[str, Any]
     if (
         status != "requeued"
         or state != SidebarJobState.RETRY.value
-        or raw.get("error_code")
+        or expected_error_code
         not in {
             "native_task_not_indexed",
             "codex_thread_conflict",
             "native_create_ambiguous",
             "marker_conflict",
         }
+        or raw.get("error_code") != expected_error_code
         or not isinstance(job_id, str)
         or re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
         or not isinstance(thread_id, str)

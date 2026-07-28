@@ -51,6 +51,49 @@ class _Pending:
     sent_at: float = field(default_factory=time.time)
 
 
+def _terminate_app_server_process(
+    process: Any,
+    *,
+    timeout: float,
+    platform: str = os.name,
+) -> None:
+    """Terminate the exact app-server process tree and reap its root."""
+
+    if process.poll() is not None:
+        process.wait(timeout=max(0.1, timeout))
+        return
+    if platform == "nt":
+        try:
+            subprocess.run(
+                [
+                    "taskkill",
+                    "/PID",
+                    str(process.pid),
+                    "/T",
+                    "/F",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(0.1, timeout),
+                check=False,
+            )
+            process.wait(timeout=max(0.1, min(timeout, 1.0)))
+            if process.poll() is not None:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        process.terminate()
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=1.0)
+        except Exception:
+            pass
+
+
 class CodexAppServerClient:
     """Minimal JSON-RPC 2.0 client for `codex app-server` over stdio.
 
@@ -187,15 +230,7 @@ class CodexAppServerClient:
                 self._proc.stdin.close()
         except Exception:
             pass
-        try:
-            self._proc.terminate()
-            self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                self._proc.kill()
-                self._proc.wait(timeout=1.0)
-            except Exception:
-                pass
+        _terminate_app_server_process(self._proc, timeout=timeout)
 
     def __enter__(self) -> "CodexAppServerClient":
         return self

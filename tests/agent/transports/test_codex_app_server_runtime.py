@@ -143,6 +143,53 @@ class TestCodexAppServerModule:
         assert "-32600" in str(err)
 
 
+class TestCodexAppServerShutdown:
+    def test_windows_shutdown_kills_the_exact_process_tree(self, monkeypatch) -> None:
+        from agent.transports import codex_app_server as cas
+
+        calls: list[list[str]] = []
+
+        class FakeProcess:
+            pid = 4242
+
+            def __init__(self) -> None:
+                self.exited = False
+                self.terminated = False
+
+            def poll(self):
+                return 0 if self.exited else None
+
+            def wait(self, timeout=None):
+                assert timeout is not None
+                if not self.exited:
+                    raise AssertionError("tree kill did not settle the root process")
+                return 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                raise AssertionError("tree kill should not need root-only fallback")
+
+        process = FakeProcess()
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            assert kwargs["stdin"] is cas.subprocess.DEVNULL
+            assert kwargs["stdout"] is cas.subprocess.DEVNULL
+            assert kwargs["stderr"] is cas.subprocess.DEVNULL
+            assert kwargs["check"] is False
+            process.exited = True
+            return object()
+
+        monkeypatch.setattr(cas.subprocess, "run", fake_run)
+
+        cas._terminate_app_server_process(process, timeout=3.0, platform="nt")
+
+        assert calls == [["taskkill", "/PID", "4242", "/T", "/F"]]
+        assert process.terminated is False
+
+
 class TestSpawnEnvIsolation:
     """The codex spawn must NOT rewrite HOME — codex's shell tool spawns
     subprocesses (gh, git, npm, aws, gcloud, ...) that need to find their
