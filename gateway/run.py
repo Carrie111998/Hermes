@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
@@ -22136,6 +22137,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.get_pending_message(session_key)  # consume and discard
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
+        # The adapter slot above holds only the FIFO head; the tail lives in
+        # ``_queued_events``.  Without clearing it, /stop and /new dropped the
+        # head and let the overflow drain on its own — a session that keeps
+        # running after "⚡ Stopped." (#73060).  Discard the whole chain so the
+        # queue means one thing for the entire session.  ``_queued_events`` is
+        # a SessionState-backed ``MutableMapping`` view (legacy_dict_property),
+        # not a plain dict, so match the mapping protocol rather than ``dict``.
+        queued_events = getattr(self, "_queued_events", None)
+        if isinstance(queued_events, MutableMapping):
+            queued_events.pop(session_key, None)
         if release_running_state:
             self._release_running_agent_state(session_key)
             # Evict the cached agent: ``_interrupt_requested`` is only
