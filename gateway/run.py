@@ -10221,11 +10221,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "'open'."
             )
 
+        from gateway.platform_registry import platform_registry
+
+        def platform_config_binds_port(platform, platform_config) -> bool:
+            registry_entry = platform_registry.get(platform.value)
+            plugin_binds_port = bool(
+                registry_entry
+                and registry_entry.is_port_binding_fn
+                and registry_entry.is_port_binding_fn(platform_config)
+            )
+            return (
+                _platform_binds_port(platform.value, platform_config.extra)
+                or plugin_binds_port
+            )
+
         port_binding_platforms = sorted(
             platform.value
             for platform, platform_config in profile_cfg.platforms.items()
             if platform_config.enabled
-            and _platform_binds_port(platform.value, platform_config.extra)
+            and platform_config_binds_port(platform, platform_config)
         )
         if port_binding_platforms:
             joined = ", ".join(port_binding_platforms)
