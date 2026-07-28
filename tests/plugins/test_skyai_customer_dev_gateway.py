@@ -1431,6 +1431,281 @@ async def test_mirror_voice_to_discord_posts_to_configured_channel(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_real_only_mirror_rejects_body_origin_class_without_server_provenance(tmp_path: Path, monkeypatch) -> None:
+    posted_channels: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        if content.startswith("SkyAI v2 разговор"):
+            posted_channels.append(channel_id)
+        return {"id": f"starter-{channel_id}"}
+
+    def fake_start_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, str]:
+        return {"id": f"thread-{channel_id}"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+    monkeypatch.setattr(dev_gateway, "_discord_start_thread_from_message", fake_start_thread)
+
+    result = await dev_gateway.mirror_to_discord(
+        {"conversation_id": "real-body-only", "message": "Здравей", "origin_class": "real"},
+        {"status": "ok", "conversation_id": "real-body-only", "reply": "Здравей", "trace": {}},
+        settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_real_customer_channel_id="1531414670844367000",
+            discord_mirror_create_threads=True,
+            discord_mirror_thread_store=tmp_path / "threads.json",
+        ),
+    )
+
+    assert result["status"] == "posted"
+    assert result["real_customer_mirror"] == {"status": "skipped", "reason": "untrusted_provenance"}
+    assert posted_channels == ["1510888721614901358"]
+
+
+@pytest.mark.asyncio
+async def test_real_only_mirror_accepts_exact_server_observed_production_origin(tmp_path: Path, monkeypatch) -> None:
+    posted_channels: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        if content.startswith("SkyAI v2 разговор"):
+            posted_channels.append(channel_id)
+        return {"id": f"starter-{channel_id}"}
+
+    def fake_start_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, str]:
+        return {"id": f"thread-{channel_id}"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+    monkeypatch.setattr(dev_gateway, "_discord_start_thread_from_message", fake_start_thread)
+
+    result = await dev_gateway.mirror_to_discord(
+        {
+            "conversation_id": "prod-real-1",
+            "message": "Искам подарък",
+            "_server_request_provenance": {"origin": "https://www.skyvision.bg", "referer": "https://www.skyvision.bg/podaruk/"},
+        },
+        {"status": "ok", "conversation_id": "prod-real-1", "reply": "Имаме идеи", "trace": {}},
+        settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_real_customer_channel_id="1531414670844367000",
+            discord_mirror_create_threads=True,
+            discord_mirror_thread_store=tmp_path / "threads.json",
+        ),
+    )
+
+    assert result["status"] == "posted"
+    assert result["channel_id"] == "1510888721614901358"
+    assert result["real_customer_mirror"]["status"] == "posted"
+    assert result["real_customer_mirror"]["channel_id"] == "1531414670844367000"
+    assert posted_channels == ["1510888721614901358", "1531414670844367000"]
+
+
+@pytest.mark.asyncio
+async def test_real_only_mirror_test_marker_overrides_production_origin(tmp_path: Path, monkeypatch) -> None:
+    posted_channels: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        posted_channels.append(channel_id)
+        return {"id": f"starter-{channel_id}"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+
+    result = await dev_gateway.mirror_to_discord(
+        {
+            "conversation_id": "synthetic-prod-origin",
+            "message": "SMOKE",
+            "_server_request_provenance": {"origin": "https://skyvision.bg", "referer": "https://skyvision.bg/"},
+            "_server_test_signal": "synthetic_smoke",
+        },
+        {"status": "ok", "conversation_id": "synthetic-prod-origin", "reply": "OK", "trace": {}},
+        settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_real_customer_channel_id="1531414670844367000",
+            discord_mirror_create_threads=False,
+        ),
+    )
+
+    assert result["real_customer_mirror"] == {"status": "skipped", "reason": "explicit_test_signal"}
+    assert posted_channels == ["1510888721614901358"]
+
+
+@pytest.mark.parametrize(
+    "server_provenance",
+    [
+        {},
+        {"origin": "https://skyvision1.7s2go.com"},
+        {"referer": "https://dev.skyvision.bg/widget"},
+        {"origin": "http://localhost:8787"},
+        {"origin": "https://preview-skyvision.bg"},
+        {"origin": "https://evil.example", "referer": "https://skyvision.bg/"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_real_only_mirror_fails_closed_for_missing_unknown_dev_canary_or_ambiguous_origin(
+    tmp_path: Path,
+    monkeypatch,
+    server_provenance: dict[str, str],
+) -> None:
+    posted_channels: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        posted_channels.append(channel_id)
+        return {"id": f"message-{channel_id}"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+
+    result = await dev_gateway.mirror_to_discord(
+        {
+            "conversation_id": "closed-provenance",
+            "message": "Здравей",
+            "_server_request_provenance": server_provenance,
+        },
+        {"status": "ok", "conversation_id": "closed-provenance", "reply": "Здравей", "trace": {}},
+        settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_real_customer_channel_id="1531414670844367000",
+            discord_mirror_create_threads=False,
+        ),
+    )
+
+    assert result["real_customer_mirror"]["status"] == "skipped"
+    assert result["real_customer_mirror"]["reason"] in {"missing_provenance", "untrusted_provenance"}
+    assert posted_channels == ["1510888721614901358"]
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_state_is_independent_per_destination_channel(tmp_path: Path, monkeypatch) -> None:
+    started: list[tuple[str, str]] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        return {"id": f"starter-{channel_id}"}
+
+    def fake_start_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, str]:
+        started.append((channel_id, message_id))
+        return {"id": f"thread-{channel_id}"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+    monkeypatch.setattr(dev_gateway, "_discord_start_thread_from_message", fake_start_thread)
+    store_path = tmp_path / "threads.json"
+
+    await dev_gateway.mirror_to_discord(
+        {
+            "conversation_id": "same-conversation",
+            "message": "Здравей",
+            "_server_request_provenance": {"origin": "https://skyvision.bg"},
+        },
+        {"status": "ok", "conversation_id": "same-conversation", "reply": "Здравей", "trace": {}},
+        settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_real_customer_channel_id="1531414670844367000",
+            discord_mirror_create_threads=True,
+            discord_mirror_thread_store=store_path,
+        ),
+    )
+
+    mapping = json.loads(store_path.read_text(encoding="utf-8"))
+    assert mapping["chat:1510888721614901358:same-conversation"] == "thread-1510888721614901358"
+    assert mapping["chat:1531414670844367000:same-conversation"] == "thread-1531414670844367000"
+    assert started == [
+        ("1510888721614901358", "starter-1510888721614901358"),
+        ("1531414670844367000", "starter-1531414670844367000"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_retry_is_idempotent_separately_per_channel(tmp_path: Path, monkeypatch) -> None:
+    starter_posts: list[str] = []
+    thread_posts: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        if content.startswith("SkyAI v2 разговор"):
+            starter_posts.append(channel_id)
+        else:
+            thread_posts.append(channel_id)
+        return {"id": f"message-{channel_id}-{len(starter_posts) + len(thread_posts)}"}
+
+    def fake_start_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, str]:
+        return {"id": f"thread-{channel_id}"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+    monkeypatch.setattr(dev_gateway, "_discord_start_thread_from_message", fake_start_thread)
+    mirror_settings = settings(
+        tmp_path,
+        discord_mirror_enabled=True,
+        discord_mirror_bot_token="token",
+        discord_mirror_channel_id="1510888721614901358",
+        discord_mirror_real_customer_channel_id="1531414670844367000",
+        discord_mirror_create_threads=True,
+        discord_mirror_thread_store=tmp_path / "threads.json",
+    )
+    payload = {
+        "conversation_id": "retry-conversation",
+        "message": "Здравей",
+        "_server_request_provenance": {"origin": "https://skyvision.bg"},
+    }
+    response = {"status": "ok", "conversation_id": "retry-conversation", "reply": "Здравей", "trace": {}}
+
+    await dev_gateway.mirror_to_discord(payload, response, mirror_settings)
+    await dev_gateway.mirror_to_discord(payload, response, mirror_settings)
+
+    assert starter_posts == ["1510888721614901358", "1531414670844367000"]
+    assert thread_posts == [
+        "thread-1510888721614901358",
+        "thread-1531414670844367000",
+        "thread-1510888721614901358",
+        "thread-1531414670844367000",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_only_mirror_does_not_backfill_historical_thread_store(tmp_path: Path, monkeypatch) -> None:
+    store_path = tmp_path / "threads.json"
+    store_path.write_text(
+        json.dumps({"chat:1510888721614901358:historical-conversation": "old-thread"}),
+        encoding="utf-8",
+    )
+    posted_channels: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        posted_channels.append(channel_id)
+        return {"id": f"message-{channel_id}"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+
+    result = await dev_gateway.mirror_to_discord(
+        {"conversation_id": "new-test-conversation", "message": "SMOKE", "_server_test_signal": "synthetic_smoke"},
+        {"status": "ok", "conversation_id": "new-test-conversation", "reply": "OK", "trace": {}},
+        settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_real_customer_channel_id="1531414670844367000",
+            discord_mirror_create_threads=False,
+            discord_mirror_thread_store=store_path,
+        ),
+    )
+
+    mapping = json.loads(store_path.read_text(encoding="utf-8"))
+    assert result["real_customer_mirror"] == {"status": "skipped", "reason": "explicit_test_signal"}
+    assert "chat:1531414670844367000:historical-conversation" not in mapping
+    assert posted_channels == ["1510888721614901358"]
+
+
+@pytest.mark.asyncio
 async def test_build_compare_response_runs_dev_and_prod_sides(tmp_path: Path) -> None:
     async def fake_runner(message, history, conversation_id, canary_settings):
         return f"DEV: {message}"

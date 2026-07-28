@@ -129,6 +129,7 @@ def call_json(base_url: str, request: SmokeRequest, *, token: str, timeout: floa
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "SkyAI-Voice-Contract-Smoke/0.1",
+        "X-SkyAI-Test-Signal": "voice_contract_smoke",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"

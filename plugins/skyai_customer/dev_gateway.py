@@ -51,6 +51,13 @@ DISCORD_MESSAGE_LIMIT = 1900
 DISCORD_THREAD_NAME_LIMIT = 100
 DISCORD_TEST_THREAD_PREFIX = "🧪 TEST · "
 DISCORD_VOICE_THREAD_PREFIX = "🎙️ Voice SkyAI · "
+DISCORD_REAL_CUSTOMER_MIRROR_MARKER = "real_customer_mirror_v1"
+SKYVISION_PRODUCTION_HOSTS = frozenset({"skyvision.bg", "www.skyvision.bg"})
+SKYAI_TEST_SIGNAL_HEADERS = (
+    "X-SkyAI-Test-Signal",
+    "X-SkyAI-Synthetic-Smoke",
+    "X-SkyAI-Test",
+)
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
 MAX_VISIBLE_PRODUCT_CARDS = 3
 BUILD_COMMIT_ENV = "SKYAI_V2_BUILD_COMMIT"
@@ -151,6 +158,7 @@ class CanarySettings:
     discord_mirror_enabled: bool = False
     discord_mirror_bot_token: str = ""
     discord_mirror_channel_id: str = ""
+    discord_mirror_real_customer_channel_id: str = ""
     discord_mirror_create_threads: bool = False
     discord_mirror_thread_store: Path | None = None
     compare_prod_base_url: str = ""
@@ -473,6 +481,127 @@ def _is_test_host(host: str) -> bool:
         or "skyai-v2-dev-ingress" in host
         or "skyvision1-" in host
     )
+
+
+def _add_server_request_context(
+    payload: dict[str, Any],
+    request: "web.Request",
+) -> None:
+    """Replace client-asserted internal fields with HTTP-boundary observations."""
+
+    provenance = {}
+    for field, header in (("origin", "Origin"), ("referer", "Referer")):
+        value = request.headers.get(header)
+        if value:
+            provenance[field] = value
+    payload["_server_request_provenance"] = provenance
+
+    payload.pop("_server_test_signal", None)
+    for header in SKYAI_TEST_SIGNAL_HEADERS:
+        value = request.headers.get(header)
+        if value and value.strip():
+            payload["_server_test_signal"] = value
+            break
+
+
+def _real_customer_mirror_decision(payload: dict[str, Any]) -> dict[str, str]:
+    if _has_server_test_signal(payload.get("_server_test_signal")):
+        return {"status": "skipped", "reason": "explicit_test_signal"}
+
+    # Client/body signals can suppress a mirror, but can never prove that a
+    # request came from the production customer boundary.
+    if _has_client_test_signal(payload):
+        return {"status": "skipped", "reason": "client_test_signal"}
+
+    if "_server_request_provenance" not in payload:
+        return {"status": "skipped", "reason": "untrusted_provenance"}
+    provenance = payload.get("_server_request_provenance")
+    if not isinstance(provenance, dict):
+        return {"status": "skipped", "reason": "untrusted_provenance"}
+
+    observed_values = [
+        provenance.get(field)
+        for field in ("origin", "referer")
+        if provenance.get(field) not in (None, "")
+    ]
+    if not observed_values:
+        return {"status": "skipped", "reason": "missing_provenance"}
+
+    hosts: list[str] = []
+    for value in observed_values:
+        host = _normalized_absolute_http_host(value)
+        if not host:
+            return {"status": "skipped", "reason": "untrusted_provenance"}
+        hosts.append(host)
+    if len(set(hosts)) != 1 or hosts[0] not in SKYVISION_PRODUCTION_HOSTS:
+        return {"status": "skipped", "reason": "untrusted_provenance"}
+    return {"status": "eligible", "reason": "server_observed_production_host"}
+
+
+def _has_server_test_signal(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def _has_client_test_signal(payload: dict[str, Any]) -> bool:
+    metadata = _payload_metadata(payload)
+    explicit = _first_string_value(
+        payload,
+        metadata,
+        "origin_class",
+        "conversation_origin",
+        "conversation_kind",
+    ).lower()
+    if explicit in {"test", "qa", "smoke", "staff_test", "dev"}:
+        return True
+    if _truthy_payload_flag(
+        payload,
+        metadata,
+        "is_test",
+        "skyai_test",
+        "staff_test",
+        "qa_test",
+    ):
+        return True
+    ip_value = _first_string_value(
+        payload,
+        metadata,
+        "ip",
+        "client_ip",
+        "forwarded_for",
+        "x_forwarded_for",
+    )
+    conversation_id = conversation_id_from_payload(payload)
+    return bool(
+        _is_known_test_ip(ip_value)
+        or re.search(
+            r"(^|[-_])(?:test|qa|smoke|compare|canary|preview|dev)(?:[-_]|$)",
+            conversation_id,
+            re.I,
+        )
+        or _has_test_url_marker(payload, metadata)
+        or any(_is_test_host(host) for host in _payload_hosts(payload, metadata))
+    )
+
+
+def _normalized_absolute_http_host(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        parsed = urlparse(value.strip())
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return ""
+        # Accessing port also validates malformed values such as ":bad".
+        parsed.port
+    except ValueError:
+        return ""
+    return (parsed.hostname or "").lower().rstrip(".")
 
 
 def build_skyai_system_prompt(surface: str = "chat") -> str:
@@ -1486,7 +1615,11 @@ def render_widget_html(settings: CanarySettings) -> str:
                 try {
                   const response = await fetch('/chatkit/message', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Accept: 'application/json',
+                      ...(isTestSession() ? { 'X-SkyAI-Test-Signal': 'widget_test_session' } : {}),
+                    },
                     body: JSON.stringify({
                       message,
                       messages: state.turns.slice(-8),
@@ -2612,11 +2745,15 @@ async def mirror_to_discord(
     if not settings.discord_mirror_bot_token or not settings.discord_mirror_channel_id:
         return {"status": "skipped", "reason": "missing_token_or_channel"}
     content = format_discord_mirror_message(request_payload, response)
+    conversation_id = str(
+        response.get("conversation_id") or conversation_id_from_payload(request_payload)
+    )
     try:
         target_channel_id = await _discord_target_channel_id(
             settings=settings,
-            conversation_id=str(response.get("conversation_id") or conversation_id_from_payload(request_payload)),
+            conversation_id=conversation_id,
             request_payload=request_payload,
+            destination_channel_id=settings.discord_mirror_channel_id,
         )
         posted = await asyncio.to_thread(
             _discord_post_message,
@@ -2626,11 +2763,58 @@ async def mirror_to_discord(
         )
     except Exception as exc:  # pragma: no cover - defensive network guard
         return {"status": "error", "reason": sanitize_runtime_error(exc)}
-    return {
+    result = {
         "status": "posted",
-        "channel_id": target_channel_id,
+        "channel_id": settings.discord_mirror_channel_id,
         "message_id": str(posted.get("id") or ""),
     }
+    if target_channel_id != settings.discord_mirror_channel_id:
+        result["target_channel_id"] = target_channel_id
+    real_customer_decision = _real_customer_mirror_decision(request_payload)
+    real_customer_channel_id = settings.discord_mirror_real_customer_channel_id
+    if real_customer_decision["status"] != "eligible":
+        result["real_customer_mirror"] = real_customer_decision
+        return result
+    if not real_customer_channel_id:
+        result["real_customer_mirror"] = {
+            "status": "skipped",
+            "reason": "missing_channel",
+        }
+        return result
+    if real_customer_channel_id == settings.discord_mirror_channel_id:
+        result["real_customer_mirror"] = {
+            "status": "skipped",
+            "reason": "same_as_all_traffic_channel",
+        }
+        return result
+
+    try:
+        real_customer_target_id = await _discord_target_channel_id(
+            settings=settings,
+            conversation_id=conversation_id,
+            request_payload=request_payload,
+            destination_channel_id=real_customer_channel_id,
+        )
+        real_customer_posted = await asyncio.to_thread(
+            _discord_post_message,
+            real_customer_target_id,
+            settings.discord_mirror_bot_token,
+            content,
+        )
+    except Exception as exc:  # pragma: no cover - defensive network guard
+        result["real_customer_mirror"] = {
+            "status": "error",
+            "reason": sanitize_runtime_error(exc),
+        }
+        return result
+    result["real_customer_mirror"] = {
+        "status": "posted",
+        "channel_id": real_customer_channel_id,
+        "message_id": str(real_customer_posted.get("id") or ""),
+    }
+    if real_customer_target_id != real_customer_channel_id:
+        result["real_customer_mirror"]["target_channel_id"] = real_customer_target_id
+    return result
 
 
 async def mirror_voice_to_discord(
@@ -2676,16 +2860,24 @@ async def _discord_target_channel_id(
     conversation_id: str,
     request_payload: dict[str, Any] | None = None,
     surface: str = "chat",
+    destination_channel_id: str | None = None,
 ) -> str:
+    channel_id = destination_channel_id or settings.discord_mirror_channel_id
     if not settings.discord_mirror_create_threads:
-        return settings.discord_mirror_channel_id
+        return channel_id
     store_path = settings.discord_mirror_thread_store or (
         settings.profile_home / "skyai_v2" / "discord_threads.json"
     )
     mapping = _load_thread_mapping(store_path)
-    mapping_key = conversation_id if surface == "chat" else f"{surface}:{conversation_id}"
+    mapping_key = f"{surface}:{channel_id}:{conversation_id}"
     if mapping_key in mapping:
         return mapping[mapping_key]
+    if channel_id == settings.discord_mirror_channel_id:
+        legacy_key = conversation_id if surface == "chat" else f"{surface}:{conversation_id}"
+        if legacy_key in mapping:
+            mapping[mapping_key] = mapping[legacy_key]
+            _write_thread_mapping(store_path, mapping)
+            return mapping[mapping_key]
 
     if surface == "voice":
         origin = classify_voice_discord_conversation(request_payload or {}, conversation_id)
@@ -2696,16 +2888,16 @@ async def _discord_target_channel_id(
     starter_prefix = f"{origin['badge']} " if origin.get("kind") == "test" else ""
     starter = await asyncio.to_thread(
         _discord_post_message,
-        settings.discord_mirror_channel_id,
+        channel_id,
         settings.discord_mirror_bot_token,
         f"{starter_prefix}{starter_label} `{conversation_id}`",
     )
     message_id = str(starter.get("id") or "")
     if not message_id:
-        return settings.discord_mirror_channel_id
+        return channel_id
     thread = await asyncio.to_thread(
         _discord_start_thread_from_message,
-        settings.discord_mirror_channel_id,
+        channel_id,
         message_id,
         settings.discord_mirror_bot_token,
         discord_thread_name(conversation_id, origin, surface=surface),
@@ -2715,7 +2907,7 @@ async def _discord_target_channel_id(
         mapping[mapping_key] = thread_id
         _write_thread_mapping(store_path, mapping)
         return thread_id
-    return settings.discord_mirror_channel_id
+    return channel_id
 
 
 def _load_thread_mapping(path: Path) -> dict[str, str]:
@@ -2822,6 +3014,7 @@ def _call_prod_skyai(payload: dict[str, Any], settings: CanarySettings) -> dict[
         headers={
             "Content-Type": "application/json",
             "User-Agent": "SkyAI-v2-Compare/0.1",
+            "X-SkyAI-Test-Signal": "compare_prod_side",
         },
     )
     try:
@@ -2912,6 +3105,7 @@ def create_app(
                 "behavior_version": settings.behavior_version,
                 "build_commit": settings.build_commit,
                 "live_model": settings.live_model,
+                "implementation_markers": [DISCORD_REAL_CUSTOMER_MIRROR_MARKER],
             }
         )
 
@@ -2925,6 +3119,7 @@ def create_app(
                 "toolset": SKYAI_TOOLSET,
                 "live_model": settings.live_model,
                 "build_commit": settings.build_commit,
+                "implementation_markers": [DISCORD_REAL_CUSTOMER_MIRROR_MARKER],
             }
         )
 
@@ -2943,6 +3138,7 @@ def create_app(
             return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        _add_server_request_context(payload, request)
         try:
             response = await build_chat_response(payload, settings, agent_runner)
         except Exception as exc:
@@ -2971,6 +3167,7 @@ def create_app(
             return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        _add_server_request_context(payload, request)
         response = await build_compare_response(payload, settings, agent_runner)
         status = 200 if response.get("status") == "ok" else 503
         return web.json_response(response, status=status)
@@ -2984,6 +3181,7 @@ def create_app(
             return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        _add_server_request_context(payload, request)
         response = await build_voice_start_response(payload, settings)
         mirror_status = await mirror_voice_to_discord(payload, response, settings, stage="start")
         if isinstance(response.get("trace"), dict):
@@ -2999,6 +3197,7 @@ def create_app(
             return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        _add_server_request_context(payload, request)
         try:
             response = await build_voice_turn_response(payload, settings, agent_runner)
         except Exception as exc:
@@ -3027,6 +3226,7 @@ def create_app(
             return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        _add_server_request_context(payload, request)
         response = await build_voice_event_response(payload, settings)
         mirror_status = await mirror_voice_to_discord(payload, response, settings, stage="event")
         if isinstance(response.get("trace"), dict):
@@ -3042,6 +3242,7 @@ def create_app(
             return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        _add_server_request_context(payload, request)
         response = await build_voice_end_response(payload, settings)
         mirror_status = await mirror_voice_to_discord(payload, response, settings, stage="end")
         if isinstance(response.get("trace"), dict):
@@ -3115,6 +3316,10 @@ def main(argv: list[str] | None = None) -> int:
             or os.getenv("DISCORD_BOT_TOKEN", "").strip()
         ),
         discord_mirror_channel_id=os.getenv("SKYAI_DISCORD_MIRROR_CHANNEL_ID", "").strip(),
+        discord_mirror_real_customer_channel_id=os.getenv(
+            "SKYAI_DISCORD_REAL_CUSTOMER_CHANNEL_ID",
+            "",
+        ).strip(),
         discord_mirror_create_threads=_env_bool("SKYAI_DISCORD_MIRROR_CREATE_THREADS"),
         discord_mirror_thread_store=_optional_env_path("SKYAI_DISCORD_MIRROR_THREAD_STORE"),
         compare_prod_base_url=os.getenv("SKYAI_COMPARE_PROD_BASE_URL", "").strip().rstrip("/"),

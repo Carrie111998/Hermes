@@ -67,7 +67,11 @@ def build_compare_payload(scenario: dict[str, Any], *, run_id: str) -> dict[str,
 
 def call_compare(base_url: str, payload: dict[str, Any], timeout: float, bearer_token: str = "") -> dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json", "User-Agent": "SkyAI-v2-Compare-Matrix/0.1"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "SkyAI-v2-Compare-Matrix/0.1",
+        "X-SkyAI-Test-Signal": "compare_matrix",
+    }
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
     request = Request(
