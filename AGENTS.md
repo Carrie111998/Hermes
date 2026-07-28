@@ -7,7 +7,9 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 > **Long-form guide:** contribution rubric, architecture, tools, config, testing,
 > and pitfalls live in
 > [`fork/harness/upstream-development-guide.md`](fork/harness/upstream-development-guide.md)
-> (upstream-aligned). Keep *this* file short for Cursor / continual-learning.
+> (upstream-aligned). Fork-owned catalog:
+> [Fork-specific features](fork/harness/upstream-development-guide.md#fork-specific-features-for-ai-agents).
+> Keep *this* file short for Cursor / continual-learning.
 
 ## What Hermes Is
 
@@ -30,7 +32,8 @@ This checkout keeps fork-only behaviour at extension and ops edges. Before an
 upstream merge or fork-owned edit, read [`fork/AGENTS.md`](fork/AGENTS.md) and
 the nested guide. Authoritative merge mechanism:
 `scripts/merge_tools/` / `scripts/sync_all.py` — upstream base, reapply verified
-fork advantages only.
+fork advantages only. Detail catalog:
+[Fork-specific features](fork/harness/upstream-development-guide.md#fork-specific-features-for-ai-agents).
 
 | Need | Guide |
 |------|--------|

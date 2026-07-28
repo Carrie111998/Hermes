@@ -43,3 +43,4 @@ py -3 -m hermes_cli.main desktop --build-only --force-build
 - Root [`README.md`](../README.md) — fork feature summary for humans
 - Root [`AGENTS.md`](../AGENTS.md) — short agent entrypoint (fork + learned prefs)
 - [`harness/upstream-development-guide.md`](harness/upstream-development-guide.md) — long-form core guide
+- **[Fork-specific features (for AI agents)](harness/upstream-development-guide.md#fork-specific-features-for-ai-agents)** — catalog of self_evolution, fork tools/plugins, vendor submodules, Windows ops, merge tooling, Desktop/watchdog notes, peripheral MCP/memory integrations

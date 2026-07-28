@@ -7,6 +7,201 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 > **Zapabob fork:** This checkout is an engineering fork of NousResearch/hermes-agent.
 > For official-vs-custom layout, merge harness rules, and Windows ops, read
 > [`fork/AGENTS.md`](../AGENTS.md) and [`fork/README.md`](../README.md) first.
+> **Fork catalog (AI):** jump to [Fork-specific features (for AI agents)](#fork-specific-features-for-ai-agents).
+
+## Fork-specific features (for AI agents)
+
+Catalog of **this fork's** edges. Everything above/below that is unmarked is
+upstream Hermes behaviour. Do not treat fork tooling as NousResearch product
+surface when opening upstream PRs.
+
+**Navigation map (roles):**
+
+| Path | Role |
+|------|------|
+| [`fork/README.md`](../README.md) | Layout index for humans/agents |
+| [`fork/AGENTS.md`](../AGENTS.md) | Fork decision tree + sacred constraints |
+| [`fork/harness/`](../harness/AGENTS.md) | Upstream **merge** / overlays (`scripts/merge_tools/`) — not the Hypura daemon |
+| [`fork/agent-harness/`](../agent-harness/AGENTS.md) | Hypura HTTP daemon + `harness_*` tools |
+| [`fork/extensions/`](../extensions/AGENTS.md) | Fork plugins + preserve_custom tool files |
+| [`fork/operations/`](../operations/AGENTS.md) | Windows stack, ports, restarts |
+| [`fork/local-workspace/`](../local-workspace/AGENTS.md) | Gitignored scratch / root clutter policy |
+
+**Upstream vs fork (quick rule):** core loop (`run_agent.py`, gateway, TUI,
+Desktop renderer contracts) = upstream. Plugins under `plugins/<fork-name>/`,
+`tools/{harness,vrchat,voicevox,shinka,ai_scientist}_*`, `scripts/windows/`,
+`scripts/merge_tools/`, `vendor/*` submodules, and `fork/` docs = fork. When
+features are equivalent, take upstream and reapply fork advantage via overlay.
+
+### self_evolution (AI-Scientist + ShinkaEvolve)
+
+- **What:** Opt-in toolset exposing research/evolution runners to the model.
+- **Where:**
+  - Toolset `self_evolution` in `toolsets.py` → tools `ai_scientist_research`, `shinka_run`
+  - `tools/ai_scientist_tool.py`, `tools/ai_scientist_env.py`, `tools/ai_scientist_deps.py`
+  - `tools/shinka_evolve_tool.py`, `tools/shinka_evolve_env.py`
+  - Vendors: `vendor/openclaw-mirror/AI-Scientist` (submodule), `vendor/shinka-osint` (canonical for `shinka_run`; not `vendor/openclaw-mirror/ShinkaEvolve`)
+- **How wired:** Overlay sanitizer replays fork toolsets into `toolsets.py` after
+  upstream merge (`scripts/merge_tools/` + `overlay_sanitize.py`). Credential
+  bridge: Hermes API keys / OAuth ladder in `ai_scientist_env` / `shinka_evolve_env`
+  (no new non-secret `HERMES_*`). Enable toolset via `hermes tools` / config —
+  not in default core bundle.
+- **Do not lose on upstream merge:** `preserve_custom` on the tool + env files;
+  `official_with_overlay` on `toolsets.py` (never hand-merge whole file);
+  vendor pins; `py -3 scripts/sync_ai_scientist_vendor.py --execute` preserves
+  `nc_kan` / `hermes_self_evolve` templates under overlays.
+- **Related docs:** [`fork/extensions/AGENTS.md`](../extensions/AGENTS.md),
+  [`fork/harness/AGENTS.md`](../harness/AGENTS.md),
+  `scripts/merge_tools/hermes-merge-conflict-strategies.json` (notes on
+  `self_evolution` / `shinka_run` / `ai_scientist_research`).
+
+### Fork-owned tools (preserve_custom)
+
+These ship in `tools/` (not plugins) and are merge-protected:
+
+| Tool file | Toolset / entry | Role |
+|-----------|-----------------|------|
+| `tools/harness_tools.py` | `harness` → `harness_*` | Hypura daemon HTTP bridge |
+| `tools/vrchat_osc_tool.py` | `vrchat` | VRChat OSC / chatbox |
+| `tools/voicevox_tts_tool.py` | voicevox tools | Local VOICEVOX TTS |
+| `tools/shinka_evolve_tool.py` | `self_evolution` / `shinka_run` | ShinkaEvolve batch |
+| `tools/ai_scientist_tool.py` | `self_evolution` / `ai_scientist_research` | AI-Scientist runner |
+
+- **How wired:** `registry.register()` at import; toolset membership in
+  `toolsets.py` via overlay. CLI: `hermes harness …` → `hermes_cli/harness.py`
+  (also `preserve_custom`). VRChat live move/speak: explicit user ACK before
+  `dry_run=false` (`plugins/vrchat-autonomy/`).
+- **Do not lose:** listed paths in `hermes-merge-conflict-strategies.json`;
+  companion `*_env.py` / deps helpers; do not relocate vendor daemon paths
+  without updating `hermes_cli/harness.py` pins.
+- **Related docs:** [`fork/agent-harness/AGENTS.md`](../agent-harness/AGENTS.md),
+  [`fork/extensions/AGENTS.md`](../extensions/AGENTS.md).
+
+### Fork plugins (representative)
+
+In-tree under `plugins/` (enable via `plugins.enabled` / `hermes tools`). Many
+are fork-operator plugins; some names also exist upstream (do not confuse).
+
+| Plugin | Path | What |
+|--------|------|------|
+| research-desk | `plugins/research-desk/` | Public-evidence research plans/runs/exports; requires `openmanus` |
+| osint-agent | `plugins/osint-agent/` | SitDeck / World Monitor Free / multilayer brief stack |
+| openmanus | `plugins/openmanus/` | Adapter for pinned `vendor/openmanus` (dry-run defaults, receipts) |
+| cloakbrowser | `plugins/web/cloakbrowser/` | Default web search/extract backend on this fork |
+| freellmapi | `plugins/model-providers/freellmapi/` | Local free-tier OpenAI-compatible proxy (often `:3001`) |
+| vrchat-autonomy | `plugins/vrchat-autonomy/` | Autonomy loop over OSC (ACK-gated) |
+| shinka-osint | `plugins/shinka-osint/` (and/or vendor plugin install) | OSINT evolution surface beside core `shinka_run` |
+
+**kanban:** upstream Hermes feature (`plugins/kanban/`, docs in main guide). Used
+here like any platform — **not** a fork-only invention. Grandfathered third-party
+plugins (observability, etc.) stay in-tree but new SaaS backends should ship as
+standalone `~/.hermes/plugins/` repos (upstream policy).
+
+- **How wired:** PluginManager discovery; each has `plugin.yaml` + `register(ctx)`.
+  Must not patch `run_agent.py` / `cli.py` / `gateway/run.py`.
+- **Do not lose:** plugin directories + any merge-policy rules that name them;
+  OpenManus submodule pin; research-desk / osint-agent `AGENTS.md` boundaries.
+- **Related docs:** [`fork/extensions/README.md`](../extensions/README.md),
+  per-plugin `AGENTS.md` where present.
+
+### Vendor submodules
+
+Declared in `.gitmodules` (paths under `vendor/`):
+
+| Submodule | Typical consumer |
+|-----------|------------------|
+| `vendor/shinka-osint` | `shinka_run`, Shinka OSINT plugin |
+| `vendor/openmanus` | `plugins/openmanus` |
+| `vendor/buzz` | Buzz relay / agent surface experiments |
+| `vendor/openclaw-mirror/AI-Scientist` | `ai_scientist_research` |
+| `vendor/openclaw-mirror/ShinkaEvolve` | Legacy/alternate pin — **runtime `shinka_run` prefers `vendor/shinka-osint`** |
+| `vendor/openclaw-mirror/ATLAS`, `vendor/neuro-sdk`, `vendor/SillyTavern`, `vendor/officecli`, `vendor/akari-video` | Named fork integrations |
+
+- **Do not lose:** submodule URLs/SHAs; `preserve_custom` on evolution vendor trees;
+  OpenClaw layered sync (`openclaw_layered_sync.py`, `openclaw_vendor_layers.json`).
+- **Related docs:** [`fork/harness/AGENTS.md`](../harness/AGENTS.md).
+
+### Windows operations
+
+- **What:** Operator scripts for stack restart, local llama, Desktop, watchdog.
+- **Where:** `scripts/windows/` — notably:
+  - `restart-hermes-stack.ps1` (Desktop on by default; **no** `-StartLlama` unless asked)
+  - `start-llama-hotswap.ps1` + `llama-hotswap-models.ini` (isolated HF-cache layout)
+  - `Start-HermesGoWatchdog.ps1` / `Build-HermesGoWatchdog.ps1` / `watchdog-go/`
+  - Legacy mutual watchdog: `Start-HermesDesktopBackendWatchdog.ps1` (prefer Go-only)
+- **How wired:** Manual / autostart; Go watchdog control plane typically
+  `127.0.0.1:9920` (operator-only — **not** callable from Hermes AI tools).
+- **Do not lose:** entire `scripts/windows/` tree and watchdog-go sources; port
+  map in [`fork/operations/AGENTS.md`](../operations/AGENTS.md).
+- **Ports (ops):** 8787 Hermes-WebUI (not messaging gateway); 9118 Go-watchdog
+  prewarm `hermes serve`; 9119 Desktop/`hermes serve`; 9120 dashboard; 8080/8081
+  llama (optional); 18794 Hypura harness; 3001 FreeLLMAPI.
+
+### Merge tooling
+
+- **What:** Repository-native upstream sync — upstream base + verified fork overlay.
+- **Where:** `scripts/merge_tools/` (`hermes-merge-conflict-strategies.json`,
+  `overlay_sanitize.py`, `apply_*_overlay.py`, `audit_fork_features.py`, …),
+  entry `scripts/sync_all.py`.
+- **How wired:** Dry-run first: `py -3 scripts/sync_all.py --dry-run`. Actions:
+  `preserve_custom`, `official_with_overlay`, `upstream`. `toolsets.py` must go
+  through sanitizer replay — never keep the whole fork file by hand.
+- **Do not lose:** `scripts/merge_tools/` itself; do not shrink `preserve_custom`
+  without operator approval; keep `dirty_tree_ignore` so `_docs`/logs stay out of
+  merge scope.
+- **Related docs:** [`fork/harness/AGENTS.md`](../harness/AGENTS.md),
+  [`fork/harness/README.md`](../harness/README.md).
+
+### Desktop / serve / watchdog (fork ops notes)
+
+Aligned with root `AGENTS.md` Learned Facts — do not invent conflicting ports.
+
+- Prefer **Go watchdog alone** after stack restarts (avoid dual PS+Go watchdogs).
+- Desktop expects healthy backend announcement on **`:9119`** (or matching
+  `HERMES_DESKTOP_REMOTE_*`). Watchdog may prewarm **`:9118`** — 9118/9119
+  mismatch → Desktop timeout waiting for port announcement.
+- Manifest **token drift** (watchdog desktop-backend.json vs live `hermes serve`
+  session token) → `/api/sessions` 401 / “Could not connect”. Go watchdog should
+  auth-probe before publishing and replace wedged occupants. Clear stale
+  `HERMES_DESKTOP_REMOTE_*` when recovering to local `:9119`.
+- Orphan / duplicate process hygiene: stack restart stops Desktop + watchdog
+  before relaunch; reserved ops ports must not be treated as Desktop backend or
+  reaped by the watchdog. Prefer `Stop-Process -Name` + short `curl.exe -m`
+  probes over hanging `Get-CimInstance`/`netstat` on this host.
+- Packaged Desktop under `%LOCALAPPDATA%\hermes\…\Hermes.exe`; after UI changes
+  rebuild (`hermes desktop --build-only --force-build`) and sync. Electron
+  `app.asar` locks during update/rebuild — hand off recovery so the process can
+  exit and release asar (see Desktop electron bootstrap). Operator builds that
+  need a path **outside** the packaged install tree should use a dedicated
+  build dir (example local convention: `C:\hermes-dtbuild`) so asar/file locks
+  do not wedge the running app — do not hardcode machine-specific paths in
+  published docs beyond this note.
+- Missing session history: treat as Desktop↔serve connectivity/auth first;
+  `~/.hermes/state.db` is often intact — do not VACUUM/rewrite live DB while
+  other agents may use it.
+
+### Peripheral integrations (fork workspace)
+
+| Integration | Where / how | Notes |
+|-------------|-------------|--------|
+| World Intel MCP | External `zapabob/world-intel-mcp`; Hermes toolset/configure name often `world-intel` | Provider keys only in `~/.hermes/.env`; optional dashboard via `.venv` `intel-dashboard` (commonly `:8501`, Tailscale for remote) |
+| Memory vault | `scripts/memory/memory_vault_sync.py`, operator stack scripts | Encrypted Ebbinghaus/brain sync to a git vault; secrets/paths via env — never commit keys |
+| Obsidian memory graph | `scripts/obsidian_memory_graph.py`, `scripts/windows/start-obsidian-memory-graph-server.ps1`, Go `tools/memory-graph-server` | Local graph HTML / HTTP serve; gitignored `output/` |
+
+These are **operator edges**, not upstream Hermes core. Prefer documenting here
+over bloating root `AGENTS.md`.
+
+### AI agent checklist (fork work)
+
+1. Read [`fork/AGENTS.md`](../AGENTS.md) → nested guide for the area.
+2. Before upstream merge: dry-run `scripts/sync_all.py`; protect
+   `self_evolution` / harness / VRChat / VOICEVOX / Windows scripts.
+3. New capability: plugin or skill first; if a new `tools/*.py` is required,
+   update merge policy the same change.
+4. Exclude `_docs/`, `fork/` navigation, fork-only plugins, and local identity
+   from NousResearch PRs.
+5. Keep root [`AGENTS.md`](../../AGENTS.md) short — long form lives in **this**
+   file; fork catalog is this section.
 
 ## What Hermes Is
 
