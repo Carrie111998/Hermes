@@ -1173,19 +1173,47 @@ def handle_function_call(
                 return json.dumps({"error": err or "tool_call could not be resolved"},
                                   ensure_ascii=False)
             # Defense in depth: the underlying tool MUST be in the session's
-            # scoped deferrable catalog. resolve_underlying_call() only checks
-            # that the name is deferrable in the global registry; this gate
-            # additionally rejects any tool the session was not granted, so a
-            # restricted session can never invoke an out-of-scope tool through
-            # the bridge even if the catalog scoping above regressed.
+            # scoped deferrable catalog, or be a visible (eager-loaded) tool
+            # the session was granted. resolve_underlying_call() no longer
+            # blocks non-deferrable names (see issue #73388), so we enforce
+            # session boundaries here instead, rejecting out-of-scope tools.
             _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
             if underlying_name not in _scoped_deferrable:
-                return json.dumps({
-                    "error": (
-                        f"'{underlying_name}' is not available in this session. "
-                        "Use tool_search to find tools you can call."
-                    ),
-                }, ensure_ascii=False)
+                # Check if it's a visible (non-deferrable) tool -- the model
+                # may route eager-loaded tools through tool_call. If found,
+                # dispatch it directly without the deferred-call validate
+                # probe (the model already sees the full schema).
+                _visible_names = {
+                    (td.get("function") or {}).get("name")
+                    for td in current_defs
+                    if (td.get("function") or {}).get("name")
+                    and not _ts_mod.is_deferrable_tool_name(
+                        (td.get("function") or {}).get("name")
+                    )
+                }
+                if underlying_name not in _visible_names:
+                    return json.dumps({
+                        "error": (
+                            f"'{underlying_name}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
+                        ),
+                    }, ensure_ascii=False)
+                # Visible tool -- recurse directly, no probe-validate needed.
+                return handle_function_call(
+                    function_name=underlying_name,
+                    function_args=underlying_args,
+                    task_id=task_id,
+                    tool_call_id=tool_call_id,
+                    session_id=session_id,
+                    user_task=user_task,
+                    enabled_tools=enabled_tools,
+                    skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                    skip_tool_request_middleware=skip_tool_request_middleware,
+                    skip_tool_execution_middleware=skip_tool_execution_middleware,
+                    tool_request_middleware_trace=list(_tool_middleware_trace),
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                )
             # Probe-validate against the deferred tool's schema (ironclaw#5149):
             # a blind call missing required arguments returns the parameter
             # schema instead of dispatching into an opaque downstream failure.

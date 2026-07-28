@@ -894,6 +894,18 @@ def dispatch_tool_describe(args: Dict[str, Any],
     if not name:
         return json.dumps({"error": "name is required"}, ensure_ascii=False)
     if not is_deferrable_tool_name(name):
+        # Not a deferrable tool -- check if it's a visible (eager-loaded)
+        # tool and return its schema from the visible list.
+        # See issue #73388.
+        visible, _ = classify_tools(current_tool_defs)
+        for td in visible:
+            fn = td.get("function") or {}
+            if fn.get("name") == name:
+                return json.dumps({
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }, ensure_ascii=False)
         return json.dumps({
             "error": (
                 f"'{name}' is not a deferrable tool. If you see it in the tools list "
@@ -1015,10 +1027,13 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
     if not is_deferrable_tool_name(name):
-        return None, {}, (
-            f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
-            "list already, call it directly instead of via tool_call."
-        )
+        # Not a deferrable tool -- but the model may still route it through
+        # tool_call due to training bias toward the search->describe->call
+        # pattern.  Pass it through instead of erroring: the downstream
+        # scope gate (model_tools / tool_executor) still enforces session
+        # boundaries, so this never grants access to out-of-scope tools.
+        # See issue #73388.
+        pass
     return name, raw_args, None
 
 

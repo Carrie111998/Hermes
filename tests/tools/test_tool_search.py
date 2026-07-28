@@ -387,14 +387,16 @@ class TestBridgeDispatch:
         result = dispatch_tool_describe({}, current_tool_defs=[])
         assert "error" in json.loads(result)
 
-    def test_tool_describe_rejects_non_deferrable(self):
-        """If the model asks to describe a core tool, refuse — it's already
-        in the visible list."""
+    def test_tool_describe_returns_visible_tool_schema(self):
+        """If the model asks to describe a tool that's visible (eager-loaded),
+        return its schema directly instead of refusing. See issue #73388."""
         from tools.tool_search import dispatch_tool_describe
         result = dispatch_tool_describe(
             {"name": "terminal"}, current_tool_defs=[_td("terminal", "Run shell")],
         )
-        assert "error" in json.loads(result)
+        payload = json.loads(result)
+        assert payload.get("name") == "terminal"
+        assert payload.get("description") == "Run shell"
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
@@ -402,21 +404,23 @@ class TestBridgeDispatch:
             "name": "unknown_xxx",
             "arguments": {"foo": "bar"},
         })
-        # Will fail classification because unknown_xxx isn't deferrable.
-        assert err is not None
+        # No error — resolve_underlying_call now passes through all tools,
+        # leaving scope enforcement to the caller. See issue #73388.
+        assert err is None
+        assert name == "unknown_xxx"
+        assert args == {"foo": "bar"}
 
     def test_resolve_underlying_call_parses_json_string_args(self):
         """Some models emit ``arguments`` as a JSON string instead of object."""
         from tools.tool_search import resolve_underlying_call
-        # Use a name that won't classify (so we don't depend on registry),
-        # but exercise the JSON parse path.
-        _, _, err = resolve_underlying_call({
+        # Now passes through any tool name (no longer rejects non-deferrable).
+        name, args, err = resolve_underlying_call({
             "name": "fake",
             "arguments": '{"a": 1}',
         })
-        # err is about classification, but the parse worked (it would have
-        # failed earlier with "not valid JSON" otherwise).
-        assert "not valid JSON" not in (err or "")
+        assert err is None
+        assert name == "fake"
+        assert args == {"a": 1}
 
     def test_resolve_underlying_call_rejects_bad_json(self):
         from tools.tool_search import resolve_underlying_call
@@ -496,16 +500,18 @@ class TestRegression_OpenClawCron84141:
         # deferrable tools to put behind them.
         assert "terminal" in names
 
-    def test_unwrap_rejects_core_tool_attempt(self):
-        """Even if the model tries to invoke a core tool through tool_call,
-        we reject the call and tell the model to use it directly."""
+    def test_unwrap_passes_through_core_tool(self):
+        """tool_call now transparently passes through core tools; the
+        scope gate in model_tools / tool_executor enforces session
+        boundaries instead. See issue #73388."""
         from tools.tool_search import resolve_underlying_call
-        _, _, err = resolve_underlying_call({
+        name, args, err = resolve_underlying_call({
             "name": "terminal",
             "arguments": {"command": "echo hi"},
         })
-        assert err is not None
-        assert "not a deferrable" in err
+        assert err is None
+        assert name == "terminal"
+        assert args == {"command": "echo hi"}
 
 
 class TestRegression_ToolsetScoping:

@@ -284,6 +284,16 @@ def _tool_search_scoped_names(agent) -> frozenset:
             skip_tool_search_assembly=True,
         ) or []
         names = _ts.scoped_deferrable_names(scoped_defs)
+        # Also include visible (non-deferrable) tool names so tool_call
+        # can transparently route eager-loaded tools.  See issue #73388.
+        _all_visible = {
+            (td.get("function") or {}).get("name")
+            for td in scoped_defs
+            if (td.get("function") or {}).get("name")
+            and (td.get("function") or {}).get("name") not in names
+        }
+        if _all_visible:
+            names = names | _all_visible
     except Exception:
         names = frozenset()
     try:
