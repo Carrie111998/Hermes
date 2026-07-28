@@ -5149,10 +5149,14 @@ def _read_exact_projection(
             raise RuntimeError("Claude session is unavailable")
         projection = _projection_from_parse(_call(adapter, "parse", path))
     elif provider is Provider.CODEX:
-        summary = _call(adapter, "find_native_thread", native_id)
-        if summary is None:
-            raise RuntimeError("Codex thread is unavailable")
-        projection = _call(adapter, "project_thread", summary)
+        exact_reader = getattr(adapter, "read_native_thread", None)
+        if callable(exact_reader):
+            projection = exact_reader(native_id)
+        else:
+            summary = _call(adapter, "find_native_thread", native_id)
+            if summary is None:
+                raise RuntimeError("Codex thread is unavailable")
+            projection = _call(adapter, "project_thread", summary)
         if not isinstance(projection, SessionProjection):
             raise RuntimeError("Codex projector returned no session projection")
     else:

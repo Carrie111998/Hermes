@@ -1118,6 +1118,26 @@ class CodexSourceAdapter:
             self._inventory_cache[wanted] = found
         return found
 
+    def read_native_thread(self, native_id: str) -> SessionProjection:
+        """Read one exact native thread without paging the full Codex inventory."""
+
+        wanted = _nonempty_string(native_id)
+        if wanted is None or wanted != native_id:
+            raise ValueError("Codex thread ID is malformed")
+        self._ensure_initialized()
+        response = self._client.request(
+            "thread/read",
+            {"threadId": wanted, "includeTurns": True},
+            timeout=_REQUEST_TIMEOUT,
+        )
+        thread = _thread_from_response(response)
+        summary = _normalize_summary(thread, archived=False)
+        if summary.native_id != wanted:
+            raise ValueError("Codex thread/read returned a different thread identity")
+        summary = self._refresh_trusted_origins([summary])[0]
+        self._inventory_cache[wanted] = summary
+        return self.project_thread(summary, response=response)
+
     def _ensure_initialized(self) -> None:
         if self._initialization_failed:
             raise RuntimeError(

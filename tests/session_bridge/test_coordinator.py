@@ -963,6 +963,12 @@ class _RefreshAdapter:
         self.operations = operations
         self.failure = failure
 
+    def read_native_thread(self, native_id: str) -> SessionProjection:
+        self.operations.append(("refresh_read", Provider.CODEX.value, native_id))
+        if self.failure is not None:
+            raise self.failure
+        return self.projection
+
     def find_native_session(self, native_id: str) -> Path | None:
         self.operations.append(("refresh_find", Provider.CLAUDE.value, native_id))
         if self.failure is not None:
@@ -1010,13 +1016,7 @@ class _HungRefreshAdapter(_RefreshAdapter):
         self.release = release
         self.read_calls = 0
 
-    def find_native_thread(
-        self,
-        native_id: str,
-        *,
-        source_kinds: tuple[str, ...] | None = None,
-    ) -> SessionProjection | None:
-        del source_kinds
+    def read_native_thread(self, native_id: str) -> SessionProjection:
         self.read_calls += 1
         self.operations.append(("hung_refresh_find", native_id, self.read_calls))
         self.started.set()
@@ -4733,6 +4733,9 @@ async def test_refresh_session_reads_exact_provider_and_persists_fresh_projectio
     assert refreshed is not None
     assert refreshed["last_native_cursor"] == projection.native_cursor
     assert refreshed["last_native_hash"] == projection.native_hash
+    if provider is Provider.CODEX:
+        assert ("refresh_read", Provider.CODEX.value, projection.native_id) in operations
+        assert not any(operation[0] == "refresh_find" for operation in operations)
 
 
 @pytest.mark.asyncio
