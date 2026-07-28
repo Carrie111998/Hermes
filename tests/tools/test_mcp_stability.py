@@ -3,7 +3,7 @@
 import asyncio
 import os
 import signal
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -582,6 +582,95 @@ class TestStdioPgroupReaping:
             _time.sleep(0.05)
         assert not psutil.pid_exists(grandchild_pid), (
             "grandchild survived killpg-based reaping (issue #23799 regression)"
+        )
+
+
+class TestStdioSpawnWindowSerialisation:
+    """Concurrent connects must not claim each other's child PIDs."""
+
+    def _make_server(self, name):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask.__new__(MCPServerTask)
+        server.name = name
+        server._ready = MagicMock()
+        server._shutdown_event = MagicMock()
+        server._shutdown_event.is_set.return_value = True
+        server._reconnect_event = MagicMock()
+        server._sampling = None
+        server._elicitation = None
+        server._registered_tool_names = []
+        return server
+
+    def test_spawn_window_is_held_under_the_spawn_lock(self):
+        """The snapshot/attribution window must run with the spawn lock held.
+
+        _run_stdio derives its spawned PID from a delta over *all* gateway
+        children, and background discovery connects every configured server
+        concurrently on one loop. If that window is not serialised, one
+        server's delta contains a peer's child, and it then orphan-tracks a
+        process it does not own — so a scoped orphan sweep can terminate a
+        healthy peer.
+        """
+        from tools import mcp_tool
+        from tools.mcp_tool import (
+            _lock,
+            _orphan_stdio_pid_servers,
+            _orphan_stdio_pids,
+            _stdio_pgids,
+            _stdio_pids,
+        )
+
+        with _lock:
+            _stdio_pids.clear()
+            _stdio_pgids.clear()
+            _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
+
+        lock_state_during_window = []
+        server = self._make_server("test-spawn-window")
+
+        async def _run():
+            spawn_lock = mcp_tool._get_stdio_spawn_lock()
+
+            def _snapshot():
+                # Sampled at both ends of the attribution window.
+                lock_state_during_window.append(spawn_lock.locked())
+                return set()
+
+            stdio_cm = MagicMock()
+            stdio_cm.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+            stdio_cm.__aexit__ = AsyncMock(return_value=False)
+            session_cm = MagicMock()
+            session_cm.__aenter__ = AsyncMock(side_effect=RuntimeError("stop here"))
+            session_cm.__aexit__ = AsyncMock(return_value=False)
+
+            with patch("tools.mcp_tool.ClientSession", return_value=session_cm), \
+                 patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._build_safe_env", return_value={}), \
+                 patch("tools.mcp_tool._resolve_stdio_command", return_value=("echo", {})), \
+                 patch("tools.mcp_tool._write_stderr_log_header"), \
+                 patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None), \
+                 patch("tools.osv_check.check_package_for_malware", return_value=None), \
+                 patch("tools.mcp_tool._kill_orphaned_mcp_children"), \
+                 patch("tools.mcp_tool._snapshot_child_pids", side_effect=_snapshot), \
+                 patch("tools.mcp_tool._filter_mcp_children", side_effect=lambda pids: pids), \
+                 patch("tools.mcp_tool.stdio_client", return_value=stdio_cm):
+                try:
+                    await server._run_stdio({"command": "echo", "args": []})
+                except Exception:
+                    pass
+            # Released before returning, so a later spawn is never blocked by a
+            # peer still inside its (up to connect_timeout) handshake.
+            assert not spawn_lock.locked()
+
+        asyncio.run(_run())
+
+        assert lock_state_during_window, "the PID snapshot was never taken"
+        assert all(lock_state_during_window), (
+            "the spawn/PID-attribution window ran without the spawn lock held, "
+            "so a concurrent connect could be misattributed; observed lock "
+            f"states={lock_state_during_window}"
         )
 
 
