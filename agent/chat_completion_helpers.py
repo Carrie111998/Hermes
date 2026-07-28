@@ -32,6 +32,7 @@ from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from agent.internal_user_messages import MAX_ITERATIONS_SUMMARY_REQUEST
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
@@ -1989,12 +1990,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
-    summary_request = (
-        "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
-    )
-    messages.append({"role": "user", "content": summary_request})
+    messages.append({"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST})
 
     try:
         # Build API messages, stripping internal-only fields

@@ -373,11 +373,13 @@ def maybe_auto_title(
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
-    # Count user messages in history to detect first exchange.
-    # conversation_history includes the exchange that just happened,
-    # so for a first exchange we expect exactly 1 user message
-    # (or 2 counting system). Be generous: generate on first 2 exchanges.
-    user_msg_count = sum(1 for m in (conversation_history or []) if m.get("role") == "user")
+    from agent.conversation_compression import is_real_user_message
+
+    # Long turns can add Hermes-authored user-role scaffolding. Count only
+    # genuine user intent so those internal rows cannot close the title gate.
+    user_msg_count = sum(
+        1 for message in (conversation_history or []) if is_real_user_message(message)
+    )
     if user_msg_count > 2:
         return
 
