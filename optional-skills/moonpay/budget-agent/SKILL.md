@@ -1,8 +1,8 @@
 ---
 name: budget-agent
-description: "Set a daily spending budget for your agent. Check spend, enforce limits before trades, and run an automated watchdog that alerts when the budget is hit."
+description: "Enforce a daily spending budget for agent actions."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

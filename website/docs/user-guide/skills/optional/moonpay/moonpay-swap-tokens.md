@@ -1,14 +1,14 @@
 ---
-title: "Swap Tokens — Swap tokens on the same chain or bridge tokens across chains"
+title: "Swap Tokens — Swap or bridge tokens across supported chains"
 sidebar_label: "Swap Tokens"
-description: "Swap tokens on the same chain or bridge tokens across chains"
+description: "Swap or bridge tokens across supported chains"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Swap Tokens
 
-Swap tokens on the same chain or bridge tokens across chains. Use when the user wants to swap, bridge, or move tokens.
+Swap or bridge tokens across supported chains.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Swap tokens on the same chain or bridge tokens across chains. Use when the user 
 | Source | Optional — install with `hermes skills install official/moonpay/swap-tokens` |
 | Path | `optional-skills/moonpay/swap-tokens` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Trading` |

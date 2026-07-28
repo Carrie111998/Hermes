@@ -1,8 +1,8 @@
 ---
 name: deposit
-description: "Create deposit links that accept crypto from any chain and auto-convert to stablecoins. No login required."
+description: "Create cross-chain crypto deposit links."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

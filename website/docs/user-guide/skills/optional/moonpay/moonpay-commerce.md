@@ -1,14 +1,14 @@
 ---
-title: "Commerce — Browse Shopify stores, search products, manage a cart, and checkout with crypto via Solana Pay"
+title: "Commerce — Shop and pay with crypto through Solana Pay"
 sidebar_label: "Commerce"
-description: "Browse Shopify stores, search products, manage a cart, and checkout with crypto via Solana Pay"
+description: "Shop and pay with crypto through Solana Pay"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Commerce
 
-Browse Shopify stores, search products, manage a cart, and checkout with crypto via Solana Pay. No login required.
+Shop and pay with crypto through Solana Pay.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Browse Shopify stores, search products, manage a cart, and checkout with crypto 
 | Source | Optional — install with `hermes skills install official/moonpay/commerce` |
 | Path | `optional-skills/moonpay/commerce` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Commerce`, `Shopping` |

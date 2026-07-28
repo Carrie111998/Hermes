@@ -1,8 +1,8 @@
 ---
 name: missions
-description: "A series of missions that walk through every MoonPay CLI capability. Use when the user is new or says \"get started\", \"show me what you can do\", or \"run the missions\"."
+description: "Run guided missions across MoonPay CLI capabilities."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

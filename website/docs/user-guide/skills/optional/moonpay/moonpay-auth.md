@@ -1,14 +1,14 @@
 ---
-title: "Auth — Set up the MoonPay CLI, authenticate, and manage local wallets"
+title: "Auth — Set up the CLI, authenticate, and manage local wallets"
 sidebar_label: "Auth"
-description: "Set up the MoonPay CLI, authenticate, and manage local wallets"
+description: "Set up the CLI, authenticate, and manage local wallets"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Auth
 
-Set up the MoonPay CLI, authenticate, and manage local wallets. Use when commands fail, for login, or to create/import wallets.
+Set up the CLI, authenticate, and manage local wallets.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Set up the MoonPay CLI, authenticate, and manage local wallets. Use when command
 | Source | Optional — install with `hermes skills install official/moonpay/auth` |
 | Path | `optional-skills/moonpay/auth` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Setup` |

@@ -1,14 +1,14 @@
 ---
-title: "Upgrade — Increase your MoonPay API rate limit by paying with crypto via x402"
+title: "Upgrade — Increase MoonPay API rate limits through x402"
 sidebar_label: "Upgrade"
-description: "Increase your MoonPay API rate limit by paying with crypto via x402"
+description: "Increase MoonPay API rate limits through x402"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Upgrade
 
-Increase your MoonPay API rate limit by paying with crypto via x402.
+Increase MoonPay API rate limits through x402.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Increase your MoonPay API rate limit by paying with crypto via x402.
 | Source | Optional — install with `hermes skills install official/moonpay/upgrade` |
 | Path | `optional-skills/moonpay/upgrade` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Payments` |

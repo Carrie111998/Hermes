@@ -1,8 +1,8 @@
 ---
 name: price-alerts
-description: "Set up desktop price alerts that notify you when tokens hit target prices. Observe-only — no trading, just notifications."
+description: "Create observe-only desktop token-price alerts."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

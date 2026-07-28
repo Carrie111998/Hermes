@@ -1,14 +1,14 @@
 ---
-title: "Polymarket Ready — Fund a Polygon wallet for Polymarket trading"
+title: "Polymarket Ready — Prepare a Polygon wallet for Polymarket trading"
 sidebar_label: "Polymarket Ready"
-description: "Fund a Polygon wallet for Polymarket trading"
+description: "Prepare a Polygon wallet for Polymarket trading"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Polymarket Ready
 
-Fund a Polygon wallet for Polymarket trading. Buy POL for gas and bridge or buy USDC.e so the wallet is ready to trade.
+Prepare a Polygon wallet for Polymarket trading.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Fund a Polygon wallet for Polymarket trading. Buy POL for gas and bridge or buy 
 | Source | Optional — install with `hermes skills install official/moonpay/polymarket-ready` |
 | Path | `optional-skills/moonpay/polymarket-ready` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Trading`, `Setup` |

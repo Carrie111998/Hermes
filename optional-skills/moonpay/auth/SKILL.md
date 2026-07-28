@@ -1,8 +1,8 @@
 ---
 name: auth
-description: "Set up the MoonPay CLI, authenticate, and manage local wallets. Use when commands fail, for login, or to create/import wallets."
+description: "Set up the CLI, authenticate, and manage local wallets."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

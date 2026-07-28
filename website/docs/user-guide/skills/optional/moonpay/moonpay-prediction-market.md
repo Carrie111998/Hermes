@@ -1,14 +1,14 @@
 ---
-title: "Prediction Market — Trade on prediction markets (Polymarket, Kalshi)"
+title: "Prediction Market — Trade and monitor Polymarket or Kalshi positions"
 sidebar_label: "Prediction Market"
-description: "Trade on prediction markets (Polymarket, Kalshi)"
+description: "Trade and monitor Polymarket or Kalshi positions"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Prediction Market
 
-Trade on prediction markets (Polymarket, Kalshi). Search markets, buy/sell positions, track PnL, and view trade history.
+Trade and monitor Polymarket or Kalshi positions.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Trade on prediction markets (Polymarket, Kalshi). Search markets, buy/sell posit
 | Source | Optional — install with `hermes skills install official/moonpay/prediction-market` |
 | Path | `optional-skills/moonpay/prediction-market` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Trading`, `Prediction-Market`, `Polymarket`, `Kalshi` |

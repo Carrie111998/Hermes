@@ -1,14 +1,14 @@
 ---
-title: "Mcp — Set up MoonPay as an MCP server for Claude Desktop or Claude Code"
+title: "Mcp — Expose MoonPay CLI tools through an MCP server"
 sidebar_label: "Mcp"
-description: "Set up MoonPay as an MCP server for Claude Desktop or Claude Code"
+description: "Expose MoonPay CLI tools through an MCP server"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Mcp
 
-Set up MoonPay as an MCP server for Claude Desktop or Claude Code. Provides all MoonPay CLI tools via the Model Context Protocol.
+Expose MoonPay CLI tools through an MCP server.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Set up MoonPay as an MCP server for Claude Desktop or Claude Code. Provides all 
 | Source | Optional — install with `hermes skills install official/moonpay/mcp` |
 | Path | `optional-skills/moonpay/mcp` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Setup` |

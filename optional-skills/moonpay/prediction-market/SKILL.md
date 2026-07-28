@@ -1,8 +1,8 @@
 ---
 name: prediction-market
-description: "Trade on prediction markets (Polymarket, Kalshi). Search markets, buy/sell positions, track PnL, and view trade history."
+description: "Trade and monitor Polymarket or Kalshi positions."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

@@ -1,14 +1,14 @@
 ---
-title: "Fund Polymarket — Install the Polymarket CLI and fund its wallet with USDC"
+title: "Fund Polymarket — Fund a Polymarket wallet with USDC"
 sidebar_label: "Fund Polymarket"
-description: "Install the Polymarket CLI and fund its wallet with USDC"
+description: "Fund a Polymarket wallet with USDC"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Fund Polymarket
 
-Install the Polymarket CLI and fund its wallet with USDC.e and POL on Polygon via MoonPay.
+Fund a Polymarket wallet with USDC.e and POL.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Install the Polymarket CLI and fund its wallet with USDC.e and POL on Polygon vi
 | Source | Optional — install with `hermes skills install official/moonpay/fund-polymarket` |
 | Path | `optional-skills/moonpay/fund-polymarket` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Trading`, `Setup`, `Polymarket`, `Polygon` |

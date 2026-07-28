@@ -1,14 +1,14 @@
 ---
-title: "X402 — Make paid API requests to x402-protected endpoints"
+title: "X402 — Call x402 APIs using the local MoonPay wallet"
 sidebar_label: "X402"
-description: "Make paid API requests to x402-protected endpoints"
+description: "Call x402 APIs using the local MoonPay wallet"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # X402
 
-Make paid API requests to x402-protected endpoints. Automatically handles payment with your local wallet.
+Call x402 APIs using the local MoonPay wallet.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Make paid API requests to x402-protected endpoints. Automatically handles paymen
 | Source | Optional — install with `hermes skills install official/moonpay/x402` |
 | Path | `optional-skills/moonpay/x402` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Payments`, `API` |

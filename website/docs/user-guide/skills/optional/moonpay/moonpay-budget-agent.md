@@ -1,14 +1,14 @@
 ---
-title: "Budget Agent — Set a daily spending budget for your agent"
+title: "Budget Agent — Enforce a daily spending budget for agent actions"
 sidebar_label: "Budget Agent"
-description: "Set a daily spending budget for your agent"
+description: "Enforce a daily spending budget for agent actions"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Budget Agent
 
-Set a daily spending budget for your agent. Check spend, enforce limits before trades, and run an automated watchdog that alerts when the budget is hit.
+Enforce a daily spending budget for agent actions.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Set a daily spending budget for your agent. Check spend, enforce limits before t
 | Source | Optional — install with `hermes skills install official/moonpay/budget-agent` |
 | Path | `optional-skills/moonpay/budget-agent` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Trading`, `Automation`, `Budget` |

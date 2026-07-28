@@ -1,8 +1,8 @@
 ---
 name: upgrade
-description: "Increase your MoonPay API rate limit by paying with crypto via x402."
+description: "Increase MoonPay API rate limits through x402."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

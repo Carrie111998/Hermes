@@ -1,8 +1,8 @@
 ---
 name: fund-polymarket
-description: "Install the Polymarket CLI and fund its wallet with USDC.e and POL on Polygon via MoonPay."
+description: "Fund a Polymarket wallet with USDC.e and POL."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

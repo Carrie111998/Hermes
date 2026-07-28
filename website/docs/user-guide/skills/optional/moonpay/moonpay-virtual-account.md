@@ -1,14 +1,14 @@
 ---
-title: "Virtual Account — Set up a virtual account for fiat on-ramp and off-ramp"
+title: "Virtual Account — Manage fiat on-ramp and off-ramp virtual accounts"
 sidebar_label: "Virtual Account"
-description: "Set up a virtual account for fiat on-ramp and off-ramp"
+description: "Manage fiat on-ramp and off-ramp virtual accounts"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Virtual Account
 
-Set up a virtual account for fiat on-ramp and off-ramp. Covers KYC, wallet registration, bank accounts, onramp (fiat to stablecoin), and offramp (stablecoin to fiat).
+Manage fiat on-ramp and off-ramp virtual accounts.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Set up a virtual account for fiat on-ramp and off-ramp. Covers KYC, wallet regis
 | Source | Optional — install with `hermes skills install official/moonpay/virtual-account` |
 | Path | `optional-skills/moonpay/virtual-account` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Fiat` |

@@ -1,14 +1,14 @@
 ---
-title: "X402 Analyst"
+title: "X402 Analyst — Research markets through paid x402 APIs"
 sidebar_label: "X402 Analyst"
-description: "Research agent that pays for real-time market intelligence via x402 APIs, synthesizes a trade recommendation, and optionally executes it"
+description: "Research markets through paid x402 APIs"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # X402 Analyst
 
-Research agent that pays for real-time market intelligence via x402 APIs, synthesizes a trade recommendation, and optionally executes it. Total cost per research run: $0.03.
+Research markets through paid x402 APIs.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Research agent that pays for real-time market intelligence via x402 APIs, synthe
 | Source | Optional — install with `hermes skills install official/moonpay/x402-analyst` |
 | Path | `optional-skills/moonpay/x402-analyst` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Research`, `Trading`, `x402`, `Payments` |

@@ -1,8 +1,8 @@
 ---
 name: x402-analyst
-description: "Research agent that pays for real-time market intelligence via x402 APIs, synthesizes a trade recommendation, and optionally executes it. Total cost per research run: $0.03."
+description: "Research markets through paid x402 APIs."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

@@ -1,8 +1,8 @@
 ---
 name: discover-tokens
-description: "Search for tokens, check prices, get trading briefs, and evaluate risk. Use for token research, \"is this token safe?\", price checks, and market analysis."
+description: "Research token prices, briefs, and trading risk."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

@@ -1,14 +1,14 @@
 ---
-title: "Check Wallet — Check wallet balances and holdings"
+title: "Check Wallet — Check wallet balances, holdings, and portfolio value"
 sidebar_label: "Check Wallet"
-description: "Check wallet balances and holdings"
+description: "Check wallet balances, holdings, and portfolio value"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Check Wallet
 
-Check wallet balances and holdings. Use for "what's in my wallet", portfolio breakdown, token balances, allocation percentages, and USD values.
+Check wallet balances, holdings, and portfolio value.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Check wallet balances and holdings. Use for "what's in my wallet", portfolio bre
 | Source | Optional — install with `hermes skills install official/moonpay/check-wallet` |
 | Path | `optional-skills/moonpay/check-wallet` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Portfolio` |

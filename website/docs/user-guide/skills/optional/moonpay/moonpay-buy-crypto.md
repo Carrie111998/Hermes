@@ -1,14 +1,14 @@
 ---
-title: "Buy Crypto — Buy crypto with fiat via MoonPay"
+title: "Buy Crypto — Create a fiat-to-crypto checkout link"
 sidebar_label: "Buy Crypto"
-description: "Buy crypto with fiat via MoonPay"
+description: "Create a fiat-to-crypto checkout link"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Buy Crypto
 
-Buy crypto with fiat via MoonPay. Returns a checkout URL to complete the purchase in a browser.
+Create a fiat-to-crypto checkout link.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Buy crypto with fiat via MoonPay. Returns a checkout URL to complete the purchas
 | Source | Optional — install with `hermes skills install official/moonpay/buy-crypto` |
 | Path | `optional-skills/moonpay/buy-crypto` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Trading` |

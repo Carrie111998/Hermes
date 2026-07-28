@@ -1,8 +1,8 @@
 ---
 name: scout
-description: "Prediction market arbitrage & alpha scout. Searches Polymarket and Kalshi for the same event, runs cross-platform arb math (including fees), and ranks opportunities by profitability. Use when asked to \"find arb\", \"scout markets\", \"find edge\", or scan a specific topic across prediction markets."
+description: "Scout Polymarket and Kalshi for arbitrage opportunities."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

@@ -1,8 +1,8 @@
 ---
 name: polymarket-ready
-description: "Fund a Polygon wallet for Polymarket trading. Buy POL for gas and bridge or buy USDC.e so the wallet is ready to trade."
+description: "Prepare a Polygon wallet for Polymarket trading."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

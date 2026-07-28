@@ -1,14 +1,14 @@
 ---
-title: "Scout — Prediction market arbitrage & alpha scout"
+title: "Scout — Scout Polymarket and Kalshi for arbitrage opportunities"
 sidebar_label: "Scout"
-description: "Prediction market arbitrage & alpha scout"
+description: "Scout Polymarket and Kalshi for arbitrage opportunities"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Scout
 
-Prediction market arbitrage & alpha scout. Searches Polymarket and Kalshi for the same event, runs cross-platform arb math (including fees), and ranks opportunities by profitability. Use when asked to "find arb", "scout markets", "find edge", or scan a specific topic across prediction markets.
+Scout Polymarket and Kalshi for arbitrage opportunities.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Prediction market arbitrage & alpha scout. Searches Polymarket and Kalshi for th
 | Source | Optional — install with `hermes skills install official/moonpay/scout` |
 | Path | `optional-skills/moonpay/scout` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Prediction-Markets`, `Polymarket`, `Kalshi`, `Arbitrage`, `Trading` |

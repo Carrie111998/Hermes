@@ -1,14 +1,14 @@
 ---
-title: "Price Alerts — Set up desktop price alerts that notify you when tokens hit target prices"
+title: "Price Alerts — Create observe-only desktop token-price alerts"
 sidebar_label: "Price Alerts"
-description: "Set up desktop price alerts that notify you when tokens hit target prices"
+description: "Create observe-only desktop token-price alerts"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Price Alerts
 
-Set up desktop price alerts that notify you when tokens hit target prices. Observe-only — no trading, just notifications.
+Create observe-only desktop token-price alerts.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Set up desktop price alerts that notify you when tokens hit target prices. Obser
 | Source | Optional — install with `hermes skills install official/moonpay/price-alerts` |
 | Path | `optional-skills/moonpay/price-alerts` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Alerts`, `Research` |

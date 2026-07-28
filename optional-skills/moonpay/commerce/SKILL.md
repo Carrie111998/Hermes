@@ -1,8 +1,8 @@
 ---
 name: commerce
-description: "Browse Shopify stores, search products, manage a cart, and checkout with crypto via Solana Pay. No login required."
+description: "Shop and pay with crypto through Solana Pay."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

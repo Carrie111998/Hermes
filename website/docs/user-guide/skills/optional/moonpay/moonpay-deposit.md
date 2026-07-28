@@ -1,14 +1,14 @@
 ---
-title: "Deposit — Create deposit links that accept crypto from any chain and auto-convert to stablecoins"
+title: "Deposit — Create cross-chain crypto deposit links"
 sidebar_label: "Deposit"
-description: "Create deposit links that accept crypto from any chain and auto-convert to stablecoins"
+description: "Create cross-chain crypto deposit links"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Deposit
 
-Create deposit links that accept crypto from any chain and auto-convert to stablecoins. No login required.
+Create cross-chain crypto deposit links.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Create deposit links that accept crypto from any chain and auto-convert to stabl
 | Source | Optional — install with `hermes skills install official/moonpay/deposit` |
 | Path | `optional-skills/moonpay/deposit` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Payments` |

@@ -1,14 +1,14 @@
 ---
-title: "Feedback — Submit feedback, bug reports, or feature requests for the MoonPay CLI"
+title: "Feedback — Submit MoonPay CLI feedback and bug reports"
 sidebar_label: "Feedback"
-description: "Submit feedback, bug reports, or feature requests for the MoonPay CLI"
+description: "Submit MoonPay CLI feedback and bug reports"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Feedback
 
-Submit feedback, bug reports, or feature requests for the MoonPay CLI. Use when the user encounters issues, wants to suggest improvements, or has general feedback.
+Submit MoonPay CLI feedback and bug reports.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Submit feedback, bug reports, or feature requests for the MoonPay CLI. Use when 
 | Source | Optional — install with `hermes skills install official/moonpay/feedback` |
 | Path | `optional-skills/moonpay/feedback` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Support` |

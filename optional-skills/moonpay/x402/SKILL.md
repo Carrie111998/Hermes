@@ -1,8 +1,8 @@
 ---
 name: x402
-description: "Make paid API requests to x402-protected endpoints. Automatically handles payment with your local wallet."
+description: "Call x402 APIs using the local MoonPay wallet."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

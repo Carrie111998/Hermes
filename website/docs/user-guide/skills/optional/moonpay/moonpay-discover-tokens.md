@@ -1,14 +1,14 @@
 ---
-title: "Discover Tokens — Search for tokens, check prices, get trading briefs, and evaluate risk"
+title: "Discover Tokens — Research token prices, briefs, and trading risk"
 sidebar_label: "Discover Tokens"
-description: "Search for tokens, check prices, get trading briefs, and evaluate risk"
+description: "Research token prices, briefs, and trading risk"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Discover Tokens
 
-Search for tokens, check prices, get trading briefs, and evaluate risk. Use for token research, "is this token safe?", price checks, and market analysis.
+Research token prices, briefs, and trading risk.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Search for tokens, check prices, get trading briefs, and evaluate risk. Use for 
 | Source | Optional — install with `hermes skills install official/moonpay/discover-tokens` |
 | Path | `optional-skills/moonpay/discover-tokens` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Research` |

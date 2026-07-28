@@ -1,14 +1,14 @@
 ---
-title: "Missions — A series of missions that walk through every MoonPay CLI capability"
+title: "Missions — Run guided missions across MoonPay CLI capabilities"
 sidebar_label: "Missions"
-description: "A series of missions that walk through every MoonPay CLI capability"
+description: "Run guided missions across MoonPay CLI capabilities"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Missions
 
-A series of missions that walk through every MoonPay CLI capability. Use when the user is new or says "get started", "show me what you can do", or "run the missions".
+Run guided missions across MoonPay CLI capabilities.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ A series of missions that walk through every MoonPay CLI capability. Use when th
 | Source | Optional — install with `hermes skills install official/moonpay/missions` |
 | Path | `optional-skills/moonpay/missions` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Setup` |

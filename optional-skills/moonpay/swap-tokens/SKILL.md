@@ -1,8 +1,8 @@
 ---
 name: swap-tokens
-description: "Swap tokens on the same chain or bridge tokens across chains. Use when the user wants to swap, bridge, or move tokens."
+description: "Swap or bridge tokens across supported chains."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

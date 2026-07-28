@@ -1,8 +1,8 @@
 ---
 name: hardware-wallet
-description: "Connect a hardware wallet (Ledger) to the MoonPay CLI. Sign transactions on the physical device — no private keys stored locally."
+description: "Connect a Ledger wallet for physical transaction signing."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

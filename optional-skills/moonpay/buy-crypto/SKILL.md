@@ -1,8 +1,8 @@
 ---
 name: buy-crypto
-description: "Buy crypto with fiat via MoonPay. Returns a checkout URL to complete the purchase in a browser."
+description: "Create a fiat-to-crypto checkout link."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

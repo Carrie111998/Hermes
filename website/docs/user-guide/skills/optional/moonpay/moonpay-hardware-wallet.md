@@ -1,14 +1,14 @@
 ---
-title: "Hardware Wallet — Connect a hardware wallet (Ledger) to the MoonPay CLI"
+title: "Hardware Wallet — Connect a Ledger wallet for physical transaction signing"
 sidebar_label: "Hardware Wallet"
-description: "Connect a hardware wallet (Ledger) to the MoonPay CLI"
+description: "Connect a Ledger wallet for physical transaction signing"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Hardware Wallet
 
-Connect a hardware wallet (Ledger) to the MoonPay CLI. Sign transactions on the physical device — no private keys stored locally.
+Connect a Ledger wallet for physical transaction signing.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Connect a hardware wallet (Ledger) to the MoonPay CLI. Sign transactions on the 
 | Source | Optional — install with `hermes skills install official/moonpay/hardware-wallet` |
 | Path | `optional-skills/moonpay/hardware-wallet` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Wallet` |

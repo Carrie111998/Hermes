@@ -1,14 +1,14 @@
 ---
-title: "Block Explorer — Open transactions, wallets, and tokens in the correct block explorer"
+title: "Block Explorer — Open MoonPay activity in the correct block explorer"
 sidebar_label: "Block Explorer"
-description: "Open transactions, wallets, and tokens in the correct block explorer"
+description: "Open MoonPay activity in the correct block explorer"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Block Explorer
 
-Open transactions, wallets, and tokens in the correct block explorer. Use after swaps, bridges, or transfers to view results in the browser.
+Open MoonPay activity in the correct block explorer.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Open transactions, wallets, and tokens in the correct block explorer. Use after 
 | Source | Optional — install with `hermes skills install official/moonpay/block-explorer` |
 | Path | `optional-skills/moonpay/block-explorer` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Explorer` |

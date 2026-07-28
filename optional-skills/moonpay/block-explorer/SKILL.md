@@ -1,8 +1,8 @@
 ---
 name: block-explorer
-description: "Open transactions, wallets, and tokens in the correct block explorer. Use after swaps, bridges, or transfers to view results in the browser."
+description: "Open MoonPay activity in the correct block explorer."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

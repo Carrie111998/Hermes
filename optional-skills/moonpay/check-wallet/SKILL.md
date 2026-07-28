@@ -1,8 +1,8 @@
 ---
 name: check-wallet
-description: "Check wallet balances and holdings. Use for \"what's in my wallet\", portfolio breakdown, token balances, allocation percentages, and USD values."
+description: "Check wallet balances, holdings, and portfolio value."
 version: 0.1.0
-author: MoonPay (tonyagents), Hermes Agent
+author: Efren Plasencia (@tonyagents), Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:

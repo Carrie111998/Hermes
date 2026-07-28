@@ -1,14 +1,14 @@
 ---
-title: "Export Data — Export portfolio balances and transaction history to CSV or JSON files"
+title: "Export Data — Export wallet balances and transactions to CSV or JSON"
 sidebar_label: "Export Data"
-description: "Export portfolio balances and transaction history to CSV or JSON files"
+description: "Export wallet balances and transactions to CSV or JSON"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Export Data
 
-Export portfolio balances and transaction history to CSV or JSON files. Use for spreadsheets, tax reporting, or record-keeping.
+Export wallet balances and transactions to CSV or JSON.
 
 ## Skill metadata
 
@@ -17,7 +17,7 @@ Export portfolio balances and transaction history to CSV or JSON files. Use for 
 | Source | Optional — install with `hermes skills install official/moonpay/export-data` |
 | Path | `optional-skills/moonpay/export-data` |
 | Version | `0.1.0` |
-| Author | MoonPay (tonyagents), Hermes Agent |
+| Author | Efren Plasencia (@tonyagents), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos |
 | Tags | `MoonPay`, `Portfolio`, `Export` |
