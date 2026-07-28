@@ -1,12 +1,18 @@
-"""Production runtime integration test with Postgres authority backend.
+"""Bridge-level lifecycle integration test with Postgres authority backend.
 
-This test exercises the AuthorityBridge in a scenario that simulates
-the governed worker runtime's claim → permit → effect → complete lifecycle
-using the Postgres authority store as the coordination backend.
+This test exercises AuthorityBridge — the runtime-facing abstraction — in
+scenarios that prove the Postgres coordination store enforces the correct
+fencing, exclusivity, and idempotency invariants through the bridge API.
 
-Unlike the unit tests which exercise individual functions, this test
-proves the full lifecycle through the bridge abstraction — the same
-interface the objective runtime uses.
+Limitations (to be addressed by multi-process acceptance test):
+- Single process: bridge objects are instantiated directly, not via
+  objective_service tick cycle or supervised worker subprocess.
+- Simulated crash: lease expiry is forced via raw SQL UPDATE, not
+  actual process death (SIGKILL) and natural lease timeout.
+- No provider read-back: recovery checks the local effect table, not
+  an external provider API.
+- Default tenant: HERMES_TENANT_ID is unset, so DEFAULT_TENANT_ID
+  is used — explicit multi-tenant propagation is not exercised.
 
 Requires:
   AUTHORITY_POSTGRES_TEST_URL="host=/var/run/postgresql port=5433 user=postgres dbname=charterforge_test"

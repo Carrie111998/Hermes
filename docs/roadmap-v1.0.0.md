@@ -1,8 +1,8 @@
 # Charterforge Roadmap to v1.0.0
 
-**Current Version:** v1.0.0 (2026-07-28)  
-**Release Type:** Production release — feature-complete, documented, stable API  
-**Gap:** None — all milestones delivered
+**Current Version:** v1.0.0-rc1 (2026-07-28)  
+**Release Type:** Pre-release candidate — feature APIs complete, runtime proof pending  
+**Gap:** Decisive multi-process, multi-tenant acceptance test required before v1.0.0
 
 ---
 
@@ -20,7 +20,7 @@
 | **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | ✅ Released |
 | **0.28.0** | Disaster Recovery | Backup/restore, failover drill | ✅ Released |
 | **0.29.0** | Security Hardening | Audit logging, secret management | ✅ Released |
-| **1.0.0** | Production Release | Feature-complete, documented, stable API | ✅ Released |
+| **1.0.0** | Production Release | Feature-complete, documented, stable API | 🟡 RC1 — runtime gate pending |
 
 ---
 
@@ -28,7 +28,7 @@
 
 **Goal:** Secure tenant boundaries preventing cross-organization data leakage.
 
-**Status:** ✅ Complete — schema, runtime, bridge, and acceptance tests all passing.
+**Status:** 🟡 Schema + bridge complete. Multi-process runtime proof and explicit tenant propagation test still required.
 
 ### Scope
 
@@ -59,8 +59,10 @@
 - [x] Decisive two-tenant, two-worker acceptance test (12-point scenario)
 - [x] Backend contract invariant tests (7 invariants, 10 tests)
 - [x] AuthorityBridge for runtime-to-Postgres integration
-- [x] Wire AuthorityBridge into objective_service tick cycle
-- [x] Production worker runtime test with Postgres backend (3 scenarios: full lifecycle, race exclusivity, crash recovery)
+- [x] Wire AuthorityBridge into objective_service tick cycle (code wiring done, not yet exercised by multi-process test)
+- [x] Bridge-level lifecycle test with Postgres backend (3 scenarios: full lifecycle, race exclusivity, simulated crash recovery)
+- [ ] Multi-process runtime test proving objective_service execution through tick cycle
+- [ ] Real crash recovery test (SIGKILL, not manual SQL expiry)
 
 ---
 
@@ -104,6 +106,66 @@
 - [x] Organization-scoped task claims (metering anchor point)
 - [x] RBAC capability model (billing:manage capability)
 - [x] AuthorityBridge lifecycle tracking (countable events)
+
+---
+
+## v1.0.0 — Production Release (Gate Pending)
+
+**Goal:** Prove the full stack works as an autonomous business runtime under realistic failure conditions.
+
+**Status:** 🟡 RC1 — feature APIs complete, decisive runtime proof required.
+
+### What v1.0.0-rc1 has (architectural preview)
+
+- Fenced Postgres authority with 12 idempotent migrations
+- Bridge-level lifecycle integration tests
+- Tenant-scoped service modules (billing, marketplace, integrations, monitoring, DR, secrets)
+- Extensive local integration tests (feature-isolated)
+
+### What v1.0.0-rc1 does NOT yet prove
+
+- Two real worker processes (not bridge objects in one test process)
+- Actual objective_service execution through the tick cycle
+- Real worker event consumption and subordinate launch
+- Process death via SIGKILL (not manual SQL claim expiry)
+- Restart from a new interpreter
+- Provider read-back after crash (not "effect row already exists")
+- Same identifiers across two explicit tenants with isolation enforced
+- Container or host separation
+
+### v1.0.0 Release Gate: Decisive Acceptance Test
+
+The following MUST pass before v1.0.0 replaces rc1:
+
+```
+two explicit tenants
+→ two real worker processes
+→ shared Postgres
+→ same local identifiers
+→ tenant-isolated claims (only one winner per tenant)
+→ exact tenant-bound permits
+→ real deterministic provider effect
+→ SIGKILL after provider effect but before local evidence
+→ fresh recovery process (new interpreter)
+→ provider read-back (not local DB lookup)
+→ no duplicate provider call
+→ one effect record per tenant
+→ one task completion per tenant
+→ subordinate completion event
+→ fresh CEO verification
+→ no cross-tenant visibility or mutation at any point
+```
+
+### Additional evidence required
+
+- [ ] Multi-process test (subprocess spawn, not in-process bridge instantiation)
+- [ ] Real lease expiry (short TTL + wait, not raw SQL UPDATE)
+- [ ] Provider read-back pattern (query external state, not local effect table)
+- [ ] Explicit tenant propagation (HERMES_TENANT_ID set, not DEFAULT_TENANT_ID fallback)
+- [ ] Cross-tenant isolation assertions (same task_id + org_id, different tenants)
+- [ ] SIGKILL recovery (os.kill, not logical release)
+- [ ] CI green on combined test suite
+- [ ] No raw SQL mutation in acceptance tests (public API only)
 
 ---
 
