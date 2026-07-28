@@ -1709,6 +1709,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 sort=function_args.get("sort"),
                 db=session_db,
                 current_session_id=agent.session_id,
+                principal_source=agent.platform if agent._user_id else None,
+                principal_user_id=agent._user_id,
             )
         )
     elif function_name == "memory":

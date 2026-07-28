@@ -67,6 +67,36 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+
+def _gateway_shared_memory_allowed(
+    user_config: dict,
+    platform: str,
+    user_id: str | None,
+) -> bool:
+    """Return whether a gateway principal may use global MEMORY.md/USER.md.
+
+    Slack is commonly multi-user, while the built-in memory files are global.
+    Fail closed there unless the exact ``platform:user_id`` principal is listed
+    under ``memory.owner_principals``. Other platforms retain their existing
+    behaviour until they opt into the same multi-principal activation model.
+    """
+    platform_norm = str(platform or "").strip().lower()
+    if platform_norm != "slack":
+        return True
+    if not user_id:
+        return False
+    memory_cfg = (user_config or {}).get("memory") or {}
+    configured = memory_cfg.get("owner_principals") or []
+    if isinstance(configured, str):
+        configured = [configured]
+    allowed = {
+        str(value).strip()
+        for value in configured
+        if isinstance(value, str) and str(value).strip()
+    }
+    return f"{platform_norm}:{user_id}" in allowed
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -12587,6 +12617,13 @@ class GatewayRunner:
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            skip_shared_memory = not _gateway_shared_memory_allowed(
+                user_config,
+                platform_key,
+                getattr(source, "user_id", None),
+            )
+            if skip_shared_memory:
+                disabled_toolsets = sorted(set(disabled_toolsets or []) | {"memory"})
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -12639,6 +12676,7 @@ class GatewayRunner:
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    skip_memory=skip_shared_memory,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -16083,6 +16121,7 @@ class GatewayRunner:
         ("compression", "protect_last_n"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
+        ("memory", "owner_principals"),
     )
 
     _HONCHO_CACHE_BUSTING_KEYS = (
@@ -17760,6 +17799,13 @@ class GatewayRunner:
                 )
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            skip_shared_memory = not _gateway_shared_memory_allowed(
+                user_config,
+                platform_key,
+                getattr(source, "user_id", None),
+            )
+            if skip_shared_memory:
+                disabled_toolsets = sorted(set(disabled_toolsets or []) | {"memory"})
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -17822,6 +17868,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    skip_memory=skip_shared_memory,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )

@@ -897,6 +897,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     sort=function_args.get("sort"),
                     db=session_db,
                     current_session_id=agent.session_id,
+                    principal_source=agent.platform if agent._user_id else None,
+                    principal_user_id=agent._user_id,
                 )
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():

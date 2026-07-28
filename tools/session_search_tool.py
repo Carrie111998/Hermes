@@ -107,10 +107,18 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    principal_source: str = None,
+    principal_user_id: str = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         sessions = db.list_sessions_rich(
+            source=principal_source,
+            user_id=principal_user_id,
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
@@ -156,6 +164,8 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    principal_source: str = None,
+    principal_user_id: str = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -199,6 +209,17 @@ def _scroll(
         session_meta = {}
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
+    if principal_source is not None or principal_user_id is not None:
+        if (
+            not principal_source
+            or not principal_user_id
+            or session_meta.get("source") != principal_source
+            or session_meta.get("user_id") != principal_user_id
+        ):
+            return tool_error(
+                "session_id is outside the current conversation principal",
+                success=False,
+            )
 
     # Fetch the window
     try:
@@ -281,6 +302,8 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    principal_source: str = None,
+    principal_user_id: str = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
@@ -289,6 +312,8 @@ def _discover(
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
+            source_filter=[principal_source] if principal_source else None,
+            user_id_filter=principal_user_id,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=50,  # widen so dedup-by-lineage can find distinct sessions
             offset=0,
@@ -387,6 +412,10 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
+    # Trusted runtime scope. These values are supplied by the agent runtime,
+    # never exposed in the model-callable schema.
+    principal_source: str = None,
+    principal_user_id: str = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -414,6 +443,8 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            principal_source=principal_source,
+            principal_user_id=principal_user_id,
         )
 
     # Limit clamp [1, 10]
@@ -426,7 +457,13 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            principal_source=principal_source,
+            principal_user_id=principal_user_id,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -447,6 +484,8 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        principal_source=principal_source,
+        principal_user_id=principal_user_id,
     )
 
 
@@ -596,6 +635,8 @@ registry.register(
         sort=args.get("sort"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
+        principal_source=kw.get("principal_source"),
+        principal_user_id=kw.get("principal_user_id"),
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",

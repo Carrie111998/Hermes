@@ -1566,6 +1566,7 @@ class SessionDB:
         include_archived: bool = False,
         archived_only: bool = False,
         id_query: str = None,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1624,6 +1625,9 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -2750,6 +2754,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        user_id_filter: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -2814,6 +2819,9 @@ class SessionDB:
             source_placeholders = ",".join("?" for _ in source_filter)
             where_clauses.append(f"s.source IN ({source_placeholders})")
             params.extend(source_filter)
+        if user_id_filter is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id_filter)
 
         if exclude_sources is not None:
             exclude_placeholders = ",".join("?" for _ in exclude_sources)
@@ -2893,6 +2901,9 @@ class SessionDB:
                 if source_filter is not None:
                     tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     tri_params.extend(source_filter)
+                if user_id_filter is not None:
+                    tri_where.append("s.user_id = ?")
+                    tri_params.append(user_id_filter)
                 if exclude_sources is not None:
                     tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     tri_params.extend(exclude_sources)
@@ -2948,6 +2959,9 @@ class SessionDB:
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)
+                if user_id_filter is not None:
+                    like_where.append("s.user_id = ?")
+                    like_params.append(user_id_filter)
                 if exclude_sources is not None:
                     like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     like_params.extend(exclude_sources)
