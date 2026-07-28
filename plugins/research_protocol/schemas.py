@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 from .approval import ApprovalScope
 from .models import (
     ConflictRecord,
@@ -43,9 +45,10 @@ def _tool_schema(name: str, description: str, parameters: dict) -> dict:
 
 def _close_pattern_mappings(node: object) -> None:
     if isinstance(node, dict):
-        if node.get("type") == "object" and "patternProperties" in node:
-            node["additionalProperties"] = False
-        for value in node.values():
+        mapping = cast(dict[str, Any], node)
+        if mapping.get("type") == "object" and "patternProperties" in mapping:
+            mapping["additionalProperties"] = False
+        for value in mapping.values():
             _close_pattern_mappings(value)
     elif isinstance(node, list):
         for value in node:

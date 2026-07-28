@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -43,9 +44,10 @@ def _close_pattern_property_objects(node: object) -> None:
     """Mirror strict Pydantic mapping-key validation in exported schemas."""
 
     if isinstance(node, dict):
-        if "patternProperties" in node:
-            node["additionalProperties"] = False
-        for value in node.values():
+        mapping = cast(dict[str, Any], node)
+        if "patternProperties" in mapping:
+            mapping["additionalProperties"] = False
+        for value in mapping.values():
             _close_pattern_property_objects(value)
     elif isinstance(node, list):
         for value in node:
