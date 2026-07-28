@@ -29,3 +29,6 @@
 [submodule "vendor/akari-video"]
 	path = vendor/akari-video
 	url = https://github.com/zapabob/akari-video
+[submodule "vendor/cloakbrowser"]
+	path = vendor/cloakbrowser
+	url = https://github.com/CloakHQ/cloakbrowser.git
