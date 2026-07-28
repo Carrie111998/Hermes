@@ -5745,6 +5745,80 @@ class TestRunConversation:
         assert result["api_calls"] == 4
         assert result["completed"] is False
 
+    def test_length_reasoning_content_exhausted_skips_continuation(self, agent):
+        """finish_reason='length' with structured reasoning_content but no
+        content (Kimi K2.x/K3 on Fireworks, DeepSeek via some providers) must
+        fire thinking-exhaustion — not waste 4 continuation retries.  These
+        models emit thinking in ``reasoning_content`` rather than inline
+        ``<think>`` tags, so the tag-based detector alone misses them."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content=None,
+            finish_reason="length",
+            reasoning_content="internal reasoning " * 500,
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Detected immediately — single API call, no continuation retries.
+        assert result["api_calls"] == 1
+        assert result["completed"] is False
+        assert "reasoning" in result["error"].lower()
+        assert "output tokens" in result["error"].lower()
+        assert result["final_response"] is not None
+        assert "Thinking Budget Exhausted" in result["final_response"]
+
+    def test_length_reasoning_field_exhausted_skips_continuation(self, agent):
+        """Same exhaustion detection for the ``reasoning`` field (DeepSeek/Qwen
+        shape) that ``normalize_response`` keeps on the message directly."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="",
+            finish_reason="length",
+            reasoning="internal reasoning " * 500,
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["api_calls"] == 1
+        assert result["completed"] is False
+        assert "Thinking Budget Exhausted" in result["final_response"]
+
+    def test_length_reasoning_content_with_partial_content_retries_normally(self, agent):
+        """Reasoning plus a partial visible answer is a genuine mid-content
+        truncation — the answer is worth continuing, so this must NOT be
+        treated as thinking-budget exhaustion."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="Here is the partial",
+            finish_reason="length",
+            reasoning_content="internal reasoning " * 500,
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Visible content present → normal continuation retries, not exhaustion.
+        assert result["api_calls"] == 4
+        assert result["completed"] is False
+
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)
         bad_tc = _mock_tool_call(

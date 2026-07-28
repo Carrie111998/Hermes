@@ -2767,12 +2767,43 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    # Some reasoning models emit their thinking in a structured
+                    # ``reasoning`` / ``reasoning_content`` field instead of
+                    # inline ``<think>`` tags — Kimi K2.x/K3 on Fireworks,
+                    # DeepSeek on certain providers.  When such a model spends
+                    # its whole budget on reasoning it returns no content and no
+                    # tool calls, and the ``<think>``-tag check above never
+                    # fires, so Hermes wastes up to 4 continuation retries on
+                    # identical budget-exhausted responses before giving up with
+                    # a misleading "remained truncated" error.  ``normalize_response``
+                    # keeps ``reasoning`` on the message and ``reasoning_content``
+                    # under ``provider_data`` (agent/transports/chat_completions.py),
+                    # so consult both.
+                    _trunc_reasoning = getattr(_trunc_msg, "reasoning", None) if _trunc_msg else None
+                    if not _trunc_reasoning and _trunc_msg:
+                        _pd = getattr(_trunc_msg, "provider_data", None)
+                        if isinstance(_pd, dict):
+                            _trunc_reasoning = _pd.get("reasoning_content")
+                    _has_reasoning_content = bool(
+                        isinstance(_trunc_reasoning, str) and _trunc_reasoning.strip()
+                    )
                     _thinking_exhausted = (
                         not _trunc_has_tool_calls
-                        and _has_think_tags
                         and (
-                            (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
-                            or _trunc_content is None
+                            # Inline ``<think>``-tag exhaustion (unchanged): tags
+                            # present and no visible text after the think block.
+                            (
+                                _has_think_tags
+                                and (
+                                    (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
+                                    or _trunc_content is None
+                                )
+                            )
+                            # Structured-reasoning exhaustion: reasoning was
+                            # produced but there is no content to show for it.
+                            # ``finish_reason == 'length'`` is already guaranteed
+                            # by the enclosing branch.
+                            or (_has_reasoning_content and not _trunc_content)
                         )
                     )
 
