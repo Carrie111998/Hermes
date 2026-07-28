@@ -2592,3 +2592,201 @@ class TestStalePortalBaseUrlMigration:
 
         auth_mod.resolve_nous_runtime_credentials()
         assert refresh_calls == [auth_mod.DEFAULT_NOUS_PORTAL_URL]
+
+
+# =============================================================================
+# Store-side quarantine: two entries sharing ONE `source` value
+#
+# `_quarantine_nous_pool_entries` is the store-side twin of
+# `CredentialPool._quarantine_dead_chain`, reached from three call paths with no
+# repairing `_persist` behind them (`resolve_nous_access_token`,
+# `resolve_nous_runtime_credentials`, and the proxy adapter).  The
+# `keeps_other_chain` tests above pair `device_code` with `manual:device_code`;
+# these pin the case where `source` cannot separate the chains at all.
+# =============================================================================
+
+
+def _same_source_nous_pool() -> list[dict]:
+    """Two `manual:device_code` entries differing only in refresh chain.
+
+    `manual:` entries are in the Nous removal filter and are never re-synced
+    from `providers.nous`, so unlike a pair of `device_code` entries (which
+    `_sync_nous_entry_from_auth_store` converges onto the singleton's chain)
+    these persist on separate chains indefinitely.  That makes this the shape
+    where `source` genuinely cannot tell the two chains apart.
+    """
+    live_jwt = _invoke_jwt(seconds=3600)
+    return [
+        {
+            "id": "dead-same-source",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 0,
+            "access_token": "access-old",
+            "refresh_token": "dead-refresh-chain",
+            "agent_key": "dead-agent-key",
+            "portal_base_url": "https://portal.example.com",
+            "inference_base_url": "https://inference.example.com/v1",
+            "scope": "inference:invoke",
+        },
+        {
+            "id": "live-same-source",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 3,
+            "access_token": live_jwt,
+            "refresh_token": "live-refresh-chain",
+            "agent_key": live_jwt,
+            "agent_key_expires_at": _future_iso(3600),
+            "expires_at": _future_iso(3600),
+            "portal_base_url": "https://portal.example.com",
+            "inference_base_url": "https://inference.example.com/v1",
+            "scope": "inference:invoke",
+        },
+    ]
+
+
+def test_quarantine_nous_pool_entries_reclaims_only_dead_chain_among_same_source():
+    """Unit-level: the predicate must split one `source` bucket by chain.
+
+    Exercised directly rather than through a call path so the assertion lands on
+    the function's own behaviour, with no `_persist` or re-seed in between.
+    """
+    from hermes_cli import auth as auth_mod
+
+    auth_store = {"credential_pool": {"nous": _same_source_nous_pool()}}
+    error = AuthError(
+        "Invalid refresh token",
+        provider="nous",
+        code="invalid_grant",
+        relogin_required=True,
+    )
+
+    removed = auth_mod._quarantine_nous_pool_entries(
+        auth_store,
+        error,
+        reason="unit",
+        dead_refresh_token="dead-refresh-chain",
+    )
+
+    assert removed is True
+    surviving = [entry["id"] for entry in auth_store["credential_pool"]["nous"]]
+    # The dead chain is reclaimed...
+    assert "dead-same-source" not in surviving
+    # ...and its same-source sibling on a live chain is not.
+    assert surviving == ["live-same-source"]
+
+
+def test_quarantine_nous_pool_entries_spares_every_entry_when_no_chain_matches():
+    """A chain that no pool entry carries must reclaim nothing at all.
+
+    The source-only filter reported `True` and emptied the bucket here; the
+    gated one has no match, so it must leave the pool untouched and say so --
+    the return value drives the caller's trace/write decision.
+    """
+    from hermes_cli import auth as auth_mod
+
+    auth_store = {"credential_pool": {"nous": _same_source_nous_pool()}}
+    error = AuthError(
+        "Invalid refresh token",
+        provider="nous",
+        code="invalid_grant",
+        relogin_required=True,
+    )
+
+    removed = auth_mod._quarantine_nous_pool_entries(
+        auth_store,
+        error,
+        reason="unit",
+        dead_refresh_token="some-third-chain-nobody-holds",
+    )
+
+    assert removed is False
+    assert [entry["id"] for entry in auth_store["credential_pool"]["nous"]] == [
+        "dead-same-source",
+        "live-same-source",
+    ]
+
+
+def test_quarantine_nous_pool_entries_without_dead_chain_reclaims_only_tokenless():
+    """`None`/`""` means no chain was identified -- not "reclaim everything".
+
+    `dead_refresh_token` is keyword-only with no default so that a caller cannot
+    silently fall into the old nuke-everything behaviour.  When a caller does
+    pass an empty chain, the documented meaning is that only entries carrying no
+    refresh token of their own match.
+    """
+    from hermes_cli import auth as auth_mod
+
+    entries = _same_source_nous_pool()
+    entries.append({
+        "id": "tokenless",
+        "source": "manual:device_code",
+        "auth_type": "oauth",
+        "priority": 9,
+        "access_token": "access-tokenless",
+        "refresh_token": "",
+    })
+    auth_store = {"credential_pool": {"nous": entries}}
+    error = AuthError(
+        "Invalid refresh token",
+        provider="nous",
+        code="invalid_grant",
+        relogin_required=True,
+    )
+
+    removed = auth_mod._quarantine_nous_pool_entries(
+        auth_store,
+        error,
+        reason="unit",
+        dead_refresh_token=None,
+    )
+
+    assert removed is True
+    surviving = [entry["id"] for entry in auth_store["credential_pool"]["nous"]]
+    assert surviving == ["dead-same-source", "live-same-source"]
+
+    # And the signature refuses a caller that never names a chain at all.
+    with pytest.raises(TypeError):
+        auth_mod._quarantine_nous_pool_entries(
+            {"credential_pool": {"nous": []}}, error, reason="unit",
+        )
+
+
+def test_runtime_refresh_failure_reclaims_only_dead_chain_among_same_source(
+    tmp_path, monkeypatch, shared_store_env,
+):
+    """End-to-end on `resolve_nous_runtime_credentials`, the widest exposure.
+
+    Nothing repairs this path: the retained entry is what the next `load_pool`
+    reads, and a `device_code` sibling wrongly dropped here cannot be recovered
+    from `providers.nous` because it is on a different chain.
+    """
+    from hermes_cli import auth as auth_mod
+
+    hermes_home = tmp_path / "hermes"
+    _setup_nous_auth(
+        hermes_home,
+        access_token="access-old",
+        refresh_token="dead-refresh-chain",
+    )
+    _seed_nous_pool(hermes_home, _same_source_nous_pool())
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _terminal_refresh_failure(*, client, portal_base_url, client_id, refresh_token):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "_refresh_access_token", _terminal_refresh_failure)
+
+    with pytest.raises(AuthError, match="Refresh session has been revoked"):
+        auth_mod.resolve_nous_runtime_credentials()
+
+    payload = json.loads((hermes_home / "auth.json").read_text())
+    surviving = [entry["id"] for entry in payload["credential_pool"]["nous"]]
+    assert "dead-same-source" not in surviving
+    assert surviving == ["live-same-source"]

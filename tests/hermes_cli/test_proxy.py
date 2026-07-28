@@ -966,3 +966,72 @@ def test_cmd_proxy_start_refuses_when_unauthenticated(capsys, tmp_path, monkeypa
     assert rc == 2
     err = capsys.readouterr().err
     assert "hermes auth add nous" in err
+
+
+def test_nous_adapter_quarantine_reclaims_only_dead_chain_among_same_source(
+    tmp_path, monkeypatch,
+):
+    """Adapter path: two `manual:device_code` entries differing only in chain.
+
+    This path is the one that had to change shape to be gated at all:
+    `_quarantine_nous_oauth_state` pops `refresh_token` off `state` before
+    `_save_state` runs, so the dead chain is captured beforehand and threaded
+    through as `quarantine_refresh_token`.  If that capture regresses to reading
+    `state` inside `_save_state`, the chain arrives blank -- which spares both
+    entries and would pass a test that only asserts the survivor.  Asserting the
+    dead entry is still reclaimed is what catches it.
+    """
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "nous": {
+                "access_token": "access-tok",
+                "refresh_token": "dead-refresh-chain",
+                "agent_key": "stale-agent-key",
+            },
+        },
+        "credential_pool": {
+            "nous": [
+                {
+                    "id": "dead-same-source",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "access_token": "access-tok",
+                    "refresh_token": "dead-refresh-chain",
+                },
+                {
+                    "id": "live-same-source",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "priority": 3,
+                    "access_token": "live-access-tok",
+                    "refresh_token": "live-refresh-chain",
+                },
+            ],
+        },
+    }))
+
+    with patch(
+        "hermes_cli.proxy.adapters.nous_portal.resolve_nous_runtime_credentials",
+        side_effect=AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        ),
+    ):
+        adapter = NousPortalAdapter()
+        with pytest.raises(RuntimeError, match="Refresh session has been revoked"):
+            adapter.get_credential()
+
+    stored = json.loads(auth_path.read_text())
+    surviving = [entry["id"] for entry in stored["credential_pool"]["nous"]]
+    # The dead chain is reclaimed (the chain was captured before the pop)...
+    assert "dead-same-source" not in surviving
+    # ...and its same-source sibling on a live chain is not.
+    assert surviving == ["live-same-source"]

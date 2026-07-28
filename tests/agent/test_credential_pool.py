@@ -3991,3 +3991,339 @@ def test_nous_terminal_refresh_keeps_healthy_singleton_seeded_entry(tmp_path, mo
     ]
     # ...and the pool must still hand back a usable credential.
     assert pool.select() is not None
+
+
+# --- fixtures for the shared-source quarantine tests below -------------------
+
+
+def _nous_two_entry_store(
+    *,
+    singleton_refresh: str,
+    live_jwt: str,
+    expires_at: str,
+    entries: list,
+) -> dict:
+    return {
+        "version": 1,
+        "active_provider": "nous",
+        "providers": {
+            "nous": {
+                "portal_base_url": "https://portal.example.com",
+                "inference_base_url": "https://inference.example.com/v1",
+                "client_id": "hermes-cli",
+                "token_type": "Bearer",
+                "scope": "inference:invoke",
+                "access_token": live_jwt,
+                "refresh_token": singleton_refresh,
+                "expires_at": expires_at,
+                "agent_key": live_jwt,
+                "agent_key_expires_at": expires_at,
+            }
+        },
+        "credential_pool": {"nous": entries},
+    }
+
+
+def _nous_pool_entry(
+    entry_id: str,
+    *,
+    priority: int,
+    source: str,
+    access: str,
+    refresh: str,
+    **extra,
+) -> dict:
+    payload = {
+        "id": entry_id,
+        "source": source,
+        "auth_type": "oauth",
+        "priority": priority,
+        "access_token": access,
+        "refresh_token": refresh,
+        "portal_base_url": "https://portal.example.com",
+        "inference_base_url": "https://inference.example.com/v1",
+        "scope": "inference:invoke",
+    }
+    payload.update(extra)
+    return payload
+
+
+# =============================================================================
+# Chain-gated quarantine: two entries sharing ONE `source` value
+#
+# The `keeps_healthy_singleton_seeded_entry` tests above pair a
+# `manual:device_code` entry with a `device_code` one, so `source` alone can
+# still tell the two chains apart.  These pin the case where it cannot: two
+# entries carrying the *same* `source` string, differing only in which refresh
+# chain they hold.  A source-only filter has no way to spare one without
+# sparing both, so this is what keeps the gate from regressing to a
+# source-derived heuristic (e.g. "a `manual:` prefix implies a different
+# lineage") that would satisfy every mixed-source test above while re-opening
+# the defect.
+#
+# Which entries can actually hold that shape differs per provider, and the
+# first test below is why:
+#
+#   * `device_code` entries are singleton-seeded, and both
+#     `_sync_codex_entry_from_auth_store` and `_sync_nous_entry_from_auth_store`
+#     re-sync exactly those from `providers.<id>` on a failed refresh.  Two of
+#     them cannot stay on different chains — they converge onto the singleton's
+#     and the duplicate is then collapsed.  So for Codex and xAI, whose filter
+#     is `{"device_code"}` alone, a same-source split-chain pair is unreachable
+#     by construction rather than merely untested.
+#   * `manual:device_code` entries have no such shadow and are never synced, so
+#     two of them persist on separate chains indefinitely.  Nous includes them
+#     in its removal filter, which makes it the one site where the shared-source
+#     case is both reachable and in scope.
+# =============================================================================
+
+
+def test_codex_device_code_entry_converges_onto_the_singleton_chain(tmp_path, monkeypatch):
+    """Why a same-source split-chain pair is unreachable for Codex/xAI.
+
+    This is not a chain-gate regression test; it pins the precondition the gate's
+    scope rests on.  A `device_code` entry stranded on a foreign chain is adopted
+    onto the singleton's chain by `_sync_codex_entry_from_auth_store` rather than
+    quarantined, so `{"device_code"}` addresses exactly one chain at a time.  If
+    that sync is ever removed, two `device_code` entries *can* diverge, and the
+    `{"device_code"}` filter becomes as blunt as the Nous one — at which point
+    the shared-source coverage below needs extending to Codex and xAI.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+
+    now = int(time.time())
+    live_access = _jwt_with_claims({"exp": now + 7 * 24 * 3600})
+    stale_access = _jwt_with_claims({"exp": now - 7 * 24 * 3600})
+
+    payload = _codex_auth_store(live_access, "live-refresh-chain")
+    payload["credential_pool"] = {
+        "openai-codex": [
+            {
+                "id": "stranded",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "device_code",
+                "access_token": stale_access,
+                "refresh_token": "some-older-chain",
+            },
+        ]
+    }
+    _write_auth_store(tmp_path, payload)
+
+    from agent.credential_pool import invalidate_pool_cache, load_pool
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    def _reused(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh token already used",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _reused)
+
+    invalidate_pool_cache("openai-codex")
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+
+    # Adopted, not quarantined: the entry is still here and now carries the
+    # singleton's chain, so no second `device_code` chain survives alongside it.
+    entries = {entry.id: entry for entry in pool.entries()}
+    assert "stranded" in entries
+    assert entries["stranded"].refresh_token == "live-refresh-chain"
+    assert selected is not None
+
+
+def test_nous_terminal_refresh_reclaims_only_dead_chain_among_same_source_entries(
+    tmp_path, monkeypatch,
+):
+    """Nous in-memory site: two `manual:device_code` entries, one chain dead.
+
+    `manual:device_code` is in the Nous removal filter and is never re-synced
+    from `providers.nous`, so this pair is a stable production shape: a stale
+    manual entry left over from an old lineage sitting next to a manual entry
+    someone added after a re-auth.  `source` is identical, so only the refresh
+    chain can separate them — a source-only filter takes both.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
+
+    expires_at = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
+    live_jwt = _jwt_with_claims({
+        "sub": "test-user",
+        "scope": ["inference:invoke"],
+        "exp": int(time.time() + 3600),
+    })
+
+    _write_auth_store(
+        tmp_path,
+        _nous_two_entry_store(
+            # The singleton is on a third chain of its own, so the store-side
+            # quarantine inside this branch is skipped and what is under test is
+            # purely the in-memory `_quarantine_dead_chain`.
+            singleton_refresh="singleton-chain",
+            live_jwt=live_jwt,
+            expires_at=expires_at,
+            entries=[
+                _nous_pool_entry(
+                    "dead-same-source",
+                    priority=0,
+                    source="manual:device_code",
+                    access="dead-access-token",
+                    refresh="dead-refresh-chain",
+                    agent_key="dead-agent-key",
+                ),
+                _nous_pool_entry(
+                    "live-same-source",
+                    priority=3,
+                    source="manual:device_code",
+                    access=live_jwt,
+                    refresh="live-refresh-chain",
+                    agent_key=live_jwt,
+                    agent_key_expires_at=expires_at,
+                    expires_at=expires_at,
+                ),
+            ],
+        ),
+    )
+
+    from agent.credential_pool import invalidate_pool_cache, load_pool
+    from hermes_cli import auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    invalidate_pool_cache("nous")
+    pool = load_pool("nous")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "dead-same-source"
+
+    def _terminal(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials", _terminal)
+
+    assert pool.try_refresh_current() is None
+
+    surviving = [entry.id for entry in pool.entries()]
+    # The chain that actually died is reclaimed...
+    assert "dead-same-source" not in surviving
+    # ...and its same-source sibling on a live chain is not.  Scoped to the
+    # manual entries: the singleton is on a third chain of its own, so the pool
+    # also (correctly) seeds a fresh `device_code` entry from it, and asserting
+    # the whole list would make this test about seeding rather than quarantine.
+    manual_ids = [
+        entry.id for entry in pool.entries()
+        if entry.source == "manual:device_code"
+    ]
+    assert manual_ids == ["live-same-source"]
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert [
+        entry["id"] for entry in persisted["credential_pool"]["nous"]
+        if entry.get("source") == "manual:device_code"
+    ] == ["live-same-source"]
+
+    # The survivor must still be usable, not merely present.
+    assert pool.select() is not None
+
+
+def test_nous_branch_names_the_dead_chain_to_the_store_side_quarantine(
+    tmp_path, monkeypatch,
+):
+    """The 4th call site: `credential_pool.py` -> `_quarantine_nous_pool_entries`.
+
+    When the singleton is on the dying chain, the Nous branch also runs the
+    *store-side* quarantine.  Asserting the resulting file cannot prove that call
+    was gated correctly: the branch's own `_persist` rewrites the correctly
+    retained in-memory entries back over the store afterwards, so it would repair
+    an over-deletion before any assertion could see it.  (That repair is exactly
+    why this half of the defect survived 6a1c0b59e and needed 3e6b1fbb9.)  So
+    this pins the argument directly -- the site must name the chain it watched
+    die, because a blank one reclaims only token-less entries.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
+
+    expires_at = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
+    live_jwt = _jwt_with_claims({
+        "sub": "test-user",
+        "scope": ["inference:invoke"],
+        "exp": int(time.time() + 3600),
+    })
+
+    _write_auth_store(
+        tmp_path,
+        _nous_two_entry_store(
+            # Singleton on the DEAD chain: store_refresh == entry_refresh is the
+            # condition that reaches the store-side call.
+            singleton_refresh="dead-refresh-chain",
+            live_jwt=live_jwt,
+            expires_at=expires_at,
+            entries=[
+                _nous_pool_entry(
+                    "dead-same-source",
+                    priority=0,
+                    source="manual:device_code",
+                    access="dead-access-token",
+                    refresh="dead-refresh-chain",
+                    agent_key="dead-agent-key",
+                ),
+                _nous_pool_entry(
+                    "live-same-source",
+                    priority=3,
+                    source="manual:device_code",
+                    access=live_jwt,
+                    refresh="live-refresh-chain",
+                    agent_key=live_jwt,
+                    agent_key_expires_at=expires_at,
+                    expires_at=expires_at,
+                ),
+            ],
+        ),
+    )
+
+    from agent.credential_pool import invalidate_pool_cache, load_pool
+    from hermes_cli import auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    invalidate_pool_cache("nous")
+    pool = load_pool("nous")
+    assert pool.select() is not None
+
+    real_quarantine = auth_mod._quarantine_nous_pool_entries
+    observed: list = []
+
+    def _spy(auth_store, error, *, reason, dead_refresh_token):
+        observed.append(dead_refresh_token)
+        return real_quarantine(
+            auth_store, error, reason=reason, dead_refresh_token=dead_refresh_token
+        )
+
+    def _terminal(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "_quarantine_nous_pool_entries", _spy)
+    monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials", _terminal)
+
+    assert pool.try_refresh_current() is None
+
+    # The store-side call was reached, and was told which chain died.
+    assert observed == ["dead-refresh-chain"]
+
+    surviving = [entry.id for entry in pool.entries()]
+    assert "dead-same-source" not in surviving
+    assert surviving == ["live-same-source"]
