@@ -2599,7 +2599,20 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
+            from agent.skill_commands import _skill_payload_is_not_found
+
+            if _skill_payload_is_not_found(loaded):
+                logger.warning(
+                    "Cron job '%s': skill not found, skipping — %s",
+                    job.get("name", job.get("id")),
+                    error,
+                )
+            else:
+                logger.warning(
+                    "Cron job '%s': skill failed to load, skipping — %s",
+                    job.get("name", job.get("id")),
+                    error,
+                )
             skipped.append(skill_name)
             continue
 

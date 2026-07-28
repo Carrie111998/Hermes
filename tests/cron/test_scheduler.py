@@ -3411,6 +3411,31 @@ class TestBuildJobPromptMissingSkill:
                 _build_job_prompt({"name": "My Job", "skills": ["ghost-skill"], "prompt": "do something"})
         assert any("ghost-skill" in record.message for record in caplog.records)
 
+    def test_load_failure_is_not_reported_as_missing(self, caplog):
+        response = json.dumps(
+            {
+                "success": False,
+                "error": "Object of type date is not JSON serializable",
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            with patch("tools.skills_tool.skill_view", return_value=response):
+                _build_job_prompt(
+                    {
+                        "name": "My Job",
+                        "skills": ["broken-skill"],
+                        "prompt": "do something",
+                    }
+                )
+
+        messages = [record.message for record in caplog.records]
+        assert any(
+            "skill failed to load" in message
+            and "Object of type date is not JSON serializable" in message
+            for message in messages
+        )
+        assert not any("skill not found" in message for message in messages)
+
     def test_valid_skill_loaded_alongside_missing(self):
         """A valid skill is still loaded when another skill in the list is missing."""
 
