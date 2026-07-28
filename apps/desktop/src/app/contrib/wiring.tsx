@@ -491,6 +491,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     busyRef,
     creatingSessionRef,
     ensureSessionState,
+    gatewayRef,
     getRouteToken,
     getRoutedStoredSessionId,
     navigate,
@@ -595,8 +596,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const composer = useComposerActions({ activeSessionId, currentCwd, requestGateway })
 
   const branchInNewChat = useCallback(
-    async (messageId?: string) => {
-      const branched = await branchCurrentSession(messageId)
+    async (messageId?: string, targetSessionId?: string) => {
+      const branched = await branchCurrentSession(messageId, targetSessionId)
 
       if (branched) {
         await refreshSessions().catch(() => undefined)

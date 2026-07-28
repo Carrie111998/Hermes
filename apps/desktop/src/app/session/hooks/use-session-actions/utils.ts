@@ -1242,6 +1242,13 @@ export function selectBranchMessages(
   return toBranchMessages(authoritativeMessages.slice(0, authoritativeIndex + 1))
 }
 
+interface OptimisticSessionContext {
+  connectionId?: string
+  cwd?: string
+  profile?: null | string
+  targetProfile?: string
+}
+
 export function upsertOptimisticSession(
   created: SessionCreateResponse,
   id: string,
@@ -1249,27 +1256,21 @@ export function upsertOptimisticSession(
   preview: string | null = null,
   parentSessionId: string | null = null,
   lastActive?: number,
-  owner?: null | SessionProfileRoute
+  context?: OptimisticSessionContext
 ) {
   const now = lastActive ?? Date.now() / 1000
-  // Stamp the profile the session was just created on so the scoped sidebar
-  // shows the new row immediately instead of filtering it out as "default"
-  // until the aggregator re-fetches. An explicitly routed create ($newChatRoute
-  // / a tile's route) names its EXACT owner: the backend profile that route
-  // serves, on that route's connection. The live gateway's profile is only the
-  // owner for an unrouted create — in All-profiles / Bot routing the ambient
-  // profile stays on `default` while the session lives on another backend (and
-  // a concurrent source switch can move the active gateway before this row is
-  // inserted), so a row stamped `default` then misroutes every session-scoped
-  // RPC that resolves its owner off the row ("session not found" on turn two).
-  const profileKey = normalizeProfileKey(owner ? owner.targetProfile || owner.profile : $activeGatewayProfile.get())
-  const connectionId = owner?.connectionId.trim() || ''
+  // Preserve an exact create route when one is available, while allowing
+  // branch callers to add cwd/profile placement before they have a connection
+  // route. A bare profile is placement metadata, not an exact owner hint.
+  const profileKey = normalizeProfileKey(context?.targetProfile || context?.profile || $activeGatewayProfile.get())
+  const connectionId = context?.connectionId?.trim() || ''
+  const fallbackCwd = context?.cwd?.trim() || $currentCwd.get().trim() || null
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
     // lane immediately (the overlay groups by path); fall back to the workspace
     // the session was just started in when the create response omits it.
-    cwd: created.info?.cwd ?? ($currentCwd.get().trim() || null),
+    cwd: created.info?.cwd ?? fallbackCwd,
     ended_at: null,
     id,
     input_tokens: 0,
@@ -1289,8 +1290,8 @@ export function upsertOptimisticSession(
     ...(connectionId ? { connection_id: connectionId } : {})
   }
 
-  if (owner) {
-    setSessionOwnerHint(id, owner)
+  if (connectionId && context?.profile) {
+    setSessionOwnerHint(id, context as SessionProfileRoute)
   }
 
   setSessions(prev => [session, ...prev.filter(s => s.id !== id)])
