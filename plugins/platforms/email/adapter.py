@@ -536,15 +536,19 @@ class EmailAdapter(BasePlatformAdapter):
         self._msgid_context: Dict[str, str] = {}
         self._thread_context_max: int = 2000  # cap to prevent unbounded growth
 
-        # Session routing: "thread" (default) gives each email subject its own
-        # session; "sender" uses one session per sender address (legacy behaviour).
+        # Session routing (opt-in thread isolation):
+        #   "sender" (default) — one session per sender address (stock Hermes
+        #     behaviour; safe for existing deployments — no session key change).
+        #   "thread" — one session per email thread via SessionSource.thread_id
+        #     (recommended for email-agent secretaries). Enable via
+        #     platforms.email.session_routing or EMAIL_SESSION_ROUTING=thread.
         self._session_routing = (
             extra.get("session_routing", "")
             or os.getenv("EMAIL_SESSION_ROUTING", "")
-            or "thread"
+            or "sender"
         ).strip().lower()
         if self._session_routing not in ("thread", "sender"):
-            self._session_routing = "thread"
+            self._session_routing = "sender"
 
         # Display name for the From: header in outgoing emails.
         self._display_name = (
@@ -1473,6 +1477,144 @@ def _build_adapter(config):
     return EmailAdapter(config)
 
 
+def interactive_setup() -> None:
+    """Interactive `hermes gateway setup` flow for the Email platform.
+
+    Collects IMAP/SMTP credentials, access control, session routing, and an
+    optional From display name. Lazy-imports hermes_cli.setup helpers so the
+    plugin stays importable in non-CLI contexts.
+    """
+    from hermes_cli.setup import (
+        get_env_value,
+        print_header,
+        print_info,
+        print_success,
+        print_warning,
+        prompt,
+        prompt_choice,
+        prompt_yes_no,
+        save_env_value,
+    )
+
+    print_header("Email")
+    existing = get_env_value("EMAIL_ADDRESS")
+    if existing:
+        print_info(f"Email: already configured (address: {existing})")
+        if not prompt_yes_no("Reconfigure Email?", False):
+            return
+
+    print_info("Talk to Hermes through a dedicated IMAP/SMTP mailbox.")
+    print_info("  Use an app password for Gmail / Workspace — not the account password.")
+    print_info("  Prefer a dedicated mailbox (not your personal inbox).")
+    print()
+
+    address = prompt("Email address", default=get_env_value("EMAIL_ADDRESS") or "")
+    if not address:
+        print_warning("Email address is required — skipping Email setup")
+        return
+    save_env_value("EMAIL_ADDRESS", address.strip())
+
+    password = prompt("Email password / app password", password=True)
+    if password:
+        save_env_value("EMAIL_PASSWORD", password)
+    elif not get_env_value("EMAIL_PASSWORD"):
+        print_warning("Password is required — skipping Email setup")
+        return
+
+    imap_host = prompt(
+        "IMAP host (e.g. imap.gmail.com)",
+        default=get_env_value("EMAIL_IMAP_HOST") or "imap.gmail.com",
+    )
+    if imap_host:
+        save_env_value("EMAIL_IMAP_HOST", imap_host.strip())
+
+    smtp_host = prompt(
+        "SMTP host (e.g. smtp.gmail.com)",
+        default=get_env_value("EMAIL_SMTP_HOST") or "smtp.gmail.com",
+    )
+    if smtp_host:
+        save_env_value("EMAIL_SMTP_HOST", smtp_host.strip())
+
+    print()
+    print_info("Access control — the gateway denies unknown senders by default.")
+    allowed = prompt(
+        "Allowed senders (comma-separated addresses or @domain tokens, empty = decide next)",
+        default=get_env_value("EMAIL_ALLOWED_USERS") or "",
+    )
+    if allowed.strip():
+        save_env_value("EMAIL_ALLOWED_USERS", allowed.replace(" ", ""))
+        print_success("  Allowlist saved.")
+    else:
+        access_idx = prompt_choice(
+            "How should unauthorized senders be handled?",
+            [
+                "Open access (any email sender can message the bot)",
+                "Keep unknown senders silent (configure allowlist later)",
+            ],
+            1,
+        )
+        if access_idx == 0:
+            save_env_value("EMAIL_ALLOW_ALL_USERS", "true")
+            print_warning("  Open access enabled — anyone who can email this mailbox can talk to the bot.")
+        else:
+            save_env_value("EMAIL_ALLOW_ALL_USERS", "")
+            print_info("  Unknown senders will be ignored until EMAIL_ALLOWED_USERS is set.")
+
+    home = prompt(
+        "Home address for cron/notifications (optional)",
+        default=get_env_value("EMAIL_HOME_ADDRESS") or "",
+    )
+    if home.strip():
+        save_env_value("EMAIL_HOME_ADDRESS", home.strip())
+
+    print()
+    print_info("Session routing controls how email conversations are isolated.")
+    print_info("  Thread mode (recommended for email secretaries): one agent session")
+    print_info("  per email thread — two subjects from the same person stay separate.")
+    print_info("  Sender mode (stock default): one session per sender address.")
+    routing_idx = prompt_choice(
+        "Session routing?",
+        [
+            "One session per email thread (recommended for email agents)",
+            "One session per sender (stock / legacy)",
+        ],
+        0,
+    )
+    routing = "thread" if routing_idx == 0 else "sender"
+    save_env_value("EMAIL_SESSION_ROUTING", routing)
+    # Also persist under platforms.email so config.yaml is the source of truth
+    # for operators who prefer YAML over env.
+    try:
+        from hermes_cli.config import write_platform_config_field
+
+        write_platform_config_field("email", "session_routing", routing, raw=True)
+    except Exception:
+        pass
+    print_success(f"  Session routing: {routing}")
+
+    print()
+    display = prompt(
+        "From display name (optional, e.g. Iris Sloane)",
+        default=get_env_value("EMAIL_DISPLAY_NAME") or "",
+    )
+    if display.strip():
+        save_env_value("EMAIL_DISPLAY_NAME", display.strip())
+        try:
+            from hermes_cli.config import write_platform_config_field
+
+            write_platform_config_field("email", "display_name", display.strip(), raw=True)
+        except Exception:
+            pass
+        print_success(f"  From header will show: {display.strip()} <{address.strip()}>")
+    else:
+        print_info("  From header will use the bare address.")
+
+    print()
+    print_success("Email platform configured.")
+    print_info("  Start or restart the gateway: hermes gateway restart")
+    print_info("  Docs: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/email")
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -1491,4 +1633,5 @@ def register(ctx) -> None:
         pii_safe=True,
         emoji="📧",
         allow_update_command=True,
+        setup_fn=interactive_setup,
     )

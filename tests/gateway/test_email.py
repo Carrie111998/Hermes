@@ -133,8 +133,13 @@ class TestDispatchMessage(unittest.TestCase):
         else:
             os.environ["EMAIL_ALLOW_ALL_USERS"] = self._prev_allow_all
 
-    def _make_adapter(self):
-        """Create an EmailAdapter with mocked env vars."""
+    def _make_adapter(self, session_routing: str = "thread"):
+        """Create an EmailAdapter with mocked env vars.
+
+        Defaults to session_routing=thread so dispatch/thread isolation tests
+        exercise the feature under test. Pass session_routing=\"sender\" (or
+        omit via a dedicated test) for legacy-default behaviour.
+        """
         from gateway.config import PlatformConfig
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
@@ -144,9 +149,13 @@ class TestDispatchMessage(unittest.TestCase):
             "EMAIL_SMTP_HOST": "smtp.test.com",
             "EMAIL_SMTP_PORT": "587",
             "EMAIL_POLL_INTERVAL": "15",
-        }):
+        }, clear=False):
+            # Clear any ambient EMAIL_SESSION_ROUTING so the explicit config wins.
+            os.environ.pop("EMAIL_SESSION_ROUTING", None)
             from plugins.platforms.email.adapter import EmailAdapter
-            adapter = EmailAdapter(PlatformConfig(enabled=True))
+            adapter = EmailAdapter(
+                PlatformConfig(enabled=True, extra={"session_routing": session_routing})
+            )
         return adapter
 
     def test_self_message_filtered(self):
@@ -360,6 +369,20 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(event.source.user_id, "john@example.com")
         self.assertEqual(event.source.user_name, "John Doe")
         self.assertEqual(event.source.chat_type, "dm")
+
+    def test_default_session_routing_is_sender(self):
+        """Unset session_routing must default to sender (safe for existing users)."""
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            os.environ.pop("EMAIL_SESSION_ROUTING", None)
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        self.assertEqual(adapter._session_routing, "sender")
 
     def test_thread_mode_different_senders_same_subject_isolated(self):
         """Two senders with the same subject must get different chat_ids (sessions)."""
@@ -884,16 +907,19 @@ class TestThreadContext(unittest.TestCase):
         else:
             os.environ["EMAIL_ALLOW_ALL_USERS"] = self._prev_allow_all
 
-    def _make_adapter(self):
+    def _make_adapter(self, session_routing: str = "thread"):
         from gateway.config import PlatformConfig
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
-        }):
+        }, clear=False):
+            os.environ.pop("EMAIL_SESSION_ROUTING", None)
             from plugins.platforms.email.adapter import EmailAdapter
-            adapter = EmailAdapter(PlatformConfig(enabled=True))
+            adapter = EmailAdapter(
+                PlatformConfig(enabled=True, extra={"session_routing": session_routing})
+            )
         return adapter
 
     def test_thread_context_stored_after_dispatch(self):
