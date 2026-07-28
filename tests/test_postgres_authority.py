@@ -917,6 +917,166 @@ class TestSchemaMigration:
             init_schema(pg)
 
 
+# ---------------------------------------------------------------------------
+# 5. Multi-tenant isolation tests
+# ---------------------------------------------------------------------------
+
+
+class TestTenantIsolation:
+    """Tenant_id is a scoping column — it must NOT weaken claim exclusivity."""
+
+    def test_different_tenants_cannot_both_claim_same_task_org(self, pg):
+        """CRITICAL INVARIANT: UNIQUE (task_id, organization_id) is the
+        exclusivity constraint.  tenant_id is NOT in the constraint.
+        Two tenants claiming the same (task, org) must result in exactly one winner.
+        """
+        from hermes_cli.postgres_authority import claim_task, DEFAULT_TENANT_ID
+        from uuid import UUID
+
+        task_id = _new_task()
+        tenant_a = DEFAULT_TENANT_ID
+        tenant_b = UUID("11111111-1111-1111-1111-111111111111")
+        expires = time.time() + 3600
+
+        gen_a = claim_task(
+            pg, task_id=task_id, claim_token=_new_token(),
+            organization_id=ORG, worker_id="tenant-a-worker",
+            claim_scope_url="", expires_at=expires,
+            tenant_id=tenant_a,
+        )
+        gen_b = claim_task(
+            pg, task_id=task_id, claim_token=_new_token(),
+            organization_id=ORG, worker_id="tenant-b-worker",
+            claim_scope_url="", expires_at=expires,
+            tenant_id=tenant_b,
+        )
+
+        assert gen_a == 1, "first claim must succeed"
+        assert gen_b is None, (
+            "second claim with different tenant_id must be rejected — "
+            "claim exclusivity is (task_id, organization_id), NOT per-tenant"
+        )
+
+    def test_tenant_id_stored_on_claim(self, pg):
+        """Verify tenant_id is persisted and returned correctly."""
+        from hermes_cli.postgres_authority import claim_task, get_claim, DEFAULT_TENANT_ID
+
+        task_id = _new_task()
+        claim_task(
+            pg, task_id=task_id, claim_token=_new_token(),
+            organization_id=ORG, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+        )
+        claim = get_claim(pg, task_id=task_id, organization_id=ORG)
+        assert claim is not None
+        assert str(claim["tenant_id"]) == str(DEFAULT_TENANT_ID)
+
+    def test_tenant_id_stored_on_permit(self, pg):
+        """Verify tenant_id is persisted on permit rows."""
+        from hermes_cli.postgres_authority import (
+            claim_task, issue_permit, DEFAULT_TENANT_ID
+        )
+        from uuid import UUID
+
+        task_id = _new_task()
+        token = _new_token()
+        tenant = UUID("22222222-2222-2222-2222-222222222222")
+
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token,
+            organization_id=ORG, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+            tenant_id=tenant,
+        )
+        permit_id = issue_permit(
+            pg, task_id=task_id, organization_id=ORG,
+            claim_token=token, lease_generation=gen,
+            action_payload={"action": "test"},
+            tenant_id=tenant,
+        )
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT tenant_id FROM task_permits WHERE permit_id = %s",
+                (permit_id,),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        assert str(row["tenant_id"]) == str(tenant)
+
+    def test_tenant_id_stored_on_effect(self, pg):
+        """Verify tenant_id is persisted on effect rows."""
+        from hermes_cli.postgres_authority import claim_task, record_effect
+        from uuid import UUID
+
+        task_id = _new_task()
+        token = _new_token()
+        tenant = UUID("33333333-3333-3333-3333-333333333333")
+
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token,
+            organization_id=ORG, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+            tenant_id=tenant,
+        )
+        key = f"{ORG}:{task_id}:a1:p1:test:ref-tenant"
+        record_effect(
+            pg, effect_key=key, task_id=task_id,
+            organization_id=ORG, run_claim_token=token,
+            lease_generation=gen, effect_type="notification",
+            payload={"msg": "tenant-scoped"},
+            tenant_id=tenant,
+        )
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT tenant_id FROM execution_effects WHERE effect_key = %s",
+                (key,),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        assert str(row["tenant_id"]) == str(tenant)
+
+
+# ---------------------------------------------------------------------------
+# 6. Migration upgrade path tests
+# ---------------------------------------------------------------------------
+
+
+class TestMigrationV2ToV3:
+    """Verify that the v2→v3 migration adds tenant_id without breaking anything."""
+
+    def test_tenant_id_column_exists_after_fresh_install(self, pg):
+        """Fresh install at v3 should have tenant_id on all tables."""
+        tables = ["task_claims", "task_runs", "task_permits", "execution_effects"]
+        for table in tables:
+            with pg.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = %s AND column_name = 'tenant_id'",
+                    (table,),
+                )
+                row = cur.fetchone()
+            assert row is not None, f"tenant_id column missing from {table}"
+
+    def test_claim_exclusivity_constraint_is_task_org_only(self, pg):
+        """The UNIQUE constraint must be on (task_id, organization_id) only."""
+        with pg.cursor() as cur:
+            cur.execute("""
+                SELECT constraint_name, array_agg(column_name ORDER BY ordinal_position)
+                FROM information_schema.key_column_usage
+                WHERE table_name = 'task_claims'
+                  AND constraint_name = 'uq_task_claims_task_org'
+                GROUP BY constraint_name
+            """)
+            row = cur.fetchone()
+        assert row is not None, "uq_task_claims_task_org constraint not found"
+        columns = row["array_agg"]
+        assert "tenant_id" not in columns, (
+            f"tenant_id must NOT be in the exclusivity constraint; found columns: {columns}"
+        )
+        assert "task_id" in columns
+        assert "organization_id" in columns
+
+
 # Note: Authority-store capability contract tests (postgres backend recognition,
 # SQLite multi-host rejection, unknown backend fail-closed) live in:
 #   tests/hermes_cli/test_authority_store.py

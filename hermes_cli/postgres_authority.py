@@ -31,6 +31,7 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+from uuid import UUID
 
 try:
     import psycopg
@@ -45,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -59,13 +60,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
             id              BIGSERIAL PRIMARY KEY,
             task_id         TEXT        NOT NULL,
             organization_id TEXT        NOT NULL,
+            tenant_id       UUID        NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
             worker_id       TEXT,
             claim_scope_url TEXT,
             lease_generation BIGINT     NOT NULL DEFAULT 1,
             expires_at      TIMESTAMPTZ NOT NULL,
             claimed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-            -- Exactly one active claim per task+org.
+            -- Exactly one active claim per task+org (tenant_id is NOT in this
+            -- constraint — it is a row-level scoping column, not an exclusivity key).
             CONSTRAINT uq_task_claims_task_org UNIQUE (task_id, organization_id)
         );
 
@@ -75,11 +78,14 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON task_claims(expires_at);
         CREATE INDEX IF NOT EXISTS idx_task_claims_organization
             ON task_claims(organization_id);
+        CREATE INDEX IF NOT EXISTS idx_task_claims_tenant
+            ON task_claims(tenant_id);
 
         CREATE TABLE IF NOT EXISTS task_runs (
             id              BIGSERIAL   PRIMARY KEY,
             task_id         TEXT        NOT NULL,
             organization_id TEXT        NOT NULL,
+            tenant_id       UUID        NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
             -- claim_token ties this run to its claim snapshot; not a FK
             -- so we keep the run row after the claim is deleted.
             claim_token     TEXT        NOT NULL,
@@ -89,7 +95,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
             started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             ended_at        TIMESTAMPTZ,
 
-            CONSTRAINT uq_task_runs_claim_gen
+            CONSTRAINT uq_task_runs_task_org_gen
                 UNIQUE (task_id, organization_id, lease_generation)
         );
 
@@ -97,12 +103,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON task_runs(task_id);
         CREATE INDEX IF NOT EXISTS idx_task_runs_status
             ON task_runs(status);
+        CREATE INDEX IF NOT EXISTS idx_task_runs_tenant
+            ON task_runs(tenant_id);
 
         CREATE TABLE IF NOT EXISTS task_permits (
             id              BIGSERIAL   PRIMARY KEY,
             permit_id       TEXT        NOT NULL UNIQUE,
             task_id         TEXT        NOT NULL,
             organization_id TEXT        NOT NULL,
+            tenant_id       UUID        NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
             claim_token     TEXT        NOT NULL,
             lease_generation BIGINT     NOT NULL,
             -- Full authority model fields (parity with SQLite)
@@ -127,6 +136,8 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON task_permits(permit_id);
         CREATE INDEX IF NOT EXISTS idx_task_permits_expires_at
             ON task_permits(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_task_permits_tenant
+            ON task_permits(tenant_id);
 
         CREATE TABLE IF NOT EXISTS execution_effects (
             id              BIGSERIAL   PRIMARY KEY,
@@ -136,6 +147,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
             effect_key      TEXT        NOT NULL UNIQUE,
             task_id         TEXT        NOT NULL,
             organization_id TEXT        NOT NULL,
+            tenant_id       UUID        NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
             run_claim_token TEXT        NOT NULL,
             lease_generation BIGINT     NOT NULL,
             permit_id       TEXT,
@@ -151,6 +163,8 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON execution_effects(task_id);
         CREATE INDEX IF NOT EXISTS idx_execution_effects_effect_key
             ON execution_effects(effect_key);
+        CREATE INDEX IF NOT EXISTS idx_execution_effects_tenant
+            ON execution_effects(tenant_id);
         """,
     ),
     # v1 → v2: schema_version bookkeeping table
@@ -162,6 +176,40 @@ _MIGRATIONS: list[tuple[int, str]] = [
             applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             description TEXT
         );
+        """,
+    ),
+    # v2 → v3: add tenant_id for multi-tenant isolation (RFC-0.23.0).
+    # tenant_id is a partitioning/scoping column — NOT part of the claim
+    # exclusivity constraint.  The invariant remains: one active claim per
+    # (task_id, organization_id).  tenant_id defaults to a fixed UUID so
+    # existing single-tenant deployments migrate without data fixup.
+    (
+        2,
+        """
+        -- Default tenant for single-tenant deployments.
+        ALTER TABLE task_claims
+            ADD COLUMN IF NOT EXISTS tenant_id UUID
+            NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';
+        CREATE INDEX IF NOT EXISTS idx_task_claims_tenant
+            ON task_claims(tenant_id);
+
+        ALTER TABLE task_runs
+            ADD COLUMN IF NOT EXISTS tenant_id UUID
+            NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';
+        CREATE INDEX IF NOT EXISTS idx_task_runs_tenant
+            ON task_runs(tenant_id);
+
+        ALTER TABLE task_permits
+            ADD COLUMN IF NOT EXISTS tenant_id UUID
+            NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';
+        CREATE INDEX IF NOT EXISTS idx_task_permits_tenant
+            ON task_permits(tenant_id);
+
+        ALTER TABLE execution_effects
+            ADD COLUMN IF NOT EXISTS tenant_id UUID
+            NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';
+        CREATE INDEX IF NOT EXISTS idx_execution_effects_tenant
+            ON execution_effects(tenant_id);
         """,
     ),
 ]
@@ -186,6 +234,9 @@ def get_postgres_url() -> str:
             "Postgres authority store requires AUTHORITY_POSTGRES_URL or DATABASE_URL"
         )
     return url
+
+
+DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000000")
 
 
 def connect(url: Optional[str] = None) -> "psycopg.Connection":
@@ -313,6 +364,7 @@ def claim_task(
     worker_id: str,
     claim_scope_url: str,
     expires_at: float,
+    tenant_id: Optional[UUID] = None,
 ) -> Optional[int]:
     """Claim a task for execution (atomic CAS).
 
@@ -327,24 +379,27 @@ def claim_task(
         worker_id: Worker identifier
         claim_scope_url: Scope URL for the claim
         expires_at: Unix timestamp when claim expires
+        tenant_id: Tenant scope (defaults to DEFAULT_TENANT_ID)
 
     Returns:
         lease_generation (int >= 1) if claim succeeded, None if already claimed
     """
     expires_dt = _ts(expires_at)
+    resolved_tenant = str(tenant_id or DEFAULT_TENANT_ID)
 
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO task_claims
-                (task_id, organization_id, worker_id,
+                (task_id, organization_id, tenant_id, worker_id,
                  claim_scope_url, lease_generation, expires_at)
             VALUES
-                (%s, %s, %s, %s, 1, %s)
+                (%s, %s, %s, %s, %s, 1, %s)
             ON CONFLICT (task_id, organization_id) DO NOTHING
             RETURNING lease_generation
             """,
-            (task_id, organization_id, worker_id, claim_scope_url, expires_dt),
+            (task_id, organization_id, resolved_tenant, worker_id,
+             claim_scope_url, expires_dt),
         )
         row = cur.fetchone()
         if not row:
@@ -357,12 +412,13 @@ def claim_task(
         cur.execute(
             """
             INSERT INTO task_runs
-                (task_id, organization_id, claim_token, lease_generation, status)
+                (task_id, organization_id, tenant_id, claim_token,
+                 lease_generation, status)
             VALUES
-                (%s, %s, %s, %s, 'pending')
+                (%s, %s, %s, %s, %s, 'pending')
             ON CONFLICT (task_id, organization_id, lease_generation) DO NOTHING
             """,
-            (task_id, organization_id, claim_token, generation),
+            (task_id, organization_id, resolved_tenant, claim_token, generation),
         )
 
         conn.commit()
@@ -378,6 +434,7 @@ def reclaim_task(
     new_worker_id: str,
     claim_scope_url: str,
     expires_at: float,
+    tenant_id: Optional[UUID] = None,
 ) -> Optional[int]:
     """Atomically replace an expired claim with a new one.
 
@@ -393,11 +450,13 @@ def reclaim_task(
         new_worker_id: Worker identifier for the new claimer
         claim_scope_url: Scope URL
         expires_at: Unix timestamp when new claim expires
+        tenant_id: Tenant scope (defaults to DEFAULT_TENANT_ID)
 
     Returns:
         New lease_generation (always > previous) if reclaim succeeded, else None.
     """
     expires_dt = _ts(expires_at)
+    resolved_tenant = str(tenant_id or DEFAULT_TENANT_ID)
 
     with conn.cursor() as cur:
         # Lock the expired row and compute the next generation atomically.
@@ -412,10 +471,12 @@ def reclaim_task(
                 claimed_at      = NOW()
             WHERE task_id        = %s
               AND organization_id = %s
+              AND tenant_id      = %s
               AND expires_at      <= NOW()
             RETURNING lease_generation
             """,
-            (new_worker_id, claim_scope_url, expires_dt, task_id, organization_id),
+            (new_worker_id, claim_scope_url, expires_dt,
+             task_id, organization_id, resolved_tenant),
         )
         row = cur.fetchone()
         if not row:
@@ -428,12 +489,13 @@ def reclaim_task(
         cur.execute(
             """
             INSERT INTO task_runs
-                (task_id, organization_id, claim_token, lease_generation, status)
+                (task_id, organization_id, tenant_id, claim_token,
+                 lease_generation, status)
             VALUES
-                (%s, %s, %s, %s, 'pending')
+                (%s, %s, %s, %s, %s, 'pending')
             ON CONFLICT (task_id, organization_id, lease_generation) DO NOTHING
             """,
-            (task_id, organization_id, new_claim_token, generation),
+            (task_id, organization_id, resolved_tenant, new_claim_token, generation),
         )
 
         conn.commit()
@@ -549,6 +611,7 @@ def complete_task(
     lease_generation: int,
     outcome: str,
     effects: Optional[list[dict[str, Any]]] = None,
+    tenant_id: Optional[UUID] = None,
 ) -> bool:
     """Complete a task run.
 
@@ -565,10 +628,13 @@ def complete_task(
         lease_generation: Must match current lease_generation on both tables
         outcome: Completion outcome string
         effects: Optional list of effects — each must include 'effect_key'
+        tenant_id: Tenant scope (defaults to DEFAULT_TENANT_ID)
 
     Returns:
         True if completed, False if any fencing check fails.
     """
+    resolved_tenant = str(tenant_id or DEFAULT_TENANT_ID)
+
     with conn.cursor() as cur:
         # --- Fence: verify run is pending for this exact generation ---
         cur.execute(
@@ -619,18 +685,19 @@ def complete_task(
                 cur.execute(
                     """
                     INSERT INTO execution_effects
-                        (effect_key, task_id, organization_id,
+                        (effect_key, task_id, organization_id, tenant_id,
                          run_claim_token, lease_generation,
                          permit_id, effect_type, provider,
                          provider_ref, idempotency_key, payload)
                     VALUES
-                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (effect_key) DO NOTHING
                     """,
                     (
                         key,
                         task_id,
                         organization_id,
+                        resolved_tenant,
                         claim_token,
                         lease_generation,
                         effect.get("permit_id", ""),
@@ -678,6 +745,7 @@ def issue_permit(
     action_type: str = "",
     target_resource: str = "",
     policy_version: str = "",
+    tenant_id: Optional[UUID] = None,
 ) -> str:
     """Issue an execution permit for a governed action.
 
@@ -693,6 +761,7 @@ def issue_permit(
         ttl_seconds: Permit TTL in seconds
         actor / executor / capability / action_type / target_resource / policy_version:
             Full authority model fields matching SQLite semantics.
+        tenant_id: Tenant scope (defaults to DEFAULT_TENANT_ID)
 
     Returns:
         Permit ID (UUID string)
@@ -707,6 +776,7 @@ def issue_permit(
     payload_hash = hashlib.sha256(
         json.dumps(action_payload, sort_keys=True).encode()
     ).hexdigest()
+    resolved_tenant = str(tenant_id or DEFAULT_TENANT_ID)
 
     with conn.cursor() as cur:
         # Verify claim is alive and carries the correct generation.
@@ -747,18 +817,19 @@ def issue_permit(
         cur.execute(
             """
             INSERT INTO task_permits
-                (permit_id, task_id, organization_id, claim_token,
+                (permit_id, task_id, organization_id, tenant_id, claim_token,
                  lease_generation, actor, executor, capability,
                  action_type, target_resource, payload_hash,
                  policy_version, action_payload, expires_at)
             VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING permit_id
             """,
             (
                 permit_id,
                 task_id,
                 organization_id,
+                resolved_tenant,
                 claim_token,
                 lease_generation,
                 actor,
@@ -904,6 +975,7 @@ def record_effect(
     idempotency_key: str = "",
     permit_id: str = "",
     payload: dict[str, Any],
+    tenant_id: Optional[UUID] = None,
 ) -> bool:
     """Persist one execution-effect record, idempotently.
 
@@ -914,16 +986,18 @@ def record_effect(
         True if inserted (new effect), False if effect_key already exists
         (idempotent — not an error).
     """
+    resolved_tenant = str(tenant_id or DEFAULT_TENANT_ID)
+
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO execution_effects
-                (effect_key, task_id, organization_id,
+                (effect_key, task_id, organization_id, tenant_id,
                  run_claim_token, lease_generation,
                  permit_id, effect_type, provider,
                  provider_ref, idempotency_key, payload)
             VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (effect_key) DO NOTHING
             RETURNING id
             """,
@@ -931,6 +1005,7 @@ def record_effect(
                 effect_key,
                 task_id,
                 organization_id,
+                resolved_tenant,
                 run_claim_token,
                 lease_generation,
                 permit_id,
@@ -1075,5 +1150,6 @@ __all__ = [
     "cleanup_expired_claims",
     "get_authority_backend",
     "get_authority_connection",
+    "DEFAULT_TENANT_ID",
     "SCHEMA_VERSION",
 ]
