@@ -1474,7 +1474,7 @@ This mirrors Claude Code's per-session WebSearch and subagent caps (v2.1.212), w
 
 ```yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "neutts"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "gradium" | "neutts"
   speed: 1.0                    # Global speed multiplier (fallback for all providers)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -1504,6 +1504,9 @@ tts:
     sample_rate: 24000
     bit_rate: 128000            # MP3 bitrate
     # base_url: "https://api.x.ai/v1"
+  gradium:
+    voice_id: "YTpq7expH9539ERJ"  # Default English voice; browse more at https://studio.gradium.ai
+    model: "default"              # Gradium model name
   neutts:
     ref_audio: ''
     ref_text: ''
