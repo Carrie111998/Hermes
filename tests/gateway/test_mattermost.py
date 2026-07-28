@@ -394,6 +394,44 @@ class TestMattermostSend:
         assert payload["root_id"] == "root_post_123"
 
     @pytest.mark.asyncio
+    async def test_send_prefers_metadata_thread_id_over_conflicting_reply_to(self):
+        """metadata['thread_id'] is authoritative when reply_to disagrees."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post_123", "root_id": ""})
+        self.adapter._api_post = AsyncMock(return_value={"id": "reply_post"})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Answer",
+            reply_to="other_thread_post_999",
+            metadata={"thread_id": "root_post_123"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args_list[0][0][1]
+        assert payload["root_id"] == "root_post_123"
+        # The stale reply_to must never reach the resolver.
+        self.adapter._api_get.assert_awaited_once_with("posts/root_post_123")
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_reply_to_without_metadata_thread_id(self):
+        """reply_to still drives threading when metadata carries no root."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post_456", "root_id": ""})
+        self.adapter._api_post = AsyncMock(return_value={"id": "reply_post"})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Answer",
+            reply_to="root_post_456",
+            metadata={"some_other_key": "value"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args_list[0][0][1]
+        assert payload["root_id"] == "root_post_456"
+
+    @pytest.mark.asyncio
     async def test_progress_send_with_invalid_thread_root_never_falls_back_flat(self):
         """Tool/status/progress bubbles must stay quiet when the thread is broken."""
         self.adapter._reply_mode = "thread"

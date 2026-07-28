@@ -183,12 +183,20 @@ class MattermostAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """Resolve the Mattermost root_id from reply_to or metadata."""
+        """Resolve the Mattermost root_id from metadata or reply_to.
+
+        ``metadata["thread_id"]`` is the thread root recorded when the
+        inbound post was received, so it wins over ``reply_to``, which may
+        point at an arbitrary reply inside the thread (or at a post in a
+        different thread entirely for delayed/progress deliveries).
+        """
         if self._reply_mode != "thread":
             return None
-        candidate = reply_to
-        if not candidate and isinstance(metadata, dict):
+        candidate = None
+        if isinstance(metadata, dict):
             candidate = metadata.get("thread_id") or metadata.get("root_id")
+        if not candidate:
+            candidate = reply_to
         if not candidate:
             return None
         return await self._resolve_root_id(str(candidate))
