@@ -418,6 +418,13 @@ class RelayAdapter(BasePlatformAdapter):
                 meta["user_id"] = author
         return meta
 
+    def bound_outbound_metadata(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Snapshot the Relay tenant discriminator before a protected claim."""
+        bound = self._with_scope(chat_id, metadata)
+        if not bound.get("scope_id") and not bound.get("user_id"):
+            raise ValueError("relay tenant discriminator is unavailable")
+        return bound
+
     def fronts_platform(self, platform: Any) -> bool:
         """Whether the authenticated relay transport advertises ``platform``.
 

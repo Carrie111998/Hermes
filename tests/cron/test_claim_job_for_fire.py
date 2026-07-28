@@ -68,6 +68,19 @@ def test_stale_claim_is_reclaimable(temp_home, monkeypatch):
     assert claim_job_for_fire(jid, claim_ttl_seconds=0) is True
 
 
+def test_stale_claim_takeover_retains_external_occurrence_identity(temp_home):
+    from cron.jobs import claim_job_for_fire, create_job, get_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="stable-fire")
+    assert claim_job_for_fire(job["id"]) is True
+    first = get_job(job["id"])["fire_claim"]["occurrence_id"]
+
+    assert claim_job_for_fire(job["id"], claim_ttl_seconds=0) is True
+    second = get_job(job["id"])["fire_claim"]["occurrence_id"]
+
+    assert second == first
+
+
 def test_mark_job_run_clears_claim(temp_home):
     """After a recurring job completes, its claim is cleared so the next fire
     can be claimed again."""

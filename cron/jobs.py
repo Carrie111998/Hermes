@@ -1918,7 +1918,22 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            # A stale-lease takeover must retain the original firing identity:
+            # the next worker may retry work, but must not turn an already
+            # dispatched external fire into a new provenance occurrence.
+            prior_occurrence = (
+                str(existing.get("occurrence_id") or "")
+                if isinstance(existing, dict)
+                else ""
+            )
+            if not prior_occurrence:
+                prior_at = str(existing.get("at") or "") if isinstance(existing, dict) else ""
+                prior_occurrence = f"external:{prior_at}" if prior_at else f"external:{now.isoformat()}"
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": _machine_id(),
+                "occurrence_id": prior_occurrence,
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())

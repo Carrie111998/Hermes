@@ -1434,6 +1434,17 @@ class TestSendTelegramThreadIdMapping:
         call2_kwargs = bot.send_message.await_args_list[1].kwargs
         assert "message_thread_id" not in call2_kwargs
 
+    def test_strict_route_does_not_retry_a_missing_thread_on_the_bare_chat(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+        bot.send_message = AsyncMock(side_effect=Exception("Bad Request: message thread not found"))
+
+        result = asyncio.run(_send_telegram("tok", "-1001234567890", "hello", thread_id="17585", strict_route=True))
+
+        assert "thread not found" in result["error"].lower()
+        assert bot.send_message.await_count == 1
+        assert bot.send_message.await_args.kwargs["message_thread_id"] == 17585
+
     def test_thread_not_found_for_media_retries_without_message_thread_id(self, monkeypatch, tmp_path):
         """Media send with stale thread_id retries without it (#27012)."""
         bot = self._make_bot()

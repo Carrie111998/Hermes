@@ -19,9 +19,13 @@ selected via the `cron.provider` config key (empty = built-in).
 """
 from __future__ import annotations
 
+import logging
 import threading
 from abc import ABC, abstractmethod
 from typing import Any
+
+
+logger = logging.getLogger("cron.scheduler_provider")
 
 
 class CronScheduler(ABC):
@@ -102,7 +106,21 @@ class CronScheduler(ABC):
         """
         from cron.jobs import claim_job_for_fire, get_job
         from cron.executions import create_execution
-        from cron.scheduler import run_one_job
+        from cron.scheduler import recover_protected_final_result_repairs_for_home, run_one_job
+
+        try:
+            recovery_errors = recover_protected_final_result_repairs_for_home()
+            for error in recovery_errors:
+                logger.warning(
+                    "Protected final-result recovery pending: %s", error,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Protected final-result recovery sweep failed: %s", exc,
+            )
+            return False
+        if recovery_errors:
+            return False
 
         if not claim_job_for_fire(job_id):
             return False  # another machine already claimed this fire

@@ -23950,6 +23950,32 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+def _recover_protected_final_results_at_gateway_startup(profile_homes: list[Any] | None = None) -> list[str]:
+    """Drain durable observers once before the Gateway admits new work."""
+    from cron.scheduler import recover_protected_final_result_repairs_for_home
+
+    homes = profile_homes or [None]
+    errors: list[str] = []
+    for home in homes:
+        if isinstance(home, tuple):
+            if len(home) != 2 or not isinstance(home[1], (str, os.PathLike)):
+                errors.append(f"recovery_profile_invalid:{home!r}")
+                continue
+            path = home[1]
+        else:
+            path = home
+        try:
+            if path is None:
+                errors.extend(recover_protected_final_result_repairs_for_home())
+            else:
+                errors.extend(recover_protected_final_result_repairs_for_home(path))
+        except Exception as exc:
+            errors.append(f"recovery_sweep_failed:{path or 'default'}:{exc}")
+    for recovery_error in errors:
+        logger.warning("Protected final-result recovery pending at Gateway startup: %s", recovery_error)
+    return errors
+
+
 # Upper bound for cooperatively draining the cron ticker on shutdown. The cron
 # thread delivers via ``safe_schedule_threadsafe`` and blocks on
 # ``future.result(timeout=60)`` (see cron/scheduler.py::_deliver_result), so a
@@ -24438,6 +24464,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    multiplex_profile_homes: list[Any] | None = None
+    if getattr(runner.config, "multiplex_profiles", False):
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+
+            multiplex_profile_homes = list(profiles_to_serve(multiplex=True))
+        except Exception as exc:
+            logger.error("Could not resolve multiplex Profiles for protected-result recovery: %s", exc)
+            return False
+    recovery_errors = (
+        _recover_protected_final_results_at_gateway_startup(multiplex_profile_homes)
+        if multiplex_profile_homes
+        else _recover_protected_final_results_at_gateway_startup()
+    )
+    if recovery_errors:
+        logger.error("Gateway startup blocked until protected final-result recovery succeeds")
+        return False
+
     # Start the gateway
     success = await runner.start()
     if not success:
@@ -24492,21 +24536,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         isinstance(cron_provider, InProcessCronScheduler)
         and getattr(runner.config, "multiplex_profiles", False)
     ):
-        try:
-            from hermes_cli.profiles import profiles_to_serve
-
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if profile_homes:
-                cron_start_kwargs["profile_homes"] = profile_homes
-                logger.info(
-                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
-                    len(profile_homes),
-                    [p[0] if isinstance(p, tuple) else p for p in profile_homes],
-                )
-        except Exception as exc:
-            logger.warning(
-                "Could not resolve profile homes for multiplex cron: %s",
-                exc,
+        if multiplex_profile_homes:
+            cron_start_kwargs["profile_homes"] = multiplex_profile_homes
+            logger.info(
+                "Cron scheduler will tick %d profile(s) under multiplex: %s",
+                len(multiplex_profile_homes),
+                [p[0] if isinstance(p, tuple) else p for p in multiplex_profile_homes],
             )
 
     # External cron providers own their remote scheduling contract. Only the

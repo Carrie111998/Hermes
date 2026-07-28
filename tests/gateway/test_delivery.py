@@ -533,6 +533,25 @@ async def test_long_output_preserved_for_chunking_adapter(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_exact_content_mode_never_adds_a_local_audit_path(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = NonChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    long_content = "x" * 5000
+    await router._deliver_to_platform(
+        target,
+        long_content,
+        metadata={"job_id": "protected"},
+        preserve_exact_content=True,
+    )
+
+    assert adapter.calls[0]["content"] == long_content
+    assert not list(tmp_path.glob("cron/output/*.txt"))
+
+
+@pytest.mark.asyncio
 async def test_short_output_never_truncated(tmp_path, monkeypatch):
     """Output under the limit passes through untouched for any adapter."""
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
@@ -600,5 +619,4 @@ async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tm
     # retry (footer needs the path) re-raises.
     with pytest.raises(OSError, match="No space left on device"):
         await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
-
 

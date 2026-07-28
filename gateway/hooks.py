@@ -59,10 +59,14 @@ class HookRegistry:
         await registry.emit("agent:start", {"platform": "telegram", ...})
     """
 
-    def __init__(self):
+    def __init__(self, hooks_dir=None):
         # event_type -> [handler_fn, ...]
         self._handlers: Dict[str, List[Callable]] = {}
+        # event_type -> hook name -> [handler_fn, ...].  Kept separately so
+        # a security boundary can target one installed consumer by name.
+        self._named_handlers: Dict[str, Dict[str, List[Callable]]] = {}
         self._loaded_hooks: List[dict] = []  # metadata for listing
+        self._hooks_dir = hooks_dir
 
     @property
     def loaded_hooks(self) -> List[dict]:
@@ -90,10 +94,11 @@ class HookRegistry:
         """
         self._register_builtin_hooks()
 
-        if not HOOKS_DIR.exists():
+        hooks_dir = self._hooks_dir if self._hooks_dir is not None else HOOKS_DIR
+        if not hooks_dir.exists():
             return
 
-        for hook_dir in sorted(HOOKS_DIR.iterdir()):
+        for hook_dir in sorted(hooks_dir.iterdir()):
             if not hook_dir.is_dir():
                 continue
 
@@ -102,6 +107,22 @@ class HookRegistry:
 
             if not manifest_path.exists() or not handler_path.exists():
                 continue
+
+            if hook_dir.name == "outbound-actionable":
+                try:
+                    from gateway.outbound_boundary import (
+                        capture_pending_outbound_attestation,
+                        load_activated_outbound_handler,
+                        outbound_activation_is_ready,
+                    )
+
+                    if not outbound_activation_is_ready(hook_dir):
+                        capture_pending_outbound_attestation(hook_dir)
+                        print("[hooks] Skipping outbound-actionable: release is not globally activated", flush=True)
+                        continue
+                except Exception:
+                    print("[hooks] Skipping outbound-actionable: activation verification failed", flush=True)
+                    continue
 
             try:
                 manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
@@ -123,20 +144,20 @@ class HookRegistry:
                 # Pydantic BaseModel for webhook/event payloads fails at first
                 # dispatch with "TypeAdapter ... is not fully defined".
                 module_name = f"hermes_hook_{hook_name}"
-                spec = importlib.util.spec_from_file_location(
-                    module_name, handler_path
-                )
-                if spec is None or spec.loader is None:
-                    print(f"[hooks] Skipping {hook_name}: could not load handler.py", flush=True)
-                    continue
-
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                try:
-                    spec.loader.exec_module(module)
-                except Exception:
-                    sys.modules.pop(module_name, None)
-                    raise
+                if hook_dir.name == "outbound-actionable":
+                    module = load_activated_outbound_handler(hook_dir, module_name)
+                else:
+                    spec = importlib.util.spec_from_file_location(module_name, handler_path)
+                    if spec is None or spec.loader is None:
+                        print(f"[hooks] Skipping {hook_name}: could not load handler.py", flush=True)
+                        continue
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = module
+                    try:
+                        spec.loader.exec_module(module)
+                    except Exception:
+                        sys.modules.pop(module_name, None)
+                        raise
 
                 handle_fn = getattr(module, "handle", None)
                 if handle_fn is None:
@@ -146,6 +167,7 @@ class HookRegistry:
                 # Register the handler for each declared event
                 for event in events:
                     self._handlers.setdefault(event, []).append(handle_fn)
+                    self._named_handlers.setdefault(event, {}).setdefault(hook_name, []).append(handle_fn)
 
                 self._loaded_hooks.append({
                     "name": hook_name,
@@ -224,4 +246,48 @@ class HookRegistry:
                     results.append(result)
             except Exception as e:
                 print(f"[hooks] Error in handler for '{event_type}': {e}", flush=True)
+        return results
+
+    async def emit_collect_strict(
+        self,
+        event_type: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> List[Any]:
+        """Collect decision-hook results without converting handler faults to allows.
+
+        Ordinary lifecycle hooks intentionally isolate a handler failure.  A
+        pre-send policy boundary has the opposite contract: its caller must be
+        able to deny before transport when any participating handler faults.
+        """
+        if context is None:
+            context = {}
+
+        results: List[Any] = []
+        for fn in self._resolve_handlers(event_type):
+            result = fn(event_type, context)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is not None:
+                results.append(result)
+        return results
+
+    async def emit_collect_strict_named(
+        self,
+        event_type: str,
+        hook_name: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> List[Any]:
+        """Run one explicitly named installed hook or fail the caller closed."""
+        if context is None:
+            context = {}
+        handlers = list(self._named_handlers.get(event_type, {}).get(hook_name, []))
+        if not handlers:
+            raise RuntimeError(f"required hook is not registered: {hook_name}")
+        results: List[Any] = []
+        for fn in handlers:
+            result = fn(event_type, context)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is not None:
+                results.append(result)
         return results

@@ -110,6 +110,25 @@ class TestDiscoverAndLoad:
 
         assert len(reg.loaded_hooks) == 2
 
+    def test_skips_generic_hook_when_no_loader_can_be_created(self, tmp_path, monkeypatch):
+        _create_hook(tmp_path, "generic", '["agent:start"]', "def handle(*_args): pass\n")
+        reg = HookRegistry()
+        monkeypatch.setattr("gateway.hooks.importlib.util.spec_from_file_location", lambda *_args: None)
+
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+
+        assert reg.loaded_hooks == []
+
+    def test_skips_generic_hook_when_module_execution_fails(self, tmp_path):
+        _create_hook(tmp_path, "generic", '["agent:start"]', "raise RuntimeError('bad handler')\n")
+        reg = HookRegistry()
+
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+
+        assert reg.loaded_hooks == []
+
 
 class TestEmit:
     @pytest.mark.asyncio

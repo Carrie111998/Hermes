@@ -365,6 +365,7 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     ran = []
     monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
     monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
+    monkeypatch.setattr(sched, "recover_protected_final_result_repairs_for_home", lambda: [])
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("j1") is True
@@ -400,6 +401,36 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("gone") is False
     assert ran == []
+
+
+def test_fire_due_does_not_claim_when_profile_recovery_raises(monkeypatch):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr(sched, "recover_protected_final_result_repairs_for_home", lambda: (_ for _ in ()).throw(RuntimeError("recovery unavailable")))
+    claimed = []
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda _job_id: claimed.append(True) or True, raising=False)
+    monkeypatch.setattr(jobs, "get_job", lambda job_id: {"id": job_id})
+    monkeypatch.setattr(executions, "create_execution", lambda *_args, **_kwargs: {"id": "execution"})
+    monkeypatch.setattr(sched, "run_one_job", lambda *_args, **_kwargs: True)
+
+    assert InProcessCronScheduler().fire_due("job") is False
+    assert claimed == []
+
+
+def test_fire_due_does_not_claim_while_protected_recovery_remains_pending(monkeypatch):
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    claimed = []
+    monkeypatch.setattr(sched, "recover_protected_final_result_repairs_for_home", lambda: ["repair pending"])
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda _job_id: claimed.append(True) or True, raising=False)
+
+    assert InProcessCronScheduler().fire_due("job") is False
+    assert claimed == []
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──

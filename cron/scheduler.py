@@ -10,8 +10,10 @@ runs at a time if multiple processes overlap.
 
 import asyncio
 import atexit
+import base64
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -1443,7 +1446,381 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _canonical_digest(value: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _provenance_occurrence_id(job: dict) -> str:
+    """Return the scheduler identity that distinguishes one firing occurrence."""
+    external_claim = job.get("fire_claim")
+    if isinstance(external_claim, dict):
+        occurrence_id = external_claim.get("occurrence_id")
+        if isinstance(occurrence_id, str) and occurrence_id:
+            return occurrence_id
+        if isinstance(external_claim.get("at"), str):
+            return "external:" + external_claim["at"]
+    scheduled_at = job.get("next_run_at")
+    if isinstance(scheduled_at, str) and scheduled_at:
+        return "scheduled:" + scheduled_at
+    # Manual/legacy runs have no persisted schedule occurrence. They are still
+    # independent firings, so retain a per-invocation opaque identity rather
+    # than coalescing unrelated manual sends.
+    return "manual:" + uuid.uuid4().hex
+
+
+def _render_cron_delivery_content(job: dict, content: str, *, wrap_response: bool) -> str:
+    if not wrap_response:
+        return content
+    task_name = job.get("name", job["id"])
+    job_id = job.get("id", "")
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{content}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    )
+
+
+_FINAL_DELIVERY_PRIVATE_BYTES = re.compile(
+    r"(?:BEGIN [A-Z0-9 ]*PRIVATE KEY|\b(?:access[_-]?token|api[_-]?key|auth[_-]?token|"
+    r"private[_-]?key|password|cookie|session(?:[_-]?(?:token|credential|id))?)\s*[:=]\s*\S+|"
+    r"\bBearer\s+\S+|"
+    r"/Users/[^\s`\"'<>]+|~/.hermes/[^\s`\"'<>]+)",
+    re.IGNORECASE,
+)
+
+
+def _final_delivery_bytes_safe(rendered: bytes) -> bool:
+    """Reject disclosure-shaped bytes after Core has rendered the final wrapper."""
+    try:
+        return _FINAL_DELIVERY_PRIVATE_BYTES.search(rendered.decode("utf-8")) is None
+    except UnicodeDecodeError:
+        return False
+
+
+def _protected_live_route(
+    *,
+    job: dict,
+    platform: Any,
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+    adapter: Any,
+    loop: Any,
+) -> tuple[dict[str, str], Any, dict[str, Any]]:
+    """Reuse Cron's Telegram DM-topic route resolution for claimed sends."""
+    from gateway.delivery import DeliveryTarget, _looks_like_int, looks_like_telegram_private_chat_id
+    from gateway.config import Platform
+
+    route_thread_id = str(thread_id) if thread_id is not None else None
+    metadata: dict[str, Any] = {"job_id": job["id"]}
+    if route_thread_id:
+        metadata["thread_id"] = route_thread_id
+    if (
+        adapter is not None
+        and loop is not None
+        and getattr(loop, "is_running", lambda: False)()
+        and platform == Platform.TELEGRAM
+        and thread_id is not None
+        and looks_like_telegram_private_chat_id(str(chat_id))
+        and _looks_like_int(str(thread_id))
+        and _is_channel_dm_topic(adapter, chat_id, loop, job["id"])
+    ):
+        route_thread_id = None
+        metadata = {"job_id": job["id"], "direct_messages_topic_id": str(thread_id)}
+    route = {
+        "platform": platform_name,
+        "chat_id": str(chat_id),
+        "thread_id": route_thread_id or "",
+        "direct_messages_topic_id": str(metadata.get("direct_messages_topic_id") or ""),
+    }
+    target = DeliveryTarget(
+        platform=platform,
+        chat_id=str(chat_id),
+        thread_id=route_thread_id,
+        is_explicit=True,
+    )
+    return route, target, metadata
+
+
+def _protected_transport_metadata(
+    *,
+    route_metadata: dict[str, Any],
+    route: dict[str, str],
+    runtime_transport: Any,
+    gateway_config: Any = None,
+    platform: Any,
+    chat_id: str,
+) -> dict[str, Any]:
+    """Bind the exact Relay logical target before issuing provenance proof."""
+    metadata = dict(route_metadata)
+    transport_platform = getattr(getattr(runtime_transport, "transport_platform", None), "value", "")
+    route["transport_platform"] = str(transport_platform)
+    if str(transport_platform) != "relay":
+        return metadata
+    metadata["_relay_logical_platform"] = str(getattr(platform, "value", platform))
+    home = getattr(gateway_config, "get_home_channel", lambda _platform: None)(platform)
+    if home is not None and str(getattr(home, "chat_id", "")) == str(chat_id):
+        if getattr(home, "user_id", None):
+            metadata["user_id"] = str(home.user_id)
+        if getattr(home, "scope_id", None):
+            metadata["scope_id"] = str(home.scope_id)
+    binder = getattr(getattr(runtime_transport, "adapter", None), "bound_outbound_metadata", None)
+    if binder is None:
+        raise ValueError("relay transport cannot bind tenant metadata")
+    metadata = binder(str(chat_id), metadata)
+    route["transport_metadata"] = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    return metadata
+
+
+def _deliver_protected_final_result(
+    *,
+    job: dict,
+    content: str,
+    platform: Any,
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+    pconfig: Any,
+    gateway_config: Any = None,
+    adapters: Any,
+    runtime_adapter: Any,
+    runtime_transport: Any = None,
+    loop: Any,
+    hooks: Any,
+    provenance_store: Any,
+    wrap_response: bool,
+    occurrence_id: str,
+) -> str | None:
+    """Deliver one claimed final result without a post-claim route fallback."""
+    from cron.output_provenance import ProvenanceError
+    from gateway.outbound_boundary import (
+        build_outbound_context,
+        outbound_after_send_sync,
+        outbound_before_send_sync,
+    )
+
+    home = _get_hermes_home()
+    route, route_target, route_metadata = _protected_live_route(
+        job=job,
+        platform=platform,
+        platform_name=platform_name,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        adapter=runtime_adapter,
+        loop=loop,
+    )
+    route_metadata = _protected_transport_metadata(
+        route_metadata=route_metadata,
+        route=route,
+        runtime_transport=runtime_transport,
+        gateway_config=gateway_config,
+        platform=platform,
+        chat_id=chat_id,
+    )
+    route_digest = _canonical_digest(route)
+    target_id = _canonical_digest(route)
+    profile_id = home.name
+    declared_profile_id = str(job.get("profile_id") or "")
+    if declared_profile_id and declared_profile_id != profile_id:
+        return f"protected final-result boundary denied {platform_name}:{chat_id}: profile identity mismatch"
+    try:
+        issued = provenance_store.issue(
+            profile_id=profile_id,
+            job_id=str(job["id"]),
+            occurrence_id=occurrence_id,
+            target_id=target_id,
+            route_digest=route_digest,
+            raw_body=content.encode("utf-8"),
+            template_digest=_canonical_digest({"wrap_response": wrap_response, "job_id": str(job["id"])}),
+            producer_class="no_agent_final" if job.get("no_agent") else "llm_final",
+        )
+        boundary_context = build_outbound_context(
+            source_kind="gateway_reply",
+            profile_path=str(home),
+            profile_id=profile_id,
+            route=route,
+            content=content,
+            looks_actionable=False,
+            output_screening_required=True,
+            provenance_proof=issued["proof"],
+        )
+        decision = outbound_before_send_sync(
+            hooks,
+            boundary_context,
+        )
+        claim = provenance_store.verify_and_claim(
+            proof=issued["proof"],
+            raw_body_b64=issued["raw_body_b64"],
+            decision=decision.decision,
+            replacement_body_b64=(
+                base64.b64encode(decision.content.encode("utf-8")).decode("ascii")
+                if decision.decision == "rewrite"
+                else None
+            ),
+        )
+    except (ProvenanceError, ValueError, UnicodeError) as exc:
+        return f"protected final-result boundary denied {platform_name}:{chat_id}: {exc}"
+    if claim["decision"] == "deny":
+        return f"protected final-result boundary denied {platform_name}:{chat_id}: {decision.reason}"
+
+    body = base64.b64decode(claim["body_b64"].encode("ascii"), validate=True)
+    rendered = _render_cron_delivery_content(job, body.decode("utf-8"), wrap_response=wrap_response)
+
+    def complete(result: str, *, success: bool, send_result: Any = None) -> None:
+        payload = send_result if isinstance(send_result, dict) else {"success": success}
+        observer_context = {
+            **boundary_context,
+            "before_send_decision": decision.raw,
+            "content": body.decode("utf-8"),
+            "success": success,
+            "send_result": payload,
+        }
+        provenance_store.complete_claim(
+            capability_id=claim["capability_id"], claim_id=claim["claim_id"], result=result,
+            post_send_repair_context=observer_context,
+        )
+        # Only a persisted terminal claim is eligible to invoke the observer.
+        # The store owns its lease, so a retry/crash cannot resend transport.
+        if callable(getattr(provenance_store, "claim_post_send_repair", None)):
+            try:
+                repair_protected_final_result_after_send(
+                    provenance_store=provenance_store,
+                    hooks=hooks,
+                    capability_id=claim["capability_id"],
+                )
+            except Exception:
+                logger.warning("Job '%s': protected final-result after-send observer remains pending", job["id"], exc_info=True)
+
+    try:
+        from gateway.delivery import MAX_PLATFORM_OUTPUT
+
+        if not _final_delivery_bytes_safe(rendered.encode("utf-8")):
+            provenance_store.block_claim(
+                capability_id=claim["capability_id"], claim_id=claim["claim_id"]
+            )
+            return f"protected final-result delivery blocked private rendered bytes {platform_name}:{chat_id}"
+        if len(rendered) > MAX_PLATFORM_OUTPUT:
+            provenance_store.block_claim(
+                capability_id=claim["capability_id"], claim_id=claim["claim_id"]
+            )
+            return f"protected final-result delivery blocked oversized rendered bytes {platform_name}:{chat_id}"
+        provenance_store.begin_send(
+            capability_id=claim["capability_id"],
+            claim_id=claim["claim_id"],
+            body=body,
+            rendered_body=rendered.encode("utf-8"),
+            route_digest=route_digest,
+            post_send_repair_context={
+                **boundary_context,
+                "before_send_decision": decision.raw,
+                "content": body.decode("utf-8"),
+            },
+        )
+        if runtime_transport is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+            from agent.async_utils import safe_schedule_threadsafe
+
+            future = safe_schedule_threadsafe(
+                runtime_transport.send(platform, route_target.chat_id, rendered, route_metadata),
+                loop,
+            )
+            if future is None:
+                complete("blocked", success=False, send_result={"error": "event_loop_schedule_failed"})
+                return f"protected final-result delivery could not schedule {platform_name}:{chat_id}"
+            try:
+                result = future.result(timeout=60)
+            except TimeoutError:
+                if future.cancel():
+                    complete("blocked", success=False, send_result={"error": "pre_dispatch_timeout"})
+                    return f"protected final-result delivery timed out before dispatch {platform_name}:{chat_id}"
+                complete("indeterminate", success=False, send_result={"error": "in_flight_timeout"})
+                return f"protected final-result delivery is indeterminate {platform_name}:{chat_id}"
+            if isinstance(result, dict):
+                delivered = result.get("success") is True and result.get("delivered") is not False
+            else:
+                delivered = _confirm_adapter_delivery(result)
+            complete("sent" if delivered else "indeterminate", success=delivered, send_result=result)
+            return None if delivered else f"protected final-result delivery unconfirmed {platform_name}:{chat_id}"
+
+        complete("blocked", success=False, send_result={"error": "protected_live_transport_required"})
+        return f"protected final-result delivery requires a live pinned transport {platform_name}:{chat_id}"
+    except Exception as exc:  # A send may have crossed the transport boundary.
+        try:
+            complete("indeterminate", success=False, send_result={"error": str(exc)})
+        except Exception:
+            pass
+        return f"protected final-result delivery indeterminate {platform_name}:{chat_id}: {exc}"
+
+
+def repair_protected_final_result_after_send(*, provenance_store: Any, hooks: Any, capability_id: str) -> str | None:
+    """Replay only a durable after-send observer; it never re-enters transport."""
+    from gateway.outbound_boundary import outbound_after_send_sync
+
+    repair = provenance_store.claim_post_send_repair(capability_id=capability_id)
+    try:
+        outbound_after_send_sync(hooks, repair["context"])
+    except Exception as exc:
+        provenance_store.complete_post_send_repair(
+            capability_id=capability_id, repair_id=repair["repair_id"], success=False, error=str(exc),
+        )
+        return f"protected final-result after-send repair failed: {exc}"
+    provenance_store.complete_post_send_repair(
+        capability_id=capability_id, repair_id=repair["repair_id"], success=True,
+    )
+    return None
+
+
+def recover_protected_final_result_repairs(*, provenance_store: Any, hooks: Any) -> list[str]:
+    """Drain due durable observer work before another protected delivery starts."""
+    pending = getattr(provenance_store, "pending_post_send_repairs", None)
+    if not callable(pending):
+        return []
+    errors: list[str] = []
+    for repair in pending():
+        capability_id = str(repair.get("capability_id") or "") if isinstance(repair, dict) else ""
+        if not capability_id:
+            errors.append("protected final-result repair has no capability id")
+            continue
+        error = repair_protected_final_result_after_send(
+            provenance_store=provenance_store, hooks=hooks, capability_id=capability_id,
+        )
+        if error:
+            errors.append(error)
+    return errors
+
+
+def recover_protected_final_result_repairs_for_home(home: str | os.PathLike[str] | None = None) -> list[str]:
+    """Recover one Profile's durable observer work without taking cron's job lock."""
+    from cron.output_provenance import ProvenanceStore
+    from gateway.outbound_boundary import load_installed_outbound_hooks
+
+    profile_home = _get_hermes_home() if home is None else home
+    hooks = load_installed_outbound_hooks(profile_home)
+    if hooks is None:
+        return []
+    return recover_protected_final_result_repairs(
+        provenance_store=ProvenanceStore(profile_home), hooks=hooks,
+    )
+
+
+def sweep_protected_final_result_repairs() -> list[str]:
+    """Run recovery from every scheduler tick, even when no job is due."""
+    return recover_protected_final_result_repairs_for_home()
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    protect_final_result: bool = False,
+    outbound_hooks: Any = None,
+    provenance_store: Any = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1490,23 +1867,36 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    active_outbound_hooks = outbound_hooks
+    active_provenance_store = provenance_store
+    provenance_occurrence_id = ""
+    if protect_final_result:
+        try:
+            from cron.output_provenance import ProvenanceStore
+            from gateway.outbound_boundary import load_installed_outbound_hooks
+
+            if active_outbound_hooks is None:
+                active_outbound_hooks = load_installed_outbound_hooks(_get_hermes_home())
+            if active_outbound_hooks is None:
+                return "protected final-result boundary unavailable: required outbound hook is not installed"
+            active_provenance_store = active_provenance_store or ProvenanceStore(_get_hermes_home())
+            provenance_occurrence_id = _provenance_occurrence_id(job)
+            recovery_errors = recover_protected_final_result_repairs(
+                provenance_store=active_provenance_store, hooks=active_outbound_hooks,
+            )
+            if recovery_errors:
+                return f"protected final-result recovery pending: {recovery_errors[0]}"
+        except Exception as exc:
+            return f"protected final-result boundary unavailable: {exc}"
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    declared_media_files, clean_final_content = BasePlatformAdapter.extract_media(content)
+    delivery_content = _render_cron_delivery_content(
+        job, clean_final_content, wrap_response=wrap_response
+    )
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(declared_media_files)
+    cleaned_delivery_content = delivery_content
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1714,6 +2104,77 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # and (worse) suppresses the DM-fallback mirror via thread_seeded.
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
+
+        if active_outbound_hooks is not None:
+            if declared_media_files:
+                msg = (
+                    f"protected final-result delivery rejected {platform_name}:{chat_id}: "
+                    "MEDIA attachments are outside the final-result contract"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            protected_error = _deliver_protected_final_result(
+                job=job,
+                content=clean_final_content,
+                platform=platform,
+                platform_name=platform_name,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                pconfig=pconfig,
+                gateway_config=config,
+                adapters=adapters,
+                runtime_adapter=runtime_adapter,
+                runtime_transport=transport,
+                loop=loop,
+                hooks=active_outbound_hooks,
+                provenance_store=active_provenance_store,
+                wrap_response=wrap_response,
+                occurrence_id=provenance_occurrence_id,
+            )
+            if protected_error:
+                logger.warning("Job '%s': %s", job["id"], protected_error)
+                delivery_errors.append(protected_error)
+            else:
+                logger.info(
+                    "Job '%s': protected final result delivered to %s:%s",
+                    job["id"], platform_name, chat_id,
+                )
+                if live_adapter_ready:
+                    if opened_thread_id and not thread_seeded:
+                        _seed_cron_thread_session(
+                            job,
+                            runtime_adapter,
+                            platform_name,
+                            chat_id,
+                            opened_thread_id,
+                            mirror_text,
+                            chat_name=origin.get("chat_name"),
+                        )
+                        thread_seeded = True
+                    if in_channel_surface and mirror_this_target and not thread_seeded:
+                        inchannel_seeded = _seed_cron_channel_session(
+                            job,
+                            runtime_adapter,
+                            platform_name,
+                            chat_id,
+                            mirror_text,
+                            is_dm=is_dm_target,
+                            user_id=origin_user_id,
+                            chat_name=origin.get("chat_name"),
+                        )
+                _maybe_mirror_cron_delivery(
+                    job,
+                    platform_name,
+                    chat_id,
+                    mirror_text,
+                    thread_id=thread_id,
+                    user_id=origin_user_id,
+                    enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
+                )
+            # A claimed result may never take the historical route fallback,
+            # media branch, or raw session mirror.
+            continue
 
         if live_adapter_ready:
             # Telegram topic routing (#22773, regression fixed #52060): a
@@ -2045,7 +2506,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        def _run_fallback_send():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    cleaned_delivery_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                )
+                            )
+
+                        future = pool.submit(_run_fallback_send)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -3965,7 +4438,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        job,
+                        deliver_content,
+                        adapters=adapters,
+                        loop=loop,
+                        protect_final_result=success,
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4056,6 +4535,17 @@ def tick(
         return 0
 
     try:
+        try:
+            recovery_errors = sweep_protected_final_result_repairs()
+            for recovery_error in recovery_errors:
+                logger.warning("Protected final-result recovery pending: %s", recovery_error)
+        except Exception as exc:
+            logger.warning("Protected final-result recovery sweep failed: %s", exc)
+            return 0
+        if recovery_errors:
+            # Do not advance occurrences or claim work while a prior protected
+            # result still needs its durable observer repaired.
+            return 0
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
