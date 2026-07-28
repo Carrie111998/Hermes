@@ -3226,6 +3226,38 @@ def test_sidebar_status_fails_closed_for_ineffective_or_invalid_terminal_ledger(
     assert status["counts"]["sidebar_failed"] == 1
 
 
+def test_sidebar_status_degrades_for_blocking_failure_without_halting_other_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 1,
+        "terminally_resolved_failed_count": 0,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 0,
+            "effective": 0,
+            "ineffective": 0,
+            "by_resolution_code": {"native_thread_unrecoverable": 0},
+        },
+        "execution_blockers": [],
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is False
+    assert status["degraded_reasons"] == ["sidebar_failed"]
+    assert status["execution_blockers"] == []
+
+
 def test_sidebar_status_preserves_exclusion_count_without_degradation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

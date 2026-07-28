@@ -4324,7 +4324,6 @@ def _public_sidebar_status(
         execution_blockers = [
             code
             for code, active in (
-                ("sidebar_failed", blocking_failed_count > 0),
                 (
                     "sidebar_terminal_resolution_mismatch",
                     ineffective_terminal_resolution_count > 0,
@@ -4347,7 +4346,6 @@ def _public_sidebar_status(
     required_execution_blockers = {
         code
         for code, active in (
-            ("sidebar_failed", blocking_failed_count > 0),
             (
                 "sidebar_terminal_resolution_mismatch",
                 ineffective_terminal_resolution_count > 0,
@@ -4385,6 +4383,8 @@ def _public_sidebar_status(
         > 0
     )
     degraded_reasons: list[str] = []
+    if blocking_failed_count > 0:
+        degraded_reasons.append("sidebar_failed")
     heartbeat_stale = (
         heartbeat_age > threshold
         if heartbeat_age is not None
