@@ -138,6 +138,7 @@ import {
   nativeRefreshUrl,
   type NativeTokenSet,
   parseTokenResponse,
+  rehydratePersistedTokens,
   resolveLoginStrategy,
   tokenNeedsRefresh
 } from './native-oauth'
@@ -6100,7 +6101,7 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
       return null
     }
 
-    const tokens = parseTokenResponse(JSON.parse(plaintext))
+    const tokens = rehydratePersistedTokens(JSON.parse(plaintext))
     _nativeTokens.set(baseUrl, tokens)
 
     return tokens

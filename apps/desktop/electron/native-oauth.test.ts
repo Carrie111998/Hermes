@@ -21,6 +21,7 @@ import {
   nativeTokenUrl,
   parseLoopbackCallback,
   parseTokenResponse,
+  rehydratePersistedTokens,
   resolveLoginStrategy,
   statusSupportsNativeFlow,
   tokenNeedsRefresh
@@ -188,4 +189,60 @@ test('tokenNeedsRefresh respects the skew window', () => {
   assert.equal(tokenNeedsRefresh({ expiresAt: now - 10 }, now), true)
   // Unknown expiry ⇒ refresh (validate before use).
   assert.equal(tokenNeedsRefresh({ expiresAt: 0 }, now), true)
+})
+
+// --- persisted token rehydration (camelCase NativeTokenSet round-trip) ---
+
+test('rehydratePersistedTokens accepts a camelCase persisted token set', () => {
+  // This is the exact shape that _persistNativeTokens writes to disk:
+  // JSON.stringify(NativeTokenSet) produces camelCase keys.
+  const persisted = {
+    accessToken: 'AT-persisted',
+    refreshToken: 'RT-persisted',
+    expiresAt: 1893456000,
+    provider: 'nous',
+    userId: 'u-1'
+  }
+
+  const t = rehydratePersistedTokens(persisted)
+
+  assert.equal(t.accessToken, 'AT-persisted')
+  assert.equal(t.refreshToken, 'RT-persisted')
+  assert.equal(t.expiresAt, 1893456000)
+  assert.equal(t.provider, 'nous')
+  assert.equal(t.userId, 'u-1')
+})
+
+test('rehydratePersistedTokens throws on missing accessToken', () => {
+  assert.throws(
+    () => rehydratePersistedTokens({ refreshToken: 'RT' }),
+    /missing accessToken/i
+  )
+})
+
+test('rehydratePersistedTokens falls back to snake_case keys', () => {
+  // Tolerates a raw OAuth response format (belt-and-suspenders).
+  const raw = {
+    access_token: 'AT-raw',
+    refresh_token: 'RT-raw',
+    expires_at: 1893456000,
+    provider: 'nous',
+    user_id: 'u-2'
+  }
+
+  const t = rehydratePersistedTokens(raw)
+
+  assert.equal(t.accessToken, 'AT-raw')
+  assert.equal(t.refreshToken, 'RT-raw')
+  assert.equal(t.expiresAt, 1893456000)
+  assert.equal(t.userId, 'u-2')
+})
+
+test('rehydratePersistedTokens tolerates absent optional fields', () => {
+  const t = rehydratePersistedTokens({ accessToken: 'AT' })
+
+  assert.equal(t.refreshToken, '')
+  assert.equal(t.expiresAt, 0)
+  assert.equal(t.provider, '')
+  assert.equal(t.userId, '')
 })

@@ -194,6 +194,39 @@ export function parseTokenResponse(body: any): NativeTokenSet {
 }
 
 /**
+ * Validate and normalise a previously-persisted ``NativeTokenSet``.
+ *
+ * ``parseTokenResponse`` is designed for raw gateway OAuth responses
+ * (snake_case: ``access_token``, ``refresh_token``, …).  Persisted token
+ * sets are serialised from the internal ``NativeTokenSet`` interface
+ * (camelCase: ``accessToken``, ``refreshToken``, …).  Passing a persisted
+ * blob through ``parseTokenResponse`` always fails because the camelCase
+ * keys don't match, producing "Gateway token response missing access_token".
+ *
+ * This function accepts the camelCase persisted shape and returns a
+ * validated ``NativeTokenSet``, falling back to snake_case so that both
+ * formats are tolerated.
+ */
+export function rehydratePersistedTokens(raw: any): NativeTokenSet {
+  // Already camelCase (the normal persisted path).
+  const accessToken = String(raw?.accessToken || raw?.access_token || '')
+
+  if (!accessToken) {
+    throw new Error('Persisted token set missing accessToken')
+  }
+
+  const expiresAt = Number(raw?.expiresAt ?? raw?.expires_at)
+
+  return {
+    accessToken,
+    refreshToken: String(raw?.refreshToken || raw?.refresh_token || ''),
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    provider: String(raw?.provider || ''),
+    userId: String(raw?.userId || raw?.user_id || '')
+  }
+}
+
+/**
  * True when a stored token set is at/near expiry and should be refreshed
  * before use. `skewSeconds` refreshes slightly early to avoid a race where
  * the token expires in flight (mirrors the server's 60s cookie floor).
