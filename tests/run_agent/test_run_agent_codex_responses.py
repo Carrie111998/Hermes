@@ -2004,7 +2004,7 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     agent.context_compressor.context_length = 20_000
     agent.context_compressor.threshold_tokens = 20_000
 
-    agent._session_db = SessionDB()
+    agent._session_db = SessionDB(db_path=tmp_path / "state.db")
     agent._ensure_db_session()
 
     responses = [
