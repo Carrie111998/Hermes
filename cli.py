@@ -2786,9 +2786,71 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
-def _strip_markdown_syntax(text: str) -> str:
-    """Best-effort markdown marker removal for plain-text display."""
-    plain = _rich_text_from_ansi(text or "").plain
+_CODE_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})([^\n]*)$")
+_CODE_FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$")
+
+
+def _split_markdown_code_fences(text: str) -> list[tuple[bool, str]]:
+    """Split ``text`` into ``(is_code, segment)`` pairs.
+
+    Fenced code blocks (```...``` or ~~~...~~~) become code segments with
+    the fence delimiters and the opening info-string (language tag) dropped;
+    their inner lines are returned verbatim so Markdown emphasis markers
+    such as ``__name__`` are not reinterpreted as bold/italic.  Text between
+    fences is returned as non-code segments for normal stripping.  An
+    unterminated opening fence consumes the remainder as code, matching
+    CommonMark's treatment and keeping in-flight streaming buffers safe.
+    """
+    segments: list[tuple[bool, str]] = []
+    lines = text.splitlines(keepends=True)
+    n = len(lines)
+    prose: list[str] = []
+
+    def flush_prose() -> None:
+        if prose:
+            segments.append((False, "".join(prose)))
+            prose.clear()
+
+    i = 0
+    while i < n:
+        line = lines[i]
+        m = _CODE_FENCE_OPEN_RE.match(line)
+        if not m:
+            prose.append(line)
+            i += 1
+            continue
+        fence_char = m.group(1)[0]
+        fence_len = len(m.group(1))
+        code: list[str] = []
+        j = i + 1
+        while j < n:
+            cand = lines[j]
+            cm = _CODE_FENCE_CLOSE_RE.match(cand)
+            if (
+                cm
+                and cm.group(1)[0] == fence_char
+                and len(cm.group(1)) >= fence_len
+            ):
+                j += 1
+                break
+            code.append(cand)
+            j += 1
+        flush_prose()
+        segments.append((True, "".join(code)))
+        i = j
+    flush_prose()
+    return segments
+
+
+def _strip_markdown_prose(text: str) -> str:
+    """Strip Markdown markers from prose (non-code) text only.
+
+    This is the emphasis / heading / link removal pass.  Fenced code blocks
+    are handled separately by :func:`_split_markdown_code_fences` so their
+    content is preserved verbatim; this helper must never see a fence
+    delimiter line.
+    """
+    plain = text
     # Avoid stripping cron-style expressions like "* * * * *" as if they were
     # Markdown horizontal rules. CommonMark treats three or more "*" as an HR,
     # but in Hermes output it's common to display cron schedules verbatim.
@@ -2799,7 +2861,6 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"^\s{0,3}(?:\*\s*){3}\s*$", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^\s{0,3}#{1,6}\s+", "", plain, flags=re.MULTILINE)
     # Preserve blockquotes, lists, and checkboxes because they carry structure.
-    plain = re.sub(r"(```+|~~~+)", "", plain)
     plain = re.sub(r"`([^`]*)`", r"\1", plain)
     plain = re.sub(r"!\[([^\]]*)\]\([^\)]*\)", r"\1", plain)
     plain = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", plain)
@@ -2812,6 +2873,21 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"\*([^\s*][^*]*?[^\s*])\*", r"\1", plain)
     plain = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", plain)
     plain = re.sub(r"~~([^~]+)~~", r"\1", plain)
+    return plain
+
+
+def _strip_markdown_syntax(text: str) -> str:
+    """Best-effort markdown marker removal for plain-text display.
+
+    Fenced code blocks are passed through verbatim (with the fence markers
+    and language tag removed) so executable code — including Python dunder
+    identifiers like ``__name__`` — is not mangled by emphasis stripping.
+    """
+    plain = _rich_text_from_ansi(text or "").plain
+    parts: list[str] = []
+    for is_code, segment in _split_markdown_code_fences(plain):
+        parts.append(segment if is_code else _strip_markdown_prose(segment))
+    plain = "".join(parts)
     plain = re.sub(r"\n{3,}", "\n\n", plain)
     return plain.strip("\n")
 

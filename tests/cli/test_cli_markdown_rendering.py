@@ -191,3 +191,71 @@ def test_strip_mode_still_strips_boundary_underscore_emphasis():
 
     output = _render_to_text(renderable)
     assert "say hi and bold now" in output
+
+
+def test_strip_mode_drops_code_fence_language_tag():
+    # The opening fence's info-string (language tag) must not leak into the
+    # plain-text output as visible text.  See issue #73212.
+    renderable = _render_final_assistant_content(
+        "Here is code:\n\n```python\nprint('hi')\n```\n",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "print('hi')" in output
+    assert "python" not in output
+    assert "```" not in output
+
+
+def test_strip_mode_preserves_dunder_identifiers_inside_code_fence():
+    # Markdown emphasis stripping must not be applied inside fenced code
+    # blocks — Python dunder identifiers like __name__ / __class__ survive
+    # verbatim so copy-pasted output stays executable.  See issue #73212.
+    source = (
+        "Run this:\n\n"
+        "```python\n"
+        "if __name__ == '__main__':\n"
+        "    print(__class__)\n"
+        "```\n"
+    )
+    renderable = _render_final_assistant_content(source, mode="strip")
+
+    output = _render_to_text(renderable)
+    # The full executable line is preserved verbatim, underscores and all.
+    assert "if __name__ == '__main__':" in output
+    assert "print(__class__)" in output
+
+    # The mangled forms reported in the issue must not appear.
+    assert "name == " not in output
+    assert "print(class)" not in output
+
+    # The fence markers and language tag are gone, but the code body remains.
+    assert "```" not in output
+    assert "python" not in output
+
+
+def test_strip_mode_preserves_tilde_fence_content_verbatim():
+    # Tilde fences (~~~) are also code blocks; inner emphasis markers and
+    # the language tag must be preserved / dropped respectively.
+    renderable = _render_final_assistant_content(
+        "~~~js\nlet x = a * b;\n~~~\n",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "let x = a * b;" in output
+    assert "~~~" not in output
+    assert "js" not in output
+
+
+def test_strip_mode_still_strips_emphasis_outside_code_fence():
+    # Prose adjacent to a code fence is still stripped normally.
+    renderable = _render_final_assistant_content(
+        "**bold** prose\n\n```\n__name__\n```\n",
+        mode="strip",
+    )
+
+    output = _render_to_text(renderable)
+    assert "bold prose" in output
+    assert "**" not in output
+    assert "__name__" in output
