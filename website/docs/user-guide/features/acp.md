@@ -145,6 +145,48 @@ Prerequisites:
 
 Use an ACP-compatible plugin and point it at `hermes acp` or `hermes-acp`.
 
+### Buzz Desktop
+
+[Buzz](https://github.com/block/buzz) ships Hermes Agent as a preset runtime.
+With Hermes installed the normal way, Buzz discovers it automatically —
+open **Settings → Runtimes** and Hermes appears under your runtimes.
+
+If discovery fails (older installs), make sure the ACP launcher resolves on a
+login-shell PATH:
+
+```bash
+command -v hermes-acp || command -v hermes
+```
+
+Recent installs write both `hermes` and `hermes-acp` launchers into
+`~/.local/bin`; running `hermes update` adds the `hermes-acp` launcher to
+older installs. As a manual fallback, configure Buzz's agent command as
+`hermes` with args `["acp"]`.
+
+#### Keep Buzz agents owner-only
+
+Buzz creates every agent with **Who can talk to this agent** set to `Owner only`.
+Leave it there when the runtime is Hermes.
+
+Two behaviors combine on this path. The `hermes-acp` toolset includes `terminal`
+and `execute_code`, and Buzz's ACP bridge answers Hermes' permission requests
+itself with `allow_once` rather than surfacing them. A Hermes agent in Buzz
+therefore runs shell commands on the host without prompting. I asked one to run
+`rm -rf` against a scratch directory and it deleted it, no prompt anywhere.
+
+Selecting `Anyone` hands that same shell access to every author who can reach
+the channel. Buzz does not warn when you pick it.
+
+Neither of the obvious mitigations works today:
+
+- `approvals.mode: manual` does make Hermes raise the permission request, but
+  Buzz auto-approves it and the command still runs.
+- `platform_toolsets.acp` does not narrow the ACP toolset, so it cannot be used
+  to drop `terminal`.
+
+`!shutdown` from the owner stops the agent in any mode, and Buzz ignores that
+command from everyone else.
+
 ## Configuration and credentials
 
 ACP mode uses the same Hermes configuration as the CLI:
@@ -155,6 +197,28 @@ ACP mode uses the same Hermes configuration as the CLI:
 - `~/.hermes/state.db`
 
 Provider resolution uses Hermes' normal runtime resolver, so ACP inherits the currently configured provider and credentials. Hermes also advertises a terminal auth method (`--setup`) for first-run ACP clients; this opens Hermes' interactive model/provider setup.
+
+## Host integration
+
+These variables are set by an **ACP host process** (an editor or another agent
+harness) on the Hermes subprocess it spawns. They are not user configuration —
+do not set them by hand in `.env` or `config.yaml`.
+
+| Variable | Value | Effect |
+|----------|-------|--------|
+| `HERMES_ACP_SKIP_CONFIGURED_MCP` | `1` | Skip starting the **globally configured** MCP servers from `config.yaml` before the ACP JSON-RPC loop begins. |
+
+Hermes normally starts every MCP server configured in `config.yaml` before it
+enters the ACP JSON-RPC loop. A host that owns MCP itself — passing the
+session's servers explicitly through `session/new` — does not need that global
+startup, and an unrelated slow or interactive MCP server would otherwise delay
+`initialize`. Setting the marker to exactly `1` lets such a host skip it.
+
+Only the global `config.yaml` discovery is skipped. **MCP servers supplied by
+the ACP session through `session/new` are still registered**, so a host loses
+no capability it asked for. Any other value (unset, empty, `0`, `false`) keeps
+the default behavior, so an unrelated truthy-looking string cannot silently
+disable MCP.
 
 ## Session behavior
 
@@ -181,6 +245,11 @@ Dangerous terminal commands can be routed back to the editor as approval prompts
 - allow once
 - allow always
 - deny
+
+Whether you actually see a prompt is up to the host. A host is free to answer the
+request programmatically instead of showing it to you, in which case these
+options exist on the wire but never reach a human. Buzz Desktop does this, so
+treat that path as unattended execution regardless of your `approvals` setting.
 
 On timeout or error, the approval bridge denies the request.
 
