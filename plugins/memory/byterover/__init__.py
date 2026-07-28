@@ -37,8 +37,8 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 # Timeouts
-_QUERY_TIMEOUT = 10   # brv query — should be fast
-_CURATE_TIMEOUT = 120  # brv curate — may involve LLM processing
+_QUERY_TIMEOUT = 600    # brv query — raise for slow local LLM
+_CURATE_TIMEOUT = 600   # brv curate — raise for slow local LLM
 
 # Minimum lengths to filter noise
 _MIN_QUERY_LEN = 10
