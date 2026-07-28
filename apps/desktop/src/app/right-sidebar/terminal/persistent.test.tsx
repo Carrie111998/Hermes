@@ -2,6 +2,8 @@ import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
+
 import { PersistentTerminal, TerminalSlot } from './persistent'
 
 vi.mock('./terminals', () => ({
@@ -114,10 +116,12 @@ function installRaf() {
   }
 }
 
-function Harness() {
+function Harness({ paneVisible = true }: { paneVisible?: boolean }) {
   return (
     <>
-      <TerminalSlot className="slot" />
+      <PaneVisibleContext.Provider value={paneVisible}>
+        <TerminalSlot className="slot" />
+      </PaneVisibleContext.Provider>
       <PersistentTerminal onAddSelectionToChat={() => undefined} />
     </>
   )
@@ -308,5 +312,25 @@ describe('PersistentTerminal rect tracking', () => {
     act(() => window.dispatchEvent(new Event('focus')))
 
     expect(raf.pending()).toBe(1)
+  })
+
+  it('hides the overlay when the terminal pane is an inactive kept-alive tab', () => {
+    installRaf()
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(10, 20, 200, 100))
+
+    render(<Harness />)
+
+    const overlay = container!.lastElementChild as HTMLElement
+    expect(overlay.style.visibility).toBe('visible')
+
+    act(() => {
+      root!.render(<Harness paneVisible={false} />)
+    })
+
+    // Inactive tree tabs deliberately retain the same non-zero layout rect.
+    // Pane visibility, rather than geometry, must remove the fixed overlay.
+    expect(overlay.style.visibility).toBe('hidden')
+    expect(overlay.style.pointerEvents).toBe('none')
+    expect(overlay.getAttribute('aria-hidden')).toBe('true')
   })
 })

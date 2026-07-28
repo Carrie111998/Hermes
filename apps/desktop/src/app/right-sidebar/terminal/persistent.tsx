@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
 
 import { $terminalTakeover } from '../store'
@@ -17,11 +18,13 @@ import { TerminalWorkspace } from './workspace'
  */
 
 const $slot = atom<HTMLElement | null>(null)
+const $slotVisible = atom(false)
 
 const SLOT_CLASS = 'relative flex min-h-0 min-w-0 flex-1 flex-col'
 
 export function TerminalSlot({ className = SLOT_CLASS }: { className?: string }) {
   const ref = useRef<HTMLDivElement | null>(null)
+  const paneVisible = usePaneVisible()
 
   useEffect(() => {
     const el = ref.current
@@ -35,9 +38,16 @@ export function TerminalSlot({ className = SLOT_CLASS }: { className?: string })
     return () => {
       if ($slot.get() === el) {
         $slot.set(null)
+        $slotVisible.set(false)
       }
     }
   }, [])
+
+  useEffect(() => {
+    if ($slot.get() === ref.current) {
+      $slotVisible.set(paneVisible)
+    }
+  }, [paneVisible])
 
   return <div className={className} ref={ref} />
 }
@@ -58,6 +68,7 @@ const sameRect = (a: Rect | null, b: Rect) =>
 
 export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalProps) {
   const slot = useStore($slot)
+  const slotVisible = useStore($slotVisible)
   const terminalTakeover = useStore($terminalTakeover)
   const [rect, setRect] = useState<Rect | null>(null)
   const [ready, setReady] = useState(false)
@@ -192,7 +203,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
     }
   }, [slot])
 
-  const visible = Boolean(rect && rect.width > 0 && rect.height > 0)
+  const visible = Boolean(slotVisible && rect && rect.width > 0 && rect.height > 0)
 
   const style: CSSProperties = {
     position: 'fixed',
