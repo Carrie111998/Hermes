@@ -2,7 +2,7 @@
 
 **Author:** Hermes  
 **Date:** 2026-07-28  
-**Status:** Accepted — Implementation in progress  
+**Status:** Implemented — All scope items complete  
 **Version:** v0.23.0  
 **Depends on:** v0.22.0 (Postgres Authority Store) ✅
 
@@ -208,8 +208,8 @@ Worker credential
 - [x] Migration plan implemented (v2→v3 tenant_id column, v3→v4 tenants registry)
 - [x] Unit tests for tenant-scoped queries (16 tests, 100% pass)
 - [x] Integration test simulating cross-tenant attack vector (4 vectors, 100% pass)
-- [ ] Documentation: Migration guide, capability model, workspace management
-- [ ] Runtime injection: Gateway tenant_id extraction + agent propagation
+- [x] Documentation: Migration guide, capability model, workspace management
+- [x] Runtime injection: Gateway tenant_id extraction + agent propagation
 
 ---
 
