@@ -1,6 +1,7 @@
 """Tests for the klib slash-command plugin."""
 
 import asyncio
+import hashlib
 import importlib.util
 import sys
 import types
@@ -66,6 +67,25 @@ def _install_transport(monkeypatch, plugin_init, handler):
     monkeypatch.setattr(plugin_init.httpx, "AsyncClient", make_client)
 
 
+def _keyboard_buttons(keyboard):
+    return [button for row in keyboard.inline_keyboard for button in row]
+
+
+def _callback_for_button(keyboard, text):
+    return next(
+        button.callback_data
+        for button in _keyboard_buttons(keyboard)
+        if button.text == text
+    )
+
+
+def _distinct_results(count):
+    return [
+        {"path": f"docs/{index}.md", "snippet": f"snippet {index}"}
+        for index in range(1, count + 1)
+    ]
+
+
 class TestKlibCommands:
     def test_successful_query_formats_only_top_five_results(self, monkeypatch):
         mod = _load_plugin_init()
@@ -92,11 +112,14 @@ class TestKlibCommands:
         assert requests[0].url.params["q"] == "cache invalidation"
         assert requests[0].url.params["mode"] == "lexical"
         assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
-        assert r"docs/1\.md" in result
-        assert r"docs/5\.md" in result
-        assert r"docs/6\.md" not in result
-        assert "top 5 of 7" in result
-        assert len(result) <= 2800
+        assert isinstance(result, tuple)
+        text, keyboard = result
+        assert r"docs/1\.md" in text
+        assert r"docs/5\.md" in text
+        assert r"docs/6\.md" not in text
+        assert r"Page 1 of 2\." in text
+        assert _callback_for_button(keyboard, "Next").startswith("klib:page:2:")
+        assert len(text) <= 2800
 
     def test_query_deduplicates_same_file_and_counts_distinct_files(
         self, monkeypatch
@@ -123,12 +146,185 @@ class TestKlibCommands:
         _install_transport(monkeypatch, mod, handler)
         result = _run(mod._handle_klib("duplicate files"))
 
-        assert result.count(r"docs/shared\.md") == 1
-        assert "first hit" in result
-        assert "duplicate hit" not in result
-        assert r"docs/4\.md" in result
-        assert r"docs/5\.md" not in result
-        assert r"Showing top 5 of 6 distinct files\." in result
+        assert isinstance(result, tuple)
+        text, keyboard = result
+        assert text.count(r"docs/shared\.md") == 1
+        assert "first hit" in text
+        assert "duplicate hit" not in text
+        assert r"docs/4\.md" in text
+        assert r"docs/5\.md" not in text
+        assert r"Page 1 of 2\." in text
+        assert _callback_for_button(keyboard, "Next").startswith("klib:page:2:")
+
+    def test_exactly_page_size_results_remain_bare_string(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200, json={"results": _distinct_results(mod._PAGE_SIZE)}
+            ),
+        )
+
+        result = _run(mod._handle_klib("five files", chat_id="chat-a"))
+
+        assert isinstance(result, str)
+        assert not mod._PAGINATION_SESSIONS
+
+    def test_six_distinct_results_attach_next_keyboard(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        fixed_time = 1234.5
+        monkeypatch.setattr(mod.time, "time", lambda: fixed_time)
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200, json={"results": _distinct_results(6)}
+            ),
+        )
+
+        result = _run(mod._handle_klib("six files", chat_id="chat-a"))
+
+        assert isinstance(result, tuple)
+        text, keyboard = result
+        assert r"Page 1 of 2\." in text
+        assert isinstance(keyboard, mod.InlineKeyboardMarkup)
+        expected_session_id = hashlib.sha256(
+            f"chat-a:six files:{fixed_time}".encode()
+        ).hexdigest()[:8]
+        assert _callback_for_button(keyboard, "Next") == (
+            f"klib:page:2:{expected_session_id}"
+        )
+        assert (
+            mod._PAGINATION_SESSIONS[expected_session_id]["expires_at"]
+            == fixed_time + 1800
+        )
+
+    def test_register_registers_command_and_callback_prefix(self):
+        mod = _load_plugin_init()
+        registered = {}
+
+        class Context:
+            def register_command(self, name, **kwargs):
+                registered["command"] = (name, kwargs)
+
+            def register_callback_handler(self, prefix, handler):
+                registered["callback"] = (prefix, handler)
+
+        mod.register(Context())
+
+        assert registered["command"][0] == "klib"
+        assert registered["callback"] == ("klib:", mod._handle_klib_callback)
+
+    def test_page_navigation_round_trip_is_byte_identical(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200, json={"results": _distinct_results(6)}
+            ),
+        )
+
+        initial = _run(mod._handle_klib("round trip", chat_id="chat-a"))
+        initial_text, initial_keyboard = initial
+        next_data = _callback_for_button(initial_keyboard, "Next")
+
+        page_two_text, page_two_keyboard = _run(
+            mod._handle_klib_callback(next_data, "chat-a")
+        )
+        prev_data = _callback_for_button(page_two_keyboard, "Prev")
+        round_trip_text, _ = _run(mod._handle_klib_callback(prev_data, "chat-a"))
+
+        assert r"Page 2 of 2\." in page_two_text
+        assert round_trip_text == initial_text
+
+    def test_mismatched_chat_id_uses_expired_session_rejection(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200, json={"results": _distinct_results(6)}
+            ),
+        )
+
+        result = _run(mod._handle_klib("private search", chat_id="chat-a"))
+        _, keyboard = result
+        callback_data = _callback_for_button(keyboard, "Next")
+        unknown = _run(mod._handle_klib_callback("klib:page:2:unknown", "chat-a"))
+        mismatched = _run(mod._handle_klib_callback(callback_data, "chat-b"))
+
+        assert mismatched == unknown
+        assert mismatched[0] == mod._INVALID_PAGINATION_REPLY
+        assert mismatched[1] is None
+
+    @pytest.mark.parametrize("page", ["0", "-1", "abc"])
+    def test_invalid_page_number_uses_same_rejection(self, monkeypatch, page):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200, json={"results": _distinct_results(6)}
+            ),
+        )
+
+        result = _run(mod._handle_klib("invalid page", chat_id="chat-a"))
+        _, keyboard = result
+        session_id = _callback_for_button(keyboard, "Next").rsplit(":", 1)[1]
+        rejected = _run(
+            mod._handle_klib_callback(f"klib:page:{page}:{session_id}", "chat-a")
+        )
+
+        assert rejected == (mod._INVALID_PAGINATION_REPLY, None)
+
+    def test_unknown_and_expired_sessions_use_same_rejection(self, monkeypatch):
+        mod = _load_plugin_init()
+        unknown = _run(mod._handle_klib_callback("klib:page:1:missing", "chat-a"))
+        mod._PAGINATION_SESSIONS["expired"] = {
+            "chat_id": "chat-a",
+            "query": "old",
+            "distinct_results": _distinct_results(6),
+            "expires_at": 0,
+        }
+
+        expired = _run(mod._handle_klib_callback("klib:page:1:expired", "chat-a"))
+
+        assert unknown == (mod._INVALID_PAGINATION_REPLY, None)
+        assert expired == unknown
+
+    def test_paging_past_five_page_ceiling_does_not_refetch(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(
+                200, json={"results": _distinct_results(mod._FETCH_LIMIT)}
+            )
+
+        _install_transport(monkeypatch, mod, handler)
+        result = _run(mod._handle_klib("twenty five files", chat_id="chat-a"))
+        _, keyboard = result
+        session_id = _callback_for_button(keyboard, "Next").rsplit(":", 1)[1]
+
+        page_five, _ = _run(
+            mod._handle_klib_callback(f"klib:page:5:{session_id}", "chat-a")
+        )
+        no_more = _run(
+            mod._handle_klib_callback(f"klib:page:6:{session_id}", "chat-a")
+        )
+
+        assert r"Page 5 of 5\." in page_five
+        assert no_more == (mod._NO_MORE_RESULTS_REPLY, None)
+        assert len(requests) == 1
 
     def test_query_overfetches_past_file_dominated_server_limit(
         self, monkeypatch
