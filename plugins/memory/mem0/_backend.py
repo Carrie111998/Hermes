@@ -266,7 +266,41 @@ class OSSBackend(Mem0Backend):
 
             on_disk = getattr(vs, "on_disk", False)
             client.delete_collection(collection_name)
-            vs.create_col(expected_dims, on_disk)
+
+            # Primary path: full-featured recreate via vector store (BM25 sparse,
+            # filter indexes, on_disk, named-vector config).
+            try:
+                vs.create_col(expected_dims, on_disk)
+                return
+            except Exception:
+                log.warning(
+                    "create_col for %r failed after dim mismatch (dims %d -> %d), "
+                    "attempting fallback with basic collection",
+                    collection_name, current_dims, expected_dims,
+                )
+
+            # Fallback: bare client.create_collection without BM25 / sparse
+            # vectors.  Not as rich as create_col, but strictly better than
+            # leaving the collection deleted.
+            try:
+                from qdrant_client.models import (
+                    Distance,
+                    VectorParams,
+                )
+
+                client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(
+                        size=expected_dims, distance=Distance.COSINE
+                    ),
+                )
+                log.info("Fallback basic collection %r created with dims %d", collection_name, expected_dims)
+            except Exception:
+                log.exception(
+                    "Fallback creation also failed for collection %r — "
+                    "collection is missing, memory operations will fail.",
+                    collection_name,
+                )
         except Exception:
             log.exception(
                 "Failed to recreate Qdrant collection %r with dims %d",

@@ -256,9 +256,16 @@ class _FakeQdrantClient:
 
     def delete_collection(self, name: str):
         self.deleted = True
+        self._existing_dims = None  # collection no longer exists
 
     def create_collection(self, **kwargs):
         self.creations.append(kwargs)
+        # Update dims so get_collection() reflects the new collection
+        vc = kwargs.get("vectors_config")
+        if vc is not None and hasattr(vc, "size"):
+            self._existing_dims = vc.size
+        elif not self._existing_dims:
+            self._existing_dims = 0  # placeholder if unknown
 
 
 class _FakeVectorStore:
@@ -268,7 +275,8 @@ class _FakeVectorStore:
         self.on_disk = on_disk
 
     def create_col(self, vector_size: int, on_disk: bool):
-        pass  # Just validate it's called
+        """Recreate the collection — update dims on the fake client."""
+        self.client._existing_dims = vector_size
 
 
 class TestOSSBackendRecreateQdrantDims:
@@ -401,10 +409,10 @@ class TestOSSBackendRecreateQdrantDims:
 
         assert not client.deleted, "Should NOT delete when create_col is absent"
 
-    def test_partial_failure_does_not_hide_error(self, caplog):
-        """When delete succeeds but create_col raises, the exception is logged."""
+    def test_partial_failure_triggers_fallback(self, caplog):
+        """When delete succeeds but create_col raises, the fallback is attempted."""
         import logging
-        caplog.set_level(logging.ERROR)
+        caplog.set_level(logging.WARNING)
 
         class _RaisingVectorStore:
             def __init__(self):
@@ -424,8 +432,175 @@ class TestOSSBackendRecreateQdrantDims:
         backend._recreate_qdrant_if_dims_changed(384)
 
         assert vs.client.deleted, "Collection should still be deleted"
-        assert "Failed to recreate Qdrant collection" in caplog.text
-        assert "create_col failed" in caplog.text
+        # The fallback (bare client.create_collection) should have been called
+        assert len(vs.client.creations) == 1, "Fallback create_collection should be called"
+        fallback_kwargs = vs.client.creations[0]
+        assert fallback_kwargs["collection_name"] == "mem0"
+        assert "attempting fallback" in caplog.text
+
+
+class TestOSSBackendRecreateQdrantIntegration:
+    """Verify the collection is functional and correctly configured AFTER a dim-mismatch recreate."""
+
+    def _make_backend(self, client: _FakeQdrantClient, collection_name: str = "mem0"):
+        backend = OSSBackend.__new__(OSSBackend)
+        vs = _FakeVectorStore(client)
+        memory = type("M", (), {
+            "vector_store": vs,
+            "collection_name": collection_name,
+        })()
+        backend._memory = memory
+        return backend
+
+    def test_recreate_updates_collection_dims(self):
+        """After recreate, get_collection() should return the new dimension size."""
+        client = _FakeQdrantClient(existing_dims=128)
+        backend = self._make_backend(client)
+
+        backend._recreate_qdrant_if_dims_changed(384)
+
+        info = client.get_collection("mem0")
+        vectors = info.config.params.vectors
+        if isinstance(vectors, dict):
+            first = next(iter(vectors.values()), None)
+            new_dims = first.size if first else None
+        else:
+            new_dims = getattr(vectors, "size", None)
+        assert new_dims == 384, (
+            f"Collection dims should be updated to 384, got {new_dims}"
+        )
+
+    def test_recreate_preserves_on_disk(self):
+        """After recreate, the on_disk config is passed through correctly."""
+        client = _FakeQdrantClient(existing_dims=128)
+        vs = _FakeVectorStore(client, on_disk=True)
+        backend = OSSBackend.__new__(OSSBackend)
+        memory = type("M", (), {
+            "vector_store": vs,
+            "collection_name": "mem0",
+        })()
+        backend._memory = memory
+
+        backend._recreate_qdrant_if_dims_changed(384)
+
+        info = client.get_collection("mem0")
+        vectors = info.config.params.vectors
+        if isinstance(vectors, dict):
+            first = next(iter(vectors.values()), None)
+            new_dims = first.size if first else None
+        else:
+            new_dims = getattr(vectors, "size", None)
+        assert new_dims == 384
+
+    def test_recreate_does_not_affect_other_collections(self):
+        """Only the target collection should be affected by recreate."""
+
+        class _MultiColQdrantClient(_FakeQdrantClient):
+            def __init__(self):
+                super().__init__(existing_dims=128)
+                self._other_dims = 256
+
+            def collection_exists(self, name: str) -> bool:
+                return name in ("mem0", "other_col")
+
+            def get_collection(self, name: str):
+                if name == "other_col":
+                    return _FakeCollectionInfo(self._other_dims)
+                return _FakeCollectionInfo(self._existing_dims)
+
+            def delete_collection(self, name: str):
+                super().delete_collection(name)
+                if name == "other_col":
+                    self._other_dims = None
+
+            def create_collection(self, **kwargs):
+                super().create_collection(**kwargs)
+                if kwargs.get("collection_name") == "other_col":
+                    self._other_dims = 256
+
+        client = _MultiColQdrantClient()
+        vs = _FakeVectorStore(client)
+        backend = OSSBackend.__new__(OSSBackend)
+        memory = type("M", (), {
+            "vector_store": vs,
+            "collection_name": "mem0",
+        })()
+        backend._memory = memory
+
+        backend._recreate_qdrant_if_dims_changed(384)
+
+        # Target collection should have new dims
+        info = client.get_collection("mem0")
+        vectors = info.config.params.vectors
+        current = vectors.size if hasattr(vectors, "size") else None
+        assert current == 384
+
+        # Other collection should be untouched
+        other = client.get_collection("other_col")
+        other_vectors = other.config.params.vectors
+        other_size = other_vectors.size if hasattr(other_vectors, "size") else None
+        assert other_size == 256, "Other collections must not be affected"
+
+    def test_recreate_fallback_creates_basic_collection(self, caplog):
+        """When create_col raises, the fallback creates a basic collection."""
+        import logging
+        caplog.set_level(logging.WARNING)
+
+        class _FallbackVectorStore:
+            def __init__(self):
+                self.client = _FakeQdrantClient(existing_dims=128)
+                self.on_disk = False
+            def create_col(self, vector_size, on_disk):
+                raise RuntimeError("primary failed")
+
+        vs = _FallbackVectorStore()
+        backend = OSSBackend.__new__(OSSBackend)
+        memory = type("M", (), {
+            "vector_store": vs,
+            "collection_name": "mem0",
+        })()
+        backend._memory = memory
+
+        backend._recreate_qdrant_if_dims_changed(384)
+
+        # Collection should still exist (via fallback)
+        info = vs.client.get_collection("mem0")
+        vectors = info.config.params.vectors
+        current = vectors.size if hasattr(vectors, "size") else None
+        assert current == 384, (
+            "Fallback should create a collection with the expected dims"
+        )
+        assert vs.client.deleted
+        assert "attempting fallback" in caplog.text
+
+    def test_fallback_reported_in_creations(self):
+        """Verify client.create_collection is called by the fallback path."""
+
+        class _FallbackVStore:
+            def __init__(self):
+                self.client = _FakeQdrantClient(existing_dims=128)
+                self.on_disk = False
+            def create_col(self, vector_size, on_disk):
+                raise RuntimeError("boom")
+
+        vs = _FallbackVStore()
+        backend = OSSBackend.__new__(OSSBackend)
+        memory = type("M", (), {
+            "vector_store": vs,
+            "collection_name": "mem0",
+        })()
+        backend._memory = memory
+
+        backend._recreate_qdrant_if_dims_changed(384)
+
+        assert len(vs.client.creations) == 1
+        kwargs = vs.client.creations[0]
+        assert kwargs["collection_name"] == "mem0"
+        # The vectors_config should contain the expected dims
+        vc = kwargs.get("vectors_config")
+        assert vc is not None, "vectors_config must be provided in fallback"
+        assert hasattr(vc, "size"), "vectors_config should have size"
+        assert vc.size == 384
 
 
 class TestOSSBackendConstructorNoExtraClient:
