@@ -1594,6 +1594,7 @@ def _deliver_protected_final_result(
     provenance_store: Any,
     wrap_response: bool,
     occurrence_id: str,
+    gate_mode: str,
 ) -> str | None:
     """Deliver one claimed final result without a post-claim route fallback."""
     from cron.output_provenance import ProvenanceError
@@ -1647,6 +1648,8 @@ def _deliver_protected_final_result(
             looks_actionable=False,
             output_screening_required=True,
             provenance_proof=issued["proof"],
+            boundary_enabled=True,
+            gate_mode=gate_mode,
         )
         decision = outbound_before_send_sync(
             hooks,
@@ -1733,9 +1736,7 @@ def _deliver_protected_final_result(
             try:
                 result = future.result(timeout=60)
             except TimeoutError:
-                if future.cancel():
-                    complete("blocked", success=False, send_result={"error": "pre_dispatch_timeout"})
-                    return f"protected final-result delivery timed out before dispatch {platform_name}:{chat_id}"
+                future.cancel()
                 complete("indeterminate", success=False, send_result={"error": "in_flight_timeout"})
                 return f"protected final-result delivery is indeterminate {platform_name}:{chat_id}"
             if isinstance(result, dict):
@@ -1811,6 +1812,29 @@ def sweep_protected_final_result_repairs() -> list[str]:
     return recover_protected_final_result_repairs_for_home()
 
 
+_FINAL_RESULT_GATE_MODES = {"enforce", "observe", "warn", "downgrade", "off"}
+
+
+def _cron_final_result_boundary_policy() -> tuple[bool, str]:
+    """Read the Profile-owned Cron boundary policy, defaulting closed."""
+    try:
+        config = load_config() or {}
+    except Exception:
+        return True, "enforce"
+    cron_config = config.get("cron", {}) if isinstance(config, dict) else {}
+    if not isinstance(cron_config, dict):
+        return True, "enforce"
+    enabled = cron_config.get("final_result_boundary_enabled", True)
+    gate_mode = cron_config.get("final_result_gate_mode", "enforce")
+    if (
+        not isinstance(enabled, bool)
+        or not isinstance(gate_mode, str)
+        or gate_mode not in _FINAL_RESULT_GATE_MODES
+    ):
+        return True, "enforce"
+    return enabled, gate_mode
+
+
 def _deliver_result(
     job: dict,
     content: str,
@@ -1818,6 +1842,7 @@ def _deliver_result(
     loop=None,
     *,
     protect_final_result: bool = False,
+    final_result_gate_mode: str = "enforce",
     outbound_hooks: Any = None,
     provenance_store: Any = None,
 ) -> Optional[str]:
@@ -2131,6 +2156,11 @@ def _deliver_result(
                 provenance_store=active_provenance_store,
                 wrap_response=wrap_response,
                 occurrence_id=provenance_occurrence_id,
+                gate_mode=(
+                    final_result_gate_mode
+                    if final_result_gate_mode in _FINAL_RESULT_GATE_MODES
+                    else "enforce"
+                ),
             )
             if protected_error:
                 logger.warning("Job '%s': %s", job["id"], protected_error)
@@ -4438,12 +4468,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
+                    boundary_enabled, gate_mode = _cron_final_result_boundary_policy()
                     delivery_error = _deliver_result(
                         job,
                         deliver_content,
                         adapters=adapters,
                         loop=loop,
-                        protect_final_result=success,
+                        protect_final_result=(
+                            success and boundary_enabled and gate_mode != "off"
+                        ),
+                        final_result_gate_mode=gate_mode,
                     )
                 except Exception as de:
                     delivery_error = str(de)

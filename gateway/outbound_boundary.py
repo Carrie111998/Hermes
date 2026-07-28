@@ -140,6 +140,46 @@ def _release_tuple_digest(version_tuple: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+def _ordered_profile_for_hook(
+    profiles: Any,
+    hook_dir: Path,
+    *,
+    profile_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Validate one ordered profile manifest and return this hook's entry."""
+    if not isinstance(profiles, list) or not profiles:
+        return None
+    if profile_id is not None and (not isinstance(profile_id, str) or not profile_id.strip()):
+        return None
+    own_hook_dir = os.path.abspath(os.fspath(hook_dir))
+    seen_profile_ids: set[str] = set()
+    seen_hook_dirs: set[str] = set()
+    matches: list[dict[str, Any]] = []
+    for entry in profiles:
+        if not isinstance(entry, dict):
+            return None
+        entry_profile_id = entry.get("profile_id")
+        entry_hook_dir = entry.get("hook_dir")
+        if (
+            not isinstance(entry_profile_id, str)
+            or not entry_profile_id.strip()
+            or not isinstance(entry_hook_dir, str)
+            or not entry_hook_dir
+            or not Path(entry_hook_dir).is_absolute()
+            or os.path.abspath(entry_hook_dir) != entry_hook_dir
+            or entry_profile_id in seen_profile_ids
+            or entry_hook_dir in seen_hook_dirs
+        ):
+            return None
+        seen_profile_ids.add(entry_profile_id)
+        seen_hook_dirs.add(entry_hook_dir)
+        if entry_hook_dir == own_hook_dir and (
+            profile_id is None or entry_profile_id == profile_id
+        ):
+            matches.append(entry)
+    return matches[0] if len(matches) == 1 else None
+
+
 def outbound_activation_is_ready(hook_dir: Path) -> bool:
     """Verify the release controls shared by generic Gateway and Cron loaders."""
     release = hook_dir / "release-tuple.json"
@@ -167,15 +207,9 @@ def outbound_activation_is_ready(hook_dir: Path) -> bool:
             return False
         profiles = shared.get("profiles") if isinstance(shared, dict) else None
         profile_id = activation_payload.get("profile_id")
-        own_entry = next(
-            (
-                item for item in profiles or []
-                if isinstance(item, dict)
-                and item.get("profile_id") == profile_id
-                and item.get("hook_dir") == str(hook_dir.absolute())
-            ),
-            None,
-        )
+        if not isinstance(profile_id, str) or not profile_id:
+            return False
+        own_entry = _ordered_profile_for_hook(profiles, hook_dir, profile_id=profile_id)
         fingerprint = own_entry.get("fingerprint") if isinstance(own_entry, dict) else None
         if (
             not isinstance(fingerprint, dict)
@@ -199,10 +233,6 @@ def outbound_activation_is_ready(hook_dir: Path) -> bool:
             and shared.get("schema_version") == "outbound-actionable-dual-activation/v1"
             and shared.get("tuple_digest") == release_payload.get("tuple_digest")
             and shared.get("version_tuple") == version_tuple
-            and isinstance(profiles, list)
-            and len(profiles) == 2
-            and {item.get("profile_id") for item in profiles if isinstance(item, dict)} == {"atlas", "yuange"}
-            and profile_id in {"atlas", "yuange"}
             and isinstance(own_entry, dict)
             and isinstance(own_entry.get("runtime_identity"), dict)
         )
@@ -231,22 +261,13 @@ def _prepared_release_for_hook(hook_dir: Path) -> tuple[dict[str, Any], dict[str
             return None
         prepared_payload = json.loads(prepared.read_text(encoding="utf-8"))
         profiles = prepared_payload.get("profiles") if isinstance(prepared_payload, dict) else None
-        own_entry = next(
-            (
-                entry for entry in profiles or []
-                if isinstance(entry, dict) and entry.get("hook_dir") == str(hook_dir.absolute())
-            ),
-            None,
-        )
+        own_entry = _ordered_profile_for_hook(profiles, hook_dir)
         fingerprint = own_entry.get("fingerprint") if isinstance(own_entry, dict) else None
         runtime_identity = own_entry.get("runtime_identity") if isinstance(own_entry, dict) else None
         if (
             prepared_payload.get("schema_version") != "outbound-actionable-dual-prepared/v1"
             or prepared_payload.get("tuple_digest") != tuple_digest
             or prepared_payload.get("version_tuple") != version_tuple
-            or not isinstance(profiles, list)
-            or len(profiles) != 2
-            or {entry.get("profile_id") for entry in profiles if isinstance(entry, dict)} != {"atlas", "yuange"}
             or not isinstance(own_entry, dict)
             or not isinstance(fingerprint, dict)
             or not isinstance(runtime_identity, dict)
@@ -411,12 +432,9 @@ def _activated_handler_snapshot(hook_dir: Path) -> tuple[Path, bytes] | None:
         shared = json.loads(shared_bytes.decode("utf-8"))
         profiles = shared.get("profiles") if isinstance(shared, dict) else None
         profile_id = activation_payload.get("profile_id")
-        own_entry = next(
-            item for item in profiles or []
-            if isinstance(item, dict)
-            and item.get("profile_id") == profile_id
-            and item.get("hook_dir") == str(hook_dir.absolute())
-        )
+        if not isinstance(profile_id, str) or not profile_id:
+            return None
+        own_entry = _ordered_profile_for_hook(profiles, hook_dir, profile_id=profile_id)
         fingerprint = own_entry.get("fingerprint") if isinstance(own_entry, dict) else None
         if (
             not isinstance(fingerprint, dict)
@@ -433,10 +451,7 @@ def _activated_handler_snapshot(hook_dir: Path) -> tuple[Path, bytes] | None:
             or shared.get("schema_version") != "outbound-actionable-dual-activation/v1"
             or shared.get("tuple_digest") != release_payload.get("tuple_digest")
             or shared.get("version_tuple") != version_tuple
-            or not isinstance(profiles, list)
-            or len(profiles) != 2
-            or {item.get("profile_id") for item in profiles if isinstance(item, dict)} != {"atlas", "yuange"}
-            or profile_id not in {"atlas", "yuange"}
+            or not isinstance(own_entry, dict)
             or not isinstance(own_entry.get("runtime_identity"), dict)
         ):
             return None
@@ -519,24 +534,13 @@ def load_installed_outbound_hooks(home: str | Path) -> Any | None:
     if "sha256:" + hashlib.sha256(activation_bytes).hexdigest() != activation_sha256:
         raise BoundaryLoadError("installed outbound boundary shared activation changed")
     profiles = shared_activation.get("profiles") if isinstance(shared_activation, dict) else None
-    own_entry = next(
-        (
-            item for item in profiles or []
-            if isinstance(item, dict)
-            and item.get("profile_id") == profile_id
-            and item.get("hook_dir") == str(hook_dir.absolute())
-        ),
-        None,
-    )
+    own_entry = _ordered_profile_for_hook(profiles, hook_dir, profile_id=profile_id)
     if (
         not isinstance(shared_activation, dict)
         or shared_activation.get("tuple_digest") != release_payload.get("tuple_digest")
-        or not isinstance(profiles, list)
-        or len(profiles) != 2
-        or {item.get("profile_id") for item in profiles if isinstance(item, dict)} != {"atlas", "yuange"}
         or not isinstance(own_entry, dict)
     ):
-        raise BoundaryLoadError("installed outbound boundary shared activation does not bind both Profiles")
+        raise BoundaryLoadError("installed outbound boundary shared activation does not bind this Profile")
     try:
         from gateway.hooks import HookRegistry
 

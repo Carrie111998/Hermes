@@ -97,6 +97,62 @@ def test_protected_final_result_claims_then_sends_once(tmp_path, monkeypatch):
     assert list(targets.values())[0]["state"] == "sent"
 
 
+@pytest.mark.parametrize("cancel_result", [True, False], ids=["cancel-accepted", "cancel-rejected"])
+def test_protected_final_result_timeout_is_indeterminate_without_resend(
+    tmp_path, monkeypatch, cancel_result,
+):
+    from cron.scheduler import _deliver_result
+    from gateway.config import Platform
+
+    store = ProvenanceStore(tmp_path)
+    store.bootstrap()
+    hooks = _Hooks({"decision": "allow", "reason": "safe"})
+    send = AsyncMock(return_value={"success": True, "delivered": True})
+    transport = SimpleNamespace(
+        adapter=SimpleNamespace(),
+        config=_config().platforms[Platform.TELEGRAM],
+        transport_platform=Platform.TELEGRAM,
+        send=send,
+    )
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    future = _Future(error=TimeoutError(), cancel_result=cancel_result)
+    schedule_count = 0
+
+    def schedule(coro, _loop):
+        nonlocal schedule_count
+        schedule_count += 1
+        coro.close()
+        return future
+
+    standalone_send = AsyncMock(return_value={"success": True})
+    monkeypatch.setattr("gateway.delivery.resolve_delivery_transport", lambda *_args: transport)
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", schedule)
+    monkeypatch.setattr("cron.scheduler._get_hermes_home", lambda: tmp_path)
+
+    with patch("gateway.config.load_gateway_config", return_value=_config()), patch(
+        "tools.send_message_tool._send_to_platform", new=standalone_send,
+    ):
+        first = _deliver_result(
+            _job(), "business-safe final result", protect_final_result=True,
+            outbound_hooks=hooks, provenance_store=store, loop=loop,
+        )
+        second = _deliver_result(
+            _job(), "business-safe final result", protect_final_result=True,
+            outbound_hooks=hooks, provenance_store=store, loop=loop,
+        )
+
+    assert first == "protected final-result delivery is indeterminate telegram:123"
+    assert "already issued" in second
+    assert schedule_count == 1
+    assert future.cancel_calls == 1
+    send.assert_called_once()
+    standalone_send.assert_not_awaited()
+    target = next(iter(next(iter(_ledger(store)["occurrences"].values()))["targets"].values()))
+    assert target["state"] == "indeterminate"
+    assert target["post_send_repair"]["context"]["send_result"] == {"error": "in_flight_timeout"}
+
+
 def test_post_send_repair_replays_only_persisted_observer_context(tmp_path):
     from cron.scheduler import repair_protected_final_result_after_send
 
@@ -684,7 +740,9 @@ class _Store:
         self.events.append(("complete", kwargs["result"]))
 
 
-def _direct_protected_call(monkeypatch, store, *, hooks=None, adapters=None, loop=None):
+def _direct_protected_call(
+    monkeypatch, store, *, hooks=None, adapters=None, loop=None, gate_mode="enforce",
+):
     from cron.scheduler import _deliver_protected_final_result
     from gateway.config import Platform
 
@@ -712,8 +770,19 @@ def _direct_protected_call(monkeypatch, store, *, hooks=None, adapters=None, loo
         runtime_transport=runtime_transport,
         loop=loop,
         hooks=hooks or _Hooks({"decision": "allow"}), provenance_store=store,
-        wrap_response=False, occurrence_id="occurrence",
+        wrap_response=False, occurrence_id="occurrence", gate_mode=gate_mode,
     )
+
+
+@pytest.mark.parametrize("gate_mode", ["enforce", "observe", "warn", "downgrade"])
+def test_protected_final_result_gate_mode_reaches_outbound_context(monkeypatch, gate_mode):
+    hooks = _Hooks({"decision": "allow"})
+
+    result = _direct_protected_call(monkeypatch, _Store(), hooks=hooks, gate_mode=gate_mode)
+
+    assert "requires a live pinned transport" in result
+    assert hooks.contexts[0]["boundary_enabled"] is True
+    assert hooks.contexts[0]["gate_mode"] == gate_mode
 
 
 def test_protected_delivery_provenance_or_boundary_failure_never_sends(monkeypatch):
@@ -990,6 +1059,7 @@ class _Future:
         self._result = result
         self._error = error
         self._cancel_result = cancel_result
+        self.cancel_calls = 0
 
     def result(self, timeout):
         assert timeout == 60
@@ -998,6 +1068,7 @@ class _Future:
         return self._result
 
     def cancel(self):
+        self.cancel_calls += 1
         return self._cancel_result
 
 
@@ -1005,8 +1076,6 @@ class _Future:
     ("future", "expected", "terminal"),
     [
         (None, "could not schedule", "blocked"),
-        (_Future(error=TimeoutError(), cancel_result=True), "timed out before dispatch", "blocked"),
-        (_Future(error=TimeoutError(), cancel_result=False), "is indeterminate", "indeterminate"),
         (_Future(result={"success": False}), "unconfirmed", "indeterminate"),
         (_Future(result={"success": True, "delivered": True}), None, "sent"),
     ],

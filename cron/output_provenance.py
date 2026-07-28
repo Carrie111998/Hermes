@@ -148,16 +148,35 @@ class ProvenanceStore:
         if existing:
             all_files = {LOCK_NAME, LEDGER_NAME, KEY_NAME, ANCHOR_NAME}
             recoverable = all_files - {ANCHOR_NAME}
-            names = {path.name for path in existing}
+            temporary_prefixes = tuple(f".{name}." for name in all_files)
+            managed = []
+            temporary = []
+            for path in existing:
+                if path.name in all_files:
+                    managed.append(path)
+                elif any(
+                    path.name.startswith(prefix) and len(path.name) > len(prefix)
+                    for prefix in temporary_prefixes
+                ):
+                    temporary.append(path)
+                else:
+                    raise ProvenanceError("provenance bootstrap requires an empty store")
+                _require_private_regular(path)
+            names = {path.name for path in managed}
             if names == all_files:
-                for path in existing:
-                    _require_private_regular(path)
+                for path in temporary:
+                    path.unlink()
+                if temporary:
+                    directory_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
                 lock_dev, lock_ino = self._anchor()
                 return {"schema_version": SCHEMA_VERSION, "lock_dev": lock_dev, "lock_ino": lock_ino}
             if ANCHOR_NAME in names or not names <= recoverable:
                 raise ProvenanceError("provenance bootstrap requires an empty store")
-            for path in existing:
-                _require_private_regular(path)
+            for path in managed + temporary:
                 path.unlink()
             directory_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:

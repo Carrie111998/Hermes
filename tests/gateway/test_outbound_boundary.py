@@ -126,6 +126,36 @@ def _prepare_capture(hook_dir):
     os.chmod(prepared, 0o600)
 
 
+def _prepared_control_path(hook_dir):
+    release = json.loads((hook_dir / "release-tuple.json").read_text(encoding="utf-8"))
+    tuple_digest = release["tuple_digest"].removeprefix("sha256:")
+    keg = Path(release["version_tuple"]["homebrew_keg_path"])
+    return keg.parent / ".outbound-actionable-activations" / f"{tuple_digest}.prepared.json"
+
+
+def _rewrite_prepared_profiles(hook_dir, profiles):
+    prepared = _prepared_control_path(hook_dir)
+    payload = json.loads(prepared.read_text(encoding="utf-8"))
+    payload["profiles"] = profiles
+    prepared.write_text(json.dumps(payload), encoding="utf-8")
+    os.chmod(prepared, 0o600)
+
+
+def _rewrite_activation_profiles(hook_dir, profiles, *, profile_id):
+    activation = hook_dir / "release-activation.json"
+    activation_payload = json.loads(activation.read_text(encoding="utf-8"))
+    shared = Path(activation_payload["activation_path"])
+    shared_payload = json.loads(shared.read_text(encoding="utf-8"))
+    shared_payload["profiles"] = profiles
+    data = json.dumps(shared_payload, sort_keys=True).encode("utf-8") + b"\n"
+    shared.write_bytes(data)
+    os.chmod(shared, 0o600)
+    activation_payload["profile_id"] = profile_id
+    activation_payload["activation_sha256"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    activation.write_text(json.dumps(activation_payload), encoding="utf-8")
+    os.chmod(activation, 0o600)
+
+
 def test_missing_boundary_decision_fails_closed():
     decision = outbound_before_send_sync(HookRegistry(), {"content": "report"})
     assert decision.decision == "deny"
@@ -458,6 +488,115 @@ def test_inert_capture_requires_a_well_formed_external_preparation_record(tmp_pa
     prepared.write_text("not json", encoding="utf-8")
     os.chmod(prepared, 0o600)
     assert outbound_boundary._prepared_release_for_hook(hook_dir) is None
+
+
+@pytest.mark.parametrize("peer_count", [0, 2])
+def test_prepared_manifest_accepts_nonempty_unique_ordered_profiles(tmp_path, peer_count):
+    from gateway import outbound_boundary
+
+    hook_dir = tmp_path / "hooks" / "outbound-actionable"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "kit-bundle-manifest.json").write_text("{}", encoding="utf-8")
+    _prepare_capture(hook_dir)
+    prepared = json.loads(_prepared_control_path(hook_dir).read_text(encoding="utf-8"))
+    own = {**prepared["profiles"][0], "profile_id": "research"}
+    peers = [
+        {**prepared["profiles"][1], "profile_id": f"peer-{index}", "hook_dir": str(tmp_path / f"peer-{index}" / "hooks" / "outbound-actionable")}
+        for index in range(peer_count)
+    ]
+    profiles = peers[:1] + [own] + peers[1:]
+    _rewrite_prepared_profiles(hook_dir, profiles)
+
+    result = outbound_boundary._prepared_release_for_hook(hook_dir)
+
+    assert result is not None
+    assert result[1]["profile_id"] == "research"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["empty", "duplicate-profile-id", "duplicate-hook-dir", "relative-hook-dir", "missing-current-hook"],
+)
+def test_prepared_manifest_rejects_ambiguous_or_unbound_profiles(tmp_path, invalid):
+    from gateway import outbound_boundary
+
+    hook_dir = tmp_path / "hooks" / "outbound-actionable"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "kit-bundle-manifest.json").write_text("{}", encoding="utf-8")
+    _prepare_capture(hook_dir)
+    profiles = json.loads(json.dumps(
+        json.loads(_prepared_control_path(hook_dir).read_text(encoding="utf-8"))["profiles"]
+    ))
+    if invalid == "empty":
+        profiles = []
+    elif invalid == "duplicate-profile-id":
+        profiles[1]["profile_id"] = profiles[0]["profile_id"]
+    elif invalid == "duplicate-hook-dir":
+        profiles[1]["hook_dir"] = profiles[0]["hook_dir"]
+    elif invalid == "relative-hook-dir":
+        profiles[1]["hook_dir"] = "relative/hooks/outbound-actionable"
+    else:
+        profiles[0]["hook_dir"] = str(tmp_path / "other" / "hooks" / "outbound-actionable")
+    _rewrite_prepared_profiles(hook_dir, profiles)
+
+    assert outbound_boundary._prepared_release_for_hook(hook_dir) is None
+
+
+@pytest.mark.parametrize("peer_count", [0, 2])
+def test_activation_manifest_accepts_nonempty_unique_ordered_profiles(tmp_path, peer_count):
+    from gateway import outbound_boundary
+
+    hook_dir = tmp_path / "hooks" / "outbound-actionable"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "HOOK.yaml").write_text("events: [outbound:before_send]\n", encoding="utf-8")
+    (hook_dir / "handler.py").write_text(
+        "def handle(*_args):\n    return {'decision': 'allow'}\n", encoding="utf-8",
+    )
+    _activate(hook_dir)
+    activation = json.loads((hook_dir / "release-activation.json").read_text(encoding="utf-8"))
+    shared = json.loads(Path(activation["activation_path"]).read_text(encoding="utf-8"))
+    own = {**shared["profiles"][0], "profile_id": "research"}
+    peers = [
+        {**shared["profiles"][1], "profile_id": f"peer-{index}", "hook_dir": str(tmp_path / f"peer-{index}" / "hooks" / "outbound-actionable")}
+        for index in range(peer_count)
+    ]
+    _rewrite_activation_profiles(hook_dir, peers[:1] + [own] + peers[1:], profile_id="research")
+
+    assert outbound_boundary.outbound_activation_is_ready(hook_dir) is True
+    assert outbound_boundary._activated_handler_snapshot(hook_dir) is not None
+    assert outbound_boundary.load_installed_outbound_hooks(tmp_path) is not None
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["empty", "duplicate-profile-id", "duplicate-hook-dir", "relative-hook-dir", "profile-hook-mismatch"],
+)
+def test_activation_manifest_rejects_ambiguous_or_unbound_profiles(tmp_path, invalid):
+    from gateway.outbound_boundary import outbound_activation_is_ready
+
+    hook_dir = tmp_path / "hooks" / "outbound-actionable"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "HOOK.yaml").write_text("events: [outbound:before_send]\n", encoding="utf-8")
+    (hook_dir / "handler.py").write_text("# handler\n", encoding="utf-8")
+    _activate(hook_dir)
+    activation = json.loads((hook_dir / "release-activation.json").read_text(encoding="utf-8"))
+    profiles = json.loads(json.dumps(
+        json.loads(Path(activation["activation_path"]).read_text(encoding="utf-8"))["profiles"]
+    ))
+    profile_id = "atlas"
+    if invalid == "empty":
+        profiles = []
+    elif invalid == "duplicate-profile-id":
+        profiles[1]["profile_id"] = profiles[0]["profile_id"]
+    elif invalid == "duplicate-hook-dir":
+        profiles[1]["hook_dir"] = profiles[0]["hook_dir"]
+    elif invalid == "relative-hook-dir":
+        profiles[1]["hook_dir"] = "relative/hooks/outbound-actionable"
+    else:
+        profile_id = "yuange"
+    _rewrite_activation_profiles(hook_dir, profiles, profile_id=profile_id)
+
+    assert outbound_activation_is_ready(hook_dir) is False
 
 
 @pytest.mark.parametrize("payload", [{}, {"schema_version": 1, "files": []}, {"schema_version": 1, "files": [{"path": "../escape", "sha256": "x"}], "bundle_sha256": "bad"}])

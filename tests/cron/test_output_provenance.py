@@ -26,6 +26,7 @@ def _issue(store: ProvenanceStore, *, target_id: str = "t1", route: str = "sha25
         raw_body=b"daily report",
         template_digest="sha256:template",
         producer_class="llm_final",
+        now=NOW,
     )
 
 
@@ -143,9 +144,10 @@ def test_expired_claim_is_durably_blocked(tmp_path, monkeypatch):
     store = ProvenanceStore(tmp_path)
     store.bootstrap()
     issued = _issue(store)
+    expired_now = NOW + timedelta(seconds=provenance.TTL_SECONDS + 1)
+    monkeypatch.setattr(provenance, "_now", lambda: expired_now)
 
     with pytest.raises(ProvenanceError, match="expired"):
-        monkeypatch.setattr(provenance, "_now", lambda: datetime(2026, 7, 28, tzinfo=timezone.utc))
         store.verify_and_claim(
             proof=issued["proof"], raw_body_b64=issued["raw_body_b64"], decision="allow",
         )
@@ -160,7 +162,8 @@ def test_expired_claim_is_blocked_again_at_send_fence(tmp_path, monkeypatch):
     issued = _issue(store)
     monkeypatch.setattr(provenance, "_now", lambda: NOW)
     claim = store.verify_and_claim(proof=issued["proof"], raw_body_b64=issued["raw_body_b64"], decision="allow")
-    monkeypatch.setattr(provenance, "_now", lambda: datetime(2026, 7, 28, tzinfo=timezone.utc))
+    expired_now = NOW + timedelta(seconds=provenance.TTL_SECONDS + 1)
+    monkeypatch.setattr(provenance, "_now", lambda: expired_now)
 
     with pytest.raises(ProvenanceError, match="expired before send"):
         store.begin_send(
@@ -414,6 +417,49 @@ def test_bootstrap_is_idempotent_after_another_initializer_commits_the_anchor(tm
     first = store.bootstrap()
 
     assert store.bootstrap() == first
+
+
+def test_bootstrap_removes_only_safe_atomic_write_residue_and_fsyncs(tmp_path, monkeypatch):
+    store = ProvenanceStore(tmp_path)
+    expected = store.bootstrap()
+    residues = [
+        store.root / f".{name}.crash-residue"
+        for name in (
+            provenance.LOCK_NAME,
+            provenance.LEDGER_NAME,
+            provenance.KEY_NAME,
+            provenance.ANCHOR_NAME,
+        )
+    ]
+    for residue in residues:
+        residue.write_bytes(b"partial")
+        os.chmod(residue, 0o600)
+    fsync_calls = []
+    monkeypatch.setattr(provenance.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+
+    assert store.bootstrap() == expected
+    assert not any(path.exists() for path in residues)
+    assert fsync_calls
+
+
+@pytest.mark.parametrize("residue_kind", ["unknown", "symlink"])
+def test_bootstrap_rejects_unknown_or_symlink_residue(tmp_path, residue_kind):
+    store = ProvenanceStore(tmp_path)
+    store.root.mkdir(parents=True, mode=0o700)
+    if residue_kind == "unknown":
+        residue = store.root / ".unrelated.crash-residue"
+        residue.write_bytes(b"unknown")
+        os.chmod(residue, 0o600)
+    else:
+        target = tmp_path / "outside"
+        target.write_bytes(b"partial")
+        os.chmod(target, 0o600)
+        residue = store.root / f".{provenance.LEDGER_NAME}.crash-residue"
+        residue.symlink_to(target)
+
+    with pytest.raises(ProvenanceError):
+        store.bootstrap()
+    assert residue.is_symlink() or residue.exists()
 
 
 @pytest.mark.parametrize(
