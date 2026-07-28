@@ -637,3 +637,72 @@ class TestCLI:
         data = json.loads(dispatched.stdout)
         assert [entry["assignee"] for entry in data["spawned"]] == ["alex"]
         assert len(data["skipped_disallowed"]) == 1
+
+    def test_boards_create_invalid_allowed_profile_is_usage_error(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_DELEGATED_CHILD_CONTEXT": "",
+        }
+
+        result = _cli(
+            ["boards", "create", "guarded", "--allowed-profile", "bad/name"],
+            env_extra=env,
+        )
+
+        assert result.returncode == 2
+        assert "kanban boards create: Invalid profile name" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_swarm_disallowed_profile_is_usage_error(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_DELEGATED_CHILD_CONTEXT": "",
+            "HERMES_PROFILE_NAME": "alex",
+        }
+        assert _cli(
+            ["boards", "create", "guarded", "--allowed-profile", "alex"],
+            env_extra=env,
+        ).returncode == 0
+
+        result = _cli(
+            [
+                "--board", "guarded", "swarm", "policy proof",
+                "--worker", "goggins:worker",
+                "--verifier", "alex",
+                "--synthesizer", "alex",
+            ],
+            env_extra=env,
+        )
+
+        assert result.returncode == 2
+        assert "kanban swarm: profile 'goggins' is not allowed" in result.stderr
+        assert "Traceback" not in result.stderr
+        listed = _cli(["--board", "guarded", "list", "--json"], env_extra=env)
+        assert json.loads(listed.stdout) == []
+
+    def test_delegated_child_fast_fails_allowed_profile_mutation(self, tmp_path):
+        normal_env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_DELEGATED_CHILD_CONTEXT": "",
+        }
+        assert _cli(
+            ["boards", "create", "guarded", "--allowed-profile", "alex"],
+            env_extra=normal_env,
+        ).returncode == 0
+
+        child_env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_DELEGATED_CHILD_CONTEXT": "1",
+        }
+        result = _cli(
+            ["boards", "set-allowed-profiles", "guarded", "goggins"],
+            env_extra=child_env,
+        )
+
+        assert result.returncode == 1
+        assert "delegate_task child contexts cannot mutate Kanban" in result.stderr
+        assert "Traceback" not in result.stderr
+        metadata = json.loads(
+            (tmp_path / "kanban" / "boards" / "guarded" / "board.json").read_text()
+        )
+        assert metadata["allowed_profiles"] == ["alex"]

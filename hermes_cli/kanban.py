@@ -1180,6 +1180,7 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "use",
     "rename",
     "set-default-workdir",
+    "set-allowed-profiles",
 })
 
 
@@ -1299,15 +1300,19 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         if allowed_profiles is not None
         else {}
     )
-    meta = kb.create_board(
-        normed,
-        name=args.name,
-        description=args.description,
-        icon=args.icon,
-        color=args.color,
-        default_workdir=args.default_workdir,
-        **policy_kwargs,
-    )
+    try:
+        meta = kb.create_board(
+            normed,
+            name=args.name,
+            description=args.description,
+            icon=args.icon,
+            color=args.color,
+            default_workdir=args.default_workdir,
+            **policy_kwargs,
+        )
+    except ValueError as exc:
+        print(f"kanban boards create: {exc}", file=sys.stderr)
+        return 2
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
@@ -1629,19 +1634,23 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
-    with kb.connect_closing() as conn:
-        created = ks.create_swarm(
-            conn,
-            goal=args.goal,
-            workers=workers,
-            verifier_assignee=args.verifier,
-            synthesizer_assignee=args.synthesizer,
-            tenant=args.tenant,
-            created_by=args.created_by or _profile_author(),
-            priority=args.priority,
-            idempotency_key=getattr(args, "idempotency_key", None),
-            board=kb.get_current_board(),
-        )
+    try:
+        with kb.connect_closing() as conn:
+            created = ks.create_swarm(
+                conn,
+                goal=args.goal,
+                workers=workers,
+                verifier_assignee=args.verifier,
+                synthesizer_assignee=args.synthesizer,
+                tenant=args.tenant,
+                created_by=args.created_by or _profile_author(),
+                priority=args.priority,
+                idempotency_key=getattr(args, "idempotency_key", None),
+                board=kb.get_current_board(),
+            )
+    except ValueError as exc:
+        print(f"kanban swarm: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
     else:
