@@ -4465,7 +4465,21 @@ def apply_approvals(conn: sqlite3.Connection) -> list:
       (``REVIEW_VERDICT=APPROVED`` / ``REVIEW_VERDICT: APPROVED``);
     * no reviewer re-open (CHANGES_REQUESTED / REJECT / re-open) comment
       was posted AFTER that approval;
+    * the approval comment has not already auto-cleared this card once
+      (idempotence — see below);
     * no open parent dependency.
+
+    Idempotence (t_jarvis_autopromote_20260728): an approval verdict
+    addresses the thing it reviewed (usually code correctness). A card
+    that re-blocks afterwards for a DIFFERENT reason (e.g. a 24h soak
+    gate, a needs_input/capability park) must NOT be re-cleared by the
+    same stale approval comment — otherwise every post-approval block
+    is defeated ~instantly on the next dispatch tick, which is exactly
+    the auto-promote-defeats-gates class of bug this family of fixes
+    exists to close. We therefore skip an approval comment_id that has
+    already produced an ``approval-auto-clear`` unblocked event on this
+    card. A NEW approval comment posted after the re-block (fresh
+    verdict on the new state) has a new comment_id and clears normally.
 
     Appends an ``unblocked`` event with reason ``approval-auto-clear`` so
     :func:`_has_sticky_block` flips off durably. Returns cleared task ids.
@@ -4489,6 +4503,15 @@ def apply_approvals(conn: sqlite3.Connection) -> list:
                 continue
             if _APPROVAL_NEGATED_RE.search(approval["body"] or ""):
                 continue  # "No REVIEW_VERDICT=APPROVED..." is a denial
+            already_fired = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
+                "AND json_extract(payload, '$.reason') = 'approval-auto-clear' "
+                "AND json_extract(payload, '$.comment_id') = ? LIMIT 1",
+                (task_id, approval["id"]),
+            ).fetchone()
+            if already_fired is not None:
+                continue  # same approval already cleared this card once;
+                # a later re-block is a new gate the stale verdict must not defeat
             reopen = conn.execute(
                 "SELECT body FROM task_comments WHERE task_id = ? AND id > ?",
                 (task_id, approval["id"]),
