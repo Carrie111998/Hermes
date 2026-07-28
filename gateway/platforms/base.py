@@ -5398,7 +5398,46 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
-        
+
+        _post_delivery_callback_fired = False
+
+        async def _fire_post_delivery_callback() -> None:
+            """Fire this run's callbacks once, before any queued turn starts."""
+            nonlocal _post_delivery_callback_fired
+            if _post_delivery_callback_fired:
+                return
+            _post_delivery_callback_fired = True
+
+            # The generation is bound while the handler runs. Read it only
+            # after that await, but before a queued follow-up can rebind the
+            # shared active-session event to its own generation.
+            callback_generation = getattr(
+                interrupt_event,
+                "_hermes_run_generation",
+                None,
+            )
+            if hasattr(self, "pop_post_delivery_callback"):
+                post_callback = self.pop_post_delivery_callback(
+                    session_key,
+                    generation=callback_generation,
+                )
+            else:
+                post_callback = getattr(self, "_post_delivery_callbacks", {}).pop(
+                    session_key,
+                    None,
+                )
+            if not callable(post_callback):
+                return
+            try:
+                post_result = post_callback()
+                if inspect.isawaitable(post_result):
+                    await asyncio.wait_for(
+                        post_result,
+                        timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                    )
+            except Exception:
+                pass
+
         try:
             await self._run_processing_hook("on_processing_start", event)
 
@@ -5836,6 +5875,11 @@ class BasePlatformAdapter(ABC):
                 if _active is not None:
                     _active.clear()
                 await _stop_typing_task()
+                # Drain this turn's deferred output before handing the shared
+                # session slot to the next generation. Otherwise the follow-up
+                # can replace the callback slot before this turn's callback is
+                # popped, dropping terminal notices and other deferred work.
+                await _fire_post_delivery_callback()
                 # Spawn a fresh task for the pending message instead of
                 # recursing.  Issue #17758: `await
                 # self._process_message_background(...)` here grew the
@@ -5893,38 +5937,9 @@ class BasePlatformAdapter(ABC):
             # leave the typing refresh task running indefinitely.
             await _stop_typing_task()
             # Fire any one-shot post-delivery callback registered for this
-            # session (e.g. deferred background-review notifications).
-            #
-            # Snapshot the callback generation HERE (after the agent has run),
-            # not at the top of this task.  _hermes_run_generation is set on
-            # the interrupt event by GatewayRunner._bind_adapter_run_generation
-            # during _handle_message_with_agent — which happens DURING the
-            # self._message_handler(event) await above.  Snapshotting earlier
-            # always captured None, which bypassed the generation-ownership
-            # check in pop_post_delivery_callback and let stale runs fire a
-            # fresher run's callbacks.
-            _callback_generation = getattr(
-                interrupt_event,
-                "_hermes_run_generation",
-                None,
-            )
-            if hasattr(self, "pop_post_delivery_callback"):
-                _post_cb = self.pop_post_delivery_callback(
-                    session_key,
-                    generation=_callback_generation,
-                )
-            else:
-                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
-                try:
-                    _post_result = _post_cb()
-                    if inspect.isawaitable(_post_result):
-                        await asyncio.wait_for(
-                            _post_result,
-                            timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
-                        )
-                except (asyncio.TimeoutError, Exception):
-                    pass
+            # run. Queued-turn handoff may already have fired it before
+            # spawning the next generation; the helper is idempotent.
+            await _fire_post_delivery_callback()
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.

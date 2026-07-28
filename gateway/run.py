@@ -12466,8 +12466,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        # Discord's typing indicator and parent-message reaction are both
+        # transient/easy to miss once an auto-thread opens. Start the durable
+        # in-thread lifecycle only after this request has passed command,
+        # authorization, drain, and concurrency gates and has claimed a real
+        # agent slot. Adapters without the explicit lifecycle capability are
+        # untouched.
+        _run_lifecycle_adapter = None
+        if source.platform == Platform.DISCORD and getattr(source, "thread_id", None):
+            _run_lifecycle_adapter = self._adapter_for_source(source)
+            _begin_run_lifecycle = getattr(
+                _run_lifecycle_adapter, "begin_run_lifecycle", None
+            )
+            if callable(_begin_run_lifecycle):
+                try:
+                    await asyncio.wait_for(
+                        _begin_run_lifecycle(
+                            event,
+                            session_key=_quick_key,
+                            generation=_run_generation,
+                        ),
+                        timeout=5.0,
+                    )
+                except Exception as _lifecycle_exc:
+                    logger.debug(
+                        "Discord run lifecycle start failed for %s: %s",
+                        _quick_key,
+                        _lifecycle_exc,
+                    )
+
+        def _set_run_lifecycle_outcome(outcome: str) -> None:
+            setter = getattr(
+                _run_lifecycle_adapter, "set_run_lifecycle_outcome", None
+            )
+            if not callable(setter):
+                return
+            try:
+                setter(event, outcome)
+            except Exception:
+                logger.debug(
+                    "Discord run lifecycle outcome update failed for %s",
+                    _quick_key,
+                    exc_info=True,
+                )
+
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            if isinstance(_agent_result, dict):
+                if _agent_result.get("timed_out"):
+                    _set_run_lifecycle_outcome("timeout")
+                elif _agent_result.get("interrupted"):
+                    _set_run_lifecycle_outcome("stopped")
+                elif _agent_result.get("failed"):
+                    _set_run_lifecycle_outcome("failed")
+                else:
+                    _set_run_lifecycle_outcome("success")
+            else:
+                _set_run_lifecycle_outcome("success")
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -12497,6 +12552,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
+        except asyncio.CancelledError:
+            _set_run_lifecycle_outcome("stopped")
+            raise
+        except Exception:
+            _set_run_lifecycle_outcome("failed")
+            raise
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -23227,6 +23288,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
+                    "timed_out": True,
                 }
 
             # Track fallback model state: if the agent switched to a

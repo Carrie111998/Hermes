@@ -26,9 +26,17 @@ class _FakeAdapter:
         self._pending_messages = {}
         self._active_sessions = {}
         self.interrupted_sessions = []
+        self.lifecycle_starts = []
+        self.lifecycle_outcomes = []
 
     async def send(self, chat_id, text, **kwargs):
         pass
+
+    async def begin_run_lifecycle(self, event, *, session_key, generation=None):
+        self.lifecycle_starts.append((event, session_key, generation))
+
+    def set_run_lifecycle_outcome(self, event, outcome):
+        self.lifecycle_outcomes.append((event, outcome))
 
     async def interrupt_session_activity(self, session_key, chat_id):
         self.interrupted_sessions.append((session_key, chat_id))
@@ -73,6 +81,27 @@ def _make_event(text="hello", chat_id="12345"):
         user_id="u1",
     )
     return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+
+
+def _make_discord_runner_and_event():
+    runner = _make_runner()
+    adapter = _FakeAdapter()
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="12345",
+        thread_id="45678",
+        chat_type="thread",
+        user_id="u1",
+    )
+    return runner, adapter, MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
 
 
 # ------------------------------------------------------------------
@@ -146,6 +175,80 @@ async def test_sentinel_cleaned_up_on_exception():
     assert session_key not in runner._running_agents, (
         "Sentinel must be removed even if handler raises"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_result", "expected_outcome"),
+    [
+        ({"final_response": "", "failed": False}, "success"),
+        ({"final_response": "", "failed": True}, "failed"),
+        ({"final_response": "", "failed": True, "timed_out": True}, "timeout"),
+        ({"final_response": "", "interrupted": True}, "stopped"),
+    ],
+)
+async def test_discord_agent_run_starts_lifecycle_and_classifies_result(
+    agent_result,
+    expected_outcome,
+):
+    runner, adapter, event = _make_discord_runner_and_event()
+    session_key = build_session_key(event.source)
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        assert adapter.lifecycle_starts == [(event, session_key, generation)]
+        return agent_result
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    assert len(adapter.lifecycle_starts) == 1
+    assert adapter.lifecycle_outcomes == [(event, expected_outcome)]
+
+
+@pytest.mark.asyncio
+async def test_discord_agent_run_marks_lifecycle_stopped_when_cancelled():
+    runner, adapter, event = _make_discord_runner_and_event()
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        raise asyncio.CancelledError
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        with pytest.raises(asyncio.CancelledError):
+            await runner._handle_message(event)
+
+    assert adapter.lifecycle_outcomes == [(event, "stopped")]
+
+
+@pytest.mark.asyncio
+async def test_non_discord_agent_run_does_not_emit_run_lifecycle():
+    runner = _make_runner()
+    event = _make_event()
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        return {"final_response": "", "failed": False}
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    assert adapter.lifecycle_starts == []
+    assert adapter.lifecycle_outcomes == []
+
+
+@pytest.mark.asyncio
+async def test_discord_dm_does_not_emit_thread_run_lifecycle():
+    runner, adapter, event = _make_discord_runner_and_event()
+    event.source.chat_type = "dm"
+    event.source.thread_id = None
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        return {"final_response": "", "failed": False}
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    assert adapter.lifecycle_starts == []
+    assert adapter.lifecycle_outcomes == []
 
 
 # ------------------------------------------------------------------

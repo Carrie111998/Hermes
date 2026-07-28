@@ -2826,6 +2826,100 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    @staticmethod
+    def _run_lifecycle_metadata(event: MessageEvent) -> Dict[str, Any]:
+        """Build thread-strict, non-conversational metadata for run markers."""
+        metadata: Dict[str, Any] = {
+            "non_conversational": True,
+            "non_conversational_history": True,
+        }
+        source = getattr(event, "source", None)
+        thread_id = getattr(source, "thread_id", None)
+        if thread_id:
+            metadata["thread_id"] = str(thread_id)
+        return metadata
+
+    @staticmethod
+    def _format_run_lifecycle_elapsed(seconds: float) -> str:
+        elapsed = max(0, int(seconds))
+        if elapsed < 60:
+            return f"{elapsed}s"
+        minutes, seconds = divmod(elapsed, 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def set_run_lifecycle_outcome(self, event: MessageEvent, outcome: str) -> None:
+        """Record a more specific terminal outcome for an active Discord run."""
+        metadata = getattr(event, "metadata", None)
+        state = metadata.get("_discord_run_lifecycle") if isinstance(metadata, dict) else None
+        if not isinstance(state, dict):
+            return
+        normalized = str(outcome or "").strip().lower()
+        if normalized in {"success", "failed", "stopped", "timeout"}:
+            state["outcome"] = normalized
+
+    async def begin_run_lifecycle(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        generation: Optional[int] = None,
+    ) -> None:
+        """Post the durable start marker and defer one fresh terminal marker."""
+        if not isinstance(getattr(event, "metadata", None), dict):
+            event.metadata = {}
+        existing = event.metadata.get("_discord_run_lifecycle")
+        if isinstance(existing, dict):
+            return
+
+        state: Dict[str, Any] = {
+            "started_at": time.monotonic(),
+            "outcome": "success",
+            "terminal_sent": False,
+            "terminal_registered": False,
+            "session_key": session_key,
+            "generation": generation,
+        }
+        event.metadata["_discord_run_lifecycle"] = state
+
+        async def _send_terminal() -> None:
+            if state.get("terminal_sent"):
+                return
+            state["terminal_sent"] = True
+            labels = {
+                "success": "✅ Run complete",
+                "failed": "❌ Run failed",
+                "stopped": "⏹️ Run stopped",
+                "timeout": "⚠️ Run timed out",
+            }
+            label = labels.get(str(state.get("outcome") or ""), labels["failed"])
+            elapsed = self._format_run_lifecycle_elapsed(
+                time.monotonic() - float(state["started_at"])
+            )
+            delivery_adapter = self._final_delivery_adapter(event.source)
+            await delivery_adapter.send(
+                event.source.chat_id,
+                f"{label} · {elapsed}",
+                metadata=self._run_lifecycle_metadata(event),
+            )
+
+        # Register this only from ``on_processing_complete``. Other features
+        # may register deferred deliveries while the agent runs; appending the
+        # lifecycle callback after those guarantees the terminal marker is the
+        # last post-delivery message in the thread.
+        state["terminal_callback"] = _send_terminal
+        try:
+            delivery_adapter = self._final_delivery_adapter(event.source)
+            await delivery_adapter.send(
+                event.source.chat_id,
+                "⏳ Run started",
+                metadata=self._run_lifecycle_metadata(event),
+            )
+        except Exception as exc:
+            logger.debug("[%s] Run lifecycle start send failed: %s", self.name, exc)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
@@ -2839,7 +2933,26 @@ class DiscordAdapter(BasePlatformAdapter):
         )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for final reaction and durable state."""
+        """Swap the in-progress reaction and finalize the durable run outcome."""
+        metadata = getattr(event, "metadata", None)
+        state = metadata.get("_discord_run_lifecycle") if isinstance(metadata, dict) else None
+        if outcome == ProcessingOutcome.CANCELLED:
+            self.set_run_lifecycle_outcome(event, "stopped")
+        elif outcome == ProcessingOutcome.FAILURE:
+            if not isinstance(state, dict) or state.get("outcome") != "timeout":
+                self.set_run_lifecycle_outcome(event, "failed")
+
+        if isinstance(state, dict) and not state.get("terminal_registered"):
+            callback = state.get("terminal_callback")
+            session_key = state.get("session_key")
+            if callable(callback) and session_key:
+                self.register_post_delivery_callback(
+                    str(session_key),
+                    callback,
+                    generation=state.get("generation"),
+                )
+                state["terminal_registered"] = True
+
         await asyncio.to_thread(
             self._record_discord_processing_complete,
             event,
