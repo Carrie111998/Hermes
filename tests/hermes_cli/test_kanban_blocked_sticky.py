@@ -105,10 +105,9 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
 
 
 def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
-    """A child that was put into ``blocked`` *without* a worker-issued
-    ``kanban_block`` (e.g. a transient crash, manual DB triage) and whose
-    ``consecutive_failures`` is still *below* the circuit-breaker limit
-    must get auto-promoted when its parents complete — preserves the
+    """A task whose status was set to ``blocked`` directly (no ``blocked``
+    event) and whose ``consecutive_failures`` is below the circuit-breaker
+    limit must stay blocked — preserves the
     pre-#28712 recovery semantics for genuinely transient failures.
 
     The complementary case — a block whose failure count has *reached*
@@ -135,19 +134,23 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
         conn.commit()
 
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
         task = kb.get_task(conn, child)
-        assert task.status == "ready"
-        # Counter is preserved across recovery (not reset) so the breaker
-        # can still accumulate if the task keeps failing (#35072).
-        assert task.consecutive_failures == 1
+        assert task.status == "blocked"
 
 
 def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
     """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
     sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
-    as sticky — otherwise we'd regress the safety net for genuinely
-    transient crashes."""
+    events — it only considers ``blocked``/``unblocked`` event kinds.
+
+    However, the blind-spot guard (t_6009ccaa) catches *any* task with
+    ``status='blocked'`` regardless of whether a ``blocked`` event exists.
+    A task that reached ``status='blocked'`` via ``_record_task_failure``
+    at/above the failure limit stays blocked via the guard (the failure-
+    limit check at lines 4413-4420 of ``recompute_ready`` would also keep
+    it blocked in this state, so both paths agree).
+    """
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
@@ -166,8 +169,8 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
         conn.commit()
 
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
-        assert kb.get_task(conn, child).status == "ready"
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +179,15 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
 
 
 def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -> None:
-    """``hermes kanban unblock`` (or the ``kanban_unblock`` tool) is
-    the only legitimate way out of a worker-initiated block.  After
-    unblock, a *subsequent* circuit-breaker block on the same task
-    must again be eligible for auto-recovery."""
+    """``hermes kanban unblock`` (or the ``kanban_unblock`` tool) correctly
+    clears the sticky-block state: the task transitions back to ``ready``
+    and the most recent block/unblock event is ``unblocked``.
+
+    However, a *subsequent* direct status flip to ``blocked`` without a
+    ``blocked`` event is caught by the blind-spot guard (t_6009ccaa) and
+    stays blocked — ANY ``status='blocked'`` task without a ``blocked``
+    event is kept blocked, regardless of the prior sticky history.
+    """
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="t")
         kb.claim_task(conn, tid)
@@ -192,18 +200,16 @@ def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -
         # After unblock the task is no longer blocked at all.
         assert kb.get_task(conn, tid).status == "ready"
 
-        # Now simulate a *later* circuit-breaker block (no new
-        # ``blocked`` event, just status flip).  The most recent
-        # block/unblock event is ``unblocked`` → guard does not fire
-        # → recompute can recover.
+        # Now simulate a *later* direct status flip to 'blocked' without
+        # a 'blocked' event.  The blind-spot guard prevents auto-promotion.
         conn.execute(
             "UPDATE tasks SET status='blocked' WHERE id=?", (tid,),
         )
         conn.commit()
 
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
-        assert kb.get_task(conn, tid).status == "ready"
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
 
 
 # ---------------------------------------------------------------------------

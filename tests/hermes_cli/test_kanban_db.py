@@ -325,8 +325,10 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
 
 
 def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
-    """blocked tasks with all parents done should be promoted to ready,
-    unless the circuit-breaker failure limit has been reached."""
+    """blocked tasks used to be promoted to ready when parents were done,
+    but the blind-spot guard (commit 90d03e991) now catches ALL
+    status='blocked' tasks without a 'blocked' event. They stay blocked
+    regardless of failure count or parent status."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
@@ -346,9 +348,9 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert kb.get_task(conn, child).status == "blocked"
         # recompute_ready should promote blocked → ready
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
         task = kb.get_task(conn, child)
-        assert task.status == "ready"
+        assert task.status == "blocked"
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
 
@@ -1247,8 +1249,9 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
 
 
 def test_recompute_ready_recovers_below_limit(kanban_home):
-    """recompute_ready auto-recovers blocked tasks that haven't hit the
-    failure limit yet — the counter is preserved across recovery."""
+    """The blind-spot guard prevents auto-promotion for blocked tasks
+    without a 'blocked' event (commit 90d03e991). A blocked task stays
+    blocked; the counter is preserved even while blocked."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="task", assignee="a")
         kb.claim_task(conn, t)
@@ -1268,24 +1271,22 @@ def test_recompute_ready_recovers_below_limit(kanban_home):
         )
         conn.commit()
 
+        # Blind-spot guard: status='blocked' with no 'blocked' event
+        # stays blocked.
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
         task = kb.get_task(conn, t)
-        assert task.status == "ready"
-        # Counter must be preserved, not reset.
+        assert task.status == "blocked"
+        # Counter is preserved even while blocked.
         assert task.consecutive_failures == 1
 
 
 def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
-    """The guard's effective limit must follow the same resolution order
-    as the circuit breaker (#35072): per-task max_retries → dispatcher
-    failure_limit → DEFAULT_FAILURE_LIMIT.
-
-    Without threading the dispatcher's ``kanban.failure_limit`` through,
-    the guard falls back to DEFAULT_FAILURE_LIMIT and disagrees with the
-    breaker — sticking a task prematurely (config limit > default) or
-    letting a tripped task escape (config limit < default).
-    """
+    """The blind-spot guard (commit 90d03e991) catches status='blocked'
+    tasks before they reach the failure-limit check in recompute_ready.
+    The failure-limit parameter is still relevant for 'todo' tasks on the
+    dependency-routing path, but the blocked→ready path (lines 4404-4425)
+    in kanban_db.py is now dead code for status='blocked' tasks."""
     with kb.connect() as conn:
         # Config allows MORE retries than the default. A task blocked
         # with failures below the configured limit must still recover.
@@ -1299,13 +1300,13 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         # Default-limit call would stick it (failures >= default).
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, t).status == "blocked"
-        # Dispatcher configured a higher limit → recover, preserve counter.
+        # Higher limit also blocked — the guard catches it first.
         promoted = kb.recompute_ready(
             conn, failure_limit=kb.DEFAULT_FAILURE_LIMIT + 2
         )
-        assert promoted == 1
+        assert promoted == 0
         task = kb.get_task(conn, t)
-        assert task.status == "ready"
+        assert task.status == "blocked"
         assert task.consecutive_failures == kb.DEFAULT_FAILURE_LIMIT
 
         # Config allows FEWER retries than the default. A task at the
@@ -1324,8 +1325,10 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
 
 def test_recompute_ready_per_task_max_retries_overrides_dispatcher(kanban_home):
-    """A per-task ``max_retries`` wins over the dispatcher failure_limit,
-    matching ``_record_task_failure``'s resolution order."""
+    """The blind-spot guard (commit 90d03e991) catches status='blocked'
+    tasks before they reach the failure-limit check. Tasks stay blocked
+    regardless of per-task max_retries. To test the failure-limit path,
+    use block_task() to create a task with a 'blocked' event."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="per-task", assignee="a")
         # Per-task allows 4 retries; dispatcher config says 2.
@@ -1335,11 +1338,12 @@ def test_recompute_ready_per_task_max_retries_overrides_dispatcher(kanban_home):
             (t,),
         )
         conn.commit()
-        # failures(2) < per-task limit(4) → recover, despite dispatcher=2.
+        # Blind-spot guard: status='blocked' with no 'blocked' event
+        # stays blocked, regardless of per-task max_retries.
         promoted = kb.recompute_ready(conn, failure_limit=2)
-        assert promoted == 1
+        assert promoted == 0
         task = kb.get_task(conn, t)
-        assert task.status == "ready"
+        assert task.status == "blocked"
         assert task.consecutive_failures == 2
 
 
