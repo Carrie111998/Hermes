@@ -38,6 +38,7 @@ from agent.transports.codex_app_server import (
     CodexAppServerError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
+from tools.tool_output_limits import get_max_turn_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,10 @@ class TurnResult:
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
+    # Set only when the live app-server usage stream crossed the absolute
+    # headroom floor. This is a recoverable safety interruption: the caller
+    # should compact the same thread and resume the same objective.
+    context_ceiling_hit: bool = False
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -83,6 +88,143 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+
+
+def _enforce_turn_tool_output_budget(
+    messages: list[dict],
+    chars_used: int,
+    budget: int,
+) -> tuple[int, bool]:
+    """Clamp this turn's newly-projected tool results to a cumulative budget.
+
+    2026-07-27 ALL-HANDS ANGLE B (#hermes-context-overrun): each tool result
+    is already bounded individually by ``truncate_tool_output`` (see
+    ``codex_event_projector._bounded_tool_output``), but that is a
+    PER-RESULT cap only — nothing stopped a turn with many tool calls from
+    stacking N maxed-out results and blowing the context window in one
+    shot. Measured: seven results each pinned at the old 50000-char
+    per-result cap in ONE turn, ~87K tokens against a 258.4K window, six
+    stalls in one evening.
+
+    This is the second, independent backstop: track cumulative tool-output
+    chars ACROSS the whole turn and once the budget is spent, every further
+    tool-role message this turn (regardless of its own per-result size) is
+    truncated or fully suppressed. Mutates ``messages`` (a
+    ``ProjectionResult.messages`` batch — 0-2 dicts) in place. Only
+    ``role == "tool"`` entries count against the budget; the paired
+    assistant tool_call message (name + args, no result body) is left
+    alone since it's small and needed for alternation.
+
+    Returns ``(new_chars_used, just_exhausted)`` — ``just_exhausted`` is
+    True the first time this call pushes the running total to the budget,
+    so the caller can log/emit a one-time notice instead of spamming one
+    per suppressed result.
+    """
+    just_exhausted = False
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        if chars_used >= budget:
+            msg["content"] = (
+                "[TURN TOOL-OUTPUT BUDGET EXCEEDED — this result withheld. "
+                f"Cumulative tool output this turn already reached the "
+                f"{budget}-char per-turn budget; further tool results are "
+                "suppressed so this turn cannot overrun the context "
+                "window. Re-run the tool call in a fresh turn if you "
+                "still need this output.]"
+            )
+            just_exhausted = True
+            continue
+        remaining = budget - chars_used
+        if len(content) > remaining:
+            omitted = len(content) - remaining
+            msg["content"] = (
+                content[:remaining]
+                + f"\n\n... [TURN BUDGET TRUNCATED - {omitted} more chars "
+                f"withheld; this turn's cumulative tool-output budget "
+                f"({budget} chars) is now spent] ..."
+            )
+            chars_used = budget
+            just_exhausted = True
+        else:
+            chars_used += len(content)
+    return chars_used, just_exhausted
+
+
+# 2026-07-27 ALL-HANDS ANGLE D (#hermes-context-overrun, 7th recurrence,
+# 423K/258.4K = 164%). ANGLE B's max_turn_bytes budget above only bounds
+# Hermes's own LOCAL PROJECTION of tool-output content: it mutates
+# ``messages`` (the projector's output) AFTER Codex's app-server subprocess
+# has already run the tool, fed the full result to the model as part of its
+# own turn context, and moved on. It never touches what Codex actually sent
+# upstream, so it cannot cap the real window.
+#
+# Separately, turn_context.py's preflight headroom backstop
+# (_MIN_ABSOLUTE_HEADROOM_TOKENS) only runs BETWEEN turns, using the
+# previous turn's final usage. But thread/tokenUsage/updated notifications
+# (consumed by _apply_token_usage_notification, called from inside this
+# very while-loop below) arrive continuously DURING a turn — confirmed live
+# in agent.log via repeated "HC80042-DEBUG usage-applied" lines firing
+# several times between one "conversation turn:" marker and the next.
+# Nothing consumed that live data mid-turn. Because terminal/file-ops/MCP
+# calls run INSIDE the codex subprocess's own agentic loop (see the
+# "Runtime: codex app-server" banner), a single Hermes-level turn can chain
+# many internal Codex tool calls — and therefore many real prompt-token
+# jumps — before ever yielding back to Hermes. A start-of-turn check can
+# only ever see the *previous* turn's final tally; it structurally cannot
+# stop a turn that overruns from the inside. Six of the seven stalls
+# tonight were gradual (~10-30K tokens/turn) and the preflight backstop
+# caught every one cleanly; the seventh was one outsized turn that blew
+# past the window before it ever yielded.
+#
+# Fix: enforce the SAME absolute-headroom invariant the preflight backstop
+# uses, but continuously, using the live usage snapshot we already receive
+# mid-turn. The instant remaining headroom drops below the floor, interrupt
+# the turn immediately instead of letting Codex's internal loop keep
+# running — the turn's last real usage still feeds the normal
+# preflight/compaction path (via codex_runtime._record_codex_app_server_usage
+# -> context_compressor.update_from_response) on the very next turn.
+_MID_TURN_HEADROOM_FLOOR_TOKENS = 90_000
+
+
+def _mid_turn_context_ceiling_hit(
+    result: "TurnResult",
+) -> tuple[bool, int, int]:
+    """Check the live token-usage snapshot against the absolute headroom
+    floor, mid-turn.
+
+    Returns ``(hit, total_tokens, context_window)``. ``hit`` is True once
+    remaining headroom (window - total) drops below
+    ``_MID_TURN_HEADROOM_FLOOR_TOKENS``. Mirrors the ratio-independent
+    absolute-token check in turn_context.py's HC80042 backstop so the same
+    invariant holds whether it's evaluated between turns or inside one.
+    """
+    usage = result.token_usage_last
+    window = result.model_context_window
+    if not isinstance(usage, dict) or not usage or not window:
+        return False, 0, 0
+    total = usage.get("totalTokens")
+    if not isinstance(total, int) or total <= 0:
+        # Fallback only: verified against the codex-rs wire protocol
+        # (codex-cli 0.144.1 generate-json-schema + upstream
+        # sse/responses.rs test fixture) that ``inputTokens`` is ALREADY
+        # inclusive of ``cachedInputTokens``, and ``outputTokens`` is
+        # already inclusive of ``reasoningOutputTokens`` — both are
+        # breakdown annotations, not additional buckets. Summing all four
+        # would double-count (the exact #hermes-context-overrun root cause
+        # fixed in codex_runtime.py._record_codex_app_server_usage).
+        input_val = usage.get("inputTokens")
+        output_val = usage.get("outputTokens")
+        total = (input_val if isinstance(input_val, int) and input_val > 0 else 0) + (
+            output_val if isinstance(output_val, int) and output_val > 0 else 0
+        )
+    if total <= 0:
+        return False, 0, window
+    headroom = window - total
+    return headroom < _MID_TURN_HEADROOM_FLOOR_TOKENS, total, window
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -578,6 +720,14 @@ class CodexAppServerSession:
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
+        # Per-turn tool-output budget (ANGLE B, #hermes-context-overrun):
+        # independent of the per-result truncation cap already applied by
+        # the projector — this bounds the SUM of every tool result's
+        # content across the whole turn, so N tool calls in one turn can
+        # never overrun the context window regardless of per-result size.
+        turn_tool_output_budget = get_max_turn_bytes()
+        turn_tool_output_chars = 0
+        turn_tool_output_budget_warned = False
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -658,10 +808,31 @@ class CodexAppServerSession:
                                 "on_event callback raised", exc_info=True
                             )
                     _apply_token_usage_notification(result, pending)
+                    if self._interrupt_for_context_ceiling(result):
+                        turn_complete = True
+                        break
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
                     if proj.messages:
+                        (
+                            turn_tool_output_chars,
+                            _budget_hit,
+                        ) = _enforce_turn_tool_output_budget(
+                            proj.messages,
+                            turn_tool_output_chars,
+                            turn_tool_output_budget,
+                        )
+                        if _budget_hit and not turn_tool_output_budget_warned:
+                            turn_tool_output_budget_warned = True
+                            logger.warning(
+                                "turn tool-output budget (%s chars) spent "
+                                "mid-turn (session %s, turn %s) — further "
+                                "tool results this turn are suppressed",
+                                turn_tool_output_budget,
+                                self._thread_id,
+                                result.turn_id,
+                            )
                         result.projected_messages.extend(proj.messages)
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
@@ -705,6 +876,8 @@ class CodexAppServerSession:
                     logger.debug("on_event callback raised", exc_info=True)
 
             _apply_token_usage_notification(result, note)
+            if self._interrupt_for_context_ceiling(result):
+                break
             _apply_compaction_notification(result, note)
 
             # Track in-progress fileChange items so the approval bridge
@@ -716,6 +889,24 @@ class CodexAppServerSession:
             # Project into messages
             projection = projector.project(note)
             if projection.messages:
+                (
+                    turn_tool_output_chars,
+                    _budget_hit,
+                ) = _enforce_turn_tool_output_budget(
+                    projection.messages,
+                    turn_tool_output_chars,
+                    turn_tool_output_budget,
+                )
+                if _budget_hit and not turn_tool_output_budget_warned:
+                    turn_tool_output_budget_warned = True
+                    logger.warning(
+                        "turn tool-output budget (%s chars) spent mid-turn "
+                        "(session %s, turn %s) — further tool results this "
+                        "turn are suppressed",
+                        turn_tool_output_budget,
+                        self._thread_id,
+                        result.turn_id,
+                    )
                 result.projected_messages.extend(projection.messages)
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
@@ -856,6 +1047,13 @@ class CodexAppServerSession:
 
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
+        # Same per-turn tool-output budget as run_turn (ANGLE B,
+        # #hermes-context-overrun) — belt-and-suspenders here since a
+        # compaction turn isn't expected to run tools, but nothing prevents
+        # it structurally and this keeps every codex-thread ingestion path
+        # under the same cumulative bound.
+        compact_tool_output_budget = get_max_turn_bytes()
+        compact_tool_output_chars = 0
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -942,6 +1140,22 @@ class CodexAppServerSession:
 
             projection = projector.project(note)
             if projection.messages:
+                (
+                    compact_tool_output_chars,
+                    _budget_hit,
+                ) = _enforce_turn_tool_output_budget(
+                    projection.messages,
+                    compact_tool_output_chars,
+                    compact_tool_output_budget,
+                )
+                if _budget_hit:
+                    logger.warning(
+                        "compact_thread tool-output budget (%s chars) "
+                        "spent mid-turn (session %s, turn %s)",
+                        compact_tool_output_budget,
+                        self._thread_id,
+                        result.turn_id,
+                    )
                 result.projected_messages.extend(projection.messages)
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
@@ -991,6 +1205,30 @@ class CodexAppServerSession:
         return result
 
     # ---------- internals ----------
+
+    def _interrupt_for_context_ceiling(self, result: TurnResult) -> bool:
+        """Interrupt a healthy turn before its live context exhausts headroom."""
+        hit, total_tokens, context_window = _mid_turn_context_ceiling_hit(result)
+        if not hit:
+            return False
+        remaining = context_window - total_tokens
+        logger.warning(
+            "codex app-server mid-turn context ceiling reached: "
+            "%s/%s tokens, %s headroom below %s floor "
+            "(thread=%s turn=%s); interrupting for automatic "
+            "compact-and-resume",
+            total_tokens,
+            context_window,
+            remaining,
+            _MID_TURN_HEADROOM_FLOOR_TOKENS,
+            self._thread_id,
+            result.turn_id,
+        )
+        self._issue_interrupt(result.turn_id)
+        result.interrupted = True
+        result.context_ceiling_hit = True
+        result.error = "codex app-server context ceiling reached mid-turn"
+        return True
 
     def _issue_interrupt(self, turn_id: Optional[str]) -> None:
         if self._client is None or self._thread_id is None or turn_id is None:

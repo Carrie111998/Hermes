@@ -91,11 +91,43 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    # 2026-07-27 ALL-HANDS ANGLE D (#hermes-context-overrun) DOUBLE-COUNT FIX:
+    # verified against the actual installed codex-cli (0.144.1) protocol
+    # schema (`codex app-server generate-json-schema`) and the upstream
+    # codex-rs test fixture (codex-rs/codex-api/src/sse/responses.rs,
+    # `parses_cache_write_token_usage`): the wire's `inputTokens` is ALREADY
+    # inclusive of `cachedInputTokens` (input_tokens=100, cached_tokens=40 in
+    # the fixture -> total_tokens=110=100+10 output, NOT 100+40+10=150).
+    # `cachedInputTokens` is a breakdown annotation of `inputTokens`, not an
+    # additional bucket — same for `reasoningOutputTokens` inside
+    # `outputTokens`.
+    #
+    # CanonicalUsage.prompt_tokens is defined as
+    # input_tokens + cache_read_tokens + cache_write_tokens (correct ONLY
+    # when its `input_tokens` field holds the non-cached remainder, which is
+    # exactly the convention agent/usage_pricing.py already follows
+    # elsewhere: it subtracts cache from the raw total before constructing
+    # CanonicalUsage). This function instead fed the raw, cache-INCLUSIVE
+    # `inputTokens` straight into CanonicalUsage.input_tokens and then added
+    # `cachedInputTokens` again — double-counting the cached share every
+    # single turn. In a long session with a high cache-hit ratio (typical
+    # once context has grown) this inflates the reported/displayed prompt
+    # size by up to ~2x. That inflated number is exactly what
+    # turn_context.py's preflight/backstop compares against threshold_tokens
+    # and what the live status-bar gauge displays — explaining a
+    # 423K/258.4K (164%) gauge reading with ZERO real context-length-exceeded
+    # API errors anywhere in agent.log (a genuine 423K prompt against a
+    # 258.4K model would have been hard-rejected by the provider).
+    #
+    # Fix: normalize `inputTokens` to its non-cached remainder BEFORE
+    # constructing CanonicalUsage, matching the established convention, so
+    # `.prompt_tokens` reconstructs the correct (non-inflated) total.
+    raw_input_tokens = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    input_tokens = max(0, raw_input_tokens - cache_read_tokens)
 
     canonical_usage = CanonicalUsage(
         input_tokens=input_tokens,
@@ -124,8 +156,27 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         try:
             compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
+            if (
+                isinstance(context_window, int)
+                and context_window > 0
+                and context_window != compressor.context_length
+            ):
+                # HC-80042: this used to set context_length WITHOUT
+                # recomputing threshold_tokens, so the two silently drifted
+                # apart (observed live: context_length updated to Codex's
+                # reported 258,400 while threshold_tokens stayed frozen at
+                # 272,000 * threshold_percent from init — an ~11K-token
+                # stale-threshold gap). Recompute both from the live window
+                # so the backstop's >= threshold_tokens check compares
+                # against the SAME window it just adopted. Deliberately does
+                # NOT touch last_real_prompt_tokens / awaiting_real_usage_*
+                # (unlike update_model()) — those reflect real usage this
+                # turn just reported and must survive this resync.
                 compressor.context_length = context_window
+                compressor.threshold_tokens = compressor._compute_threshold_tokens(
+                    context_window, compressor.threshold_percent, compressor.max_tokens,
+                )
+                compressor._apply_threshold_tokens_cap()
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
 
@@ -665,6 +716,95 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+_CONTEXT_CEILING_CONTINUATION = (
+    "Continue the same objective from the turn that Hermes interrupted for "
+    "context safety. Native compaction has completed. Inspect the current "
+    "state, preserve completed work, and resume without repeating successful "
+    "side effects."
+)
+
+
+def _recover_codex_context_ceiling(agent, turn):
+    """Compact and resume the same Codex thread after a safety interruption.
+
+    A mid-turn ceiling is not a user interrupt and must not strand the active
+    objective. Recovery is deliberately bounded to one compact-and-resume
+    attempt so a broken compactor cannot create an infinite internal loop.
+    """
+    if not getattr(turn, "context_ceiling_hit", False):
+        return turn, 1
+
+    session = getattr(agent, "_codex_session", None)
+    if session is None:
+        turn.error = "context ceiling recovery lost the active Codex session"
+        turn.should_retire = True
+        return turn, 1
+
+    logger.warning(
+        "codex app-server context safety recovery: compacting and resuming "
+        "the same objective (session=%s thread=%s turn=%s)",
+        getattr(agent, "session_id", None) or "none",
+        getattr(turn, "thread_id", None) or "",
+        getattr(turn, "turn_id", None) or "",
+    )
+    compact_result = session.compact_thread()
+    if (
+        getattr(compact_result, "interrupted", False)
+        or getattr(compact_result, "error", None)
+    ):
+        turn.error = (
+            "context ceiling recovery compaction failed: "
+            f"{getattr(compact_result, 'error', None) or 'interrupted'}"
+        )
+        turn.should_retire = bool(
+            getattr(turn, "should_retire", False)
+            or getattr(compact_result, "should_retire", False)
+        )
+        return turn, 2
+
+    _record_codex_app_server_compaction(
+        agent,
+        compact_result,
+        force=True,
+    )
+    resumed = session.run_turn(user_input=_CONTEXT_CEILING_CONTINUATION)
+    # Preserve completed tool-call/result pairs from the interrupted attempt,
+    # but drop partial assistant narration at the recovery boundary. Keeping
+    # two adjacent assistant messages would violate the persisted alternation
+    # contract, while completed tool effects are essential recovery context.
+    completed_prior_work = [
+        message
+        for message in (getattr(turn, "projected_messages", None) or [])
+        if isinstance(message, dict)
+        and (
+            message.get("role") == "tool"
+            or bool(message.get("tool_calls"))
+        )
+    ]
+    resumed.projected_messages = [
+        *completed_prior_work,
+        *(getattr(resumed, "projected_messages", None) or []),
+    ]
+    resumed.tool_iterations = (
+        int(getattr(turn, "tool_iterations", 0) or 0)
+        + int(getattr(resumed, "tool_iterations", 0) or 0)
+    )
+    if getattr(resumed, "context_ceiling_hit", False):
+        resumed.error = (
+            "context ceiling recurred immediately after native compaction"
+        )
+        resumed.should_retire = True
+    else:
+        logger.info(
+            "codex app-server context safety recovery completed "
+            "(session=%s thread=%s turn=%s)",
+            getattr(agent, "session_id", None) or "none",
+            getattr(resumed, "thread_id", None) or "",
+            getattr(resumed, "turn_id", None) or "",
+        )
+    return resumed, 3
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -748,6 +888,7 @@ def run_codex_app_server_turn(
 
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
+        turn, api_calls = _recover_codex_context_ceiling(agent, turn)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -877,8 +1018,6 @@ def run_codex_app_server_turn(
     )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
-
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
     should_review_skills = False

@@ -37,6 +37,9 @@ class TestDefaults:
         assert tol.DEFAULT_MAX_BYTES == 50_000
         assert tol.DEFAULT_MAX_LINES == 2000
         assert tol.DEFAULT_MAX_LINE_LENGTH == 2000
+        # ANGLE B (#hermes-context-overrun, 2026-07-27): second, independent
+        # cumulative-per-turn budget alongside the per-result max_bytes cap.
+        assert tol.DEFAULT_MAX_TURN_BYTES == 60_000
 
     def test_get_limits_returns_defaults_when_config_missing(self):
         with patch("hermes_cli.config.load_config", return_value={}):
@@ -45,6 +48,7 @@ class TestDefaults:
             "max_bytes": tol.DEFAULT_MAX_BYTES,
             "max_lines": tol.DEFAULT_MAX_LINES,
             "max_line_length": tol.DEFAULT_MAX_LINE_LENGTH,
+            "max_turn_bytes": tol.DEFAULT_MAX_TURN_BYTES,
         }
 
     def test_get_limits_returns_defaults_when_config_not_a_dict(self):
@@ -69,6 +73,7 @@ class TestOverrides:
                 "max_bytes": 100_000,
                 "max_lines": 5000,
                 "max_line_length": 4096,
+                "max_turn_bytes": 300_000,
             }
         }
         with patch("hermes_cli.config.load_config", return_value=cfg):
@@ -77,6 +82,7 @@ class TestOverrides:
             "max_bytes": 100_000,
             "max_lines": 5000,
             "max_line_length": 4096,
+            "max_turn_bytes": 300_000,
         }
 
     def test_partial_override_preserves_other_defaults(self):
@@ -86,6 +92,7 @@ class TestOverrides:
         assert limits["max_bytes"] == 200_000
         assert limits["max_lines"] == tol.DEFAULT_MAX_LINES
         assert limits["max_line_length"] == tol.DEFAULT_MAX_LINE_LENGTH
+        assert limits["max_turn_bytes"] == tol.DEFAULT_MAX_TURN_BYTES
 
     def test_section_not_a_dict_falls_back(self):
         cfg = {"tool_output": "nonsense"}
@@ -118,12 +125,14 @@ class TestShortcuts:
                 "max_bytes": 111,
                 "max_lines": 222,
                 "max_line_length": 333,
+                "max_turn_bytes": 444,
             }
         }
         with patch("hermes_cli.config.load_config", return_value=cfg):
             assert tol.get_max_bytes() == 111
             assert tol.get_max_lines() == 222
             assert tol.get_max_line_length() == 333
+            assert tol.get_max_turn_bytes() == 444
 
 
 class TestDefaultConfigHasSection:
@@ -139,6 +148,7 @@ class TestDefaultConfigHasSection:
         assert section["max_bytes"] == tol.DEFAULT_MAX_BYTES
         assert section["max_lines"] == tol.DEFAULT_MAX_LINES
         assert section["max_line_length"] == tol.DEFAULT_MAX_LINE_LENGTH
+        assert section["max_turn_bytes"] == tol.DEFAULT_MAX_TURN_BYTES
 
 
 class TestIntegrationReadPagination:

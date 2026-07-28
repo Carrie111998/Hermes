@@ -422,6 +422,72 @@ class TestRunTurn:
         assert r.token_usage_total["totalTokens"] == 500
         assert r.model_context_window == 200000
 
+    def test_live_usage_interrupts_turn_before_context_headroom_is_exhausted(self):
+        client = FakeClient()
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            tokenUsage={
+                "last": {
+                    "totalTokens": 170_001,
+                    "inputTokens": 170_000,
+                    "cachedInputTokens": 150_000,
+                    "outputTokens": 1,
+                },
+                "modelContextWindow": 258_400,
+            },
+        )
+
+        result = make_session(client).run_turn("continue", turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.context_ceiling_hit is True
+        assert result.should_retire is False
+        assert "context ceiling" in result.error
+        assert any(
+            method == "turn/interrupt"
+            and params.get("turnId") == "turn-fake-001"
+            for method, params in client.requests
+        )
+
+    def test_server_request_drain_enforces_same_live_context_ceiling(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-ceiling",
+            command="pwd",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            tokenUsage={
+                "last": {
+                    "totalTokens": 170_001,
+                    "inputTokens": 170_000,
+                    "outputTokens": 1,
+                },
+                "modelContextWindow": 258_400,
+            },
+        )
+        session = make_session(
+            client,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+
+        result = session.run_turn("continue", turn_timeout=2.0)
+
+        assert result.context_ceiling_hit is True
+        assert client.responses == [
+            ("approval-ceiling", {"decision": "accept"})
+        ]
+        assert any(
+            method == "turn/interrupt"
+            for method, _params in client.requests
+        )
+
     def test_rich_content_turn_is_collapsed_to_text_payload(self):
         client = FakeClient()
         client.queue_notification(
@@ -1573,6 +1639,90 @@ class TestHasTurnAbortedMarker:
             _has_turn_aborted_marker,
         )
         assert _has_turn_aborted_marker("<turn_aborted/>") is True
+
+
+class TestEnforceTurnToolOutputBudget:
+    """Unit coverage for the per-turn cumulative tool-output budget.
+
+    2026-07-27 ALL-HANDS ANGLE B (#hermes-context-overrun): the projector's
+    per-result truncate_tool_output cap alone was proven insufficient — a
+    turn with several tool calls can stack N capped-but-still-large
+    results past the context window (measured: seven results at the old
+    50000-char per-result cap, ~87K tokens in ONE turn). This budget is a
+    second, independent ceiling on the SUM across a whole turn.
+    """
+
+    def test_single_result_under_budget_is_untouched(self):
+        from agent.transports.codex_app_server_session import (
+            _enforce_turn_tool_output_budget,
+        )
+        msgs = [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "x" * 100},
+        ]
+        chars_used, hit = _enforce_turn_tool_output_budget(msgs, 0, 1000)
+        assert chars_used == 100
+        assert hit is False
+        assert msgs[1]["content"] == "x" * 100
+
+    def test_result_crossing_budget_is_truncated_not_dropped(self):
+        from agent.transports.codex_app_server_session import (
+            _enforce_turn_tool_output_budget,
+        )
+        msgs = [{"role": "tool", "tool_call_id": "c1", "content": "y" * 500}]
+        chars_used, hit = _enforce_turn_tool_output_budget(msgs, 800, 1000)
+        assert chars_used == 1000
+        assert hit is True
+        assert len(msgs[0]["content"]) < 500
+        assert "TURN BUDGET TRUNCATED" in msgs[0]["content"]
+
+    def test_result_after_budget_exhausted_is_fully_suppressed(self):
+        from agent.transports.codex_app_server_session import (
+            _enforce_turn_tool_output_budget,
+        )
+        msgs = [{"role": "tool", "tool_call_id": "c2", "content": "z" * 500}]
+        chars_used, hit = _enforce_turn_tool_output_budget(msgs, 1000, 1000)
+        assert chars_used == 1000
+        assert hit is True
+        assert "TURN TOOL-OUTPUT BUDGET EXCEEDED" in msgs[0]["content"]
+
+    def test_seven_maxed_results_never_exceed_budget(self):
+        """Reproduces the measured incident shape: 7 results each pinned
+        at the (old) 50000-char per-result cap in one turn. Cumulative
+        tool-output chars across the whole turn must never exceed the
+        configured per-turn budget, regardless of how many tool calls
+        fire."""
+        from agent.transports.codex_app_server_session import (
+            _enforce_turn_tool_output_budget,
+        )
+        budget = 60_000
+        chars_used = 0
+        for i in range(7):
+            msgs = [
+                {"role": "assistant", "content": None, "tool_calls": [{"id": f"c{i}"}]},
+                {"role": "tool", "tool_call_id": f"c{i}", "content": "X" * 50_000},
+            ]
+            chars_used, _hit = _enforce_turn_tool_output_budget(
+                msgs, chars_used, budget
+            )
+            assert chars_used <= budget
+        assert chars_used == budget
+
+    def test_non_tool_messages_are_never_touched(self):
+        from agent.transports.codex_app_server_session import (
+            _enforce_turn_tool_output_budget,
+        )
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1"}],
+            }
+        ]
+        chars_used, hit = _enforce_turn_tool_output_budget(msgs, 999_999, 1000)
+        assert chars_used == 999_999
+        assert hit is False
+        assert msgs[0]["tool_calls"] == [{"id": "c1"}]
 
 
 class TestClassifyOAuthFailure:

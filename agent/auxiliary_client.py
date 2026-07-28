@@ -395,10 +395,18 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
 # 272K Codex cap — see _CODEX_OAUTH_CONTEXT_FALLBACK in model_metadata.py).
 # With a 272K ceiling the default 50% compaction trigger fires at ~136K —
 # wasteful, since the model can hold far more raw context before
-# summarization actually buys anything. We raise the trigger to 85% (~231K)
-# on this exact route so Codex gpt-5.4 / gpt-5.5 / gpt-5.6 sessions use the
-# window they actually have.
-_CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.85
+# summarization actually buys anything. We raise the trigger, but NOT all
+# the way to 0.85 (~231K, ~38-40K headroom) as originally shipped: the
+# 2026-07-27 all-hands incident (HC-80042, "6th stall tonight") measured a
+# SINGLE codex_app_server turn adding 46-91K real prompt tokens in one
+# preflight-to-next-preflight cycle (one moderate tool-output read), which
+# alone exceeds the old ~38-40K headroom before the backstop in
+# turn_context.py even gets a chance to force compact_thread() on the next
+# turn. Production sessions were observed climbing to 1.4-1.7x the 258-272K
+# window (379K-471K) before wedging — the thin headroom, not a broken
+# backstop, is why. 0.60 (~103K headroom on a 258K window) still avoids the
+# wasteful 136K trigger while surviving a single oversized agentic turn.
+_CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.60
 
 # gpt-5.3-codex-spark is Codex-OAuth-only (ChatGPT Pro entitlement) with a
 # native 128K context window.  The default 50% compaction trigger fires at

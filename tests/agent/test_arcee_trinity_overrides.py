@@ -132,12 +132,18 @@ def test_is_codex_gpt54_or_gpt55_rejects_non_54_55_models(model) -> None:
 
 
 def test_compression_threshold_for_codex_gpt55() -> None:
-    assert _compression_threshold_for_model("gpt-5.4", "openai-codex") == 0.85
-    assert _compression_threshold_for_model("gpt-5.4-pro", "openai-codex") == 0.85
-    assert _compression_threshold_for_model("openai/gpt-5.4", "openai-codex") == 0.85
-    assert _compression_threshold_for_model("gpt-5.5", "openai-codex") == 0.85
-    assert _compression_threshold_for_model("gpt-5.5-pro", "openai-codex") == 0.85
-    assert _compression_threshold_for_model("openai/gpt-5.5", "openai-codex") == 0.85
+    for model in (
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "openai/gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "openai/gpt-5.5",
+    ):
+        threshold = _compression_threshold_for_model(model, "openai-codex")
+        assert threshold is not None
+        assert 0.50 < threshold < 0.85
+        assert 272_000 * (1 - threshold) >= 90_000
 
 
 def test_compression_threshold_codex_gpt55_other_routes_unaffected() -> None:

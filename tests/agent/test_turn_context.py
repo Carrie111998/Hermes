@@ -512,3 +512,58 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
+
+
+def test_codex_native_backstop_forces_compaction_on_real_usage_over_threshold(tmp_path):
+    """P0-2 (hermes-context-compaction-hang) regression guard.
+
+    In native/off mode Hermes normally never calls ``thread/compact/start``
+    itself — it assumes Codex compacts its own thread on its own schedule
+    (see ``test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex``
+    in ``tests/run_agent/test_codex_app_server_compaction.py``, which still
+    asserts the hands-off default). But real sessions were observed climbing
+    to 1.4-1.7x the configured context window before a turn hung, proving
+    Codex's own compaction is not a reliable backstop on its own.
+
+    Hermes already receives Codex's REAL post-turn token usage every turn
+    (``last_real_prompt_tokens``) even in native mode — it just never acted
+    on it. This locks in the fix: once that real number is known to be over
+    threshold, the preflight must force a codex-native compaction rather
+    than silently trusting Codex, regardless of native/off mode.
+    """
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent.api_mode = "codex_app_server"
+    agent.codex_app_server_auto_compaction = "native"
+    agent.context_compressor.last_real_prompt_tokens = (
+        agent.context_compressor.threshold_tokens + 1000
+    )
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=100):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._compress_context.assert_called_once()
+    _, kwargs = agent._compress_context.call_args
+    assert kwargs.get("force") is True
+
+
+def test_codex_native_mode_skips_when_real_usage_not_yet_over_threshold(tmp_path):
+    """Companion negative case for the backstop above: native mode's normal
+    hands-off behavior must stay untouched when Codex's real reported usage
+    has not (yet) proven the thread is over budget — the backstop must not
+    fire speculatively off the (structurally under-counting) rough local
+    estimate alone.
+    """
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent.api_mode = "codex_app_server"
+    agent.codex_app_server_auto_compaction = "native"
+    # last_real_prompt_tokens stays at its initial 0 — no real usage
+    # reported yet, so the backstop has no evidence to act on.
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=100):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._compress_context.assert_not_called()

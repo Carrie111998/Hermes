@@ -108,7 +108,7 @@ class TestRunConversationCodexPath:
                 turn_id="turn-usage-1",
                 thread_id="thread-usage-1",
                 token_usage_last={
-                    "totalTokens": 130,
+                    "totalTokens": 105,
                     "inputTokens": 80,
                     "cachedInputTokens": 20,
                     "outputTokens": 25,
@@ -126,28 +126,28 @@ class TestRunConversationCodexPath:
             result = agent.run_conversation("hello")
 
         assert result["api_calls"] == 1
-        assert result["prompt_tokens"] == 100
+        assert result["prompt_tokens"] == 80
         assert result["completion_tokens"] == 25
-        assert result["total_tokens"] == 130
-        assert result["input_tokens"] == 80
+        assert result["total_tokens"] == 105
+        assert result["input_tokens"] == 60
         assert result["output_tokens"] == 25
         assert result["cache_read_tokens"] == 20
         assert result["cache_write_tokens"] == 0
         assert result["reasoning_tokens"] == 5
-        assert result["last_prompt_tokens"] == 100
+        assert result["last_prompt_tokens"] == 80
 
         assert agent.session_api_calls == 1
-        assert agent.session_prompt_tokens == 100
+        assert agent.session_prompt_tokens == 80
         assert agent.session_completion_tokens == 25
-        assert agent.session_total_tokens == 130
-        assert agent.session_input_tokens == 80
+        assert agent.session_total_tokens == 105
+        assert agent.session_input_tokens == 60
         assert agent.session_output_tokens == 25
         assert agent.session_cache_read_tokens == 20
         assert agent.session_cache_write_tokens == 0
         assert agent.session_reasoning_tokens == 5
-        assert agent.context_compressor.last_prompt_tokens == 100
+        assert agent.context_compressor.last_prompt_tokens == 80
         assert agent.context_compressor.last_completion_tokens == 25
-        assert agent.context_compressor.last_total_tokens == 130
+        assert agent.context_compressor.last_total_tokens == 105
         assert agent.context_compressor.context_length == 200000
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
@@ -633,6 +633,95 @@ class TestErrorHandling:
         assert result["partial"] is True
         assert result["error"] == "user interrupted"
 
+    def test_context_ceiling_compacts_and_resumes_same_objective(self, monkeypatch):
+        inputs = []
+        turns = iter([
+            TurnResult(
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "tool-before-compact",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{}",
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "tool-before-compact",
+                        "content": "completed work",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "partial narration",
+                    },
+                ],
+                tool_iterations=1,
+                interrupted=True,
+                error="codex app-server context ceiling reached mid-turn",
+                turn_id="turn-before-compact",
+                thread_id="thread-1",
+                context_ceiling_hit=True,
+            ),
+            TurnResult(
+                final_text="mission complete",
+                projected_messages=[
+                    {"role": "assistant", "content": "mission complete"},
+                ],
+                turn_id="turn-after-compact",
+                thread_id="thread-1",
+            ),
+        ])
+
+        def fake_run_turn(self, user_input, **kwargs):
+            inputs.append(user_input)
+            return next(turns)
+
+        def fake_compact_thread(self, **kwargs):
+            return TurnResult(
+                compacted=True,
+                turn_id="compact-turn",
+                thread_id="thread-1",
+            )
+
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-1",
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "compact_thread",
+            fake_compact_thread,
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("finish the mission")
+
+        assert result["completed"] is True
+        assert result["partial"] is False
+        assert result["final_response"] == "mission complete"
+        assert result["api_calls"] == 3
+        assert inputs[0] == "finish the mission"
+        assert inputs[1].startswith("Continue the same objective")
+        assert [
+            msg.get("content")
+            for msg in result["messages"]
+            if msg.get("role") == "user"
+        ] == ["finish the mission"]
+        assert "partial narration" not in [
+            msg.get("content") for msg in result["messages"]
+        ]
+        assert "completed work" in [
+            msg.get("content") for msg in result["messages"]
+        ]
+
 
 class TestSessionRetirementOnRunAgent:
     """run_agent.py side: when run_turn returns should_retire=True, the
@@ -804,4 +893,3 @@ class TestCodexToolProgressBridge:
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert "HERMES_SCOPED_SYSTEM_PROMPT" in captured_init["developer_instructions"]
         assert ("tool.started", "exec_command", "pytest") in events
-

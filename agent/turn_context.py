@@ -48,6 +48,17 @@ from agent.model_metadata import (
 
 logger = logging.getLogger(__name__)
 
+# HC-80042: minimum absolute token headroom (context_length -
+# last_real_prompt_tokens) the codex_app_server backstop requires before the
+# NEXT turn starts. A ratio-based threshold alone (0.75 small-context floor,
+# or a per-model autoraise) scales headroom down together with the trigger
+# point, so tightening it to buy headroom just makes compaction thrash more
+# often. Sized off a live measurement (2026-07-27 all-hands incident): one
+# ordinary codex_app_server turn with a moderate tool-output read added
+# 46-96K real prompt tokens in a single preflight-to-preflight cycle. 90K
+# comfortably clears that with margin for a heavier turn.
+_MIN_ABSOLUTE_HEADROOM_TOKENS = 90_000
+
 
 def compose_user_api_content(
     content: Any,
@@ -778,6 +789,12 @@ def build_turn_context(
 
         _should_compress_now = False
         _compress_block_reason = None
+        # Backstop force-flag for the codex-native branch below (P0-2,
+        # #hermes-context-compaction-hang). Only ever True when the
+        # native/off auto-compaction mode is skipping its own preflight AND
+        # Codex's own last reported real usage already proves the thread is
+        # over threshold — see the branch below for the full rationale.
+        _codex_native_backstop_force = False
         if _preflight_deferred:
             logger.info(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
@@ -799,11 +816,90 @@ def build_turn_context(
                 _cooldown_secs = _compression_cooldown.get("remaining_seconds", 0.0)
                 _compress_block_reason = f"cooldown:{_cooldown_secs:.0f}"
         elif _codex_native_auto:
-            logger.info(
-                "Skipping Hermes preflight compression for codex app-server "
-                "(mode=%s); Hermes will not start thread compaction here.",
-                getattr(agent, "codex_app_server_auto_compaction", "native"),
+            # P0-2 root cause (#hermes-context-compaction-hang): in
+            # native/off mode Hermes never calls thread/compact/start on its
+            # own — it assumes Codex's app-server compacts the thread on its
+            # own schedule. Codex *does* sometimes emit an unprompted
+            # ContextCompaction boundary (observed in production logs), but
+            # not reliably enough: real sessions were measured climbing to
+            # 1.4-1.7x the configured context window (~379K-471K tokens
+            # against a ~258K-272K budget) before the next turn's request
+            # hung against the provider and the 600s turn timeout fired.
+            #
+            # Hermes already receives Codex's REAL post-turn token usage
+            # every turn (``last_real_prompt_tokens``, populated by
+            # ``update_from_response`` in context_compressor.py) even though
+            # it takes no action on it in this mode. Use that real number —
+            # not the rough local-transcript estimate, which undercounts the
+            # actual Codex-side thread (it does not see Codex's own retained
+            # reasoning items) — as a backstop: if the last turn's real
+            # prompt tokens already meet or exceed threshold, force a
+            # Codex-native compaction now via ``compact_thread()`` rather
+            # than trusting Codex to have already handled it. This is
+            # strictly additive: it only fires when Codex's own compaction
+            # has demonstrably NOT kept the thread under budget.
+            _real_tokens_over_threshold = (
+                _compressor.last_real_prompt_tokens > 0
+                and _compressor.last_real_prompt_tokens >= _compressor.threshold_tokens
             )
+            # HC-80042 absolute-headroom backstop: any ratio-based threshold
+            # (the 0.75 small-context floor, or a per-model autoraise up to
+            # 0.85) leaves headroom = context_length * (1 - ratio). At 0.75
+            # on a 258-272K Codex window that is only ~65-68K tokens — and a
+            # single codex_app_server turn with a moderate tool-output read
+            # was measured live adding 46-96K real prompt tokens in ONE
+            # preflight-to-preflight cycle (2026-07-27 all-hands incident).
+            # A ratio alone can never guarantee enough headroom to survive
+            # one more oversized turn, because tightening the ratio to buy
+            # headroom also triggers more frequent (thrashing) compaction —
+            # a real, separately-evidenced problem the 0.75 floor exists to
+            # prevent. So this is an ABSOLUTE token check, independent of
+            # and additive to the ratio: if fewer than
+            # _MIN_ABSOLUTE_HEADROOM_TOKENS remain before the real window
+            # limit, force compaction now regardless of what the ratio says.
+            _headroom_tokens = (
+                _compressor.context_length - _compressor.last_real_prompt_tokens
+                if _compressor.last_real_prompt_tokens > 0
+                else None
+            )
+            _headroom_critical = (
+                _headroom_tokens is not None
+                and _headroom_tokens < _MIN_ABSOLUTE_HEADROOM_TOKENS
+            )
+            if _headroom_critical:
+                _real_tokens_over_threshold = True
+                logger.debug(
+                    "Codex-native absolute-headroom backstop tripped: only "
+                    "~%s tokens remain before the %s window (last real "
+                    "prompt ~%s), below the %s floor — forcing compaction "
+                    "even though the ratio threshold (%s) was not yet hit "
+                    "(session %s)",
+                    f"{_headroom_tokens:,}",
+                    f"{_compressor.context_length:,}",
+                    f"{_compressor.last_real_prompt_tokens:,}",
+                    f"{_MIN_ABSOLUTE_HEADROOM_TOKENS:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    agent.session_id or "none",
+                )
+            if _real_tokens_over_threshold:
+                logger.warning(
+                    "Codex-native auto-compaction backstop: last real prompt "
+                    "~%s >= %s threshold (mode=%s) but Codex has not "
+                    "compacted the thread — forcing thread/compact/start "
+                    "(session %s)",
+                    f"{_compressor.last_real_prompt_tokens:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    getattr(agent, "codex_app_server_auto_compaction", "native"),
+                    agent.session_id or "none",
+                )
+                _should_compress_now = True
+                _codex_native_backstop_force = True
+            else:
+                logger.info(
+                    "Skipping Hermes preflight compression for codex app-server "
+                    "(mode=%s); Hermes will not start thread compaction here.",
+                    getattr(agent, "codex_app_server_auto_compaction", "native"),
+                )
         else:
             _should_compress_now = _compressor.should_compress(_preflight_tokens)
             if not _should_compress_now:
@@ -863,6 +959,14 @@ def build_turn_context(
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
+                    # Only the codex-native real-usage backstop (above) sets
+                    # this; force=True here bypasses
+                    # _compress_context_via_codex_app_server's
+                    # "mode != hermes -> skip" gate for that one case. All
+                    # other callers (normal threshold-triggered compression)
+                    # keep the default force=False and its cooldown/breaker
+                    # guards intact.
+                    force=_codex_native_backstop_force,
                 )
                 if (
                     messages is _preflight_input
