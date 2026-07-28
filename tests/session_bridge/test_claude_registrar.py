@@ -502,6 +502,26 @@ def test_winpty_accepts_cursor_positioned_pasted_text_token() -> None:
     assert "paste again to expand" in observed
 
 
+def test_winpty_prompt_input_wait_drains_post_acceptance_redraw() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                [
+                    "[Pastedtext#1+6lines] paste again to expand",
+                    "\r\nlate redraw",
+                ]
+            )
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str | None:
+            return next(self.chunks)
+
+    observed = _WinPtyProcess(Process()).read_until_prompt_input(
+        1.0, prompt="a much longer multiline registration prompt"
+    )
+
+    assert "late redraw" in observed
+
+
 @pytest.mark.parametrize(
     ("process", "expected_writes"),
     [

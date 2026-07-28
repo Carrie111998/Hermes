@@ -58,6 +58,7 @@ _RESPONSE_SETTLE_SECONDS = 0.5
 _READINESS_SETTLE_SECONDS = 0.5
 _PROMPT_SUBMIT_DELAY_SECONDS = 0.5
 _PROMPT_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
+_PROMPT_ACCEPTANCE_SETTLE_SECONDS = 0.5
 _CLAUDE_FORCED_ONBOARDING = frozenset({"banner", "step"})
 _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
     "CLAUDE_CODE_POWERUP_ONBOARDING",
@@ -590,15 +591,25 @@ class _WinPtyProcess:
             raise RuntimeError("PTY prompt-input read unavailable")
         deadline = time.monotonic() + timeout
         chunks: list[str] = []
+        candidate_seen = False
+        settle_deadline: float | None = None
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            wake_at = (
+                deadline if settle_deadline is None else min(deadline, settle_deadline)
+            )
+            remaining = wake_at - now
             if remaining <= 0:
+                if candidate_seen:
+                    return "".join(chunks)
                 raise _PtyResponseTimeout(
                     _prompt_input_timeout_reason("".join(chunks), prompt=prompt)
                 )
             try:
                 value = timed_read(4096, remaining)
             except (EOFError, StopIteration) as exc:
+                if candidate_seen:
+                    return "".join(chunks)
                 raise RuntimeError("PTY closed before prompt input") from exc
             except Exception as exc:
                 raise RuntimeError("PTY prompt-input read unavailable") from exc
@@ -613,12 +624,16 @@ class _WinPtyProcess:
             joined = "".join(chunks)
             if len(joined) > _MAX_RESPONSE_CHARS:
                 raise RuntimeError("PTY prompt-input output exceeded limit")
-            if (
-                _prompt_input_visible(joined, prompt=prompt)
-                or _is_authentication_failure(joined)
-                or _is_provider_limit_failure(joined)
+            if _is_authentication_failure(joined) or _is_provider_limit_failure(
+                joined
             ):
                 return joined
+            if _prompt_input_visible(joined, prompt=prompt):
+                candidate_seen = True
+            if candidate_seen:
+                settle_deadline = (
+                    time.monotonic() + _PROMPT_ACCEPTANCE_SETTLE_SECONDS
+                )
 
     def read_until_ready(
         self, timeout: float, *, accept_workspace_trust: bool = False
