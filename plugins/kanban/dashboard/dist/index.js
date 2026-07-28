@@ -1277,7 +1277,7 @@
         "hermes-kanban-stats-strip",
         missing > 0 ? "hermes-kanban-stats-strip--warning" : "",
       ),
-      title: "Worker runs that exited without calling kanban_complete or kanban_block in the last 24 hours.",
+      title: "Tasks reconciled to pending review after repeated worker exits without kanban_complete or kanban_block in the last 24 hours.",
     },
       h("span", { className: "hermes-kanban-stats-label" }, "Missing-exit-signal 24h"),
       h("span", { className: "hermes-kanban-stats-value" }, String(missing)),

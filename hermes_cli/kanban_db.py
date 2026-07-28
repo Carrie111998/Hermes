@@ -9387,7 +9387,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     missing_cutoff = now - 24 * 60 * 60
     missing_exit_signal_24h = int(conn.execute(
         "SELECT COUNT(*) AS n FROM task_events "
-        "WHERE kind = 'protocol_violation' AND created_at >= ?",
+        "WHERE kind = 'missing_exit_signal' AND created_at >= ?",
         (missing_cutoff,),
     ).fetchone()["n"])
     ended_runs_24h = int(conn.execute(

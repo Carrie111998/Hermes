@@ -4720,9 +4720,18 @@ def test_board_stats_reports_missing_exit_signal_rate(kanban_home):
         tid = kb.create_task(conn, title="metric", assignee="worker")
         _drive_protocol_violation(conn, tid, 996000)
 
+        first_stats = kb.board_stats(conn)
+        assert first_stats["missing_exit_signal_24h"] == 0, (
+            "single retryable protocol_violation events are not the terminal "
+            "missing_exit_signal diagnostic"
+        )
+
+        _drive_protocol_violation(conn, tid, 996001)
+        _drive_protocol_violation(conn, tid, 996002)
+
         stats = kb.board_stats(conn)
-        assert stats["missing_exit_signal_24h"] >= 1
-        assert stats["ended_runs_24h"] >= 1
+        assert stats["missing_exit_signal_24h"] == 1
+        assert stats["ended_runs_24h"] >= 3
         assert stats["missing_exit_signal_rate_24h"] > 0
     finally:
         conn.close()
