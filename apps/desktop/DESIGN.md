@@ -117,6 +117,22 @@ that sit inside a heading/sentence; replaces `h-auto px-0 py-0`), `micro`
 (status-stack/table-footers), and the icon family `icon` / `icon-xs` /
 `icon-sm` / `icon-lg` / `icon-titlebar`.
 
+**Icon-only buttons must have a tooltip.** Every button with an `icon*` size
+carries no visible text label, so it must be wrapped in `<Tip label={...}>`
+with a descriptive label (matching the button's `aria-label`). Never use the
+native HTML `title=` attribute — it's unstyled, delayed (~500ms OS default),
+and visually inconsistent with the instant themed `Tip`. An enforcement test
+(`src/components/ui/__tests__/no-native-title.test.ts`) fails on any `<button>`
+or `<Button>` that still carries `title=`.
+
+**Keybind hints in tooltips.** When a button corresponds to a rebindable
+hotkey, use `<TipKeybindLabel actionId="..." />` as the `Tip` label — it
+auto-reads both the i18n label and the current keybind combo from the store,
+so the hint stays live when the user rebinds. Pass `text={...}` only when the
+tooltip is context-dependent (e.g. "Show" / "Hide" based on state). Never
+hardcode combos in components — always read from the `$bindings` store via
+`useKeybindHint` or `TipKeybindLabel`.
+
 Notes:
 - Text buttons are square (no radius) and sized by padding + line-height (no
   fixed heights). Only icon buttons carry the shared 4px radius.
@@ -176,7 +192,12 @@ Notes:
   semantics when unifying appearance.
 - Respect `AppShell` overlay ownership. Persistent terminal/content layers,
   route overlays, dialogs, and boot surfaces must not compete through ad-hoc
-  z-index literals.
+  z-index literals. Pick a rung of the ladder in `styles.css` instead —
+  `--z-modal-backdrop` / `--z-modal` / `--z-modal-popover`, `--z-over-modal`
+  (toasts, tooltips, command surfaces) and `--z-over-modal-content`,
+  `--z-switcher-backdrop` / `--z-switcher`, then the boot chain
+  `--z-connecting` → `--z-onboarding` → `--z-setup` → `--z-crash`. Plain
+  `z-10`/`z-20` are still right for stacking *within* one component.
 
 ## Iconography & brand
 
@@ -278,6 +299,9 @@ The detailed state contract lives in the scoped
 - [ ] Tokens (`--ui-*`, `shadow-nous`, `--stroke-nous`) — zero raw colors /
       one-off shadows?
 - [ ] No `className` overriding a primitive's padding / size / radius / chrome?
+- [ ] Icon-only buttons wrapped in `<Tip>` with a descriptive label?
+- [ ] No native `title=` on buttons — use `<Tip>` instead?
+- [ ] Keybind hints read from the store via `useKeybindHint` / `TipKeybindLabel`?
 - [ ] Overlay uses `shadow-nous` + `border-(--stroke-nous)`, no hard border?
 - [ ] Flat — no card-in-card, no gratuitous row dividers?
 - [ ] No automatic navigation, focus steal, or pane opening from background
