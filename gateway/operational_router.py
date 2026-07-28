@@ -35,7 +35,7 @@ _REACTION_EVENT_RE = re.compile(r"^reaction:(?:added|removed):[a-z0-9_+\-]+$", r
 _TOKEN_WORD_RE = re.compile(r"\btokens?\b|token|令牌", re.I)
 _TOKEN_USAGE_RE = re.compile(r"用量|消耗|统计|使用|usage|spend|cost|input|output", re.I)
 _DEEP_RE = re.compile(r"(^\s*/deep(?:\s+|$))|深入排查|分析根因", re.I)
-_CRON_JOB_RE = re.compile(r"[“\"'](?P<name>[^”\"']+)[”\"']\s*(?:这个)?(?:定时)?任务")
+_CRON_JOB_RE = re.compile(r"[“‘\"'](?P<name>[^”’\"']+)[”’\"']\s*(?:这个)?(?:定时)?任务")
 _CRON_TARGET_RE = re.compile(r"(?:改为|改成|调整为).*?(?:发送到|投递到)\s*(?P<target>[^，。！？!?]+)")
 
 
@@ -58,7 +58,7 @@ def route_operational_request(
     text: str,
     *,
     platform: str,
-    received_at: float | None = None,
+    received_at: float | datetime | None = None,
 ) -> OperationalRoute:
     """Route a narrow, repeatable operation without consulting an LLM."""
     raw = (text or "").strip()
@@ -92,8 +92,18 @@ def _looks_like_token_request(text: str) -> bool:
     return bool(_TOKEN_WORD_RE.search(normalized) and _TOKEN_USAGE_RE.search(normalized))
 
 
-def _parse_window(text: str, *, received_at: float | None) -> tuple[float, float, str] | None:
-    now = datetime.fromtimestamp(received_at if received_at is not None else time.time()).astimezone()
+def _parse_window(
+    text: str, *, received_at: float | datetime | None
+) -> tuple[float, float, str] | None:
+    # Gateway MessageEvent.timestamp is a datetime, while direct callers and
+    # tests commonly provide Unix seconds. Accept both so this route cannot
+    # fail over to the general agent merely because of timestamp shape.
+    if isinstance(received_at, datetime):
+        now = received_at.astimezone()
+    else:
+        now = datetime.fromtimestamp(
+            received_at if received_at is not None else time.time()
+        ).astimezone()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     normalized = re.sub(r"\s+", "", text.lower())
     if any(word in normalized for word in ("今天", "今日", "当天", "today")):

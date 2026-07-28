@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -85,6 +86,19 @@ def test_token_report_is_local_and_uses_request_time_as_its_cutoff(tmp_path, mon
     assert "900" not in result.text
 
 
+def test_token_report_accepts_gateway_datetime_timestamp(tmp_path, monkeypatch):
+    _write_usage_db(tmp_path)
+    monkeypatch.setattr(operational_router, "get_hermes_home", lambda: tmp_path)
+
+    result = operational_router.route_operational_request(
+        "查今天 token 用量",
+        platform="feishu",
+        received_at=datetime(2026, 7, 28, 12, 0),
+    )
+
+    assert result.kind == "handled"
+
+
 def test_vague_token_request_asks_for_window_without_agent_dispatch():
     result = operational_router.route_operational_request(
         "查 token 消耗", platform="feishu", received_at=time.time()
@@ -115,6 +129,24 @@ def test_clear_cron_retarget_uses_cron_and_directory_interfaces(monkeypatch):
     assert result.route_name == "cron_retarget_delivery"
     assert "配置生效验证：通过" in result.text
     assert "模型 0 Token" in result.text
+
+
+def test_cron_retarget_accepts_chinese_single_quotes(monkeypatch):
+    monkeypatch.setattr(
+        operational_router,
+        "_retarget_cron_delivery",
+        lambda job_name, target_name, platform: operational_router.OperationalRoute(
+            "handled", f"{job_name}/{target_name}/{platform}", "cron_retarget_delivery"
+        ),
+    )
+
+    result = operational_router.route_operational_request(
+        "请把 ‘模型限频监控’这个定时任务的结果改为发送到 Hermes IT 群",
+        platform="feishu",
+    )
+
+    assert result.kind == "handled"
+    assert result.text == "模型限频监控/Hermes IT 群/feishu"
 
 
 def test_deep_prefix_keeps_request_on_the_agent_path():
