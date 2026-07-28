@@ -371,7 +371,10 @@ def _apply_managed_env() -> None:
     if managed_dir is None:
         return
     managed_env = managed_dir / ".env"
-    if not managed_env.exists():
+    try:
+        if not managed_env.exists():
+            return
+    except PermissionError:  # noqa: BLE001 — fail-open per docstring
         return
     _sanitize_env_file_if_needed(managed_env)
     _load_dotenv_with_fallback(managed_env, override=True)
