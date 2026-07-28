@@ -65,7 +65,7 @@ _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 _CLAUDE_MAIN_REPL_FOOTER_RE = re.compile(
-    "\u23f5\u23f5\\s*don't\\s*ask\\s*on", re.IGNORECASE
+    "\u23f5\u23f5\\s*don't\\s*ask(?:\\s+on)?\\b", re.IGNORECASE
 )
 _CLAUDE_2110_RESUME_SCAFFOLD = "No response requested."
 _MAX_AUTH_RECOVERY_ATTEMPTS = 24

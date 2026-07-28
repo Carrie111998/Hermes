@@ -1425,6 +1425,28 @@ def test_winpty_readiness_accepts_claude_216_compact_main_footer() -> None:
     assert "\u23f5\u23f5don't ask on" in output
 
 
+def test_winpty_readiness_accepts_claude_219_permission_indicator() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([
+                "\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H",
+                "\x1b[?2004h",
+                "\x1b[2m\u23f5\u23f5 Don't Ask (shift+tab to cycle)\x1b[0m",
+            ])
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+    output = _WinPtyProcess(Process()).read_until_ready(1.0)
+
+    assert "\x1b[?2004h" in output
+    assert "\u23f5\u23f5 Don't Ask" in output
+
+
 def test_winpty_readiness_waits_for_footer_then_product_modal() -> None:
     modal = (
         "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
