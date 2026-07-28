@@ -1284,6 +1284,7 @@ AUTHOR_MAP = {
     "hex-clawd@users.noreply.github.com": "hex-clawd",
     "154585401+LeonSGP43@users.noreply.github.com": "LeonSGP43",
     "barteq@hacknotes.local": "barteqpl",
+    "sophia@hermes.local": "knoal",  # PR #71783 (sister to #71787)
     "pama0227@gmail.com": "pama0227",
     "52785845+ee-blog@users.noreply.github.com": "ee-blog",
     "simplenamebox@gmail.com": "simplenamebox-ops",
