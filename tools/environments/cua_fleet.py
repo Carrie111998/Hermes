@@ -7,7 +7,6 @@ import base64
 import json
 import logging
 import os
-import re
 import threading
 import time
 import urllib.error
@@ -37,7 +36,7 @@ class CuaFleetConfig:
     client_secret: str = ""
     image: str = "trycua/cua:latest"
     image_pull_secret: str = "ecr-credentials"
-    pool_prefix: str = "hermes"
+    pool: str = "hermes-desktop"
     cwd: str = "/root"
     timeout: int = 60
     cpu: int | None = 2
@@ -83,6 +82,11 @@ class _AsyncWorker:
         self._loop.close()
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
 class _UrlLibHttpClient:
     """Build the SDK's HttpClient callback without depending on cua-sandbox."""
 
@@ -106,8 +110,9 @@ class _UrlLibHttpClient:
             method=request.method,
             headers={header.name: header.value for header in request.headers},
         )
+        opener = urllib.request.build_opener(_NoRedirectHandler())
         try:
-            with urllib.request.urlopen(native, timeout=self._timeout) as response:
+            with opener.open(native, timeout=self._timeout) as response:
                 return self._response(
                     response.status, response.headers.items(), response.read()
                 )
@@ -227,6 +232,20 @@ def _parse_mcp_response(body: bytes) -> Mapping[str, Any]:
     return parsed
 
 
+def _parse_service_response(body: bytes) -> Mapping[str, Any]:
+    """Parse computer-server JSON or its SSE ``data:`` envelope."""
+    text = body.decode("utf-8", errors="replace").strip()
+    data_frames = [
+        line[5:].strip() for line in text.splitlines() if line.startswith("data:")
+    ]
+    if data_frames:
+        text = data_frames[0]
+    parsed = json.loads(text or "{}")
+    if not isinstance(parsed, Mapping):
+        raise ValueError("Fleet service returned a non-object response")
+    return parsed
+
+
 class CuaFleetEnvironment(BaseEnvironment):
     """One bound Fleet sandbox shared by terminal and computer-use tools."""
 
@@ -331,20 +350,15 @@ class CuaFleetEnvironment(BaseEnvironment):
             raise RuntimeError(
                 f"Fleet service {service!r} failed with HTTP {response.status}"
             )
-        parsed = json.loads(response.body.decode("utf-8", errors="replace") or "{}")
-        if not isinstance(parsed, Mapping):
-            raise ValueError(
-                f"Fleet service {service!r} returned a non-object response"
-            )
-        return parsed
+        return _parse_service_response(response.body)
 
     def cleanup(self) -> None:
         if self._computer_backend is not None:
             self._computer_backend.stop()
             self._computer_backend = None
         if not self._released:
-            self._released = True
             self._release_callback()
+            self._released = True
 
 
 def _shell_quote(value: str) -> str:
@@ -362,6 +376,15 @@ class CuaFleetDesktopProvider:
         self._states: dict[str, _FleetState] = {}
         self._workers: dict[str, _AsyncWorker] = {}
         self._lock = threading.RLock()
+        self._reconcile_lock = threading.Lock()
+        self._shared_worker: _AsyncWorker | None = None
+        self._shared_client: Any = None
+        self._shared_http_client: Any = None
+
+    @staticmethod
+    def _http_client_type(http_client_base: type) -> type:
+        # Concrete callback first: generated HttpClient.execute is abstract.
+        return type("FleetHttpClient", (_UrlLibHttpClient, http_client_base), {})
 
     def acquire(
         self,
@@ -388,57 +411,17 @@ class CuaFleetDesktopProvider:
             )
 
         sdk = self._load_sdk()
-        worker = _AsyncWorker()
+        worker, client, http_client = self._shared_connection(
+            sdk, client_id, client_secret
+        )
         lease_id = uuid.uuid4().hex
-        namespace = _resource_name(self.config.pool_prefix, task_id, lease_id)
-        http_client_type = type(
-            "FleetHttpClient", (sdk.HttpClient, _UrlLibHttpClient), {}
-        )
-        allowed_hosts = {
-            urllib.parse.urlparse(self.config.base_url).hostname,
-            urllib.parse.urlparse(self.config.token_url).hostname,
-        }
-        http_client = http_client_type(
-            sdk,
-            self.config.request_timeout,
-            tuple(host for host in allowed_hosts if host),
-        )
-        client = sdk.CyclopsClient.connect(
-            sdk.CyclopsConfiguration(
-                base_url=self.config.base_url,
-                token_url=self.config.token_url,
-                credentials=sdk.CyclopsCredentials(client_id, client_secret),
-                pool_poll_interval_ms=max(
-                    1, int(self.config.ready_poll_interval * 1000)
-                ),
-                pool_poll_limit=max(
-                    1,
-                    int(
-                        self.config.ready_timeout
-                        / max(self.config.ready_poll_interval, 0.001)
-                    ),
-                ),
-                claim_poll_interval_ms=max(
-                    1, int(self.config.ready_poll_interval * 1000)
-                ),
-                claim_poll_limit=max(
-                    1,
-                    int(
-                        self.config.ready_timeout
-                        / max(self.config.ready_poll_interval, 0.001)
-                    ),
-                ),
-            ),
-            http_client,
-        )
+        namespace = self.config.pool
         pool = claim = None
         try:
-            pool = worker.run(
-                client.create_pool(
-                    self._pool_request(sdk, namespace, image or self.config.image)
-                ),
-                self.config.request_timeout,
-            )
+            with self._reconcile_lock:
+                pool = self._reconcile_pool(
+                    worker, client, sdk, namespace, image or self.config.image
+                )
             pool = self._wait_pool(worker, client, pool)
             claim = worker.run(
                 client.create_claim(sdk.CreateClaimRequest(pool=pool, spec=None)),
@@ -451,12 +434,6 @@ class CuaFleetDesktopProvider:
                     worker.run(client.delete_claim(claim), self.config.request_timeout)
                 except Exception:
                     logger.warning("Failed to roll back Fleet claim", exc_info=True)
-            if pool is not None:
-                try:
-                    worker.run(client.delete_pool(pool), self.config.request_timeout)
-                except Exception:
-                    logger.warning("Failed to roll back Fleet pool", exc_info=True)
-            worker.stop()
             raise
 
         state = _FleetState(client, http_client, pool, claim, sandbox)
@@ -503,28 +480,68 @@ class CuaFleetDesktopProvider:
 
     def release(self, lease: ComputeLease) -> None:
         with self._lock:
-            state = self._states.pop(lease.lease_id, None)
-            worker = self._workers.pop(lease.lease_id, None)
+            state = self._states.get(lease.lease_id)
+            worker = self._workers.get(lease.lease_id)
         if state is None or worker is None:
             return
-        error = None
-        try:
-            worker.run(
-                state.client.delete_claim(state.claim), self.config.request_timeout
+        worker.run(state.client.delete_claim(state.claim), self.config.request_timeout)
+        with self._lock:
+            self._states.pop(lease.lease_id, None)
+            self._workers.pop(lease.lease_id, None)
+
+    def _shared_connection(
+        self, sdk: Any, client_id: str, client_secret: str
+    ) -> tuple[_AsyncWorker, Any, Any]:
+        with self._lock:
+            if self._shared_worker is not None:
+                return (
+                    self._shared_worker,
+                    self._shared_client,
+                    self._shared_http_client,
+                )
+            worker = _AsyncWorker()
+            http_client_type = self._http_client_type(sdk.HttpClient)
+            allowed_hosts = {
+                urllib.parse.urlparse(self.config.base_url).hostname,
+                urllib.parse.urlparse(self.config.token_url).hostname,
+            }
+            http_client = http_client_type(
+                sdk,
+                self.config.request_timeout,
+                tuple(host for host in allowed_hosts if host),
             )
-        except Exception as exc:
-            error = exc
-        try:
-            # cua-fleet owns the coupled pool + namespace teardown here.
-            worker.run(
-                state.client.delete_pool(state.pool), self.config.request_timeout
+            client = sdk.CyclopsClient.connect(
+                sdk.CyclopsConfiguration(
+                    base_url=self.config.base_url,
+                    token_url=self.config.token_url,
+                    credentials=sdk.CyclopsCredentials(client_id, client_secret),
+                    pool_poll_interval_ms=max(
+                        1, int(self.config.ready_poll_interval * 1000)
+                    ),
+                    pool_poll_limit=max(
+                        1,
+                        int(
+                            self.config.ready_timeout
+                            / max(self.config.ready_poll_interval, 0.001)
+                        ),
+                    ),
+                    claim_poll_interval_ms=max(
+                        1, int(self.config.ready_poll_interval * 1000)
+                    ),
+                    claim_poll_limit=max(
+                        1,
+                        int(
+                            self.config.ready_timeout
+                            / max(self.config.ready_poll_interval, 0.001)
+                        ),
+                    ),
+                ),
+                http_client,
             )
-        except Exception as exc:
-            error = error or exc
-        finally:
-            worker.stop()
-        if error is not None:
-            raise error
+            self._shared_worker = worker
+            self._shared_client = client
+            self._shared_http_client = http_client
+            return worker, client, http_client
 
     def _load_sdk(self) -> Any:
         if self._sdk is not None:
@@ -576,6 +593,40 @@ class CuaFleetDesktopProvider:
             ),
         )
 
+    def _reconcile_pool(
+        self,
+        worker: _AsyncWorker,
+        client: Any,
+        sdk: Any,
+        namespace: str,
+        image: str,
+    ) -> Any:
+        desired = self._pool_request(sdk, namespace, image)
+        pools = worker.run(client.list_pools(namespace), self.config.request_timeout)
+        current = next(
+            (pool for pool in pools if pool.metadata.name == namespace), None
+        )
+        if current is None:
+            try:
+                return worker.run(
+                    client.create_pool(desired), self.config.request_timeout
+                )
+            except BaseException:
+                # Creation may have committed remotely before a local timeout.
+                pools = worker.run(
+                    client.list_pools(namespace), self.config.request_timeout
+                )
+                current = next(
+                    (pool for pool in pools if pool.metadata.name == namespace), None
+                )
+                if current is None:
+                    raise
+                return current
+        if current.spec != desired.spec:
+            current.spec = desired.spec
+            return worker.run(client.update_pool(current), self.config.request_timeout)
+        return current
+
     def _wait_pool(self, worker: _AsyncWorker, client: Any, pool: Any) -> Any:
         deadline = time.monotonic() + self.config.ready_timeout
         while True:
@@ -588,13 +639,6 @@ class CuaFleetDesktopProvider:
                     f"Timed out waiting for Fleet pool {pool.metadata.name!r}"
                 )
             time.sleep(self.config.ready_poll_interval)
-
-
-def _resource_name(prefix: str, task_id: str, lease_id: str) -> str:
-    value = re.sub(
-        r"[^a-z0-9-]+", "-", f"{prefix}-{task_id}-{lease_id[:8]}".lower()
-    ).strip("-")
-    return value[:63].rstrip("-") or f"hermes-{lease_id[:8]}"
 
 
 def _provider_from_config(compute_config: Mapping[str, Any] | None = None) -> Any:

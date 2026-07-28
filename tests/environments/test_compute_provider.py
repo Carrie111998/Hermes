@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.request
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -153,6 +155,7 @@ def test_cua_fleet_config_defaults() -> None:
     assert config.token_url.startswith("https://auth.cua.ai/")
     assert config.client_id == ""
     assert config.client_secret == ""
+    assert config.pool == "hermes-desktop"
 
 
 def test_environments_package_reexports_cua_fleet_sdk() -> None:
@@ -164,17 +167,31 @@ class _FakeFleetClient:
     def __init__(self):
         self.calls = []
         self.pool = SimpleNamespace(
-            metadata=SimpleNamespace(namespace="hermes-task", name="hermes-task"),
+            metadata=SimpleNamespace(namespace="hermes-desktop", name="hermes-desktop"),
             status=SimpleNamespace(available_count=1),
+            spec=None,
         )
+        self.pools = []
         self.claim = SimpleNamespace(metadata=SimpleNamespace(name="hermes-task-claim"))
         self.sandbox = SimpleNamespace(
             namespace="hermes-task", name="sandbox-1", services=["server", "mcp"]
         )
 
+    async def list_pools(self, namespace):
+        self.calls.append(("list_pools", namespace))
+        return self.pools
+
     async def create_pool(self, request):
         self.calls.append(("create_pool", request))
+        self.pool.spec = request.spec
+        self.pools = [self.pool]
         return self.pool
+
+    async def update_pool(self, pool):
+        self.calls.append(("update_pool", pool))
+        self.pool = pool
+        self.pools = [pool]
+        return pool
 
     async def get_pool(self, pool):
         self.calls.append(("get_pool", pool))
@@ -203,6 +220,11 @@ class _FakeFleetClient:
         )
 
 
+class _FakeRecord:
+    def __eq__(self, other):
+        return type(self) is type(other) and self.__dict__ == other.__dict__
+
+
 class _FakeFleetSdk:
     class HttpClient:
         pass
@@ -212,54 +234,57 @@ class _FakeFleetSdk:
             self.client_id = client_id
             self.client_secret = client_secret
 
-    class CyclopsConfiguration:
+    class CyclopsConfiguration(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
     class CyclopsClient:
         client = _FakeFleetClient()
+        connect_calls = 0
 
         @classmethod
         def connect(cls, configuration, http_client):
+            cls.connect_calls += 1
             cls.configuration = configuration
             cls.http_client = http_client
             return cls.client
 
-    class CreatePoolRequest:
+    class CreatePoolRequest(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    class CreateClaimRequest:
+    class CreateClaimRequest(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    class PoolSpec:
+    class PoolSpec(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    class PoolTemplate:
+    class PoolTemplate(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    class SandboxService:
+    class SandboxService(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    class HttpHeader:
+    class HttpHeader(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    class HttpRequest:
+    class HttpRequest(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    class HttpResponse:
+    class HttpResponse(_FakeRecord):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
 
 def _fleet_provider() -> CuaFleetDesktopProvider:
     _FakeFleetSdk.CyclopsClient.client = _FakeFleetClient()
+    _FakeFleetSdk.CyclopsClient.connect_calls = 0
     return CuaFleetDesktopProvider(
         CuaFleetConfig(
             client_id="ukey-test", client_secret="secret", ready_poll_interval=0
@@ -268,20 +293,55 @@ def _fleet_provider() -> CuaFleetDesktopProvider:
     )
 
 
-def test_cua_fleet_sdk_owns_pool_claim_and_namespace_lifecycle() -> None:
+def test_cua_fleet_reconciles_missing_pool_and_releases_only_claim() -> None:
     provider = _fleet_provider()
-
     lease = provider.acquire("task-1", image="registry.example/desktop:latest")
     environment = provider.create_environment(lease)
     provider.release(lease)
-
     calls = [call[0] for call in _FakeFleetSdk.CyclopsClient.client.calls]
-    assert calls[:4] == ["create_pool", "get_pool", "create_claim", "wait_claim"]
-    assert calls[-2:] == ["delete_claim", "delete_pool"]
+    assert calls[:5] == [
+        "list_pools",
+        "create_pool",
+        "get_pool",
+        "create_claim",
+        "wait_claim",
+    ]
+    assert calls[-1] == "delete_claim"
+    assert "delete_pool" not in calls
     assert environment.compute_lease is lease
-    assert lease.metadata["namespace"] == lease.metadata["pool"]
-    request = _FakeFleetSdk.CyclopsClient.client.calls[0][1]
-    assert {service.name for service in request.spec.services} == {"server", "mcp"}
+    assert lease.metadata["namespace"] == "hermes-desktop"
+    assert lease.metadata["pool"] == "hermes-desktop"
+
+
+def test_cua_fleet_reconcile_is_noop_when_pool_spec_matches() -> None:
+    provider = _fleet_provider()
+    client = _FakeFleetSdk.CyclopsClient.client
+    desired = provider._pool_request(
+        _FakeFleetSdk, "hermes-desktop", provider.config.image
+    )
+    client.pool.spec = desired.spec
+    client.pools = [client.pool]
+    lease = provider.acquire("task-existing")
+    provider.release(lease)
+    calls = [call[0] for call in client.calls]
+    assert "create_pool" not in calls
+    assert "update_pool" not in calls
+    assert calls.count("delete_claim") == 1
+    assert "delete_pool" not in calls
+
+
+def test_cua_fleet_reconcile_updates_drifted_pool() -> None:
+    provider = _fleet_provider()
+    client = _FakeFleetSdk.CyclopsClient.client
+    client.pool.spec = SimpleNamespace(replicas=99)
+    client.pools = [client.pool]
+    lease = provider.acquire("task-drifted")
+    provider.release(lease)
+    calls = [call[0] for call in client.calls]
+    assert "create_pool" not in calls
+    assert calls.count("update_pool") == 1
+    assert client.pool.spec.replicas == 1
+    assert "delete_pool" not in calls
 
 
 def test_cua_fleet_environment_routes_terminal_through_bound_sandbox() -> None:
@@ -317,14 +377,14 @@ def test_compute_config_selects_cua_fleet_provider(monkeypatch) -> None:
     provider = _provider_from_config({
         "provider": "cua_fleet",
         "image": "registry.example/desktop:latest",
-        "cua_fleet": {"base_url": "https://run.cua.ai", "pool_prefix": "hermes"},
+        "cua_fleet": {"base_url": "https://run.cua.ai", "pool": "hermes-desktop"},
     })
 
     assert isinstance(provider, CuaFleetDesktopProvider)
     assert provider.config.image == "registry.example/desktop:latest"
 
 
-def test_cua_fleet_release_still_deletes_pool_when_claim_delete_fails() -> None:
+def test_cua_fleet_release_reports_claim_delete_failure_without_deleting_pool() -> None:
     provider = _fleet_provider()
     lease = provider.acquire("task-4")
     client = _FakeFleetSdk.CyclopsClient.client
@@ -334,11 +394,10 @@ def test_cua_fleet_release_still_deletes_pool_when_claim_delete_fails() -> None:
         raise RuntimeError("claim delete failed")
 
     client.delete_claim = fail_delete_claim
-
     with pytest.raises(RuntimeError, match="claim delete failed"):
         provider.release(lease)
-
-    assert [call[0] for call in client.calls][-2:] == ["delete_claim", "delete_pool"]
+    assert [call[0] for call in client.calls][-1] == "delete_claim"
+    assert "delete_pool" not in [call[0] for call in client.calls]
 
 
 def test_cua_fleet_sdk_package_is_lazy_installable() -> None:
@@ -357,5 +416,128 @@ def test_cua_fleet_environment_cleanup_releases_sdk_resources() -> None:
 
     calls = [call[0] for call in _FakeFleetSdk.CyclopsClient.client.calls]
     assert calls.count("delete_claim") == 1
-    assert calls.count("delete_pool") == 1
+    assert "delete_pool" not in calls
+    assert lease.lease_id not in provider._states
+
+
+def test_cua_fleet_http_client_uses_concrete_execute_first() -> None:
+    class AbstractHttpClient:
+        async def execute(self, request):
+            raise NotImplementedError
+
+    client_type = CuaFleetDesktopProvider._http_client_type(AbstractHttpClient)
+    assert client_type.execute is not AbstractHttpClient.execute
+
+
+def test_cua_fleet_terminal_parses_sse_command_response() -> None:
+    from tools.environments.cua_fleet import _parse_service_response
+
+    parsed = _parse_service_response(
+        b'data: {"success":true,"result":{"stdout":"ok\\n","stderr":"","returncode":0}}\n\n'
+    )
+    assert parsed["result"] == {"stdout": "ok\n", "stderr": "", "returncode": 0}
+
+
+def test_cua_fleet_reconcile_recovers_pool_after_ambiguous_create_failure() -> None:
+    provider = _fleet_provider()
+    client = _FakeFleetSdk.CyclopsClient.client
+    original_create = client.create_pool
+
+    async def create_then_fail(request):
+        await original_create(request)
+        raise TimeoutError("ambiguous create timeout")
+
+    client.create_pool = create_then_fail
+    lease = provider.acquire("task-timeout")
+    provider.release(lease)
+    calls = [call[0] for call in client.calls]
+    assert calls.count("create_pool") == 1
+    assert calls.count("list_pools") == 2
+    assert "delete_pool" not in calls
+
+
+def test_cua_fleet_claim_release_can_retry_after_transient_failure() -> None:
+    provider = _fleet_provider()
+    lease = provider.acquire("task-retry-release")
+    client = _FakeFleetSdk.CyclopsClient.client
+    original = client.delete_claim
+    attempts = 0
+
+    async def fail_once(claim):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient delete failure")
+        await original(claim)
+
+    client.delete_claim = fail_once
+    with pytest.raises(RuntimeError, match="transient delete failure"):
+        provider.release(lease)
+    assert lease.lease_id in provider._states
+
+    provider.release(lease)
+    assert lease.lease_id not in provider._states
+    assert attempts == 2
+
+
+def test_cua_fleet_provider_reuses_sdk_client_across_claims() -> None:
+    provider = _fleet_provider()
+    first = provider.acquire("task-client-one")
+    first_client = provider._states[first.lease_id].client
+    second = provider.acquire("task-client-two")
+    second_client = provider._states[second.lease_id].client
+    assert first_client is second_client
+    assert _FakeFleetSdk.CyclopsClient.connect_calls == 1
+    provider.release(first)
+    provider.release(second)
+
+
+def test_cua_fleet_http_client_rejects_redirects(monkeypatch) -> None:
+    from tools.environments.cua_fleet import _UrlLibHttpClient
+
+    class Sdk:
+        class HttpHeader:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class HttpResponse:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+    client = _UrlLibHttpClient(Sdk, 1, ("run.cua.ai",))
+    request = SimpleNamespace(
+        url="https://run.cua.ai/api", body=None, method="GET", headers=[]
+    )
+    redirected = urllib.error.HTTPError(
+        request.url, 302, "Found", {"Location": "https://evil.example/steal"}, None
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        Mock(return_value=Mock(open=Mock(side_effect=redirected))),
+    )
+    response = client._execute(request)
+    assert response.status == 302
+
+
+def test_cua_fleet_environment_cleanup_retries_claim_release() -> None:
+    provider = _fleet_provider()
+    lease = provider.acquire("task-env-retry")
+    environment = provider.create_environment(lease)
+    client = _FakeFleetSdk.CyclopsClient.client
+    original = client.delete_claim
+    attempts = 0
+
+    async def fail_once(claim):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient cleanup failure")
+        await original(claim)
+
+    client.delete_claim = fail_once
+    with pytest.raises(RuntimeError, match="transient cleanup failure"):
+        environment.cleanup()
+    environment.cleanup()
+    assert attempts == 2
     assert lease.lease_id not in provider._states
