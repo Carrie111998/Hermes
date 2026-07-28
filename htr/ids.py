@@ -19,6 +19,10 @@ IdKind = Literal[
     "heal_cycle",
     "approval",
     "reconciliation",
+    "marker_disposition",
+    "marker_disposition_approval",
+    "marker_disposition_claim",
+    "marker_disposition_attempt",
 ]
 
 ID_PREFIXES: dict[IdKind, str] = {
@@ -33,10 +37,14 @@ ID_PREFIXES: dict[IdKind, str] = {
     "heal_cycle": "heal_",
     "approval": "apr_",
     "reconciliation": "rcn_",
+    "marker_disposition": "mdp_",
+    "marker_disposition_approval": "mda_",
+    "marker_disposition_claim": "mdc_",
+    "marker_disposition_attempt": "mat_",
 }
 
 _ID_BODY_RE = re.compile(
-    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn)_(\d{8})_([a-f0-9]{6})$"
+    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn|mdp|mda|mdc|mat)_(\d{8})_([a-f0-9]{6})$"
 )
 
 
@@ -120,3 +128,23 @@ def new_approval_id() -> str:
 
 def new_reconciliation_case_id() -> str:
     return generate_id("reconciliation")
+
+
+def generate_reconciliation_case_id() -> str:
+    return new_reconciliation_case_id()
+
+
+def generate_marker_disposition_id() -> str:
+    return generate_id("marker_disposition")
+
+
+def generate_marker_disposition_approval_id() -> str:
+    return generate_id("marker_disposition_approval")
+
+
+def generate_marker_disposition_claim_id() -> str:
+    return generate_id("marker_disposition_claim")
+
+
+def generate_marker_disposition_attempt_id() -> str:
+    return generate_id("marker_disposition_attempt")

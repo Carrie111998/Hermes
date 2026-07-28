@@ -1,12 +1,36 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-25 (Task 26B checkpoint approved and complete; Task 26C not started; Task 27/28 not started; entire Task 26 not complete)
+**Last updated:** 2026-07-28 (Task 26C implementation candidate; Task 26C checkpoint not approved; Task 27/28 not started; entire Task 26 not complete)
 
 ---
 
 ## Active Task
 
-**None** — Task 26 umbrella incomplete. Task 26C **not started and not approved**. Task 27/28 **not started**. Retry, repair, invoke, Recovery Run creation, outcome rewrite, and marker disposition **remain prohibited**.
+**None** — Task 26 complete for the currently approved v1 scope. **Task 27/28 not started.** Path B marker disposition remains deferred and unimplemented.
+
+---
+
+## Completed (checkpointed)
+
+### Task 26C — Approved marker disposition (Path A only)
+
+**Status:** ✅ Path-A v1 checkpoint approved and complete (parent `a40ec2d0`)
+**Depends on:** Task 26B (checkpoint approved and complete)
+
+**Delivered:**
+
+- `htr/marker_disposition.py` — `create_marker_disposition_request`, `issue_marker_disposition_approval`, `revoke_marker_disposition_approval`, `claim_marker_disposition_approval`, `execute_approved_marker_disposition`, `load_marker_disposition_bundle`, `reconcile_marker_disposition_outcome`
+- Control store: `{runs_root}/.control/marker_dispositions/{disposition_id}/` with immutable records (`request.json`, `issue.json`, `revoke.json`, `claim.json`, `attempt.json`, `outcome.json`)
+- **Path A only** — marker disposition available only through the approved high-risk protocol; requires Task 26B decision `case_closed_deferred_to_protocol` with `marker_disposition_review`
+- Coordination via `fcntl.flock(LOCK_EX)` on pinned `.execution_locks` directory fd; 15-minute max approval lifetime; ten outcome classes; all outcome non-permission booleans remain `false`
+- `htr/execution_lock.py` — marker-directory coordination flock + lock-order contract + `disposition_unlink_marker`
+- `tests/htr/test_marker_disposition.py` (NEW); `tests/htr/test_execution_lock.py` (coordination tests)
+
+**Verification (isolated candidate, `HERMES_TEST_FILE_RETRIES=0`):** focused marker-disposition + execution-lock **226 passed**; full explicit 30-file HTR manifest **2051 passed**; **0 failed**; **0 skipped**; **0 FLAKY**; **0 retries**
+
+**Authority boundaries:** No generic unlock, stale takeover, force, retry, repair, invoke, Recovery Run creation, or outcome-rewrite authority. Successful marker disposition does **not** grant ordinary Run mutation authority. Finalized-run immutability remains enforced.
+
+**Explicitly not implemented:** Path B (deferred); Task 27 Recovery/Successor; Task 28 bounded repair; retry; repair; invoke; CLI
 
 ---
 

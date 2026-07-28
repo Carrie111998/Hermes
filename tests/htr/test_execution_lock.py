@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import inspect
+import json
 import multiprocessing
 import os
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,8 +32,14 @@ from htr.execution_lock import (
     RunExecutionLockOccupiedError,
     RunExecutionLockPathUnsafeError,
     RunExecutionLockReleaseConflictError,
+    acquire_marker_directory_entry_coordination,
     begin_run_write,
+    disposition_unlink_marker,
     marker_present_noncreating,
+    pin_lock_directory,
+    read_marker_metadata_at,
+    release_marker_directory_entry_coordination,
+
     run_mutation_boundary,
     run_write_barrier,
 )
@@ -438,40 +447,38 @@ def _subprocess_contention_worker(
     runs_root: str,
     run_id: str,
     slot: Any,
+    barrier: Any,
 ) -> None:
     base = Path(runs_root)
+    barrier.wait()
     try:
         with run_write_barrier(run_id, base):
             slot.put("held")
-            import time
-
-            time.sleep(0.5)
     except RunExecutionLockOccupiedError:
         slot.put("blocked")
 
 
-@pytest.mark.skipif(multiprocessing.get_start_method() != "fork", reason="fork test")
 def test_subprocess_same_run_contention(tmp_path):
     run_id = new_run_id()
-    ctx = multiprocessing.get_context("fork")
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
     slot_a = ctx.Queue()
     slot_b = ctx.Queue()
     p1 = ctx.Process(
         target=_subprocess_contention_worker,
-        args=(str(tmp_path), run_id, slot_a),
+        args=(str(tmp_path), run_id, slot_a, barrier),
     )
     p2 = ctx.Process(
         target=_subprocess_contention_worker,
-        args=(str(tmp_path), run_id, slot_b),
+        args=(str(tmp_path), run_id, slot_b, barrier),
     )
     p1.start()
-    import time
-
-    time.sleep(0.05)
     p2.start()
-    p1.join(timeout=5)
-    p2.join(timeout=5)
-    results = {slot_a.get(timeout=1), slot_b.get(timeout=1)}
+    p1.join(timeout=15)
+    p2.join(timeout=15)
+    assert p1.exitcode == 0
+    assert p2.exitcode == 0
+    results = {slot_a.get(timeout=5), slot_b.get(timeout=5)}
     assert results == {"held", "blocked"}
 
 
@@ -961,7 +968,15 @@ def _subprocess_first_closure_worker(
 
     start_gate.wait(timeout=10)
     try:
-        with patch.object(io, "atomic_write_json", side_effect=slow_write):
+        from htr.finalization import SealEvaluation, SealState
+
+        with patch(
+            "htr.events.evaluate_run_seal",
+            return_value=SealEvaluation(SealState.NOT_FINALIZED, (), run_id),
+        ), patch(
+            "htr.finalization.evaluate_run_seal",
+            return_value=SealEvaluation(SealState.NOT_FINALIZED, (), run_id),
+        ), patch.object(io, "atomic_write_json", side_effect=slow_write):
             events.record_run_final_closure(Path(runs_root), run_id, record, actor="human")
         slot.put("written")
     except RunExecutionLockOccupiedError:
@@ -969,6 +984,24 @@ def _subprocess_first_closure_worker(
     except BaseException as exc:
         slot.put(f"error:{type(exc).__name__}")
 
+
+
+
+def _queue_get(queue: Any, *, timeout: float = 10) -> Any:
+    import queue as queue_module
+
+    return queue.get(timeout=timeout)
+
+
+def _queue_has_item(queue: Any, *, timeout: float = 0.5) -> bool:
+    import queue as queue_module
+
+    try:
+        item = queue.get(timeout=timeout)
+        queue.put(item)
+        return True
+    except queue_module.Empty:
+        return False
 
 def _subprocess_exact_replay_worker(
     runs_root: str,
@@ -1146,38 +1179,36 @@ def test_subprocess_first_closure_versus_exact_replay_interleaving(tmp_path):
     _assert_full_snapshot_unchanged(before, _full_snapshot(tmp_path, run_id=run_id))
 
 
-@pytest.mark.skipif(multiprocessing.get_start_method() != "fork", reason="fork test")
-def test_forked_child_cannot_mutate_or_release_parent_ownership(tmp_path):
+def _subprocess_spawned_child_ownership_worker(
+    runs_root: str,
+    run_id: str,
+    mutate_slot: Any,
+    release_slot: Any,
+    parent_ready: Any,
+) -> None:
+    parent_ready.wait(timeout=10)
+    _subprocess_fork_child_mutate_worker(runs_root, run_id, mutate_slot)
+    _subprocess_fork_child_release_worker(runs_root, run_id, release_slot)
+
+
+def test_spawned_child_cannot_mutate_or_release_parent_ownership(tmp_path):
     run_id = new_run_id()
-    result_path = tmp_path / "fork_result"
+    ctx = multiprocessing.get_context("spawn")
+    parent_ready = ctx.Event()
+    mutate_slot = ctx.Queue()
+    release_slot = ctx.Queue()
+    proc = ctx.Process(
+        target=_subprocess_spawned_child_ownership_worker,
+        args=(str(tmp_path), run_id, mutate_slot, release_slot, parent_ready),
+    )
     with run_write_barrier(run_id, tmp_path):
-        child = os.fork()
-        if child == 0:
-            mutate_out: list[str] = []
-            release_out: list[str] = []
-
-            class _Slot:
-                def __init__(self, sink: list[str]) -> None:
-                    self._sink = sink
-
-                def put(self, value: str) -> None:
-                    self._sink.append(value)
-
-            _subprocess_fork_child_mutate_worker(
-                str(tmp_path), run_id, _Slot(mutate_out)
-            )
-            _subprocess_fork_child_release_worker(
-                str(tmp_path), run_id, _Slot(release_out)
-            )
-            result_path.write_text(
-                f"{mutate_out[0]}\n{release_out[0]}", encoding="utf-8"
-            )
-            os._exit(0)
-        _, status = os.waitpid(child, 0)
-        assert os.WEXITSTATUS(status) == 0
-        lines = result_path.read_text(encoding="utf-8").splitlines()
-        assert lines[0] == "blocked"
-        assert lines[1].startswith("error:")
+        proc.start()
+        parent_ready.set()
+        proc.join(timeout=15)
+        assert proc.exitcode == 0
+        assert mutate_slot.get(timeout=5) == "blocked"
+        release_result = release_slot.get(timeout=5)
+        assert release_result == "no_entry" or str(release_result).startswith("error:")
     assert not marker_present_noncreating(tmp_path, run_id)
 
 
@@ -1389,3 +1420,609 @@ def test_no_force_unlock_skip_env_bypass_or_automatic_takeover():
     for token in forbidden:
         assert token not in text
     assert "os.environ" not in text
+
+
+def test_marker_directory_coordination_flock_acquire_release(tmp_path):
+    """Task 26C: exclusive flock on pinned .execution_locks fd acquires and releases cleanly."""
+    import os
+
+    from htr.execution_lock import (
+        acquire_marker_directory_entry_coordination,
+        lock_directory_identity,
+        pin_lock_directory,
+        release_marker_directory_entry_coordination,
+    )
+
+    runs_fd, lock_fd = pin_lock_directory(tmp_path)
+    try:
+        before = lock_directory_identity(lock_fd)
+        acquire_marker_directory_entry_coordination(lock_fd)
+        release_marker_directory_entry_coordination(lock_fd)
+        after = lock_directory_identity(lock_fd)
+        assert before == after
+    finally:
+        os.close(lock_fd)
+        os.close(runs_fd)
+
+
+def _prepare_disposition_execute_chain(tmp_path: Path) -> tuple[str, str, str]:
+    from htr.action_plan import PlanningIntent
+    from htr.approval_control import issue_approval
+    from htr.ids import (
+        generate_marker_disposition_approval_id,
+        generate_marker_disposition_claim_id,
+        generate_marker_disposition_id,
+        generate_reconciliation_case_id,
+        new_event_id,
+        new_run_id,
+        new_task_id,
+    )
+    from htr.invoke_run_completion import invoke_approved_run_completion
+    from htr.marker_disposition import (
+        claim_marker_disposition_approval,
+        create_marker_disposition_request,
+        issue_marker_disposition_approval,
+    )
+    from htr.reconciliation_cases import (
+        ReconciliationDecisionClass,
+        ReconciliationNextProtocol,
+        ReconciliationScopeReason,
+        open_reconciliation_case,
+        record_reconciliation_decision,
+        record_reconciliation_observation,
+    )
+    from htr.reconciliation_inspection import PILOT_BOUND_API
+    from htr.finalization import SealEvaluation, SealState
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+
+    run_id = new_run_id()
+    io.create_run_workspace(run_id, base_dir=tmp_path)
+    task_id = new_task_id()
+    io.create_task_workspace(run_id, task_id, base_dir=tmp_path)
+    TASK16._complete_task(tmp_path, run_id, task_id)
+    completion = contracts.make_run_completion_record(
+        run_id=run_id, completed_task_ids=[task_id]
+    )
+    intent = PlanningIntent(
+        requested_action=PILOT_BOUND_API,
+        action_inputs={"record": completion, "actor": "human", "event_id": new_event_id()},
+        htr_runs_root=str(tmp_path),
+    )
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    issue = issue_approval(
+        run_id,
+        intent,
+        approver_id="alice",
+        executor_id="bob",
+        expires_at=expires,
+        base_dir=tmp_path,
+    )
+    invoke_approved_run_completion(
+        issue["approval_id"], claim_id="claim-el-coord", base_dir=tmp_path
+    )
+    locks_root = tmp_path / LOCKS_DIR_NAME
+    locks_root.mkdir(parents=True, exist_ok=True)
+    (locks_root / f"{run_id}.marker").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "acquisition_id": str(uuid.uuid4()),
+                "pid": os.getpid(),
+                "hostname": "test-host",
+                "run_id": run_id,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    case_id = generate_reconciliation_case_id()
+    open_reconciliation_case(
+        case_id,
+        issue["approval_id"],
+        base_dir=tmp_path,
+        opened_by="operator",
+        scope_reason=ReconciliationScopeReason.ambiguous_completion_reconciliation,
+    )
+    obs, _ = record_reconciliation_observation(
+        case_id, base_dir=tmp_path, observed_by="operator"
+    )
+    record_reconciliation_decision(
+        case_id,
+        base_dir=tmp_path,
+        expected_observation_digest=obs.observation_digest,
+        requested_decision_class=ReconciliationDecisionClass.case_closed_deferred_to_protocol,
+        decided_by="operator",
+        recommended_next_protocol=ReconciliationNextProtocol.marker_disposition_review,
+    )
+    disposition_id = generate_marker_disposition_id()
+    with patch(
+        "htr.marker_disposition.evaluate_run_seal",
+        return_value=SealEvaluation(SealState.FINALIZED_VALID, (), run_id),
+    ):
+        create_marker_disposition_request(
+            disposition_id,
+            case_id,
+            requested_by="operator",
+            base_dir=tmp_path,
+        )
+    issue_marker_disposition_approval(
+        disposition_id,
+        generate_marker_disposition_approval_id(),
+        issued_by="approver",
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        base_dir=tmp_path,
+    )
+    claim_marker_disposition_approval(
+        disposition_id,
+        generate_marker_disposition_claim_id(),
+        claimant="executor",
+        base_dir=tmp_path,
+    )
+    return disposition_id, run_id, generate_marker_disposition_claim_id()
+
+
+def _subprocess_hold_run_write_barrier_worker(
+    runs_root: str,
+    run_id: str,
+    slot: Any,
+    barrier: Any,
+    release_gate: Any,
+) -> None:
+    from pathlib import Path
+
+    from htr.execution_lock import (
+        acquire_marker_directory_entry_coordination,
+        pin_lock_directory,
+        release_marker_directory_entry_coordination,
+    )
+
+    runs_fd, lock_fd = pin_lock_directory(Path(runs_root))
+    try:
+        acquire_marker_directory_entry_coordination(lock_fd)
+        barrier.wait()
+        slot.put("held")
+        release_gate.wait(timeout=10)
+    finally:
+        release_marker_directory_entry_coordination(lock_fd)
+        os.close(lock_fd)
+        os.close(runs_fd)
+
+
+def _subprocess_disposition_execute_worker(
+    runs_root: str,
+    disposition_id: str,
+    attempt_id: str,
+    slot: Any,
+    barrier: Any,
+) -> None:
+    from pathlib import Path
+
+    from htr.finalization import SealEvaluation, SealState
+    from htr.marker_disposition import execute_approved_marker_disposition
+    from unittest.mock import patch
+
+    request = json.loads(
+        (
+            Path(runs_root)
+            / ".control"
+            / "marker_dispositions"
+            / disposition_id
+            / "request.json"
+        ).read_text(encoding="utf-8")
+    )
+    run_id = request["marker_run_id"]
+    barrier.wait()
+    try:
+        with patch(
+            "htr.marker_disposition.evaluate_run_seal",
+            return_value=SealEvaluation(SealState.FINALIZED_VALID, (), run_id),
+        ):
+            result = execute_approved_marker_disposition(
+                disposition_id,
+                attempt_id,
+                executor="executor",
+                base_dir=Path(runs_root),
+            )
+        slot.put(("ok", result.outcome_class))
+    except Exception as exc:
+        slot.put(("err", type(exc).__name__, str(exc)))
+
+
+def test_subprocess_disposition_execute_waits_for_run_write_barrier(tmp_path):
+    disposition_id, run_id, attempt_id = _prepare_disposition_execute_chain(tmp_path)
+    from htr.ids import generate_marker_disposition_attempt_id
+
+    attempt_id = generate_marker_disposition_attempt_id()
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    release_gate = ctx.Event()
+    hold_slot = ctx.Queue()
+    exec_slot = ctx.Queue()
+    holder = ctx.Process(
+        target=_subprocess_hold_run_write_barrier_worker,
+        args=(str(tmp_path), run_id, hold_slot, barrier, release_gate),
+    )
+    executor = ctx.Process(
+        target=_subprocess_disposition_execute_worker,
+        args=(str(tmp_path), disposition_id, attempt_id, exec_slot, barrier),
+    )
+    holder.start()
+    executor.start()
+    assert _queue_get(hold_slot) == "held"
+    assert not _queue_has_item(exec_slot)
+    release_gate.set()
+    holder.join(timeout=15)
+    executor.join(timeout=15)
+    assert holder.exitcode == 0
+    assert executor.exitcode == 0
+    outcome = _queue_get(exec_slot)
+    assert outcome[0] == "ok"
+    assert outcome[1] == "disposed_verified"
+    assert not marker_present_noncreating(tmp_path, run_id)
+
+
+def _subprocess_hold_disposition_flock_worker(
+    runs_root: str,
+    slot: Any,
+    start_gate: Any,
+    release_gate: Any,
+) -> None:
+    from pathlib import Path
+
+    from htr.execution_lock import (
+        acquire_marker_directory_entry_coordination,
+        pin_lock_directory,
+        release_marker_directory_entry_coordination,
+    )
+
+    runs_fd, lock_fd = pin_lock_directory(Path(runs_root))
+    try:
+        acquire_marker_directory_entry_coordination(lock_fd)
+        slot.put("flock_held")
+        start_gate.set()
+        release_gate.wait(timeout=10)
+        release_marker_directory_entry_coordination(lock_fd)
+    finally:
+        os.close(lock_fd)
+        os.close(runs_fd)
+
+
+def _subprocess_run_write_barrier_after_flock_worker(
+    runs_root: str,
+    run_id: str,
+    slot: Any,
+    start_gate: Any,
+) -> None:
+    from pathlib import Path
+
+    from htr.execution_lock import run_write_barrier
+
+    start_gate.wait(timeout=10)
+    try:
+        with run_write_barrier(run_id, Path(runs_root)):
+            slot.put("acquired")
+    except Exception as exc:
+        slot.put(("blocked", type(exc).__name__))
+
+
+def test_subprocess_run_write_barrier_blocks_while_disposition_flock_held(tmp_path):
+    run_id = new_run_id()
+    ctx = multiprocessing.get_context("spawn")
+    start_gate = ctx.Event()
+    release_gate = ctx.Event()
+    flock_slot = ctx.Queue()
+    acquire_slot = ctx.Queue()
+    flock_proc = ctx.Process(
+        target=_subprocess_hold_disposition_flock_worker,
+        args=(str(tmp_path), flock_slot, start_gate, release_gate),
+    )
+    acquire_proc = ctx.Process(
+        target=_subprocess_run_write_barrier_after_flock_worker,
+        args=(str(tmp_path), run_id, acquire_slot, start_gate),
+    )
+    flock_proc.start()
+    acquire_proc.start()
+    assert flock_slot.get(timeout=10) == "flock_held"
+    start_gate.wait(timeout=5)
+    assert not _queue_has_item(acquire_slot)
+    release_gate.set()
+    flock_proc.join(timeout=15)
+    result = acquire_slot.get(timeout=10)
+    acquire_proc.join(timeout=15)
+    assert flock_proc.exitcode == 0
+    assert acquire_proc.exitcode == 0
+    assert result == "acquired"
+
+
+# --- Task 26C spawn+Barrier coordination (zero sleep/retry) ---
+
+
+def _subprocess_concurrent_disposition_execute_worker(
+    runs_root: str,
+    disposition_id: str,
+    attempt_id: str,
+    slot: Any,
+    barrier: Any,
+) -> None:
+    from pathlib import Path
+
+    from htr.finalization import SealEvaluation, SealState
+    from htr.marker_disposition import execute_approved_marker_disposition
+    from unittest.mock import patch
+
+    request = json.loads(
+        (
+            Path(runs_root)
+            / ".control"
+            / "marker_dispositions"
+            / disposition_id
+            / "request.json"
+        ).read_text(encoding="utf-8")
+    )
+    run_id = request["marker_run_id"]
+    barrier.wait()
+    try:
+        with patch(
+            "htr.marker_disposition.evaluate_run_seal",
+            return_value=SealEvaluation(SealState.FINALIZED_VALID, (), run_id),
+        ):
+            result = execute_approved_marker_disposition(
+                disposition_id,
+                attempt_id,
+                executor="executor",
+                base_dir=Path(runs_root),
+            )
+        slot.put(("ok", result.outcome_class, result.exact_replay))
+    except Exception as exc:
+        slot.put(("err", type(exc).__name__, str(exc)))
+
+
+def test_subprocess_concurrent_identical_disposition_execution(tmp_path):
+    from htr.ids import generate_marker_disposition_attempt_id
+
+    disposition_id, run_id, _claim = _prepare_disposition_execute_chain(tmp_path)
+    attempt_id = generate_marker_disposition_attempt_id()
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    slots = [ctx.Queue(), ctx.Queue()]
+    procs = [
+        ctx.Process(
+            target=_subprocess_concurrent_disposition_execute_worker,
+            args=(str(tmp_path), disposition_id, attempt_id, slots[i], barrier),
+        )
+        for i in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+    results = [_queue_get(slots[i]) for i in range(2)]
+    ok = [r for r in results if r[0] == "ok"]
+    assert len(ok) == 2
+    assert sum(1 for r in ok if r[2] is True) == 1
+    assert sum(1 for r in ok if r[2] is False) == 1
+    assert not marker_present_noncreating(tmp_path, run_id)
+
+
+def test_subprocess_conflicting_concurrent_disposition_execution(tmp_path):
+    from htr.ids import generate_marker_disposition_attempt_id
+
+    disposition_id, run_id, _claim = _prepare_disposition_execute_chain(tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    slots = [ctx.Queue(), ctx.Queue()]
+    procs = [
+        ctx.Process(
+            target=_subprocess_concurrent_disposition_execute_worker,
+            args=(
+                str(tmp_path),
+                disposition_id,
+                generate_marker_disposition_attempt_id(),
+                slots[i],
+                barrier,
+            ),
+        )
+        for i in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+    results = [_queue_get(slots[i]) for i in range(2)]
+    classes = [r[1] for r in results if r[0] == "ok"]
+    assert len(classes) == 2
+    assert "disposed_verified" in classes
+    assert "execution_ambiguous" in classes
+    assert not marker_present_noncreating(tmp_path, run_id)
+
+
+def _subprocess_crash_holding_flock_worker(
+    runs_root: str,
+    slot: Any,
+    start_gate: Any,
+) -> None:
+    from pathlib import Path
+
+    from htr.execution_lock import (
+        acquire_marker_directory_entry_coordination,
+        pin_lock_directory,
+    )
+
+    runs_fd, lock_fd = pin_lock_directory(Path(runs_root))
+    try:
+        acquire_marker_directory_entry_coordination(lock_fd)
+        slot.put("flock_held")
+        start_gate.wait(timeout=10)
+        os._exit(1)
+    finally:
+        os.close(lock_fd)
+        os.close(runs_fd)
+
+
+def test_subprocess_crash_holding_flock_releases_on_next_acquire(tmp_path):
+    run_id = new_run_id()
+    io.create_run_workspace(run_id, base_dir=tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    start_gate = ctx.Event()
+    slot = ctx.Queue()
+    proc = ctx.Process(
+        target=_subprocess_crash_holding_flock_worker,
+        args=(str(tmp_path), slot, start_gate),
+    )
+    proc.start()
+    assert slot.get(timeout=10) == "flock_held"
+    start_gate.set()
+    proc.join(timeout=10)
+    assert proc.exitcode == 1
+    with run_write_barrier(run_id, base_dir=tmp_path):
+        pass
+    assert not marker_present_noncreating(tmp_path, run_id)
+
+
+
+
+def test_thread_recursive_coordination_acquire_rejected(tmp_path):
+    runs_fd, lock_fd = pin_lock_directory(tmp_path)
+    try:
+        acquire_marker_directory_entry_coordination(lock_fd)
+        with pytest.raises(RunExecutionLockBoundaryViolationError, match="recursive"):
+            acquire_marker_directory_entry_coordination(lock_fd)
+        release_marker_directory_entry_coordination(lock_fd)
+    finally:
+        os.close(lock_fd)
+        os.close(runs_fd)
+
+
+def test_disposition_unlink_requires_coordination_held(tmp_path):
+    run_id = new_run_id()
+    with run_write_barrier(run_id, tmp_path):
+        entry = _el._thread_active_entry()
+        assert entry is not None
+        metadata, identity = read_marker_metadata_at(entry.lock_root_fd, run_id)
+        with pytest.raises(RunExecutionLockBoundaryViolationError, match="coordination required"):
+            disposition_unlink_marker(
+                entry.lock_root_fd,
+                run_id,
+                expected_identity=identity,
+                expected_acquisition_id=metadata["acquisition_id"],
+            )
+
+
+def _subprocess_disposition_exception_releases_flock_worker(
+    runs_root: str,
+    slot: Any,
+    start_gate: Any,
+) -> None:
+    from pathlib import Path
+
+    from htr.execution_lock import (
+        acquire_marker_directory_entry_coordination,
+        pin_lock_directory,
+        release_marker_directory_entry_coordination,
+    )
+
+    runs_fd, lock_fd = pin_lock_directory(Path(runs_root))
+    try:
+        acquire_marker_directory_entry_coordination(lock_fd)
+        slot.put("flock_held")
+        start_gate.set()
+        raise RuntimeError("simulated disposition failure")
+    except RuntimeError:
+        release_marker_directory_entry_coordination(lock_fd)
+        slot.put("released")
+    finally:
+        os.close(lock_fd)
+        os.close(runs_fd)
+
+
+def test_subprocess_disposition_exception_releases_flock(tmp_path):
+    run_id = new_run_id()
+    io.create_run_workspace(run_id, base_dir=tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    start_gate = ctx.Event()
+    slot = ctx.Queue()
+    proc = ctx.Process(
+        target=_subprocess_disposition_exception_releases_flock_worker,
+        args=(str(tmp_path), slot, start_gate),
+    )
+    proc.start()
+    assert slot.get(timeout=10) == "flock_held"
+    start_gate.wait(timeout=5)
+    proc.join(timeout=10)
+    assert proc.exitcode == 0
+    assert slot.get(timeout=5) == "released"
+    with run_write_barrier(run_id, base_dir=tmp_path):
+        pass
+    assert not marker_present_noncreating(tmp_path, run_id)
+
+
+def test_owned_release_uses_nonrecursive_coordination(tmp_path):
+    run_id = new_run_id()
+    with run_write_barrier(run_id, tmp_path):
+        entry = _el._thread_active_entry()
+        assert entry is not None
+        acquire_marker_directory_entry_coordination(entry.lock_root_fd)
+        try:
+            with pytest.raises(RunExecutionLockBoundaryViolationError, match="recursive"):
+                acquire_marker_directory_entry_coordination(entry.lock_root_fd)
+        finally:
+            release_marker_directory_entry_coordination(entry.lock_root_fd)
+
+
+def test_disposition_flock_reacquire_after_execute(tmp_path):
+    """Directory flock is released after disposition execute — re-acquire succeeds."""
+    disposition_id, run_id, _claim = _prepare_disposition_execute_chain(tmp_path)
+    from htr.ids import generate_marker_disposition_attempt_id
+    from htr.execution_lock import (
+        acquire_marker_directory_entry_coordination,
+        pin_lock_directory,
+        release_marker_directory_entry_coordination,
+    )
+    from htr.finalization import SealEvaluation, SealState
+    from htr.marker_disposition import execute_approved_marker_disposition
+
+    with patch(
+        "htr.marker_disposition.evaluate_run_seal",
+        return_value=SealEvaluation(SealState.FINALIZED_VALID, (), run_id),
+    ):
+        result = execute_approved_marker_disposition(
+            disposition_id,
+            generate_marker_disposition_attempt_id(),
+            executor="executor",
+            base_dir=tmp_path,
+        )
+    assert result.outcome_class == "disposed_verified"
+    runs_fd, lock_fd = pin_lock_directory(tmp_path)
+    try:
+        acquire_marker_directory_entry_coordination(lock_fd)
+        release_marker_directory_entry_coordination(lock_fd)
+    finally:
+        os.close(lock_fd)
+        os.close(runs_fd)
+
+
+def test_disposition_marker_replacement_before_unlink_fails_closed(tmp_path):
+    disposition_id, run_id, _claim = _prepare_disposition_execute_chain(tmp_path)
+    from htr.ids import generate_marker_disposition_attempt_id
+    from htr.finalization import SealEvaluation, SealState
+    from htr.marker_disposition import execute_approved_marker_disposition
+
+    marker_path = tmp_path / LOCKS_DIR_NAME / f"{run_id}.marker"
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    payload["acquisition_id"] = str(uuid.uuid4())
+    marker_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    with patch(
+        "htr.marker_disposition.evaluate_run_seal",
+        return_value=SealEvaluation(SealState.FINALIZED_VALID, (), run_id),
+    ):
+        result = execute_approved_marker_disposition(
+            disposition_id,
+            generate_marker_disposition_attempt_id(),
+            executor="executor",
+            base_dir=tmp_path,
+        )
+    assert result.outcome_class == "marker_changed"
+    assert marker_present_noncreating(tmp_path, run_id)

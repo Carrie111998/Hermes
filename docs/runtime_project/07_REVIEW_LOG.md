@@ -2,6 +2,38 @@
 
 ---
 
+## 2026-07-28 — Task 26C: Approved marker disposition (Path A — checkpoint approved and complete)
+
+**Implementer:** Cursor (isolated candidate tree `/home/unaliu/task26c-candidate/`; parent `a40ec2d0`)
+**Scope:** `htr/marker_disposition.py` (NEW), `htr/execution_lock.py`, `htr/paths.py`, `htr/ids.py`, `htr/state.py`, `htr/__init__.py`, `tests/htr/test_marker_disposition.py` (NEW), `tests/htr/test_execution_lock.py`, runtime docs (5 files)
+**Production Runtime modified:** Yes — Path A marker disposition control API + coordination flock on `.execution_locks` directory fd
+**Marker mutation:** Yes — **only** via approved `execute_approved_marker_disposition` under coordination flock (Path A high-risk protocol)
+**Task 26A:** Closed
+**Task 26B:** Checkpoint approved and complete
+**Task 26C checkpoint:** **Path-A v1 approved and complete**
+**Task 27/28:** Not started
+**Entire Task 26:** Complete for approved v1 scope (Path B deferred)
+**Verification:** focused marker-disposition + execution-lock **226 passed**; full explicit 30-file HTR manifest **2051 passed**; 0 failed; 0 skipped; 0 FLAKY; 0 retries (`HERMES_TEST_FILE_RETRIES=0`)
+
+### Contract
+
+- Public APIs: `create_marker_disposition_request`, `issue_marker_disposition_approval`, `revoke_marker_disposition_approval`, `claim_marker_disposition_approval`, `execute_approved_marker_disposition`, `load_marker_disposition_bundle`, `reconcile_marker_disposition_outcome`
+- Storage: `{runs_root}/.control/marker_dispositions/{disposition_id}/` with immutable O_EXCL records
+- **Path A only** — marker disposition available only through the approved high-risk protocol
+- 15-minute max approval lifetime; ten outcome classes; all outcome non-permission booleans remain `false`
+- Coordination: `fcntl.flock(LOCK_EX)` on pinned `.execution_locks` directory fd with documented lock-order contract
+- Task 26B reconciliation records are read-only inputs; not mutated by disposition
+- **No** generic unlock, stale takeover, force, retry, repair, invoke, Recovery Run creation, or outcome-rewrite authority
+- Successful marker disposition does **not** grant ordinary Run mutation authority; finalized-run immutability remains enforced
+
+### Explicitly not implemented
+
+- Path B marker disposition (deferred and unimplemented)
+- Retry, repair, invoke, Recovery/Successor Runs, outcome rewrite, CLI
+- Task 27/28
+
+---
+
 ## 2026-07-25 — Task 26B: Durable reconciliation cases (checkpoint approved)
 
 **Implementer:** Cursor (isolated candidate tree; parent `8de2b29b`)

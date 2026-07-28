@@ -508,6 +508,165 @@ class ReconciliationCaseBundle:
     decision_record: ReconciliationDecisionRecord | None
 
 
+ERROR_CODE_MARKER_DISPOSITION_VALIDATION: Final = "MARKER_DISPOSITION_VALIDATION_FAILED"
+ERROR_CODE_MARKER_DISPOSITION_CONFLICT: Final = "MARKER_DISPOSITION_CONFLICT"
+ERROR_CODE_MARKER_DISPOSITION_STATE: Final = "MARKER_DISPOSITION_ILLEGAL_STATE"
+ERROR_CODE_MARKER_DISPOSITION_DURABILITY: Final = "MARKER_DISPOSITION_DURABILITY_FAILED"
+
+
+MarkerDispositionDurabilityStage = Literal[
+    "record_write",
+    "record_fsync",
+    "disposition_dir_fsync",
+    "control_dir_fsync",
+    "parent_dir_fsync",
+    "lock_directory_fsync",
+]
+
+MarkerDispositionRecordName = Literal[
+    "request.json",
+    "issue.json",
+    "revoke.json",
+    "claim.json",
+    "attempt.json",
+    "outcome.json",
+]
+
+
+class MarkerDispositionStateError(HTRStateError):
+    """Base error for Task 26C marker disposition operations."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = ERROR_CODE_MARKER_DISPOSITION_STATE,
+        disposition_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.disposition_id = disposition_id
+
+
+class MarkerDispositionValidationError(MarkerDispositionStateError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_MARKER_DISPOSITION_VALIDATION, **kwargs)
+
+
+class MarkerDispositionConflictError(MarkerDispositionStateError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_MARKER_DISPOSITION_CONFLICT, **kwargs)
+
+
+class MarkerDispositionDurabilityError(MarkerDispositionStateError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        disposition_id: str,
+        record_name: MarkerDispositionRecordName,
+        durability_stage: MarkerDispositionDurabilityStage,
+        record_may_have_committed: bool,
+        exact_replay_status: ExactReplayStatus,
+        marker_may_have_been_removed: bool = False,
+        marker_directory_durability_indeterminate: bool = False,
+    ) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_MARKER_DISPOSITION_DURABILITY,
+            disposition_id=disposition_id,
+        )
+        self.record_name = record_name
+        self.durability_stage = durability_stage
+        self.record_may_have_committed = record_may_have_committed
+        self.exact_replay_status = exact_replay_status
+        self.marker_may_have_been_removed = marker_may_have_been_removed
+        self.marker_directory_durability_indeterminate = marker_directory_durability_indeterminate
+
+
+@dataclass(frozen=True)
+class MarkerDispositionWriteMetadata:
+    exact_replay: bool
+    exact_replay_status: ExactReplayStatus
+    record_may_have_committed: bool
+    durability_indeterminate: bool
+
+
+@dataclass(frozen=True)
+class MarkerDispositionRequestRecord:
+    disposition_id: str
+    request_digest: str
+    reconciliation_case_id: str
+    run_id: str
+    requested_by: str
+    requested_at: str
+
+
+@dataclass(frozen=True)
+class MarkerDispositionIssueRecord:
+    disposition_id: str
+    disposition_approval_id: str
+    issue_digest: str
+    issued_by: str
+    issued_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class MarkerDispositionClaimRecord:
+    disposition_id: str
+    claim_id: str
+    claim_digest: str
+    claimant: str
+    claimed_at: str
+
+
+@dataclass(frozen=True)
+class MarkerDispositionAttemptRecord:
+    disposition_id: str
+    attempt_id: str
+    attempt_digest: str
+    executor: str
+    attempted_at: str
+
+
+@dataclass(frozen=True)
+class MarkerDispositionOutcomeRecord:
+    disposition_id: str
+    outcome_class: str
+    outcome_digest: str
+    recorded_at: str
+
+
+@dataclass(frozen=True)
+class MarkerDispositionBundle:
+    disposition_id: str
+    request_record: MarkerDispositionRequestRecord | None
+    issue_record: MarkerDispositionIssueRecord | None
+    revoke_record: dict[str, Any] | None
+    claim_record: MarkerDispositionClaimRecord | None
+    attempt_record: MarkerDispositionAttemptRecord | None
+    outcome_record: MarkerDispositionOutcomeRecord | None
+
+
+@dataclass(frozen=True)
+class MarkerDispositionExecutionResult:
+    disposition_id: str
+    outcome_class: str
+    outcome_digest: str
+    exact_replay: bool
+    marker_removed_by_this_execution: bool
+
+
+@dataclass(frozen=True)
+class MarkerDispositionReconcileResult:
+    disposition_id: str
+    classification: str
+    outcome_record: MarkerDispositionOutcomeRecord | None
+    marker_present: bool | None
+    notes: tuple[str, ...] = ()
+
+
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:
     """Return True when *to_status* is legal from *from_status*."""
     if from_status not in TASK_STATUSES or to_status not in TASK_STATUSES:

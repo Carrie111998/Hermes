@@ -1,16 +1,30 @@
-"""Run-scoped durable write marker and mutation boundary (Task 23)."""
+"""Run-scoped durable write marker and mutation boundary (Task 23–26C).
+
+Lock-order contract (non-recursive, no bypass flags):
+- run_write_barrier holds marker ownership for its lifetime but acquires directory
+  coordination (fcntl.flock) only briefly around marker create/release/cleanup.
+- disposition execution acquires coordination once on its pinned lock_root_fd,
+  calls disposition_unlink_marker and related helpers that require coordination
+  already held, and releases in finally on all paths.
+- No helper re-acquires coordination on the same directory identity in-process.
+"""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import functools
 import inspect
 import json
 import os
 import socket
+import stat
 import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+
+_coordination_state = threading.local()
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
@@ -248,6 +262,48 @@ def _close_fd_once(fd: int) -> None:
         pass
 
 
+
+
+def _coordination_identity(lock_root_fd: int) -> tuple[int, int]:
+    return lock_directory_identity(lock_root_fd)
+
+
+def _assert_marker_directory_coordination_held(lock_root_fd: int) -> None:
+    identity = _coordination_identity(lock_root_fd)
+    holder = getattr(_coordination_state, "holder", None)
+    if holder != identity:
+        raise RunExecutionLockBoundaryViolationError(
+            "marker directory coordination required"
+        )
+
+
+def _release_marker_success_locked(entry: _RegistryEntry) -> None:
+    """Release marker after successful body; coordination must already be held."""
+    _verify_entry_owner(entry)
+    _assert_marker_directory_coordination_held(entry.lock_root_fd)
+    if _fstat_identity(entry.marker_fd) != _stat_entry_identity(
+        entry.lock_root_fd, entry.marker_name
+    ):
+        raise RunExecutionLockReleaseConflictError(
+            "marker replaced before success release"
+        )
+    os.unlink(entry.marker_name, dir_fd=entry.lock_root_fd)
+    _fsync_dir_fd(entry.lock_root_fd)
+
+
+def _cleanup_owned_marker_locked(
+    lock_root_fd: int, marker_name: str, marker_fd: int
+) -> None:
+    """Pre-write cleanup; coordination must already be held."""
+    _assert_marker_directory_coordination_held(lock_root_fd)
+    if _fstat_identity(marker_fd) != _stat_entry_identity(lock_root_fd, marker_name):
+        raise RunExecutionLockReleaseConflictError(
+            "marker path identity mismatch during pre-write cleanup"
+        )
+    os.unlink(marker_name, dir_fd=lock_root_fd)
+    _fsync_dir_fd(lock_root_fd)
+
+
 def _fstat_identity(fd: int) -> tuple[int, int]:
     st = os.fstat(fd)
     return st.st_dev, st.st_ino
@@ -256,6 +312,120 @@ def _fstat_identity(fd: int) -> tuple[int, int]:
 def _stat_entry_identity(lock_root_fd: int, name: str) -> tuple[int, int]:
     st = os.stat(name, dir_fd=lock_root_fd, follow_symlinks=False)
     return st.st_dev, st.st_ino
+
+
+def _require_flock_support() -> None:
+    if not hasattr(fcntl, "flock"):
+        raise RunExecutionLockUnsupportedError(
+            "fcntl.flock is required for marker directory-entry coordination"
+        )
+
+
+@contextlib.contextmanager
+def _marker_directory_entry_coordination(lock_root_fd: int) -> Iterator[None]:
+    """Exclusive flock on pinned .execution_locks directory fd (Task 26C)."""
+    acquire_marker_directory_entry_coordination(lock_root_fd)
+    try:
+        yield
+    finally:
+        release_marker_directory_entry_coordination(lock_root_fd)
+
+
+def acquire_marker_directory_entry_coordination(lock_root_fd: int) -> None:
+    """Acquire exclusive marker-directory coordination (for disposition execution)."""
+    _require_flock_support()
+    identity = _coordination_identity(lock_root_fd)
+    holder = getattr(_coordination_state, "holder", None)
+    if holder is not None:
+        if holder == identity:
+            raise RunExecutionLockBoundaryViolationError(
+                "recursive marker directory coordination acquire"
+            )
+        raise RunExecutionLockBoundaryViolationError(
+            "marker directory coordination already held on different directory"
+        )
+    try:
+        fcntl.flock(lock_root_fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        raise RunExecutionLockIndeterminateError(
+            f"marker directory coordination lock failed: {exc}"
+        ) from exc
+    _coordination_state.holder = identity
+
+
+def release_marker_directory_entry_coordination(lock_root_fd: int) -> None:
+    """Release marker-directory coordination after unlink + dir fsync."""
+    _require_flock_support()
+    identity = _coordination_identity(lock_root_fd)
+    holder = getattr(_coordination_state, "holder", None)
+    if holder != identity:
+        raise RunExecutionLockBoundaryViolationError(
+            "marker directory coordination release without matching acquire"
+        )
+    try:
+        fcntl.flock(lock_root_fd, fcntl.LOCK_UN)
+    except OSError as exc:
+        raise RunExecutionLockIndeterminateError(
+            f"marker directory coordination unlock failed: {exc}"
+        ) from exc
+    _coordination_state.holder = None
+
+
+def pin_lock_directory(base_dir: Path | None) -> tuple[int, int]:
+    """Return (runs_root_fd, lock_root_fd) for disposition; caller must close both."""
+    return _bootstrap_and_pin(base_dir)
+
+
+def lock_directory_identity(lock_root_fd: int) -> tuple[int, int]:
+    return _fstat_identity(lock_root_fd)
+
+
+def read_marker_metadata_at(
+    lock_root_fd: int,
+    run_id: str,
+) -> tuple[dict[str, Any], tuple[int, int]]:
+    """Read marker JSON and (st_dev, st_ino) via no-follow dir-fd access."""
+    marker_name = _marker_name(run_id)
+    try:
+        st = os.stat(marker_name, dir_fd=lock_root_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise RunExecutionLockIndeterminateError("marker not present") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise RunExecutionLockPathUnsafeError("marker is not a regular file")
+    flags = _O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC
+    fd = os.open(marker_name, flags, dir_fd=lock_root_fd)
+    try:
+        identity = _fstat_identity(fd)
+        if identity != (st.st_dev, st.st_ino):
+            raise RunExecutionLockReleaseConflictError("marker identity mismatch on open")
+        payload = os.read(fd, 65536)
+        metadata = json.loads(payload.decode("utf-8"))
+        if not isinstance(metadata, dict):
+            raise RunExecutionLockPathUnsafeError("marker metadata is not an object")
+        return metadata, identity
+    finally:
+        _close_fd_once(fd)
+
+
+def disposition_unlink_marker(
+    lock_root_fd: int,
+    run_id: str,
+    *,
+    expected_identity: tuple[int, int],
+    expected_acquisition_id: str,
+) -> None:
+    """Identity-checked unlink under coordination; caller must hold coordination flock."""
+    _assert_marker_directory_coordination_held(lock_root_fd)
+    marker_name = _marker_name(run_id)
+    metadata, identity = read_marker_metadata_at(lock_root_fd, run_id)
+    if identity != expected_identity:
+        raise RunExecutionLockReleaseConflictError("marker identity changed before unlink")
+    if metadata.get("acquisition_id") != expected_acquisition_id:
+        raise RunExecutionLockReleaseConflictError("marker acquisition_id mismatch")
+    if metadata.get("run_id") != run_id:
+        raise RunExecutionLockReleaseConflictError("marker run_id mismatch")
+    os.unlink(marker_name, dir_fd=lock_root_fd)
+    _fsync_dir_fd(lock_root_fd)
 
 
 def _thread_active_entry() -> _RegistryEntry | None:
@@ -389,45 +559,42 @@ def _write_marker_metadata(fd: int, payload: dict[str, Any]) -> None:
 
 def _acquire_marker(lock_root_fd: int, run_id: str) -> tuple[int, str, str]:
     marker_name = _marker_name(run_id)
-    if _stat_marker_present(lock_root_fd, marker_name):
-        raise RunExecutionLockOccupiedError(run_id=run_id)
+    with _marker_directory_entry_coordination(lock_root_fd):
+        if _stat_marker_present(lock_root_fd, marker_name):
+            raise RunExecutionLockOccupiedError(run_id=run_id)
 
-    flags = _O_CREAT | _O_EXCL | _O_WRONLY | _O_NOFOLLOW | _O_CLOEXEC
-    try:
-        marker_fd = os.open(marker_name, flags, MARKER_MODE, dir_fd=lock_root_fd)
-    except FileExistsError as exc:
-        raise RunExecutionLockOccupiedError(run_id=run_id) from exc
-    except OSError as exc:
-        raise RunExecutionLockIndeterminateError(
-            f"marker acquisition failed: {exc}", run_id=run_id
-        ) from exc
+        flags = _O_CREAT | _O_EXCL | _O_WRONLY | _O_NOFOLLOW | _O_CLOEXEC
+        try:
+            marker_fd = os.open(marker_name, flags, MARKER_MODE, dir_fd=lock_root_fd)
+        except FileExistsError as exc:
+            raise RunExecutionLockOccupiedError(run_id=run_id) from exc
+        except OSError as exc:
+            raise RunExecutionLockIndeterminateError(
+                f"marker acquisition failed: {exc}", run_id=run_id
+            ) from exc
 
-    token = str(uuid.uuid4())
-    metadata = {
-        "schema_version": "1",
-        "acquisition_id": token,
-        "pid": os.getpid(),
-        "hostname": socket.gethostname(),
-        "run_id": run_id,
-    }
-    try:
-        _write_marker_metadata(marker_fd, metadata)
-        _fsync_file_fd(marker_fd)
-        _fsync_dir_fd(lock_root_fd)
-    except Exception:
-        _cleanup_owned_marker(lock_root_fd, marker_name, marker_fd)
-        raise
-    return marker_fd, token, marker_name
+        token = str(uuid.uuid4())
+        metadata = {
+            "schema_version": "1",
+            "acquisition_id": token,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "run_id": run_id,
+        }
+        try:
+            _write_marker_metadata(marker_fd, metadata)
+            _fsync_file_fd(marker_fd)
+            _fsync_dir_fd(lock_root_fd)
+        except Exception:
+            _cleanup_owned_marker(lock_root_fd, marker_name, marker_fd)
+            raise
+        return marker_fd, token, marker_name
 
 
 def _cleanup_owned_marker(lock_root_fd: int, marker_name: str, marker_fd: int) -> None:
     try:
-        if _fstat_identity(marker_fd) != _stat_entry_identity(lock_root_fd, marker_name):
-            raise RunExecutionLockReleaseConflictError(
-                "marker path identity mismatch during pre-write cleanup"
-            )
-        os.unlink(marker_name, dir_fd=lock_root_fd)
-        _fsync_dir_fd(lock_root_fd)
+        with _marker_directory_entry_coordination(lock_root_fd):
+            _cleanup_owned_marker_locked(lock_root_fd, marker_name, marker_fd)
     except RunExecutionLockError:
         raise
     except OSError as exc:
@@ -462,14 +629,8 @@ def _verify_entry_owner(entry: _RegistryEntry) -> None:
 def _release_marker_success(entry: _RegistryEntry) -> None:
     _verify_entry_owner(entry)
     try:
-        if _fstat_identity(entry.marker_fd) != _stat_entry_identity(
-            entry.lock_root_fd, entry.marker_name
-        ):
-            raise RunExecutionLockReleaseConflictError(
-                "marker replaced before success release"
-            )
-        os.unlink(entry.marker_name, dir_fd=entry.lock_root_fd)
-        _fsync_dir_fd(entry.lock_root_fd)
+        with _marker_directory_entry_coordination(entry.lock_root_fd):
+            _release_marker_success_locked(entry)
     except RunExecutionLockError:
         raise
     except OSError as exc:

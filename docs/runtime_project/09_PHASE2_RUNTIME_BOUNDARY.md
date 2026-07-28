@@ -1,6 +1,6 @@
 # Phase 2 — Runtime Integration Boundary
 
-**Status:** Phase 2 **implementation in progress** (Task 19 `57a1ed651`; Task 21 action plan ✅; Task 22 immutable seal ✅; Task 23 write barrier ✅); architecture checkpoint Task 20 (Policy C). **Updated:** 2026-07-25 (Task 26B checkpoint approved and complete; Task 26C not started; Task 27/28 not started; entire Task 26 not complete)
+**Status:** Phase 2 **implementation in progress** (Task 19 `57a1ed651`; Task 21 action plan ✅; Task 22 immutable seal ✅; Task 23 write barrier ✅); architecture checkpoint Task 20 (Policy C). **Updated:** 2026-07-28 (Task 26C Path-A v1 checkpoint approved and complete; Task 26 complete for approved v1 scope; Path B deferred; Task 27/28 not started)
 **Date:** 2026-07-19 (planning); **updated** 2026-07-21 (Tasks 19–23)
 **Depends on:** Phase 1 closed — Task 17.1 `8fea4daa0`; baseline Git-reproducible at Task 18.5 `04b11bc4d`
 **Audience:** Architect + Cursor implementer
@@ -126,7 +126,9 @@ Runtime must not append events or write SoT directly. Writes only through allowl
 
 **Task 26A read-only reconciliation inspection (checkpoint approved — complete):** `inspect_run_completion_reconciliation` for the Task 25 `complete_run_manually` pilot only. Inspects approval/control evidence, read-only marker metadata, and lifecycle JSON/event/manifest correspondence; returns derived `RunCompletionReconciliationInspection` with independent axes and `overall_classification`. Always `safe_to_retry=false` and `marker_disposition_allowed=false`. Literal read-only — no marker bootstrap/acquire/disposition, no invoke/retry/repair. Semantic digest `htr.reconciliation.inspection.digest.v1`.
 
-**Task 26B durable reconciliation cases (checkpoint approved and complete):** Control store at `{runs_root}/.control/reconciliation/{case_id}/` with immutable O_EXCL records (`open.json`, `observation.json`, `decision.json`). Public APIs: `generate_reconciliation_case_id`, `open_reconciliation_case`, `record_reconciliation_observation`, `record_reconciliation_decision`, `load_reconciliation_case`. Observation persists proven Task 26A inspection projection; decision-time revalidation with drift detection; policy-derived decision classes. **Decisions grant reconciliation posture only**; all six non-permission booleans (`safe_to_retry`, `marker_disposition_allowed`, `invoke_allowed`, `repair_allowed`, `recovery_run_creation_allowed`, `outcome_rewrite_allowed`) remain **`false`**. Does **not** acquire execution marker, call `begin_run_write`, invoke, repair, create Recovery Runs, or rewrite outcomes. **Task 26C** (marker disposition protocol) **not started and not approved**. Marker disposition **remains prohibited**. Existing markers remain `occupied_unknown` to normal writers.
+**Task 26B durable reconciliation cases (checkpoint approved and complete):** Control store at `{runs_root}/.control/reconciliation/{case_id}/` with immutable O_EXCL records (`open.json`, `observation.json`, `decision.json`). Public APIs: `generate_reconciliation_case_id`, `open_reconciliation_case`, `record_reconciliation_observation`, `record_reconciliation_decision`, `load_reconciliation_case`. Observation persists proven Task 26A inspection projection; decision-time revalidation with drift detection; policy-derived decision classes. **Decisions grant reconciliation posture only**; all six non-permission booleans remain **`false`**. Does **not** acquire execution marker, call `begin_run_write`, invoke, repair, create Recovery Runs, or rewrite outcomes.
+
+**Task 26C approved marker disposition (Path A — checkpoint approved and complete):** Control store at `{runs_root}/.control/marker_dispositions/{disposition_id}/` with immutable records (`request.json`, `issue.json`, `revoke.json`, `claim.json`, `attempt.json`, `outcome.json`). Public APIs: `create_marker_disposition_request`, `issue_marker_disposition_approval`, `revoke_marker_disposition_approval`, `claim_marker_disposition_approval`, `execute_approved_marker_disposition`, `load_marker_disposition_bundle`, `reconcile_marker_disposition_outcome`. **Path A only** — requires Task 26B decision `case_closed_deferred_to_protocol` with `marker_disposition_review`. Coordination via `fcntl.flock(LOCK_EX)` on pinned `.execution_locks` directory fd; 15-minute max approval lifetime; ten outcome classes; all permission booleans remain **`false`**. Marker removal **only** via approved execution under coordination flock. Does **not** mutate Task 26B reconciliation records. Retry, repair, invoke, Recovery Run creation, and outcome rewrite **remain prohibited**. Task 27/28 **not started**.
 
 Ambiguous outcomes include: not started; completed and verified; failed before mutation; may-have-completed (lost ack); SoT/event disagree; post-write verification failed; escalation required.
 
@@ -173,7 +175,7 @@ read-only observability          ← Task 19 ✅
 → human-gated single-API invoke  ← Task 25 ✅ (`c6a9e305`)
 → read-only reconciliation inspection ← Task 26A ✅ (closed)
 → durable reconciliation cases ← Task 26B ✅ (checkpoint approved and complete)
-→ marker disposition ← Task 26C (not started; not approved)
+→ marker disposition ← Task 26C ✅ (Path-A v1 checkpoint approved and complete)
 → Recovery/Successor Run protocol ← Task 27 (not started)
 → bounded retry and repair       ← Task 28 (not started)
 → selective unattended automation
@@ -212,8 +214,8 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 | 25 | Human-gated single-API invoke pilot | ✅ `c6a9e305` |
 | 26A | Read-only reconciliation inspection | ✅ Closed (checkpoint approved) |
 | 26B | Durable reconciliation cases | ✅ Checkpoint approved and complete |
-| 26C | Marker disposition protocol | Not started; not approved |
-| 26 | Execution reconciliation (umbrella) | Incomplete (26A/26B done; 26C pending) |
+| 26C | Marker disposition protocol | ✅ Path-A v1 checkpoint approved and complete |
+| 26 | Execution reconciliation (umbrella) | ✅ Complete for approved v1 scope (26A/26B/26C Path A done; Path B deferred) |
 | 27 | Recovery/Successor Run protocol | Not started |
 | 28 | Bounded retry/repair framework | Not started |
 | 29 | Advisory artifact/link inspection | |
@@ -231,8 +233,8 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 - Task 24 **checkpointed** — authoritative approval control delivered.
 - Task 25 **checkpointed** (`c6a9e305`) — narrow `complete_run_manually` pilot only.
 - Task 26A **closed** (checkpoint approved) — read-only reconciliation inspection complete.
-- Task 26B **checkpoint approved and complete** — durable reconciliation case control records; decisions grant reconciliation posture only; all six non-permission booleans remain `false`; marker disposition, retry, repair, invoke, Recovery Run creation, and outcome rewrite **remain prohibited**.
-- Task 26C **not started and not approved** — entire Task 26 not complete.
-- Task 27/28 **not started**.
+- Task 26B **checkpoint approved and complete** — durable reconciliation case control records; decisions grant reconciliation posture only; all six non-permission booleans remain `false`.
+- Task 26C **Path-A v1 checkpoint approved and complete** (Path A marker disposition only) — coordination flock + immutable disposition records; retry, repair, invoke, Recovery Run creation, and outcome rewrite **remain prohibited** outside Path A.
+- Task 26 **complete for approved v1 scope** (Path B deferred); Task 27/28 **not started**.
 - No general Phase 2 lifecycle invoke path is enabled outside the Task 25 pilot API.
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.

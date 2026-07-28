@@ -110,6 +110,44 @@ def reconciliation_decision_path(case_id: str, base_dir: Path | None = None) -> 
     return reconciliation_case_dir(case_id, base_dir) / "decision.json"
 
 
+MARKER_DISPOSITIONS_DIR_NAME = "marker_dispositions"
+
+
+def control_marker_dispositions_root(base_dir: Path | None = None) -> Path:
+    return control_root(base_dir) / MARKER_DISPOSITIONS_DIR_NAME
+
+
+def marker_disposition_dir(disposition_id: str, base_dir: Path | None = None) -> Path:
+    _validate_path_component(disposition_id, "disposition_id")
+    if not validate_id(disposition_id, "marker_disposition"):
+        raise ValueError(f"invalid disposition_id format: {disposition_id!r}")
+    return control_marker_dispositions_root(base_dir) / disposition_id
+
+
+def marker_disposition_request_path(disposition_id: str, base_dir: Path | None = None) -> Path:
+    return marker_disposition_dir(disposition_id, base_dir) / "request.json"
+
+
+def marker_disposition_issue_path(disposition_id: str, base_dir: Path | None = None) -> Path:
+    return marker_disposition_dir(disposition_id, base_dir) / "issue.json"
+
+
+def marker_disposition_revoke_path(disposition_id: str, base_dir: Path | None = None) -> Path:
+    return marker_disposition_dir(disposition_id, base_dir) / "revoke.json"
+
+
+def marker_disposition_claim_path(disposition_id: str, base_dir: Path | None = None) -> Path:
+    return marker_disposition_dir(disposition_id, base_dir) / "claim.json"
+
+
+def marker_disposition_attempt_path(disposition_id: str, base_dir: Path | None = None) -> Path:
+    return marker_disposition_dir(disposition_id, base_dir) / "attempt.json"
+
+
+def marker_disposition_outcome_path(disposition_id: str, base_dir: Path | None = None) -> Path:
+    return marker_disposition_dir(disposition_id, base_dir) / "outcome.json"
+
+
 def reports_dir(run_id: str, base_dir: Path | None = None) -> Path:
     return run_root(run_id, base_dir) / "reports"
 
