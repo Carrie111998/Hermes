@@ -1301,6 +1301,100 @@ class TestCrossTenantAttackVectors:
         assert ok is False, "cross-org completion must be rejected"
 
 
+# ---------------------------------------------------------------------------
+# 9. Workspace management tests
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceManagement:
+    """Workspace lifecycle within a tenant."""
+
+    def test_create_workspace(self, pg):
+        from hermes_cli.postgres_authority import (
+            create_workspace, get_workspace, DEFAULT_TENANT_ID,
+        )
+        from uuid import UUID
+
+        ws_id = UUID("f0f0f0f0-f0f0-f0f0-f0f0-f0f0f0f0f0f0")
+        ok = create_workspace(
+            pg, workspace_id=ws_id, tenant_id=DEFAULT_TENANT_ID,
+            name="Engineering", slug="engineering", owner_id="ceo-1",
+        )
+        assert ok is True
+
+        ws = get_workspace(pg, workspace_id=ws_id, tenant_id=DEFAULT_TENANT_ID)
+        assert ws is not None
+        assert ws["name"] == "Engineering"
+        assert ws["slug"] == "engineering"
+        assert ws["active"] is True
+
+    def test_create_workspace_idempotent(self, pg):
+        from hermes_cli.postgres_authority import create_workspace, DEFAULT_TENANT_ID
+        from uuid import UUID
+
+        ws_id = UUID("f1f1f1f1-f1f1-f1f1-f1f1-f1f1f1f1f1f1")
+        assert create_workspace(
+            pg, workspace_id=ws_id, tenant_id=DEFAULT_TENANT_ID,
+            name="Sales", slug="sales",
+        ) is True
+        assert create_workspace(
+            pg, workspace_id=ws_id, tenant_id=DEFAULT_TENANT_ID,
+            name="Sales", slug="sales",
+        ) is False
+
+    def test_workspace_tenant_scoped(self, pg):
+        """Workspace lookup with wrong tenant returns None."""
+        from hermes_cli.postgres_authority import (
+            create_workspace, get_workspace, create_tenant, DEFAULT_TENANT_ID,
+        )
+        from uuid import UUID
+
+        tenant_a = DEFAULT_TENANT_ID
+        tenant_b = UUID("f2f2f2f2-f2f2-f2f2-f2f2-f2f2f2f2f2f2")
+        create_tenant(pg, tenant_id=tenant_b, slug="ws-test-tenant")
+
+        ws_id = UUID("f3f3f3f3-f3f3-f3f3-f3f3-f3f3f3f3f3f3")
+        create_workspace(
+            pg, workspace_id=ws_id, tenant_id=tenant_a,
+            name="Private", slug="private",
+        )
+        # Correct tenant finds it
+        assert get_workspace(pg, workspace_id=ws_id, tenant_id=tenant_a) is not None
+        # Wrong tenant does not
+        assert get_workspace(pg, workspace_id=ws_id, tenant_id=tenant_b) is None
+
+    def test_list_workspaces_returns_active_only(self, pg):
+        from hermes_cli.postgres_authority import (
+            create_workspace, list_workspaces, deactivate_workspace,
+            DEFAULT_TENANT_ID,
+        )
+        from uuid import UUID
+
+        ws1 = UUID("f4f4f4f4-f4f4-f4f4-f4f4-f4f4f4f4f4f4")
+        ws2 = UUID("f5f5f5f5-f5f5-f5f5-f5f5-f5f5f5f5f5f5")
+        create_workspace(
+            pg, workspace_id=ws1, tenant_id=DEFAULT_TENANT_ID,
+            name="Active WS", slug="active-ws",
+        )
+        create_workspace(
+            pg, workspace_id=ws2, tenant_id=DEFAULT_TENANT_ID,
+            name="Deactivated WS", slug="deactivated-ws",
+        )
+        deactivate_workspace(pg, workspace_id=ws2, tenant_id=DEFAULT_TENANT_ID)
+
+        workspaces = list_workspaces(pg, tenant_id=DEFAULT_TENANT_ID)
+        slugs = [w["slug"] for w in workspaces]
+        assert "active-ws" in slugs
+        assert "deactivated-ws" not in slugs
+
+    def test_default_workspace_seeded(self, pg):
+        from hermes_cli.postgres_authority import list_workspaces, DEFAULT_TENANT_ID
+
+        workspaces = list_workspaces(pg, tenant_id=DEFAULT_TENANT_ID)
+        slugs = [w["slug"] for w in workspaces]
+        assert "default" in slugs
+
+
 # Note: Authority-store capability contract tests (postgres backend recognition,
 # SQLite multi-host rejection, unknown backend fail-closed) live in:
 #   tests/hermes_cli/test_authority_store.py

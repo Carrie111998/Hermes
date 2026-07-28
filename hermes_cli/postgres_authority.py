@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -229,6 +229,38 @@ _MIGRATIONS: list[tuple[int, str]] = [
         -- Seed the default tenant so existing rows satisfy FK if added later.
         INSERT INTO tenants (id, slug, name)
         VALUES ('00000000-0000-0000-0000-000000000000', 'default', 'Default Tenant')
+        ON CONFLICT (id) DO NOTHING;
+        """,
+    ),
+    # v4 → v5: workspaces table for multi-workspace isolation within a tenant.
+    (
+        4,
+        """
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id              UUID        PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            name            TEXT        NOT NULL,
+            slug            TEXT        NOT NULL,
+            owner_id        TEXT        NOT NULL DEFAULT '',
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            active          BOOLEAN     NOT NULL DEFAULT true,
+
+            CONSTRAINT uq_workspaces_tenant_slug UNIQUE (tenant_id, slug)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workspaces_tenant
+            ON workspaces(tenant_id);
+
+        -- Seed the default workspace for the default tenant.
+        INSERT INTO workspaces (id, tenant_id, name, slug, owner_id)
+        VALUES (
+            '00000000-0000-0000-0000-000000000001',
+            '00000000-0000-0000-0000-000000000000',
+            'Default Workspace',
+            'default',
+            ''
+        )
         ON CONFLICT (id) DO NOTHING;
         """,
     ),
@@ -1237,6 +1269,86 @@ def check_tenant_claim_quota(
 
 
 # ---------------------------------------------------------------------------
+# Workspace management
+# ---------------------------------------------------------------------------
+
+
+def create_workspace(
+    conn: "psycopg.Connection",
+    *,
+    workspace_id: UUID,
+    tenant_id: UUID,
+    name: str,
+    slug: str,
+    owner_id: str = "",
+) -> bool:
+    """Create a workspace within a tenant. Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO workspaces (id, tenant_id, name, slug, owner_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            """,
+            (str(workspace_id), str(tenant_id), name, slug, owner_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+
+
+def get_workspace(
+    conn: "psycopg.Connection",
+    *,
+    workspace_id: UUID,
+    tenant_id: UUID,
+) -> Optional[dict[str, Any]]:
+    """Look up a workspace by ID, scoped to the correct tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM workspaces WHERE id = %s AND tenant_id = %s",
+            (str(workspace_id), str(tenant_id)),
+        )
+        return cur.fetchone()
+
+
+def list_workspaces(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+) -> list[dict[str, Any]]:
+    """List all active workspaces for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM workspaces WHERE tenant_id = %s AND active = true ORDER BY name",
+            (str(tenant_id),),
+        )
+        return cur.fetchall()
+
+
+def deactivate_workspace(
+    conn: "psycopg.Connection",
+    *,
+    workspace_id: UUID,
+    tenant_id: UUID,
+) -> bool:
+    """Deactivate a workspace (soft-delete)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE workspaces SET active = false, updated_at = NOW()
+            WHERE id = %s AND tenant_id = %s AND active = true
+            RETURNING id
+            """,
+            (str(workspace_id), str(tenant_id)),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+
+
+# ---------------------------------------------------------------------------
 # Environment / backend detection
 # ---------------------------------------------------------------------------
 
@@ -1289,6 +1401,10 @@ __all__ = [
     "suspend_tenant",
     "activate_tenant",
     "check_tenant_claim_quota",
+    "create_workspace",
+    "get_workspace",
+    "list_workspaces",
+    "deactivate_workspace",
     "get_authority_backend",
     "get_authority_connection",
     "DEFAULT_TENANT_ID",
