@@ -12,6 +12,8 @@ empty ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes.
 
 from __future__ import annotations
 
+import multiprocessing
+import time
 from pathlib import Path
 
 import pytest
@@ -101,3 +103,91 @@ def test_reentrant_same_path_lock_is_exclusive(conn):
         assert held_a is True
         with kb._dispatch_tick_lock(db_path) as held_b:
             assert held_b is False, "same-board lock must be exclusive"
+
+
+def test_write_txn_shares_the_dispatch_tick_lock_in_process(conn):
+    """``write_txn`` must take the *same* lock file as ``_dispatch_tick_lock``.
+
+    Regression for the gap described in FASE2_escopo_correcao.md: dashboard/
+    CLI writes (which go through ``write_txn``) previously had no cross-
+    process serialization against the dispatcher tick. This does not
+    exercise real OS-level blocking (see the multiprocessing test below for
+    that); it pins the invariant that both code paths resolve to the exact
+    same lock file for a given board, which is what makes them mutually
+    exclusive across processes.
+    """
+    db_path = kb.kanban_db_path(board="default")
+    dispatch_lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    resolved = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+    write_lock_path = resolved.with_name(resolved.name + ".dispatch.lock")
+    assert write_lock_path == dispatch_lock_path.resolve()
+
+    kb.create_task(conn, title="t", assignee="w")
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("lock-test", "test", None, 0),
+        )
+
+
+def _hold_dispatch_lock_then_signal(db_path_str, ready_evt, release_evt):
+    """Child process: acquire the board's dispatch lock and hold it."""
+    import fcntl
+
+    db_path = Path(db_path_str)
+    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    ready_evt.set()
+    release_evt.wait(timeout=10)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+def test_write_txn_blocks_behind_a_cross_process_dispatch_lock_holder(conn):
+    """A ``write_txn`` must block while another OS process holds the lock."""
+    db_path = kb.kanban_db_path(board="default")
+    kb.create_task(conn, title="t", assignee="w")
+
+    ready_evt = multiprocessing.Event()
+    release_evt = multiprocessing.Event()
+    proc = multiprocessing.Process(
+        target=_hold_dispatch_lock_then_signal,
+        args=(str(db_path), ready_evt, release_evt),
+    )
+    proc.start()
+    try:
+        assert ready_evt.wait(timeout=5), "child never acquired the dispatch lock"
+        started = time.monotonic()
+
+        import threading
+
+        def _release_after_delay():
+            time.sleep(0.3)
+            release_evt.set()
+
+        releaser = threading.Thread(target=_release_after_delay)
+        releaser.start()
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET priority = 5 WHERE id = "
+                "(SELECT id FROM tasks LIMIT 1)"
+            )
+        elapsed = time.monotonic() - started
+        releaser.join()
+        assert elapsed >= 0.25, (
+            "write_txn returned before the external dispatch-lock holder "
+            "released it — the cross-process lock is not being honoured"
+        )
+    finally:
+        release_evt.set()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+    row = conn.execute("PRAGMA integrity_check").fetchone()
+    assert row[0] == "ok"
