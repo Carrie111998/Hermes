@@ -1030,9 +1030,9 @@ def _coerce_boolean(value):
         return bool(value)
     if isinstance(value, str):
         low = value.strip().lower()
-        if low == "true":
+        if low in ("true", "1"):
             return True
-        if low == "false":
+        if low in ("false", "0"):
             return False
     return value
 
