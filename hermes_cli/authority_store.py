@@ -31,17 +31,42 @@ SQLITE_CAPABILITIES = StoreCapabilities(
     resource_fencing=True,
 )
 
+POSTGRES_CAPABILITIES = StoreCapabilities(
+    backend="postgres",
+    durable=True,
+    transactional=True,
+    single_host_multi_process=True,
+    multi_host=True,
+    atomic_event_claims=True,
+    resource_fencing=True,
+)
+
+
+def _psycopg_available() -> bool:
+    try:
+        import psycopg  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
 
 def capabilities(config: Mapping[str, Any]) -> StoreCapabilities:
     agentic = config.get("agentic") or {}
     store = agentic.get("authority_store") or {}
     backend = str(store.get("backend") or "sqlite").lower()
-    if backend != "sqlite":
-        raise AuthorityStoreConfigurationError(
-            f"authority store backend {backend!r} is not installed; "
-            "refusing to fall back to SQLite"
-        )
-    return SQLITE_CAPABILITIES
+    if backend == "sqlite":
+        return SQLITE_CAPABILITIES
+    if backend == "postgres":
+        if not _psycopg_available():
+            raise AuthorityStoreConfigurationError(
+                "authority store backend 'postgres' requires psycopg: "
+                "pip install psycopg[binary]; refusing to fall back to SQLite"
+            )
+        return POSTGRES_CAPABILITIES
+    raise AuthorityStoreConfigurationError(
+        f"authority store backend {backend!r} is not installed; "
+        "refusing to fall back to SQLite"
+    )
 
 
 def validate_topology(config: Mapping[str, Any]) -> StoreCapabilities:
@@ -75,11 +100,12 @@ def status(config: Mapping[str, Any]) -> dict[str, Any]:
         result = validate_topology(config)
     except AuthorityStoreConfigurationError as exc:
         backend = str(store.get("backend") or "sqlite").lower()
-        declared = (
-            asdict(SQLITE_CAPABILITIES)
-            if backend == "sqlite"
-            else {"backend": backend}
-        )
+        if backend == "sqlite":
+            declared = asdict(SQLITE_CAPABILITIES)
+        elif backend == "postgres":
+            declared = asdict(POSTGRES_CAPABILITIES)
+        else:
+            declared = {"backend": backend}
         return {
             **declared,
             "deployment_scope": scope,
