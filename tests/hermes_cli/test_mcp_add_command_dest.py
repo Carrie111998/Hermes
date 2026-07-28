@@ -42,6 +42,7 @@ def _build_parser():
     mcp_add.add_argument("--url")
     mcp_add.add_argument("--command", dest="mcp_command")
     mcp_add.add_argument("--connect-timeout", type=float)
+    mcp_add.add_argument("--all-tools", action="store_true")
     mcp_add.add_argument("--args", nargs=argparse.REMAINDER, default=[])
 
     return parser
@@ -106,6 +107,23 @@ class TestMcpAddCommandDest:
         assert args.command == "mcp"
         assert args.mcp_action == "add"
         assert args.connect_timeout == 180
+
+    def test_all_tools_flag_enables_headless_selection(self):
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "mcp",
+                "add",
+                "headless",
+                "--command",
+                "python",
+                "--all-tools",
+            ]
+        )
+
+        assert args.command == "mcp"
+        assert args.mcp_action == "add"
+        assert args.all_tools is True
 
     def test_args_passthrough_keeps_nested_option_flags(self):
         """`--args` must keep command flags like Docker MCP's --profile."""

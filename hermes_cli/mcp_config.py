@@ -427,6 +427,7 @@ def cmd_mcp_add(args):
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
     raw_connect_timeout = getattr(args, "connect_timeout", None)
+    all_tools = bool(getattr(args, "all_tools", False))
 
     server_config: Dict[str, Any] = {}
     try:
@@ -565,15 +566,19 @@ def cmd_mcp_add(args):
         print(f"    {color(tool_name, Colors.GREEN):40s} {short}")
     print()
 
-    # Ask: enable all, select, or cancel
-    try:
-        choice = input(
-            color(f"  Enable all {len(tools)} tools? [Y/n/select]: ", Colors.YELLOW)
-        ).strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        print()
-        _info("Cancelled.")
-        return
+    # Ask: enable all, select, or cancel unless the caller explicitly selected
+    # the headless all-tools path.
+    if all_tools:
+        choice = ""
+    else:
+        try:
+            choice = input(
+                color(f"  Enable all {len(tools)} tools? [Y/n/select]: ", Colors.YELLOW)
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            _info("Cancelled.")
+            return
 
     if choice in {"n", "no"}:
         _info("Cancelled — server not saved.")

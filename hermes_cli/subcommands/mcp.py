@@ -66,6 +66,11 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         help="Timeout in seconds for initial connection and tool discovery",
     )
     mcp_add_p.add_argument(
+        "--all-tools",
+        action="store_true",
+        help="Enable every discovered tool without an interactive selection prompt",
+    )
+    mcp_add_p.add_argument(
         "--env",
         nargs="*",
         default=[],

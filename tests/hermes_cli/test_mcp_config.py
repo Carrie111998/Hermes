@@ -250,6 +250,40 @@ class TestMcpAdd:
         assert srv["command"] == "npx"
         assert srv["args"] == ["@mcp/github"]
 
+    def test_add_stdio_server_all_tools_without_prompt(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """--all-tools saves a discovered server without reading stdin."""
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [("echo_time", "Echo with live time")],
+        )
+
+        def unexpected_prompt(_prompt):
+            raise AssertionError("--all-tools must not read stdin")
+
+        monkeypatch.setattr("builtins.input", unexpected_prompt)
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(
+            _make_args(
+                name="headless",
+                mcp_command="python",
+                args=["server.py"],
+                all_tools=True,
+            )
+        )
+        out = capsys.readouterr().out
+        assert "Saved" in out
+        assert "1/1 tools" in out
+
+        from hermes_cli.config import load_config
+
+        server = load_config()["mcp_servers"]["headless"]
+        assert server["enabled"] is True
+        assert "tools" not in server
+
     def test_add_connection_failure_save_disabled(
         self, tmp_path, capsys, monkeypatch
     ):
