@@ -448,6 +448,22 @@ class TestStripThinkBlocks:
     def test_no_blocks_unchanged(self, agent):
         assert agent._strip_think_blocks("hello world") == "hello world"
 
+    def test_list_content_parts_join_text(self, agent):
+        content = [
+            {"type": "text", "text": "visible"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "output_text", "content": "answer"},
+        ]
+
+        assert agent._strip_think_blocks(content) == "visible\nanswer"
+
+    def test_list_content_parts_strip_think_blocks(self, agent):
+        content = [
+            {"type": "text", "text": "<think>hidden</think>shown"},
+        ]
+
+        assert agent._strip_think_blocks(content) == "shown"
+
     def test_single_block_removed(self, agent):
         result = agent._strip_think_blocks("<think>reasoning</think> answer")
         assert "reasoning" not in result
