@@ -207,10 +207,16 @@ class OpenAIStreamer(StreamingTTSProvider):
     def stream(self, text: str) -> Iterator[bytes]:
         from openai import OpenAI
 
-        client = OpenAI(
-            api_key=get_env_value("OPENAI_API_KEY"),
-            base_url=get_env_value("OPENAI_BASE_URL") or None,
-        )
+        # Mirror the synchronous synthesize() precedence: tts.openai.base_url /
+        # api_key win over the environment, so a self-hosted OpenAI-compatible
+        # endpoint configured for ordinary replies is also honored on the
+        # streaming path instead of silently escaping to api.openai.com
+        # (#73530). Falling through to the environment preserves the default
+        # cloud behavior when no config override is set. (available() still
+        # gates on OPENAI_API_KEY — the separate no-cloud-key gap.)
+        base_url = self.section.get("base_url") or get_env_value("OPENAI_BASE_URL") or None
+        api_key = self.section.get("api_key") or get_env_value("OPENAI_API_KEY")
+        client = OpenAI(api_key=api_key, base_url=base_url)
         model = self.section.get("model", "gpt-4o-mini-tts")
         voice = self.section.get("voice", "alloy")
         with client.audio.speech.with_streaming_response.create(

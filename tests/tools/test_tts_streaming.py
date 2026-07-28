@@ -135,6 +135,67 @@ def test_openai_available_reflects_key(monkeypatch):
     assert ts.OpenAIStreamer.available() is True
 
 
+def _capture_openai_client(monkeypatch):
+    """Inject a fake ``openai`` module and return the kwargs OpenAI() gets."""
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_bytes(self):
+            yield b"\x00\x00"
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.audio = MagicMock()
+            self.audio.speech.with_streaming_response.create.return_value = _FakeResponse()
+
+    fake_openai = MagicMock()
+    fake_openai.OpenAI = _FakeClient
+    monkeypatch.setitem(__import__("sys").modules, "openai", fake_openai)
+    return captured
+
+
+def test_openai_stream_honors_config_base_url_over_env(monkeypatch):
+    """tts.openai.base_url must win over the environment so a self-hosted
+    endpoint isn't bypassed for api.openai.com on the streaming path (#73530)."""
+    captured = _capture_openai_client(monkeypatch)
+    monkeypatch.setattr(
+        ts, "get_env_value",
+        lambda k, *a: {"OPENAI_API_KEY": "cloud-key"}.get(k),
+    )
+
+    section = {"base_url": "http://localhost:4003/v1", "api_key": "dummy-no-auth",
+               "model": "qwen3-tts", "voice": "mira"}
+    streamer = ts.OpenAIStreamer({"openai": section}, section)
+    list(streamer.stream("hello"))
+
+    assert captured["base_url"] == "http://localhost:4003/v1"
+    assert captured["api_key"] == "dummy-no-auth"
+
+
+def test_openai_stream_falls_back_to_env_without_config(monkeypatch):
+    """With no config override the streamer keeps the default cloud behavior:
+    api_key from the environment and base_url unset (SDK default)."""
+    captured = _capture_openai_client(monkeypatch)
+    monkeypatch.setattr(
+        ts, "get_env_value",
+        lambda k, *a: {"OPENAI_API_KEY": "cloud-key"}.get(k),
+    )
+
+    section = {"model": "gpt-4o-mini-tts", "voice": "alloy"}
+    streamer = ts.OpenAIStreamer({"openai": section}, section)
+    list(streamer.stream("hello"))
+
+    assert captured["api_key"] == "cloud-key"
+    assert captured["base_url"] is None
+
+
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
 
 
