@@ -44,6 +44,41 @@ def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
 
 
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_tracks_verified_polling_progress():
+    adapter = _make_adapter()
+    generation, _progress = adapter._begin_polling_generation()
+
+    waiter = asyncio.create_task(adapter.wait_until_send_ready(timeout=1.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    adapter._record_polling_progress(generation)
+
+    assert await waiter is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_times_out_without_progress():
+    adapter = _make_adapter()
+    adapter._begin_polling_generation()
+
+    assert await adapter.wait_until_send_ready(timeout=0.01) is False
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_follows_replacement_generation():
+    adapter = _make_adapter()
+    adapter._begin_polling_generation()
+    waiter = asyncio.create_task(adapter.wait_until_send_ready(timeout=1.0))
+    await asyncio.sleep(0)
+
+    replacement_generation, _progress = adapter._begin_polling_generation()
+    adapter._record_polling_progress(replacement_generation)
+
+    assert await waiter is True
+
+
 def _mock_polling_app(*, get_me=None):
     app = MagicMock()
     app.updater = MagicMock()

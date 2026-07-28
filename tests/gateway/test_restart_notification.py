@@ -705,6 +705,33 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
 
 
 @pytest.mark.asyncio
+async def test_send_restart_notification_retries_after_send_path_recovers(
+    tmp_path, monkeypatch
+):
+    """A startup send racing Telegram polling progress is retried once."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.wait_until_send_ready = AsyncMock(return_value=True)
+    adapter.send = AsyncMock(side_effect=[
+        SendResult(success=False, error="send_path_degraded", retryable=True),
+        SendResult(success=True, message_id="restart"),
+    ])
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "42", None)
+    adapter.wait_until_send_ready.assert_awaited_once()
+    assert adapter.send.await_count == 2
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_send_home_channel_startup_notification_skipped_when_flag_disabled(
     tmp_path, monkeypatch
 ):

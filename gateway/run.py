@@ -17567,6 +17567,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "♻ Gateway restarted successfully. Your session continues.",
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
+            if (
+                result is not None
+                and getattr(result, "success", True) is False
+                and getattr(result, "error", None) == "send_path_degraded"
+                and getattr(result, "retryable", False)
+            ):
+                wait_until_send_ready = getattr(
+                    transport.adapter,
+                    "wait_until_send_ready",
+                    None,
+                )
+                if callable(wait_until_send_ready):
+                    if await wait_until_send_ready(timeout=10.0):
+                        result = await transport.send(
+                            platform,
+                            str(chat_id),
+                            "♻ Gateway restarted successfully. Your session continues.",
+                            metadata=_non_conversational_metadata(
+                                metadata,
+                                platform=platform,
+                            ),
+                        )
             # adapter.send() catches provider errors (e.g. "Chat not found")
             # and returns SendResult(success=False) rather than raising, so
             # we must inspect the result before claiming success — otherwise

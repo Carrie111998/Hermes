@@ -2092,6 +2092,29 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count = 0
         self._send_path_degraded = False
 
+    async def wait_until_send_ready(self, timeout: float) -> bool:
+        """Wait for verified getUpdates progress before a guarded send retry."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+
+        while self._send_path_degraded:
+            progress = self._polling_progress_event
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(progress.wait(), timeout=min(remaining, 0.1))
+            except asyncio.TimeoutError:
+                continue
+
+            # A reconnect can replace the generation event while this task is
+            # waiting. Re-read state rather than treating stale progress as
+            # proof that the current send path is healthy.
+            if progress is not self._polling_progress_event:
+                continue
+
+        return True
+
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
 
