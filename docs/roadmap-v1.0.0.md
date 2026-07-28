@@ -1,8 +1,8 @@
 # Charterforge Roadmap to v1.0.0
 
-**Current Version:** v0.25.0 (2026-07-28)  
-**Release Type:** Agent marketplace with tool/skill registry  
-**Gap:** External integrations, monitoring, disaster recovery, security hardening
+**Current Version:** v1.0.0 (2026-07-28)  
+**Release Type:** Production release — feature-complete, documented, stable API  
+**Gap:** None — all milestones delivered
 
 ---
 
@@ -16,11 +16,11 @@
 | **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | ✅ Released |
 | **0.24.0** | Billing Engine | Usage metering + invoicing | ✅ Released |
 | **0.25.0** | Agent Marketplace | Tool/skill discovery + installation | ✅ Released |
-| **0.26.0** | External Integrations | Email, calendar, CRM, project tools | 🟡 Next |
-| **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | 🔲 |
-| **0.28.0** | Disaster Recovery | Backup/restore, failover drill | 🔲 |
-| **0.29.0** | Security Hardening | Audit logging, secret management | 🔲 |
-| **1.0.0** | Production Release | Feature-complete, documented, stable API | 🔲 |
+| **0.26.0** | External Integrations | Email, calendar, CRM, project tools | ✅ Released |
+| **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | ✅ Released |
+| **0.28.0** | Disaster Recovery | Backup/restore, failover drill | ✅ Released |
+| **0.29.0** | Security Hardening | Audit logging, secret management | ✅ Released |
+| **1.0.0** | Production Release | Feature-complete, documented, stable API | ✅ Released |
 
 ---
 
