@@ -834,6 +834,50 @@ class UpdateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    # Operator override for the goal-mode completion judge. The dashboard IS
+    # the human, so it must keep an escape hatch for a card the judge won't
+    # pass — but the override has to be deliberate and audited, not the
+    # silent default this endpoint used to be.
+    force_complete: bool = False
+
+
+def _dashboard_completion_gate(conn, task, task_id: str, payload):
+    """Apply the goal-mode judge gate to a dashboard completion.
+
+    Returns the metadata dict to persist. Raises ``HTTPException(409)`` when
+    the judge refuses and the operator has not passed ``force_complete``.
+
+    This endpoint previously called ``complete_task`` with no gate at all,
+    which made it a complete bypass of the check both the CLI and the
+    ``kanban_complete`` tool enforce.
+    """
+    from hermes_cli import kanban_judge_gate as judge_gate
+
+    gate = judge_gate.evaluate(
+        kanban_db, conn, task, payload.summary or payload.result or "",
+        task_id=task_id,
+    )
+    metadata = payload.metadata
+    if not gate.allow:
+        if not getattr(payload, "force_complete", False):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "goal completion rejected by judge",
+                    "reason": gate.reason,
+                    "hint": "resend with force_complete=true to override "
+                            "deliberately; the override is recorded on the task",
+                },
+            )
+        metadata = dict(metadata or {})
+        metadata["judge_gate"] = {"bypass": "operator_force",
+                                  "reason": gate.reason}
+        return metadata
+    bypass = gate.bypass_kind()
+    if bypass:
+        metadata = dict(metadata or {})
+        metadata["judge_gate"] = {"bypass": bypass, "reason": gate.reason}
+    return metadata
 
 
 @router.patch("/tasks/{task_id}")
@@ -861,11 +905,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
+                gated_metadata = _dashboard_completion_gate(
+                    conn, task, task_id, payload)
                 ok = kanban_db.complete_task(
                     conn, task_id,
                     result=payload.result,
                     summary=payload.summary,
-                    metadata=payload.metadata,
+                    metadata=gated_metadata,
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -1194,6 +1240,9 @@ class BulkTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    # Operator override for the goal-mode judge, same contract as
+    # UpdateTaskBody. Applies to every id in the batch.
+    force_complete: bool = False
 
 
 @router.post("/tasks/bulk")
@@ -1224,11 +1273,25 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
+                        # Same judge gate as the single-task endpoint. On a
+                        # bulk close a refusal marks just that row failed —
+                        # one un-passable card must not abort the batch.
+                        try:
+                            gated_metadata = _dashboard_completion_gate(
+                                conn, kanban_db.get_task(conn, tid), tid, payload)
+                        except HTTPException as gate_exc:
+                            detail = gate_exc.detail
+                            entry.update(
+                                ok=False,
+                                error=(detail.get("reason")
+                                       if isinstance(detail, dict) else str(detail)))
+                            results.append(entry)
+                            continue
                         ok = kanban_db.complete_task(
                             conn, tid,
                             result=payload.result,
                             summary=payload.summary,
-                            metadata=payload.metadata,
+                            metadata=gated_metadata,
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)

@@ -243,6 +243,44 @@ def test_loop_gives_up_when_judge_reply_unparseable(monkeypatch):
     assert "unparseable" in res["reason"]
 
 
+@pytest.mark.parametrize("verdict,reason", [
+    ("continue", goals.JUDGE_REASON_NO_CLIENT),
+    ("skipped", goals.JUDGE_REASON_EMPTY_GOAL),
+])
+def test_loop_gives_up_when_judge_never_ran(monkeypatch, verdict, reason):
+    """judge_goal also answers locally, WITHOUT setting either failure flag.
+
+    A missing/unloadable auxiliary client is a steady state, not a blip: every
+    call returns it, so a loop reading only the verdict re-pokes the worker
+    until the budget dies — the original incident, made permanent.
+    """
+    monkeypatch.setattr(
+        goals, "judge_goal",
+        lambda goal, response, subgoals=None, background_processes=None, **_kw:
+            (verdict, reason, False, None, False),
+    )
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-no-client",
+        goal_text="ship it",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=15,
+        first_response="did the work",
+    )
+    assert res["outcome"] == "judge_unavailable"
+    assert res["turns_used"] < 15, "must not drain the budget"
+
+
+def test_real_rejection_is_not_mistaken_for_a_missing_judge():
+    """The no-verdict check must not swallow genuine 'not done' verdicts."""
+    assert goals.judge_reason_is_no_verdict("continue", "criteria not met") is False
+    assert goals.judge_reason_is_no_verdict("continue",
+                                            goals.JUDGE_REASON_NO_CLIENT) is True
+
+
 def test_loop_recovers_when_judge_comes_back(monkeypatch):
     """A transient blip must not end the run — the counter resets."""
     seq = [("continue", "judge error: Timeout", False, True),
