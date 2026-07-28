@@ -4452,7 +4452,7 @@ class TestFallbackChainDefaultHeaders:
 
         assert isinstance(client, FakeOpenAI)
         assert model == "relay-model"
-        assert captured["default_headers"] == {"X-Relay-Key": "relay-secret"}
+        assert captured["default_headers"]["X-Relay-Key"] == "relay-secret"
 
     def test_custom_endpoint_falls_back_to_runtime_main_headers(self, monkeypatch):
         import agent.auxiliary_client as aux_mod
@@ -4484,7 +4484,7 @@ class TestFallbackChainDefaultHeaders:
 
         assert isinstance(client, FakeOpenAI)
         assert model == "relay-model"
-        assert captured["default_headers"] == {"X-Relay-Key": "relay-secret"}
+        assert captured["default_headers"]["X-Relay-Key"] == "relay-secret"
 
     def test_openrouter_merges_resolution_default_headers(self, monkeypatch):
         import agent.auxiliary_client as aux_mod
@@ -4549,7 +4549,8 @@ class TestFallbackChainDefaultHeaders:
 
         assert isinstance(client, FakeCodex)
         assert model == "grok-vision"
-        assert captured["default_headers"] == {"X-Relay-Key": "relay-secret"}
+        assert captured["default_headers"]["X-Relay-Key"] == "relay-secret"
+        assert captured["default_headers"]["User-Agent"].startswith("Hermes-Agent/")
 
     def test_refresh_nous_client_preserves_runtime_headers(self, monkeypatch):
         import agent.auxiliary_client as aux_mod
