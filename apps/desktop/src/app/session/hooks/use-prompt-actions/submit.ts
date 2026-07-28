@@ -21,6 +21,7 @@ import {
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $sessions, resolveComposerSessionKey, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -34,6 +35,7 @@ import {
   isProviderSetupError,
   isSessionBusyError,
   isSessionNotFoundError,
+  isTargetSessionBusy,
   type SubmitTextOptions,
   withSessionBusyRetry
 } from './utils'
@@ -143,9 +145,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // from $busy by a separate effect) may still read true — honoring it would
       // bounce the drained send. The drain lock serializes them; the user path
       // keeps the guard so a stray Enter mid-turn can't double-submit.
+      //
+      // The guard reads the TARGET session's busy state (isTargetSessionBusy),
+      // not the foreground flag: an explicit target (tile, queue drain) is
+      // frequently not the session on screen, so the foreground flag would gate
+      // one session's send on another session's turn.
       const hasSendable = Boolean(visibleText || terminalContextBlocks || attachments.length || hasImage)
 
-      if (!hasSendable || (!options?.fromQueue && busyRef.current)) {
+      const guardSessionId = options?.sessionId ?? activeSessionIdRef.current
+
+      if (
+        !hasSendable ||
+        (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
+      ) {
         return false
       }
 
@@ -256,10 +268,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       const optimisticId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
+      // What the bubble shows. A `/skill` send carries the whole expanded
+      // skill body as its text — model-facing scaffolding — so the dispatcher
+      // hands us the invocation to render instead. Everything else shows what
+      // was typed.
+      const bubbleText = options?.displayText ?? visibleText
+
       const buildUserMessage = (): ChatMessage => ({
         id: optimisticId,
         role: 'user',
-        parts: [textPart(visibleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
+        parts: [textPart(bubbleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
         attachmentRefs
       })
 
@@ -454,7 +472,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (!sessionId) {
         try {
-          sessionId = await createBackendSessionForSend(visibleText)
+          sessionId = await createBackendSessionForSend(bubbleText)
         } catch (err) {
           dropOptimistic(null)
           releaseBusy()
@@ -531,7 +549,13 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
-          ...(interrupted && { interrupted })
+          ...(interrupted && { interrupted }),
+          // A queue drain is a "run after" message, never a live-turn
+          // correction. The flag tells the gateway's busy path to hold it for
+          // the next turn untouched — without it, losing the settle race
+          // (client saw idle, server still unwinding) redirects or interrupts
+          // the live turn with text the user explicitly queued.
+          ...(options?.fromQueue && { queued: true })
         })
 
         // On sleep/wake the gateway's in-memory session may have been cleared

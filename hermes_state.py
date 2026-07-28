@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import atexit
 import contextlib
 import json
 import logging
@@ -25,10 +26,16 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
+from agent.skill_commands import (
+    SKILL_EXCERPT_JOINT,
+    SKILL_SCAFFOLD_SQL_LIKE,
+    describe_skill_invocation,
+)
 from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
@@ -57,12 +64,6 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     remain protected until normal TTL expiry (conservative: PID reuse must
     never steal a live lease, and a wrongly-kept lease self-heals via TTL).
     """
-    # Windows stays TTL-only: stdlib os.kill(pid, 0) is NOT a no-op probe
-    # there (bpo-14484 — sig=0 maps to CTRL_C_EVENT and can kill the target's
-    # console group), and PID recycling semantics make liveness a weaker
-    # deadness signal. The 300s lease TTL remains the recovery path.
-    if os.name == "nt":
-        return False
     match = _COMPRESSION_LOCK_HOLDER_PID_RE.search(holder or "")
     if match is None:
         return False
@@ -84,10 +85,14 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
             return not psutil.pid_exists(pid)
         except Exception:
             return False  # any doubt → keep the lease until TTL expiry
-    # Scaffold-phase fallback only (psutil missing). POSIX-only by the
-    # os.name gate above.
+    # Scaffold-phase fallback only (psutil missing), and POSIX-only: stdlib
+    # os.kill(pid, 0) is NOT a no-op probe on Windows (bpo-14484 — sig=0 maps
+    # to CTRL_C_EVENT and can kill the target's console group). Without psutil
+    # a Windows host stays TTL-only; the lease TTL remains the recovery path.
+    if os.name == "nt":
+        return False
     try:
-        os.kill(pid, 0)  # windows-footgun: ok — function early-returns on nt above
+        os.kill(pid, 0)  # windows-footgun: ok — nt early-returns just above
     except ProcessLookupError:
         return True
     except (PermissionError, OSError, OverflowError):
@@ -130,6 +135,69 @@ def _delegate_from_json(col: str = "model_config") -> str:
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
+
+
+def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
+    """Match sessions whose ``workspace_key(row)`` equals ``key``.
+
+    Mirrors :func:`workspace_key`: a session belongs to workspace ``key``
+    when its recorded ``git_repo_root`` equals ``key``, or — for rows that
+    predate per-session git metadata — when its ``cwd`` is at or under
+    ``key`` (so a session started in ``repo/src`` still groups with ``repo``).
+    Used by ``hermes -c``/``--resume`` to continue the most recent session in
+    the *current* workspace rather than the global MRU.
+    """
+    prefix = key.rstrip("/\\") or key
+    cwd_clause, cwd_params = _cwd_prefix_clause(prefix)
+    return (
+        f"(s.git_repo_root = ? OR (COALESCE(s.git_repo_root, '') = '' AND {cwd_clause}))",
+        [prefix, *cwd_params],
+    )
+
+
+# Session preview = the head of the first user message, shown wherever a
+# session has no title (sidebar rows, pickers, exports, the desktop's
+# `sessionTitle` fallback).
+#
+# A /skill invocation expands into a message that embeds the whole skill body,
+# so the plain head of it previews the SKILL's opening prose as if the user had
+# written it. Scaffolded rows therefore carry a wider excerpt so
+# ``_shape_preview`` can hand it to ``describe_skill_invocation`` and recover
+# ``/work — fix the title leak``: the whole message while it stays under the
+# budget, and head + tail (where the typed instruction lands) once it doesn't.
+_PREVIEW_HEAD_CHARS = 63
+_PREVIEW_SCAFFOLD_WINDOW = 400
+_PREVIEW_MAX_CHARS = 60
+
+_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
+_PREVIEW_SCAFFOLDED_SQL = f"m.content LIKE '{SKILL_SCAFFOLD_SQL_LIKE}'"
+
+# The shared ``_preview_raw`` SELECT expression, interpolated by every listing
+# query. A scaffolded row gets a wider excerpt: the whole message while it fits
+# the budget, else head + tail (where the typed instruction lands) spliced
+# around SKILL_EXCERPT_JOINT.
+_PREVIEW_RAW_SELECT = (
+    f"CASE WHEN {_PREVIEW_SCAFFOLDED_SQL}"
+    f" AND LENGTH(m.content) > {_PREVIEW_SCAFFOLD_WINDOW * 2}"
+    f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW})"
+    f" || '{SKILL_EXCERPT_JOINT}'"
+    f" || SUBSTR({_PREVIEW_CONTENT_SQL}, -{_PREVIEW_SCAFFOLD_WINDOW})"
+    f" WHEN {_PREVIEW_SCAFFOLDED_SQL}"
+    f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW * 2})"
+    f" ELSE SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_HEAD_CHARS}) END"
+)
+
+
+def _shape_preview(raw: Any) -> str:
+    """Turn a ``_preview_raw`` column into the short preview callers show."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    described = describe_skill_invocation(text)
+    text = described if described is not None else text.split(SKILL_EXCERPT_JOINT)[0]
+    if len(text) > _PREVIEW_MAX_CHARS:
+        return text[:_PREVIEW_MAX_CHARS] + "..."
+    return text
 
 
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
@@ -532,6 +600,17 @@ def apply_wal_with_fallback(
     (prefer DELETE).  If the on-disk DB is already WAL, keep WAL and warn
     — never live-downgrade under possible concurrent openers.
 
+    This gate (#70055) is deliberately RETAINED. An earlier revision of the
+    lock-cancellation fix (#71724) reverted it on the theory that DELETE was
+    "the mode that corrupts", but that comparison was confounded: the clean
+    WAL result came from SQLite 3.53.1, which carries BOTH the WAL-reset fix
+    AND 3.51.0's defenses against close()-broken POSIX locks, so it says
+    nothing about 3.50.4.  Re-measured on the actually-bundled 3.50.4 with
+    the lock fix in place, WAL and DELETE are both clean (0/3 each) — i.e.
+    there is no evidence that WAL is safer here, and upstream still documents
+    the WAL-reset bug as real through 3.51.2 with serious consequences.  Until
+    a fixed runtime is delivered, keep new databases out of WAL.
+
     The WARNING is deduplicated per ``db_label``: repeated connections
     to the same underlying DB (e.g. kanban_db.connect() which is called
     on every kanban operation) log once per process, not once per call.
@@ -731,9 +810,29 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     Raw file copy on purpose: the DB won't open cleanly, so we preserve the
     bytes exactly for forensics / manual restore. WAL and SHM sidecars are
     copied too when present. Returns the backup path, or None on failure.
+
+    Refuses when a connection to this database is still live in the process:
+    reading the file would ``close()`` a descriptor for it and cancel that
+    connection's POSIX advisory locks (see ``hermes_cli.sqlite_safe_read``).
+    The repair path can be entered by one SessionDB while the gateway holds
+    others, so this is a real possibility rather than a theoretical one.
     """
     import datetime
     import shutil
+
+    try:
+        from hermes_cli.sqlite_safe_read import has_live_connection
+    except ImportError:
+        has_live_connection = None  # type: ignore[assignment]
+
+    if has_live_connection is not None and has_live_connection(db_path):
+        logger.error(
+            "Refusing to raw-copy %s for backup: a connection to it is still "
+            "open in this process and the copy would cancel that connection's "
+            "POSIX locks. Close all SessionDB handles first.",
+            db_path,
+        )
+        return None
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
@@ -747,6 +846,96 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
         return None
+
+
+def preflight_db_writability(
+    db_path: Path,
+    *,
+    db_label: str = "state.db",
+) -> None:
+    """Refuse-or-repair read-only DB files BEFORE the first connection opens.
+
+    Port of Kilo-Org/kilocode#12508's startup preflight. A stray read-only
+    ``state.db`` / ``-wal`` / ``-shm`` (sudo run, restored backup, copied
+    dotfiles) previously surfaced as an opaque
+    ``sqlite3.OperationalError: attempt to write a readonly database`` raised
+    from deep inside ``_init_schema`` — naming no file and no fix — and the
+    obvious wrong "fix" (deleting the ``-wal``) silently loses committed
+    transactions. This preflight:
+
+    - **Repairs** permissions with ``chmod u+rw`` when the file lives inside
+      the Hermes home tree (``get_hermes_home()``) — the safe repair scope:
+      Hermes owns those files, and the OS makes ``chmod`` fail on files the
+      user doesn't own, which bounds the repair exactly.
+    - **Fails fast with an actionable error** naming the exact file and the
+      exact ``chmod`` command for anything else (root-owned files, read-only
+      mounts, custom paths outside the home tree).
+    - Never deletes or truncates a WAL sidecar — once writable, the normal
+      open path checkpoints its committed frames into the DB as intended.
+
+    ``:memory:`` and ``file:`` URI paths are skipped (no plain on-disk files
+    to check). Shared by :class:`SessionDB` and ``hermes_cli.kanban_db``.
+    """
+    raw = str(db_path)
+    if raw == ":memory:" or raw.startswith("file:"):
+        return
+
+    try:
+        home: Optional[Path] = Path(get_hermes_home()).resolve()
+    except Exception:  # pragma: no cover - defensive
+        home = None
+
+    def _in_repair_scope(p: Path) -> bool:
+        if home is None:
+            return False
+        try:
+            return p.resolve().is_relative_to(home)
+        except (OSError, ValueError):
+            return False
+
+    def _ensure_writable(p: Path, *, is_dir: bool = False) -> None:
+        import stat as _stat
+
+        if os.access(p, os.R_OK | os.W_OK):
+            return
+        if _in_repair_scope(p):
+            try:
+                add = _stat.S_IRUSR | _stat.S_IWUSR | (_stat.S_IXUSR if is_dir else 0)
+                os.chmod(p, p.stat().st_mode | add)
+            except OSError:
+                pass
+            if os.access(p, os.R_OK | os.W_OK):
+                logger.info(
+                    "%s preflight: repaired read-only %s (chmod u+rw%s)",
+                    db_label,
+                    p,
+                    "x" if is_dir else "",
+                )
+                return
+        kind = "directory" if is_dir else "file"
+        wal_note = (
+            " Do NOT delete the -wal file — it contains committed data that "
+            "will be merged into the database once it is writable."
+            if p.name.endswith("-wal")
+            else ""
+        )
+        raise sqlite3.OperationalError(
+            f"{db_label} is not writable: {kind} {p} is read-only for this "
+            f"user. Hermes needs read-write access to open the database. "
+            f"Fix with: chmod u+rw{'x' if is_dir else ''} '{p}'"
+            f" (files owned by another user may need sudo/chown).{wal_note}"
+        )
+
+    parent = db_path.parent
+    if parent.is_dir():
+        # SQLite needs a writable directory in every journal mode (WAL and
+        # SHM sidecars in WAL mode; the rollback journal in DELETE mode).
+        _ensure_writable(parent, is_dir=True)
+
+    for suffix in ("", "-wal", "-shm"):
+        p = db_path.with_name(db_path.name + suffix) if suffix else db_path
+        if p.is_file():
+            _ensure_writable(p)
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
@@ -1576,8 +1765,53 @@ class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
 
-def is_zeroed_state_db(path: Path, *, probe_bytes: int = 100) -> bool:
+def _connect_tracked_db(path, tracking_path=None, **kwargs):
+    """``sqlite3.connect`` that registers the open fd for lock-safety.
+
+    While a connection is live, byte-level probes of the same file are
+    refused: an ``open()``/``close()`` cancels every POSIX advisory lock this
+    process holds on it -- including a running VACUUM's EXCLUSIVE lock.
+    Released automatically on ``close()``.
+
+    The ONLY tolerated fallback is the helper being absent entirely
+    (scaffold/embed installs that ship hermes_state without hermes_cli). A
+    real connection failure must propagate: silently retrying an *untracked*
+    connect would disable the guard for the lifetime of that connection,
+    which is precisely the failure mode this module exists to prevent.
+    """
+    try:
+        from hermes_cli.sqlite_safe_read import connect_tracked
+    except ImportError:
+        logger.debug(
+            "hermes_cli.sqlite_safe_read unavailable; opening %s untracked "
+            "(byte-probe guard inactive in this install)",
+            path,
+        )
+        return sqlite3.connect(str(path), **kwargs)
+
+    # Open through THIS module's sqlite3.connect so callers (and tests) that
+    # patch hermes_state.sqlite3.connect keep control of connection creation;
+    # the helper still owns tracking.
+    return connect_tracked(
+        path,
+        tracking_path=tracking_path,
+        connect_fn=sqlite3.connect,
+        **kwargs,
+    )
+
+
+def is_zeroed_state_db(
+    path: Path, *, probe_bytes: int = 100, force: bool = False
+) -> bool:
     """Detect the #68474 zeroed state.db signature (size>0, NUL header).
+
+    Byte-level probe, so it is only safe BEFORE any connection to *path*
+    exists in this process: ``close()`` cancels every POSIX advisory lock the
+    process holds on the file, which can pull the EXCLUSIVE lock out from
+    under a running VACUUM and corrupt the database. The read is routed
+    through ``read_header_bytes_preopen``, which refuses (returning False
+    here) once a connection is live. Pass ``force=True`` only for offline
+    files -- quarantined copies, snapshots, archives.
 
     Prefer ``hermes_cli.backup.is_zeroed_sqlite_file`` when available; this
     local copy keeps SessionDB openable without importing the CLI package
@@ -1586,7 +1820,7 @@ def is_zeroed_state_db(path: Path, *, probe_bytes: int = 100) -> bool:
     try:
         from hermes_cli.backup import is_zeroed_sqlite_file
 
-        return is_zeroed_sqlite_file(path, probe_bytes=probe_bytes)
+        return is_zeroed_sqlite_file(path, probe_bytes=probe_bytes, force=force)
     except Exception:
         pass
     try:
@@ -1595,11 +1829,11 @@ def is_zeroed_state_db(path: Path, *, probe_bytes: int = 100) -> bool:
         return False
     if size <= 0:
         return False
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(max(16, probe_bytes))
-    except OSError:
-        return False
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(
+        path, length=max(16, probe_bytes), force=force
+    )
     if not head or head.startswith(b"SQLite format 3"):
         return False
     return all(byte == 0 for byte in head)
@@ -1783,6 +2017,14 @@ class SessionDB:
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Async token accounting (see queue_token_counts). The condition
+        # guards queue + writer state; it is distinct from self._lock so
+        # enqueue/flush bookkeeping never contends with SQLite writes.
+        self._token_queue: deque = deque()
+        self._token_queue_cond = threading.Condition(threading.Lock())
+        self._token_writer_thread: Optional[threading.Thread] = None
+        self._token_writer_stop = False
+        self._token_writer_busy = False
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -1793,8 +2035,9 @@ class SessionDB:
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
-                self._conn = sqlite3.connect(
+                self._conn = _connect_tracked_db(
                     f"file:{self.db_path}?mode=ro",
+                    tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
                     timeout=1.0,
@@ -1804,6 +2047,13 @@ class SessionDB:
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Read-only file/sidecar preflight (port of kilocode#12508):
+            # repair-or-refuse BEFORE the first connection so users get an
+            # actionable message instead of an opaque "attempt to write a
+            # readonly database" from deep inside _init_schema.
+            if not read_only:
+                preflight_db_writability(self.db_path, db_label="state.db")
 
             # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
             # generic "file is not a database" with no recovery path. Quarantine
@@ -1835,7 +2085,7 @@ class SessionDB:
                     raise sqlite3.DatabaseError(msg)
 
             def _connect_and_init():
-                self._conn = sqlite3.connect(
+                self._conn = _connect_tracked_db(
                     str(self.db_path),
                     check_same_thread=False,
                     # Short timeout — application-level retry with random
@@ -2420,10 +2670,19 @@ class SessionDB:
     def close(self):
         """Close the database connection.
 
-        Writable connections attempt a TRUNCATE WAL checkpoint first so that
-        exiting processes help shrink the WAL file. Read-only probes close
-        without checkpointing, preserving their no-write contract.
+        Drains queued token deltas first (the background writer needs the
+        connection). Writable connections then attempt a TRUNCATE WAL
+        checkpoint so that exiting processes help shrink the WAL file.
+        Read-only probes close without checkpointing, preserving their
+        no-write contract.
         """
+        self._stop_token_writer()
+        # The atexit hook holds a strong reference to this instance (bound
+        # method); without unregistering, every closed SessionDB stays
+        # reachable until interpreter exit. Bound methods compare equal by
+        # (instance, function), so this removes exactly our registration;
+        # no-op when the writer never started.
+        atexit.unregister(self._drain_token_queue_at_exit)
         with self._lock:
             if self._conn:
                 if not self.read_only:
@@ -3863,6 +4122,9 @@ class SessionDB:
         filters on ``source``; ``active_only`` restricts to sessions that
         have not ended.
         """
+        # Full rows carry token/cost totals (MCP listings, /status) — drain
+        # queued async accounting deltas so consumers see exact counters.
+        self.flush_token_counts()
         query = """
             SELECT sessions.*,
                    COALESCE(
@@ -4519,7 +4781,24 @@ class SessionDB:
         holder: str,
         ttl_seconds: float = 300.0,
     ) -> bool:
-        """Extend the compression lock lease if ``holder`` still owns it."""
+        """Extend the compression lock lease if ``holder`` still owns it.
+
+        Ownership is decided by the ``holder`` column alone, deliberately NOT
+        by ``expires_at``: a live owner whose refresher thread was starved
+        (GC pause, loaded CI runner, a slow write escaping ``_execute_write``'s
+        retry budget) past its own TTL must be able to revive its still-unclaimed
+        row on the next tick. Requiring ``expires_at >= now`` here made such a
+        stall permanent — every later refresh matched 0 rows, so the owner kept
+        compressing and rotating with no lease at all, which is exactly the
+        unprotected window a competing path can fork the session lineage in.
+
+        This does not resurrect a lock somebody else already took: SQLite
+        serialises writes, so a reclaim (DELETE-expired + INSERT-or-IGNORE in
+        :meth:`try_acquire_compression_lock`) and this UPDATE never interleave.
+        Reclaim-first replaces ``holder``, so this UPDATE matches nothing and
+        returns False; refresh-first pushes ``expires_at`` into the future, so
+        the reclaimer's DELETE-expired matches nothing and its acquire fails.
+        """
         if not session_id or not holder:
             return False
         now = time.time()
@@ -4528,8 +4807,8 @@ class SessionDB:
         def _do(conn):
             cur = conn.execute(
                 "UPDATE compression_locks SET expires_at = ? "
-                "WHERE session_id = ? AND holder = ? AND expires_at >= ?",
-                (expires_at, session_id, holder, now),
+                "WHERE session_id = ? AND holder = ?",
+                (expires_at, session_id, holder),
             )
             return cur.rowcount > 0
 
@@ -4685,6 +4964,9 @@ class SessionDB:
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
         """
+        # Barrier against queued token deltas — see update_session_model.
+        self.flush_token_counts()
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
@@ -4712,6 +4994,14 @@ class SessionDB:
         switch explicitly replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
         """
+        # This write bypasses the token queue, so deltas enqueued before the
+        # switch must land first: a still-queued first delta carries the
+        # pre-switch route, and applying it after this UPDATE would trip the
+        # first_accounted_route overwrite in update_token_counts (row sees
+        # api_call_count == 0 + a route mismatch) and resurrect the old
+        # model/provider. Flushing here restores the pre-queue ordering.
+        self.flush_token_counts()
+
         def _do(conn):
             conn.execute(
                 """UPDATE sessions SET
@@ -4800,6 +5090,9 @@ class SessionDB:
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
         behavior of ``update_session_model`` (see #48173, #48248).
         """
+        # Barrier against queued token deltas — see update_session_model.
+        self.flush_token_counts()
+
         def _do(conn):
             conn.execute(
                 """UPDATE sessions SET
@@ -4811,6 +5104,263 @@ class SessionDB:
                 (provider, base_url, billing_mode, session_id),
             )
         self._execute_write(_do)
+
+    # ── Async token accounting ──
+    # update_token_counts() runs a sessions UPDATE (plus a per-model usage
+    # upsert) inside BEGIN IMMEDIATE; against a cold multi-GB state.db one
+    # call can stall the turn thread for tens to hundreds of ms, and the
+    # tool loop pays it after EVERY API call (measured p50 3.3ms / p95 70ms
+    # per call in production). queue_token_counts() reduces the critical
+    # path to a deque append: a dedicated single-writer thread applies
+    # deltas in enqueue order, coalescing consecutive same-route deltas
+    # into one UPDATE when a backlog forms. Readers that need exact
+    # mid-turn totals (get_session and friends) call flush_token_counts()
+    # first — a plain attribute check when nothing is queued.
+
+    # Delta fields summed when coalescing. Route fields must be equal for
+    # two deltas to merge: model/billing_* feed COALESCE backfill and the
+    # per-model usage attribution key, and cost_status/cost_source are
+    # last-non-None-wins — equality makes the merged UPDATE byte-for-byte
+    # equivalent to applying the deltas sequentially.
+    _TOKEN_DELTA_SUM_FIELDS = (
+        "input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_write_tokens", "reasoning_tokens", "api_call_count",
+    )
+    _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    _TOKEN_DELTA_ROUTE_FIELDS = (
+        "model", "cost_status", "cost_source", "pricing_version",
+        "billing_provider", "billing_base_url", "billing_mode",
+    )
+
+    def queue_token_counts(self, session_id: str, **kwargs) -> None:
+        """Enqueue a token/cost delta for the background writer.
+
+        Accepts the same keyword arguments as :meth:`update_token_counts`
+        and applies them asynchronously with identical semantics.  Cheap
+        (append + notify) — safe to call on the turn thread after every
+        API call.  After close() has stopped the writer, falls back to the
+        synchronous path and may raise like :meth:`update_token_counts`.
+        """
+        with self._token_queue_cond:
+            thread = self._token_writer_thread
+            writer_stopped = self._token_writer_stop and (
+                thread is None or not thread.is_alive()
+            )
+            if not writer_stopped:
+                self._token_queue.append((session_id, kwargs))
+                if thread is None or not thread.is_alive():
+                    # Daemon so process exit never hangs on accounting; the
+                    # atexit hook drains anything still queued at interpreter
+                    # shutdown (registered once per instance, on first use).
+                    # ``not is_alive()`` (rather than ``is None`` only)
+                    # respawns the writer if it ever died from an unexpected
+                    # escape — otherwise a dead thread object would block
+                    # respawn forever and deltas would pile up on the deque
+                    # until a reader's flush drained them synchronously.
+                    thread = threading.Thread(
+                        target=self._token_writer_loop,
+                        name="session-db-token-writer",
+                        daemon=True,
+                    )
+                    self._token_writer_thread = thread
+                    thread.start()
+                    atexit.register(self._drain_token_queue_at_exit)
+                self._token_queue_cond.notify_all()
+        if writer_stopped:
+            # Writer permanently stopped (close() ran; a stop-flagged but
+            # still-live writer keeps accepting — its loop drains before
+            # exiting). Enqueueing now would drop the delta silently: no
+            # writer will run and close() already unregistered the atexit
+            # hook. Apply inline instead so a closed-connection failure
+            # raises at the call site, exactly like the old synchronous
+            # update_token_counts path these call sites still guard for.
+            self.update_token_counts(session_id, **kwargs)
+
+    def flush_token_counts(self, timeout: float = 5.0) -> bool:
+        """Block until every queued token delta has been applied.
+
+        Returns True when the queue is fully drained, False on timeout
+        (callers then read totals that are stale by the still-queued
+        deltas — no worse than reading before the flush existed).
+        Never raises: apply failures are logged by the writer.
+        """
+        # Fast path — nothing queued, nothing in flight.
+        if not self._token_queue and not self._token_writer_busy:
+            return True
+        batch = None
+        with self._token_queue_cond:
+            deadline = time.monotonic() + timeout
+            while self._token_queue or self._token_writer_busy:
+                # A live writer is authoritative even when stop-flagged
+                # (close() in progress): its loop drains the queue before
+                # exiting, and draining here instead would race its
+                # in-flight batch — newer deltas committing before older
+                # ones breaks the last-non-None-wins / first-accounted-
+                # route / COALESCE-backfill fields. Only when the writer is
+                # dead (or never started for these deltas) does the caller
+                # take the leftovers. Re-checked each wakeup: the writer
+                # can exit mid-wait with deltas enqueued after its final
+                # empty-queue check. busy is claimed while draining (same
+                # protocol as the writer) so a concurrent flush cannot
+                # report drained — or pop a newer delta — while this batch
+                # is still unapplied; a claimed busy therefore also means
+                # "wait", never "drain alongside".
+                thread = self._token_writer_thread
+                if (
+                    (thread is None or not thread.is_alive())
+                    and not self._token_writer_busy
+                ):
+                    self._token_writer_busy = True
+                    batch = list(self._token_queue)
+                    self._token_queue.clear()
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._token_queue_cond.wait(remaining)
+        if batch:
+            try:
+                self._apply_token_batch(batch)
+            finally:
+                with self._token_queue_cond:
+                    self._token_writer_busy = False
+                    self._token_queue_cond.notify_all()
+        return True
+
+    def _token_writer_loop(self) -> None:
+        while True:
+            with self._token_queue_cond:
+                while not self._token_queue and not self._token_writer_stop:
+                    self._token_queue_cond.wait()
+                if not self._token_queue:
+                    return  # stop requested and fully drained
+                # busy is set BEFORE the queue is cleared: the lock-free
+                # fast path in flush_token_counts() reads queue-then-busy,
+                # so this order guarantees it can never observe an empty
+                # queue while the popped batch is still unapplied.
+                self._token_writer_busy = True
+                batch = list(self._token_queue)
+                self._token_queue.clear()
+            try:
+                self._apply_token_batch(batch)
+            finally:
+                with self._token_queue_cond:
+                    self._token_writer_busy = False
+                    self._token_queue_cond.notify_all()
+
+    def _apply_token_batch(self, batch: List[Tuple[str, Dict[str, Any]]]) -> None:
+        """Apply queued deltas in order, coalescing where safe. Never raises."""
+        try:
+            coalesced = self._coalesce_token_deltas(batch)
+        except Exception as exc:
+            # Coalescing must never kill the writer thread (a dead writer
+            # can't be observed by callers). Fall back to applying the raw
+            # batch delta-by-delta — the merge is an optimization only.
+            logger.warning(
+                "async token accounting: coalesce failed, applying raw "
+                "batch: %s", exc,
+            )
+            coalesced = batch
+        for session_id, kwargs in coalesced:
+            try:
+                self.update_token_counts(session_id, **kwargs)
+            except Exception as exc:
+                # Same contract as the old inline call sites: accounting
+                # loss is logged, never raised into a turn.
+                logger.warning(
+                    "async token accounting: apply failed (session=%s): %s",
+                    session_id, exc,
+                )
+
+    def _coalesce_token_deltas(
+        self, batch: List[Tuple[str, Dict[str, Any]]]
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Merge consecutive incremental deltas with an identical route.
+
+        Only adjacent deltas merge, so ordering across sessions and across
+        a mid-session /model switch is preserved exactly.  absolute=True
+        deltas (cumulative overwrites) never merge.
+        """
+        groups: List[Tuple[Optional[tuple], str, Dict[str, Any]]] = []
+        for session_id, kwargs in batch:
+            key = None
+            if not kwargs.get("absolute"):
+                key = (session_id,) + tuple(
+                    kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS
+                )
+            if groups and key is not None and groups[-1][0] == key:
+                merged = groups[-1][2]
+                for f in self._TOKEN_DELTA_SUM_FIELDS:
+                    merged[f] = merged.get(f, 0) + kwargs.get(f, 0)
+                for f in self._TOKEN_DELTA_COST_FIELDS:
+                    value = kwargs.get(f)
+                    if value is not None:
+                        # None-preserving sum: an all-None run must stay
+                        # None so COALESCE keeps the stored value untouched.
+                        merged[f] = (merged.get(f) or 0.0) + value
+            else:
+                groups.append((key, session_id, dict(kwargs)))
+        return [(sid, kw) for _, sid, kw in groups]
+
+    def _stop_token_writer(self, join_timeout: float = 10.0) -> None:
+        """Stop the writer thread and drain remaining deltas. Never raises."""
+        with self._token_queue_cond:
+            self._token_writer_stop = True
+            self._token_queue_cond.notify_all()
+            thread = self._token_writer_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                # Writer stuck mid-apply (pathological lock contention).
+                # Leave any queued deltas unapplied rather than racing the
+                # stuck apply and misordering/double-counting.
+                logger.warning(
+                    "async token accounting: writer did not stop within %.0fs; "
+                    "%d queued delta(s) not persisted",
+                    join_timeout, len(self._token_queue),
+                )
+                return
+        # Writer exited (or never started) — apply leftovers synchronously.
+        # Claim busy like the writer/flush drains do, so a concurrent
+        # flush_token_counts cannot fast-path True while this batch is
+        # still being applied; conversely, wait out a flush caller-drain
+        # that already claimed busy — close() nulls the connection right
+        # after this returns, and must not yank it mid-batch.
+        with self._token_queue_cond:
+            deadline = time.monotonic() + join_timeout
+            while self._token_writer_busy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "async token accounting: concurrent drain did not "
+                        "finish within %.0fs; %d queued delta(s) not persisted",
+                        join_timeout, len(self._token_queue),
+                    )
+                    return
+                self._token_queue_cond.wait(remaining)
+            # busy is claimed BEFORE the queue is cleared — same ordering
+            # as the writer loop and the flush caller-drain. The lock-free
+            # fast path in flush_token_counts() reads queue-then-busy
+            # without the cond, so clearing first would let a concurrent
+            # flush observe "empty and idle" and return True while this
+            # popped batch is still unapplied.
+            batch = list(self._token_queue)
+            if batch:
+                self._token_writer_busy = True
+                self._token_queue.clear()
+        if batch:
+            try:
+                self._apply_token_batch(batch)
+            finally:
+                with self._token_queue_cond:
+                    self._token_writer_busy = False
+                    self._token_queue_cond.notify_all()
+
+    def _drain_token_queue_at_exit(self) -> None:
+        try:
+            self._stop_token_writer()
+        except Exception:
+            pass  # Best effort — never fatal at interpreter shutdown.
 
     def update_token_counts(
         self,
@@ -5224,6 +5774,10 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
+        # Cost/usage readers (/status, /usage, gateway endpoints) reach the
+        # row through here; drain queued token deltas so they see exact
+        # totals. No-op attribute check when nothing is queued.
+        self.flush_token_counts()
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -5775,6 +6329,9 @@ class SessionDB:
         significant I/O saving on large databases where the blob routinely
         runs to tens of kilobytes per row.
         """
+        # Rows carry token/cost totals — drain queued deltas first so
+        # listings (sidebar, /resume, dashboards) show exact counters.
+        self.flush_token_counts()
         where_clauses = []
         params = []
 
@@ -5917,7 +6474,7 @@ class SessionDB:
                 )
                 SELECT {_sel},
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -5942,7 +6499,7 @@ class SessionDB:
             query = f"""
                 SELECT {_sel},
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -5964,13 +6521,7 @@ class SessionDB:
         sessions = []
         for row in rows:
             s = dict(row)
-            # Build the preview from the raw substring
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -6043,10 +6594,10 @@ class SessionDB:
         # compute it generically rather than hardcoding the successor char.
         prefix_hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
-        query = """
+        query = f"""
             SELECT s.*,
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -6068,12 +6619,7 @@ class SessionDB:
         runs: List[Dict[str, Any]] = []
         for row in rows:
             s = dict(row)
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
             runs.append(s)
         return runs
 
@@ -6085,11 +6631,13 @@ class SessionDB:
         Pass ``compact_rows=True`` to omit the ``system_prompt`` blob (see
         ``list_sessions_rich`` for details).
         """
+        # Same read-your-writes guarantee as list_sessions_rich.
+        self.flush_token_counts()
         _sel = self._compact_session_cols() if compact_rows else "s.*"
         query = f"""
             SELECT {_sel},
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -6108,13 +6656,53 @@ class SessionDB:
         if not row:
             return None
         s = dict(row)
-        raw = s.pop("_preview_raw", "").strip()
-        if raw:
-            text = raw[:60]
-            s["preview"] = text + ("..." if len(raw) > 60 else "")
-        else:
-            s["preview"] = ""
+        s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
         return s
+
+    def list_skill_scaffolded_sessions(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Titled sessions whose first user turn was a ``/skill`` invocation.
+
+        Those titles were generated from the expanded message, which embeds the
+        whole skill body — so they describe the skill rather than the request.
+        Returns ``id``, ``title``, and the full first-turn ``content`` so a
+        caller can re-derive what the user typed. Newest first.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.id, s.title, m.content
+                FROM sessions s
+                JOIN messages m ON m.id = (
+                    SELECT m2.id FROM messages m2
+                    WHERE m2.session_id = s.id AND m2.role = 'user'
+                      AND m2.content IS NOT NULL
+                    ORDER BY m2.timestamp, m2.id LIMIT 1
+                )
+                WHERE s.title IS NOT NULL AND m.content LIKE ?
+                ORDER BY s.started_at DESC
+                LIMIT ?
+                """,
+                (SKILL_SCAFFOLD_SQL_LIKE, int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_first_assistant_text(self, session_id: str) -> str:
+        """The session's first assistant reply as plain text ('' when none).
+
+        Pairs with :meth:`list_skill_scaffolded_sessions` so a re-title can feed
+        the titler the same (request, reply) shape the live path uses.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' AND content IS NOT NULL "
+                "ORDER BY timestamp, id LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return ""
+        decoded = self._decode_content(row["content"])
+        return decoded if isinstance(decoded, str) else ""
 
     # =========================================================================
     # Message storage
@@ -7466,16 +8054,27 @@ class SessionDB:
         Each entry is a dict with keys ``id``, ``timestamp``, ``preview``.
         ``preview`` is the first 80 characters of the message content
         (with line breaks collapsed to spaces). Used by the /rewind
-        slash command picker.
+        slash command picker, CLI/TUI/gateway ``/undo [N]``, and any other
+        caller that needs real user-turn targets.
+
+        Bookkeeping timeline rows (``display_kind`` set — e.g. model_switch,
+        async_delegation_complete, auto_continue, hidden) are excluded. They
+        are durable ``role='user'`` rows for the API transcript, but no client
+        counts them as user turns (desktop demotes them to system / drops them;
+        the CLI already uses ``not m.get("display_kind")``). Including them here
+        made ``/undo`` soft-delete from a marker instead of the last real turn —
+        same class of index skew as the prompt.submit ordinal bug.
 
         By default only active messages are returned.
         """
         active_clause = "" if include_inactive else " AND active = 1"
+        # Match CLI/desktop: only real user turns, not timeline bookkeeping.
+        display_clause = " AND (display_kind IS NULL OR display_kind = '')"
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, timestamp, content FROM messages "
                 "WHERE session_id = ? AND role = 'user'"
-                f"{active_clause} "
+                f"{active_clause}{display_clause} "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, int(limit)),
             )
@@ -7494,7 +8093,9 @@ class SessionDB:
                 if not preview:
                     preview = "[multimodal content]"
             elif isinstance(decoded, str):
-                preview = decoded
+                # A /skill turn embeds the whole skill body; show what the user
+                # typed instead of the skill's opening prose.
+                preview = describe_skill_invocation(decoded) or decoded
             else:
                 preview = ""
             preview = " ".join(preview.split())  # collapse whitespace
@@ -8487,12 +9088,18 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        workspace_key: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source.
 
         Returns rows enriched with a computed ``last_active`` column (latest
         message timestamp for the session, falling back to ``started_at``),
         ordered by most-recently-used first.
+
+        Pass ``workspace_key`` to scope rows to one workspace — matching
+        :func:`workspace_key` semantics (git repo root, else cwd). Used by
+        ``hermes -c``/``--resume`` so the "last" session is the last one in
+        the *current* workspace, not the global MRU.
         """
         select_with_last_active = (
             "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
@@ -8502,20 +9109,24 @@ class SessionDB:
             "FROM messages GROUP BY session_id"
             ") m ON m.session_id = s.id "
         )
+        where_clauses = []
+        params: list = []
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if workspace_key:
+            ws_clause, ws_params = _workspace_key_clause(workspace_key)
+            where_clauses.append(ws_clause)
+            params.extend(ws_params)
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        params.extend([limit, offset])
         with self._lock:
-            if source:
-                cursor = self._conn.execute(
-                    f"{select_with_last_active}"
-                    "WHERE s.source = ? "
-                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
-                )
-            else:
-                cursor = self._conn.execute(
-                    f"{select_with_last_active}"
-                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
+            cursor = self._conn.execute(
+                f"{select_with_last_active}"
+                f"{where_sql} "
+                "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                params,
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================================
@@ -8579,6 +9190,51 @@ class SessionDB:
         with self._lock:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
+
+    def session_count_by_source(
+        self,
+        *,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        exclude_children: bool = False,
+    ) -> Dict[str, int]:
+        """Return a ``{source: count}`` dict via a single ``GROUP BY`` query.
+
+        Replaces the O(N) ``list_sessions_rich`` histogram loop with an
+        aggregate query. When ``exclude_children`` is False the query uses
+        ``idx_sessions_source``; when True, the child-exclusion predicates
+        require a full table scan (same as ``session_count`` and
+        ``list_sessions_rich``).
+
+        ``exclude_children=True`` mirrors ``list_sessions_rich`` visibility
+        (roots + branch sessions, excluding sub-agent runs, delegates, and
+        compression continuations) so the source counts match what the
+        Sessions page actually lists.
+        """
+        where_clauses = []
+        params: list = []
+
+        if exclude_children:
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("SessionDB connection is closed")
+            rows = self._conn.execute(
+                "SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, COUNT(*) AS count "
+                f"FROM sessions s{where_sql} "
+                "GROUP BY COALESCE(NULLIF(s.source, ''), 'cli') "
+                "ORDER BY count DESC",
+                params,
+            ).fetchall()
+        return {str(row["source"]): int(row["count"] or 0) for row in rows}
 
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
@@ -9446,6 +10102,8 @@ class SessionDB:
     @staticmethod
     def _prune_filter_where(
         *,
+        last_active_before: Optional[float] = None,
+        last_active_after: Optional[float] = None,
         started_before: Optional[float] = None,
         started_after: Optional[float] = None,
         source: Optional[str] = None,
@@ -9488,6 +10146,24 @@ class SessionDB:
         """
         clauses = ["s.ended_at IS NOT NULL"]
         params: list = []
+        if last_active_before is not None:
+            clauses.append(
+                """COALESCE(
+                       (SELECT MAX(m.timestamp) FROM messages m
+                        WHERE m.session_id = s.id),
+                       s.started_at
+                   ) < ?"""
+            )
+            params.append(last_active_before)
+        if last_active_after is not None:
+            clauses.append(
+                """COALESCE(
+                       (SELECT MAX(m.timestamp) FROM messages m
+                        WHERE m.session_id = s.id),
+                       s.started_at
+                   ) >= ?"""
+            )
+            params.append(last_active_after)
         if started_before is not None:
             clauses.append("s.started_at < ?")
             params.append(started_before)
@@ -9575,18 +10251,31 @@ class SessionDB:
         Backs ``--dry-run`` and pre-confirmation counts. Accepts the same
         keyword filters as :meth:`_prune_filter_where` (unknown names raise
         ``TypeError`` there). Rows are ordered oldest-first and carry
-        ``id, source, title, model, started_at, ended_at, message_count,
-        archived``.
+        ``id, source, title, model, started_at, last_active, ended_at,
+        message_count, archived``. ``older_than_days`` is an inactivity
+        threshold: it uses the latest message timestamp, falling back to
+        ``started_at`` for sessions without messages.
         """
-        if filters.get("started_before") is None and older_than_days is not None:
-            filters["started_before"] = time.time() - (older_than_days * 86400)
+        if (
+            filters.get("last_active_before") is None
+            and filters.get("started_before") is None
+            and older_than_days is not None
+        ):
+            filters["last_active_before"] = time.time() - (
+                older_than_days * 86400
+            )
         where, params = self._prune_filter_where(source=source, **filters)
         with self._lock:
             cursor = self._conn.execute(
                 f"""SELECT s.id, s.source, s.title, s.model, s.started_at,
+                           COALESCE(
+                               (SELECT MAX(m.timestamp) FROM messages m
+                                WHERE m.session_id = s.id),
+                               s.started_at
+                           ) AS last_active,
                            s.ended_at, s.message_count, s.archived
                     FROM sessions s WHERE {where}
-                    ORDER BY s.started_at ASC""",
+                    ORDER BY last_active ASC, s.started_at ASC""",
                 params,
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -9625,8 +10314,8 @@ class SessionDB:
         "Touched" is the latest message timestamp (falling back to
         ``started_at``) — i.e. real recency, not creation time — so a session
         created long ago but active yesterday is spared, while an old
-        abandoned one (even a still-open one) is swept. This differs from
-        :meth:`archive_sessions`, which ages on ``started_at`` and only ended
+        abandoned one (even a still-open one) is swept. Unlike
+        :meth:`archive_sessions`, this method can also archive unended
         sessions.
 
         Guards:
@@ -9675,15 +10364,19 @@ class SessionDB:
     ) -> int:
         """Delete sessions matching the filters. Returns count deleted.
 
-        Default behavior (no keyword filters) is unchanged: delete ended
-        sessions older than ``older_than_days`` days, optionally restricted
-        to ``source``. Additional keyword filters AND together — the full
-        set is defined by :meth:`_prune_filter_where`:
+        By default, delete ended sessions inactive for
+        ``older_than_days`` days, optionally restricted to ``source``.
+        Activity is the latest message timestamp, falling back to
+        ``started_at`` for sessions without messages. Additional keyword
+        filters AND together — the full set is defined by
+        :meth:`_prune_filter_where`:
 
+        * ``last_active_before`` / ``last_active_after`` — epoch bounds on
+          the latest message timestamp (falling back to ``started_at``).
         * ``started_before`` / ``started_after`` — epoch bounds on
-          ``started_at``. ``started_before`` overrides ``older_than_days``;
-          pass ``older_than_days=None`` for no upper age bound (e.g. when
-          only pruning a recent window via ``started_after``).
+          ``started_at``. An explicit ``started_before`` overrides the
+          default ``older_than_days`` inactivity cutoff; pass
+          ``older_than_days=None`` for no implicit upper age bound.
         * ``title_like`` / ``model_like`` / ``branch_like`` —
           case-insensitive substring matches.
         * ``end_reason`` / ``provider`` / ``user_id`` / ``chat_id`` /
@@ -9705,8 +10398,14 @@ class SessionDB:
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
         """
-        if filters.get("started_before") is None and older_than_days is not None:
-            filters["started_before"] = time.time() - (older_than_days * 86400)
+        if (
+            filters.get("last_active_before") is None
+            and filters.get("started_before") is None
+            and older_than_days is not None
+        ):
+            filters["last_active_before"] = time.time() - (
+                older_than_days * 86400
+            )
         where, where_params = self._prune_filter_where(source=source, **filters)
         removed_ids: list[str] = []
 
@@ -10223,10 +10922,10 @@ class SessionDB:
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT s.*,
                         COALESCE(
-                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                            (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                              ORDER BY m.timestamp, m.id LIMIT 1),
@@ -10252,10 +10951,10 @@ class SessionDB:
                 # telegram_dm_topic_bindings doesn't exist yet — no bindings
                 # means every telegram session for this user is "unlinked".
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT s.*,
                         COALESCE(
-                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                            (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                              ORDER BY m.timestamp, m.id LIMIT 1),
@@ -10277,8 +10976,7 @@ class SessionDB:
         sessions: List[Dict[str, Any]] = []
         for row in rows:
             session = dict(row)
-            raw = str(session.pop("_preview_raw", "") or "").strip()
-            session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            session["preview"] = _shape_preview(session.pop("_preview_raw", ""))
             sessions.append(session)
         return sessions
 
@@ -10445,7 +11143,7 @@ class SessionDB:
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
-        """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
+        """Idempotent auto-maintenance: prune inactive sessions + optional VACUUM.
 
         Records the last run timestamp in state_meta so subsequent calls
         within ``min_interval_hours`` no-op. Designed to be called once at
@@ -10499,7 +11197,7 @@ class SessionDB:
 
             if pruned > 0:
                 logger.info(
-                    "state.db auto-maintenance: pruned %d session(s) older than %d days%s",
+                    "state.db auto-maintenance: pruned %d session(s) inactive for %d days%s",
                     pruned,
                     retention_days,
                     " + VACUUM" if result["vacuumed"] else "",
