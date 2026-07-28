@@ -97,7 +97,7 @@ def relay_client_tool(agent: Any, function_name: str, function_args: dict,
             notify(entry)
         except Exception as _notify_err:
             logger.debug("client tool notify error: %s", _notify_err)
-    relayed = _ctg.wait_for_result(call_id, _ctg.get_client_tool_timeout())
+    relayed = _ctg.wait_for_result(session_key, call_id, _ctg.get_client_tool_timeout())
     if relayed is None:
         return json.dumps(
             {"error": f"client tool '{function_name}' timed out (no result from shell)"},

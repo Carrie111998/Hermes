@@ -14,12 +14,14 @@ indistinguishable from a locally-executed tool.
 
 This is a direct structural sibling of ``tools.clarify_gateway``:
 
-  * store a pending client-tool call (keyed by ``call_id`` = the model's
-    ``tool_call_id``),
+  * store a pending client-tool call (keyed by ``(run_id, call_id)`` — the
+    model's ``tool_call_id`` is only unique *within* a run, so the run id is
+    part of the key and every lookup is scoped to it),
   * block the agent thread on an ``Event`` (polled in 1s slices so the
     inactivity heartbeat keeps firing),
   * resolve the wait when the HTTP layer fires
-    ``resolve_client_tool(call_id, result_json)``,
+    ``resolve_client_tool(run_id, call_id, result_json)`` — a result posted
+    to a different run can never resolve this one,
   * support a timeout so a shell that never answers does NOT hang the agent
     thread forever (which would pin the gateway's running-agent guard),
   * ``clear_session(run_id)`` on run end/stop so blocked threads unwind.
@@ -37,7 +39,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +68,14 @@ class _ClientToolEntry:
 
 
 _lock = threading.RLock()
-# call_id → _ClientToolEntry  (primary lookup for the tool_result POST)
-_entries: Dict[str, _ClientToolEntry] = {}
+# (session_key, call_id) → _ClientToolEntry  (lookup for the tool_result POST)
+#
+# The run id is part of the key on purpose.  ``call_id`` is the model's
+# ``tool_call_id`` and is only unique within a single run, so a call_id-only
+# registry would let a result POSTed to run B resolve run A's pending call
+# (and would let a second run's registration clobber the first's entry,
+# stranding that agent thread until timeout).
+_entries: Dict[Tuple[str, str], _ClientToolEntry] = {}
 # session_key (run_id) → list[call_id]  (FIFO; for session cleanup)
 _session_index: Dict[str, List[str]] = {}
 
@@ -86,7 +94,7 @@ def register(
 
     The caller (the invoke_tool interception) then fires the run's notify
     callback (→ ``tool_call.request`` SSE) and blocks on
-    ``wait_for_result(call_id, timeout)``.
+    ``wait_for_result(session_key, call_id, timeout)``.
     """
     entry = _ClientToolEntry(
         call_id=call_id,
@@ -95,12 +103,12 @@ def register(
         arguments=dict(arguments) if arguments else {},
     )
     with _lock:
-        _entries[call_id] = entry
+        _entries[(session_key, call_id)] = entry
         _session_index.setdefault(session_key, []).append(call_id)
     return entry
 
 
-def wait_for_result(call_id: str, timeout: float) -> Optional[str]:
+def wait_for_result(session_key: str, call_id: str, timeout: float) -> Optional[str]:
     """Block on the entry's event until resolved or timeout fires.
 
     Polls in 1-second slices so the agent's inactivity heartbeat keeps
@@ -111,7 +119,7 @@ def wait_for_result(call_id: str, timeout: float) -> Optional[str]:
     Returns the resolved result string, or ``None`` on timeout.
     """
     with _lock:
-        entry = _entries.get(call_id)
+        entry = _entries.get((session_key, call_id))
     if entry is None:
         return None
 
@@ -133,7 +141,7 @@ def wait_for_result(call_id: str, timeout: float) -> Optional[str]:
 
     with _lock:
         # Remove from indices regardless of resolution outcome.
-        _entries.pop(call_id, None)
+        _entries.pop((session_key, call_id), None)
         ids = _session_index.get(entry.session_key)
         if ids and call_id in ids:
             ids.remove(call_id)
@@ -147,15 +155,20 @@ def wait_for_result(call_id: str, timeout: float) -> Optional[str]:
 # Public API — gateway / HTTP side
 # =========================================================================
 
-def resolve_client_tool(call_id: str, result_json: str) -> bool:
-    """Unblock the agent thread waiting on ``call_id``.
+def resolve_client_tool(run_id: str, call_id: str, result_json: str) -> bool:
+    """Unblock the agent thread waiting on ``call_id`` *within run ``run_id``*.
 
-    ``result_json`` is the tool-result string handed back to the model.
+    The lookup is scoped to ``(run_id, call_id)``: a result POSTed to a
+    different run's ``/tool_result`` endpoint can never resolve this run's
+    pending call, even when the caller knows a valid call_id.  ``result_json``
+    is the tool-result string handed back to the model.
+
     Returns True if a pending entry was found and resolved, False otherwise
-    (already resolved, expired, or never existed → caller returns 409).
+    (wrong run, already resolved, expired, or never existed → caller returns
+    409).
     """
     with _lock:
-        entry = _entries.get(call_id)
+        entry = _entries.get((run_id, call_id))
         if entry is None:
             return False
     entry.result = str(result_json) if result_json is not None else ""
@@ -168,7 +181,7 @@ def get_pending_for_session(session_key: str) -> Optional[_ClientToolEntry]:
     with _lock:
         ids = _session_index.get(session_key) or []
         for cid in ids:
-            entry = _entries.get(cid)
+            entry = _entries.get((session_key, cid))
             if entry is not None:
                 return entry
         return None
@@ -178,7 +191,7 @@ def has_pending(session_key: str) -> bool:
     """Return True when this run has at least one pending client-tool call."""
     with _lock:
         ids = _session_index.get(session_key) or []
-        return any(_entries.get(cid) is not None for cid in ids)
+        return any(_entries.get((session_key, cid)) is not None for cid in ids)
 
 
 def clear_session(session_key: str) -> int:
@@ -192,7 +205,7 @@ def clear_session(session_key: str) -> int:
     """
     with _lock:
         ids = list(_session_index.pop(session_key, []) or [])
-        entries = [_entries.pop(cid, None) for cid in ids]
+        entries = [_entries.pop((session_key, cid), None) for cid in ids]
     cancelled = 0
     for entry in entries:
         if entry is None:

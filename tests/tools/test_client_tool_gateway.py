@@ -32,14 +32,14 @@ def test_register_then_resolve_roundtrip():
     out = {}
 
     def _agent_thread():
-        out["result"] = ctg.wait_for_result("call_1", timeout=5.0)
+        out["result"] = ctg.wait_for_result(run_id, "call_1", timeout=5.0)
 
     t = threading.Thread(target=_agent_thread)
     t.start()
     # Let the waiter enter its poll loop, then resolve from the "HTTP" side.
     time.sleep(0.2)
     assert ctg.has_pending(run_id) is True
-    assert ctg.resolve_client_tool("call_1", '{"ok": true}') is True
+    assert ctg.resolve_client_tool(run_id, "call_1", '{"ok": true}') is True
     t.join(timeout=3.0)
 
     assert out["result"] == '{"ok": true}'
@@ -51,7 +51,7 @@ def test_timeout_returns_none():
     run_id = "run_test2"
     ctg.register("call_2", run_id, "set_timer", {"minutes": 1})
     start = time.monotonic()
-    result = ctg.wait_for_result("call_2", timeout=0.5)
+    result = ctg.wait_for_result(run_id, "call_2", timeout=0.5)
     elapsed = time.monotonic() - start
     assert result is None
     assert elapsed >= 0.5
@@ -66,7 +66,7 @@ def test_clear_session_cancels_with_error_result():
     out = {}
 
     def _agent_thread(cid):
-        out[cid] = ctg.wait_for_result(cid, timeout=5.0)
+        out[cid] = ctg.wait_for_result(run_id, cid, timeout=5.0)
 
     threads = [threading.Thread(target=_agent_thread, args=(c,))
                for c in ("call_3a", "call_3b")]
@@ -87,7 +87,116 @@ def test_clear_session_cancels_with_error_result():
 
 
 def test_resolve_unknown_call_is_false():
-    assert ctg.resolve_client_tool("nope", '{"x":1}') is False
+    assert ctg.resolve_client_tool("run_missing", "nope", '{"x":1}') is False
+
+
+# =========================================================================
+# Cross-run correlation — entries are scoped to (run_id, call_id)
+# =========================================================================
+
+def test_resolve_from_wrong_run_does_not_unblock():
+    """A result POSTed to another live run must not resolve this run's call.
+
+    Regression: the registry was keyed by call_id alone, so a caller who knew
+    a pending call_id could unblock a *different* run by posting to its
+    /tool_result endpoint.
+    """
+    run_a, run_b = "run_a", "run_b"
+    ctg.register("call_shared", run_a, "set_timer", {"minutes": 5})
+    # run_b is live but has no pending call with that id.
+    ctg.register("call_b_only", run_b, "get_location", {})
+
+    out = {}
+
+    def _agent_thread():
+        out["result"] = ctg.wait_for_result(run_a, "call_shared", timeout=2.0)
+
+    t = threading.Thread(target=_agent_thread)
+    t.start()
+    time.sleep(0.2)
+
+    # The wrong-run POST is rejected and leaves run_a still waiting.
+    assert ctg.resolve_client_tool(run_b, "call_shared", '{"hijacked": true}') is False
+    assert ctg.has_pending(run_a) is True
+
+    # The correctly-scoped POST resolves it.
+    assert ctg.resolve_client_tool(run_a, "call_shared", '{"ok": true}') is True
+    t.join(timeout=3.0)
+    assert out["result"] == '{"ok": true}'
+
+
+def test_duplicate_call_id_across_runs_are_independent():
+    """The same call_id in two runs must not collide.
+
+    tool_call_id is only unique within a run. Keyed by call_id alone the
+    second register() clobbered the first entry, stranding that agent thread
+    until its timeout.
+    """
+    run_a, run_b = "run_dup_a", "run_dup_b"
+    entry_a = ctg.register("call_same", run_a, "set_timer", {"minutes": 5})
+    entry_b = ctg.register("call_same", run_b, "set_alarm", {"hour": 7})
+    assert entry_a is not entry_b
+
+    out = {}
+
+    def _agent_thread(run_id):
+        out[run_id] = ctg.wait_for_result(run_id, "call_same", timeout=3.0)
+
+    threads = [threading.Thread(target=_agent_thread, args=(r,))
+               for r in (run_a, run_b)]
+    for t in threads:
+        t.start()
+    time.sleep(0.2)
+
+    assert ctg.has_pending(run_a) is True
+    assert ctg.has_pending(run_b) is True
+
+    # Resolving one leaves the other pending with its own payload.
+    assert ctg.resolve_client_tool(run_a, "call_same", '{"which": "a"}') is True
+    time.sleep(0.2)
+    assert ctg.has_pending(run_b) is True
+    assert ctg.resolve_client_tool(run_b, "call_same", '{"which": "b"}') is True
+
+    for t in threads:
+        t.join(timeout=3.0)
+    assert out[run_a] == '{"which": "a"}'
+    assert out[run_b] == '{"which": "b"}'
+
+
+def test_clear_session_only_affects_its_own_run():
+    """Run-boundary cleanup must not cancel another run's pending calls."""
+    run_a, run_b = "run_clr_a", "run_clr_b"
+    ctg.register("call_same", run_a, "set_timer", {"minutes": 5})
+    ctg.register("call_same", run_b, "set_timer", {"minutes": 9})
+
+    assert ctg.clear_session(run_a) == 1
+    assert ctg.has_pending(run_a) is False
+    assert ctg.has_pending(run_b) is True
+
+    pending_b = ctg.get_pending_for_session(run_b)
+    assert pending_b is not None
+    assert pending_b.arguments == {"minutes": 9}
+
+
+def test_double_resolve_is_rejected():
+    """A duplicate POST for an already-resolved call returns False (→ 409)."""
+    run_id = "run_double"
+    ctg.register("call_d", run_id, "set_timer", {"minutes": 1})
+
+    out = {}
+
+    def _agent_thread():
+        out["result"] = ctg.wait_for_result(run_id, "call_d", timeout=3.0)
+
+    t = threading.Thread(target=_agent_thread)
+    t.start()
+    time.sleep(0.2)
+
+    assert ctg.resolve_client_tool(run_id, "call_d", '{"first": true}') is True
+    t.join(timeout=3.0)
+    # Entry is gone once the waiter unwound, so a replay cannot resolve again.
+    assert ctg.resolve_client_tool(run_id, "call_d", '{"second": true}') is False
+    assert out["result"] == '{"first": true}'
 
 
 def test_notify_callback_receives_entry():

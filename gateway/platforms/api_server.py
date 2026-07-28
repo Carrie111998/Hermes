@@ -6305,7 +6305,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     _PARALLEL_SAFE_TOOLS,
                     _PATH_SCOPED_TOOLS,
                 )
-                _reserved = set(_PARALLEL_SAFE_TOOLS) | set(_PATH_SCOPED_TOOLS)
+                # Agent-level tools own their dispatch (and emit their own post
+                # hook) inside the executor, so a client tool sharing one of
+                # their names cannot be intercepted uniformly — reject the name
+                # rather than let locality depend on which execution path the
+                # turn happened to take.
+                from agent.agent_runtime_helpers import (
+                    AGENT_RUNTIME_POST_HOOK_TOOL_NAMES,
+                )
+                _reserved = (
+                    set(_PARALLEL_SAFE_TOOLS)
+                    | set(_PATH_SCOPED_TOOLS)
+                    | set(AGENT_RUNTIME_POST_HOOK_TOOL_NAMES)
+                )
                 _seen: set = set()
                 for _i, _td in enumerate(_raw_tools):
                     if not isinstance(_td, dict) or _td.get("type") != "function":
@@ -6895,7 +6907,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from tools import client_tool_gateway as _ctg
 
-            resolved = _ctg.resolve_client_tool(call_id, result_json)
+            resolved = _ctg.resolve_client_tool(run_id, call_id, result_json)
         except Exception as exc:
             logger.exception("[api_server] tool_result resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
