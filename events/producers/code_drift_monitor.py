@@ -169,6 +169,11 @@ class DriftSample:
     missed_subjects: Tuple[str, ...] = ()
     repo_name: str = "agent-src"
     trunk_ref: str = DEFAULT_TRUNK_REF
+    # Which branch the checkout is actually ON ("HEAD" when detached, ""
+    # when unknowable). Names the CAUSE that the counts only imply: the
+    # 2026-07-28 ~/.hermes incident was a live checkout pointed off master,
+    # which reads as a plain "62 behind" unless the branch name is carried.
+    branch: str = ""
     detail: str = ""
     executed_gated: bool = False
     executed_changed: bool = False
@@ -243,12 +248,19 @@ def sample_code_drift(
     if not (repo / ".git").exists():
         return None
 
+    # Resolved BEFORE the misconfigured returns on purpose: an unresolvable
+    # trunk is precisely when "what branch is this checkout on?" is the
+    # operator's next question, and it stays answerable there because only
+    # the TRUNK lookup failed.
+    rc_branch, branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = branch.strip() if rc_branch == 0 else ""
+
     def _misconfigured(detail: str) -> DriftSample:
-        logger.error("CodeDriftMonitor: %s in %s — cannot evaluate drift",
-                     detail, repo)
+        logger.error("CodeDriftMonitor: %s in %s (on %s) — cannot evaluate drift",
+                     detail, repo, branch or "?")
         return DriftSample(
             state="misconfigured", head="", trunk="", detail=detail,
-            repo_name=repo_name, trunk_ref=trunk_ref,
+            repo_name=repo_name, trunk_ref=trunk_ref, branch=branch,
         )
 
     rc_head, head = _git(repo, "rev-parse", "--verify", "HEAD")
@@ -260,7 +272,7 @@ def sample_code_drift(
     head, trunk = head.strip(), trunk.strip()
     dirty = bool(_git(repo, "status", "--porcelain")[1].strip())
 
-    common = dict(repo_name=repo_name, trunk_ref=trunk_ref)
+    common = dict(repo_name=repo_name, trunk_ref=trunk_ref, branch=branch)
     if head == trunk:
         return DriftSample(state="in_sync", head=head, trunk=trunk,
                            dirty=dirty, **common)
@@ -450,6 +462,11 @@ class CodeDriftMonitor:
         `trunk` is the honest field name now that watched repos disagree on
         the branch (agent-src `main`, ~/.hermes `master`); `main` is kept as
         an alias so older consumers and stored events keep rendering.
+
+        `branch` is the checkout's ACTUAL branch, which trunk_name is not:
+        the pair together distinguishes "on trunk, merely behind" (FF it)
+        from "pointed at a different branch entirely" (re-point it), and
+        those have different remediations.
         """
         return {
             "repo": self._repo_str(),
@@ -458,13 +475,14 @@ class CodeDriftMonitor:
             "trunk_name": (sample.trunk_ref or self._trunk_ref).rsplit("/", 1)[-1],
             "trunk": sample.trunk[:9],
             "main": sample.trunk[:9],  # back-compat alias
+            "branch": sample.branch,
         }
 
     def _emit_drift(self, sample: DriftSample) -> str:
         logger.warning(
-            "Code drift [%s]: checkout %s %s (behind %d / ahead %d, dirty=%s) "
-            "— HEAD %s vs trunk %s%s",
-            self._repo_name, sample.state,
+            "Code drift [%s]: checkout on %s is %s %s "
+            "(behind %d / ahead %d, dirty=%s) — HEAD %s vs trunk %s%s",
+            self._repo_name, sample.branch or "?", sample.state,
             (sample.trunk_ref or self._trunk_ref).rsplit("/", 1)[-1],
             sample.behind_count, sample.ahead_count,
             sample.dirty, sample.head[:9] or "?", sample.trunk[:9] or "?",

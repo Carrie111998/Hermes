@@ -88,6 +88,50 @@ class TestSampleCodeDrift:
         assert s.shape == ["behind", 3, 0]
 
 
+class TestBranchIdentity:
+    """The checkout's ACTUAL branch, carried alongside the counts.
+
+    "62 behind" reads as "needs a fast-forward" when the real cause is a
+    checkout pointed at another branch entirely (the 2026-07-28 ~/.hermes
+    incident). The counts cannot distinguish those two; the branch name can,
+    and the remediations differ (`ff-only` vs. re-point).
+    """
+
+    def test_detached_checkout_reports_HEAD(self, repo):
+        assert sample_code_drift(repo).branch == "HEAD"
+
+    def test_named_branch_is_reported(self, repo):
+        _git(repo, "checkout", "-b", "feature/side-quest")
+        s = sample_code_drift(repo)
+        assert s.branch == "feature/side-quest"
+        assert s.state != "in_sync", "sanity: still off trunk"
+
+    def test_branch_survives_an_unresolvable_trunk(self, repo):
+        """The misconfigured path resolves branch BEFORE it bails.
+
+        Only the TRUNK lookup failed, so "which branch is this on?" is still
+        answerable — and it is exactly the operator's next question.
+        """
+        _git(repo, "checkout", "-b", "wrong-branch")
+        _git(repo, "branch", "-m", "main", "master")   # no `main` ref left
+
+        s = sample_code_drift(repo, "refs/heads/main")
+        assert s.state == "misconfigured"
+        assert s.branch == "wrong-branch"
+
+    def test_branch_reaches_the_event_payload(self, bus, tmp_path, repo):
+        """End-to-end: it has to survive to the bus to reach Telegram."""
+        _git(repo, "checkout", "-b", "pointed-off-trunk")
+        m = make_monitor(bus, tmp_path, repo=WatchedRepo("hermes", repo),
+                         clock=lambda: 1000.0)
+
+        assert m.check() is not None
+
+        p = _drift_events(bus)[0].payload
+        assert p["branch"] == "pointed-off-trunk"
+        assert p["trunk_name"] == "main", "branch must not overwrite trunk_name"
+
+
 class TestTrunkRefIsParameterised:
     """~/.hermes trunk is `master` and it has NO `main` (2026-07-28)."""
 

@@ -115,8 +115,12 @@ def check_code_drift(
         print(f"[FAIL] {tag}: {sample.detail} in {repo} -- drift CANNOT be "
               "evaluated, so this repo is effectively UNMONITORED (not clean)")
         if sample.detail != MISCONFIG_HEAD_UNRESOLVED:
+            # Naming the branch the checkout is ACTUALLY on turns a guess
+            # into a diagnosis: it is usually the trunk name that was meant.
+            on = f" (checkout is on `{sample.branch}`)" if sample.branch else ""
             print(f"  remediation: check the real trunk name (git -C {repo} "
-                  "branch --list) and fix the watched-repo entry's trunk_ref")
+                  f"branch --list){on} and fix the watched-repo entry's "
+                  "trunk_ref")
         return 1
 
     if sample.dirty:
