@@ -57,7 +57,7 @@ import {
   closeCommandPalette,
   setCommandPaletteOpen
 } from '@/store/command-palette'
-import { $bindings } from '@/store/keybinds'
+import { $bindings, bindingsFor } from '@/store/keybinds'
 import { openPetGenerate } from '@/store/pet-generate'
 import { requestStartWorkSession } from '@/store/projects'
 import { $connection } from '@/store/session'
@@ -241,7 +241,9 @@ const PaletteRow = memo(function PaletteRow({
   onSelectItem: (item: PaletteItem) => void
 }) {
   const Icon = item.icon
-  const combo = item.action ? bindings[item.action]?.[0] : undefined
+  // `bindingsFor`, not a raw lookup: a plugin's action is contributed after
+  // $bindings was seeded, so its combo only resolves through the fallback chain.
+  const combo = item.action ? bindingsFor(item.action, bindings)[0] : undefined
 
   return (
     <CommandItem
