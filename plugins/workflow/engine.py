@@ -1201,8 +1201,16 @@ class WorkflowEngine:
             # Preserve the pre-B2 footer. It contains braces (JSON
             # dict literal) that would otherwise be eaten by the
             # template resolver if we appended it first.
-            return resolved_task + f"\n\nContext: {json.dumps(context)}"
-        return resolved_task
+            body = resolved_task + f"\n\nContext: {json.dumps(context)}"
+        else:
+            body = resolved_task
+        # Append run ID so agents can identify which workflow run
+        # this card belongs to — critical when multiple runs of the
+        # same workflow are in progress simultaneously.
+        run_id = lookup.get("run_id", "")
+        if run_id:
+            body += f"\n\nRun ID: {run_id}"
+        return body
 
     # ── State persistence ──────────────────────────────────────
 
