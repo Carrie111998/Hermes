@@ -4683,18 +4683,36 @@ class AIAgent:
         the owning worker thread's pending ``recv``/``send`` with an EOF or
         ``EPIPE`` so it can unwind and close ``client`` from its own context
         — which is where the FD release belongs.
+
+        When ``force_close_tcp_sockets`` yields zero sockets the abort is a
+        silent no-op: the worker thread stays blocked on ``recv`` and the
+        request remains alive server-side for minutes (#72975).  We escalate
+        by attempting to close the httpx response stream directly — this is
+        safe from a stranger thread because closing a response stream does
+        not release pool-managed FDs (it only triggers an internal
+        ``httpx.Response.close`` which sends RST/FIN at the HTTP layer).
         """
         if client is None:
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
-                "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) %s",
-                reason,
-                shutdown_count,
-                self._client_log_context(),
-            )
+            if shutdown_count == 0:
+                logger.warning(
+                    "OpenAI client abort found 0 sockets to shut down "
+                    "(%s, shared=False) — attempting httpx response close "
+                    "as fallback %s",
+                    reason,
+                    self._client_log_context(),
+                )
+                self._try_abort_httpx_response(client)
+            else:
+                logger.info(
+                    "OpenAI client aborted (%s, shared=False, "
+                    "tcp_force_closed=%d, deferred_close=stranger_thread) %s",
+                    reason,
+                    shutdown_count,
+                    self._client_log_context(),
+                )
         except Exception as exc:
             logger.debug(
                 "OpenAI client abort failed (%s, shared=False) %s error=%s",
@@ -4778,19 +4796,36 @@ class AIAgent:
         SSL BIO and can recycle a TLS FD into a SQLite header (#29507 /
         #67142). Only ``shutdown(SHUT_RDWR)`` the pool's sockets so the worker
         unblocks and releases the FD from its own thread.
+
+        When ``force_close_tcp_sockets`` yields zero sockets the abort is a
+        silent no-op: the worker thread stays blocked on ``recv`` and the
+        request remains alive server-side for minutes (#72975).  We escalate
+        by attempting to close the httpx response stream directly.
         """
         if client is None:
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
-                "Anthropic client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) provider=%s model=%s",
-                reason,
-                shutdown_count,
-                getattr(self, "provider", None),
-                getattr(self, "model", None),
-            )
+            if shutdown_count == 0:
+                logger.warning(
+                    "Anthropic client abort found 0 sockets to shut down "
+                    "(%s, shared=False) — attempting httpx response close "
+                    "as fallback provider=%s model=%s",
+                    reason,
+                    getattr(self, "provider", None),
+                    getattr(self, "model", None),
+                )
+                self._try_abort_httpx_response(client)
+            else:
+                logger.info(
+                    "Anthropic client aborted (%s, shared=False, "
+                    "tcp_force_closed=%d, deferred_close=stranger_thread) "
+                    "provider=%s model=%s",
+                    reason,
+                    shutdown_count,
+                    getattr(self, "provider", None),
+                    getattr(self, "model", None),
+                )
         except Exception as exc:
             logger.debug(
                 "Anthropic client abort failed (%s, shared=False) provider=%s model=%s error=%s",
@@ -4799,6 +4834,55 @@ class AIAgent:
                 getattr(self, "model", None),
                 exc,
             )
+
+    @staticmethod
+    def _try_abort_httpx_response(client: Any) -> None:
+        """Fallback when ``force_close_tcp_sockets`` found zero sockets.
+
+        Walks the OpenAI/Anthropic SDK wrapper down to the underlying
+        ``httpx.Response`` and calls its ``close()``.  This sends RST/FIN
+        at the HTTP layer, unblocking the worker thread's blocked
+        ``recv``/``send`` without touching pool-managed FDs.
+
+        Safe from a stranger thread: ``httpx.Response.close()`` only
+        operates on the response stream (not the connection pool sockets),
+        so there is no FD-recycle race with the owning worker's SSL BIO.
+        """
+        if client is None:
+            return
+        try:
+            # OpenAI SDK: client._client is the httpx client; its _response
+            # attribute holds the active httpx.Response (if any).
+            http_client = getattr(client, "_client", None)
+            if http_client is None:
+                return
+            # Try to find and close the active response.
+            response = getattr(http_client, "_response", None)
+            if response is not None:
+                response.close()
+                return
+            # Some SDK versions store the stream differently — try the
+            # transport pool's active connections as a secondary path.
+            transport = getattr(http_client, "_transport", None)
+            if transport is None:
+                return
+            pool = getattr(transport, "_pool", None)
+            if pool is None:
+                return
+            for conn in list(getattr(pool, "_connections", []) or []):
+                inner = getattr(conn, "_connection", None) or conn
+                stream = (
+                    getattr(inner, "_network_stream", None)
+                    or getattr(inner, "_stream", None)
+                )
+                if stream is not None:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+        except Exception:
+            # Best-effort; swallow all errors to avoid masking the original
+            # abort exception context.
+            pass
 
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
