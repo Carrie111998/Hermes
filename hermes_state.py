@@ -928,7 +928,11 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
+WHEN COALESCE(new.content, '') != COALESCE(old.content, '')
+   OR COALESCE(new.tool_name, '') != COALESCE(old.tool_name, '')
+   OR COALESCE(new.tool_calls, '') != COALESCE(old.tool_calls, '')
+BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
@@ -958,7 +962,11 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON message
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages
+WHEN COALESCE(new.content, '') != COALESCE(old.content, '')
+   OR COALESCE(new.tool_name, '') != COALESCE(old.tool_name, '')
+   OR COALESCE(new.tool_calls, '') != COALESCE(old.tool_calls, '')
+BEGIN
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
@@ -1209,6 +1217,90 @@ class SessionDB:
             "COALESCE(tool_calls, '') "
             "FROM messages"
         )
+
+    @staticmethod
+    def _is_broad_update_trigger(cursor: sqlite3.Cursor, trigger_name: str) -> bool:
+        """True when the named UPDATE trigger is broad (fires on every UPDATE).
+
+        A narrowed trigger has a WHEN clause that gates on payload columns;
+        a broad trigger has none.  We inspect sqlite_master.sql so the
+        check is a single read — no trigger execution, no FTS rebuild.
+        """
+        row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()
+        if row is None:
+            return False  # trigger doesn't exist yet — nothing to narrow
+        sql = row[0] if not isinstance(row, sqlite3.Row) else row[0]
+        if sql is None:
+            return False
+        return "WHEN" not in sql.upper()
+
+    @classmethod
+    def _migrate_fts_update_triggers(cls, cursor: sqlite3.Cursor) -> bool:
+        """Narrow broad UPDATE triggers to payload-scoped ones.
+
+        Migration contract (per review of the FTS trigger narrowing PR):
+          1. Inspect sqlite_master.sql — only migrate when an existing
+             UPDATE trigger is broad (no WHEN clause).
+          2. Drop only the two UPDATE triggers, recreate them with
+             individual cursor.execute() calls (NOT executescript, which
+             has different transaction semantics).
+          3. Keep INSERT/DELETE triggers present throughout.
+          4. Do NOT rebuild FTS — broad triggers may have over-indexed
+             unchanged payload, but they have not missed content updates,
+             so existing index contents remain valid.
+          5. Idempotent — reopening an already-converged DB performs
+             reads only and produces zero FTS rebuild/maintenance statements.
+
+        Returns True if a migration was performed, False if already converged.
+        """
+        update_triggers = (
+            "messages_fts_update",
+            "messages_fts_trigram_update",
+        )
+        # Read-only inspection: check whether any UPDATE trigger is broad.
+        needs_migration = any(
+            cls._is_broad_update_trigger(cursor, name)
+            for name in update_triggers
+        )
+        if not needs_migration:
+            return False
+
+        # Drop only the broad UPDATE triggers — INSERT/DELETE stay live.
+        for name in update_triggers:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+        # Recreate as narrowed triggers with individual execute() calls.
+        # The caller (typically _init_schema) wraps this in BEGIN IMMEDIATE
+        # so the drop+recreate is atomic across concurrent writers.
+        cursor.execute(
+            "CREATE TRIGGER messages_fts_update "
+            "AFTER UPDATE ON messages "
+            "WHEN COALESCE(new.content, '') != COALESCE(old.content, '') "
+            "   OR COALESCE(new.tool_name, '') != COALESCE(old.tool_name, '') "
+            "   OR COALESCE(new.tool_calls, '') != COALESCE(old.tool_calls, '') "
+            "BEGIN "
+            "DELETE FROM messages_fts WHERE rowid = old.id; "
+            "INSERT INTO messages_fts(rowid, content) VALUES (new.id, "
+            "COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')"
+            "); END;"
+        )
+        cursor.execute(
+            "CREATE TRIGGER messages_fts_trigram_update "
+            "AFTER UPDATE ON messages "
+            "WHEN COALESCE(new.content, '') != COALESCE(old.content, '') "
+            "   OR COALESCE(new.tool_name, '') != COALESCE(old.tool_name, '') "
+            "   OR COALESCE(new.tool_calls, '') != COALESCE(old.tool_calls, '') "
+            "BEGIN "
+            "DELETE FROM messages_fts_trigram WHERE rowid = old.id; "
+            "INSERT INTO messages_fts_trigram(rowid, content) VALUES (new.id, "
+            "COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')"
+            "); END;"
+        )
+        return True
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
@@ -1901,6 +1993,13 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
+            #
+            # Check trigger count BEFORE _ensure_fts_schema: if triggers were
+            # dropped (e.g. by a no-FTS5 runtime) the FTS indexes may be stale
+            # and need a one-time backfill after recreation. This is distinct
+            # from the broad->narrowed migration below, which does NOT need a
+            # rebuild (broad triggers may have over-indexed unchanged payload
+            # but have not missed content updates).
             triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
@@ -1912,6 +2011,21 @@ class SessionDB:
                     cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                 )
                 self._trigram_available = trigram_enabled
+
+                # Narrow broad UPDATE triggers to payload-scoped ones.
+                # This is a read-only inspection + targeted drop/recreate of
+                # only the two UPDATE triggers -- INSERT/DELETE stay live, and
+                # no FTS rebuild is needed because broad triggers may have
+                # over-indexed unchanged payload but have not missed content
+                # updates. See _migrate_fts_update_triggers for the full
+                # migration contract. Idempotent: already-converged DBs
+                # perform reads only.
+                self._migrate_fts_update_triggers(cursor)
+
+                # Rebuild FTS when triggers were missing (not just broad).
+                # triggers_need_repair was computed above before
+                # _ensure_fts_schema recreated them; if True, the FTS
+                # indexes may be stale and need a one-time backfill.
                 if triggers_need_repair:
                     self._rebuild_fts_indexes(
                         cursor,
