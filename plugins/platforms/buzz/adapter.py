@@ -12,6 +12,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,29 @@ WS_AUTH_TIMEOUT = 20.0
 WS_MAX_MESSAGE_BYTES = 2_000_000
 MAX_TRACKED_EVENT_IDS = 10_000
 MAX_TRACKED_SENT_IDS = 2_000
+_SLASH_CONFIRM_COMMANDS = frozenset({"/approve", "/always", "/cancel"})
+_EXEC_APPROVAL_COMMANDS = frozenset({"/approve", "/deny"})
+_EXEC_APPROVAL_RESPONSES = frozenset({
+    "approve",
+    "yes",
+    "ok",
+    "okay",
+    "confirm",
+    "y",
+    "👍",
+    "deny",
+    "no",
+    "reject",
+    "cancel",
+    "n",
+    "👎",
+    "always",
+    "approve always",
+    "always approve",
+    "session",
+    "approve session",
+    "session approve",
+})
 
 
 class BuzzCliError(RuntimeError):
@@ -106,6 +130,44 @@ def _thread_id(tags: Any) -> Optional[str]:
     return reply
 
 
+def _wake_word_pattern(wake_word: str, *, at_start: bool = False) -> re.Pattern:
+    normalized = wake_word.strip().lstrip("@").strip()
+    if not normalized:
+        return re.compile(r"(?!x)x")
+    prefix = r"^\s*" if at_start else r"(?<![\w@'-])"
+    return re.compile(
+        rf"{prefix}@{re.escape(normalized)}(?![\w'-])",
+        flags=re.IGNORECASE,
+    )
+
+
+def _contains_wake_word(content: str, wake_words: list[str]) -> bool:
+    return any(
+        _wake_word_pattern(wake_word).search(content) is not None
+        for wake_word in wake_words
+    )
+
+
+def _strip_leading_wake_word(content: str, wake_words: list[str]) -> str:
+    for wake_word in wake_words:
+        match = _wake_word_pattern(wake_word, at_start=True).match(content)
+        if match is None:
+            continue
+        remainder = content[match.end() :]
+        remainder = re.sub(r"^[ \t]*[:,][ \t]*", "", remainder, count=1)
+        return remainder.lstrip()
+    return content
+
+
+def _event_timestamp(value: Any, *, now: Optional[int] = None) -> int:
+    current = int(time.time()) if now is None else int(now)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return current
+    return min(max(parsed, 0), current)
+
+
 def _is_for_agent(
     event: dict[str, Any],
     *,
@@ -120,8 +182,8 @@ def _is_for_agent(
         return True
     if sent_ids.intersection(_tag_values(tags, "e")):
         return True
-    content = str(event.get("content") or "").lower()
-    return any(f"@{word.lower()}" in content for word in wake_words)
+    content = str(event.get("content") or "")
+    return _contains_wake_word(content, wake_words)
 
 
 def _private_key() -> str:
@@ -137,6 +199,18 @@ def _relay_url(config: Optional[PlatformConfig] = None) -> str:
     return str(extra.get("relay_url") or os.getenv("BUZZ_RELAY_URL", "")).strip()
 
 
+def _default_cli_paths() -> tuple[Path, ...]:
+    hermes_home = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser()
+    user_home = Path.home()
+    return (
+        hermes_home / "bin" / "buzz",
+        user_home / ".local" / "bin" / "buzz",
+        user_home / ".cargo" / "bin" / "buzz",
+        Path("/opt/homebrew/bin/buzz"),
+        Path("/usr/local/bin/buzz"),
+    )
+
+
 def _resolve_cli(config: Optional[PlatformConfig] = None) -> Optional[str]:
     extra = getattr(config, "extra", {}) or {}
     configured = str(extra.get("cli") or os.getenv("BUZZ_CLI", "")).strip()
@@ -148,7 +222,13 @@ def _resolve_cli(config: Optional[PlatformConfig] = None) -> Optional[str]:
         if path.is_file() and os.access(path, os.X_OK):
             return str(path)
         return None
-    return shutil.which("buzz")
+    resolved = shutil.which("buzz")
+    if resolved:
+        return resolved
+    for path in _default_cli_paths():
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
 
 
 def _websocket_url(relay_url: str) -> str:
@@ -277,15 +357,21 @@ class BuzzAdapter(BasePlatformAdapter):
             extra.get("require_mention", os.getenv("BUZZ_REQUIRE_MENTION")),
             default=True,
         )
-        self._wake_words = _split_csv(
-            extra.get("wake_words") or os.getenv("BUZZ_WAKE_WORDS", "Hermes,Maximus")
-        )
         self._profile_name = str(
             extra.get("profile_name") or os.getenv("BUZZ_PROFILE_NAME", "")
         ).strip()
         self._profile_about = str(
             extra.get("profile_about") or os.getenv("BUZZ_PROFILE_ABOUT", "")
         ).strip()
+        configured_wake_words = _split_csv(
+            extra.get("wake_words") or os.getenv("BUZZ_WAKE_WORDS", "Hermes,Maximus")
+        )
+        self._wake_words = list(
+            dict.fromkeys([
+                *configured_wake_words,
+                *([self._profile_name] if self._profile_name else []),
+            ])
+        )
 
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready = asyncio.Event()
@@ -325,20 +411,14 @@ class BuzzAdapter(BasePlatformAdapter):
             )
             return False
 
-        try:
-            from gateway.status import acquire_scoped_lock
-
-            self._lock_key = f"{self._relay_url}:{self._agent_pubkey}"
-            if not acquire_scoped_lock("buzz", self._lock_key):
-                self._set_fatal_error(
-                    "buzz_identity_in_use",
-                    "This Buzz identity is already used by another Hermes profile",
-                    retryable=False,
-                )
-                self._lock_key = None
-                return False
-        except ImportError:
+        self._lock_key = f"{self._relay_url}:{self._agent_pubkey}"
+        if not self._acquire_platform_lock(
+            "buzz",
+            self._lock_key,
+            "Buzz identity",
+        ):
             self._lock_key = None
+            return False
 
         try:
             await self._run_cli(["channels", "list", "--member"], timeout=20.0)
@@ -412,9 +492,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if not self._lock_key:
             return
         try:
-            from gateway.status import release_scoped_lock
-
-            release_scoped_lock("buzz", self._lock_key)
+            self._release_platform_lock()
         except Exception:
             logger.debug("[Buzz] Failed to release identity lock", exc_info=True)
         self._lock_key = None
@@ -550,7 +628,7 @@ class BuzzAdapter(BasePlatformAdapter):
         subscriptions: dict[str, Optional[str]],
         event: dict[str, Any],
     ) -> None:
-        created_at = int(event.get("created_at") or time.time())
+        created_at = _event_timestamp(event.get("created_at"))
         self._membership_since = max(self._membership_since, created_at)
         dm_ids = _tag_values(event.get("tags") or [], "h")
         if not dm_ids or not dm_ids[0].strip():
@@ -600,7 +678,11 @@ class BuzzAdapter(BasePlatformAdapter):
                     backoff = 1.0
 
                     async for raw in websocket:
-                        message = json.loads(raw)
+                        try:
+                            message = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            logger.warning("[Buzz] Ignoring malformed WebSocket frame")
+                            continue
                         if not isinstance(message, list) or not message:
                             continue
                         if message[0] == "EVENT" and len(message) >= 3:
@@ -615,7 +697,7 @@ class BuzzAdapter(BasePlatformAdapter):
                                 continue
                             channel = subscriptions.get(subscription_id)
                             if channel:
-                                created_at = int(event.get("created_at") or 0)
+                                created_at = _event_timestamp(event.get("created_at"))
                                 self._since[channel] = max(
                                     self._since.get(channel, 0), created_at
                                 )
@@ -674,18 +756,6 @@ class BuzzAdapter(BasePlatformAdapter):
             return
 
         chat_type = "dm" if channel in self._dm_channels else "group"
-        if (
-            chat_type == "group"
-            and self._require_mention
-            and not _is_for_agent(
-                event,
-                agent_pubkey=self._agent_pubkey,
-                wake_words=self._wake_words,
-                sent_ids=self._sent_ids,
-            )
-        ):
-            return
-
         tags = event.get("tags") or []
         source = self.build_source(
             chat_id=channel,
@@ -695,7 +765,24 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=author[:12],
             thread_id=_thread_id(tags),
         )
-        created_at = int(event.get("created_at") or time.time())
+        addressed = _is_for_agent(
+            event,
+            agent_pubkey=self._agent_pubkey,
+            wake_words=self._wake_words,
+            sent_ids=self._sent_ids,
+        )
+        if (
+            chat_type == "group"
+            and self._require_mention
+            and not addressed
+            and not self._is_pending_control_reply(source, text)
+        ):
+            return
+
+        text = _strip_leading_wake_word(text, self._wake_words)
+        if not text:
+            return
+        created_at = _event_timestamp(event.get("created_at"))
         message_event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -705,6 +792,60 @@ class BuzzAdapter(BasePlatformAdapter):
             timestamp=datetime.fromtimestamp(created_at, tz=timezone.utc),
         )
         await self.handle_message(message_event)
+
+    def _is_pending_control_reply(self, source, text: str) -> bool:
+        from gateway.session import build_session_key
+
+        extra = self.config.extra or {}
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+        )
+        command = (text.lstrip().split(maxsplit=1) or [""])[0].lower()
+        normalized_text = text.strip().lower()
+
+        if (
+            command in _EXEC_APPROVAL_COMMANDS
+            or normalized_text in _EXEC_APPROVAL_RESPONSES
+        ):
+            try:
+                from tools.approval import has_blocking_approval
+
+                if has_blocking_approval(session_key):
+                    return True
+            except Exception:
+                logger.debug(
+                    "[Buzz] Could not inspect pending exec approval", exc_info=True
+                )
+
+        if command in _SLASH_CONFIRM_COMMANDS:
+            try:
+                from tools.slash_confirm import get_pending
+
+                if get_pending(session_key) is not None:
+                    return True
+            except Exception:
+                logger.debug(
+                    "[Buzz] Could not inspect pending slash confirm", exc_info=True
+                )
+
+        if not command.startswith("/"):
+            try:
+                from tools.clarify_gateway import get_pending_for_session
+
+                return (
+                    get_pending_for_session(
+                        session_key,
+                        include_choice_prompts=True,
+                    )
+                    is not None
+                )
+            except Exception:
+                logger.debug(
+                    "[Buzz] Could not inspect pending clarification", exc_info=True
+                )
+        return False
 
     async def send(
         self,

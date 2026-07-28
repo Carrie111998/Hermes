@@ -57,6 +57,50 @@ def test_addressing_accepts_pubkey_reply_or_wake_word():
         wake_words=["Hermes"],
         sent_ids=set(),
     )
+    assert not buzz._is_for_agent(
+        {"content": "@HermesExtended please check", "tags": []},
+        agent_pubkey=pubkey,
+        wake_words=["Hermes"],
+        sent_ids=set(),
+    )
+    assert not buzz._is_for_agent(
+        {"content": "email me at person@Hermes.test", "tags": []},
+        agent_pubkey=pubkey,
+        wake_words=["Hermes"],
+        sent_ids=set(),
+    )
+
+
+def test_strip_leading_wake_word_preserves_real_command():
+    assert (
+        buzz._strip_leading_wake_word(
+            "@Maximus: /status",
+            ["Hermes", "Maximus"],
+        )
+        == "/status"
+    )
+    assert (
+        buzz._strip_leading_wake_word(
+            "Please ask @Maximus about status",
+            ["Maximus"],
+        )
+        == "Please ask @Maximus about status"
+    )
+    assert (
+        buzz._strip_leading_wake_word(
+            "@MaximusExtended /status",
+            ["Maximus"],
+        )
+        == "@MaximusExtended /status"
+    )
+
+
+def test_event_timestamp_rejects_invalid_values_and_future_high_water_marks():
+    assert buzz._event_timestamp("not-a-timestamp", now=1_000) == 1_000
+    assert buzz._event_timestamp(-20, now=1_000) == 0
+    assert buzz._event_timestamp(900, now=1_000) == 900
+    assert buzz._event_timestamp(1_100, now=1_000) == 1_000
+    assert buzz._event_timestamp(99_999, now=1_000) == 1_000
 
 
 def test_check_requirements_needs_relay_and_private_key_only(monkeypatch):
@@ -79,6 +123,19 @@ def test_validate_config_checks_cli_url_and_private_key(monkeypatch):
 
     monkeypatch.setenv("BUZZ_PRIVATE_KEY", "invalid")
     assert not buzz.validate_config(_config(relay_url="https://buzz.example.test"))
+
+
+def test_cli_resolution_handles_service_path_without_interactive_shell(
+    monkeypatch, tmp_path
+):
+    cli = tmp_path / "buzz"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o755)
+    monkeypatch.delenv("BUZZ_CLI", raising=False)
+    monkeypatch.setattr(buzz.shutil, "which", lambda command: None)
+    monkeypatch.setattr(buzz, "_default_cli_paths", lambda: (cli,))
+
+    assert buzz._resolve_cli() == str(cli)
 
 
 def test_cli_send_uses_stdin_and_never_places_content_in_arguments(monkeypatch):
@@ -145,6 +202,26 @@ def test_profile_publication_is_opt_in():
     instance._profile_name = "Maximus"
     asyncio.run(instance._publish_profile_best_effort())
     assert calls == [(["users", "set-profile", "--name", "Maximus"], 20.0)]
+
+
+def test_explicit_profile_name_is_also_a_typed_wake_word(monkeypatch):
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
+    monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
+    instance = buzz.BuzzAdapter(
+        _config(
+            relay_url="https://buzz.example.test",
+            profile_name="Jessica",
+            wake_words=["Hermes"],
+        )
+    )
+
+    assert instance._wake_words == ["Hermes", "Jessica"]
+    assert buzz._is_for_agent(
+        {"content": "@Jessica please check", "tags": []},
+        agent_pubkey=instance._agent_pubkey,
+        wake_words=instance._wake_words,
+        sent_ids=set(),
+    )
 
 
 def test_env_enablement_requires_complete_identity(monkeypatch):
@@ -283,6 +360,24 @@ def test_nostr_auth_event_has_valid_bip340_signature_and_owner_tag():
     assert _verify_schnorr(event_id, event["pubkey"], bytes.fromhex(event["sig"]))
 
 
+def test_schnorr_sign_matches_official_bip340_vector_zero():
+    private_key = "00" * 31 + "03"
+    message = bytes(32)
+    signature = nostr_auth.schnorr_sign(
+        message,
+        private_key,
+        auxiliary_randomness=bytes(32),
+    )
+
+    assert nostr_auth.public_key_hex(private_key).upper() == (
+        "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9"
+    )
+    assert signature.hex().upper() == (
+        "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215"
+        "25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"
+    )
+
+
 class _FakeWebSocket:
     def __init__(self):
         self.sent = []
@@ -367,6 +462,44 @@ def test_websocket_subscriptions_resume_from_last_timestamp():
     assert websocket.sent[2][2]["since"] == 299
 
 
+def test_websocket_loop_ignores_malformed_json_frames(monkeypatch):
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
+    monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
+    instance = buzz.BuzzAdapter(_config(relay_url="https://buzz.example.test"))
+    instance._channels = []
+    instance._running = True
+
+    class MalformedStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not instance._running:
+                raise StopAsyncIteration
+            instance._running = False
+            return "{malformed"
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    async def subscribe(*args, **kwargs):
+        return {}
+
+    instance._authenticate_websocket = no_op
+    instance._subscribe_websocket = subscribe
+    monkeypatch.setattr("websockets.connect", lambda *args, **kwargs: MalformedStream())
+
+    asyncio.run(instance._websocket_loop())
+
+    assert instance._ws_ready.is_set()
+
+
 def test_event_id_dedup_routes_only_once(monkeypatch):
     monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
     monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
@@ -392,6 +525,105 @@ def test_event_id_dedup_routes_only_once(monkeypatch):
     assert received[0].message_id == "event-1"
 
 
+def test_group_dispatch_strips_address_before_slash_command(monkeypatch):
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
+    monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
+    instance = buzz.BuzzAdapter(_config(relay_url="https://buzz.example.test"))
+    instance._channels = ["group-id"]
+    instance._wake_words = ["Maximus"]
+    received = []
+
+    async def handle_message(event):
+        received.append(event)
+
+    instance.handle_message = handle_message
+    event = {
+        "id": "command-1",
+        "pubkey": "b" * 64,
+        "content": "@Maximus: /status",
+        "created_at": 1_700_000_000,
+        "tags": [["h", "group-id"]],
+    }
+    asyncio.run(instance._dispatch_event("group-id", event))
+
+    assert len(received) == 1
+    assert received[0].text == "/status"
+    assert received[0].is_command()
+
+
+def test_group_dispatch_only_bypasses_mention_gate_for_pending_control(monkeypatch):
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
+    monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
+    instance = buzz.BuzzAdapter(_config(relay_url="https://buzz.example.test"))
+    instance._channels = ["group-id"]
+    received = []
+
+    async def handle_message(event):
+        received.append(event)
+
+    instance.handle_message = handle_message
+    instance._is_pending_control_reply = lambda source, text: text == "2"
+    base_event = {
+        "pubkey": "b" * 64,
+        "created_at": 1_700_000_000,
+        "tags": [["h", "group-id"]],
+    }
+
+    asyncio.run(
+        instance._dispatch_event(
+            "group-id",
+            {**base_event, "id": "control-1", "content": "2"},
+        )
+    )
+    asyncio.run(
+        instance._dispatch_event(
+            "group-id",
+            {**base_event, "id": "control-2", "content": "general discussion"},
+        )
+    )
+
+    assert [event.text for event in received] == ["2"]
+
+
+def test_pending_control_reply_uses_sender_scoped_gateway_state(monkeypatch):
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
+    monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
+    instance = buzz.BuzzAdapter(_config(relay_url="https://buzz.example.test"))
+    source = instance.build_source(
+        chat_id="group-id",
+        chat_type="group",
+        user_id="owner-pubkey",
+    )
+    seen = []
+
+    monkeypatch.setattr(
+        "tools.approval.has_blocking_approval",
+        lambda session_key: seen.append(("approval", session_key)) or True,
+    )
+    assert instance._is_pending_control_reply(source, "/approve")
+    assert instance._is_pending_control_reply(source, "yes")
+    assert instance._is_pending_control_reply(source, "approve always")
+    assert seen[0][0] == "approval"
+    assert "owner-pubkey" in seen[0][1]
+
+    monkeypatch.setattr(
+        "tools.approval.has_blocking_approval",
+        lambda session_key: False,
+    )
+    monkeypatch.setattr(
+        "tools.slash_confirm.get_pending",
+        lambda session_key: {"confirm_id": "pending"},
+    )
+    assert instance._is_pending_control_reply(source, "/always")
+
+    monkeypatch.setattr(
+        "tools.clarify_gateway.get_pending_for_session",
+        lambda session_key, include_choice_prompts: object(),
+    )
+    assert instance._is_pending_control_reply(source, "2")
+    assert not instance._is_pending_control_reply(source, "/new")
+
+
 def test_connect_and_disconnect_acquire_and_release_scoped_lock(monkeypatch):
     monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
     monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
@@ -399,14 +631,14 @@ def test_connect_and_disconnect_acquire_and_release_scoped_lock(monkeypatch):
     acquired = []
     released = []
 
-    monkeypatch.setattr(
-        "gateway.status.acquire_scoped_lock",
-        lambda platform, key: acquired.append((platform, key)) or True,
+    instance._acquire_platform_lock = lambda scope, identity, resource_desc: (
+        acquired.append((scope, identity, resource_desc)) or True
     )
-    monkeypatch.setattr(
-        "gateway.status.release_scoped_lock",
-        lambda platform, key: released.append((platform, key)),
-    )
+    instance._release_platform_lock = lambda: released.append((
+        "buzz",
+        instance._lock_key,
+        "Buzz identity",
+    ))
 
     async def run_cli(args, **kwargs):
         return []
@@ -430,8 +662,35 @@ def test_connect_and_disconnect_acquire_and_release_scoped_lock(monkeypatch):
 
     asyncio.run(exercise())
 
-    assert acquired == [("buzz", f"https://buzz.example.test:{instance._agent_pubkey}")]
+    assert acquired == [
+        (
+            "buzz",
+            f"https://buzz.example.test:{instance._agent_pubkey}",
+            "Buzz identity",
+        )
+    ]
     assert released == acquired
+
+
+def test_connect_stops_before_relay_probe_when_identity_lock_is_held(monkeypatch):
+    monkeypatch.setenv("BUZZ_PRIVATE_KEY", TEST_PRIVATE_KEY)
+    monkeypatch.setattr(buzz, "_resolve_cli", lambda config=None: "/tmp/buzz")
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (False, {"pid": 98765}),
+    )
+    instance = buzz.BuzzAdapter(_config(relay_url="https://buzz.example.test"))
+    probes = []
+
+    async def run_cli(*args, **kwargs):
+        probes.append((args, kwargs))
+        return []
+
+    instance._run_cli = run_cli
+
+    assert asyncio.run(instance.connect()) is False
+    assert probes == []
+    assert instance._lock_key is None
 
 
 def test_standalone_sender_uses_cli_without_constructing_adapter(monkeypatch):
