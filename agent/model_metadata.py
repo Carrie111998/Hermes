@@ -2785,7 +2785,7 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
         return len(str(msg))
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k == "_anthropic_content_blocks":
+        if k in ("_anthropic_content_blocks", "reasoning_details"):
             continue
         if k == "content":
             if isinstance(v, list):
@@ -2814,7 +2814,7 @@ def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
         return estimate_tokens_rough(str(msg))
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k == "_anthropic_content_blocks":
+        if k in ("_anthropic_content_blocks", "reasoning_details"):
             continue
         if k == "content":
             if isinstance(v, list):
