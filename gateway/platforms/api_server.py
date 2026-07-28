@@ -1208,6 +1208,16 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # ``start_gateway`` no longer waits for MCP discovery before serving, and
+        # the agent below snapshots the tool registry once, for its whole life.
+        # This is where that snapshot happens for every OpenAI-compatible request
+        # — the busiest agent-build path in the gateway — so the wait belongs
+        # here. Safe to block: ``_run_agent`` dispatches its ``_run`` closure
+        # through ``run_in_executor``, so this is a worker thread, not the loop.
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_complete
+
+        ensure_mcp_discovery_complete()
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -4678,12 +4688,24 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_close():
             try:
                 self._set_run_status(run_id, "running")
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
-                    gateway_session_key=gateway_session_key,
+                # Off the loop, unlike the rest of this coroutine. ``_create_agent``
+                # joins background MCP discovery, which can block for as long as a
+                # slow MCP server takes to enumerate; this body runs as a bare task
+                # on the event loop, so building the agent inline here would stall
+                # health checks and platform heartbeats for that whole time — the
+                # #16856 failure the background discovery exists to avoid. The
+                # /v1/chat/completions path gets this for free (its whole closure is
+                # dispatched through run_in_executor); /v1/runs only offloads the
+                # conversation below, so the build needs offloading on its own.
+                agent = await loop.run_in_executor(
+                    None,
+                    lambda: self._create_agent(
+                        ephemeral_system_prompt=ephemeral_system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_text_cb,
+                        tool_progress_callback=event_cb,
+                        gateway_session_key=gateway_session_key,
+                    ),
                 )
                 self._active_run_agents[run_id] = agent
 
@@ -5186,6 +5208,22 @@ class APIServerAdapter(BasePlatformAdapter):
             # discover_mcp_tools() and corrupt _servers or stop the MCP loop
             # mid-rebuild.
             async with self._mcp_reload_lock:
+                # The gateway now serves BEFORE startup discovery has finished, so
+                # a reload arriving in that window would tear down servers the
+                # startup thread is still connecting — stopping the MCP event loop
+                # underneath it and leaving orphaned sessions or a half-registered
+                # registry. ``register_mcp_servers`` only dedupes against
+                # ``_servers``, not against in-flight connects, so the two cannot
+                # safely overlap. Let startup finish first; it is a no-op once done.
+                # In an executor because the join blocks.
+                #
+                # The join-ONLY variant, deliberately: the agent-build helper
+                # discovers inline when no startup thread exists, which here would
+                # connect servers before `old_servers` is snapshotted below — an
+                # empty `added` list, and a teardown of what it had just connected.
+                from hermes_cli.mcp_startup import wait_for_startup_mcp_discovery
+
+                await loop.run_in_executor(None, wait_for_startup_mcp_discovery)
                 await self._refresh_omnio_connector_toolkit_approvals()
                 with _lock:
                     old_servers = set(_servers.keys())
