@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from hermes_cli.inventory import (
     ConfigContext,
+    build_model_options_payload,
     build_models_payload,
     load_picker_context,
 )
@@ -1031,3 +1032,31 @@ def test_list_authenticated_providers_refresh_busts_cache():
         assert clear.call_count == 0
         model_switch.list_authenticated_providers(refresh=True)
         assert clear.call_count == 1
+
+
+# ─── model.options picker visibility ───────────────────────────────────
+
+
+def test_build_model_options_payload_requests_for_picker():
+    """GUI/TUI/API model.options must keep exhausted credential pools visible.
+
+    Aux pickers already forward for_picker=True (#66624). build_model_options_payload
+    is the shared path for Desktop/TUI/dashboard pickers — omitting the flag
+    hid rate-limited providers from the chat model dropdown mid-session.
+    """
+    captured: dict = {}
+
+    def _capture(*_args, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    with patch(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        side_effect=_capture,
+    ):
+        build_model_options_payload(_empty_ctx())
+
+    assert captured.get("for_picker") is True, (
+        "build_model_options_payload must pass for_picker=True so exhausted-pool "
+        "providers stay visible in Desktop/TUI model pickers"
+    )

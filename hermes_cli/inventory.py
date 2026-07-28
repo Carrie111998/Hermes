@@ -286,6 +286,11 @@ def build_model_options_payload(
       endpoints do not block the picker
     - explicit refresh: probe every custom provider while busting the model
       cache so live catalogs repopulate fully
+    - ``for_picker=True``: keep providers whose credential pool is entirely
+      rate-limited visible. Desktop/TUI/API pickers are human-facing surfaces;
+      hiding a temporarily exhausted pool makes providers vanish mid-session
+      even though another model under the same provider may still work
+      (same contract as ``/model`` and aux pickers — #66584 / #66624).
     """
     refresh = bool(refresh)
     return build_models_payload(
@@ -299,6 +304,7 @@ def build_model_options_payload(
         refresh=refresh,
         probe_custom_providers=refresh,
         probe_current_custom_provider=not refresh,
+        for_picker=True,
     )
 
 
