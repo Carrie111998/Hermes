@@ -80,6 +80,15 @@ class TestBuildLearnPrompt:
         # #6 scripts/references/templates layout.
         assert "scripts/" in _AUTHORING_STANDARDS
 
+    def test_authoring_standards_exclude_private_and_transient_material(self):
+        std = _AUTHORING_STANDARDS.lower()
+        assert "not a user profile or session archive" in std
+        assert "non-placeholder email addresses" in std
+        assert "credentials" in std
+        assert "re-checking volatile evidence" in std
+        assert "backup," in std
+        assert "snapshot, or timestamped copies" in std
+
 
 class TestLearnRegistryWiring:
     def test_learn_is_registered_and_resolves(self):
