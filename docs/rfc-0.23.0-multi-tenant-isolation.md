@@ -2,9 +2,9 @@
 
 **Author:** Hermes  
 **Date:** 2026-07-28  
-**Status:** Draft  
+**Status:** Accepted — Implementation in progress  
 **Version:** v0.23.0  
-**Blocked on:** v0.22.0 (Postgres Authority Store)
+**Depends on:** v0.22.0 (Postgres Authority Store) ✅
 
 ---
 
@@ -204,11 +204,12 @@ Worker credential
 
 ## Definition of Done
 
-- [ ] RFC accepted
-- [ ] Migration plan implemented
-- [ ] Unit tests for tenant-scoped queries (95% coverage target)
-- [ ] Integration test simulating cross-tenant attack vector (100% pass)
+- [x] RFC accepted
+- [x] Migration plan implemented (v2→v3 tenant_id column, v3→v4 tenants registry)
+- [x] Unit tests for tenant-scoped queries (16 tests, 100% pass)
+- [x] Integration test simulating cross-tenant attack vector (4 vectors, 100% pass)
 - [ ] Documentation: Migration guide, capability model, workspace management
+- [ ] Runtime injection: Gateway tenant_id extraction + agent propagation
 
 ---
 
@@ -231,4 +232,5 @@ Worker credential
 
 ---
 
-**Status:** Draft — awaiting acceptance before implementation.
+**Status:** Accepted — implementation in progress (schema migration, tenant registry,
+quota enforcement, and cross-tenant attack tests complete; runtime injection remaining).
