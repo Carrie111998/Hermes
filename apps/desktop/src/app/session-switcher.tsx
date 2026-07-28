@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 
 import { sessionTitle } from '@/lib/chat-runtime'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { cn } from '@/lib/utils'
 import { $unreadFinishedSessionIds } from '@/store/session'
 import { $attentionSessionIds, $workingSessionIds } from '@/store/session-states'
@@ -11,6 +12,19 @@ import { $switcherIndex, $switcherOpen, $switcherSessions, closeSwitcher } from 
 
 import { HUD_ITEM, HUD_POSITION, HUD_SURFACE, HUD_TEXT } from './floating-hud'
 import { openSession } from './open-session'
+
+export function sessionSwitcherStatus(
+  session: { id: string; profile?: null | string },
+  statusIds: { attention: ReadonlySet<string>; unread: ReadonlySet<string>; working: ReadonlySet<string> }
+): { attention: boolean; unread: boolean; working: boolean } {
+  const identityKey = sessionIdentityKey(session.id, session.profile)
+
+  return {
+    attention: statusIds.attention.has(identityKey),
+    unread: statusIds.unread.has(identityKey),
+    working: statusIds.working.has(identityKey)
+  }
+}
 
 // Compact session-switcher HUD — keyboard-driven from `use-keybinds`, rows
 // clickable via mousedown (Ctrl+click on macOS). No Dialog: Tab stays global.
@@ -37,9 +51,9 @@ export function SessionSwitcher() {
   const attentionIds = new Set(attention)
   const unreadIds = new Set(unread)
 
-  const pick = (sessionId: string) => {
+  const pick = (sessionId: string, profile?: null | string) => {
     closeSwitcher()
-    openSession(sessionId, navigate)
+    openSession(sessionId, navigate, 'in-place', profile)
   }
 
   return createPortal(
@@ -61,6 +75,13 @@ export function SessionSwitcher() {
       >
         {sessions.map((session, i) => {
           const selected = i === index
+          const identityKey = sessionIdentityKey(session.id, session.profile)
+
+          const status = sessionSwitcherStatus(session, {
+            attention: attentionIds,
+            unread: unreadIds,
+            working: workingIds
+          })
 
           return (
             <div
@@ -70,18 +91,14 @@ export function SessionSwitcher() {
                 HUD_TEXT,
                 selected ? 'bg-accent text-accent-foreground' : 'text-(--ui-text-secondary)'
               )}
-              key={session.id}
+              key={identityKey}
               onMouseDown={e => {
                 e.preventDefault()
-                pick(session.id)
+                pick(session.id, session.profile)
               }}
               ref={selected ? activeRef : undefined}
             >
-              <SwitcherDot
-                attention={attentionIds.has(session.id)}
-                unread={unreadIds.has(session.id)}
-                working={workingIds.has(session.id)}
-              />
+              <SwitcherDot {...status} />
               <span className="min-w-0 flex-1 truncate">{sessionTitle(session)}</span>
               {i < 9 && (
                 <span

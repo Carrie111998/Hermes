@@ -5,6 +5,12 @@ import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
 import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
+import {
+  normalizeProfileKey,
+  parseSessionIdentityKey,
+  sessionIdentityKey,
+  sessionMatchesIdentity
+} from '@/lib/session-identity'
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
@@ -60,7 +66,11 @@ export function rememberedSessionProfile(
   activeProfile: null | string
 ): string {
   if (sessionId) {
-    const owner = sessions.find(session => sessionMatchesStoredId(session, sessionId))?.profile?.trim()
+    const matching = sessions.filter(session => sessionMatchesStoredId(session, sessionId))
+
+    const owner =
+      matching.find(session => sessionMatchesIdentity(session, sessionId, activeProfile))?.profile?.trim() ??
+      (matching.length === 1 ? matching[0]?.profile?.trim() : undefined)
 
     if (owner) {
       return owner
@@ -166,8 +176,15 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
 /** Durable id for pinning. Auto-compression rotates a conversation's session
  *  id (root -> continuation tip), so pins keyed on the live id evaporate. The
  *  lineage root is stable across every compression, so we pin on that. */
-export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
-  session._lineage_root_id ?? session.id
+export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>): string =>
+  sessionIdentityKey(session._lineage_root_id ?? session.id, session.profile)
+
+/** Profile-safe pin id while a session row is still loading. */
+export const resolveSessionPinId = (
+  session: Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'> | null | undefined,
+  storedSessionId: string,
+  profile?: null | string
+): string => (session ? sessionPinId(session) : sessionIdentityKey(storedSessionId, profile))
 
 /** True when a stored/lineage id resolves to this session — it matches either
  *  the live id or the stable lineage root (see sessionPinId). The one place the
@@ -187,15 +204,44 @@ export const sessionMatchesStoredId = (
  */
 export function resolveComposerSessionKey(
   selectedSessionId: string | null | undefined,
-  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[]
+  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>[],
+  profile?: null | string
 ): string | null {
   if (!selectedSessionId) {
     return null
   }
 
-  const row = sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))
+  const row = sessions.find(session =>
+    profile === undefined
+      ? sessionMatchesStoredId(session, selectedSessionId)
+      : sessionMatchesIdentity(session, selectedSessionId, profile)
+  )
 
-  return row ? sessionPinId(row) : selectedSessionId
+  const durableId = row ? (row._lineage_root_id ?? row.id) : selectedSessionId
+
+  return profile === undefined ? durableId : sessionIdentityKey(durableId, profile)
+}
+
+/** Source keys inspected while moving draft/queue state onto a durable composer key. */
+export function resolveComposerMigrationKeys(
+  selectedSessionId: string,
+  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>[],
+  profile: null | string | undefined
+): { legacyLineageKey: string | null; selectedIdentity: string } {
+  const normalizedProfile = normalizeProfileKey(profile)
+
+  const ownedDefaultRow =
+    normalizedProfile === 'default'
+      ? sessions.find(session => sessionMatchesIdentity(session, selectedSessionId, normalizedProfile))
+      : undefined
+
+  return {
+    // Pre-profile draft/queue keys were raw ids. Only an exact row owned by the
+    // default profile may donate that raw lineage source; a colliding row from
+    // another profile must never be treated as legacy default-profile state.
+    legacyLineageKey: ownedDefaultRow ? (ownedDefaultRow._lineage_root_id ?? ownedDefaultRow.id) : null,
+    selectedIdentity: sessionIdentityKey(selectedSessionId, profile)
+  }
 }
 
 /** Merge a fresh server session page into the in-memory list, keeping any
@@ -226,21 +272,27 @@ export function mergeSessionPage(
   incoming: SessionInfo[],
   keepIds: Iterable<string>
 ): SessionInfo[] {
-  const keep = keepIds instanceof Set ? keepIds : new Set(keepIds)
+  const keep = new Set(
+    [...keepIds].map(id => {
+      const parsed = parseSessionIdentityKey(id)
+
+      return sessionIdentityKey(parsed.storedSessionId, parsed.profile)
+    })
+  )
 
   // Carry a known title onto a row that arrives title-less, so a freshly
   // submitted session (e.g. a branch draft) holds its placeholder instead of
   // flashing its raw message preview in the gap between persist and the async
   // auto-titler. A real clear sets the local title null first, so this never
   // masks one.
-  const prevById = new Map(previous.map(session => [session.id, session]))
+  const prevById = new Map(previous.map(session => [sessionIdentityKey(session.id, session.profile), session]))
 
   const merged = incoming.map(session => {
     if (session.title?.trim()) {
       return session
     }
 
-    const carried = prevById.get(session.id)?.title?.trim()
+    const carried = prevById.get(sessionIdentityKey(session.id, session.profile))?.title?.trim()
 
     return carried ? { ...session, title: carried } : session
   })
@@ -249,19 +301,22 @@ export function mergeSessionPage(
     return merged
   }
 
-  const incomingIds = new Set(merged.map(session => session.id))
+  const incomingIds = new Set(merged.map(session => sessionIdentityKey(session.id, session.profile)))
 
   // Deduplicate by compression lineage: when auto-compression rotates the tip
   // id (old #4 → new #5), the incoming page carries the new tip but the
   // previous list still holds the old one.  Without lineage-level dedup both
   // rows survive as separate sidebar entries (fixes #43483).
-  const incomingLineageKeys = new Set(merged.map(session => session._lineage_root_id ?? session.id))
+  const incomingLineageKeys = new Set(
+    merged.map(session => sessionIdentityKey(session._lineage_root_id ?? session.id, session.profile))
+  )
 
   const survivors = previous.filter(
     session =>
-      !incomingIds.has(session.id) &&
-      !incomingLineageKeys.has(session._lineage_root_id ?? session.id) &&
-      (keep.has(session.id) || (session._lineage_root_id != null && keep.has(session._lineage_root_id)))
+      !incomingIds.has(sessionIdentityKey(session.id, session.profile)) &&
+      !incomingLineageKeys.has(sessionIdentityKey(session._lineage_root_id ?? session.id, session.profile)) &&
+      (keep.has(sessionIdentityKey(session.id, session.profile)) ||
+        (session._lineage_root_id != null && keep.has(sessionIdentityKey(session._lineage_root_id, session.profile))))
   )
 
   return survivors.length ? [...survivors, ...merged] : merged
@@ -301,8 +356,15 @@ export const $messagingTruncated = atom<boolean>(false)
 // from the row count the query already returned.
 export const $sessionProfilesTruncated = atom<Record<string, boolean>>({})
 export const $sessionsLoading = atom(true)
+// Last profile scope whose recents request completed successfully. Distinct
+// from $sessionsLoading: populated refreshes deliberately avoid skeleton churn,
+// but a newly requested scope is still unresolved until its own response lands.
+// Sidebar order reconciliation uses this to preserve rows for profiles that
+// have not yet been loaded instead of treating them as confirmed empty.
+export const $sessionsHydratedProfileScope = atom<null | string>(null)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
+export const $selectedSessionIdentityKey = atom<string | null>(null)
 export interface ActiveSessionStoredIdRotation {
   nextStoredSessionId: string
   previousStoredSessionId: string
@@ -385,6 +447,8 @@ export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($mes
 export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean>>) =>
   updateAtom($sessionProfilesTruncated, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
+export const setSessionsHydratedProfileScope = (next: Updater<null | string>) =>
+  updateAtom($sessionsHydratedProfileScope, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>
   updateAtom($activeSessionStoredIdRotation, next)
@@ -393,13 +457,17 @@ export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStor
 // Written by session-states.ts (handleTransition), cleared here on session open.
 export const $unreadFinishedSessionIds = atom<string[]>([])
 
-export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
+export const setSelectedStoredSessionId = (next: Updater<string | null>, profile?: null | string) => {
   updateAtom($selectedStoredSessionId, next)
   // Opening a session clears its unread state — the user is now looking at it.
   const id = $selectedStoredSessionId.get()
 
-  if (id && $unreadFinishedSessionIds.get().includes(id)) {
-    $unreadFinishedSessionIds.set($unreadFinishedSessionIds.get().filter(x => x !== id))
+  $selectedSessionIdentityKey.set(id ? sessionIdentityKey(id, profile) : null)
+
+  const identityKey = id ? sessionIdentityKey(id, profile) : null
+
+  if (identityKey && $unreadFinishedSessionIds.get().includes(identityKey)) {
+    $unreadFinishedSessionIds.set($unreadFinishedSessionIds.get().filter(x => x !== identityKey))
   }
 }
 

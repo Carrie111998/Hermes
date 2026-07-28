@@ -11,6 +11,7 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { sessionMatchesIdentity } from '@/lib/session-identity'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
@@ -28,7 +29,6 @@ import {
   $sessions,
   $sessionStartedAt,
   $turnStartedAt,
-  sessionMatchesStoredId,
   setCurrentUsage
 } from '@/store/session'
 import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
@@ -161,7 +161,8 @@ export function useStatusbarItems({
   // every session-list write (title updates, poll refreshes, archives).
   const focusedRowStartedAt = useStoreSelector($sessions, sessions =>
     focusedStoredSessionId
-      ? (sessions.find(s => sessionMatchesStoredId(s, focusedStoredSessionId))?.started_at ?? null)
+      ? (sessions.find(s => sessionMatchesIdentity(s, focusedStoredSessionId, activeGatewayProfile))?.started_at ??
+        null)
       : null
   )
 

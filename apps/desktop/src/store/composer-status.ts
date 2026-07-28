@@ -1,6 +1,7 @@
 import { atom, computed } from 'nanostores'
 
 import { translateNow } from '@/i18n'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { stableArray } from '@/lib/stable-array'
 import type { TodoItem, TodoStatus } from '@/lib/todos'
 
@@ -29,6 +30,8 @@ export interface ComposerStatusItem {
   /** subagent: its own stored session id — row click opens that session window
    *  (livestreamed by the gateway's child-session mirror). */
   sessionId?: string
+  /** Owning profile inherited from the parent runtime. */
+  sessionProfile?: null | string
   state: StatusItemState
   title: string
   /** todo: the full four-state status driving the row's checkmark glyph. */
@@ -57,10 +60,11 @@ export const $backgroundRunningSessionIds = computed([$backgroundStatusBySession
 
   for (const [runtimeId, items] of Object.entries(bg)) {
     if (items.some(i => i.state === 'running')) {
-      const storedId = states[runtimeId]?.storedSessionId
+      const state = states[runtimeId]
+      const storedId = state?.storedSessionId
 
       if (storedId) {
-        ids.add(storedId)
+        ids.add(sessionIdentityKey(storedId, state.storedSessionProfile))
       }
     }
   }
@@ -129,10 +133,11 @@ function cancelAllAutoDismiss(sid: string) {
   autoClearTimers.delete(sid)
 }
 
-const subToItem = (s: SubagentProgress): ComposerStatusItem => ({
+const subToItem = (s: SubagentProgress, sessionProfile?: null | string): ComposerStatusItem => ({
   currentTool: s.currentTool,
   id: s.id,
   sessionId: s.sessionId,
+  sessionProfile,
   state: 'running',
   title: s.goal,
   type: 'subagent'
@@ -175,7 +180,8 @@ const sameStatusItem = (a: ComposerStatusItem, b: ComposerStatusItem) =>
   a.currentTool === b.currentTool &&
   a.goalStatus === b.goalStatus &&
   a.todoStatus === b.todoStatus &&
-  a.sessionId === b.sessionId
+  a.sessionId === b.sessionId &&
+  a.sessionProfile === b.sessionProfile
 
 const stabilizeItems = (prev: ComposerStatusItem[] | undefined, next: ComposerStatusItem[]): ComposerStatusItem[] => {
   if (!prev) {
@@ -190,8 +196,8 @@ const stabilizeItems = (prev: ComposerStatusItem[] | undefined, next: ComposerSt
 let prevStatusItems: Record<string, ComposerStatusItem[]> = {}
 
 export const $statusItemsBySession = computed(
-  [$goalsBySession, $subagentsBySession, $backgroundStatusBySession, $todosBySession],
-  (goals, subs, background, todos) => {
+  [$goalsBySession, $subagentsBySession, $backgroundStatusBySession, $todosBySession, $sessionStates],
+  (goals, subs, background, todos, states) => {
     const out: Record<string, ComposerStatusItem[]> = {}
 
     const push = (sid: string, items: ComposerStatusItem[]) => {
@@ -209,7 +215,12 @@ export const $statusItemsBySession = computed(
     }
 
     for (const [sid, list] of Object.entries(subs)) {
-      push(sid, list.filter(s => s.status === 'running' || s.status === 'queued').map(subToItem))
+      push(
+        sid,
+        list
+          .filter(s => s.status === 'running' || s.status === 'queued')
+          .map(subagent => subToItem(subagent, states[sid]?.storedSessionProfile))
+      )
     }
 
     for (const [sid, list] of Object.entries(background)) {

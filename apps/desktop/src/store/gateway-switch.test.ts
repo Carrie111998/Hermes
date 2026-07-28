@@ -7,12 +7,14 @@ import {
   $messagingSessions,
   $sessionProfilesTruncated,
   $sessions,
+  $sessionsHydratedProfileScope,
   $sessionsLoading,
   setCronSessions,
   setFreshDraftReady,
   setMessagingSessions,
   setSessionProfilesTruncated,
   setSessions,
+  setSessionsHydratedProfileScope,
   setSessionsLoading
 } from '@/store/session'
 import { $stalledSessionIds } from '@/store/session-states'
@@ -27,6 +29,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
   beforeEach(() => {
     $gatewaySwitching.set(false)
     setSessions([{ id: 's1', title: 'old', profile: 'default' } as never])
+    setSessionsHydratedProfileScope('default')
     setSessionProfilesTruncated({ default: true })
     setCronSessions([{ id: 'c1', title: 'cron', profile: 'default' } as never])
     setMessagingSessions([{ id: 'm1', title: 'tg', profile: 'default' } as never])
@@ -39,6 +42,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
   afterEach(() => {
     resetSessionsLimit()
     setSessions([])
+    setSessionsHydratedProfileScope(null)
     setCronSessions([])
     setMessagingSessions([])
     $stalledSessionIds.set([])
@@ -50,6 +54,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     wipeSessionListsForGatewaySwitch()
 
     expect($sessions.get()).toEqual([])
+    expect($sessionsHydratedProfileScope.get()).toBeNull()
     expect($sessionProfilesTruncated.get()).toEqual({})
     expect($cronSessions.get()).toEqual([])
     expect($messagingSessions.get()).toEqual([])

@@ -5,6 +5,7 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -38,7 +39,7 @@ import {
   setSessionsLoading
 } from '@/store/session'
 import { $attentionSessionIds, $workingSessionIds, resetTileRuntimeBindings } from '@/store/session-states'
-import type { RpcEvent } from '@/types/hermes'
+import type { RpcEvent, SessionInfo } from '@/types/hermes'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
 
@@ -58,6 +59,21 @@ interface GatewayBootOptions {
   onGatewayReady: (gateway: HermesGateway | null) => void
   refreshHermesConfig: () => Promise<void>
   refreshSessions: () => Promise<void>
+}
+
+export function profilesWithLiveSessions(
+  sessions: Pick<SessionInfo, 'id' | 'profile'>[],
+  liveSessionIds: ReadonlySet<string>
+): Set<string> {
+  const profiles = new Set<string>()
+
+  for (const session of sessions) {
+    if (liveSessionIds.has(sessionIdentityKey(session.id, session.profile))) {
+      profiles.add(normalizeProfileKey(session.profile))
+    }
+  }
+
+  return profiles
 }
 
 export function useGatewayBoot({
@@ -425,15 +441,8 @@ export function useGatewayBoot({
     // to idle-reap. The active profile is always spared.
     const recomputeKeptGateways = () => {
       const live = new Set([...$workingSessionIds.get(), ...$attentionSessionIds.get()])
-      const keep = new Set<string>()
 
-      for (const session of $sessions.get()) {
-        if (live.has(session.id)) {
-          keep.add(normalizeProfileKey(session.profile))
-        }
-      }
-
-      pruneSecondaryGateways(keep)
+      pruneSecondaryGateways(profilesWithLiveSessions($sessions.get(), live))
     }
 
     const offWorking = $workingSessionIds.subscribe(() => recomputeKeptGateways())

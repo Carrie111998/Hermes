@@ -1,5 +1,7 @@
 import { atom } from 'nanostores'
 
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
+
 import type { ComposerAttachment } from './composer'
 
 export interface QueuedPromptEntry {
@@ -16,6 +18,60 @@ export interface QueuedPromptEntry {
 type QueueState = Record<string, QueuedPromptEntry[]>
 
 const STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+const QUEUE_STATE_VERSION = 2
+
+interface PersistedQueueGroup {
+  entries: QueuedPromptEntry[]
+  profile: string
+  storedSessionId: string
+}
+
+function isPersistedQueueGroup(value: unknown): value is PersistedQueueGroup {
+  return (
+    Boolean(value) &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Array.isArray((value as PersistedQueueGroup).entries) &&
+    typeof (value as PersistedQueueGroup).profile === 'string' &&
+    typeof (value as PersistedQueueGroup).storedSessionId === 'string' &&
+    (value as PersistedQueueGroup).storedSessionId.length > 0
+  )
+}
+
+export function decodeQueuedPromptState(raw: string): QueueState {
+  const parsed = JSON.parse(raw) as unknown
+  const stored = parsed as { queues?: unknown; version?: unknown } | null
+
+  if (stored && typeof stored === 'object' && stored.version === QUEUE_STATE_VERSION && Array.isArray(stored.queues)) {
+    return Object.fromEntries(
+      stored.queues
+        .filter(isPersistedQueueGroup)
+        .map(group => [sessionIdentityKey(group.storedSessionId, group.profile), group.entries])
+    )
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {}
+  }
+
+  // v1 was an ownerless record keyed directly by raw stored ids. Its container
+  // establishes the legacy domain; NUL or sentinel-looking id bytes do not.
+  return Object.fromEntries(
+    Object.entries(parsed)
+      .filter((entry): entry is [string, QueuedPromptEntry[]] => entry[0].length > 0 && Array.isArray(entry[1]))
+      .map(([storedSessionId, entries]) => [sessionIdentityKey(storedSessionId, 'default'), entries])
+  )
+}
+
+export function encodeQueuedPromptState(state: QueueState): string {
+  return JSON.stringify({
+    queues: Object.entries(state).map(([identityKey, entries]) => ({
+      ...parseSessionIdentityKey(identityKey),
+      entries
+    })),
+    version: QUEUE_STATE_VERSION
+  })
+}
 
 const load = (): QueueState => {
   if (typeof window === 'undefined') {
@@ -24,9 +80,8 @@ const load = (): QueueState => {
 
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY)
-    const parsed = raw ? JSON.parse(raw) : null
 
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as QueueState) : {}
+    return raw ? decodeQueuedPromptState(raw) : {}
   } catch {
     return {}
   }
@@ -41,7 +96,7 @@ const save = (state: QueueState) => {
     if (Object.keys(state).length === 0) {
       window.localStorage.removeItem(STORAGE_KEY)
     } else {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+      window.localStorage.setItem(STORAGE_KEY, encodeQueuedPromptState(state))
     }
   } catch {
     // best-effort: storage may be unavailable, queue still works in-memory
@@ -95,9 +150,7 @@ const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
 }
 
 const sidOf = (key: string | null | undefined): null | string => {
-  const trimmed = key?.trim()
-
-  return trimmed ? trimmed : null
+  return key ? key : null
 }
 
 const queueFor = (sid: string) => $queuedPromptsBySession.get()[sid] ?? []

@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import type { ArtifactDetection } from '@/lib/artifact-detect'
+import { sessionIdentityKey } from '@/lib/session-identity'
 
 import {
+  $artifactRegistry,
   $artifactVersionSelection,
   artifactsForSession,
   clearArtifactRegistry,
@@ -78,6 +80,24 @@ describe('artifacts store', () => {
 
     expect(artifactsForSession('session-1')).toHaveLength(1)
     expect(artifactsForSession('session-2')).toHaveLength(1)
+  })
+
+  it('keeps colliding stored session ids isolated by profile', () => {
+    const alpha = upsertArtifact('shared', HTML_DETECTION, '<html>alpha</html>', 'alpha')!
+    const beta = upsertArtifact('shared', HTML_DETECTION, '<html>beta</html>', 'beta')!
+
+    expect(alpha.artifactId).not.toBe(beta.artifactId)
+    expect(artifactsForSession('shared', 'alpha')[0]?.versions.at(-1)?.content).toBe('<html>alpha</html>')
+    expect(artifactsForSession('shared', 'beta')[0]?.versions.at(-1)?.content).toBe('<html>beta</html>')
+  })
+
+  it('keeps opaque stored ids distinct when they differ by whitespace', () => {
+    upsertArtifact('shared', HTML_DETECTION, '<html>plain</html>', 'alpha')
+    upsertArtifact('shared ', HTML_DETECTION, '<html>space</html>', 'alpha')
+
+    expect(artifactsForSession('shared', 'alpha')[0]?.versions.at(-1)?.content).toBe('<html>plain</html>')
+    expect(artifactsForSession('shared ', 'alpha')[0]?.versions.at(-1)?.content).toBe('<html>space</html>')
+    expect($artifactRegistry.get()).toHaveProperty(sessionIdentityKey('shared ', 'alpha'))
   })
 
   it('rejects empty sessions and empty content', () => {

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
+import { sessionIdentityKey } from '@/lib/session-identity'
+
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../routes'
 
 import { routeTargetFromToken, sessionContextDrift } from './session-context-drift'
@@ -73,6 +75,36 @@ describe('sessionContextDrift', () => {
     })
 
     expect(reason).toBe('route:sess-a->sess-b')
+  })
+
+  it('drifts when only the routed profile changes for a colliding stored id', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute('shared'), '?profile=alpha'),
+      nowRouteToken: routeToken(sessionRoute('shared'), '?profile=beta'),
+      startSelectedStoredId: 'shared',
+      nowSelectedStoredId: 'shared',
+      startSelectedProfile: 'alpha',
+      nowSelectedProfile: 'beta',
+      submitTargetStoredId: 'shared',
+      submitTargetProfile: 'alpha'
+    })
+
+    expect(reason).toBe('route:alpha/shared->beta/shared')
+  })
+
+  it('drifts when selection moves between profiles that share the stored id', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute('shared'), '?profile=alpha'),
+      nowRouteToken: routeToken(sessionRoute('shared'), '?profile=alpha'),
+      startSelectedStoredId: 'shared',
+      nowSelectedStoredId: 'shared',
+      startSelectedProfile: 'alpha',
+      nowSelectedProfile: 'beta',
+      submitTargetStoredId: 'shared',
+      submitTargetProfile: 'alpha'
+    })
+
+    expect(reason).toBe('selection:alpha/shared->beta/shared')
   })
 
   it('drifts when the route moves to the new-chat route mid-submit', () => {
@@ -161,6 +193,23 @@ describe('sessionContextDrift', () => {
     })
 
     expect(reason).toBe('composer:sess-b->sess-a')
+  })
+
+  it('drifts when compound composer scopes have the same raw id under different profiles', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(sessionRoute('shared'), '?profile=beta'),
+      nowRouteToken: routeToken(sessionRoute('shared'), '?profile=beta'),
+      startSelectedStoredId: 'shared',
+      nowSelectedStoredId: 'shared',
+      startSelectedProfile: 'beta',
+      nowSelectedProfile: 'beta',
+      submitTargetStoredId: 'shared',
+      submitTargetProfile: 'beta',
+      composerScope: sessionIdentityKey('shared', 'alpha'),
+      submitTargetComposerScope: sessionIdentityKey('shared', 'beta')
+    })
+
+    expect(reason).toBe('composer:alpha/shared->beta/shared')
   })
 
   it('checks the composer prong before the route/selection prongs', () => {

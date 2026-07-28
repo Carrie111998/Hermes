@@ -1,9 +1,37 @@
 import { describe, expect, it } from 'vitest'
 
-import { NEW_CHAT_ROUTE, primaryRouteSelectedSessionId, sessionRoute, SETTINGS_ROUTE } from './routes'
+import { sessionIdentityKey } from '@/lib/session-identity'
+
+import {
+  NEW_CHAT_ROUTE,
+  primaryRouteSelectedSessionId,
+  routeSessionIdentityKey,
+  routeSessionProfile,
+  sessionRoute,
+  SETTINGS_ROUTE
+} from './routes'
 
 const SESS_A = 'sess-a'
 const SESS_B = 'sess-b'
+
+describe('profile-routed session paths', () => {
+  it('retains the owning profile when building a session route', () => {
+    expect(sessionRoute('telegram/session', 'ubuntu server')).toBe('/telegram%2Fsession?profile=ubuntu%20server')
+  })
+
+  it('recovers and normalizes the owning profile from the route query', () => {
+    expect(routeSessionProfile('?profile=%20ubuntu%20server%20')).toBe('ubuntu server')
+    expect(routeSessionProfile('?profile=%20%20')).toBeNull()
+    expect(routeSessionProfile('')).toBeNull()
+  })
+
+  it('distinguishes colliding stored ids by the route owner profile', () => {
+    expect(routeSessionIdentityKey('/shared', '?profile=alpha', 'default')).toBe(
+      sessionIdentityKey('shared', 'alpha')
+    )
+    expect(routeSessionIdentityKey('/shared', '?profile=beta', 'default')).toBe(sessionIdentityKey('shared', 'beta'))
+  })
+})
 
 describe('primaryRouteSelectedSessionId', () => {
   it('prefers the routed session id over a stale/different store selection (#59305)', () => {

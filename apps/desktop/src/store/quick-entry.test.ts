@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   initialQuickComposerState,
+  normalizeQuickEntrySubmitPayload,
   QUICK_TARGET_CURRENT,
   QUICK_TARGET_NEW,
   type QuickComposerEvent,
@@ -32,8 +33,8 @@ function run(events: QuickComposerEvent[], from: QuickComposerState = initialQui
 const connect: QuickComposerEvent = {
   connected: true,
   sessions: [
-    { id: 's1', title: 'Fix the build' },
-    { id: 's2', title: 'Research trip' }
+    { id: 's1', target: { kind: 'session', profile: 'alpha', storedSessionId: 's1' }, title: 'Fix the build' },
+    { id: 's2', target: { kind: 'session', profile: 'beta', storedSessionId: 's2' }, title: 'Research trip' }
   ],
   type: 'state'
 }
@@ -53,7 +54,7 @@ describe('quickComposerReducer', () => {
   it('submit sends the trimmed draft with the target, clears it, and hides', () => {
     const { sent, state } = run([connect, { draft: '  ship it  ', type: 'edit' }, { type: 'submit' }])
 
-    expect(sent).toEqual([{ target: QUICK_TARGET_CURRENT, text: 'ship it' }])
+    expect(sent).toEqual([{ target: { kind: 'current' }, text: 'ship it' }])
     expect(state.draft).toBe('')
     expect(state.submitting).toBe(true)
     expect(state.visible).toBe(false)
@@ -80,7 +81,7 @@ describe('quickComposerReducer', () => {
 
     // The gateway comes back: the same draft now sends.
     const after = run([connect, { type: 'submit' }], state)
-    expect(after.sent).toEqual([{ target: QUICK_TARGET_CURRENT, text: 'hello?' }])
+    expect(after.sent).toEqual([{ target: { kind: 'current' }, text: 'hello?' }])
   })
 
   it('a disconnect push mid-composition keeps the draft but blocks the send', () => {
@@ -99,7 +100,7 @@ describe('quickComposerReducer', () => {
   it('a second submit while already submitting cannot double-send', () => {
     const { sent, state } = run([connect, { draft: 'hello', type: 'edit' }, { type: 'submit' }, { type: 'submit' }])
 
-    expect(sent).toEqual([{ target: QUICK_TARGET_CURRENT, text: 'hello' }])
+    expect(sent).toEqual([{ target: { kind: 'current' }, text: 'hello' }])
     expect(state.submitting).toBe(true)
   })
 
@@ -111,7 +112,37 @@ describe('quickComposerReducer', () => {
       { type: 'submit' }
     ])
 
-    expect(sent).toEqual([{ target: 's2', text: 'send this there' }])
+    expect(sent).toEqual([
+      { target: { kind: 'session', profile: 'beta', storedSessionId: 's2' }, text: 'send this there' }
+    ])
+  })
+
+  it('rejects legacy string targets instead of confusing them with controls or compound IDs', () => {
+    expect(normalizeQuickEntrySubmitPayload('legacy prompt')).toBeNull()
+    expect(normalizeQuickEntrySubmitPayload({ target: 'current', text: 'do not redirect' })).toBeNull()
+    expect(normalizeQuickEntrySubmitPayload({ target: 'new', text: 'do not redirect' })).toBeNull()
+    expect(normalizeQuickEntrySubmitPayload({ target: 'alpha\0shared', text: 'do not redirect' })).toBeNull()
+  })
+
+  it('rejects a session target without an explicit nonblank owner', () => {
+    expect(
+      normalizeQuickEntrySubmitPayload({
+        target: { kind: 'session', profile: '   ', storedSessionId: 'shared' },
+        text: 'do not redirect'
+      })
+    ).toBeNull()
+  })
+
+  it('validates a session target while preserving the exact opaque stored ID', () => {
+    expect(
+      normalizeQuickEntrySubmitPayload({
+        target: { kind: 'session', profile: ' BETA ', storedSessionId: ' left\0right ' },
+        text: 'owned prompt'
+      })
+    ).toEqual({
+      target: { kind: 'session', profile: 'BETA', storedSessionId: ' left\0right ' },
+      text: 'owned prompt'
+    })
   })
 
   it('the new-session target rides the submit payload', () => {
@@ -122,14 +153,20 @@ describe('quickComposerReducer', () => {
       { type: 'submit' }
     ])
 
-    expect(sent).toEqual([{ target: QUICK_TARGET_NEW, text: 'fresh start' }])
+    expect(sent).toEqual([{ target: { kind: 'new' }, text: 'fresh start' }])
   })
 
   it('a picked session that vanishes from the pushed list falls back to current', () => {
     const { state } = run([
       connect,
       { target: 's2', type: 'target' },
-      { connected: true, sessions: [{ id: 's1', title: 'Fix the build' }], type: 'state' }
+      {
+        connected: true,
+        sessions: [
+          { id: 's1', target: { kind: 'session', profile: 'alpha', storedSessionId: 's1' }, title: 'Fix the build' }
+        ],
+        type: 'state'
+      }
     ])
 
     expect(state.target).toBe(QUICK_TARGET_CURRENT)
@@ -166,7 +203,7 @@ describe('quickComposerReducer', () => {
   it('the blur that follows a submit does not re-send or resurrect the draft', () => {
     const { sent, state } = run([connect, { draft: 'go', type: 'edit' }, { type: 'submit' }, { type: 'blur' }])
 
-    expect(sent).toEqual([{ target: QUICK_TARGET_CURRENT, text: 'go' }])
+    expect(sent).toEqual([{ target: { kind: 'current' }, text: 'go' }])
     expect(state.draft).toBe('')
     expect(state.submitting).toBe(false)
     expect(state.visible).toBe(false)
@@ -210,7 +247,7 @@ describe('quickComposerReducer', () => {
     const first = run([connect, { draft: 'one', type: 'edit' }, { type: 'submit' }])
     const second = run([{ type: 'shown' }, { draft: 'two', type: 'edit' }, { type: 'submit' }], first.state)
 
-    expect(first.sent).toEqual([{ target: QUICK_TARGET_CURRENT, text: 'one' }])
-    expect(second.sent).toEqual([{ target: QUICK_TARGET_CURRENT, text: 'two' }])
+    expect(first.sent).toEqual([{ target: { kind: 'current' }, text: 'one' }])
+    expect(second.sent).toEqual([{ target: { kind: 'current' }, text: 'two' }])
   })
 })

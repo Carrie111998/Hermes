@@ -9,7 +9,7 @@
 
 import { useStore } from '@nanostores/react'
 import { type ComponentProps, lazy, memo, type ReactNode, Suspense, useMemo } from 'react'
-import { Navigate, Route, Routes, useParams } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
@@ -19,7 +19,7 @@ import { $freshDraftReady, $gatewayState } from '@/store/session'
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
-import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
+import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, routeSessionProfile, sessionRoute } from '../routes'
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
 import { useStatusbarItems } from '../shell/hooks/use-statusbar-items'
 import { ModelMenuPanel } from '../shell/model-menu-panel'
@@ -38,8 +38,15 @@ const SkillsView = lazy(async () => ({ default: (await import('../skills')).Skil
 
 export function LegacySessionRedirect() {
   const { sessionId } = useParams()
+  const { search } = useLocation()
+  const activeProfile = useStore($activeGatewayProfile)
 
-  return <Navigate replace to={sessionId ? sessionRoute(sessionId) : NEW_CHAT_ROUTE} />
+  return (
+    <Navigate
+      replace
+      to={sessionId ? sessionRoute(sessionId, routeSessionProfile(search) ?? activeProfile) : NEW_CHAT_ROUTE}
+    />
+  )
 }
 
 export const SidebarSurface = memo(function SidebarSurface({

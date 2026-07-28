@@ -33,7 +33,10 @@ declare global {
       // with an error code when the sessionId is empty/invalid. `watch` opens
       // a spectator window (lazy resume — no agent build) for live-streaming
       // a running subagent's session.
-      openSessionWindow: (sessionId: string, opts?: { watch?: boolean }) => Promise<{ ok: boolean; error?: string }>
+      openSessionWindow: (
+        sessionId: string,
+        opts?: { profile?: null | string; watch?: boolean }
+      ) => Promise<{ ok: boolean; error?: string }>
       // Open a new full-chrome app window — a peer instance of the primary that
       // renders the complete app against the shared backend, so the user can run
       // multiple GUI windows at once.
@@ -79,7 +82,7 @@ declare global {
         // Quick window subscribes to those pushes.
         onState: (callback: (payload: QuickEntryStatePush) => void) => () => void
         // Primary renderer subscribes to submits captured by the quick window.
-        onSubmit: (callback: (payload: QuickEntrySubmitPayload | string) => void) => () => void
+        onSubmit: (callback: (payload: QuickEntrySubmitPayload) => void) => () => void
         // Quick window subscribes to "you were just summoned" so it can reset
         // its draft and re-focus the input on every open.
         onShown: (callback: () => void) => () => void
@@ -231,8 +234,10 @@ declare global {
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
-      onFocusSession?: (callback: (sessionId: string) => void) => () => void
-      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      onFocusSession?: (callback: (payload: { profile?: null | string; sessionId: string }) => void) => () => void
+      onNotificationAction?: (
+        callback: (payload: { actionId: string; profile?: null | string; sessionId?: string }) => void
+      ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
@@ -739,6 +744,8 @@ export interface HermesNotification {
   body?: string
   silent?: boolean
   kind?: string
+  profile?: null | string
+  runtimeSessionId?: string
   sessionId?: string
   actions?: { id: string; text: string }[]
 }

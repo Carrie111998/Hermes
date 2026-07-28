@@ -6,6 +6,8 @@ import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { normalizeProfileKey, sessionIdentityKey } from '@/lib/session-identity'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $busy,
@@ -94,58 +96,56 @@ export function useSessionStateCache({
     setMutableRef(busyRef, busy)
   }, [busy, busyRef])
 
-  const ensureSessionState = useCallback((sessionId: string, storedSessionId?: string | null) => {
-    const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
+  const ensureSessionState = useCallback(
+    (sessionId: string, storedSessionId?: string | null, storedSessionProfile?: null | string) => {
+      const existing = sessionStateByRuntimeIdRef.current.get(sessionId)
+      const profileKey = normalizeProfileKey(
+        storedSessionProfile ?? existing?.storedSessionProfile ?? $activeGatewayProfile.get()
+      )
 
-    if (existing) {
-      if (storedSessionId !== undefined && storedSessionId !== existing.storedSessionId) {
-        // Stored id changed (e.g. auto-compression rotated it). Create a NEW
-        // state object rather than mutating in place — updateSessionState needs
-        // the PREVIOUS state to detect transitions (busy→idle, id rotation).
-        const updated = { ...existing, storedSessionId }
+      if (existing) {
+        const storedIdChanged = storedSessionId !== undefined && storedSessionId !== existing.storedSessionId
+        const profileChanged = normalizeProfileKey(existing.storedSessionProfile) !== profileKey
 
-        sessionStateByRuntimeIdRef.current.set(sessionId, updated)
+        if (storedIdChanged || profileChanged) {
+          const nextStoredId = storedSessionId === undefined ? existing.storedSessionId : storedSessionId
+          const updated = { ...existing, storedSessionId: nextStoredId, storedSessionProfile: profileKey }
 
-        // Drop the obsolete stored→runtime reverse mapping as soon as the id
-        // rotates (e.g. auto-compression forks a continuation). Leaving the
-        // stale key lets getRuntimeIdForStoredSession resolve the old stored id
-        // to this runtime, which the compression route-follow logic relies on
-        // being absent. The rotation signal was previously emitted centrally
-        // from handleTransition (session-states.ts), but updateSessionState
-        // now skips publishSessionState (and thus handleTransition) when the
-        // updater is a no-op — fire it here so the route-follow effect still
-        // tracks compression without needing a dummy state write.
-        if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
-          runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
+          sessionStateByRuntimeIdRef.current.set(sessionId, updated)
 
-          // A rotation event needs a real next id — a null/cleared stored id
-          // is a detach, not a rotation the route-follow effect should chase.
-          if (storedSessionId && sessionId === $activeSessionId.get()) {
+          if (existing.storedSessionId) {
+            runtimeIdByStoredSessionIdRef.current.delete(
+              sessionIdentityKey(existing.storedSessionId, existing.storedSessionProfile)
+            )
+          }
+
+          if (storedIdChanged && existing.storedSessionId && nextStoredId && sessionId === $activeSessionId.get()) {
             setActiveSessionStoredIdRotation({
-              nextStoredSessionId: storedSessionId,
+              nextStoredSessionId: nextStoredId,
               previousStoredSessionId: existing.storedSessionId,
               runtimeSessionId: sessionId
             })
           }
+
+          if (nextStoredId) {
+            runtimeIdByStoredSessionIdRef.current.set(sessionIdentityKey(nextStoredId, profileKey), sessionId)
+          }
         }
 
-        if (storedSessionId) {
-          runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
-        }
+        return sessionStateByRuntimeIdRef.current.get(sessionId)!
       }
 
-      return sessionStateByRuntimeIdRef.current.get(sessionId)!
-    }
+      const created = createClientSessionState(storedSessionId ?? null, [], profileKey)
+      sessionStateByRuntimeIdRef.current.set(sessionId, created)
 
-    const created = createClientSessionState(storedSessionId ?? null)
-    sessionStateByRuntimeIdRef.current.set(sessionId, created)
+      if (storedSessionId) {
+        runtimeIdByStoredSessionIdRef.current.set(sessionIdentityKey(storedSessionId, profileKey), sessionId)
+      }
 
-    if (storedSessionId) {
-      runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
-    }
-
-    return created
-  }, [])
+      return created
+    },
+    []
+  )
 
   const resetViewSync = useCallback(() => {
     // Drop any RAF-pending transcript stage so a backgrounded turn cannot
@@ -280,9 +280,10 @@ export function useSessionStateCache({
     (
       sessionId: string,
       updater: (state: ClientSessionState) => ClientSessionState,
-      storedSessionId?: string | null
+      storedSessionId?: string | null,
+      storedSessionProfile?: null | string
     ) => {
-      const previous = ensureSessionState(sessionId, storedSessionId)
+      const previous = ensureSessionState(sessionId, storedSessionId, storedSessionProfile)
       // Give the updater the raw previous state so it can return the same
       // reference when nothing changed (the caller sees a no-op). Previously
       // the param was always a fresh spread, so every call looked like a
@@ -300,14 +301,15 @@ export function useSessionStateCache({
       }
 
       sessionStateByRuntimeIdRef.current.set(sessionId, next)
+      // Publish identity rotation first. The transition migrates any journal
+      // from the previous stored id to `next`; persisting afterward then writes
+      // the current running snapshot or clears that migrated entry when this
+      // same update also settles the turn.
+      publishSessionState(sessionId, next)
       // Crash-survivable turn progress: journal the running turn's visible
       // tail (throttled localStorage write; cleared the moment the turn
       // settles) so a renderer/app death mid-turn can be recovered on resume.
       persistInFlightTurnState(next)
-      // Publishing to $sessionStates automatically fires transition side-effects
-      // (watchdog, settle grace, unread marker, compression id rotation) inside
-      // publishSessionState — no manual transition call needed.
-      publishSessionState(sessionId, next)
       syncSessionStateToView(sessionId, next)
 
       return next
@@ -315,8 +317,9 @@ export function useSessionStateCache({
     [ensureSessionState, syncSessionStateToView]
   )
 
-  const getRuntimeIdForStoredSession = useCallback((storedSessionId: string): string | null => {
-    const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+  const getRuntimeIdForStoredSession = useCallback((storedSessionId: string, profile?: null | string): string | null => {
+    const profileKey = normalizeProfileKey(profile ?? $activeGatewayProfile.get())
+    const runtimeId = runtimeIdByStoredSessionIdRef.current.get(sessionIdentityKey(storedSessionId, profileKey))
 
     if (!runtimeId) {
       return null
@@ -324,7 +327,10 @@ export function useSessionStateCache({
 
     const runtimeState = sessionStateByRuntimeIdRef.current.get(runtimeId)
 
-    return runtimeState?.storedSessionId === storedSessionId ? runtimeId : null
+    return runtimeState?.storedSessionId === storedSessionId &&
+      normalizeProfileKey(runtimeState.storedSessionProfile) === profileKey
+      ? runtimeId
+      : null
   }, [])
 
   return {

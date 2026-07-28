@@ -58,6 +58,7 @@ import {
 } from '@/store/command-palette'
 import { $bindings } from '@/store/keybinds'
 import { openPetGenerate } from '@/store/pet-generate'
+import { $activeGatewayProfile } from '@/store/profile'
 import { requestStartWorkSession } from '@/store/projects'
 import { runGatewayRestart } from '@/store/system-actions'
 import { applyBackendUpdate } from '@/store/updates'
@@ -87,6 +88,7 @@ import { prettyName } from '../settings/helpers'
 import { usePaletteContributions } from './contrib'
 import { MarketplaceThemePage } from './marketplace-theme-page'
 import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
+import { archivedSessionTarget, sessionPaletteItemId } from './session-items'
 
 interface PaletteItem {
   /** Keybind action id — its live combo renders as a hotkey hint. */
@@ -133,6 +135,7 @@ interface SessionEntry {
   git_branch?: null | string
   id: string
   preview?: string
+  profile?: null | string
   title: string
 }
 
@@ -228,6 +231,7 @@ const toSessionEntry = (session: SessionRow): SessionEntry => ({
   git_branch: session.git_branch ?? null,
   id: session.id,
   preview: session.preview ?? undefined,
+  profile: session.profile,
   title: sessionTitle(session)
 })
 
@@ -382,9 +386,10 @@ export function CommandPalette() {
   // Sessions: plain select = open in-place (focus existing tile/main, else main);
   // ⌘/⌃-select / ⌘-Enter = new tab; ⇧⌘ = own window. Same door as the sidebar.
   const goSession = useCallback(
-    (sessionId: string) => (event?: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => {
-      openSession(sessionId, navigate, openSessionIntentFromModifiers(event))
-    },
+    (sessionId: string, profile?: null | string) =>
+      (event?: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => {
+        openSession(sessionId, navigate, openSessionIntentFromModifiers(event), profile)
+      },
     [navigate]
   )
 
@@ -656,7 +661,7 @@ export function CommandPalette() {
             id: `goto-${directId}`,
             keywords: ['session', 'id', 'go to', directId],
             label: `${t.commandCenter.goToSession} ${directId}`,
-            runWithEvent: goSession(directId)
+            runWithEvent: goSession(directId, $activeGatewayProfile.get())
           }
         ]
       })
@@ -736,7 +741,7 @@ export function CommandPalette() {
         heading: t.commandCenter.sections.sessions,
         items: sessions.map(session => ({
           icon: MessageCircle,
-          id: `session-${session.id}`,
+          id: sessionPaletteItemId('session', session),
           keywords: [
             'chat',
             'session',
@@ -744,7 +749,7 @@ export function CommandPalette() {
             ...(session.git_branch ? [session.git_branch] : [])
           ],
           label: session.title,
-          runWithEvent: goSession(session.id)
+          runWithEvent: goSession(session.id, session.profile)
         }))
       })
     }
@@ -779,7 +784,7 @@ export function CommandPalette() {
         heading: t.commandCenter.archivedChats,
         items: archivedSessions.map(session => ({
           icon: Archive,
-          id: `archived-${session.id}`,
+          id: sessionPaletteItemId('archived', session),
           keywords: [
             'archived',
             'chat',
@@ -788,7 +793,7 @@ export function CommandPalette() {
             ...(session.git_branch ? [session.git_branch] : [])
           ],
           label: session.title,
-          run: go(`${SETTINGS_ROUTE}?tab=sessions&session=${encodeURIComponent(session.id)}`)
+          run: go(archivedSessionTarget(session))
         }))
       })
     }

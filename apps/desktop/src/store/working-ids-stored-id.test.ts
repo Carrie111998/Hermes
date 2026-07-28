@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { $workingSessionIds, clearAllSessionStates, publishSessionState } from '@/store/session-states'
 
 /**
@@ -27,6 +28,6 @@ describe('$workingSessionIds — a busy runtime with no stored id', () => {
   it('shows the spinner as soon as the stored id is known', () => {
     publishSessionState('runtime-mapped', { ...createClientSessionState('stored-x'), busy: true })
 
-    expect($workingSessionIds.get()).toEqual(['stored-x'])
+    expect($workingSessionIds.get()).toEqual([sessionIdentityKey('stored-x', 'default')])
   })
 })

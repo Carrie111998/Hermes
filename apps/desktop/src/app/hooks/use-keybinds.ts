@@ -26,6 +26,7 @@ import {
   toggleSidebarOpen
 } from '@/store/layout'
 import {
+  $activeGatewayProfile,
   $newChatProfile,
   cycleProfile,
   requestProfileCreate,
@@ -44,6 +45,7 @@ import {
   onSwitcherTabDown,
   onSwitcherTabUp,
   openOrAdvanceSwitcher,
+  type SessionSwitcherTarget,
   slotSessionId,
   switcherActive,
   switcherJustClosed
@@ -102,9 +104,9 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     }
   }
 
-  const goToSession = (sessionId: null | string) => {
-    if (sessionId) {
-      openSession(sessionId, navigate)
+  const goToSession = (target: null | SessionSwitcherTarget) => {
+    if (target) {
+      openSession(target.sessionId, navigate, 'in-place', target.profile)
     }
   }
 
@@ -197,7 +199,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // macOS the menu accelerator owns ⌘W and routes through the same
     // closeActiveTab via IPC (see use-desktop-integrations); this binding is
     // the Win/Linux path where ⌘W reaches the renderer directly.
-    'view.closeTab': () => void closeActiveTab(id => navigate(sessionRoute(id))),
+    'view.closeTab': () => void closeActiveTab(id => navigate(sessionRoute(id, $activeGatewayProfile.get()))),
     'view.reopenTab': reopenLastClosedTile,
     'view.findInPage': openFindBar,
     // ⌘G / ⌘⇧G are handled by the find bar's own capture-phase listener while

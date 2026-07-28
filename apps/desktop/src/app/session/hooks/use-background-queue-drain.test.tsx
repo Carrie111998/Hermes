@@ -3,6 +3,7 @@ import type { MutableRefObject } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
@@ -10,26 +11,29 @@ import {
   getQueuedPrompts,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { $activeGatewayProfile } from '@/store/profile'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 
 import { useBackgroundQueueDrain } from './use-background-queue-drain'
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 
+const DEFAULT_BACKGROUND_IDENTITY = sessionIdentityKey('stored-session-a', 'default')
+
 function Harness({
   enabled = true,
   runtimeMap,
-  selectedStoredSessionId = 'stored-session-b',
+  selectedSessionIdentityKey = sessionIdentityKey('stored-session-b', 'default'),
   submitText
 }: {
   enabled?: boolean
   runtimeMap: MutableRefObject<Map<string, string>>
-  selectedStoredSessionId?: string | null
+  selectedSessionIdentityKey?: string | null
   submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
 }) {
   useBackgroundQueueDrain({
     enabled,
     runtimeIdByStoredSessionIdRef: runtimeMap,
-    selectedStoredSessionId,
+    selectedSessionIdentityKey,
     submitText
   })
 
@@ -40,6 +44,7 @@ describe('useBackgroundQueueDrain', () => {
   beforeEach(() => {
     vi.useRealTimers()
     clearAllSessionStates()
+    $activeGatewayProfile.set('default')
   })
 
   afterEach(() => {
@@ -52,10 +57,10 @@ describe('useBackgroundQueueDrain', () => {
   })
 
   it('drains an idle queued prompt for a non-selected background session', async () => {
-    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const runtimeMap = { current: new Map([[sessionIdentityKey('stored-session-a', 'default'), 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'continue in the background', attachments: [] })
+    enqueueQueuedPrompt(DEFAULT_BACKGROUND_IDENTITY, { text: 'continue in the background', attachments: [] })
     clearAllSessionStates()
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
@@ -64,34 +69,41 @@ describe('useBackgroundQueueDrain', () => {
       expect(submitText).toHaveBeenCalledWith('continue in the background', {
         attachments: [],
         fromQueue: true,
+        profile: 'default',
         sessionId: 'rt-session-a',
         storedSessionId: 'stored-session-a'
       })
     })
 
-    await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
+    await waitFor(() => expect(getQueuedPrompts(DEFAULT_BACKGROUND_IDENTITY)).toHaveLength(0))
   })
 
   it('leaves the selected session queue to the mounted ChatBar drainer', async () => {
-    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const runtimeMap = { current: new Map([[sessionIdentityKey('stored-session-a', 'default'), 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'visible queue entry', attachments: [] })
+    enqueueQueuedPrompt(DEFAULT_BACKGROUND_IDENTITY, { text: 'visible queue entry', attachments: [] })
     clearAllSessionStates()
 
-    render(<Harness runtimeMap={runtimeMap} selectedStoredSessionId="stored-session-a" submitText={submitText} />)
+    render(
+      <Harness
+        runtimeMap={runtimeMap}
+        selectedSessionIdentityKey={sessionIdentityKey('stored-session-a', 'default')}
+        submitText={submitText}
+      />
+    )
 
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(DEFAULT_BACKGROUND_IDENTITY)).toHaveLength(1)
   })
 
   it('does not drain a background session that is still marked working', async () => {
-    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const runtimeMap = { current: new Map([[sessionIdentityKey('stored-session-a', 'default'), 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'wait for current turn', attachments: [] })
+    enqueueQueuedPrompt(DEFAULT_BACKGROUND_IDENTITY, { text: 'wait for current turn', attachments: [] })
     // Mark the session as working (busy) so the drain should skip it
     publishSessionState('rt-session-a', { ...createClientSessionState('stored-session-a'), busy: true })
 
@@ -100,18 +112,18 @@ describe('useBackgroundQueueDrain', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(DEFAULT_BACKGROUND_IDENTITY)).toHaveLength(1)
   })
 
   it('does not drain a parked background session, even when idle', async () => {
     // A Stop in a tile parks that session's queue; when the user then focuses
     // another chat, THIS drainer takes over the tile's queue — it must honor
     // the park just like the mounted ChatBar drainer does.
-    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const runtimeMap = { current: new Map([[sessionIdentityKey('stored-session-a', 'default'), 'rt-session-a']]) }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'halted by stop', attachments: [] })
-    parkQueuedPrompts('stored-session-a')
+    enqueueQueuedPrompt(DEFAULT_BACKGROUND_IDENTITY, { text: 'halted by stop', attachments: [] })
+    parkQueuedPrompts(DEFAULT_BACKGROUND_IDENTITY)
     clearAllSessionStates()
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
@@ -119,14 +131,14 @@ describe('useBackgroundQueueDrain', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(submitText).not.toHaveBeenCalled()
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(DEFAULT_BACKGROUND_IDENTITY)).toHaveLength(1)
   })
 
   it('passes a null runtime id so submitText can resume stale background sessions by stored id', async () => {
     const runtimeMap = { current: new Map<string, string>() }
     const submitText = vi.fn(async () => true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'resume then send', attachments: [] })
+    enqueueQueuedPrompt(DEFAULT_BACKGROUND_IDENTITY, { text: 'resume then send', attachments: [] })
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 
@@ -134,6 +146,7 @@ describe('useBackgroundQueueDrain', () => {
       expect(submitText).toHaveBeenCalledWith('resume then send', {
         attachments: [],
         fromQueue: true,
+        profile: 'default',
         sessionId: null,
         storedSessionId: 'stored-session-a'
       })
@@ -143,10 +156,10 @@ describe('useBackgroundQueueDrain', () => {
   it('retries a rejected background drain without waiting for another queue or busy-state change', async () => {
     vi.useFakeTimers()
 
-    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const runtimeMap = { current: new Map([[sessionIdentityKey('stored-session-a', 'default'), 'rt-session-a']]) }
     const submitText = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'retry me', attachments: [] })
+    enqueueQueuedPrompt(DEFAULT_BACKGROUND_IDENTITY, { text: 'retry me', attachments: [] })
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 
@@ -155,7 +168,7 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     expect(submitText).toHaveBeenCalledTimes(1)
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect(getQueuedPrompts(DEFAULT_BACKGROUND_IDENTITY)).toHaveLength(1)
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(750)
@@ -163,6 +176,33 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     expect(submitText).toHaveBeenCalledTimes(2)
-    expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+    expect(getQueuedPrompts(DEFAULT_BACKGROUND_IDENTITY)).toHaveLength(0)
+  })
+
+  it('does not drain a colliding stored id owned by another profile', async () => {
+    const alphaKey = sessionIdentityKey('shared', 'alpha')
+    const runtimeMap = { current: new Map([[alphaKey, 'rt-alpha']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt(alphaKey, { text: 'alpha only', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(submitText).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(alphaKey)).toHaveLength(1)
+  })
+
+  it('does not reinterpret a legacy raw queue key as the active non-default profile', async () => {
+    $activeGatewayProfile.set('beta')
+    const runtimeMap = { current: new Map([[sessionIdentityKey('shared', 'beta'), 'rt-beta']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt('shared', { text: 'legacy owner unknown', attachments: [] })
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(submitText).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('shared')).toHaveLength(1)
   })
 })

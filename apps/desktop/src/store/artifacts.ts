@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { artifactContentHash, type ArtifactDetection, type ArtifactKind, artifactSlug } from '@/lib/artifact-detect'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
 
 import { closeArtifactPreviewTabs, openPreview, type PreviewTarget } from './preview'
 
@@ -32,6 +33,7 @@ export interface ArtifactRecord {
   id: string
   kind: ArtifactKind
   language: string
+  profile: string
   sessionId: string
   slug: string
   title: string
@@ -90,14 +92,17 @@ export function getArtifact(artifactId: string): ArtifactRecord | null {
   return findArtifact($artifactRegistry.get(), artifactId)
 }
 
-export function artifactsForSession(sessionId: string | null | undefined): ArtifactRecord[] {
-  const id = sessionId?.trim()
+export function artifactsForSession(
+  sessionId: string | null | undefined,
+  profile: null | string | undefined = undefined
+): ArtifactRecord[] {
+  const id = sessionId
 
   if (!id) {
     return []
   }
 
-  return $artifactRegistry.get()[id] ?? []
+  return $artifactRegistry.get()[sessionIdentityKey(id, profile)] ?? []
 }
 
 interface UpsertResult {
@@ -115,9 +120,10 @@ interface UpsertResult {
 export function upsertArtifact(
   sessionId: string | null | undefined,
   detection: ArtifactDetection,
-  content: string
+  content: string,
+  profile: null | string | undefined = undefined
 ): UpsertResult | null {
-  const id = sessionId?.trim()
+  const id = sessionId
   const trimmed = content.trim()
 
   if (!id || !trimmed) {
@@ -127,7 +133,9 @@ export function upsertArtifact(
   const slug = artifactSlug(detection)
   const hash = artifactContentHash(trimmed)
   const registry = $artifactRegistry.get()
-  const records = registry[id] ?? []
+  const identity = sessionIdentityKey(id, profile)
+  const normalizedProfile = parseSessionIdentityKey(identity).profile
+  const records = registry[identity] ?? []
   const existing = records.find(record => record.slug === slug)
   const now = Date.now()
 
@@ -154,7 +162,7 @@ export function upsertArtifact(
     $artifactRegistry.set(
       pruneRegistry({
         ...registry,
-        [id]: records.map(record => (record.id === existing.id ? next : record))
+        [identity]: records.map(record => (record.id === existing.id ? next : record))
       })
     )
 
@@ -163,9 +171,10 @@ export function upsertArtifact(
 
   const record: ArtifactRecord = {
     createdAt: now,
-    id: `${id}:${slug}`,
+    id: `${identity}:${slug}`,
     kind: detection.kind,
     language: detection.language,
+    profile: normalizedProfile,
     sessionId: id,
     slug,
     title: detection.title,
@@ -173,7 +182,7 @@ export function upsertArtifact(
     versions: [{ content: trimmed, createdAt: now, hash }]
   }
 
-  $artifactRegistry.set(pruneRegistry({ ...registry, [id]: [...records, record] }))
+  $artifactRegistry.set(pruneRegistry({ ...registry, [identity]: [...records, record] }))
 
   return { artifactId: record.id, record, versionAdded: true }
 }

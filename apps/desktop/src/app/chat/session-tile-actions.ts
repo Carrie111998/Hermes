@@ -18,13 +18,14 @@ import { useI18n } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
+import { sessionMatchesIdentity } from '@/lib/session-identity'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
-import { $connection, $sessions, sessionMatchesStoredId } from '@/store/session'
+import { $connection, $sessions } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents } from '@/store/subagents'
@@ -71,10 +72,14 @@ export function listTileSessionRow(deps: {
   runtimeId: string
   sessions: readonly SessionInfo[]
   storedSessionId: string
+  storedSessionProfile?: null | string
 }): boolean {
   const preview = deps.preview.trim()
 
-  if (!preview || deps.sessions.some(session => sessionMatchesStoredId(session, deps.storedSessionId))) {
+  if (
+    !preview ||
+    deps.sessions.some(session => sessionMatchesIdentity(session, deps.storedSessionId, deps.storedSessionProfile))
+  ) {
     return false
   }
 
@@ -82,7 +87,10 @@ export function listTileSessionRow(deps: {
     { info: { cwd: deps.cwd, model: deps.model }, session_id: deps.runtimeId, stored_session_id: deps.storedSessionId },
     deps.storedSessionId,
     null,
-    preview
+    preview,
+    null,
+    undefined,
+    deps.storedSessionProfile
   )
   broadcastSessionsChanged()
 
@@ -90,15 +98,22 @@ export function listTileSessionRow(deps: {
 }
 
 interface SessionTileActionsArgs {
+  profile: string
   runtimeId: string
   scope: ComposerScope
   storedSessionId: string
 }
 
-export function useSessionTileActions({ runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
+export function useSessionTileActions({ profile, runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
   const { t } = useI18n()
   const copy = t.desktop
-  const { requestGateway } = useGatewayRequest()
+  const { requestGatewayForProfile } = useGatewayRequest()
+
+  const requestGateway = useCallback(
+    <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number) =>
+      requestGatewayForProfile<T>(profile, method, params, timeoutMs),
+    [profile, requestGatewayForProfile]
+  )
 
   const runtimeIdRef = useRef(runtimeId)
   runtimeIdRef.current = runtimeId
@@ -146,9 +161,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       preview,
       runtimeId,
       sessions: $sessions.get(),
-      storedSessionId: storedIdRef.current
+      storedSessionId: storedIdRef.current,
+      storedSessionProfile: profile
     })
-  }, [])
+  }, [profile])
 
   // Tile-side attachment staging: same upload rules as the primary submit
   // (skip synced/pathless, byte-upload files+images), against the tile scope.
@@ -156,9 +172,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { updateComposerAttachments?: boolean } = {}
+      options: { requestGateway?: typeof requestGateway; updateComposerAttachments?: boolean } = {}
     ): Promise<ComposerAttachment[]> => {
       const remote = $connection.get()?.mode === 'remote'
+      const submitGateway = options.requestGateway ?? requestGateway
       const synced: ComposerAttachment[] = []
 
       for (const attachment of attachments) {
@@ -169,7 +186,11 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
-          const next = await uploadComposerAttachment(attachment, { remote, requestGateway, sessionId })
+          const next = await uploadComposerAttachment(attachment, {
+            remote,
+            requestGateway: submitGateway,
+            sessionId
+          })
 
           if (options.updateComposerAttachments ?? true) {
             scope.attachments.update(next)
@@ -196,6 +217,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     copy,
     createBackendSessionForSend: async () => runtimeIdRef.current,
     getRoutedStoredSessionId: () => storedIdRef.current,
+    getRoutedStoredSessionProfile: () => profile,
     getRuntimeIdForStoredSession: storedId => (storedId === storedIdRef.current ? runtimeIdRef.current : null),
     // A tile IS its session — no route to abandon, so the create-abort guard's
     // token is a stable constant (the guard never trips for a tile).
@@ -227,14 +249,19 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
-        await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current)
+        await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current, profile, storedIdRef.current)
 
         return true
       }
 
-      return await submitPromptText(rawText, options)
+      return await submitPromptText(rawText, {
+        ...options,
+        profile,
+        sessionId: runtimeIdRef.current,
+        storedSessionId: storedIdRef.current
+      })
     },
-    [listTileSession, scope.attachments.$attachments, submitPromptText]
+    [listTileSession, profile, scope.attachments.$attachments, submitPromptText]
   )
 
   const cancelRun = useCallback(async () => {
@@ -255,7 +282,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     clearSessionSubagents(sessionId)
     resetSessionBackground(sessionId)
     setSessionDraftingTool(sessionId, '')
-    clearAllPrompts(sessionId)
+    clearAllPrompts(sessionId, profile)
     clearClarifyRequest(undefined, sessionId)
 
     try {
@@ -263,7 +290,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     } catch (err) {
       notifyError(err, copy.stopFailed)
     }
-  }, [copy.stopFailed, requestGateway, update])
+  }, [copy.stopFailed, profile, requestGateway, update])
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {

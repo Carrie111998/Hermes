@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { $selectedStoredSessionId, $unreadFinishedSessionIds } from '@/store/session'
 import { $attentionSessionIds, $workingSessionIds, clearAllSessionStates } from '@/store/session-states'
 
@@ -32,7 +33,7 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
       sessions: [{ id: 'runtime-a', session_key: 'stored-a', status: 'working' }]
     })
 
-    expect($workingSessionIds.get()).toEqual(['stored-a'])
+    expect($workingSessionIds.get()).toEqual([sessionIdentityKey('stored-a', 'default')])
 
     // The turn finished and the gateway reaped the session between polls.
     rehydrateLiveSessionStatuses({ sessions: [] })
@@ -47,7 +48,7 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
 
     rehydrateLiveSessionStatuses({ sessions: [] })
 
-    expect($unreadFinishedSessionIds.get()).toEqual(['stored-b'])
+    expect($unreadFinishedSessionIds.get()).toEqual([sessionIdentityKey('stored-b', 'default')])
   })
 
   it('clears a blocked session that disappears from the live snapshot', () => {
@@ -55,7 +56,7 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
       sessions: [{ id: 'runtime-c', session_key: 'stored-c', status: 'waiting' }]
     })
 
-    expect($attentionSessionIds.get()).toEqual(['stored-c'])
+    expect($attentionSessionIds.get()).toEqual([sessionIdentityKey('stored-c', 'default')])
 
     rehydrateLiveSessionStatuses({ sessions: [] })
 
@@ -74,6 +75,6 @@ describe('rehydrateLiveSessionStatuses — reaping vanished runtimes', () => {
 
     rehydrateLiveSessionStatuses({ sessions: [] }, Date.now(), 'default')
 
-    expect($workingSessionIds.get()).toEqual(['stored-other'])
+    expect($workingSessionIds.get()).toEqual([sessionIdentityKey('stored-other', 'other')])
   })
 })

@@ -1,7 +1,8 @@
 import { computed } from 'nanostores'
 
 import { sessionProjectColor } from '@/app/chat/sidebar/projects/workspace-groups'
-import { Codecs, persistentAtom } from '@/lib/persisted'
+import { persistentAtom } from '@/lib/persisted'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
 import { $projects } from '@/store/projects'
 import { $sessions, sessionPinId } from '@/store/session'
 import type { ProjectInfo, SessionInfo } from '@/types/hermes'
@@ -11,11 +12,70 @@ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
 // lineage id so a color survives auto-compression's session-id rotation. To take
 // this to the TUI later, promote this one atom to a backend SessionInfo.color
 // field — the resolver below and the picker UI stay exactly as they are.
-export const $sessionColorOverrides = persistentAtom<Record<string, string>>(
-  'hermes.desktop.sessionColors',
-  {},
-  Codecs.stringRecord
-)
+const SESSION_COLOR_OVERRIDES_VERSION = 1
+
+interface PersistedSessionColorOverride {
+  color: string
+  profile: string
+  storedSessionId: string
+}
+
+function isPersistedSessionColorOverride(value: unknown): value is PersistedSessionColorOverride {
+  return (
+    Boolean(value) &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    typeof (value as PersistedSessionColorOverride).color === 'string' &&
+    typeof (value as PersistedSessionColorOverride).profile === 'string' &&
+    typeof (value as PersistedSessionColorOverride).storedSessionId === 'string' &&
+    (value as PersistedSessionColorOverride).storedSessionId.length > 0
+  )
+}
+
+export function decodeSessionColorOverrides(raw: string): Record<string, string> {
+  const parsed = JSON.parse(raw) as unknown
+  const stored = parsed as { entries?: unknown; version?: unknown } | null
+
+  if (
+    stored &&
+    typeof stored === 'object' &&
+    stored.version === SESSION_COLOR_OVERRIDES_VERSION &&
+    Array.isArray(stored.entries)
+  ) {
+    return Object.fromEntries(
+      stored.entries
+        .filter(isPersistedSessionColorOverride)
+        .map(entry => [sessionIdentityKey(entry.storedSessionId, entry.profile), entry.color])
+    )
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {}
+  }
+
+  // Main's legacy schema was an ownerless string record. Every key is an
+  // opaque default-profile id, even when its bytes resemble a compound key.
+  return Object.fromEntries(
+    Object.entries(parsed)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+      .map(([storedSessionId, color]) => [sessionIdentityKey(storedSessionId, 'default'), color])
+  )
+}
+
+export function encodeSessionColorOverrides(overrides: Record<string, string>): string {
+  return JSON.stringify({
+    entries: Object.entries(overrides).map(([identityKey, color]) => ({
+      ...parseSessionIdentityKey(identityKey),
+      color
+    })),
+    version: SESSION_COLOR_OVERRIDES_VERSION
+  })
+}
+
+export const $sessionColorOverrides = persistentAtom<Record<string, string>>('hermes.desktop.sessionColors', {}, {
+  decode: decodeSessionColorOverrides,
+  encode: encodeSessionColorOverrides
+})
 
 // Set a session's override (null clears it → falls back to the project color).
 export function setSessionColorOverride(durableId: string, color: null | string): void {
@@ -56,7 +116,7 @@ export const $sessionColorById = computed(
       const color = resolveSessionColor(session, projects, overrides)
 
       if (color) {
-        map[session.id] = color
+        map[sessionIdentityKey(session.id, session.profile)] = color
       }
     }
 
@@ -75,6 +135,7 @@ export function sessionColorFor(session: null | SessionInfo | undefined): string
   }
 
   return (
-    $sessionColorById.get()[session.id] ?? resolveSessionColor(session, $projects.get(), $sessionColorOverrides.get())
+    $sessionColorById.get()[sessionIdentityKey(session.id, session.profile)] ??
+    resolveSessionColor(session, $projects.get(), $sessionColorOverrides.get())
   )
 }

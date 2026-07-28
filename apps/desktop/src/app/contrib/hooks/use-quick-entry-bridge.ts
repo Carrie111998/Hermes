@@ -1,9 +1,10 @@
 import { useEffect, useRef } from 'react'
 
+import { useI18n } from '@/i18n'
+import { normalizeProfileKey, sessionIdentityKey } from '@/lib/session-identity'
+import { notifyError } from '@/store/notifications'
 import {
   initQuickEntryBridge,
-  QUICK_TARGET_CURRENT,
-  QUICK_TARGET_NEW,
   type QuickEntrySessionOption,
   setQuickEntrySubmitHandler
 } from '@/store/quick-entry'
@@ -26,7 +27,12 @@ function sessionOptions(): QuickEntrySessionOption[] {
     .filter(session => !session.archived)
     .slice(0, QUICK_ENTRY_SESSION_OPTIONS)
     .map(session => ({
-      id: session.id,
+      id: sessionIdentityKey(session.id, session.profile),
+      target: {
+        kind: 'session' as const,
+        profile: normalizeProfileKey(session.profile),
+        storedSessionId: session.id
+      },
       title: session.title?.trim() || session.preview?.trim() || session.id
     }))
 }
@@ -51,6 +57,9 @@ function sessionOptions(): QuickEntrySessionOption[] {
  * one keystroke would send N prompts.
  */
 export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: QuickEntryBridgeParams): void {
+  const { t } = useI18n()
+  const copyRef = useRef(t.desktop)
+  copyRef.current = t.desktop
   const submitTextRef = useRef(submitText)
   submitTextRef.current = submitText
   const startFreshRef = useRef(startFreshSessionDraft)
@@ -62,7 +71,7 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
     }
 
     setQuickEntrySubmitHandler(({ target, text }) => {
-      if (target === QUICK_TARGET_NEW) {
+      if (target.kind === 'new') {
         // Same as the user clicking New Chat and typing: fresh draft, then the
         // normal submit creates the backend session.
         startFreshRef.current()
@@ -71,20 +80,31 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
         return
       }
 
-      if (target !== QUICK_TARGET_CURRENT) {
+      if (target.kind === 'session') {
         // A picked stored session: resume + submit in the background through
         // the session-tile delegate so the primary view stays where it is.
         const delegate = sessionTileDelegate()
 
-        if (delegate) {
-          void delegate
-            .resumeTile(target)
-            .then(runtimeId => delegate.submitToSession(runtimeId, text))
-            // A dead/undeliverable target must not swallow the prompt.
-            .catch(() => void submitTextRef.current(text))
+        const targetExists = $sessions
+          .get()
+          .some(
+            session =>
+              session.id === target.storedSessionId && normalizeProfileKey(session.profile) === target.profile
+          )
+
+        if (!delegate || !targetExists) {
+          notifyError(new Error(copyRef.current.sessionUnavailable), copyRef.current.promptFailed)
 
           return
         }
+
+        void delegate
+          .resumeTile(target.storedSessionId, target.profile)
+          .then(runtimeId => delegate.submitToSession(runtimeId, text, target.profile))
+          // Never redirect a failed owned-session send into the visible chat.
+          .catch(error => notifyError(error, copyRef.current.promptFailed))
+
+        return
       }
 
       void submitTextRef.current(text)

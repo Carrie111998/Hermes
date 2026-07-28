@@ -4,7 +4,7 @@ import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGit } from '@/lib/desktop-git'
 
 import { $worktreeRefreshToken } from './projects'
-import { $busy, $currentCwd, $selectedStoredSessionId } from './session'
+import { $busy, $currentCwd, $selectedSessionIdentityKey } from './session'
 import { $workspaceChangeTick } from './workspace-events'
 
 // Live working-tree status for the active session's cwd — the data backbone of
@@ -193,8 +193,9 @@ $currentCwd.subscribe(cwd => {
 // branch (the agent ran `git checkout` in another session's terminal). The cwd
 // subscription above won't fire when the path is identical, so the branch label
 // would stay stale until a window focus or turn-settle triggers a refresh.
-// Treat the stored-session id as a structural edge in its own right.
-$selectedStoredSessionId.subscribe(() => scheduleRepoStatusRefresh())
+// Treat the profile-qualified stored-session identity as a structural edge in
+// its own right. The raw id can stay unchanged across a profile collision.
+$selectedSessionIdentityKey.subscribe(() => scheduleRepoStatusRefresh())
 
 // A worktree add/remove (desktop op, or the agent's out-of-band git in a settled
 // turn / a window refocus — both already bump this token) → re-probe.

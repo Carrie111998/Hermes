@@ -3,6 +3,8 @@ import { type MutableRefObject, useLayoutEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import { clearInFlightTurnJournal, readInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import {
   $activeSessionStoredIdRotation,
   $currentFastMode,
@@ -57,8 +59,10 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
       previousStoredSessionId: 'stored-A',
       runtimeSessionId: 'runtime-A'
     })
-    expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
-    expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-A-next')).toBe('runtime-A')
+    expect(cache.runtimeIdByStoredSessionIdRef.current.has(sessionIdentityKey('stored-A', 'default'))).toBe(false)
+    expect(cache.runtimeIdByStoredSessionIdRef.current.get(sessionIdentityKey('stored-A-next', 'default'))).toBe(
+      'runtime-A'
+    )
   })
 
   it('does not publish a foreground-navigation event for a background runtime rotation', () => {
@@ -75,8 +79,55 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     })
 
     expect($activeSessionStoredIdRotation.get()).toBeNull()
-    expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
-    expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-A-next')).toBe('runtime-A')
+    expect(cache.runtimeIdByStoredSessionIdRef.current.has(sessionIdentityKey('stored-A', 'default'))).toBe(false)
+    expect(cache.runtimeIdByStoredSessionIdRef.current.get(sessionIdentityKey('stored-A-next', 'default'))).toBe(
+      'runtime-A'
+    )
+  })
+
+  it('does not resurrect a settled turn journal when its stored id rotates', () => {
+    vi.useFakeTimers()
+    let cache!: Cache
+
+    try {
+      render(<Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="root" />)
+
+      act(() => {
+        cache.updateSessionState(
+          'runtime-A',
+          state => ({
+            ...state,
+            busy: true,
+            messages: [
+              userMessage('user-1', 'prompt'),
+              { ...assistantText('old-stream', 'stale partial turn'), pending: true }
+            ],
+            streamId: 'old-stream',
+            turnStartedAt: 1
+          }),
+          'root',
+          'alpha'
+        )
+        vi.advanceTimersByTime(400)
+      })
+      expect(readInFlightTurnJournal('root', 'alpha')?.streamId).toBe('old-stream')
+
+      act(() => {
+        cache.updateSessionState(
+          'runtime-A',
+          state => ({ ...state, awaitingResponse: false, busy: false, streamId: null, turnStartedAt: null }),
+          'tip',
+          'alpha'
+        )
+      })
+
+      expect(readInFlightTurnJournal('root', 'alpha')).toBeNull()
+      expect(readInFlightTurnJournal('tip', 'alpha')).toBeNull()
+    } finally {
+      clearInFlightTurnJournal('root', 'alpha')
+      clearInFlightTurnJournal('tip', 'alpha')
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -489,7 +540,7 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
 
     // Simulate a recycled/cross-wired map entry. The reverse state ownership
     // check must reject it instead of allowing a submit into stored-B.
-    cache.runtimeIdByStoredSessionIdRef.current.set('stored-A', 'runtime-B')
+    cache.runtimeIdByStoredSessionIdRef.current.set(sessionIdentityKey('stored-A', 'default'), 'runtime-B')
     expect(cache.getRuntimeIdForStoredSession('stored-A')).toBeNull()
   })
 })

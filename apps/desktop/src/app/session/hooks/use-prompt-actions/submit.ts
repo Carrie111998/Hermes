@@ -6,6 +6,7 @@ import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -20,7 +21,15 @@ import {
 } from '@/store/composer'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { $sessions, resolveComposerSessionKey, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import {
+  $selectedSessionIdentityKey,
+  $sessions,
+  resolveComposerSessionKey,
+  setAwaitingResponse,
+  setBusy,
+  setMessages
+} from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
@@ -36,6 +45,7 @@ import {
   isSessionBusyError,
   isSessionNotFoundError,
   isTargetSessionBusy,
+  type ProfileGatewayRequest,
   type SubmitTextOptions,
   withSessionBusyRetry
 } from './utils'
@@ -46,20 +56,23 @@ interface SubmitPromptDeps {
   copy: Translations['desktop']
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
+  getRoutedStoredSessionProfile: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
   requestGateway: GatewayRequest
-  resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  requestGatewayForProfile?: ProfileGatewayRequest
+  resumeStoredSession: (storedSessionId: string, profile?: null | string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   syncAttachmentsForSubmit: (
     sessionId: string,
     attachments: ComposerAttachment[],
-    options?: { updateComposerAttachments?: boolean }
+    options?: { requestGateway?: GatewayRequest; updateComposerAttachments?: boolean }
   ) => Promise<ComposerAttachment[]>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    storedSessionProfile?: null | string
   ) => ClientSessionState
   /** Composer-scope seams: the main chat runs on the module-level globals
    *  (defaults); a session tile injects its own so a tile submit never writes
@@ -91,9 +104,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
     copy,
     createBackendSessionForSend,
     getRoutedStoredSessionId,
+    getRoutedStoredSessionProfile,
     getRuntimeIdForStoredSession,
     getRouteToken,
     requestGateway,
+    requestGatewayForProfile,
     resumeStoredSession,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
@@ -171,26 +186,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // so the backend notes the interruption to the model.
       const interrupted = takeVoicePlaybackInterrupted()
 
-      // Queue drains carry their source session explicitly. A background drain
-      // must never inherit the currently selected session after the user moves
-      // to another chat.
-      const targetStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
-
-      const targetStartedInCurrentView =
-        !targetStoredSessionId || targetStoredSessionId === selectedStoredSessionIdRef.current
-
-      // A queued/background drain whose runtime binding was reaped must NOT
-      // inherit the foreground runtime id when its storedSessionId targets a
-      // different session — that would land the queued prompt in whichever
-      // session the user happens to be viewing (cross-session leak). When the
-      // drain is for the current view (no storedSessionId, or it matches the
-      // foreground), the foreground runtime is correct and must be kept.
-      const isBackgroundQueueDrain = Boolean(
-        options?.fromQueue && options?.storedSessionId && options.storedSessionId !== selectedStoredSessionIdRef.current
-      )
-
-      let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
-
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
       // can redirect the user's text into a different chat (#54527). Mutable —
@@ -199,6 +194,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const startingActiveSessionId = activeSessionIdRef.current
       const selectedStoredSessionId = selectedStoredSessionIdRef.current
       const routedStoredSessionId = getRoutedStoredSessionId()
+      const routedStoredSessionProfile = getRoutedStoredSessionProfile()
 
       const routedRuntimeId = routedStoredSessionId ? getRuntimeIdForStoredSession(routedStoredSessionId) : null
 
@@ -215,6 +211,74 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       let startingRouteToken = getRouteToken()
 
+      // Queue drains carry their source session explicitly. Otherwise the route
+      // wins over a stale selection when its runtime binding needs recovery.
+      const targetStoredSessionId = options?.storedSessionId ?? startingStoredSessionId
+      let recoveryStoredSessionId = targetStoredSessionId
+      const selectedIdentityKey = $selectedSessionIdentityKey.get()
+      const selectedIdentity = selectedIdentityKey ? parseSessionIdentityKey(selectedIdentityKey) : null
+      const targetRuntimeState = $sessionStates.get()[guardSessionId ?? '']
+
+      const selectedOwnerProfile =
+        targetStoredSessionId && selectedIdentity?.storedSessionId === targetStoredSessionId
+          ? selectedIdentity.profile
+          : null
+
+      const runtimeOwnerProfile =
+        targetStoredSessionId && targetRuntimeState?.storedSessionId === targetStoredSessionId
+          ? targetRuntimeState.storedSessionProfile
+          : null
+
+      const routedOwnerProfile =
+        targetStoredSessionId && targetStoredSessionId === routedStoredSessionId
+          ? routedStoredSessionProfile
+          : null
+
+      // Resolve an uncached durable target before the rest of the submit can
+      // await attachments or gateway work. resolveStoredSession snapshots the
+      // active profile at invocation, so a later profile switch cannot change
+      // the owner selected here.
+      const fallbackProfile = $activeGatewayProfile.get()
+
+      const resolvedOwnerProfile =
+        options?.profile ||
+        routedOwnerProfile ||
+        runtimeOwnerProfile ||
+        selectedOwnerProfile ||
+        (targetStoredSessionId ? await resolveSessionProfile(targetStoredSessionId) : undefined)
+
+      const targetProfile = normalizeProfileKey(resolvedOwnerProfile ?? fallbackProfile)
+
+      const requestTargetGateway: GatewayRequest = (method, params, timeoutMs) =>
+        requestGatewayForProfile
+          ? requestGatewayForProfile(targetProfile, method, params, timeoutMs)
+          : timeoutMs === undefined
+            ? requestGateway(method, params)
+            : requestGateway(method, params, timeoutMs)
+
+      const targetIdentityKey = targetStoredSessionId
+        ? sessionIdentityKey(targetStoredSessionId, targetProfile)
+        : null
+
+      const targetStartedInCurrentView = Boolean(
+        !targetStoredSessionId ||
+        selectedIdentityKey === targetIdentityKey ||
+        (routedStoredSessionId === targetStoredSessionId &&
+          sessionIdentityKey(routedStoredSessionId, routedStoredSessionProfile ?? fallbackProfile) === targetIdentityKey) ||
+        (!selectedIdentityKey &&
+          targetStoredSessionId === selectedStoredSessionId &&
+          normalizeProfileKey(fallbackProfile) === targetProfile)
+      )
+
+      // A queued/background drain whose runtime binding was reaped must NOT
+      // inherit the foreground runtime id. Compare the full durable identity:
+      // alpha/shared is background while beta/shared is selected.
+      const isBackgroundQueueDrain = Boolean(
+        options?.fromQueue && options?.storedSessionId && !targetStartedInCurrentView
+      )
+
+      let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : startingActiveSessionId)
+
       // Reason string (or null) for why the session context genuinely drifted
       // under this in-flight submit. sessionContextDrift ignores the churn a
       // busy gateway produces (selection null-resets on a gateway/profile
@@ -227,12 +291,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // pipeline's own re-home) is never counted as drift.
       const sessionDriftReason = (): string | null =>
         targetStartedInCurrentView
-          ? sessionContextDrift({
+          ? (() => {
+              const nowIdentityKey = $selectedSessionIdentityKey.get()
+              const nowIdentity = nowIdentityKey ? parseSessionIdentityKey(nowIdentityKey) : null
+
+              return sessionContextDrift({
               startRouteToken: startingRouteToken,
               nowRouteToken: getRouteToken(),
               startSelectedStoredId: startingStoredSessionId,
               nowSelectedStoredId: selectedStoredSessionIdRef.current,
+              startSelectedProfile: targetProfile,
+              nowSelectedProfile: nowIdentity?.profile ?? $activeGatewayProfile.get(),
               submitTargetStoredId: startingStoredSessionId,
+              submitTargetProfile: targetProfile,
               composerScope: options?.composerScope,
               // The composer keys drafts/attachments on the durable lineage
               // root (survives auto-compression tip rotation), while
@@ -240,8 +311,13 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               // into the same lineage-root domain before comparing, or every
               // submit into a session that has ever compressed would
               // false-positive-abort.
-              submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
-            })
+              submitTargetComposerScope: resolveComposerSessionKey(
+                startingStoredSessionId,
+                $sessions.get(),
+                targetProfile
+              )
+              })
+            })()
           : null
 
       const targetIsCurrentView = (): boolean => targetStartedInCurrentView && !sessionDriftReason()
@@ -250,7 +326,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // stalled turn can't stack the same prompt into multiple real turns. The
       // foreground ChatBar and background drainers can briefly overlap during a
       // session switch; this per-session lock makes that safe.
-      const submitLockKey = targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'
+      const submitLockKey = `${targetProfile}\u0000${targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'}`
 
       if (_submitInFlight.has(submitLockKey)) {
         return false
@@ -310,7 +386,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // (what made drained-after-interrupt sends go silent).
             interrupted: false
           }),
-          targetStoredSessionId
+          targetStoredSessionId,
+          targetProfile
         )
 
       // After sync rewrites refs, refresh the optimistic message in place so the
@@ -322,7 +399,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             ...state,
             messages: state.messages.map(message => (message.id === optimisticId ? buildUserMessage() : message))
           }),
-          targetStoredSessionId
+          targetStoredSessionId,
+          targetProfile
         )
 
       const dropOptimistic = (sid: null | string) => {
@@ -343,7 +421,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             awaitingResponse: false,
             pendingBranchGroup: null
           }),
-          targetStoredSessionId
+          targetStoredSessionId,
+          targetProfile
         )
       }
 
@@ -383,7 +462,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // cross-wired. Run the full profile-aware resume path. Creating here
         // would fork a contextless chat against whichever profile is active.
         try {
-          await resumeStoredSession(routedStoredSessionId)
+          await resumeStoredSession(routedStoredSessionId, targetProfile)
         } catch {
           return abortForSessionSwitch(null)
         }
@@ -423,12 +502,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         try {
           // Re-register on the session's OWNING profile — resuming on whichever
           // profile is live would fork the conversation into the wrong DB (#67603).
-          const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
-
-          const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+          const resumed = await requestTargetGateway<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
             source: 'desktop',
-            ...(resumeProfile ? { profile: resumeProfile } : {})
+            profile: targetProfile
           })
 
           const resumeDrift = sessionDriftReason()
@@ -521,6 +598,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // Re-pin the baseline to the created chat for the rest of the
         // pipeline; the closures (seedOptimistic et al) see the new value.
         startingStoredSessionId = selectedStoredSessionIdRef.current
+        recoveryStoredSessionId = startingStoredSessionId
         startingRouteToken = getRouteToken()
 
         seedOptimistic(sessionId)
@@ -528,6 +606,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       try {
         const syncedAttachments = await syncAttachmentsForSubmit(sessionId, attachments, {
+          requestGateway: requestTargetGateway,
           updateComposerAttachments: usingComposerAttachments
         })
 
@@ -565,10 +644,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         try {
           await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', submitParams(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            requestTargetGateway('prompt.submit', submitParams(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
           )
         } catch (firstErr) {
-          const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
+          const recoverStoredSessionId = recoveryStoredSessionId
 
           if ((isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) && recoverStoredSessionId) {
             // Re-register the session in the gateway and get a fresh live ID.
@@ -576,12 +655,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // backend loop (#55578 symptom d) rejects the submit even though
             // the stored session is fine — resume + retry instead of erroring
             // out and losing the session binding.
-            const resumeProfile = await resolveSessionProfile(recoverStoredSessionId)
-
-            const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+            const resumed = await requestTargetGateway<{ session_id: string }>('session.resume', {
               session_id: recoverStoredSessionId,
               source: 'desktop',
-              ...(resumeProfile ? { profile: resumeProfile } : {})
+              profile: targetProfile
             })
 
             const resumeRetryDrift = sessionDriftReason()
@@ -600,7 +677,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               }
 
               await withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestTargetGateway('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               )
             } else {
               submitErr = firstErr
@@ -654,7 +731,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             pendingBranchGroup: null,
             sawAssistantPayload: true
           }),
-          targetStoredSessionId
+          targetStoredSessionId,
+          targetProfile
         )
 
         if (targetIsCurrentView() && isProviderSetupError(err)) {
@@ -676,9 +754,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       copy,
       createBackendSessionForSend,
       getRoutedStoredSessionId,
+      getRoutedStoredSessionProfile,
       getRuntimeIdForStoredSession,
       getRouteToken,
       requestGateway,
+      requestGatewayForProfile,
       resumeStoredSession,
       scope,
       selectedStoredSessionIdRef,

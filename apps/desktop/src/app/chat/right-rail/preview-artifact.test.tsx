@@ -1,7 +1,13 @@
 import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { $artifactRegistry, $artifactVersionSelection, artifactPreviewTarget, upsertArtifact } from '@/store/artifacts'
+import {
+  $artifactRegistry,
+  $artifactVersionSelection,
+  artifactPreviewTarget,
+  artifactsForSession,
+  upsertArtifact
+} from '@/store/artifacts'
 
 import { ArtifactPreview } from './preview-artifact'
 
@@ -16,7 +22,7 @@ function register(title: string, kind: 'code' | 'html' | 'svg', content: string)
 }
 
 async function renderArtifact(artifactId: string) {
-  const record = $artifactRegistry.get()['session-1']!.find(item => item.id === artifactId)!
+  const record = artifactsForSession('session-1').find(item => item.id === artifactId)!
 
   await act(async () => {
     render(<ArtifactPreview target={artifactPreviewTarget(record)} />)
@@ -98,7 +104,7 @@ describe('ArtifactPreview', () => {
 
   it('falls back to an empty state when the registry no longer has the artifact', async () => {
     const { artifactId } = register('Dashboard', 'html', '<h1>gone</h1>')
-    const record = $artifactRegistry.get()['session-1']!.find(item => item.id === artifactId)!
+    const record = artifactsForSession('session-1').find(item => item.id === artifactId)!
     const target = artifactPreviewTarget(record)
 
     $artifactRegistry.set({})

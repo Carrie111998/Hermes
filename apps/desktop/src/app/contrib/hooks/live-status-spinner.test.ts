@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { $selectedStoredSessionId, $unreadFinishedSessionIds } from '@/store/session'
 import { $workingSessionIds, clearAllSessionStates } from '@/store/session-states'
 
@@ -34,7 +35,7 @@ describe('rehydrateLiveSessionStatuses — seeding a turn the renderer never saw
       sessions: [{ id: 'runtime-cold', session_key: 'stored-cold', status: 'working' }]
     })
 
-    expect($workingSessionIds.get()).toContain('stored-cold')
+    expect($workingSessionIds.get()).toContain(sessionIdentityKey('stored-cold', 'default'))
   })
 
   it('keeps the spinner across polls while the turn is still running', () => {
@@ -45,7 +46,7 @@ describe('rehydrateLiveSessionStatuses — seeding a turn the renderer never saw
       sessions: [{ id: 'runtime-cold', session_key: 'stored-cold', status: 'working' }]
     })
 
-    expect($workingSessionIds.get()).toContain('stored-cold')
+    expect($workingSessionIds.get()).toContain(sessionIdentityKey('stored-cold', 'default'))
   })
 
   it('shows the spinner when a runtime id is recycled onto a new stored session', () => {
@@ -59,8 +60,8 @@ describe('rehydrateLiveSessionStatuses — seeding a turn the renderer never saw
       sessions: [{ id: 'runtime-1', session_key: 'stored-new', status: 'working' }]
     })
 
-    expect($workingSessionIds.get()).toContain('stored-new')
-    expect($workingSessionIds.get()).not.toContain('stored-old')
+    expect($workingSessionIds.get()).toContain(sessionIdentityKey('stored-new', 'default'))
+    expect($workingSessionIds.get()).not.toContain(sessionIdentityKey('stored-old', 'default'))
   })
 
   it('leaves a starting session idle — the agent build is not proof of a turn', () => {
@@ -72,6 +73,6 @@ describe('rehydrateLiveSessionStatuses — seeding a turn the renderer never saw
       sessions: [{ id: 'runtime-boot', session_key: 'stored-boot', status: 'starting' }]
     })
 
-    expect($workingSessionIds.get()).not.toContain('stored-boot')
+    expect($workingSessionIds.get()).not.toContain(sessionIdentityKey('stored-boot', 'default'))
   })
 })

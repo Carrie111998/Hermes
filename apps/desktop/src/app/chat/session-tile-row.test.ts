@@ -29,14 +29,15 @@ function row(overrides: Partial<SessionInfo> = {}): SessionInfo {
   }
 }
 
-function seed(preview: string, sessions: SessionInfo[] = $sessions.get()) {
+function seed(preview: string, sessions: SessionInfo[] = $sessions.get(), profile?: string) {
   return listTileSessionRow({
     cwd: '/work/repo',
     model: 'claude-opus-5',
     preview,
     runtimeId: RUNTIME,
     sessions,
-    storedSessionId: STORED
+    storedSessionId: STORED,
+    storedSessionProfile: profile
   })
 }
 
@@ -66,6 +67,15 @@ describe('listTileSessionRow', () => {
     const rotated = row({ _lineage_root_id: STORED, id: 'stored-tab-compressed-2' })
 
     expect(seed('after compression', [rotated])).toBe(false)
+  })
+
+  it('does not let a colliding session from another profile suppress the tile row', () => {
+    const alpha = row({ profile: 'alpha', title: 'Alpha' })
+
+    expect(seed('beta prompt', [alpha], 'beta')).toBe(true)
+    expect($sessions.get()).toEqual([
+      expect.objectContaining({ id: STORED, preview: 'beta prompt', profile: 'beta' })
+    ])
   })
 
   it('does not list a session on an empty or whitespace-only send', () => {

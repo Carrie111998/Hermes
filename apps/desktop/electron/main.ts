@@ -83,7 +83,7 @@ import {
 } from './desktop-uninstall'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
-import { createEventDeduper } from './event-dedupe'
+import { createEventDeduper, notificationDedupeKey } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
@@ -8473,7 +8473,9 @@ function focusWindow(win) {
   win.focus()
 }
 
-function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
+function spawnSecondaryWindow(
+  { sessionId, watch, profile }: { profile?: null | string; sessionId?: string; watch?: boolean } = {}
+) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -8519,6 +8521,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+      profile,
       watch
     }),
     'Session window'
@@ -8528,8 +8531,8 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+function createSessionWindow(sessionId, { profile = null, watch = false } = {}) {
+  return sessionWindows.openOrFocus(sessionId, profile, () => spawnSecondaryWindow({ profile, sessionId, watch }))
 }
 
 // Additional full "instance" windows — peers of the primary that render the
@@ -9255,7 +9258,10 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
     return { ok: false, error: 'invalid-session-id' }
   }
 
-  createSessionWindow(sessionId.trim(), { watch: opts?.watch === true })
+  createSessionWindow(sessionId, {
+    profile: typeof opts?.profile === 'string' ? opts.profile.trim() || null : null,
+    watch: opts?.watch === true
+  })
 
   return { ok: true }
 })
@@ -10010,7 +10016,7 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   // kind+session can arrive here twice. Collapse it at this single choke point.
   // Return true (not false): a notification for the event IS being shown by the
   // first caller, so the settings "send test" success probe stays honest.
-  if (isDuplicateNotification(`${payload?.kind ?? ''}:${payload?.sessionId ?? ''}`)) {
+  if (isDuplicateNotification(notificationDedupeKey(payload ?? {}))) {
     return true
   }
 
@@ -10033,7 +10039,10 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     focusWindow(mainWindow)
 
     if (payload?.sessionId) {
-      mainWindow.webContents.send('hermes:focus-session', payload.sessionId)
+      mainWindow.webContents.send('hermes:focus-session', {
+        profile: typeof payload?.profile === 'string' ? payload.profile : null,
+        sessionId: payload.sessionId
+      })
     }
   })
   notification.on('action', (_actionEvent, index) => {
@@ -10044,7 +10053,11 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     const action = actions[index]
 
     if (action?.id) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
+      mainWindow.webContents.send('hermes:notification-action', {
+        actionId: action.id,
+        profile: typeof payload?.profile === 'string' ? payload.profile : null,
+        sessionId: payload?.runtimeSessionId ?? payload?.sessionId
+      })
     }
   })
   notification.show()
@@ -10316,7 +10329,9 @@ ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
   // Deliberately does NOT raise/focus the main window — the user asked to fire
   // a prompt from wherever they were, not to be yanked into the app.
   mainWindow.webContents.send('hermes:quick-entry:submit', {
-    target: typeof payload?.target === 'string' && payload.target ? payload.target : 'current',
+    // Renderer-side validation accepts only the discriminated object. Forward
+    // old/invalid shapes unchanged so they are rejected rather than redirected.
+    target: payload?.target,
     text
   })
 })

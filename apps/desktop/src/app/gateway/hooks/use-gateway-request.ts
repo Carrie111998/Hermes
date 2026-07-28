@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
-import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
+import { $gateway, ensureActiveGatewayOpen, gatewayForProfile, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
 
@@ -144,5 +144,43 @@ export function useGatewayRequest() {
     [ensureGatewayOpen]
   )
 
-  return { connectionRef, gateway, gatewayRef, requestGateway }
+  // Resolve the socket by immutable owner instead of whichever profile happens
+  // to be active when a delayed callback finally sends. Unlike switching the
+  // active gateway, this never changes the window's visible profile.
+  const requestGatewayForProfile = useCallback(
+    async <T>(
+      profile: string,
+      method: string,
+      params: Record<string, unknown> = {},
+      timeoutMs?: number,
+      signal?: AbortSignal
+    ) => {
+      const gateway = await gatewayForProfile(profile)
+
+      if (!gateway) {
+        throw new Error(`Hermes gateway unavailable for profile ${profile}`)
+      }
+
+      try {
+        return await gateway.request<T>(method, params, timeoutMs, signal)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+
+        if (!/not connected|connection closed/i.test(message)) {
+          throw error
+        }
+
+        const recovered = await gatewayForProfile(profile)
+
+        if (!recovered) {
+          throw error
+        }
+
+        return recovered.request<T>(method, params, timeoutMs, signal)
+      }
+    },
+    []
+  )
+
+  return { connectionRef, gateway, gatewayRef, requestGateway, requestGatewayForProfile }
 }

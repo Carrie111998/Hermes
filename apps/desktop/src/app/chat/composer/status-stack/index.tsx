@@ -126,7 +126,9 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const openAgents = () => navigate(AGENTS_ROUTE)
 
   const openSubagent = (item: ComposerStatusItem) =>
-    item.sessionId ? void openSessionInNewWindow(item.sessionId, { watch: true }) : openAgents()
+    item.sessionId
+      ? void openSessionInNewWindow(item.sessionId, { profile: item.sessionProfile, watch: true })
+      : openAgents()
 
   // Preview links live as child rows of the background group — a localhost dev
   // server and its preview are the same thing — so they no longer float as an

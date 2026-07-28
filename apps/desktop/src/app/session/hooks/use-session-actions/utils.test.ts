@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { getSession } from '@/hermes'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { $approvalModes, approvalModeForProfile } from '@/store/approval-mode'
 import { $desktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $sessions, setSessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -15,10 +17,18 @@ import {
   isSessionGoneError,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  resolveStoredSession,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
-  toBranchMessages
+  toBranchMessages,
+  upsertOptimisticSession,
+  upsertResolvedSession
 } from './utils'
+
+vi.mock('@/hermes', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getSession: vi.fn()
+}))
 
 const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
   ({ id, role, parts: [{ type: 'text', text }], ...extra }) as ChatMessage
@@ -79,6 +89,50 @@ describe('sessionMatchesStoredId', () => {
     expect(sessionMatchesStoredId(session({ id: 'a' }), 'a')).toBe(true)
     expect(sessionMatchesStoredId(session({ id: 'live', _lineage_root_id: 'root' }), 'root')).toBe(true)
     expect(sessionMatchesStoredId(session({ id: 'a' }), 'b')).toBe(false)
+  })
+})
+
+describe('profile-scoped session upserts', () => {
+  beforeEach(() => {
+    setSessions([])
+  })
+
+  it('keeps colliding optimistic ids from other profiles', () => {
+    setSessions([session({ id: 'shared', profile: 'alpha', title: 'Alpha' })])
+
+    upsertOptimisticSession({} as never, 'shared', 'Beta', null, null, undefined, 'beta')
+
+    expect($sessions.get()).toEqual([
+      expect.objectContaining({ id: 'shared', profile: 'beta', title: 'Beta' }),
+      expect.objectContaining({ id: 'shared', profile: 'alpha', title: 'Alpha' })
+    ])
+  })
+
+  it('replaces only the resolved lineage in the owning profile', () => {
+    setSessions([
+      session({ id: 'alpha-tip', _lineage_root_id: 'shared', profile: 'alpha' }),
+      session({ id: 'beta-old', _lineage_root_id: 'shared', profile: 'beta' })
+    ])
+
+    upsertResolvedSession(session({ id: 'beta-new', _lineage_root_id: 'shared', profile: 'beta' }), 'shared')
+
+    expect($sessions.get().map(({ id, profile }) => `${profile}:${id}`)).toEqual(['beta:beta-new', 'alpha:alpha-tip'])
+  })
+})
+
+describe('resolveStoredSession profile ownership', () => {
+  afterEach(() => {
+    setSessions([])
+    vi.mocked(getSession).mockReset()
+  })
+
+  it('queries the requested active profile before accepting a sole colliding cache row', async () => {
+    $activeGatewayProfile.set('beta')
+    setSessions([session({ id: 'shared', profile: 'alpha', title: 'Alpha' })])
+    vi.mocked(getSession).mockResolvedValue(session({ id: 'shared', profile: 'beta', title: 'Beta' }))
+
+    await expect(resolveStoredSession('shared')).resolves.toEqual(expect.objectContaining({ profile: 'beta' }))
+    expect(getSession).toHaveBeenCalledWith('shared', 'beta')
   })
 })
 

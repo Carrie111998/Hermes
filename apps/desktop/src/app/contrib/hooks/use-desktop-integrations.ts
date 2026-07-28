@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
-import { storedSessionIdForNotification } from '@/lib/session-ids'
+import { sessionIdentityForNotification } from '@/lib/session-ids'
 import { respondToApprovalAction } from '@/store/native-notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
@@ -24,10 +24,12 @@ interface DesktopIntegrationsParams {
   chatOpen: boolean
   hasPreview: boolean
   locationPathname: string
+  locationSearch: string
   navigate: (to: string, options?: { replace?: boolean }) => void
   refreshSessions: () => Promise<unknown> | unknown
   resumeExhaustedSessionId: null | string
   routedSessionId: null | string
+  routedSessionProfile: null | string
   runtimeIdByStoredSessionId: { readonly current: Map<string, string> }
 }
 
@@ -40,10 +42,12 @@ interface DesktopIntegrationsParams {
  */
 export function useDesktopIntegrations({
   locationPathname,
+  locationSearch,
   navigate,
   refreshSessions,
   resumeExhaustedSessionId,
   routedSessionId,
+  routedSessionProfile,
   runtimeIdByStoredSessionId
 }: DesktopIntegrationsParams): void {
   // Update polling — populates $desktopVersion/$updateStatus, which feed the
@@ -74,14 +78,18 @@ export function useDesktopIntegrations({
     if (routedSessionId) {
       setRememberedSessionId(
         routedSessionId,
-        rememberedSessionProfile($sessions.get(), routedSessionId, $activeGatewayProfile.get())
+        rememberedSessionProfile(
+          $sessions.get(),
+          routedSessionId,
+          routedSessionProfile ?? $activeGatewayProfile.get()
+        )
       )
     }
 
     if (!isOverlayView(appViewForPath(locationPathname))) {
-      setRememberedRoute(locationPathname)
+      setRememberedRoute(`${locationPathname}${locationSearch}`)
     }
-  }, [locationPathname, routedSessionId])
+  }, [locationPathname, locationSearch, routedSessionId, routedSessionProfile])
 
   const restoredRef = useRef(false)
 
@@ -108,7 +116,7 @@ export function useDesktopIntegrations({
     const last = getRememberedSessionId($activeGatewayProfile.get())
 
     if (last) {
-      navigate(sessionRoute(last), { replace: true })
+      navigate(sessionRoute(last, $activeGatewayProfile.get()), { replace: true })
     }
   }, [locationPathname, navigate])
 
@@ -128,9 +136,13 @@ export function useDesktopIntegrations({
   // tile / main) instead of forcing main. Runtime id is translated to the
   // stored id the chat route is keyed by; action buttons resolve in place.
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onFocusSession?.(sessionId => {
-      if (sessionId) {
-        openSession(storedSessionIdForNotification(sessionId, runtimeIdByStoredSessionId.current), navigate)
+    const unsubscribe = window.hermesDesktop?.onFocusSession?.(target => {
+      if (target?.sessionId) {
+        const identity = target.profile
+          ? target
+          : sessionIdentityForNotification(target.sessionId, runtimeIdByStoredSessionId.current)
+
+        openSession(identity.sessionId, navigate, 'in-place', identity.profile)
       }
     })
 
@@ -138,8 +150,8 @@ export function useDesktopIntegrations({
   }, [navigate, runtimeIdByStoredSessionId])
 
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
-      void respondToApprovalAction(sessionId ?? null, actionId)
+    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, profile, sessionId }) => {
+      void respondToApprovalAction(sessionId ?? null, actionId, profile)
     })
 
     return () => unsubscribe?.()
@@ -176,7 +188,7 @@ export function useDesktopIntegrations({
   // path is the `view.closeTab` keybind (use-keybinds), sharing closeActiveTab.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onClosePreviewRequested?.(
-      () => void closeActiveTab(id => navigate(sessionRoute(id)))
+      () => void closeActiveTab(id => navigate(sessionRoute(id, $activeGatewayProfile.get())))
     )
 
     return () => unsubscribe?.()

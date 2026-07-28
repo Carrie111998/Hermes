@@ -16,6 +16,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
+import { sessionMatchesIdentity } from '@/lib/session-identity'
 import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgentNotice } from '@/store/agent-notices'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
@@ -36,7 +37,6 @@ import {
   $currentCwd,
   $currentModel,
   $currentProvider,
-  sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
@@ -258,6 +258,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const sessionId = route.sessionId
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
+
+      const notificationSession = () => {
+        const state = sessionId ? updateSessionState(sessionId, current => current) : undefined
+
+        return {
+          profile: state?.storedSessionProfile ?? event.profile ?? $activeGatewayProfile.get(),
+          sessionId,
+          storedSessionId: state?.storedSessionId
+        }
+      }
 
       // Mid-turn compaction does not emit another message.start. The first
       // model output or tool event proves summarization has finished and the
@@ -630,9 +640,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         // Turn ended — drop any blocking prompt still open for THIS session
         // (e.g. interrupted, or the approval already resolved). Scoped to the
-        // session so a background turn finishing can't wipe the active chat's
-        // prompt, and vice versa.
-        clearAllPrompts(sessionId)
+        // exact profile/session owner so colliding pooled runtime ids cannot
+        // clear one another's prompts.
+        clearAllPrompts(sessionId, notificationSession().profile)
         clearClarifyRequest(undefined, sessionId)
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the
@@ -703,7 +713,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const nextTitle = typeof payload?.title === 'string' ? payload.title.trim() : ''
 
         if (storedId && nextTitle) {
-          setSessions(prev => prev.map(s => (sessionMatchesStoredId(s, storedId) ? { ...s, title: nextTitle } : s)))
+          setSessions(prev =>
+            prev.map(s =>
+              sessionMatchesIdentity(s, storedId, activeGatewayProfile) ? { ...s, title: nextTitle } : s
+            )
+          )
         }
       } else if (event.type === 'tool.generating') {
         // Announced while the model is still emitting the call's JSON, so it
@@ -835,9 +849,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
 
           dispatchNativeNotification({
+            ...notificationSession(),
             body: question,
             kind: 'input',
-            sessionId,
             title: translateNow('notifications.native.inputTitle')
           })
         }
@@ -859,6 +873,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             : undefined,
           command,
           description,
+          profile: notificationSession().profile,
           sessionId: sessionId ?? null,
           smartDenied: payload?.smart_denied === true
         })
@@ -868,13 +883,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         dispatchNativeNotification({
+          ...notificationSession(),
           actions: [
             { id: 'approve', text: translateNow('notifications.native.approveAction') },
             { id: 'reject', text: translateNow('notifications.native.rejectAction') }
           ],
           body: command || description,
           kind: 'approval',
-          sessionId,
           title: translateNow('notifications.native.approvalTitle')
         })
       } else if (event.type === 'sudo.request') {
@@ -883,16 +898,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
-          setSudoRequest({ requestId, sessionId: sessionId ?? null })
+          setSudoRequest({ profile: notificationSession().profile, requestId, sessionId: sessionId ?? null })
 
           if (sessionId) {
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
           }
 
           dispatchNativeNotification({
+            ...notificationSession(),
             body: translateNow('notifications.native.inputBody'),
             kind: 'input',
-            sessionId,
             title: translateNow('notifications.native.inputTitle')
           })
         }
@@ -908,6 +923,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setSecretRequest({
             requestId,
             envVar,
+            profile: notificationSession().profile,
             prompt: promptText,
             sessionId: sessionId ?? null
           })
@@ -917,9 +933,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
 
           dispatchNativeNotification({
+            ...notificationSession(),
             body: promptText || envVar || translateNow('notifications.native.inputBody'),
             kind: 'input',
-            sessionId,
             title: translateNow('notifications.native.inputTitle')
           })
         }
@@ -1032,7 +1048,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // for this session so an approval/sudo/secret overlay can't linger past
         // the failed turn (same intent as the message.complete clear).
         if (sessionId) {
-          clearAllPrompts(sessionId)
+          clearAllPrompts(sessionId, notificationSession().profile)
           clearClarifyRequest(undefined, sessionId)
           clearActiveSessionTodos(sessionId)
           setSessionCompacting(sessionId, false)
@@ -1045,9 +1061,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         dispatchNativeNotification({
+          ...notificationSession(),
           body: errorMessage,
           kind: 'turnError',
-          sessionId,
           title: translateNow('notifications.native.turnErrorTitle')
         })
 

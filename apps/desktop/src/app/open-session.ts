@@ -11,6 +11,7 @@
  *   - `window` (⇧⌘-click) — pop into its own window; falls back to `tab` when
  *     the bridge has no session-window support.
  */
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { focusedSessionNeedsRoute, focusOpenSession, openSessionTile } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
@@ -48,17 +49,20 @@ export function openSessionIntentFromModifiers(
 export function openSession(
   storedSessionId: string,
   navigate: OpenSessionNavigate,
-  intent: OpenSessionIntent = 'in-place'
+  intent: OpenSessionIntent = 'in-place',
+  profile?: null | string
 ): void {
   if (!storedSessionId) {
     return
   }
 
+  const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+  const targetProfile = normalizeProfileKey(profile ?? activeProfile)
   let resolved: OpenSessionIntent = intent
 
   if (resolved === 'window') {
     if (canOpenSessionWindow()) {
-      void openSessionInNewWindow(storedSessionId)
+      void openSessionInNewWindow(storedSessionId, { profile: targetProfile })
 
       return
     }
@@ -71,11 +75,11 @@ export function openSession(
     // Already on screen? Front it. openSessionTile would no-op on main without
     // focusing, or try to relocate an existing tile — neither is right for a
     // soft "open beside" link.
-    if (focusOpenSession(storedSessionId)) {
+    if (targetProfile === activeProfile && focusOpenSession(storedSessionId, targetProfile)) {
       return
     }
 
-    openSessionTile(storedSessionId, 'center')
+    void openSessionTile(storedSessionId, 'center', undefined, undefined, targetProfile)
 
     return
   }
@@ -84,7 +88,10 @@ export function openSession(
   // otherwise load it into main. From a full page (artifacts, skills, …) a
   // `'main'` hit still has to route back: fronting the workspace tab alone
   // leaves the page showing.
-  if (focusedSessionNeedsRoute(focusOpenSession(storedSessionId), $workspaceIsPage.get())) {
-    navigate(sessionRoute(storedSessionId))
+  if (
+    targetProfile !== activeProfile ||
+    focusedSessionNeedsRoute(focusOpenSession(storedSessionId, targetProfile), $workspaceIsPage.get())
+  ) {
+    navigate(sessionRoute(storedSessionId, targetProfile))
   }
 }

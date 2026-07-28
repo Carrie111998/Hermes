@@ -5,10 +5,12 @@ import {
   clearInFlightTurnJournal,
   type JournalableSessionState,
   mergeInFlightMessages,
+  migrateInFlightTurnJournal,
   persistInFlightTurnState,
   readInFlightTurnJournal,
   recoverInFlightTurnJournal
 } from '@/lib/inflight-turn-journal'
+import { sessionIdentityKey } from '@/lib/session-identity'
 
 const STORAGE_KEY = 'hermes.desktop.inflightTurnJournal.v1'
 
@@ -113,10 +115,89 @@ describe('persistInFlightTurnState', () => {
     vi.advanceTimersByTime(400)
 
     const raw = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!)
-    raw.entries['stored-1'].updatedAt = Date.now() - 8 * 24 * 60 * 60 * 1000
+    raw.entries[sessionIdentityKey('stored-1', 'default')].updatedAt = Date.now() - 8 * 24 * 60 * 60 * 1000
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(raw))
 
     expect(readInFlightTurnJournal('stored-1')).toBeNull()
+  })
+
+  it('isolates colliding stored ids by profile', () => {
+    persistInFlightTurnState(
+      journalState({
+        messages: [user('alpha-user', 'alpha prompt'), assistant('alpha-stream', 'alpha partial', { pending: true })],
+        storedSessionId: 'shared',
+        storedSessionProfile: 'alpha',
+        streamId: 'alpha-stream'
+      })
+    )
+    persistInFlightTurnState(
+      journalState({
+        messages: [user('beta-user', 'beta prompt'), assistant('beta-stream', 'beta partial', { pending: true })],
+        storedSessionId: 'shared',
+        storedSessionProfile: 'beta',
+        streamId: 'beta-stream'
+      })
+    )
+
+    vi.advanceTimersByTime(400)
+
+    expect(readInFlightTurnJournal('shared', 'alpha')?.streamId).toBe('alpha-stream')
+    expect(readInFlightTurnJournal('shared', 'beta')?.streamId).toBe('beta-stream')
+
+    clearInFlightTurnJournal('shared', 'alpha')
+
+    expect(readInFlightTurnJournal('shared', 'alpha')).toBeNull()
+    expect(readInFlightTurnJournal('shared', 'beta')?.streamId).toBe('beta-stream')
+
+    clearInFlightTurnJournal('shared', 'beta')
+  })
+
+  it('moves pending and persisted turn state when compression rotates the stored id', () => {
+    persistInFlightTurnState(
+      journalState({ storedSessionId: 'root', storedSessionProfile: 'alpha', streamId: 'alpha-stream' })
+    )
+    vi.advanceTimersByTime(400)
+    persistInFlightTurnState(
+      journalState({ storedSessionId: 'root-pending', storedSessionProfile: 'alpha', streamId: 'pending-stream' })
+    )
+
+    migrateInFlightTurnJournal('root', 'tip', 'alpha')
+    migrateInFlightTurnJournal('root-pending', 'tip-pending', 'alpha')
+
+    expect(readInFlightTurnJournal('root', 'alpha')).toBeNull()
+    expect(readInFlightTurnJournal('tip', 'alpha')?.streamId).toBe('alpha-stream')
+    vi.advanceTimersByTime(400)
+    expect(readInFlightTurnJournal('root-pending', 'alpha')).toBeNull()
+    expect(readInFlightTurnJournal('tip-pending', 'alpha')?.streamId).toBe('pending-stream')
+
+    clearInFlightTurnJournal('tip', 'alpha')
+    clearInFlightTurnJournal('tip-pending', 'alpha')
+  })
+
+  it('keeps a newer destination-side pending snapshot during rotation', () => {
+    persistInFlightTurnState(
+      journalState({
+        messages: [user('u1', 'prompt'), assistant('old-stream', 'older partial', { pending: true })],
+        storedSessionId: 'root',
+        storedSessionProfile: 'alpha',
+        streamId: 'old-stream'
+      })
+    )
+    persistInFlightTurnState(
+      journalState({
+        messages: [user('u1', 'prompt'), assistant('new-stream', 'newer partial', { pending: true })],
+        storedSessionId: 'tip',
+        storedSessionProfile: 'alpha',
+        streamId: 'new-stream'
+      })
+    )
+
+    migrateInFlightTurnJournal('root', 'tip', 'alpha')
+    vi.advanceTimersByTime(400)
+
+    expect(readInFlightTurnJournal('root', 'alpha')).toBeNull()
+    expect(readInFlightTurnJournal('tip', 'alpha')?.streamId).toBe('new-stream')
+    clearInFlightTurnJournal('tip', 'alpha')
   })
 })
 

@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { $sidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import { applyConfiguredDefaultProjectDir } from '@/store/session'
@@ -454,8 +455,17 @@ describe('tombstone pruning', () => {
   }
 
   beforeEach(() => {
+    $activeGatewayProfile.set('default')
     $removedSessionIds.set(new Set())
     $sessionMutationsInFlight.set(new Set())
+  })
+
+  it('keeps opaque stored ids distinct when creating tombstones', () => {
+    tombstoneSessions(['shared', 'shared '], 'alpha')
+
+    expect($removedSessionIds.get()).toEqual(
+      new Set([sessionIdentityKey('shared', 'alpha'), sessionIdentityKey('shared ', 'alpha')])
+    )
   })
 
   it('keeps an in-flight delete tombstone even when the backend snapshot omits it', async () => {
@@ -469,7 +479,7 @@ describe('tombstone pruning', () => {
     openGatewayReturning([])
     await refreshProjectTree()
 
-    expect($removedSessionIds.get().has('sess-1')).toBe(true)
+    expect($removedSessionIds.get().has(sessionIdentityKey('sess-1', 'default'))).toBe(true)
   })
 
   it('prunes the tombstone once the mutation settles and scope no longer lists it', async () => {
@@ -482,6 +492,6 @@ describe('tombstone pruning', () => {
     endSessionMutation(['sess-1'])
     await refreshProjectTree()
 
-    expect($removedSessionIds.get().has('sess-1')).toBe(false)
+    expect($removedSessionIds.get().has(sessionIdentityKey('sess-1', 'default'))).toBe(false)
   })
 })

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { createEventDeduper } from './event-dedupe'
+import { createEventDeduper, notificationDedupeKey } from './event-dedupe'
 
 test('collapses the same key inside the window (two windows, one event)', () => {
   const isDup = createEventDeduper(1000)
@@ -17,6 +17,17 @@ test('distinct keys are independent', () => {
   assert.equal(isDup('input:s1', 0), false)
   assert.equal(isDup('approval:s1', 0), false, 'different kind')
   assert.equal(isDup('input:s2', 0), false, 'different session')
+})
+
+test('notification keys partition colliding session ids by normalized profile', () => {
+  assert.notEqual(
+    notificationDedupeKey({ kind: 'turnDone', profile: 'alpha', sessionId: 'shared' }),
+    notificationDedupeKey({ kind: 'turnDone', profile: 'beta', sessionId: 'shared' })
+  )
+  assert.equal(
+    notificationDedupeKey({ kind: 'turnDone', profile: ' default ', sessionId: 'shared' }),
+    notificationDedupeKey({ kind: 'turnDone', profile: null, sessionId: 'shared' })
+  )
 })
 
 test('re-fires once the window elapses', () => {

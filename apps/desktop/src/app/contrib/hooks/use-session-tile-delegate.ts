@@ -2,22 +2,25 @@ import { useEffect } from 'react'
 
 import { getSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
+import { sessionIdentityKey } from '@/lib/session-identity'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
 import { resolveSessionProfile } from '../../session/hooks/use-session-actions/utils'
 import type { useSessionStateCache } from '../../session/hooks/use-session-state-cache'
-import type { GatewayRequester } from '../types'
+import type { GatewayRequester, ProfileGatewayRequester } from '../types'
 
 type SessionStateCache = ReturnType<typeof useSessionStateCache>
 
 interface SessionTileDelegateParams {
-  archiveSession: (storedSessionId: string) => Promise<unknown>
-  branchStoredSession: (storedSessionId: string) => Promise<unknown>
+  archiveSession: (storedSessionId: string, profile?: null | string) => Promise<unknown>
+  branchStoredSession: (storedSessionId: string, profile?: null | string) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
-  removeSession: (storedSessionId: string) => Promise<unknown>
+  removeSession: (storedSessionId: string, profile?: null | string) => Promise<unknown>
   requestGateway: GatewayRequester
+  requestGatewayForProfile?: ProfileGatewayRequester
   runtimeIdByStoredSessionIdRef: SessionStateCache['runtimeIdByStoredSessionIdRef']
   sessionStateByRuntimeIdRef: SessionStateCache['sessionStateByRuntimeIdRef']
   updateSessionState: SessionStateCache['updateSessionState']
@@ -36,50 +39,61 @@ export function useSessionTileDelegate({
   executeSlashCommand,
   removeSession,
   requestGateway,
+  requestGatewayForProfile,
   runtimeIdByStoredSessionIdRef,
   sessionStateByRuntimeIdRef,
   updateSessionState
 }: SessionTileDelegateParams): void {
   useEffect(() => {
+    const requestOwnedGateway: ProfileGatewayRequester = requestGatewayForProfile
+      ? requestGatewayForProfile
+      : (_profile, method, params, timeoutMs) =>
+          timeoutMs === undefined ? requestGateway(method, params) : requestGateway(method, params, timeoutMs)
+
     setSessionTileDelegate({
-      archiveSession: async storedSessionId => {
-        await archiveSession(storedSessionId)
+      archiveSession: async (storedSessionId, ownerProfile) => {
+        const profile = normalizeProfileKey(ownerProfile ?? $activeGatewayProfile.get())
+        await archiveSession(storedSessionId, profile)
       },
-      branchSession: async storedSessionId => {
-        await branchStoredSession(storedSessionId)
+      branchSession: async (storedSessionId, ownerProfile) => {
+        const profile = normalizeProfileKey(ownerProfile ?? $activeGatewayProfile.get())
+        await branchStoredSession(storedSessionId, profile)
       },
-      deleteSession: async storedSessionId => {
-        await removeSession(storedSessionId)
+      deleteSession: async (storedSessionId, ownerProfile) => {
+        const profile = normalizeProfileKey(ownerProfile ?? $activeGatewayProfile.get())
+        await removeSession(storedSessionId, profile)
       },
-      executeSlash: async (rawCommand, sessionId) => {
-        await executeSlashCommand(rawCommand, { sessionId })
+      executeSlash: async (rawCommand, sessionId, profile, storedSessionId) => {
+        await executeSlashCommand(rawCommand, { profile, sessionId, storedSessionId })
       },
-      interruptSession: async runtimeId => {
-        await requestGateway('session.interrupt', { session_id: runtimeId })
+      interruptSession: async (runtimeId, ownerProfile) => {
+        const profile = normalizeProfileKey(ownerProfile)
+        await requestOwnedGateway(profile, 'session.interrupt', { session_id: runtimeId })
       },
-      resumeTile: async storedSessionId => {
-        const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+      resumeTile: async (storedSessionId, ownerProfile) => {
+        const profile = normalizeProfileKey(
+          ownerProfile ?? (await resolveSessionProfile(storedSessionId)) ?? $activeGatewayProfile.get()
+        )
+
+        const existing = runtimeIdByStoredSessionIdRef.current.get(sessionIdentityKey(storedSessionId, profile))
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
 
-        if (existing && cached?.storedSessionId === storedSessionId) {
+        if (
+          existing &&
+          cached?.storedSessionId === storedSessionId &&
+          normalizeProfileKey(cached.storedSessionProfile) === profile
+        ) {
           publishSessionState(existing, cached)
 
           return existing
         }
 
-        // Resolve the owning profile before binding a runtime. A tile can open a
-        // session from any profile, not just the active one; resuming (or
-        // reading messages) without a profile lets the gateway fall back to the
-        // launch-profile DB and fork the conversation into the wrong profile —
-        // the same cross-profile bleed the recovery resumes had (#67603).
-        const profile = await resolveSessionProfile(storedSessionId)
-
         const [prefetch, resumed] = await Promise.all([
           getSessionMessages(storedSessionId, profile).catch(() => null),
-          requestGateway<SessionResumeResponse>('session.resume', {
+          requestOwnedGateway<SessionResumeResponse>(profile, 'session.resume', {
             session_id: storedSessionId,
             cols: 96,
-            ...(profile ? { profile } : {})
+            profile
           })
         ])
 
@@ -97,13 +111,20 @@ export function useSessionTileDelegate({
             messages:
               state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
           }),
-          storedSessionId
+          storedSessionId,
+          profile
         )
 
         return runtimeId
       },
-      submitToSession: async (runtimeId, text) => {
-        await requestGateway('prompt.submit', { session_id: runtimeId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+      submitToSession: async (runtimeId, text, ownerProfile) => {
+        const profile = normalizeProfileKey(ownerProfile)
+        await requestOwnedGateway(
+          profile,
+          'prompt.submit',
+          { session_id: runtimeId, text },
+          PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+        )
       },
       updateSession: (runtimeId, updater) => updateSessionState(runtimeId, updater)
     })
@@ -113,6 +134,7 @@ export function useSessionTileDelegate({
     executeSlashCommand,
     removeSession,
     requestGateway,
+    requestGatewayForProfile,
     runtimeIdByStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
     updateSessionState

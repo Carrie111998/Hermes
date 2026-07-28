@@ -2,9 +2,13 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { HermesPreviewTarget } from '@/global'
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $previewTabs, $previewTarget, closeRightRail, type PreviewTarget } from '@/store/preview'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $messages, $selectedStoredSessionId } from '@/store/session'
+import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
 import { usePreviewRouting } from './use-preview-routing'
@@ -15,7 +19,7 @@ function assistantMessage(id: string, text: string): ChatMessage {
   return { id, parts: [assistantTextPart(text)], role: 'assistant' }
 }
 
-function fileTarget(path: string): PreviewTarget {
+function fileTarget(path: string): HermesPreviewTarget & PreviewTarget {
   return { kind: 'file', label: path, path, previewKind: 'html', source: path, url: `file://${path}` }
 }
 
@@ -39,6 +43,7 @@ async function emitPreviewOpen(url = '/tmp/artifact-test.html') {
   await act(async () => {
     handleEvent({
       payload: { label: 'hi bestie', url },
+      profile: 'default',
       session_id: RUNTIME_SESSION_ID,
       type: 'preview.open'
     } as unknown as RpcEvent)
@@ -49,8 +54,10 @@ describe('open_preview', () => {
   beforeEach(() => {
     // A live session always has a runtime id; only the STORED id lags.
     $activeSessionId.set(RUNTIME_SESSION_ID)
+    $activeGatewayProfile.set('default')
     $currentCwd.set('/work')
     $messages.set([])
+    clearAllSessionStates()
     closeRightRail()
     window.localStorage.clear()
 
@@ -65,7 +72,9 @@ describe('open_preview', () => {
     $messages.set([])
     closeRightRail()
     $activeSessionId.set(null)
+    $activeGatewayProfile.set('default')
     $selectedStoredSessionId.set(null)
+    clearAllSessionStates()
     window.localStorage.clear()
     vi.restoreAllMocks()
   })
@@ -107,6 +116,145 @@ describe('open_preview', () => {
         session_id: 'some-other-session',
         type: 'preview.open'
       } as unknown as RpcEvent)
+    })
+
+    expect($previewTabs.get()).toHaveLength(0)
+  })
+
+  it('ignores a pooled preview event from another profile when runtime ids collide', async () => {
+    $selectedStoredSessionId.set('shared')
+    $activeGatewayProfile.set('beta')
+    render(<Harness />)
+
+    await act(async () => {
+      handleEvent({
+        payload: { url: '/tmp/alpha.html' },
+        profile: 'alpha',
+        session_id: RUNTIME_SESSION_ID,
+        type: 'preview.open'
+      } as unknown as RpcEvent)
+    })
+
+    expect(window.hermesDesktop.normalizePreviewTarget).not.toHaveBeenCalled()
+    expect($previewTabs.get()).toHaveLength(0)
+  })
+
+  it('ignores a pooled preview event from another profile before the stored id exists', async () => {
+    $selectedStoredSessionId.set(null)
+    $activeGatewayProfile.set('beta')
+    render(<Harness />)
+
+    await act(async () => {
+      handleEvent({
+        payload: { url: '/tmp/alpha.html' },
+        profile: 'alpha',
+        session_id: RUNTIME_SESSION_ID,
+        type: 'preview.open'
+      } as unknown as RpcEvent)
+    })
+
+    expect(window.hermesDesktop.normalizePreviewTarget).not.toHaveBeenCalled()
+    expect($previewTabs.get()).toHaveLength(0)
+  })
+
+  it('ignores stale colliding runtime state when the focused draft has no stored id yet', async () => {
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState('shared'),
+      storedSessionProfile: 'alpha'
+    })
+    $selectedStoredSessionId.set(null)
+    $activeGatewayProfile.set('beta')
+    render(<Harness />)
+
+    await act(async () => {
+      handleEvent({
+        payload: { url: '/tmp/alpha.html' },
+        profile: 'alpha',
+        session_id: RUNTIME_SESSION_ID,
+        type: 'preview.open'
+      } as unknown as RpcEvent)
+    })
+
+    expect(window.hermesDesktop.normalizePreviewTarget).not.toHaveBeenCalled()
+    expect($previewTabs.get()).toHaveLength(0)
+  })
+
+  it('fails closed on a profileless preview event that only matches a pooled runtime id', async () => {
+    $selectedStoredSessionId.set(null)
+    $activeGatewayProfile.set('beta')
+    render(<Harness />)
+
+    await act(async () => {
+      handleEvent({
+        payload: { url: '/tmp/owner-unknown.html' },
+        session_id: RUNTIME_SESSION_ID,
+        type: 'preview.open'
+      } as unknown as RpcEvent)
+    })
+
+    expect(window.hermesDesktop.normalizePreviewTarget).not.toHaveBeenCalled()
+    expect($previewTabs.get()).toHaveLength(0)
+  })
+
+  it('drops an async open when focus moves to the same stored id in another profile', async () => {
+    let resolveTarget!: (target: HermesPreviewTarget) => void
+
+    const pendingTarget = new Promise<HermesPreviewTarget>(resolve => {
+      resolveTarget = resolve
+    })
+
+    $selectedStoredSessionId.set('shared')
+    $activeGatewayProfile.set('alpha')
+    vi.mocked(window.hermesDesktop.normalizePreviewTarget).mockReturnValue(pendingTarget)
+    render(<Harness />)
+
+    await act(async () => {
+      handleEvent({
+        payload: { url: '/tmp/owned.html' },
+        profile: 'alpha',
+        session_id: RUNTIME_SESSION_ID,
+        type: 'preview.open'
+      } as unknown as RpcEvent)
+    })
+
+    await waitFor(() => expect(window.hermesDesktop.normalizePreviewTarget).toHaveBeenCalled())
+
+    await act(async () => {
+      $activeGatewayProfile.set('beta')
+      resolveTarget(fileTarget('/tmp/owned.html'))
+      await pendingTarget
+    })
+
+    expect($previewTabs.get()).toHaveLength(0)
+  })
+
+  it('drops an async open when the profile changes before the stored id exists', async () => {
+    let resolveTarget!: (target: HermesPreviewTarget) => void
+
+    const pendingTarget = new Promise<HermesPreviewTarget>(resolve => {
+      resolveTarget = resolve
+    })
+
+    $selectedStoredSessionId.set(null)
+    $activeGatewayProfile.set('alpha')
+    vi.mocked(window.hermesDesktop.normalizePreviewTarget).mockReturnValue(pendingTarget)
+    render(<Harness />)
+
+    await act(async () => {
+      handleEvent({
+        payload: { url: '/tmp/owned.html' },
+        profile: 'alpha',
+        session_id: RUNTIME_SESSION_ID,
+        type: 'preview.open'
+      } as unknown as RpcEvent)
+    })
+
+    await waitFor(() => expect(window.hermesDesktop.normalizePreviewTarget).toHaveBeenCalled())
+
+    await act(async () => {
+      $activeGatewayProfile.set('beta')
+      resolveTarget(fileTarget('/tmp/owned.html'))
+      await pendingTarget
     })
 
     expect($previewTabs.get()).toHaveLength(0)

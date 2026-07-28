@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HermesRepoStatus } from '@/global'
 
 import { $repoStatus, $repoStatusLoading, refreshRepoStatus } from './coding-status'
-import { $currentCwd, $selectedStoredSessionId } from './session'
+import { $currentCwd, setSelectedStoredSessionId } from './session'
 
 const sampleStatus: HermesRepoStatus = {
   branch: 'feature/login',
@@ -30,7 +30,7 @@ describe('refreshRepoStatus', () => {
     vi.useFakeTimers()
     $repoStatus.set(null)
     $currentCwd.set('')
-    $selectedStoredSessionId.set(null)
+    setSelectedStoredSessionId(null)
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
   })
 
@@ -149,7 +149,7 @@ describe('refreshRepoStatus', () => {
     stubProbe(probe)
 
     $currentCwd.set('/repo')
-    $selectedStoredSessionId.set('session-a')
+    setSelectedStoredSessionId('session-a', 'default')
     // The cwd subscription fires on the set above; drain the debounced refresh.
     vi.advanceTimersByTime(200)
     await vi.runAllTicks()
@@ -160,7 +160,24 @@ describe('refreshRepoStatus', () => {
     // identical, so its subscription would not re-fire — but the stored-session
     // id did change, which must still trigger a probe so the branch label
     // tracks the new session's checked-out branch.
-    $selectedStoredSessionId.set('session-b')
+    setSelectedStoredSessionId('session-b', 'default')
+    vi.advanceTimersByTime(200)
+    await vi.runAllTicks()
+
+    expect(probe).toHaveBeenCalledWith('/repo')
+  })
+
+  it('refreshes when only the selected session profile changes', async () => {
+    const probe = vi.fn(async () => sampleStatus)
+    stubProbe(probe)
+
+    $currentCwd.set('/repo')
+    setSelectedStoredSessionId('shared', 'alpha')
+    vi.advanceTimersByTime(200)
+    await vi.runAllTicks()
+    probe.mockClear()
+
+    setSelectedStoredSessionId('shared', 'beta')
     vi.advanceTimersByTime(200)
     await vi.runAllTicks()
 

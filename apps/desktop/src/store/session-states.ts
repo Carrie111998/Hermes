@@ -28,12 +28,15 @@ import {
   noteActiveTreeGroup,
   revealTreePane
 } from '@/components/pane-shell/tree/store'
+import { migrateInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
 
-import { $activeGatewayProfile, normalizeProfileKey } from './profile'
+import { $activeGatewayProfile, ensureGatewayProfile, normalizeProfileKey } from './profile'
 import {
   $activeSessionId,
+  $selectedSessionIdentityKey,
   $selectedStoredSessionId,
   $unreadFinishedSessionIds,
   setActiveSessionStoredIdRotation
@@ -52,18 +55,23 @@ export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 // presentation hint and never mutates the backend-derived busy state.
 export const $stalledSessionIds = atom<string[]>([])
 
-export function setSessionStalled(storedSessionId: string | null | undefined, stalled: boolean) {
+export function setSessionStalled(
+  storedSessionId: string | null | undefined,
+  stalled: boolean,
+  profile?: null | string
+) {
   if (!storedSessionId) {
     return
   }
 
+  const identityKey = sessionIdentityKey(storedSessionId, profile)
   const current = $stalledSessionIds.get()
-  const present = current.includes(storedSessionId)
+  const present = current.includes(identityKey)
 
   if (stalled && !present) {
-    $stalledSessionIds.set([...current, storedSessionId])
+    $stalledSessionIds.set([...current, identityKey])
   } else if (!stalled && present) {
-    $stalledSessionIds.set(current.filter(id => id !== storedSessionId))
+    $stalledSessionIds.set(current.filter(id => id !== identityKey))
   }
 }
 
@@ -85,7 +93,7 @@ function armWatchdog(runtimeId: string) {
       const current = $sessionStates.get()[runtimeId]
 
       if (current?.busy) {
-        setSessionStalled(current.storedSessionId, true)
+        setSessionStalled(current.storedSessionId, true, current.storedSessionProfile)
       }
     }, SESSION_WATCHDOG_TIMEOUT_MS)
   )
@@ -135,6 +143,10 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   // could let a background session's delayed rotation steal the foreground
   // route.
   if (previous?.storedSessionId && next.storedSessionId && previous.storedSessionId !== next.storedSessionId) {
+    if (normalizeProfileKey(previous.storedSessionProfile) === normalizeProfileKey(next.storedSessionProfile)) {
+      migrateInFlightTurnJournal(previous.storedSessionId, next.storedSessionId, next.storedSessionProfile)
+    }
+
     if (runtimeId === $activeSessionId.get()) {
       setActiveSessionStoredIdRotation({
         nextStoredSessionId: next.storedSessionId,
@@ -143,20 +155,20 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
       })
     }
 
-    clearSettled(previous.storedSessionId)
-    setSessionStalled(previous.storedSessionId, false)
+    clearSettled(sessionIdentityKey(previous.storedSessionId, previous.storedSessionProfile))
+    setSessionStalled(previous.storedSessionId, false, previous.storedSessionProfile)
   }
 
   // Every busy publish is stream activity: clear the quiet hint and restart
   // the silence window. A real terminal transition clears both the timer and
   // any hint, but only that authoritative transition clears working/busy.
   if (next.busy) {
-    setSessionStalled(next.storedSessionId, false)
+    setSessionStalled(next.storedSessionId, false, next.storedSessionProfile)
     armWatchdog(runtimeId)
   } else {
     clearWatchdog(runtimeId)
-    setSessionStalled(next.storedSessionId, false)
-    setSessionStalled(previous?.storedSessionId, false)
+    setSessionStalled(next.storedSessionId, false, next.storedSessionProfile)
+    setSessionStalled(previous?.storedSessionId, false, previous?.storedSessionProfile)
   }
 
   const storedId = next.storedSessionId
@@ -165,18 +177,19 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     return
   }
 
+  const identityKey = sessionIdentityKey(storedId, next.storedSessionProfile)
   const wasWorking = previous?.busy ?? false
 
   if (next.busy && !wasWorking) {
-    clearSettled(storedId)
+    clearSettled(identityKey)
   } else if (!next.busy && wasWorking) {
-    markSettled(storedId)
+    markSettled(identityKey)
 
-    if (storedId !== $selectedStoredSessionId.get()) {
+    if (identityKey !== $selectedSessionIdentityKey.get()) {
       const cur = $unreadFinishedSessionIds.get()
 
-      if (!cur.includes(storedId)) {
-        $unreadFinishedSessionIds.set([...cur, storedId])
+      if (!cur.includes(identityKey)) {
+        $unreadFinishedSessionIds.set([...cur, identityKey])
       }
     }
   }
@@ -215,7 +228,11 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
 
   const current = $sessionStates.get()
-  setSessionStalled(current[runtimeId]?.storedSessionId, false)
+  setSessionStalled(
+    current[runtimeId]?.storedSessionId,
+    false,
+    current[runtimeId]?.storedSessionProfile
+  )
 
   if (!(runtimeId in current)) {
     return
@@ -252,7 +269,7 @@ export function clearAllSessionStates() {
 const storedIds = (states: Record<string, ClientSessionState>, pred: (s: ClientSessionState) => boolean) =>
   Object.values(states)
     .filter(s => pred(s) && s.storedSessionId)
-    .map(s => s.storedSessionId!)
+    .map(s => sessionIdentityKey(s.storedSessionId!, s.storedSessionProfile))
 
 let workingIds: readonly string[] = []
 export const $workingSessionIds = computed(
@@ -438,21 +455,21 @@ export function resetTileRuntimeBindings() {
 
 export interface SessionTileDelegate {
   /** Archive a stored session (the sidebar's archive, incl. tile cleanup). */
-  archiveSession(storedSessionId: string): Promise<void>
+  archiveSession(storedSessionId: string, profile?: null | string): Promise<void>
   /** Branch a stored session into a new chat (the sidebar's branch). */
-  branchSession(storedSessionId: string): Promise<void>
+  branchSession(storedSessionId: string, profile?: null | string): Promise<void>
   /** Delete a stored session (the sidebar's delete, incl. tile cleanup). */
-  deleteSession(storedSessionId: string): Promise<void>
+  deleteSession(storedSessionId: string, profile?: null | string): Promise<void>
   /** Run a slash command against a tile's session (app-level effects — e.g.
    *  branch/handoff — act on the main surface, as they should). */
-  executeSlash(rawCommand: string, sessionId: string): Promise<void>
+  executeSlash(rawCommand: string, sessionId: string, profile: string, storedSessionId: string): Promise<void>
   /** Interrupt a tile's running turn. */
-  interruptSession(runtimeId: string): Promise<void>
+  interruptSession(runtimeId: string, profile: string): Promise<void>
   /** Bind a live runtime id for a stored session (resume without touching
    *  the main view). Returns the runtime id, or throws. */
-  resumeTile(storedSessionId: string): Promise<string>
+  resumeTile(storedSessionId: string, profile?: null | string): Promise<string>
   /** Submit a prompt to a tile's live session. */
-  submitToSession(runtimeId: string, text: string): Promise<void>
+  submitToSession(runtimeId: string, text: string, profile: string): Promise<void>
   /** THE session-state write path — routes through the wiring cache so the
    *  cache, the primary view (when active), and every tile mirror agree. */
   updateSession(runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState): ClientSessionState
@@ -528,15 +545,22 @@ function syncTileStripOrder() {
  *  An unanchored open (⌘T, ⌘⇧T on a tile that predates anchors) docks into the
  *  FOCUSED chat zone — the same zone ⌘1…⌘9 and ⌘W act on — so a new tab lands
  *  in the strip the user is looking at, not always main's. */
-export function openSessionTile(
+export async function openSessionTile(
   storedSessionId: string,
   dir: TileDock = 'right',
   anchor?: string,
-  before?: null | string
-) {
+  before?: null | string,
+  profile?: null | string
+): Promise<void> {
+  const targetProfile = normalizeProfileKey(profile ?? profileKey())
+
+  if (targetProfile !== profileKey()) {
+    await ensureGatewayProfile(targetProfile)
+  }
+
   const tiles = $sessionTiles.get()
 
-  if (storedSessionId === $selectedStoredSessionId.get()) {
+  if (sessionIdentityKey(storedSessionId, targetProfile) === $selectedSessionIdentityKey.get()) {
     return
   }
 
@@ -601,7 +625,11 @@ export function nextSessionTileForWorkspace(): null | string {
  *  Callers that own the router need the `'main'` vs `'tile'` distinction: a
  *  `'main'` hit only reaches the screen if the workspace pane is actually
  *  showing the chat, whereas a tile renders in its own pane regardless. */
-export function focusOpenSession(storedSessionId: string): 'main' | 'tile' | null {
+export function focusOpenSession(storedSessionId: string, profile?: null | string): 'main' | 'tile' | null {
+  if (normalizeProfileKey(profile ?? profileKey()) !== profileKey()) {
+    return null
+  }
+
   if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
     const paneId = `${TILE_PANE_PREFIX}${storedSessionId}`
     revealTreePane(paneId) // un-dismiss + adopt + front in its group
@@ -656,7 +684,24 @@ export function closeSessionTile(storedSessionId: string) {
  *  backend (resume 404s). Unlike close, it leaves no ⌘⇧T undo (resurrecting it
  *  would just 404 again) and evicts any cached state. This is what clears the
  *  "Session not found" resume spam from stale/cross-profile persisted tiles. */
-export function discardSessionTile(storedSessionId: string) {
+export function discardSessionTile(storedSessionId: string, profile?: null | string) {
+  const targetProfile = normalizeProfileKey(profile ?? profileKey())
+
+  if (targetProfile !== profileKey()) {
+    const tiles = tilesByProfile[targetProfile] ?? []
+    const stored = tiles.filter(tile => tile.storedSessionId !== storedSessionId)
+
+    if (stored.length > 0) {
+      tilesByProfile[targetProfile] = stored
+    } else {
+      delete tilesByProfile[targetProfile]
+    }
+
+    persistTiles()
+
+    return
+  }
+
   const runtimeId = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId
 
   if (runtimeId) {
@@ -707,6 +752,11 @@ export const $focusedStoredSessionId = computed(
   }
 )
 
+export const $focusedSessionIdentityKey = computed(
+  [$focusedStoredSessionId, $activeGatewayProfile],
+  (storedId, profile) => (storedId ? sessionIdentityKey(storedId, profile) : null)
+)
+
 /** Live runtime id of the focused session (a tile's bound runtime, else the
  *  primary's active session). */
 export const $focusedRuntimeId = computed(
@@ -734,7 +784,9 @@ export const selectionHomesToWorkspace = (selected: null | string, tiles: readon
 
 // Homing also FRONTS the workspace tab: the resumed chat loads in the workspace
 // pane, so a zone parked on a tile tab must switch back or the click looks dead.
-$selectedStoredSessionId.listen(selected => {
+$selectedSessionIdentityKey.listen(identityKey => {
+  const selected = identityKey ? parseSessionIdentityKey(identityKey).storedSessionId : null
+
   if (!selectionHomesToWorkspace(selected, $sessionTiles.get())) {
     return
   }

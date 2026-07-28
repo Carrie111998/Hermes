@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $backgroundStatusBySession, dismissBackgroundProcess, reconcileBackgroundProcesses } from './composer-status'
+import { createClientSessionState } from '@/lib/chat-runtime'
+
+import {
+  $backgroundStatusBySession,
+  $statusItemsBySession,
+  dismissBackgroundProcess,
+  reconcileBackgroundProcesses
+} from './composer-status'
+import { $sessionStates } from './session-states'
+import { $subagentsBySession, type SubagentProgress } from './subagents'
 
 const SID = 'sess-1'
 
@@ -149,5 +158,32 @@ describe('reconcileBackgroundProcesses', () => {
     vi.advanceTimersByTime(5_000)
 
     expect(itemsOf('sess-arm')).toEqual([])
+  })
+})
+
+describe('subagent status ownership', () => {
+  it('carries the parent runtime profile into child window items', () => {
+    const subagent = {
+      id: 'deleg-1',
+      parentId: null,
+      goal: 'review',
+      sessionId: 'shared',
+      status: 'running',
+      taskCount: 1,
+      taskIndex: 0,
+      startedAt: 1,
+      updatedAt: 1,
+      filesRead: [],
+      filesWritten: [],
+      stream: []
+    } satisfies SubagentProgress
+
+    $sessionStates.set({ runtime: { ...createClientSessionState('parent'), storedSessionProfile: 'alpha' } })
+    $subagentsBySession.set({ runtime: [subagent] })
+
+    expect($statusItemsBySession.get().runtime?.[0]).toMatchObject({ sessionId: 'shared', sessionProfile: 'alpha' })
+
+    $subagentsBySession.set({})
+    $sessionStates.set({})
   })
 })

@@ -3,6 +3,8 @@ import { createContext, useContext } from 'react'
 
 import type { ClientSessionState } from '@/app/types'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { parseSessionIdentityKey } from '@/lib/session-identity'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -13,6 +15,7 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $messages,
+  $selectedSessionIdentityKey,
   $selectedStoredSessionId
 } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
@@ -50,6 +53,7 @@ export interface SessionView {
   $lastVisibleIsUser: ReadableAtom<boolean>
   $cwd: ReadableAtom<string>
   $model: ReadableAtom<string>
+  $profile: ReadableAtom<string>
   $provider: ReadableAtom<string>
   $fast: ReadableAtom<boolean>
   $reasoningEffort: ReadableAtom<string>
@@ -86,6 +90,9 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $messages: $primaryMessages,
   $messagesEmpty: computed($primaryMessages, messages => messages.length === 0),
   $model: primaryField<string>(state => state.model, $currentModel),
+  $profile: computed([$selectedSessionIdentityKey, $activeGatewayProfile], (identity, activeProfile) =>
+    identity ? parseSessionIdentityKey(identity).profile : activeProfile
+  ),
   $provider: primaryField<string>(state => state.provider, $currentProvider),
   $reasoningEffort: primaryField<string>(state => state.reasoningEffort, $currentReasoningEffort),
   $runtimeId: $activeSessionId,

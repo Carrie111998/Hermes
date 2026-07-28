@@ -2,6 +2,7 @@ import { useCallback } from 'react'
 
 import { gatewayEventCompletedFileDiff } from '@/lib/gateway-events'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { normalizeProfileKey } from '@/lib/session-identity'
 import {
   $previewTabs,
   beginPreviewServerRestart,
@@ -10,8 +11,9 @@ import {
   progressPreviewServerRestart,
   requestPreviewReload
 } from '@/store/preview'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
-import { $focusedRuntimeId } from '@/store/session-states'
+import { $focusedRuntimeId, $focusedSessionIdentityKey } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
 type EventHandler = (event: RpcEvent) => void
@@ -24,6 +26,52 @@ interface PreviewRoutingOptions {
 
 function asRecord(payload: unknown): Record<string, unknown> {
   return payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {}
+}
+
+interface PreviewOwner {
+  identity: null | string
+  profile: string
+  runtimeId: string
+}
+
+function focusedPreviewOwner(): PreviewOwner | null {
+  const runtimeId = $focusedRuntimeId.get()
+
+  if (!runtimeId) {
+    return null
+  }
+
+  // Durable focused identity + active profile are authoritative. Runtime ids
+  // are pooled per backend, so joining through $sessionStates[runtimeId] can
+  // inherit a stale owner left by another profile before this draft publishes
+  // its own stored id/state.
+  const profile = normalizeProfileKey($activeGatewayProfile.get())
+  const identity = $focusedSessionIdentityKey.get()
+
+  return { identity, profile, runtimeId }
+}
+
+function eventBelongsToOwner(event: RpcEvent, owner: PreviewOwner): boolean {
+  // Gateway boot/registry stamps every real socket event with its source
+  // profile. A profileless event has only a pooled runtime id and therefore
+  // cannot establish ownership safely.
+  if (event.session_id !== owner.runtimeId || !event.profile) {
+    return false
+  }
+
+  if (normalizeProfileKey(event.profile) !== owner.profile) {
+    return false
+  }
+
+  return true
+}
+
+function ownerStillFocused(owner: PreviewOwner): boolean {
+  const current = focusedPreviewOwner()
+
+  return owner.identity
+    ? current?.identity === owner.identity
+    : current?.runtimeId === owner.runtimeId && current.profile === owner.profile
 }
 
 export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestGateway }: PreviewRoutingOptions) {
@@ -60,6 +108,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
   const handleDesktopGatewayEvent = useCallback<EventHandler>(
     event => {
       baseHandleGatewayEvent(event)
+      const owner = focusedPreviewOwner()
 
       if (event.type === 'preview.open') {
         // Agent-driven open in response to an explicit user request ("show
@@ -72,9 +121,9 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         const { url, label } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
 
-        if (target && (!event.session_id || event.session_id === $focusedRuntimeId.get())) {
+        if (target && owner && eventBelongsToOwner(event, owner)) {
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(resolved => {
-            if (resolved) {
+            if (resolved && ownerStillFocused(owner)) {
               const trimmedLabel = typeof label === 'string' ? label.trim() : ''
               openPreview(trimmedLabel ? { ...resolved, label: trimmedLabel } : resolved, 'tool-result')
             }
@@ -98,7 +147,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         }
       }
 
-      if (event.session_id && event.session_id !== $focusedRuntimeId.get()) {
+      if (!owner || !eventBelongsToOwner(event, owner)) {
         return
       }
 

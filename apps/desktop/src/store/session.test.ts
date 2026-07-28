@@ -2,19 +2,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import type { SessionInfo } from '@/types/hermes'
 
+import { clearSessionDraft, migrateSessionDraft, stashSessionDraft, takeSessionDraft } from './composer'
+import { clearQueuedPrompts, enqueueQueuedPrompt, getQueuedPrompts, migrateQueuedPrompts } from './composer-queue'
 import {
   $activeSessionId,
   $connection,
   $currentCwd,
-  $selectedStoredSessionId,
   $unreadFinishedSessionIds,
   applyConfiguredDefaultProjectDir,
   getRememberedSessionId,
   mergeSessionPage,
   rememberedSessionProfile,
+  resolveComposerMigrationKeys,
   resolveComposerSessionKey,
+  resolveSessionPinId,
   sessionPinId,
   setCurrentCwd,
   setRememberedSessionId,
@@ -27,6 +31,8 @@ import {
   getRecentlySettledSessionIds,
   publishSessionState
 } from './session-states'
+
+const identity = (storedSessionId: string) => sessionIdentityKey(storedSessionId, 'default')
 
 const session = (over: Partial<SessionInfo>): SessionInfo => ({
   archived: false,
@@ -60,12 +66,12 @@ describe('computed $attentionSessionIds', () => {
     publishSessionState('rt1', { ...createClientSessionState('s1'), needsInput: true })
     publishSessionState('rt2', { ...createClientSessionState('s2'), needsInput: false })
 
-    expect($attentionSessionIds.get()).toEqual(['s1'])
+    expect($attentionSessionIds.get()).toEqual([identity('s1')])
   })
 
   it('updates when needsInput changes', () => {
     publishSessionState('rt1', { ...createClientSessionState('s1'), needsInput: true })
-    expect($attentionSessionIds.get()).toEqual(['s1'])
+    expect($attentionSessionIds.get()).toEqual([identity('s1')])
 
     publishSessionState('rt1', { ...createClientSessionState('s1'), needsInput: false })
     expect($attentionSessionIds.get()).toEqual([])
@@ -79,13 +85,19 @@ describe('computed $attentionSessionIds', () => {
 
 describe('sessionPinId', () => {
   it('uses the live id when there is no compression lineage', () => {
-    expect(sessionPinId(session({ id: 'abc' }))).toBe('abc')
+    expect(sessionPinId(session({ id: 'abc' }))).toBe(sessionIdentityKey('abc', 'default'))
   })
 
   it('uses the lineage root so a pin survives compression', () => {
     // After auto-compression the entry surfaces under a fresh tip id but keeps
     // the original root — pinning on the root keeps the pin stable.
-    expect(sessionPinId(session({ id: 'tip', _lineage_root_id: 'root' }))).toBe('root')
+    expect(sessionPinId(session({ id: 'tip', _lineage_root_id: 'root' }))).toBe(
+      sessionIdentityKey('root', 'default')
+    )
+  })
+
+  it('qualifies an unloaded-row fallback with its owning profile', () => {
+    expect(resolveSessionPinId(null, 'shared', 'beta')).toBe(sessionIdentityKey('shared', 'beta'))
   })
 })
 
@@ -101,6 +113,73 @@ describe('resolveComposerSessionKey', () => {
 
   it('falls back to the live id when the tip row is not loaded yet', () => {
     expect(resolveComposerSessionKey('tip-new', [])).toBe('tip-new')
+  })
+
+  it('qualifies the durable composer key by owning profile', () => {
+    const sessions = [
+      session({ id: 'alpha-tip', _lineage_root_id: 'shared', profile: 'alpha' }),
+      session({ id: 'beta-tip', _lineage_root_id: 'shared', profile: 'beta' })
+    ]
+
+    expect(resolveComposerSessionKey('shared', sessions, 'alpha')).toBe(sessionIdentityKey('shared', 'alpha'))
+    expect(resolveComposerSessionKey('shared', sessions, 'beta')).toBe(sessionIdentityKey('shared', 'beta'))
+  })
+})
+
+describe('resolveComposerMigrationKeys', () => {
+  it('returns the raw legacy lineage key for an owned default-profile compression tip', () => {
+    const sessions = [session({ id: 'tip', _lineage_root_id: 'root', profile: 'default' })]
+
+    expect(resolveComposerMigrationKeys('tip', sessions, 'default')).toEqual({
+      legacyLineageKey: 'root',
+      selectedIdentity: sessionIdentityKey('tip', 'default')
+    })
+  })
+
+  it('migrates a legacy draft while preserving decoded queue state already on the compound destination', () => {
+    const sessions = [
+      session({ id: 'tip', _lineage_root_id: 'alpha-root', profile: 'alpha' }),
+      session({ id: 'tip', _lineage_root_id: 'root', profile: 'default' })
+    ]
+
+    const destination = resolveComposerSessionKey('tip', sessions, 'default')
+    const { legacyLineageKey } = resolveComposerMigrationKeys('tip', sessions, 'default')
+    const legacyQueueIdentity = sessionIdentityKey('root', 'default')
+
+    clearSessionDraft('root')
+    clearSessionDraft(destination)
+    clearQueuedPrompts(legacyQueueIdentity)
+    clearQueuedPrompts(destination)
+    stashSessionDraft('root', 'legacy draft', [])
+    enqueueQueuedPrompt(legacyQueueIdentity, { attachments: [], text: 'legacy queued prompt' })
+
+    expect(migrateSessionDraft(legacyLineageKey, destination)).toBe(true)
+    expect(migrateQueuedPrompts(legacyQueueIdentity, destination)).toBe(false)
+    expect(takeSessionDraft('root').text).toBe('')
+    expect(takeSessionDraft(destination).text).toBe('legacy draft')
+    expect(getQueuedPrompts(destination).map(entry => entry.text)).toEqual(['legacy queued prompt'])
+
+    clearSessionDraft(destination)
+    clearQueuedPrompts(destination)
+  })
+
+  it('does not derive a default-profile legacy key from a colliding non-default row', () => {
+    const sessions = [session({ id: 'shared', _lineage_root_id: 'alpha-root', profile: 'alpha' })]
+    const defaultShared = sessionIdentityKey('shared', 'default')
+
+    expect(resolveComposerMigrationKeys('shared', sessions, 'default')).toEqual({
+      legacyLineageKey: null,
+      selectedIdentity: defaultShared
+    })
+  })
+
+  it('never exposes a raw legacy lineage key to a non-default profile', () => {
+    const sessions = [session({ id: 'tip', _lineage_root_id: 'root', profile: 'beta' })]
+
+    expect(resolveComposerMigrationKeys('tip', sessions, 'beta')).toEqual({
+      legacyLineageKey: null,
+      selectedIdentity: sessionIdentityKey('tip', 'beta')
+    })
   })
 })
 
@@ -287,14 +366,14 @@ describe('getRecentlySettledSessionIds', () => {
     // clearAllSessionStates also drops settle-grace entries + watchdog timers,
     // so nothing leaks in from a previous test.
     clearAllSessionStates()
-    $selectedStoredSessionId.set(null)
+    setSelectedStoredSessionId(null)
     $unreadFinishedSessionIds.set([])
   })
 
   afterEach(() => {
     vi.useRealTimers()
     clearAllSessionStates()
-    $selectedStoredSessionId.set(null)
+    setSelectedStoredSessionId(null)
     $unreadFinishedSessionIds.set([])
   })
 
@@ -306,11 +385,11 @@ describe('getRecentlySettledSessionIds', () => {
     const idle = { ...working, busy: false }
     publishSessionState('rt1', idle)
 
-    expect(getRecentlySettledSessionIds()).toEqual(['s1'])
+    expect(getRecentlySettledSessionIds()).toEqual([identity('s1')])
 
     // Still inside the window.
     vi.setSystemTime(29_000)
-    expect(getRecentlySettledSessionIds()).toEqual(['s1'])
+    expect(getRecentlySettledSessionIds()).toEqual([identity('s1')])
 
     // Past the window: the entry is pruned on read.
     vi.setSystemTime(31_000)
@@ -330,7 +409,7 @@ describe('getRecentlySettledSessionIds', () => {
     const idle = { ...working, busy: false }
     publishSessionState('rt1', idle)
 
-    expect(getRecentlySettledSessionIds()).toEqual(['s2'])
+    expect(getRecentlySettledSessionIds()).toEqual([identity('s2')])
 
     // A new turn for the same session is "working" again — drop it from the
     // settled set so it's tracked as working, not recently-finished.
@@ -345,17 +424,17 @@ describe('unread finished sessions', () => {
   beforeEach(() => {
     clearAllSessionStates()
     $unreadFinishedSessionIds.set([])
-    $selectedStoredSessionId.set(null)
+    setSelectedStoredSessionId(null)
   })
 
   afterEach(() => {
     clearAllSessionStates()
     $unreadFinishedSessionIds.set([])
-    $selectedStoredSessionId.set(null)
+    setSelectedStoredSessionId(null)
   })
 
   it('marks a session unread when its turn finishes in the background', () => {
-    $selectedStoredSessionId.set('other-session')
+    setSelectedStoredSessionId('other-session')
 
     const working = makeState({ busy: true, storedSessionId: 's1' })
     publishSessionState('rt1', working)
@@ -363,11 +442,11 @@ describe('unread finished sessions', () => {
     const idle = { ...working, busy: false }
     publishSessionState('rt1', idle)
 
-    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+    expect($unreadFinishedSessionIds.get()).toEqual([identity('s1')])
   })
 
   it('does NOT mark unread when the finishing session is the active one', () => {
-    $selectedStoredSessionId.set('s1')
+    setSelectedStoredSessionId('s1')
 
     const working = makeState({ busy: true, storedSessionId: 's1' })
     publishSessionState('rt1', working)
@@ -379,7 +458,7 @@ describe('unread finished sessions', () => {
   })
 
   it('does NOT mark unread on idle→idle re-asserts (no prior working state)', () => {
-    $selectedStoredSessionId.set('other-session')
+    setSelectedStoredSessionId('other-session')
 
     const idle = makeState({ busy: false, storedSessionId: 's1' })
     publishSessionState('rt1', idle)
@@ -388,7 +467,7 @@ describe('unread finished sessions', () => {
   })
 
   it('clears unread when the user opens the session', () => {
-    $selectedStoredSessionId.set('other')
+    setSelectedStoredSessionId('other')
 
     const working = makeState({ busy: true, storedSessionId: 's1' })
     publishSessionState('rt1', working)
@@ -396,7 +475,7 @@ describe('unread finished sessions', () => {
     const idle = { ...working, busy: false }
     publishSessionState('rt1', idle)
 
-    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+    expect($unreadFinishedSessionIds.get()).toEqual([identity('s1')])
 
     setSelectedStoredSessionId('s1')
     expect($unreadFinishedSessionIds.get()).toEqual([])
@@ -455,6 +534,15 @@ describe('rememberedSessionProfile', () => {
     const sessions = [session({ _lineage_root_id: 'root-1', id: 'tip-2', profile: 'work' })]
 
     expect(rememberedSessionProfile(sessions, 'root-1', 'default')).toBe('work')
+  })
+
+  it('uses the routed profile when stored ids collide', () => {
+    const sessions = [
+      session({ id: 'shared', profile: 'alpha' }),
+      session({ id: 'shared', profile: 'beta' })
+    ]
+
+    expect(rememberedSessionProfile(sessions, 'shared', 'beta')).toBe('beta')
   })
 
   it('falls back to the active profile for a session not yet in the list', () => {

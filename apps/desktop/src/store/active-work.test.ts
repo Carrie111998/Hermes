@@ -8,10 +8,11 @@ import { clearAllSessionStates, publishSessionState } from './session-states'
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 const setActiveWork = vi.fn()
 
-const busy = (storedSessionId: string, isBusy: boolean) =>
-  ({ busy: isBusy, needsInput: false, storedSessionId }) as ClientSessionState
+const busy = (storedSessionId: string, isBusy: boolean, storedSessionProfile = 'default') =>
+  ({ busy: isBusy, needsInput: false, storedSessionId, storedSessionProfile }) as ClientSessionState
 
-const session = (id: string, title: null | string) => ({ id, title }) as (typeof $sessions.value)[number]
+const session = (id: string, title: null | string, profile = 'default') =>
+  ({ id, profile, title }) as (typeof $sessions.value)[number]
 
 beforeAll(async () => {
   desktopWindow.hermesDesktop = { setActiveWork } as unknown as Window['hermesDesktop']
@@ -38,6 +39,13 @@ describe('active work bridge', () => {
     publishSessionState('runtime-1', busy('s1', true))
 
     expect(setActiveWork).toHaveBeenLastCalledWith({ count: 1, titles: [] })
+  })
+
+  it('reports the title from the exact owner when stored ids collide', () => {
+    $sessions.set([session('shared', 'Alpha task', 'alpha'), session('shared', 'Beta task', 'beta')])
+    publishSessionState('runtime-beta', busy('shared', true, 'beta'))
+
+    expect(setActiveWork).toHaveBeenLastCalledWith({ count: 1, titles: ['Beta task'] })
   })
 
   it('drops back to nothing when the turn ends', () => {

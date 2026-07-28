@@ -33,20 +33,46 @@ const row = (over: Partial<SessionInfo>): SessionInfo =>
     ...over
   }) as SessionInfo
 
-function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
+function renderTile(
+  requestGateway: ReturnType<typeof vi.fn>,
+  actions: {
+    archiveSession?: (storedSessionId: string, profile?: null | string) => Promise<unknown>
+    branchStoredSession?: (storedSessionId: string, profile?: null | string) => Promise<unknown>
+    removeSession?: (storedSessionId: string, profile?: null | string) => Promise<unknown>
+  } = {},
+  requestGatewayForProfile?: ReturnType<typeof vi.fn>
+) {
   renderHook(() =>
     useSessionTileDelegate({
-      archiveSession: vi.fn(async () => undefined),
-      branchStoredSession: vi.fn(async () => undefined),
+      archiveSession: actions.archiveSession ?? vi.fn(async () => undefined),
+      branchStoredSession: actions.branchStoredSession ?? vi.fn(async () => undefined),
       executeSlashCommand: vi.fn(async () => undefined) as never,
-      removeSession: vi.fn(async () => undefined),
+      removeSession: actions.removeSession ?? vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
+      requestGatewayForProfile: requestGatewayForProfile as never,
       runtimeIdByStoredSessionIdRef: { current: new Map() },
       sessionStateByRuntimeIdRef: { current: new Map() },
       updateSessionState: vi.fn()
     })
   )
 }
+
+describe('useSessionTileDelegate owned actions', () => {
+  it('forwards the tab owner instead of substituting the active profile', async () => {
+    const archiveSession = vi.fn(async () => undefined)
+    const branchStoredSession = vi.fn(async () => undefined)
+    const removeSession = vi.fn(async () => undefined)
+
+    renderTile(vi.fn(), { archiveSession, branchStoredSession, removeSession })
+    await sessionTileDelegate()!.archiveSession('shared', 'alpha')
+    await sessionTileDelegate()!.branchSession('shared', 'alpha')
+    await sessionTileDelegate()!.deleteSession('shared', 'alpha')
+
+    expect(archiveSession).toHaveBeenCalledWith('shared', 'alpha')
+    expect(branchStoredSession).toHaveBeenCalledWith('shared', 'alpha')
+    expect(removeSession).toHaveBeenCalledWith('shared', 'alpha')
+  })
+})
 
 describe('useSessionTileDelegate resumeTile', () => {
   beforeEach(() => {
@@ -70,7 +96,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     )
 
     renderTile(requestGateway)
-    const runtimeId = await sessionTileDelegate()!.resumeTile('stored-x')
+    const runtimeId = await sessionTileDelegate()!.resumeTile('stored-x', 'ai-engineer')
 
     expect(runtimeId).toBe('runtime-1')
     expect(getSessionMessages).toHaveBeenCalledWith('stored-x', 'ai-engineer')
@@ -89,12 +115,57 @@ describe('useSessionTileDelegate resumeTile', () => {
     )
 
     renderTile(requestGateway)
-    await sessionTileDelegate()!.resumeTile('stored-y')
+    await sessionTileDelegate()!.resumeTile('stored-y', 'default')
 
     expect(requestGateway).toHaveBeenCalledWith('session.resume', {
       session_id: 'stored-y',
       cols: 96,
       profile: 'default'
     })
+  })
+
+  it('uses the tile bucket owner instead of a sole colliding cache row', async () => {
+    setSessions([row({ id: 'shared', profile: 'alpha' })])
+
+    const requestGateway = vi.fn(async (method: string) =>
+      method === 'session.resume' ? ({ session_id: 'runtime-beta' } as never) : ({} as never)
+    )
+
+    renderTile(requestGateway)
+    await sessionTileDelegate()!.resumeTile('shared', 'beta')
+
+    expect(getSessionMessages).toHaveBeenCalledWith('shared', 'beta')
+    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      session_id: 'shared',
+      cols: 96,
+      profile: 'beta'
+    })
+  })
+
+  it('resumes and submits through the captured owner gateway', async () => {
+    const requestGateway = vi.fn(async () => ({} as never))
+
+    const requestGatewayForProfile = vi.fn(async (_profile: string, method: string) =>
+      (method === 'session.resume' ? { session_id: 'runtime-alpha' } : {}) as never
+    )
+
+    renderTile(requestGateway, {}, requestGatewayForProfile)
+
+    const runtimeId = await sessionTileDelegate()!.resumeTile('shared', 'alpha')
+    await sessionTileDelegate()!.submitToSession(runtimeId, 'owned prompt', 'alpha')
+
+    expect(requestGatewayForProfile).toHaveBeenNthCalledWith(1, 'alpha', 'session.resume', {
+      session_id: 'shared',
+      cols: 96,
+      profile: 'alpha'
+    })
+    expect(requestGatewayForProfile).toHaveBeenNthCalledWith(
+      2,
+      'alpha',
+      'prompt.submit',
+      { session_id: 'runtime-alpha', text: 'owned prompt' },
+      1_800_000
+    )
+    expect(requestGateway).not.toHaveBeenCalled()
   })
 })

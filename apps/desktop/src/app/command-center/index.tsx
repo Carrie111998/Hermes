@@ -25,6 +25,7 @@ import {
   Wrench
 } from '@/lib/icons'
 import { exportSession } from '@/lib/session-export'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { fmtDateTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
@@ -51,10 +52,10 @@ type UsagePeriod = (typeof USAGE_PERIODS)[number]
 interface CommandCenterViewProps {
   initialSection?: CommandCenterSection
   onClose: () => void
-  onDeleteSession: (sessionId: string) => Promise<void>
+  onDeleteSession: (sessionId: string, profile?: null | string) => Promise<void>
   // Accepted for call-site parity; navigation lives in the global Cmd+K palette.
   onNavigateRoute?: (path: string) => void
-  onOpenSession: (sessionId: string) => void
+  onOpenSession: (sessionId: string, profile?: null | string) => void
 }
 
 function formatTimestamp(value?: number | null): string {
@@ -355,10 +356,13 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
                     const pinned = pinnedSessionIds.includes(pinId)
 
                     return (
-                      <li className="group flex items-center gap-2 py-2" key={session.id}>
+                      <li
+                        className="group flex items-center gap-2 py-2"
+                        key={sessionIdentityKey(session.id, session.profile)}
+                      >
                         <button
                           className="min-w-0 flex-1 text-left"
-                          onClick={() => onOpenSession(session.id)}
+                          onClick={() => onOpenSession(session.id, session.profile)}
                           type="button"
                         >
                           <div className="truncate text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
@@ -383,7 +387,7 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
                           </RowIconButton>
                           <RowIconButton
                             className="hover:text-destructive"
-                            onClick={() => void onDeleteSession(session.id)}
+                            onClick={() => void onDeleteSession(session.id, session.profile)}
                             title={cc.deleteSession}
                           >
                             <Trash2 className="size-3.5" />

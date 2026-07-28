@@ -1,4 +1,6 @@
-import { isNewChatRoute, routeSessionId } from '../../routes'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
+
+import { isNewChatRoute, routeSessionId, routeSessionProfile } from '../../routes'
 
 /**
  * The chat a route token points at: the stored/routed session id, `'__new__'`
@@ -7,6 +9,21 @@ import { isNewChatRoute, routeSessionId } from '../../routes'
  * rather than their raw string.
  */
 export type RouteTarget = string | null
+
+function routeTokenParts(token: string): { pathname: string; search: string } {
+  const firstSeparator = token.indexOf(':')
+
+  if (firstSeparator === -1) {
+    return { pathname: token, search: '' }
+  }
+
+  const secondSeparator = token.indexOf(':', firstSeparator + 1)
+
+  return {
+    pathname: token.slice(0, firstSeparator),
+    search: secondSeparator === -1 ? token.slice(firstSeparator + 1) : token.slice(firstSeparator + 1, secondSeparator)
+  }
+}
 
 /**
  * Reduce a route token to the chat it targets. The token is
@@ -18,10 +35,34 @@ export type RouteTarget = string | null
  * id arrives as %3A, and the app's other routes are literal colon-free paths).
  */
 export function routeTargetFromToken(token: string): RouteTarget {
-  const separator = token.indexOf(':')
-  const pathname = separator === -1 ? token : token.slice(0, separator)
+  const { pathname } = routeTokenParts(token)
 
   return routeSessionId(pathname) ?? (isNewChatRoute(pathname) ? '__new__' : null)
+}
+
+function routeIdentityFromToken(token: string, fallbackProfile?: null | string): RouteTarget {
+  const { pathname, search } = routeTokenParts(token)
+  const storedSessionId = routeSessionId(pathname)
+
+  if (storedSessionId) {
+    return sessionIdentityKey(storedSessionId, routeSessionProfile(search) ?? fallbackProfile)
+  }
+
+  return isNewChatRoute(pathname) ? '__new__' : null
+}
+
+function selectionIdentity(storedSessionId: string | null, profile?: null | string): string | null {
+  return storedSessionId === null ? null : sessionIdentityKey(storedSessionId, profile)
+}
+
+function describeTarget(target: RouteTarget): string {
+  if (!target || target === '__new__') {
+    return String(target)
+  }
+
+  const { profile, storedSessionId } = parseSessionIdentityKey(target)
+
+  return profile === 'default' ? storedSessionId : `${profile}/${storedSessionId}`
 }
 
 interface SessionContextDriftArgs {
@@ -29,6 +70,8 @@ interface SessionContextDriftArgs {
   nowRouteToken: string
   startSelectedStoredId: string | null
   nowSelectedStoredId: string | null
+  startSelectedProfile?: null | string
+  nowSelectedProfile?: null | string
   /**
    * The stored session this submit is bound to, when known. Drift ignores a
    * move *to* this id: the submit pipeline itself re-homes selection and route
@@ -37,18 +80,19 @@ interface SessionContextDriftArgs {
    * a real chat as drift.
    */
   submitTargetStoredId?: string | null
+  submitTargetProfile?: null | string
   /**
-   * The composer scope that was actually loaded when the text was submitted
-   * (SubmitTextOptions.composerScope). The composer and the session-side refs
-   * live in separate React subtrees and can each be internally consistent yet
-   * still disagree with each other at the instant of send — this prong catches
-   * that cross-component drift (#59305). Omit for non-composer submits.
+   * The compound durable identity that the composer had loaded when the text
+   * was submitted (SubmitTextOptions.composerScope). The composer and the
+   * session-side refs live in separate React subtrees and can each be internally
+   * consistent yet still disagree at send time — this catches that drift
+   * (#59305). Omit for non-composer submits.
    */
   composerScope?: string | null
   /**
-   * resolveComposerSessionKey(submitTargetStoredId, sessions) — the durable
-   * lineage-root form of the submit target, in the SAME domain as
-   * composerScope. Compared against composerScope instead of the raw
+   * resolveComposerSessionKey(submitTargetStoredId, sessions, profile) — the
+   * compound durable lineage-root identity of the submit target, in the SAME
+   * domain as composerScope. Compared against composerScope instead of the raw
    * submitTargetStoredId: the composer keys drafts/attachments on the lineage
    * root (stable across auto-compression tip rotation) while
    * submitTargetStoredId tracks the live tip — comparing composerScope
@@ -75,7 +119,10 @@ export function sessionContextDrift({
   nowRouteToken,
   startSelectedStoredId,
   nowSelectedStoredId,
+  startSelectedProfile,
+  nowSelectedProfile,
   submitTargetStoredId,
+  submitTargetProfile,
   composerScope,
   submitTargetComposerScope
 }: SessionContextDriftArgs): string | null {
@@ -87,29 +134,29 @@ export function sessionContextDrift({
   // submitTargetStoredId (live tip) — see the field doc on
   // SessionContextDriftArgs for why those two must not be conflated.
   if (composerScope !== undefined && composerScope !== null && composerScope !== submitTargetComposerScope) {
-    return `composer:${composerScope}->${submitTargetComposerScope}`
+    return `composer:${describeTarget(composerScope)}->${describeTarget(submitTargetComposerScope ?? null)}`
   }
 
-  const targetStart = routeTargetFromToken(startRouteToken)
-  const targetNow = routeTargetFromToken(nowRouteToken)
+  const targetStart = routeIdentityFromToken(startRouteToken, startSelectedProfile)
+  const targetNow = routeIdentityFromToken(nowRouteToken, nowSelectedProfile)
+  const submitTarget = selectionIdentity(submitTargetStoredId ?? null, submitTargetProfile)
 
   // Route prong: the routed chat moved to a different, real chat. A null target
   // (navigated to settings / a non-chat overlay route) or a search/hash-only
   // change (same target) is not drift, and neither is landing on the submit's
   // own target.
-  if (targetNow !== targetStart && targetNow !== null && targetNow !== submitTargetStoredId) {
-    return `route:${targetStart}->${targetNow}`
+  if (targetNow !== targetStart && targetNow !== null && targetNow !== submitTarget) {
+    return `route:${describeTarget(targetStart)}->${describeTarget(targetNow)}`
   }
 
   // Selection prong: selection moved to a different, real stored session. A
   // null-reset (nowSelectedStoredId === null) or a move onto the submit's own
   // target is not drift.
-  if (
-    nowSelectedStoredId !== null &&
-    nowSelectedStoredId !== startSelectedStoredId &&
-    nowSelectedStoredId !== submitTargetStoredId
-  ) {
-    return `selection:${startSelectedStoredId}->${nowSelectedStoredId}`
+  const selectedStart = selectionIdentity(startSelectedStoredId, startSelectedProfile)
+  const selectedNow = selectionIdentity(nowSelectedStoredId, nowSelectedProfile)
+
+  if (selectedNow !== null && selectedNow !== selectedStart && selectedNow !== submitTarget) {
+    return `selection:${describeTarget(selectedStart)}->${describeTarget(selectedNow)}`
   }
 
   return null

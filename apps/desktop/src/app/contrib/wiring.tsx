@@ -26,6 +26,7 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { normalizeProfileKey, parseSessionIdentityKey, sessionMatchesIdentity } from '@/lib/session-identity'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -45,10 +46,10 @@ import {
   $messagingSessions,
   $resumeExhaustedSessionId,
   $resumeFailedSessionId,
+  $selectedSessionIdentityKey,
   $selectedStoredSessionId,
   $sessions,
-  sessionMatchesStoredId,
-  sessionPinId,
+  resolveSessionPinId,
   setAwaitingResponse,
   setBusy,
   setMessages
@@ -72,7 +73,14 @@ import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
 import { closeAllTerminals } from '../right-sidebar/terminal/terminals'
-import { CRON_ROUTE, navigateToWorkspacePage, routeSessionId, SETTINGS_ROUTE, syncWorkspaceRoute } from '../routes'
+import {
+  CRON_ROUTE,
+  navigateToWorkspacePage,
+  routeSessionId,
+  routeSessionProfile,
+  SETTINGS_ROUTE,
+  syncWorkspaceRoute
+} from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
@@ -156,24 +164,30 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const freshDraftReady = useStore($freshDraftReady)
   const resumeFailedSessionId = useStore($resumeFailedSessionId)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
+  const selectedSessionIdentityKey = useStore($selectedSessionIdentityKey)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const messagingSessions = useStore($messagingSessions)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
 
   const routedSessionId = routeSessionId(location.pathname)
+  const routedSessionProfile = routeSessionProfile(location.search)
   const routedSessionIdRef = useRef(routedSessionId)
+  const routedSessionProfileRef = useRef(routedSessionProfile)
 
   routedSessionIdRef.current = routedSessionId
+  routedSessionProfileRef.current = routedSessionProfile
   const routeToken = `${location.pathname}:${location.search}:${location.hash}`
   const routeTokenRef = useRef(routeToken)
   routeTokenRef.current = routeToken
   const getRouteToken = useCallback(() => routeTokenRef.current, [])
 
   const getRoutedStoredSessionId = useCallback(() => routedSessionIdRef.current, [])
+  const getRoutedStoredSessionProfile = useCallback(() => routedSessionProfileRef.current, [])
 
   const clearRoutedSessionIntent = useCallback(() => {
     routedSessionIdRef.current = null
+    routedSessionProfileRef.current = null
   }, [])
 
   // Point the workspace at the route: the pane contribution re-registers
@@ -222,7 +236,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     setMessages
   })
 
-  const { connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
+  const { connectionRef, gateway, gatewayRef, requestGateway, requestGatewayForProfile } = useGatewayRequest()
 
   const {
     loadMoreMessagingForPlatform,
@@ -303,7 +317,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         return
       }
 
-      const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
+      const selectedIdentity = parseSessionIdentityKey($selectedSessionIdentityKey.get() ?? '')
+
+      const storedProfile =
+        (selectedIdentity.storedSessionId === storedSessionId ? selectedIdentity.profile : null) ??
+        sessionStateByRuntimeIdRef.current.get(runtimeSessionId)?.storedSessionProfile ??
+        activeGatewayProfile
 
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
@@ -333,7 +352,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         }
       }
     },
-    [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
+    [activeGatewayProfile, activeSessionIdRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef, updateSessionState]
   )
 
   // Refresh the open messaging transcript (inbound platform turns arrive via
@@ -347,7 +366,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
-    const stored = $messagingSessions.get().find(s => sessionMatchesStoredId(s, storedSessionId))
+    const selectedIdentity = parseSessionIdentityKey($selectedSessionIdentityKey.get() ?? '')
+
+    const stored = $messagingSessions
+      .get()
+      .find(s => sessionMatchesIdentity(s, storedSessionId, selectedIdentity.profile || activeGatewayProfile))
 
     if (!stored || !isMessagingSource(stored.source)) {
       return
@@ -373,7 +396,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     } catch {
       // Non-fatal: next poll or manual refresh can hydrate.
     }
-  }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
+  }, [activeGatewayProfile, activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
 
   const { handleGatewayEvent } = useMessageStream({
     activeGatewayProfile,
@@ -558,13 +581,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     busyRef,
     createBackendSessionForSend,
     getRoutedStoredSessionId,
+    getRoutedStoredSessionProfile,
     getRuntimeIdForStoredSession,
     getRouteToken,
     handleSkinCommand,
     openMemoryGraph: openStarmap,
     refreshSessions,
     requestGateway,
-    resumeStoredSession: resumeSession,
+    requestGatewayForProfile,
+    resumeStoredSession: (sessionId, profile) => resumeSession(sessionId, false, profile),
     selectedStoredSessionIdRef,
     startFreshSessionDraft,
     sttEnabled,
@@ -576,7 +601,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   useBackgroundQueueDrain({
     enabled: gatewayState === 'open',
     runtimeIdByStoredSessionIdRef,
-    selectedStoredSessionId,
+    selectedSessionIdentityKey,
     submitText
   })
 
@@ -588,6 +613,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     executeSlashCommand,
     removeSession,
     requestGateway,
+    requestGatewayForProfile,
     runtimeIdByStoredSessionIdRef,
     sessionStateByRuntimeIdRef,
     updateSessionState
@@ -640,6 +666,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   )
 
   useRouteResume({
+    activeGatewayProfile,
     activeSessionId,
     activeSessionIdRef,
     creatingSessionRef,
@@ -651,6 +678,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     resumeFailedSessionId,
     resumeExhaustedSessionId,
     routedSessionId,
+    routedSessionProfile,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
@@ -689,7 +717,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // live over the websocket already.
   const activeIsMessaging =
     !!selectedStoredSessionId &&
-    isMessagingSource(messagingSessions.find(s => sessionMatchesStoredId(s, selectedStoredSessionId))?.source)
+    isMessagingSource(
+      messagingSessions.find(s => sessionMatchesIdentity(s, selectedStoredSessionId, activeGatewayProfile))?.source
+    )
 
   // Keep app data live while the gateway is open (on-connect reseed + the
   // cron / messaging / transcript visibility polls + fresh-draft reseed).
@@ -717,10 +747,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     chatOpen,
     hasPreview: Boolean(previewTarget),
     locationPathname: location.pathname,
+    locationSearch: location.search,
     navigate,
     refreshSessions,
     resumeExhaustedSessionId,
     routedSessionId,
+    routedSessionProfile,
     runtimeIdByStoredSessionId: runtimeIdByStoredSessionIdRef
   })
 
@@ -733,8 +765,16 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
-    const session = $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))
-    const pinId = session ? sessionPinId(session) : sessionId
+    const selectedIdentityKey = $selectedSessionIdentityKey.get()
+    const selectedIdentity = selectedIdentityKey ? parseSessionIdentityKey(selectedIdentityKey) : null
+
+    const session = selectedIdentity
+      ? $sessions
+          .get()
+          .find(s => sessionMatchesIdentity(s, selectedIdentity.storedSessionId, selectedIdentity.profile))
+      : undefined
+
+    const pinId = resolveSessionPinId(session, sessionId, selectedIdentity?.profile ?? $activeGatewayProfile.get())
 
     if ($pinnedSessionIds.get().includes(pinId)) {
       unpinSession(pinId)
@@ -778,20 +818,21 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    onArchiveSession: sessionId => void archiveSession(sessionId),
+    onArchiveSession: (sessionId, profile) => void archiveSession(sessionId, profile),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onBranchInNewChat: messageId => void branchInNewChat(messageId),
-    onBranchSession: sessionId => void branchStoredSession(sessionId),
+    onBranchSession: (sessionId, profile) => void branchStoredSession(sessionId, profile),
     onCancel: cancelRun,
     onDeleteSelectedSession: () => {
-      const id = $selectedStoredSessionId.get()
+      const identityKey = $selectedSessionIdentityKey.get()
 
-      if (id) {
-        void removeSession(id)
+      if (identityKey) {
+        const { profile, storedSessionId } = parseSessionIdentityKey(identityKey)
+        void removeSession(storedSessionId, profile)
       }
     },
-    onDeleteSession: sessionId => void removeSession(sessionId),
+    onDeleteSession: (sessionId, profile) => void removeSession(sessionId, profile),
     onDismissError: dismissError,
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
@@ -813,8 +854,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onRestoreToMessage: restoreToMessage,
     // Already on screen (open tile, or the main session)? Jump to its tab;
     // otherwise load it into main. Same door every other session link uses.
-    onResumeSession: sessionId => openSession(sessionId, navigate),
-    onRetryResume: sessionId => void resumeSession(sessionId, true),
+    onResumeSession: (sessionId, profile) => openSession(sessionId, navigate, 'in-place', profile),
+    onRetryResume: (sessionId, profile) => void resumeSession(sessionId, true, profile),
     onSteer: steerPrompt,
     onSubmit: submitText,
     onThreadMessagesChange: handleThreadMessagesChange,
@@ -950,7 +991,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         />
       )}
       <ModelPickerOverlay gateway={gateway || undefined} onSelect={selectModel} profile={activeGatewayProfile} />
-      <SessionPickerOverlay onResume={sessionId => openSession(sessionId, navigate)} />
+      <SessionPickerOverlay onResume={(sessionId, profile) => openSession(sessionId, navigate, 'in-place', profile)} />
       <ModelVisibilityOverlay
         gateway={gateway || undefined}
         onOpenProviders={openProviderSettings}
@@ -992,7 +1033,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             onClose={closeOverlayToPreviousRoute}
             onDeleteSession={removeSession}
             onNavigateRoute={path => navigateToWorkspacePage(navigate, path)}
-            onOpenSession={sessionId => openSession(sessionId, navigate)}
+            onOpenSession={(sessionId, profile) => openSession(sessionId, navigate, 'in-place', profile)}
           />
         </Suspense>
       )}
@@ -1007,7 +1048,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         <Suspense fallback={null}>
           <CronView
             onClose={closeOverlayToPreviousRoute}
-            onOpenSession={sessionId => openSession(sessionId, navigate)}
+            onOpenSession={(sessionId, profile) => openSession(sessionId, navigate, 'in-place', profile)}
           />
         </Suspense>
       )}

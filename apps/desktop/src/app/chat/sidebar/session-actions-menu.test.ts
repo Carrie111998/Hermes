@@ -1,9 +1,10 @@
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 
-import { renameSessionPreferringRpc } from './session-actions-menu'
+import { renameSessionPreferringRpc, updateRenamedSessionTitle } from './session-actions-menu'
 
 // The branched-session rename bug: a freshly branched session lives only in the
 // gateway's runtime _sessions map (no state.db row yet), so REST PATCH
@@ -51,6 +52,7 @@ afterEach(() => {
   request.mockClear()
   activeGateway.mockReset()
   activeGateway.mockReturnValue({ request })
+  $activeGatewayProfile.set('default')
   $activeSessionId.set(null)
   $selectedStoredSessionId.set(null)
 })
@@ -70,6 +72,7 @@ describe('renameSessionPreferringRpc', () => {
   it('falls back to REST when the RPC fails (e.g. socket mid-reconnect)', async () => {
     $selectedStoredSessionId.set(STORED_ID)
     $activeSessionId.set(RUNTIME_ID)
+    $activeGatewayProfile.set('work')
     request.mockRejectedValueOnce(new Error('not connected'))
 
     const result = await renameSessionPreferringRpc(STORED_ID, 'My branch', 'work')
@@ -77,6 +80,16 @@ describe('renameSessionPreferringRpc', () => {
     expect(request).toHaveBeenCalledOnce()
     expect(renameSession).toHaveBeenCalledWith(STORED_ID, 'My branch', 'work')
     expect(result.title).toBe('rest-title')
+  })
+
+  it('uses REST when another profile owns the same stored session id', async () => {
+    $selectedStoredSessionId.set(STORED_ID)
+    $activeSessionId.set(RUNTIME_ID)
+
+    await renameSessionPreferringRpc(STORED_ID, 'Other profile', 'work')
+
+    expect(request).not.toHaveBeenCalled()
+    expect(renameSession).toHaveBeenCalledWith(STORED_ID, 'Other profile', 'work')
   })
 
   it('uses REST for a non-active row (background/persisted session)', async () => {
@@ -108,5 +121,19 @@ describe('renameSessionPreferringRpc', () => {
 
     expect(request).not.toHaveBeenCalled()
     expect(renameSession).toHaveBeenCalledWith(STORED_ID, 'My branch', undefined)
+  })
+})
+
+describe('updateRenamedSessionTitle', () => {
+  it('updates only the owning profile when stored session ids collide', () => {
+    const sessions = [
+      { id: 'shared', profile: 'alpha', title: 'Alpha title' },
+      { id: 'shared', profile: 'beta', title: 'Beta title' }
+    ]
+
+    expect(updateRenamedSessionTitle(sessions, 'shared', 'alpha', 'Renamed alpha')).toEqual([
+      { id: 'shared', profile: 'alpha', title: 'Renamed alpha' },
+      { id: 'shared', profile: 'beta', title: 'Beta title' }
+    ])
   })
 })

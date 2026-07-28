@@ -43,6 +43,7 @@ export function ArtifactCard({ code, detection, streaming = false }: ArtifactCar
   const view = useSessionView()
   const runtimeId = useStore(view.$runtimeId)
   const storedId = useStore(view.$storedId)
+  const profile = useStore(view.$profile)
   const registry = useStore($artifactRegistry)
   const sessionId = storedId || runtimeId || ''
 
@@ -53,20 +54,20 @@ export function ArtifactCard({ code, detection, streaming = false }: ArtifactCar
   // replays are no-ops.
   useEffect(() => {
     if (!streaming && sessionId && trimmed) {
-      upsertArtifact(sessionId, detection, trimmed)
+      upsertArtifact(sessionId, detection, trimmed, profile)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- detection derives from code
-  }, [detection.kind, detection.language, detection.title, sessionId, streaming, trimmed])
+  }, [detection.kind, detection.language, detection.title, profile, sessionId, streaming, trimmed])
 
   const record = useMemo(() => {
     void registry
 
-    const slugMatch = artifactsForSession(sessionId).find(
+    const slugMatch = artifactsForSession(sessionId, profile).find(
       candidate => candidate.kind === detection.kind && candidate.versions.some(v => v.content === trimmed)
     )
 
     return slugMatch ?? null
-  }, [detection.kind, registry, sessionId, trimmed])
+  }, [detection.kind, profile, registry, sessionId, trimmed])
 
   const lineCount = useMemo(() => trimmed.split('\n').length, [trimmed])
   const kindLabel = copy.kind[detection.kind]
@@ -80,7 +81,7 @@ export function ArtifactCard({ code, detection, streaming = false }: ArtifactCar
 
     // Ensure the registry row exists even if the completion effect hasn't
     // fired yet (e.g. clicked in the same frame the stream sealed).
-    const result = upsertArtifact(sessionId, detection, trimmed)
+    const result = upsertArtifact(sessionId, detection, trimmed, profile)
 
     if (!result) {
       return

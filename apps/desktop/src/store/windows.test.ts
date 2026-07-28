@@ -89,6 +89,16 @@ describe('openSessionInNewWindow', () => {
     expect(notifyError).not.toHaveBeenCalled()
   })
 
+  it('forwards the owning profile for cross-profile windows', async () => {
+    const open = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(open)
+
+    await openSessionInNewWindow('s1', { profile: 'ubuntu-server' })
+
+    expect(open).toHaveBeenCalledWith('s1', { profile: 'ubuntu-server' })
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
   it('notifies on an ok:false result', async () => {
     installBridge(vi.fn().mockResolvedValue({ ok: false, error: 'invalid-session-id' }))
 
@@ -149,6 +159,7 @@ describe('openNewWindow', () => {
     expect(openWindow).toHaveBeenCalledTimes(1)
     expect(notifyError).not.toHaveBeenCalled()
   })
+
 
   it('notifies on an ok:false result', async () => {
     installBridge(undefined, vi.fn().mockResolvedValue({ ok: false, error: 'nope' }))

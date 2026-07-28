@@ -27,13 +27,14 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
+import { sessionIdentityKey, sessionMatchesIdentity } from '@/lib/session-identity'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $activeSessionId,
   $selectedStoredSessionId,
   $sessions,
-  sessionMatchesStoredId,
   sessionPinId,
   setSessions
 } from '@/store/session'
@@ -64,7 +65,10 @@ export async function renameSessionPreferringRpc(
   title: string,
   profile?: string
 ): Promise<{ title?: string }> {
-  const isActiveRow = storedSessionId === $selectedStoredSessionId.get()
+  const isActiveRow =
+    storedSessionId === $selectedStoredSessionId.get() &&
+    normalizeProfileKey(profile) === normalizeProfileKey($activeGatewayProfile.get())
+
   const runtimeId = isActiveRow ? $activeSessionId.get() : null
   const gateway = activeGateway()
 
@@ -86,6 +90,16 @@ export async function renameSessionPreferringRpc(
   }
 
   return renameSession(storedSessionId, title, profile)
+}
+
+export function updateRenamedSessionTitle<
+  T extends { id: string; profile?: null | string; title?: null | string }
+>(sessions: T[], storedSessionId: string, profile: null | string | undefined, title: null | string): T[] {
+  const targetIdentity = sessionIdentityKey(storedSessionId, profile)
+
+  return sessions.map(session =>
+    sessionIdentityKey(session.id, session.profile) === targetIdentity ? { ...session, title } : session
+  )
 }
 
 interface SessionActions {
@@ -115,11 +129,11 @@ interface SessionActions {
 // component so only an OPEN submenu subscribes to the stores (not every row's
 // menu). Reads/writes the override keyed by the DURABLE id so a color survives
 // compression; clearing falls back to the inherited project color.
-function SessionColorSwatches({ sessionId }: { sessionId: string }) {
+function SessionColorSwatches({ profile, sessionId }: { profile?: string; sessionId: string }) {
   const { t } = useI18n()
   const overrides = useStore($sessionColorOverrides)
-  const session = useStore($sessions).find(s => sessionMatchesStoredId(s, sessionId))
-  const durableId = session ? sessionPinId(session) : sessionId
+  const session = useStore($sessions).find(s => sessionMatchesIdentity(s, sessionId, profile))
+  const durableId = session ? sessionPinId(session) : sessionIdentityKey(sessionId, profile)
 
   return (
     <ColorSwatches
@@ -151,10 +165,15 @@ function useSessionActions({
   const [renameOpen, setRenameOpen] = useState(false)
   const tiles = useStore($sessionTiles)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
-  const alreadyTabbed = sessionId === selectedStoredSessionId || tiles.some(tile => tile.storedSessionId === sessionId)
+  const belongsToActiveProfile = normalizeProfileKey(profile) === normalizeProfileKey(activeGatewayProfile)
+
+  const alreadyTabbed =
+    belongsToActiveProfile &&
+    (sessionId === selectedStoredSessionId || tiles.some(tile => tile.storedSessionId === sessionId))
 
   const spec = (partial: Omit<ActionItemSpec, 'onSelect'> & { onSelect: () => void }): ActionItemSpec => partial
 
@@ -172,7 +191,7 @@ function useSessionActions({
               // Stack into the MAIN zone as a tab (center dock; the strip
               // sticky-shows on gain) — the door to the tab bar. Focuses first
               // if the session is already on screen.
-              openSession(sessionId, () => undefined, 'tab')
+              openSession(sessionId, () => undefined, 'tab', profile)
             }
           })
         ]
@@ -185,7 +204,7 @@ function useSessionActions({
             label: r.newWindow,
             onSelect: () => {
               triggerHaptic('selection')
-              openSession(sessionId, () => undefined, 'window')
+              openSession(sessionId, () => undefined, 'window', profile)
             }
           })
         ]
@@ -327,7 +346,7 @@ function useSessionActions({
           <span>{t.sidebar.projects.menuAppearance}</span>
         </kit.SubTrigger>
         <kit.SubContent className="p-2">
-          <SessionColorSwatches sessionId={sessionId} />
+          <SessionColorSwatches profile={profile} sessionId={sessionId} />
         </kit.SubContent>
       </kit.Sub>
       <CopyButton
@@ -463,7 +482,7 @@ function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, prof
     try {
       const result = await renameSessionPreferringRpc(sessionId, next, profile)
       const finalTitle = result.title || next || ''
-      setSessions(prev => prev.map(s => (s.id === sessionId ? { ...s, title: finalTitle || null } : s)))
+      setSessions(prev => updateRenamedSessionTitle(prev, sessionId, profile, finalTitle || null))
       notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
       onOpenChange(false)
     } catch (err) {

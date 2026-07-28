@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { sessionIdentityKey } from '@/lib/session-identity'
 import type { SessionInfo } from '@/types/hermes'
 
 const patch = vi.fn<(id: string, pinned: boolean, profile?: null | string) => Promise<{ ok: boolean }>>(() =>
@@ -41,7 +42,7 @@ afterEach(() => {
 describe('watchSessionPins', () => {
   it('mirrors a new pin as pinned=true with the row profile', async () => {
     $sessions.set([row('a', { profile: 'work' })])
-    $pinnedSessionIds.set(['a'])
+    $pinnedSessionIds.set([sessionIdentityKey('a', 'work')])
     await flush()
 
     expect(patch).toHaveBeenCalledWith('a', true, 'work')
@@ -49,18 +50,18 @@ describe('watchSessionPins', () => {
 
   it('mirrors an unpin as pinned=false', async () => {
     $sessions.set([row('b')])
-    $pinnedSessionIds.set(['b'])
+    $pinnedSessionIds.set([sessionIdentityKey('b', 'default')])
     await flush()
     patch.mockClear()
 
     $pinnedSessionIds.set([])
     await flush()
 
-    expect(patch).toHaveBeenCalledWith('b', false, undefined)
+    expect(patch).toHaveBeenCalledWith('b', false, 'default')
   })
 
   it('defers a pin whose row is not loaded, then flushes once it appears', async () => {
-    $pinnedSessionIds.set(['c'])
+    $pinnedSessionIds.set([sessionIdentityKey('c', 'p2')])
     await flush()
     // No row yet -> nothing sent.
     expect(patch).not.toHaveBeenCalled()
@@ -74,15 +75,15 @@ describe('watchSessionPins', () => {
   it('matches a pin id against the lineage root', async () => {
     // pin id is the lineage root; the live row carries it as _lineage_root_id.
     $sessions.set([row('tip', { _lineage_root_id: 'root' })])
-    $pinnedSessionIds.set(['root'])
+    $pinnedSessionIds.set([sessionIdentityKey('root', 'default')])
     await flush()
 
-    expect(patch).toHaveBeenCalledWith('root', true, undefined)
+    expect(patch).toHaveBeenCalledWith('root', true, 'default')
   })
 
   it('does not re-PATCH an already-mirrored pin on unrelated session updates', async () => {
     $sessions.set([row('d')])
-    $pinnedSessionIds.set(['d'])
+    $pinnedSessionIds.set([sessionIdentityKey('d', 'default')])
     await flush()
     patch.mockClear()
 

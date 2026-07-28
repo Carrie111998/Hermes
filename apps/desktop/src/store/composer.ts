@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { triggerHaptic } from '@/lib/haptics'
+import { sessionIdentityKey } from '@/lib/session-identity'
 
 export interface ComposerAttachment {
   id: string
@@ -96,9 +97,10 @@ export const mainComposerScope = createComposerAttachmentScope($composerAttachme
 // Per-thread draft stash for the decoupled composer. Session lifecycle never
 // touches this — only ChatBar's scope swap reads/writes it. Text mirrors to
 // localStorage; attachments are memory-only (blobs, upload state).
-export const SESSION_DRAFTS_STORAGE_KEY = 'hermes:composer-drafts:v3'
+export const SESSION_DRAFTS_STORAGE_KEY = 'hermes:composer-drafts:v4'
 
-const NEW_SESSION_DRAFT_KEY = '__new__'
+const LEGACY_SESSION_DRAFTS_STORAGE_KEY = 'hermes:composer-drafts:v3'
+const SESSION_DRAFTS_STORAGE_VERSION = 4
 const MAX_PERSISTED_DRAFTS = 50
 const EMPTY_SESSION_DRAFT: SessionDraft = { attachments: [], text: '' }
 
@@ -107,47 +109,97 @@ export interface SessionDraft {
   text: string
 }
 
-const draftKey = (scope: string | null | undefined) => scope?.trim() || NEW_SESSION_DRAFT_KEY
+type SessionDraftKey = string | null
+
+const draftKey = (scope: string | null | undefined): SessionDraftKey => scope ?? null
 
 const cloneDraft = (draft: SessionDraft): SessionDraft => ({
   attachments: draft.attachments.map(attachment => ({ ...attachment })),
   text: draft.text
 })
 
-function loadPersistedDraftTexts(): [string, SessionDraft][] {
+interface PersistedSessionDraftsV4 {
+  version: 4
+  drafts: Array<{ scope: SessionDraftKey; text: string }>
+}
+
+function parsePersistedDraftsV4(raw: string): [SessionDraftKey, SessionDraft][] {
+  const parsed = JSON.parse(raw) as Partial<PersistedSessionDraftsV4>
+
+  if (parsed.version !== SESSION_DRAFTS_STORAGE_VERSION || !Array.isArray(parsed.drafts)) {
+    return []
+  }
+
+  return parsed.drafts.flatMap(entry =>
+    entry &&
+    (entry.scope === null || typeof entry.scope === 'string') &&
+    typeof entry.text === 'string'
+      ? [[entry.scope, { attachments: [], text: entry.text }] as [SessionDraftKey, SessionDraft]]
+      : []
+  )
+}
+
+function loadPersistedDraftTexts(): { entries: [SessionDraftKey, SessionDraft][]; migratedLegacy: boolean } {
   try {
     const raw = window.localStorage.getItem(SESSION_DRAFTS_STORAGE_KEY)
 
-    if (!raw) {
-      return []
+    if (raw) {
+      return { entries: parsePersistedDraftsV4(raw), migratedLegacy: false }
     }
 
-    return Object.entries(JSON.parse(raw) as Record<string, string>).map(([key, text]) => [
-      key,
-      { attachments: [], text }
-    ])
+    const legacyRaw = window.localStorage.getItem(LEGACY_SESSION_DRAFTS_STORAGE_KEY)
+
+    if (!legacyRaw) {
+      return { entries: [], migratedLegacy: false }
+    }
+
+    const legacy = JSON.parse(legacyRaw) as Record<string, unknown>
+
+    const entries = Object.entries(legacy).flatMap(([storedSessionId, text]) =>
+      typeof text === 'string'
+        ? [
+            [
+              storedSessionId === '__new__' ? null : sessionIdentityKey(storedSessionId, 'default'),
+              { attachments: [], text }
+            ] as [SessionDraftKey, SessionDraft]
+          ]
+        : []
+    )
+
+    return { entries, migratedLegacy: true }
   } catch {
-    return []
+    return { entries: [], migratedLegacy: false }
   }
 }
 
-const draftsBySession = new Map<string, SessionDraft>(loadPersistedDraftTexts())
+const loadedDrafts = loadPersistedDraftTexts()
+const draftsBySession = new Map<SessionDraftKey, SessionDraft>(loadedDrafts.entries)
 
-function persistDraftTexts() {
+function persistDraftTexts(): boolean {
   try {
-    const entries = [...draftsBySession]
+    const drafts = [...draftsBySession]
       .filter(([, draft]) => draft.text)
       .slice(-MAX_PERSISTED_DRAFTS)
-      .map(([key, draft]) => [key, draft.text] as const)
+      .map(([scope, draft]) => ({ scope, text: draft.text }))
 
-    if (entries.length === 0) {
+    if (drafts.length === 0) {
       window.localStorage.removeItem(SESSION_DRAFTS_STORAGE_KEY)
     } else {
-      window.localStorage.setItem(SESSION_DRAFTS_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)))
+      window.localStorage.setItem(
+        SESSION_DRAFTS_STORAGE_KEY,
+        JSON.stringify({ drafts, version: SESSION_DRAFTS_STORAGE_VERSION } satisfies PersistedSessionDraftsV4)
+      )
     }
+
+    return true
   } catch {
     // Best-effort only — quota/private-mode must never break typing.
+    return false
   }
+}
+
+if (loadedDrafts.migratedLegacy && persistDraftTexts()) {
+  window.localStorage.removeItem(LEGACY_SESSION_DRAFTS_STORAGE_KEY)
 }
 
 export function stashSessionDraft(scope: string | null | undefined, text: string, attachments: ComposerAttachment[]) {

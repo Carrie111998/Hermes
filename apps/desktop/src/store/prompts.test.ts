@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { clearClarifyRequest, setClarifyRequest } from './clarify'
+import { $activeGatewayProfile } from './profile'
 import {
   $activeSessionAwaitingInput,
   $approvalRequest,
@@ -20,12 +21,14 @@ import { $activeSessionId } from './session'
 // active session, so each test focuses the session it's asserting on.
 beforeEach(() => {
   $activeSessionId.set('s1')
+  $activeGatewayProfile.set('default')
 })
 
 afterEach(() => {
   clearAllPrompts()
   clearClarifyRequest()
   $activeSessionId.set(null)
+  $activeGatewayProfile.set('default')
 })
 
 describe('approval prompt store', () => {
@@ -66,6 +69,16 @@ describe('approval prompt store', () => {
     })
 
     expect($approvalRequest.get()?.allowPermanent).toBe(false)
+  })
+
+  it('does not clear a colliding approval owned by another profile', () => {
+    setApprovalRequest({ command: 'alpha', description: 'd', profile: 'alpha', sessionId: 's1' })
+    setApprovalRequest({ command: 'beta', description: 'e', profile: 'beta', sessionId: 's1' })
+    $activeGatewayProfile.set('beta')
+
+    clearApprovalRequest('s1', undefined, 'alpha')
+
+    expect($approvalRequest.get()?.command).toBe('beta')
   })
 })
 

@@ -1,5 +1,7 @@
 import type { SessionInfo } from '@/types/hermes'
 
+import { sessionIdentityKey } from './session-identity'
+
 export interface SidebarSessionEntry {
   branchStem?: string
   session: SessionInfo
@@ -29,11 +31,11 @@ export function flattenSessionsWithBranches(
   const byVisibleId = new Map<string, SessionInfo>()
 
   for (const session of sessions) {
-    byVisibleId.set(session.id, session)
-    const rootId = session._lineage_root_id?.trim()
+    byVisibleId.set(sessionIdentityKey(session.id, session.profile), session)
+    const rootId = session._lineage_root_id
 
     if (rootId) {
-      byVisibleId.set(rootId, session)
+      byVisibleId.set(sessionIdentityKey(rootId, session.profile), session)
     }
   }
 
@@ -41,22 +43,24 @@ export function flattenSessionsWithBranches(
   const nestedIds = new Set<string>()
 
   for (const session of sessions) {
-    const parentId = session.parent_session_id?.trim()
+    const parentId = session.parent_session_id
 
     if (!parentId) {
       continue
     }
 
-    const parent = byVisibleId.get(parentId)
+    const parent = byVisibleId.get(sessionIdentityKey(parentId, session.profile))
 
-    if (!parent || parent.id === session.id) {
+    if (!parent || sessionIdentityKey(parent.id, parent.profile) === sessionIdentityKey(session.id, session.profile)) {
       continue
     }
 
-    nestedIds.add(session.id)
-    const siblings = childrenByParent.get(parent.id) ?? []
+    const sessionKey = sessionIdentityKey(session.id, session.profile)
+    const parentKey = sessionIdentityKey(parent.id, parent.profile)
+    nestedIds.add(sessionKey)
+    const siblings = childrenByParent.get(parentKey) ?? []
     siblings.push(session)
-    childrenByParent.set(parent.id, siblings)
+    childrenByParent.set(parentKey, siblings)
   }
 
   for (const siblings of childrenByParent.values()) {
@@ -70,20 +74,21 @@ export function flattenSessionsWithBranches(
   const groupRecencyMemo = new Map<string, number>()
 
   const groupRecency = (session: SessionInfo): number => {
-    const cached = groupRecencyMemo.get(session.id)
+    const identityKey = sessionIdentityKey(session.id, session.profile)
+    const cached = groupRecencyMemo.get(identityKey)
 
     if (cached !== undefined) {
       return cached
     }
 
-    groupRecencyMemo.set(session.id, recency(session)) // cycle guard
+    groupRecencyMemo.set(identityKey, recency(session)) // cycle guard
 
-    const max = (childrenByParent.get(session.id) ?? []).reduce(
+    const max = (childrenByParent.get(identityKey) ?? []).reduce(
       (acc, child) => Math.max(acc, groupRecency(child)),
       recency(session)
     )
 
-    groupRecencyMemo.set(session.id, max)
+    groupRecencyMemo.set(identityKey, max)
 
     return max
   }
@@ -95,18 +100,22 @@ export function flattenSessionsWithBranches(
   const seen = new Set<string>()
 
   const emit = (session: SessionInfo, branchStem?: string) => {
-    if (seen.has(session.id)) {
+    const identityKey = sessionIdentityKey(session.id, session.profile)
+
+    if (seen.has(identityKey)) {
       return
     }
 
-    seen.add(session.id)
+    seen.add(identityKey)
     out.push(branchStem ? { branchStem, session } : { session })
 
-    const children = childrenByParent.get(session.id)
+    const children = childrenByParent.get(identityKey)
     children?.forEach((child, index) => emit(child, index === children.length - 1 ? '└─ ' : '├─ '))
   }
 
-  const roots = sessions.filter(session => !nestedIds.has(session.id)).map((session, index) => ({ index, session }))
+  const roots = sessions
+    .filter(session => !nestedIds.has(sessionIdentityKey(session.id, session.profile)))
+    .map((session, index) => ({ index, session }))
 
   if (!options.preserveOrder) {
     roots.sort((a, b) => groupRecency(b.session) - groupRecency(a.session) || a.index - b.index)
@@ -115,7 +124,7 @@ export function flattenSessionsWithBranches(
   roots.forEach(({ session }) => emit(session))
 
   for (const session of sessions) {
-    if (!seen.has(session.id)) {
+    if (!seen.has(sessionIdentityKey(session.id, session.profile))) {
       out.push({ session })
     }
   }

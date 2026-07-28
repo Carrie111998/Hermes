@@ -12,17 +12,14 @@
  */
 
 import { setSessionPinnedRemote } from '@/hermes'
+import { parseSessionIdentityKey, sessionMatchesIdentity } from '@/lib/session-identity'
 import { $pinnedSessionIds } from '@/store/layout'
-import { $sessions, sessionMatchesStoredId } from '@/store/session'
+import { $sessions } from '@/store/session'
 
 // pin ids we've successfully PATCHed pinned=true this session.
 const mirrored = new Set<string>()
 // pin ids awaiting their row so we can resolve the owning profile before PATCH.
 const pending = new Set<string>()
-
-function profileFor(pinId: string): null | string | undefined {
-  return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
-}
 
 function reconcile(): void {
   // Config/session REST is only reachable through the Electron bridge.
@@ -37,7 +34,8 @@ function reconcile(): void {
     if (!current.has(id)) {
       mirrored.delete(id)
       pending.delete(id)
-      void setSessionPinnedRemote(id, false, profileFor(id)).catch(() => {})
+      const identity = parseSessionIdentityKey(id)
+      void setSessionPinnedRemote(identity.storedSessionId, false, identity.profile).catch(() => {})
     }
   }
 
@@ -51,7 +49,11 @@ function reconcile(): void {
   // Flush whatever we can resolve now; unresolved ids (row not loaded yet)
   // retry on the next $sessions change.
   for (const id of [...pending]) {
-    const row = $sessions.get().find(entry => sessionMatchesStoredId(entry, id))
+    const identity = parseSessionIdentityKey(id)
+
+    const row = $sessions
+      .get()
+      .find(entry => sessionMatchesIdentity(entry, identity.storedSessionId, identity.profile))
 
     if (!row) {
       continue
@@ -59,7 +61,7 @@ function reconcile(): void {
 
     pending.delete(id)
     mirrored.add(id)
-    void setSessionPinnedRemote(id, true, row.profile).catch(() => {
+    void setSessionPinnedRemote(identity.storedSessionId, true, identity.profile).catch(() => {
       // Let a later reconcile retry the mirror.
       mirrored.delete(id)
       pending.add(id)

@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
-import { $selectedStoredSessionId, $sessions } from './session'
+import { $activeGatewayProfile } from './profile'
+import { $sessions, setSelectedStoredSessionId } from './session'
 import {
   $switcherIndex,
   $switcherOpen,
@@ -16,11 +17,11 @@ import {
   SWITCHER_REVEAL_MS
 } from './session-switcher'
 
-const session = (id: string): SessionInfo => ({ id }) as SessionInfo
+const session = (id: string, profile = 'default'): SessionInfo => ({ id, profile }) as SessionInfo
 
 const seed = (ids: string[], selected: null | string) => {
-  $sessions.set(ids.map(session))
-  $selectedStoredSessionId.set(selected)
+  $sessions.set(ids.map(id => session(id)))
+  setSelectedStoredSessionId(selected, 'default')
 }
 
 const tabTap = (direction: 1 | -1 = 1) => {
@@ -34,6 +35,7 @@ const tabTap = (direction: 1 | -1 = 1) => {
 beforeEach(() => {
   vi.useRealTimers()
   closeSwitcher()
+  $activeGatewayProfile.set('default')
   $switcherSessions.set([])
   $switcherIndex.set(0)
 })
@@ -53,7 +55,7 @@ describe('openOrAdvanceSwitcher', () => {
   it('jumps immediately on a quick Tab tap without opening the HUD', () => {
     seed(['a', 'b', 'c'], 'a')
 
-    expect(tabTap()).toBe('b')
+    expect(tabTap()).toEqual({ profile: 'default', sessionId: 'b' })
     expect($switcherOpen.get()).toBe(false)
     expect(commitOnCtrlUp()).toBeNull()
   })
@@ -83,7 +85,7 @@ describe('openOrAdvanceSwitcher', () => {
   it('opens on a second Tab while Ctrl is still down', () => {
     seed(['a', 'b', 'c'], 'a')
 
-    expect(tabTap()).toBe('b')
+    expect(tabTap()).toEqual({ profile: 'default', sessionId: 'b' })
     onSwitcherTabDown()
     openOrAdvanceSwitcher(1)
     onSwitcherTabUp()
@@ -95,12 +97,28 @@ describe('openOrAdvanceSwitcher', () => {
   it('commits the HUD highlight on Ctrl up', () => {
     seed(['a', 'b', 'c'], 'a')
 
-    expect(tabTap()).toBe('b')
+    expect(tabTap()).toEqual({ profile: 'default', sessionId: 'b' })
     onSwitcherTabDown()
     openOrAdvanceSwitcher(1)
     onSwitcherTabUp()
 
-    expect(commitOnCtrlUp()).toBe('c')
+    expect(commitOnCtrlUp()).toEqual({ profile: 'default', sessionId: 'c' })
+  })
+
+  it('preserves the selected profile when stored ids collide', () => {
+    $sessions.set([session('shared', 'alpha'), session('shared', 'beta'), session('other', 'beta')])
+    $activeGatewayProfile.set('beta')
+    setSelectedStoredSessionId('shared', 'beta')
+
+    expect(tabTap(-1)).toEqual({ profile: 'alpha', sessionId: 'shared' })
+  })
+
+  it('uses the selected identity rather than the active profile during a profile transition', () => {
+    $sessions.set([session('shared', 'alpha'), session('shared', 'beta'), session('other', 'beta')])
+    $activeGatewayProfile.set('beta')
+    setSelectedStoredSessionId('shared', 'alpha')
+
+    expect(tabTap(-1)).toEqual({ profile: 'beta', sessionId: 'other' })
   })
 })
 
@@ -110,6 +128,6 @@ describe('slotSessionId', () => {
     tabTap()
     $sessions.set([session('x')])
 
-    expect(slotSessionId(2)).toBe('b')
+    expect(slotSessionId(2)).toEqual({ profile: 'default', sessionId: 'b' })
   })
 })

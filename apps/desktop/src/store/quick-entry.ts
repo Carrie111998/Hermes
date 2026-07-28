@@ -17,6 +17,8 @@
 
 import { atom } from 'nanostores'
 
+import { normalizeProfileKey } from '@/lib/session-identity'
+
 export interface QuickEntryState {
   enabled: boolean
   /** null before the first read; the settings row shows a skeleton until then. */
@@ -100,8 +102,18 @@ export async function saveQuickEntrySettings(patch: { enabled?: boolean; shortcu
 // ── Quick window submit state machine ───────────────────────────────────────
 
 /** A recent session the quick window can target (pushed by the primary). */
+export interface QuickEntrySessionTarget {
+  kind: 'session'
+  profile: string
+  storedSessionId: string
+}
+
+export type QuickEntryTarget = { kind: 'current' } | { kind: 'new' } | QuickEntrySessionTarget
+
 export interface QuickEntrySessionOption {
+  /** Opaque picker value. Session ownership travels separately in `target`. */
   id: string
+  target: QuickEntrySessionTarget
   title: string
 }
 
@@ -123,8 +135,8 @@ export interface QuickEntryStatePush {
 
 /** What a quick-window submit carries back to the primary renderer. */
 export interface QuickEntrySubmitPayload {
-  /** QUICK_TARGET_CURRENT, QUICK_TARGET_NEW, or a stored session id. */
-  target: string
+  /** Discriminated destination; never shares a namespace with opaque stored IDs. */
+  target: QuickEntryTarget
   text: string
 }
 
@@ -230,8 +242,21 @@ export function quickComposerReducer(state: QuickComposerState, event: QuickComp
         return { send: null, state }
       }
 
+      const target: QuickEntryTarget | null =
+        state.target === QUICK_TARGET_NEW
+          ? { kind: 'new' }
+          : state.target === QUICK_TARGET_CURRENT
+            ? { kind: 'current' }
+            : (state.sessions.find(session => session.id === state.target)?.target ?? null)
+
+      // A malformed/stale session option must not redirect a prompt to the
+      // current chat. Keep the draft and window intact so the user can retry.
+      if (!target) {
+        return { send: null, state }
+      }
+
       return {
-        send: { target: state.target, text },
+        send: { target, text },
         state: { ...state, draft: '', submitting: true, visible: false }
       }
     }
@@ -260,26 +285,49 @@ export function setQuickEntrySubmitHandler(fn: ((payload: QuickEntrySubmitPayloa
   submitHandler = fn
 }
 
-function normalizeSubmitPayload(raw: unknown): null | QuickEntrySubmitPayload {
-  // Tolerate the v1 bare-string wire shape (an older quick window after a
-  // partial update) by treating it as "send to the current chat".
-  if (typeof raw === 'string') {
-    return raw.trim() ? { target: QUICK_TARGET_CURRENT, text: raw } : null
+function normalizeQuickEntryTarget(raw: unknown): QuickEntryTarget | null {
+  if (!raw || typeof raw !== 'object') {
+    return null
   }
 
+  const target = raw as Record<string, unknown>
+
+  if (target.kind === 'current' || target.kind === 'new') {
+    return { kind: target.kind }
+  }
+
+  if (
+    target.kind === 'session' &&
+    typeof target.profile === 'string' &&
+    target.profile.trim().length > 0 &&
+    typeof target.storedSessionId === 'string' &&
+    target.storedSessionId.length > 0
+  ) {
+    return {
+      kind: 'session',
+      profile: normalizeProfileKey(target.profile),
+      storedSessionId: target.storedSessionId
+    }
+  }
+
+  return null
+}
+
+export function normalizeQuickEntrySubmitPayload(raw: unknown): null | QuickEntrySubmitPayload {
   if (!raw || typeof raw !== 'object') {
     return null
   }
 
   const record = raw as Record<string, unknown>
   const text = typeof record.text === 'string' ? record.text : ''
+  const target = normalizeQuickEntryTarget(record.target)
 
-  if (!text.trim()) {
+  if (!text.trim() || !target) {
     return null
   }
 
   return {
-    target: typeof record.target === 'string' && record.target ? record.target : QUICK_TARGET_CURRENT,
+    target,
     text
   }
 }
@@ -296,7 +344,7 @@ export function initQuickEntryBridge(): () => void {
   }
 
   unsubscribeSubmit = api.onSubmit(raw => {
-    const payload = normalizeSubmitPayload(raw)
+    const payload = normalizeQuickEntrySubmitPayload(raw)
 
     if (payload) {
       submitHandler?.(payload)

@@ -6,6 +6,7 @@ import { type FC, useCallback, useRef } from 'react'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type SidebarListRow } from '@/lib/session-date-groups'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
@@ -31,10 +32,10 @@ interface VirtualSessionListProps {
   activeSessionId: null | string
   className?: string
   rows: SidebarListRow[]
-  onArchiveSession: (sessionId: string) => void
+  onArchiveSession: (sessionId: string, profile?: null | string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
-  onDeleteSession: (sessionId: string) => void
-  onResumeSession: (sessionId: string) => void
+  onDeleteSession: (sessionId: string, profile?: null | string) => void
+  onResumeSession: (sessionId: string, profile?: null | string) => void
   onTogglePin: (sessionId: string) => void
   pinned: boolean
   showProfileTags?: boolean
@@ -69,7 +70,11 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     getItemKey: index => {
       const row = listRows[index]
 
-      return row ? (row.kind === 'divider' ? row.key : row.entry.session.id) : index
+      return row
+        ? row.kind === 'divider'
+          ? row.key
+          : sessionIdentityKey(row.entry.session.id, row.entry.session.profile)
+        : index
     },
     getScrollElement: () => scrollerRef.current,
     // jsdom-friendly default; the real rect takes over on first observe.
@@ -102,18 +107,19 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     }
 
     const { branchStem, session } = row.entry
+    const identityKey = sessionIdentityKey(session.id, session.profile)
     const reorderable = sortable && !branchStem
 
     const commonProps: SessionRowCommonProps = {
       branchStem,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      onArchive: () => onArchiveSession(session.id),
+      isSelected: identityKey === activeSessionId,
+      isWorking: workingSessionIdSet.has(identityKey),
+      onArchive: () => onArchiveSession(session.id, session.profile),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
+      onDelete: () => onDeleteSession(session.id, session.profile),
       onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
+      onResume: () => onResumeSession(session.id, session.profile),
       reorderable,
       showProfile: showProfileTags
     }
@@ -121,7 +127,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     return reorderable ? (
       <VirtualSortableRow
         index={virtualItem.index}
-        key={session.id}
+        key={identityKey}
         measureRef={virtualizer.measureElement}
         rowProps={commonProps}
         session={session}
@@ -130,7 +136,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       <SidebarSessionRow
         {...commonProps}
         data-index={virtualItem.index}
-        key={session.id}
+        key={identityKey}
         ref={virtualizer.measureElement}
         session={session}
       />
@@ -160,7 +166,9 @@ interface VirtualSortableRowProps {
 }
 
 function VirtualSortableRow({ index, measureRef, rowProps, session }: VirtualSortableRowProps) {
-  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
+    id: sessionIdentityKey(session.id, session.profile)
+  })
 
   // Merge dnd-kit's setNodeRef with the virtualizer's measureElement so
   // the row participates in both DnD hit-testing and TanStack height

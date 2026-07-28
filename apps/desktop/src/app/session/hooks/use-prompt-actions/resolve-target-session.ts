@@ -49,6 +49,7 @@ export interface ResolveTargetSessionDeps {
   requestGateway: GatewayRequest
   routedStoredSessionId: null | string
   selectedStoredSessionId: null | string
+  targetProfile?: null | string
 }
 
 export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Promise<null | string> {
@@ -59,7 +60,8 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
     getRuntimeIdForStoredSession,
     requestGateway,
     routedStoredSessionId,
-    selectedStoredSessionId
+    selectedStoredSessionId,
+    targetProfile
   } = deps
 
   // 1. An explicit target always wins — the caller knows which session it means.
@@ -89,7 +91,7 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
 
   if (storedTarget) {
     try {
-      const profile = await resolveSessionProfile(storedTarget)
+      const profile = targetProfile ?? (await resolveSessionProfile(storedTarget))
 
       const resumed = await requestGateway<{ session_id?: string }>('session.resume', {
         session_id: storedTarget,

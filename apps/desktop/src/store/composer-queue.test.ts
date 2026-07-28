@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
+import { sessionIdentityKey } from '@/lib/session-identity'
+
 import type { ComposerAttachment } from './composer'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
   clearQueuedPrompts,
+  decodeQueuedPromptState,
   dequeueQueuedPrompt,
+  encodeQueuedPromptState,
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
@@ -44,6 +48,14 @@ describe('composer queue store', () => {
     expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('first')
     expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('second')
     expect(dequeueQueuedPrompt(SESSION_KEY)).toBeNull()
+  })
+
+  it('keeps opaque session keys distinct when stored ids differ by whitespace', () => {
+    enqueueQueuedPrompt('alpha\u0000shared', { attachments: [], text: 'plain' })
+    enqueueQueuedPrompt('alpha\u0000shared ', { attachments: [], text: 'trailing space' })
+
+    expect(getQueuedPrompts('alpha\u0000shared').map(entry => entry.text)).toEqual(['plain'])
+    expect(getQueuedPrompts('alpha\u0000shared ').map(entry => entry.text)).toEqual(['trailing space'])
   })
 
   it('clones attachments when queueing', () => {
@@ -117,8 +129,29 @@ describe('composer queue store', () => {
     const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY)
     expect(raw).toBeTruthy()
 
-    const parsed = JSON.parse(String(raw)) as Record<string, { text: string }[]>
-    expect(parsed[SESSION_KEY]?.[0]?.text).toBe('persist me')
+    const parsed = decodeQueuedPromptState(String(raw))
+    expect(parsed[sessionIdentityKey(SESSION_KEY, 'default')]?.[0]?.text).toBe('persist me')
+  })
+
+  it('migrates legacy record keys as opaque default-profile ids', () => {
+    const sentinelLookingId = 'alpha\u0000shared'
+    const entry = { attachments: [], id: 'queued-1', queuedAt: 1, text: 'preserve me' }
+    const decoded = decodeQueuedPromptState(JSON.stringify({ [sentinelLookingId]: [entry] }))
+
+    expect(decoded).toEqual({ [sessionIdentityKey(sentinelLookingId, 'default')]: [entry] })
+  })
+
+  it('round-trips same-looking opaque and owner-qualified queue identities separately', () => {
+    const sentinelLookingId = 'alpha\u0000shared'
+    const defaultEntry = { attachments: [], id: 'queued-default', queuedAt: 1, text: 'default' }
+    const alphaEntry = { attachments: [], id: 'queued-alpha', queuedAt: 2, text: 'alpha' }
+
+    const state = {
+      [sessionIdentityKey(sentinelLookingId, 'default')]: [defaultEntry],
+      [sessionIdentityKey('shared', 'alpha')]: [alphaEntry]
+    }
+
+    expect(decodeQueuedPromptState(encodeQueuedPromptState(state))).toEqual(state)
   })
 })
 

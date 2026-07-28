@@ -41,6 +41,7 @@ import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { LayoutDashboard, PanelBottom } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { Codecs, persistentAtom } from '@/lib/persisted'
+import { parseSessionIdentityKey, sessionMatchesIdentity } from '@/lib/session-identity'
 import { pruneComposerPopoutZones } from '@/store/composer-popout'
 import {
   $fileBrowserOpen,
@@ -56,7 +57,11 @@ import {
 } from '@/store/layout'
 import { $previewOpenRequest, $previewTabs, closeRightRail } from '@/store/preview'
 import { $reviewOpen, closeReview, REVIEW_PANE_ID } from '@/store/review'
-import { $currentCwd, $selectedStoredSessionId, $sessions, sessionMatchesStoredId } from '@/store/session'
+import {
+  $currentCwd,
+  $selectedSessionIdentityKey,
+  $sessions
+} from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { $statusbarVisible, toggleStatusbarVisible } from '@/store/statusbar-prefs'
 
@@ -108,15 +113,16 @@ const wrapWorkspaceTab = (tab: ReactElement) => <WorkspaceTabMenu>{tab}</Workspa
 /** The `@session` payload for the workspace tab — the loaded primary session,
  *  or null on a fresh draft / full-page view (nothing to link). */
 const workspaceDragPayload = (): SessionDragPayload | null => {
-  const selected = $selectedStoredSessionId.get()
+  const identityKey = $selectedSessionIdentityKey.get()
 
-  if (!selected || $workspaceIsPage.get()) {
+  if (!identityKey || $workspaceIsPage.get()) {
     return null
   }
 
-  const stored = $sessions.get().find(s => sessionMatchesStoredId(s, selected))
+  const { profile, storedSessionId } = parseSessionIdentityKey(identityKey)
+  const stored = $sessions.get().find(s => sessionMatchesIdentity(s, storedSessionId, profile))
 
-  return { id: selected, profile: stored?.profile ?? '', title: stored ? storedSessionTitle(stored) : '' }
+  return { id: storedSessionId, profile, title: stored ? storedSessionTitle(stored) : '' }
 }
 
 // The main tab drags like a session tile — drop it on a composer to link the
@@ -434,8 +440,14 @@ watchSessionPins()
 // register() replaces same-id in place; the render fn is the shared constant
 // above, so the pane content never remounts.
 const syncWorkspaceTitle = () => {
-  const selected = $selectedStoredSessionId.get()
-  const stored = selected ? $sessions.get().find(s => sessionMatchesStoredId(s, selected)) : null
+  const identityKey = $selectedSessionIdentityKey.get()
+  const identity = identityKey ? parseSessionIdentityKey(identityKey) : null
+
+  const stored = identity
+    ? $sessions
+        .get()
+        .find(s => sessionMatchesIdentity(s, identity.storedSessionId, identity.profile))
+    : null
 
   registry.register({
     id: 'workspace',
@@ -445,7 +457,15 @@ const syncWorkspaceTitle = () => {
       // The tab's status dot — the SAME primitive the sidebar row and session
       // tiles render, so the main tab never disagrees with its sidebar row. No
       // dot on a fresh draft (no session yet).
-      tabLead: selected ? () => <SessionStatusDot session={stored} storedSessionId={selected} /> : undefined,
+      tabLead: identity
+        ? () => (
+            <SessionStatusDot
+              profile={identity.profile}
+              session={stored}
+              storedSessionId={identity.storedSessionId}
+            />
+          )
+        : undefined,
       // Pages aren't tab-able: the main zone's bar stands down while one shows.
       headerVeto: $workspaceIsPage.get(),
       placement: 'main',
@@ -458,7 +478,7 @@ const syncWorkspaceTitle = () => {
   })
 }
 
-$selectedStoredSessionId.listen(syncWorkspaceTitle)
+$selectedSessionIdentityKey.listen(syncWorkspaceTitle)
 $sessions.listen(syncWorkspaceTitle)
 $workspaceIsPage.listen(syncWorkspaceTitle)
 

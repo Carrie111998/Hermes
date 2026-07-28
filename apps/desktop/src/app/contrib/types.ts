@@ -7,6 +7,7 @@ import type { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
 import type { ModelMenuPanel } from '../shell/model-menu-panel'
 
 export type GatewayRequester = ReturnType<typeof useGatewayRequest>['requestGateway']
+export type ProfileGatewayRequester = ReturnType<typeof useGatewayRequest>['requestGatewayForProfile']
 
 /** The ChatSidebar handlers the controller owns — forwarded verbatim. */
 export type SidebarActions = Pick<

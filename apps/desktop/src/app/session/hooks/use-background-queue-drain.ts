@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { normalizeProfileKey, parseSessionIdentityKey } from '@/lib/session-identity'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
@@ -13,6 +14,7 @@ import {
   shouldAutoDrain
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $workingSessionIds } from '@/store/session-states'
 
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
@@ -22,7 +24,7 @@ type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise
 interface BackgroundQueueDrainOptions {
   enabled: boolean
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
-  selectedStoredSessionId: string | null
+  selectedSessionIdentityKey: string | null
   submitText: SubmitQueuedPrompt
 }
 
@@ -39,7 +41,7 @@ const BACKGROUND_DRAIN_RETRY_MS = 750
 export function useBackgroundQueueDrain({
   enabled,
   runtimeIdByStoredSessionIdRef,
-  selectedStoredSessionId,
+  selectedSessionIdentityKey,
   submitText
 }: BackgroundQueueDrainOptions) {
   const { t } = useI18n()
@@ -82,7 +84,7 @@ export function useBackgroundQueueDrain({
   )
 
   const drainSessionQueue = useCallback(
-    (sessionKey: string, entry: QueuedPromptEntry) => {
+    (sessionKey: string, identityKey: string, storedSessionId: string, profile: string, entry: QueuedPromptEntry) => {
       if (drainingSessionIdsRef.current.has(sessionKey)) {
         return
       }
@@ -115,14 +117,15 @@ export function useBackgroundQueueDrain({
             return true
           }
 
-          const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(sessionKey) ?? null
+          const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(identityKey) ?? null
 
           const accepted = await Promise.resolve(
             submitTextRef.current(liveEntry.text, {
               attachments: liveEntry.attachments,
               fromQueue: true,
+              profile,
               sessionId: runtimeSessionId,
-              storedSessionId: sessionKey
+              storedSessionId
             })
           )
 
@@ -155,13 +158,21 @@ export function useBackgroundQueueDrain({
     }
 
     const working = new Set(workingSessionIds)
+    const profile = $activeGatewayProfile.get()
 
     for (const [sessionKey, entries] of Object.entries(queuedPromptsBySession)) {
+      // Persisted v1 keys are migrated at the storage boundary. A raw live key
+      // still parses as default, so a non-default profile fails closed rather
+      // than claiming ownerless queue state.
+      const identityKey = sessionKey
+      const identity = parseSessionIdentityKey(identityKey)
+
       if (
-        sessionKey === selectedStoredSessionId ||
+        normalizeProfileKey(identity.profile) !== normalizeProfileKey(profile) ||
+        identityKey === selectedSessionIdentityKey ||
         drainingSessionIdsRef.current.has(sessionKey) ||
         !shouldAutoDrain({
-          isBusy: working.has(sessionKey),
+          isBusy: working.has(identityKey),
           parked: Boolean(parkedQueueSessions[sessionKey]),
           queueLength: entries.length
         })
@@ -175,7 +186,7 @@ export function useBackgroundQueueDrain({
         continue
       }
 
-      drainSessionQueue(sessionKey, entry)
+      drainSessionQueue(sessionKey, identityKey, identity.storedSessionId, identity.profile, entry)
     }
   }, [
     drainSessionQueue,
@@ -183,7 +194,7 @@ export function useBackgroundQueueDrain({
     parkedQueueSessions,
     queuedPromptsBySession,
     retryTick,
-    selectedStoredSessionId,
+    selectedSessionIdentityKey,
     workingSessionIds
   ])
 }

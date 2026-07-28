@@ -1,6 +1,7 @@
 import { useCallback, useRef } from 'react'
 
 import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
 import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
@@ -14,7 +15,7 @@ import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
 import { $removedSessionIds } from '@/store/projects'
 import {
   $messagingSessions,
-  $selectedStoredSessionId,
+  $selectedSessionIdentityKey,
   $sessions,
   CRON_SECTION_LIMIT,
   mergeSessionPage,
@@ -25,6 +26,7 @@ import {
   setMessagingTruncated,
   setSessionProfilesTruncated,
   setSessions,
+  setSessionsHydratedProfileScope,
   setSessionsLoading
 } from '@/store/session'
 import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
@@ -52,13 +54,13 @@ function sessionsToKeep(scope?: string): Set<string> {
     ...getRecentlySettledSessionIds()
   ])
 
-  const active = $selectedStoredSessionId.get()
+  const activeIdentity = $selectedSessionIdentityKey.get()
 
-  if (active) {
-    const session = scope ? $sessions.get().find(s => s.id === active) : null
+  if (activeIdentity) {
+    const { profile } = parseSessionIdentityKey(activeIdentity)
 
-    if (!scope || !session || normalizeProfileKey(session.profile) === scope) {
-      keep.add(active)
+    if (!scope || normalizeProfileKey(profile) === scope) {
+      keep.add(activeIdentity)
     }
   }
 
@@ -188,7 +190,9 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
         const incoming = tombstones.size
           ? recents.sessions.filter(
-              s => !tombstones.has(s.id) && !(s._lineage_root_id && tombstones.has(s._lineage_root_id))
+              s =>
+                !tombstones.has(sessionIdentityKey(s.id, s.profile)) &&
+                !(s._lineage_root_id && tombstones.has(sessionIdentityKey(s._lineage_root_id, s.profile)))
             )
           : recents.sessions
 
@@ -227,6 +231,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
         // Hit the cap → at least one platform may have more on disk than loaded.
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
+        // Publish scope completion only after every recents update above has
+        // landed. Until this point a populated old scope is presentation data,
+        // not evidence that newly requested profiles are empty.
+        setSessionsHydratedProfileScope(profileScope === ALL_PROFILES ? ALL_PROFILES : normalizeProfileKey(profileScope))
       }
     } finally {
       if (showLoading && refreshSessionsRequestRef.current === requestId) {

@@ -10,6 +10,7 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import { groupEntriesByRecency, type SidebarListRow, toSessionRows } from '@/lib/session-date-groups'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
@@ -89,9 +90,9 @@ interface SidebarSessionsSectionProps {
   sessions: SessionInfo[]
   activeSessionId: null | string
   workingSessionIdSet: Set<string>
-  onResumeSession: (sessionId: string) => void
-  onDeleteSession: (sessionId: string) => void
-  onArchiveSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, profile?: null | string) => void
+  onDeleteSession: (sessionId: string, profile?: null | string) => void
+  onArchiveSession: (sessionId: string, profile?: null | string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
@@ -224,25 +225,26 @@ export function SidebarSessionsSection({
   )
 
   const renderRow = (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+    const identityKey = sessionIdentityKey(session.id, session.profile)
     const rowProps = {
       branchStem,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      onArchive: () => onArchiveSession(session.id),
+      isSelected: identityKey === activeSessionId,
+      isWorking: workingSessionIdSet.has(identityKey),
+      onArchive: () => onArchiveSession(session.id, session.profile),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
+      onDelete: () => onDeleteSession(session.id, session.profile),
       onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
+      onResume: () => onResumeSession(session.id, session.profile),
       reorderable: draggable && !branchStem,
       session,
       showProfile: showProfileTags
     }
 
     return draggable && !branchStem ? (
-      <SortableSidebarSessionRow key={session.id} {...rowProps} />
+      <SortableSidebarSessionRow key={identityKey} {...rowProps} />
     ) : (
-      <SidebarSessionRow key={session.id} {...rowProps} />
+      <SidebarSessionRow key={identityKey} {...rowProps} />
     )
   }
 
@@ -381,7 +383,11 @@ export function SidebarSessionsSection({
 
     inner =
       sessionsDraggable && onReorderSessions ? (
-        <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
+        <ReorderableList
+          ids={sessions.map(session => sessionIdentityKey(session.id, session.profile))}
+          onReorder={onReorderSessions}
+          sensors={dndSensors}
+        >
           {virtual}
         </ReorderableList>
       ) : (
@@ -389,7 +395,11 @@ export function SidebarSessionsSection({
       )
   } else if (sessionsDraggable && onReorderSessions) {
     inner = (
-      <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
+      <ReorderableList
+        ids={sessions.map(session => sessionIdentityKey(session.id, session.profile))}
+        onReorder={onReorderSessions}
+        sensors={dndSensors}
+      >
         {flatRows.map(row => renderListRow(row, true))}
       </ReorderableList>
     )
@@ -434,7 +444,12 @@ interface SortableSessionRowProps {
 }
 
 function SortableSidebarSessionRow(props: SortableSessionRowProps) {
-  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id)} />
+  return (
+    <SidebarSessionRow
+      {...props}
+      {...useSortableBindings(sessionIdentityKey(props.session.id, props.session.profile))}
+    />
+  )
 }
 
 function SortableProjectOverviewRow(props: React.ComponentProps<typeof ProjectOverviewRow>) {

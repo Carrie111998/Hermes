@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { sessionIdentityKey } from '@/lib/session-identity'
 import {
   $attentionSessionIds,
   $stalledSessionIds,
@@ -44,8 +45,11 @@ describe('rehydrateLiveSessionStatuses', () => {
       now
     )
 
-    expect($workingSessionIds.get()).toEqual(['overnight-exam-learning', 'temporary-file-cleanup'])
-    expect($stalledSessionIds.get()).toEqual(['overnight-exam-learning'])
+    expect($workingSessionIds.get()).toEqual([
+      sessionIdentityKey('overnight-exam-learning', 'default'),
+      sessionIdentityKey('temporary-file-cleanup', 'default')
+    ])
+    expect($stalledSessionIds.get()).toEqual([sessionIdentityKey('overnight-exam-learning', 'default')])
     expect($attentionSessionIds.get()).toEqual([])
   })
 
@@ -54,8 +58,8 @@ describe('rehydrateLiveSessionStatuses', () => {
       sessions: [{ id: 'runtime-needs-user', session_key: 'needs-user', status: 'waiting' }]
     })
 
-    expect($workingSessionIds.get()).toEqual(['needs-user'])
-    expect($attentionSessionIds.get()).toEqual(['needs-user'])
+    expect($workingSessionIds.get()).toEqual([sessionIdentityKey('needs-user', 'default')])
+    expect($attentionSessionIds.get()).toEqual([sessionIdentityKey('needs-user', 'default')])
     expect($stalledSessionIds.get()).toEqual([])
   })
 

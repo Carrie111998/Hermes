@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
+import { sessionIdentityKey } from '@/lib/session-identity'
 
 type NavigateLike = (to: string, options?: { replace?: boolean }) => void
 
@@ -181,8 +182,24 @@ export function primaryRouteSelectedSessionId(pathname: string, storeSelectedSes
   return routeSessionId(pathname) ?? storeSelectedSessionId
 }
 
-export function sessionRoute(sessionId: string): string {
-  return `${SESSION_ROUTE_PREFIX}${encodeURIComponent(sessionId)}`
+export function routeSessionProfile(search: string): string | null {
+  const profile = new URLSearchParams(search).get('profile')?.trim()
+
+  return profile || null
+}
+
+/** Compound durable identity represented by a session route, if any. */
+export function routeSessionIdentityKey(pathname: string, search: string, fallbackProfile: string): string | null {
+  const storedSessionId = routeSessionId(pathname)
+
+  return storedSessionId ? sessionIdentityKey(storedSessionId, routeSessionProfile(search) ?? fallbackProfile) : null
+}
+
+export function sessionRoute(sessionId: string, profile?: null | string): string {
+  const path = `${SESSION_ROUTE_PREFIX}${encodeURIComponent(sessionId)}`
+  const profileKey = profile?.trim()
+
+  return profileKey ? `${path}?profile=${encodeURIComponent(profileKey)}` : path
 }
 
 export function appViewForPath(pathname: string): AppView {

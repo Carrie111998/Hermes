@@ -12,11 +12,16 @@ import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesk
 import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { persistentAtom } from '@/lib/persisted'
+import { parseSessionIdentityKey, sessionIdentityKey, sessionMatchesIdentity } from '@/lib/session-identity'
 import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
-import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
+import {
+  $selectedSessionIdentityKey,
+  $sessions,
+  workspaceCwdForNewSession
+} from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
 // First-class, per-profile Projects (named, multi-folder workspaces). State is
@@ -59,15 +64,13 @@ function projectsStaleBackendError(): Error {
 // refresh once the server snapshot has caught up.
 export const $removedSessionIds = atom<Set<string>>(new Set())
 
-export function tombstoneSessions(ids: Array<null | string | undefined>): void {
+export function tombstoneSessions(ids: Array<null | string | undefined>, profile?: null | string): void {
   const next = new Set($removedSessionIds.get())
   const before = next.size
 
   for (const id of ids) {
-    const trimmed = id?.trim()
-
-    if (trimmed) {
-      next.add(trimmed)
+    if (id) {
+      next.add(sessionIdentityKey(id, profile ?? $activeGatewayProfile.get()))
     }
   }
 
@@ -76,7 +79,7 @@ export function tombstoneSessions(ids: Array<null | string | undefined>): void {
   }
 }
 
-export function untombstoneSessions(ids: Array<null | string | undefined>): void {
+export function untombstoneSessions(ids: Array<null | string | undefined>, profile?: null | string): void {
   const current = $removedSessionIds.get()
 
   if (!current.size) {
@@ -86,10 +89,8 @@ export function untombstoneSessions(ids: Array<null | string | undefined>): void
   const next = new Set(current)
 
   for (const id of ids) {
-    const trimmed = id?.trim()
-
-    if (trimmed) {
-      next.delete(trimmed)
+    if (id) {
+      next.delete(sessionIdentityKey(id, profile ?? $activeGatewayProfile.get()))
     }
   }
 
@@ -104,15 +105,14 @@ export function untombstoneSessions(ids: Array<null | string | undefined>): void
 // the backend catches up. Keyed by id, so concurrent deletes stay independent.
 export const $sessionMutationsInFlight = atom<Set<string>>(new Set())
 
-function mutateInFlight(ids: Array<null | string | undefined>, add: boolean): void {
+function mutateInFlight(ids: Array<null | string | undefined>, add: boolean, profile?: null | string): void {
   const current = $sessionMutationsInFlight.get()
   const next = new Set(current)
 
   for (const id of ids) {
-    const trimmed = id?.trim()
-
-    if (trimmed) {
-      add ? next.add(trimmed) : next.delete(trimmed)
+    if (id) {
+      const identityKey = sessionIdentityKey(id, profile ?? $activeGatewayProfile.get())
+      add ? next.add(identityKey) : next.delete(identityKey)
     }
   }
 
@@ -121,8 +121,10 @@ function mutateInFlight(ids: Array<null | string | undefined>, add: boolean): vo
   }
 }
 
-export const beginSessionMutation = (ids: Array<null | string | undefined>): void => mutateInFlight(ids, true)
-export const endSessionMutation = (ids: Array<null | string | undefined>): void => mutateInFlight(ids, false)
+export const beginSessionMutation = (ids: Array<null | string | undefined>, profile?: null | string): void =>
+  mutateInFlight(ids, true, profile)
+export const endSessionMutation = (ids: Array<null | string | undefined>, profile?: null | string): void =>
+  mutateInFlight(ids, false, profile)
 
 // True while the disk scan is in flight (drives the "finding repos" hint).
 export const $reposScanning = atom(false)
@@ -371,7 +373,8 @@ async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
       return
     }
 
-    const scoped = new Set(res.scoped_session_ids ?? [])
+    const profile = $activeGatewayProfile.get()
+    const scoped = new Set((res.scoped_session_ids ?? []).map(id => sessionIdentityKey(id, profile)))
     $projectTree.set(res.projects ?? [])
     $activeProjectId.set(res.active_id ?? null)
     const tombstones = $removedSessionIds.get()
@@ -835,13 +838,16 @@ export async function addProjectFolder(
 // Used so deleting a project you have a session open from kicks you back to the
 // intro draft instead of stranding you in a now-orphaned view.
 function openSessionBelongsToProject(projectId: string, projects: ProjectInfo[]): boolean {
-  const openId = $selectedStoredSessionId.get()
+  const identityKey = $selectedSessionIdentityKey.get()
+  const openIdentity = identityKey ? parseSessionIdentityKey(identityKey) : null
 
-  if (!openId) {
+  if (!openIdentity) {
     return false
   }
 
-  const open = $sessions.get().find(s => sessionMatchesStoredId(s, openId))
+  const open = $sessions
+    .get()
+    .find(s => sessionMatchesIdentity(s, openIdentity.storedSessionId, openIdentity.profile))
 
   return Boolean(open && liveSessionProjectId(open, projects) === projectId)
 }

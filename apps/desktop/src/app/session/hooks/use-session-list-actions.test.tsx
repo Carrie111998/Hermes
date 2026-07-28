@@ -1,15 +1,19 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { resolveManualSessionOrderIds } from '@/app/chat/sidebar/order'
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import {
   $cronSessions,
   $messagingSessions,
   $sessions,
+  $sessionsHydratedProfileScope,
   $sessionsLoading,
   setCronSessions,
   setMessagingSessions,
   setSessions,
+  setSessionsHydratedProfileScope,
   setSessionsLoading
 } from '@/store/session'
 
@@ -77,6 +81,7 @@ beforeEach(() => {
   setSessions([])
   setCronSessions([])
   setMessagingSessions([])
+  setSessionsHydratedProfileScope(null)
   setSessionsLoading(false)
 })
 
@@ -84,6 +89,7 @@ afterEach(() => {
   setSessions([])
   setCronSessions([])
   setMessagingSessions([])
+  setSessionsHydratedProfileScope(null)
   setSessionsLoading(false)
 })
 
@@ -151,11 +157,67 @@ describe('refreshSessions identity + loading hygiene', () => {
     expect(loadingStates).toEqual([false])
   })
 
+  it('does not mark a new populated profile scope hydrated until its refresh succeeds', async () => {
+    let resolveAll!: (value: SidebarSessionsResponse) => void
+
+    const pendingAll = new Promise<SidebarSessionsResponse>(resolve => {
+      resolveAll = resolve
+    })
+
+    setSessions([row('alpha', { profile: 'alpha' })])
+    setSessionsHydratedProfileScope('alpha')
+    listSidebarSessions.mockReturnValue(pendingAll)
+
+    const { rerender, result } = renderHook(
+      ({ profileScope }) => useSessionListActions({ profileScope }),
+      { initialProps: { profileScope: 'alpha' } }
+    )
+
+    rerender({ profileScope: '__all__' })
+    let refresh!: Promise<void>
+
+    act(() => {
+      refresh = result.current.refreshSessions()
+    })
+
+    expect($sessionsLoading.get()).toBe(false)
+    expect($sessionsHydratedProfileScope.get()).toBe('alpha')
+
+    const alpha = sessionIdentityKey('alpha', 'alpha')
+    const beta = sessionIdentityKey('beta', 'beta')
+
+    expect(
+      resolveManualSessionOrderIds(
+        [alpha],
+        [alpha, beta],
+        true,
+        $sessionsHydratedProfileScope.get() !== '__all__',
+        ['alpha', 'beta']
+      )
+    ).toEqual([alpha, beta])
+
+    await act(async () => {
+      resolveAll(sidebar({ sessions: [row('alpha', { profile: 'alpha' })] }))
+      await refresh
+    })
+
+    expect($sessionsHydratedProfileScope.get()).toBe('__all__')
+    expect(
+      resolveManualSessionOrderIds(
+        [alpha],
+        [alpha, beta],
+        true,
+        $sessionsHydratedProfileScope.get() !== '__all__',
+        ['alpha', 'beta']
+      )
+    ).toEqual([alpha])
+  })
+
   it('drops rows the user just deleted, even when the backend page still lists them', async () => {
     // A delete RPC is in flight: the row is tombstoned optimistically but the
     // batched refresh still carries it (and a lineage-tip variant). Both must be
     // filtered so the optimistic removal never flashes back.
-    removed.ids = new Set(['b', 'root-c'])
+    removed.ids = new Set([sessionIdentityKey('b', 'default'), sessionIdentityKey('root-c', 'default')])
     listSidebarSessions.mockResolvedValue(
       sidebar({
         sessions: [row('a'), row('b'), row('c', { _lineage_root_id: 'root-c' } as Partial<SessionInfo>)]
@@ -169,6 +231,21 @@ describe('refreshSessions identity + loading hygiene', () => {
     })
 
     expect($sessions.get().map(s => s.id)).toEqual(['a'])
+  })
+
+  it('applies an optimistic tombstone only to the owning profile when stored ids collide', async () => {
+    removed.ids = new Set([sessionIdentityKey('shared', 'alpha')])
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [row('shared', { profile: 'alpha' }), row('shared', { profile: 'beta' })] })
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(s => s.profile)).toEqual(['beta'])
   })
 
   it('still shows loading for the initial (empty-list) fetch', async () => {

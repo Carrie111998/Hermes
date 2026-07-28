@@ -15,6 +15,7 @@ import {
   resolveDesktopCommand
 } from '@/lib/desktop-slash-commands'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
@@ -26,6 +27,7 @@ import { $petGenInput, openPetGenerate } from '@/store/pet-generate'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $connection,
+  $selectedSessionIdentityKey,
   $sessions,
   $yoloActive,
   resolveComposerSessionKey,
@@ -44,12 +46,14 @@ import type {
   SessionTitleResponse,
   SlashExecResponse
 } from '../../../types'
+import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import { resolveTargetSessionId } from './resolve-target-session'
 import {
   type GatewayRequest,
   isSessionIdCandidate,
   isTargetSessionBusy,
+  type ProfileGatewayRequest,
   renderCommandsCatalog,
   renderRpcResult,
   slashStatusText,
@@ -76,13 +80,15 @@ interface SlashCommandDeps {
     sessionId: string,
     role: ChatMessage['role'],
     text: string,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    options?: { insertBeforeActiveReply?: boolean; storedSessionProfile?: null | string }
   ) => void
   branchCurrentSession: () => Promise<boolean>
   busyRef: MutableRefObject<boolean>
   copy: Translations['desktop']
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
+  getRoutedStoredSessionProfile: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   handleSkinCommand: (arg: string) => string
   handoffSession: (
@@ -92,14 +98,16 @@ interface SlashCommandDeps {
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
   requestGateway: GatewayRequest
-  resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  requestGatewayForProfile?: ProfileGatewayRequest
+  resumeStoredSession: (storedSessionId: string, profile?: null | string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
   submitPromptText: (rawText: string, options?: SubmitTextOptions) => Promise<boolean>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    storedSessionProfile?: null | string
   ) => ClientSessionState
 }
 
@@ -113,12 +121,14 @@ export function useSlashCommand(deps: SlashCommandDeps) {
     copy,
     createBackendSessionForSend,
     getRoutedStoredSessionId,
+    getRoutedStoredSessionProfile,
     getRuntimeIdForStoredSession,
     handleSkinCommand,
     handoffSession,
     openMemoryGraph,
     refreshSessions,
     requestGateway,
+    requestGatewayForProfile,
     resumeStoredSession,
     selectedStoredSessionIdRef,
     startFreshSessionDraft,
@@ -129,7 +139,48 @@ export function useSlashCommand(deps: SlashCommandDeps) {
   const compressInFlightRef = useRef(new Set<string>())
 
   return useCallback(
-    async (rawCommand: string, options?: { sessionId?: string; recordInput?: boolean }) => {
+    async (
+      rawCommand: string,
+      options?: {
+        profile?: null | string
+        recordInput?: boolean
+        sessionId?: null | string
+        storedSessionId?: null | string
+      }
+    ) => {
+      const routedStoredSessionId = options?.storedSessionId ?? getRoutedStoredSessionId()
+      const routedStoredSessionProfile = options?.storedSessionId ? options.profile : getRoutedStoredSessionProfile()
+      const selectedStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
+      const selectedIdentityKey = $selectedSessionIdentityKey.get()
+      const selectedIdentity = selectedIdentityKey ? parseSessionIdentityKey(selectedIdentityKey) : null
+
+      const selectedOwnerProfile =
+        selectedStoredSessionId && selectedIdentity?.storedSessionId === selectedStoredSessionId
+          ? selectedIdentity.profile
+          : null
+
+      const fallbackProfile = $activeGatewayProfile.get()
+
+      const resolvedOwnerProfile =
+        options?.profile ||
+        routedStoredSessionProfile ||
+        $sessionStates.get()[options?.sessionId ?? '']?.storedSessionProfile ||
+        selectedOwnerProfile ||
+        (routedStoredSessionId || selectedStoredSessionId
+          ? await resolveSessionProfile(routedStoredSessionId ?? selectedStoredSessionId)
+          : undefined)
+
+      // Capture the target owner before any create/resume/command await. A
+      // profile switch while a slash command is resolving must not re-home it.
+      const targetProfile = normalizeProfileKey(resolvedOwnerProfile ?? fallbackProfile)
+
+      const requestTargetGateway: GatewayRequest = (method, params, timeoutMs) =>
+        requestGatewayForProfile
+          ? requestGatewayForProfile(targetProfile, method, params, timeoutMs)
+          : timeoutMs === undefined
+            ? requestGateway(method, params)
+            : requestGateway(method, params, timeoutMs)
+
       // Resolve the session this command targets through the SHARED ladder that
       // submit.ts uses. A slash command runs backend commands against a runtime
       // session, and per-session state (`/goal`, `/usage`, `/status`) is keyed by
@@ -145,9 +196,10 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           createSession: () => createBackendSessionForSend(preview),
           explicitRuntimeId: sessionHint,
           getRuntimeIdForStoredSession,
-          requestGateway,
-          routedStoredSessionId: getRoutedStoredSessionId(),
-          selectedStoredSessionId: selectedStoredSessionIdRef.current
+          requestGateway: requestTargetGateway,
+          routedStoredSessionId,
+          selectedStoredSessionId,
+          targetProfile
         })
 
       // Resolve the target session plus a writer for inline slash output, or
@@ -155,7 +207,17 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       // build-renderSlashOutput boilerplate every exec-style handler repeats.
       const withSlashOutput = async (
         ctx: SlashActionCtx
-      ): Promise<{ render: (text: string) => void; sessionId: string; storedSessionId: string | null } | null> => {
+      ): Promise<{
+        render: (text: string) => void
+        sessionId: string
+        storedSessionId: string | null
+        storedSessionProfile: string
+      } | null> => {
+        // A draft may not have published runtime state yet. Snapshot its owner
+        // before session creation/resume awaits so a profile switch cannot
+        // re-home the command after it starts.
+        const fallbackSessionProfile = targetProfile
+
         // A slash on a fresh draft creates the backend session; seed the
         // sidebar preview with the typed command so the row doesn't sit as
         // "Untitled session" (auto-title only fires after a full exchange,
@@ -176,7 +238,14 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         // to updateSessionState re-keyed the tile's cache entry onto the
         // primary's stored session. Fall back to the selection only for a
         // session with no published state yet (a draft this call just created).
-        const storedSessionId = $sessionStates.get()[sessionId]?.storedSessionId ?? selectedStoredSessionIdRef.current
+        const publishedState = $sessionStates.get()[sessionId]
+
+        const storedSessionId =
+          publishedState?.storedSessionId ?? options?.storedSessionId ?? selectedStoredSessionIdRef.current
+
+        const storedSessionProfile = normalizeProfileKey(
+          publishedState?.storedSessionProfile ?? fallbackSessionProfile
+        )
 
         // Header carries the command token only. The full invocation would
         // duplicate long args — `/goal <prose>` echoed the whole goal in the
@@ -186,10 +255,29 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             sessionId,
             'system',
             ctx.recordInput ? slashStatusText(`/${ctx.name}`, text) : text,
-            storedSessionId
+            storedSessionId,
+            { storedSessionProfile }
           )
 
-        return { render, sessionId, storedSessionId }
+        return { render, sessionId, storedSessionId, storedSessionProfile }
+      }
+
+      const updateStoredSessionTitle = (
+        storedSessionId: string | null,
+        storedSessionProfile: string,
+        title: string | null
+      ) => {
+        if (!storedSessionId) {
+          return
+        }
+
+        const targetIdentity = sessionIdentityKey(storedSessionId, storedSessionProfile)
+
+        setSessions(prev =>
+          prev.map(session =>
+            sessionIdentityKey(session.id, session.profile) === targetIdentity ? { ...session, title } : session
+          )
+        )
       }
 
       // `exec` commands (and unknown skill / quick commands the backend owns)
@@ -288,7 +376,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // rather than re-reading the globals here — a session switch between
             // dispatch and this branch would otherwise queue the kickoff on
             // whichever chat is now in front.
-            const queueKey = resolveComposerSessionKey(storedSessionId, $sessions.get()) || storedSessionId || sessionId
+            const targetProfile =
+              $sessionStates.get()[sessionId]?.storedSessionProfile ?? $activeGatewayProfile.get()
+
+            const queueKey =
+              resolveComposerSessionKey(storedSessionId, $sessions.get(), targetProfile) ||
+              sessionIdentityKey(storedSessionId || sessionId, targetProfile)
 
             if (enqueueQueuedPrompt(queueKey, { attachments: [], text: message, displayText })) {
               renderSlashOutput('session busy — message queued to send when the current turn finishes')
@@ -303,15 +396,21 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // same pair the output writer and the busy gate above already use.
           // Bare `submitPromptText(message)` let submit re-resolve from
           // `activeSessionIdRef`, which names the FOREGROUND chat: a `/work`
-          // typed into a fresh ⌘T tab loaded the skill in that tab, then fired
-          // its kickoff as a user message into whatever conversation was on
-          // screen. Every other target the dispatcher serves (tile, background
-          // queue drain, a session created by this very call) had the same leak.
-          await submitPromptText(message, { sessionId, storedSessionId, displayText })
+          // typed into a fresh ⌘T tab loaded the skill in that tab, printed
+          // "⚡ loading skill" there, then fired its kickoff as a user message
+          // into whatever conversation was on screen. Every other target the
+          // dispatcher serves (tile, background queue drain, a session created
+          // by this very call) had the same leak.
+          await submitPromptText(message, {
+            profile: $sessionStates.get()[sessionId]?.storedSessionProfile ?? $activeGatewayProfile.get(),
+            sessionId,
+            storedSessionId,
+            displayText
+          })
         }
 
         try {
-          const result = await requestGateway<unknown>('slash.exec', {
+          const result = await requestTargetGateway<unknown>('slash.exec', {
             session_id: sessionId,
             command: command.replace(/^\/+/, '')
           })
@@ -347,7 +446,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
         try {
           const dispatch = parseCommandDispatch(
-            await requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
+            await requestTargetGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
           )
 
           if (!dispatch) {
@@ -403,7 +502,10 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // Forward the surface's declared timeout when present; the default
           // requestGateway layer keeps (30s) is too tight for RPCs that do
           // real work.
-          const result = await requestGateway<unknown>(surface.rpc, params, surface.timeoutMs)
+          const result = await (requestGatewayForProfile
+            ? requestTargetGateway<unknown>(surface.rpc, params, surface.timeoutMs)
+            : requestGateway<unknown>(surface.rpc, params, surface.timeoutMs))
+
           const body = renderRpcResult(result, ctx.name)
 
           renderSlashOutput(body || `/${ctx.name}: no output`)
@@ -453,17 +555,18 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          const { render: renderSlashOutput, sessionId, storedSessionId } = resolved
+          const { render: renderSlashOutput, sessionId, storedSessionId, storedSessionProfile } = resolved
           const focusTopic = ctx.arg.trim()
-          const noticeId = `session-compress:${sessionId}`
+          const operationKey = sessionIdentityKey(sessionId, storedSessionProfile)
+          const noticeId = `session-compress:${operationKey}`
 
           // Coalesce concurrent compress requests for the same session so a
           // double-enter doesn't fire two LLM summarise calls.
-          if (compressInFlightRef.current.has(sessionId)) {
+          if (compressInFlightRef.current.has(operationKey)) {
             return
           }
 
-          compressInFlightRef.current.add(sessionId)
+          compressInFlightRef.current.add(operationKey)
           notify({
             durationMs: 0,
             id: noticeId,
@@ -472,7 +575,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           })
 
           try {
-            const result = await requestGateway<SessionCompressResponse>(
+            const result = await requestTargetGateway<SessionCompressResponse>(
               'session.compress',
               {
                 session_id: sessionId,
@@ -491,7 +594,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               updateSessionState(
                 sessionId,
                 state => ({ ...state, messages: toChatMessages(result.messages!) }),
-                storedSessionId
+                storedSessionId,
+                storedSessionProfile
               )
             }
 
@@ -502,11 +606,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             }
 
             if (result?.info?.title !== undefined) {
-              setSessions(prev =>
-                prev.map(session =>
-                  session.id === sessionId ? { ...session, title: result.info!.title || null } : session
-                )
-              )
+              updateStoredSessionTitle(storedSessionId, storedSessionProfile, result.info.title || null)
             }
 
             if (result?.summary?.headline) {
@@ -568,7 +668,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           } finally {
-            compressInFlightRef.current.delete(sessionId)
+            compressInFlightRef.current.delete(operationKey)
           }
         },
         // /yolo maps to the status-bar YOLO control — a per-session approval
@@ -586,7 +686,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           }
 
           try {
-            const active = await setSessionYolo(requestGateway, sid, next)
+            const active = await setSessionYolo(requestTargetGateway, sid, next)
             appendSessionTextMessage(sid, 'system', copy.yoloSystem(active))
           } catch {
             notify({ kind: 'error', title: copy.yoloTitle, message: copy.yoloToggleFailed })
@@ -687,11 +787,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          const { render: renderSlashOutput, sessionId } = resolved
+          const { render: renderSlashOutput, sessionId, storedSessionId, storedSessionProfile } = resolved
           const { arg } = ctx
 
           try {
-            const result = await requestGateway<SessionTitleResponse>('session.title', {
+            const result = await requestTargetGateway<SessionTitleResponse>('session.title', {
               session_id: sessionId,
               title: arg
             })
@@ -699,7 +799,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             const finalTitle = (result?.title || arg).trim()
             const queued = result?.pending === true
 
-            setSessions(prev => prev.map(s => (s.id === sessionId ? { ...s, title: finalTitle || null } : s)))
+            updateStoredSessionTitle(storedSessionId, storedSessionProfile, finalTitle || null)
             await refreshSessions().catch(() => undefined)
             renderSlashOutput(
               finalTitle
@@ -720,7 +820,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           const { render: renderSlashOutput, sessionId } = resolved
 
           try {
-            const catalog = await requestGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })
+            const catalog = await requestTargetGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })
 
             renderSlashOutput(renderCommandsCatalog(catalog, copy))
           } catch (err) {
@@ -768,7 +868,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               return
             }
 
-            setPetScale(requestGateway, value)
+            setPetScale(requestTargetGateway, value)
 
             return
           }
@@ -815,7 +915,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           }
 
           try {
-            const result = await requestGateway<BrowserManageResponse>('browser.manage', {
+            const result = await requestTargetGateway<BrowserManageResponse>('browser.manage', {
               action: cmdAction,
               session_id: sessionId,
               ...(url && { url })
@@ -877,7 +977,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           return
         }
 
-        const sessions = $sessions.get()
+        const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+
+        const sessions = $sessions
+          .get()
+          .filter(session => normalizeProfileKey(session.profile) === activeProfile)
+
         const lower = query.toLowerCase()
 
         const match =
@@ -950,7 +1055,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
       }
 
-      await runSlash(rawCommand, options?.sessionId, options?.recordInput ?? true)
+      await runSlash(rawCommand, options?.sessionId ?? undefined, options?.recordInput ?? true)
     },
     [
       activeSessionIdRef,
@@ -960,12 +1065,14 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       copy,
       createBackendSessionForSend,
       getRoutedStoredSessionId,
+      getRoutedStoredSessionProfile,
       getRuntimeIdForStoredSession,
       handleSkinCommand,
       handoffSession,
       openMemoryGraph,
       refreshSessions,
       requestGateway,
+      requestGatewayForProfile,
       resumeStoredSession,
       selectedStoredSessionIdRef,
       startFreshSessionDraft,

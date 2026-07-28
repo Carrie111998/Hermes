@@ -4,6 +4,11 @@ import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { Codecs, persistentAtom } from '@/lib/persisted'
+import {
+  parseSessionIdentityKey,
+  sessionIdentityKey,
+  sessionIdentityKeysFromLegacyIds
+} from '@/lib/session-identity'
 import { arraysEqual, insertUniqueId, readKey } from '@/lib/storage'
 
 import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride, togglePane } from './panes'
@@ -70,11 +75,69 @@ export const $sidebarWidth: ReadableAtom<number> = computed($paneStates, states 
   return typeof override === 'number' ? override : SIDEBAR_DEFAULT_WIDTH
 })
 
-export const $pinnedSessionIds = persistentAtom(SIDEBAR_PINNED_STORAGE_KEY, [] as string[], Codecs.stringArray)
+const SESSION_IDENTITY_ARRAY_VERSION = 1
+
+interface PersistedSessionIdentity {
+  profile: string
+  storedSessionId: string
+}
+
+function isPersistedSessionIdentity(value: unknown): value is PersistedSessionIdentity {
+  return (
+    Boolean(value) &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    typeof (value as PersistedSessionIdentity).profile === 'string' &&
+    typeof (value as PersistedSessionIdentity).storedSessionId === 'string' &&
+    (value as PersistedSessionIdentity).storedSessionId.length > 0
+  )
+}
+
+const sessionIdentityArrayCodec = {
+  decode: (raw: string): string[] => {
+    const parsed = JSON.parse(raw) as unknown
+
+    // Main's legacy schema was an ownerless string array. The container—not
+    // delimiter-looking bytes inside an id—is the only safe migration signal.
+    if (Array.isArray(parsed)) {
+      return sessionIdentityKeysFromLegacyIds(
+        parsed.filter((item): item is string => typeof item === 'string' && item.length > 0)
+      )
+    }
+
+    const stored = parsed as { identities?: unknown; version?: unknown } | null
+
+    if (
+      !stored ||
+      typeof stored !== 'object' ||
+      stored.version !== SESSION_IDENTITY_ARRAY_VERSION ||
+      !Array.isArray(stored.identities)
+    ) {
+      return []
+    }
+
+    return [
+      ...new Set(
+        stored.identities
+          .filter(isPersistedSessionIdentity)
+          .map(identity => sessionIdentityKey(identity.storedSessionId, identity.profile))
+      )
+    ]
+  },
+  encode: (identities: string[]): null | string =>
+    identities.length === 0
+      ? null
+      : JSON.stringify({
+          identities: identities.map(parseSessionIdentityKey),
+          version: SESSION_IDENTITY_ARRAY_VERSION
+        })
+}
+
+export const $pinnedSessionIds = persistentAtom(SIDEBAR_PINNED_STORAGE_KEY, [] as string[], sessionIdentityArrayCodec)
 export const $sidebarSessionOrderIds = persistentAtom(
   SIDEBAR_SESSION_ORDER_STORAGE_KEY,
   [] as string[],
-  Codecs.stringArray
+  sessionIdentityArrayCodec
 )
 export const $sidebarSessionOrderManual = persistentAtom(SIDEBAR_SESSION_ORDER_MANUAL_STORAGE_KEY, false, Codecs.bool)
 export const $sidebarWorkspaceOrderIds = persistentAtom(
@@ -383,15 +446,24 @@ export function unpinSession(sessionId: string) {
   )
 }
 
-// Replace the whole pinned order at once (drag-reorder hands back the new order
-// rather than a single move). Keep only ids that are actually pinned so a stale
-// row can't smuggle an unpinned id into the store.
+// Reorder only the submitted visible subset. Concrete profile scopes do not
+// render other profiles' pins, so replacing the whole array here would either
+// erase those hidden pins or reject the drag entirely. Keep only ids that are
+// actually pinned so a stale row cannot smuggle an unpinned id into the store.
 export function setPinnedSessionOrder(ids: string[]) {
   const prev = $pinnedSessionIds.get()
   const pinned = new Set(prev)
-  const next = ids.filter(id => pinned.has(id))
+  const nextVisible = [...new Set(ids.filter(id => pinned.has(id)))]
 
-  if (next.length === prev.length && !arraysEqual(prev, next)) {
+  if (!nextVisible.length) {
+    return
+  }
+
+  const visible = new Set(nextVisible)
+  let nextIndex = 0
+  const next = prev.map(id => (visible.has(id) ? nextVisible[nextIndex++] : id))
+
+  if (!arraysEqual(prev, next)) {
     $pinnedSessionIds.set(next)
   }
 }

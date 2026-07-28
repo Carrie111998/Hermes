@@ -10,6 +10,7 @@ import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { parseSessionIdentityKey } from '@/lib/session-identity'
 import { normalize } from '@/lib/text'
 import { clearClarifyRequest } from '@/store/clarify'
 import {
@@ -21,16 +22,19 @@ import {
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { clearAllPrompts } from '@/store/prompts'
 import {
   $busy,
   $connection,
   $messages,
+  $selectedSessionIdentityKey,
   setAwaitingResponse,
   setBusy,
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
@@ -44,7 +48,6 @@ import type {
   ImageAttachResponse,
   SessionRedirectResponse
 } from '../../../types'
-import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import {
   applyBranchVisibility,
@@ -66,6 +69,7 @@ import {
   type GatewayRequest,
   inlineErrorMessage,
   isSessionNotFoundError,
+  type ProfileGatewayRequest,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
   type SubmitTextOptions
@@ -176,20 +180,23 @@ interface PromptActionsOptions {
   branchCurrentSession: () => Promise<boolean>
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
+  getRoutedStoredSessionProfile: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
   handleSkinCommand: (arg: string) => string
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
-  resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  requestGatewayForProfile?: ProfileGatewayRequest
+  resumeStoredSession: (storedSessionId: string, profile?: null | string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
   sttEnabled: boolean
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
-    storedSessionId?: string | null
+    storedSessionId?: string | null,
+    storedSessionProfile?: null | string
   ) => ClientSessionState
 }
 
@@ -207,12 +214,14 @@ export function usePromptActions({
   branchCurrentSession,
   createBackendSessionForSend,
   getRoutedStoredSessionId,
+  getRoutedStoredSessionProfile,
   getRuntimeIdForStoredSession,
   getRouteToken,
   handleSkinCommand,
   openMemoryGraph,
   refreshSessions,
   requestGateway,
+  requestGatewayForProfile,
   resumeStoredSession,
   selectedStoredSessionIdRef,
   startFreshSessionDraft,
@@ -228,7 +237,7 @@ export function usePromptActions({
       role: ChatMessage['role'],
       text: string,
       storedSessionId?: string | null,
-      options: { insertBeforeActiveReply?: boolean } = {}
+      options: { insertBeforeActiveReply?: boolean; storedSessionProfile?: null | string } = {}
     ) => {
       // Strip ANSI: slash-command output from the backend worker carries SGR
       // color codes (e.g. "Unknown command" in red). The ESC byte is invisible
@@ -269,12 +278,33 @@ export function usePromptActions({
 
           return { ...state, messages }
         },
-        storedSessionId ?? selectedStoredSessionIdRef.current
+        storedSessionId ?? selectedStoredSessionIdRef.current,
+        options.storedSessionProfile
       )
 
       return messageId
     },
     [selectedStoredSessionIdRef, updateSessionState]
+  )
+
+  const captureSessionTarget = useCallback(
+    (sessionId: string) => {
+      const runtimeState = $sessionStates.get()[sessionId]
+      const selectedIdentityKey = $selectedSessionIdentityKey.get()
+      const selectedIdentity = selectedIdentityKey ? parseSessionIdentityKey(selectedIdentityKey) : null
+      const storedSessionId = runtimeState?.storedSessionId ?? selectedStoredSessionIdRef.current
+
+      const selectedProfile =
+        storedSessionId && selectedIdentity?.storedSessionId === storedSessionId ? selectedIdentity.profile : null
+
+      return {
+        profile: normalizeProfileKey(
+          runtimeState?.storedSessionProfile ?? selectedProfile ?? $activeGatewayProfile.get()
+        ),
+        storedSessionId
+      }
+    },
+    [selectedStoredSessionIdRef]
   )
 
   // In-flight drop-time eager uploads, keyed by attachment id. Submit joins
@@ -286,9 +316,10 @@ export function usePromptActions({
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { updateComposerAttachments?: boolean } = {}
+      options: { requestGateway?: GatewayRequest; updateComposerAttachments?: boolean } = {}
     ): Promise<ComposerAttachment[]> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
+      const submitGateway = options.requestGateway ?? requestGateway
       const remote = $connection.get()?.mode === 'remote'
       const synced: ComposerAttachment[] = []
 
@@ -317,7 +348,11 @@ export function usePromptActions({
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
-          const nextAttachment = await uploadComposerAttachment(attachment, { remote, requestGateway, sessionId })
+          const nextAttachment = await uploadComposerAttachment(attachment, {
+            remote,
+            requestGateway: submitGateway,
+            sessionId
+          })
 
           // Update-only: never resurrect a chip the user removed mid-upload.
           if (updateComposerAttachments) {
@@ -401,9 +436,11 @@ export function usePromptActions({
     copy,
     createBackendSessionForSend,
     getRoutedStoredSessionId,
+    getRoutedStoredSessionProfile,
     getRuntimeIdForStoredSession,
     getRouteToken,
     requestGateway,
+    requestGatewayForProfile,
     resumeStoredSession,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
@@ -500,12 +537,14 @@ export function usePromptActions({
     copy,
     createBackendSessionForSend,
     getRoutedStoredSessionId,
+    getRoutedStoredSessionProfile,
     getRuntimeIdForStoredSession,
     handleSkinCommand,
     handoffSession,
     openMemoryGraph,
     refreshSessions,
     requestGateway,
+    requestGatewayForProfile,
     resumeStoredSession,
     selectedStoredSessionIdRef,
     startFreshSessionDraft,
@@ -522,7 +561,16 @@ export function usePromptActions({
         triggerHaptic('selection')
         // Forward the explicit target (background queue drain, tile) — dropping
         // it ran the command against whatever chat happened to be in front.
-        await executeSlashCommand(visibleText, options?.sessionId ? { sessionId: options.sessionId } : undefined)
+        await executeSlashCommand(
+          visibleText,
+          options
+            ? {
+                profile: options.profile,
+                sessionId: options.sessionId,
+                storedSessionId: options.storedSessionId
+              }
+            : undefined
+        )
 
         return true
       }
@@ -557,6 +605,7 @@ export function usePromptActions({
     // The ref is updated via useEffect on every activeSessionId change, so it
     // always reflects the current session — same pattern submitText uses.
     const sessionId = activeSessionIdRef.current
+    const target = sessionId ? captureSessionTarget(sessionId) : null
 
     const releaseBusy = () => {
       setMutableRef(busyRef, false)
@@ -573,22 +622,27 @@ export function usePromptActions({
       return
     }
 
-    updateSessionState(sessionId, state => {
-      const streamId = state.streamId
-      const messages = finalizeInterruptedMessages(state.messages, streamId)
+    updateSessionState(
+      sessionId,
+      state => {
+        const streamId = state.streamId
+        const messages = finalizeInterruptedMessages(state.messages, streamId)
 
-      return {
-        ...state,
-        messages,
-        busy: false,
-        awaitingResponse: false,
-        streamId: null,
-        pendingBranchGroup: null,
-        needsInput: false,
-        interrupted: true,
-        turnStartedAt: null
-      }
-    })
+        return {
+          ...state,
+          messages,
+          busy: false,
+          awaitingResponse: false,
+          streamId: null,
+          pendingBranchGroup: null,
+          needsInput: false,
+          interrupted: true,
+          turnStartedAt: null
+        }
+      },
+      target?.storedSessionId,
+      target?.profile
+    )
 
     clearSessionTodos(sessionId)
     clearSessionSubagents(sessionId)
@@ -598,7 +652,7 @@ export function usePromptActions({
     // raised. Drop this session's pending clarify / approval / sudo / secret so
     // a dead panel (and the sidebar "needs input" dot) can't linger and accept
     // an answer the backend will reject.
-    clearAllPrompts(sessionId)
+    clearAllPrompts(sessionId, target?.profile)
     clearClarifyRequest(undefined, sessionId)
 
     try {
@@ -607,14 +661,12 @@ export function usePromptActions({
     } catch (err) {
       let stopError = err
 
-      if (isSessionNotFoundError(err) && selectedStoredSessionIdRef.current) {
+      if (isSessionNotFoundError(err) && target?.storedSessionId) {
         try {
-          const resumeProfile = await resolveSessionProfile(selectedStoredSessionIdRef.current)
-
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-            session_id: selectedStoredSessionIdRef.current,
+            session_id: target.storedSessionId,
             source: 'desktop',
-            ...(resumeProfile ? { profile: resumeProfile } : {})
+            profile: target.profile
           })
 
           const recoveredId = resumed?.session_id
@@ -634,7 +686,7 @@ export function usePromptActions({
       releaseBusy()
       notifyError(stopError, copy.stopFailed)
     }
-  }, [activeSessionIdRef, busyRef, copy.stopFailed, requestGateway, selectedStoredSessionIdRef, updateSessionState])
+  }, [activeSessionIdRef, busyRef, captureSessionTarget, copy.stopFailed, requestGateway, updateSessionState])
 
   // The desktop steering action is an immediate correction: the core cancels
   // model generation and rebuilds the live turn with displayed reasoning and
@@ -647,6 +699,7 @@ export function usePromptActions({
       // reaches the live model mid-turn, so a stale target delivers the user's
       // correction into a conversation they are no longer looking at.
       const sessionId = activeSessionIdRef.current
+      const target = sessionId ? captureSessionTarget(sessionId) : null
 
       if (!text || !sessionId) {
         return false
@@ -662,22 +715,35 @@ export function usePromptActions({
         // its RPC response. Insert before the live reply *before* awaiting the
         // gateway; appending after the response leaves the correction below a
         // reply that the redirect has already replaced.
-        const messageId = appendSessionTextMessage(id, 'user', text, undefined, { insertBeforeActiveReply: true })
+        const messageId = appendSessionTextMessage(id, 'user', text, target?.storedSessionId, {
+          insertBeforeActiveReply: true,
+          storedSessionProfile: target?.profile
+        })
 
         const discardOptimisticMessage = () =>
-          updateSessionState(id, state => ({
-            ...state,
-            messages: state.messages.filter(message => message.id !== messageId)
-          }))
+          updateSessionState(
+            id,
+            state => ({
+              ...state,
+              messages: state.messages.filter(message => message.id !== messageId)
+            }),
+            target?.storedSessionId,
+            target?.profile
+          )
 
         const moveOptimisticMessageToEnd = () =>
-          updateSessionState(id, state => {
-            const message = state.messages.find(candidate => candidate.id === messageId)
+          updateSessionState(
+            id,
+            state => {
+              const message = state.messages.find(candidate => candidate.id === messageId)
 
-            return message
-              ? { ...state, messages: [...state.messages.filter(candidate => candidate.id !== messageId), message] }
-              : state
-          })
+              return message
+                ? { ...state, messages: [...state.messages.filter(candidate => candidate.id !== messageId), message] }
+                : state
+            },
+            target?.storedSessionId,
+            target?.profile
+          )
 
         try {
           const result = await requestGateway<SessionRedirectResponse>('session.redirect', { session_id: id, text })
@@ -712,14 +778,12 @@ export function usePromptActions({
         // A stale runtime id after reconnect 404s ("session not found"): resume
         // the stored session and retry once, mirroring stopPrompt so a
         // correction right after a reconnect isn't lost to the race.
-        if (isSessionNotFoundError(err) && selectedStoredSessionIdRef.current) {
+        if (isSessionNotFoundError(err) && target?.storedSessionId) {
           try {
-            const resumeProfile = await resolveSessionProfile(selectedStoredSessionIdRef.current)
-
             const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-              session_id: selectedStoredSessionIdRef.current,
+              session_id: target.storedSessionId,
               source: 'desktop',
-              ...(resumeProfile ? { profile: resumeProfile } : {})
+              profile: target.profile
             })
 
             const recoveredId = resumed?.session_id
@@ -738,7 +802,7 @@ export function usePromptActions({
 
       return false
     },
-    [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
+    [activeSessionIdRef, appendSessionTextMessage, captureSessionTarget, requestGateway, updateSessionState]
   )
 
   const reloadFromMessage = useCallback(

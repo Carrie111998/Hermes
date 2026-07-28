@@ -1,4 +1,5 @@
 import { type ChatMessage, type ChatMessagePart, chatMessageText } from '@/lib/chat-messages'
+import { normalizeProfileKey, sessionIdentityKey } from '@/lib/session-identity'
 
 /**
  * Crash-survivable in-flight turn journal.
@@ -37,6 +38,7 @@ export interface JournalableSessionState {
   busy: boolean
   messages: ChatMessage[]
   storedSessionId: null | string
+  storedSessionProfile?: null | string
   streamId: null | string
   turnStartedAt: null | number
 }
@@ -395,7 +397,7 @@ export function mergeInFlightMessages(
 const persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const persistLatest = new Map<string, JournalableSessionState>()
 
-function writeSnapshot(storedSessionId: string, state: JournalableSessionState): void {
+function writeSnapshot(journalKey: string, state: JournalableSessionState): void {
   const tail = recoverableTail(state.messages, state.streamId)
 
   if (tail.length === 0) {
@@ -404,7 +406,7 @@ function writeSnapshot(storedSessionId: string, state: JournalableSessionState):
 
   const journal = loadStore()
 
-  journal.entries[storedSessionId] = {
+  journal.entries[journalKey] = {
     messages: tail,
     streamId: state.streamId,
     turnStartedAt: state.turnStartedAt,
@@ -422,47 +424,118 @@ export function persistInFlightTurnState(state: JournalableSessionState): void {
     return
   }
 
+  const journalKey = sessionIdentityKey(storedSessionId, state.storedSessionProfile)
+
   if (!state.busy && !state.awaitingResponse && !state.streamId) {
-    clearInFlightTurnJournal(storedSessionId)
+    clearInFlightTurnJournal(storedSessionId, state.storedSessionProfile)
 
     return
   }
 
-  persistLatest.set(storedSessionId, state)
+  persistLatest.set(journalKey, state)
 
-  if (persistTimers.has(storedSessionId)) {
+  if (persistTimers.has(journalKey)) {
     return
   }
 
   persistTimers.set(
-    storedSessionId,
+    journalKey,
     setTimeout(() => {
-      persistTimers.delete(storedSessionId)
-      const latest = persistLatest.get(storedSessionId)
+      persistTimers.delete(journalKey)
+      const latest = persistLatest.get(journalKey)
 
-      persistLatest.delete(storedSessionId)
+      persistLatest.delete(journalKey)
 
       if (latest) {
-        writeSnapshot(storedSessionId, latest)
+        writeSnapshot(journalKey, latest)
       }
     }, PERSIST_THROTTLE_MS)
   )
 }
 
-export function readInFlightTurnJournal(storedSessionId: null | string): InFlightTurnSnapshot | null {
+/** Move crash-recovery state when compression rotates a stored session id. */
+export function migrateInFlightTurnJournal(
+  previousStoredSessionId: string,
+  nextStoredSessionId: string,
+  profile?: null | string
+): void {
+  if (previousStoredSessionId === nextStoredSessionId) {
+    return
+  }
+
+  const profileKey = normalizeProfileKey(profile)
+  const previousKey = sessionIdentityKey(previousStoredSessionId, profileKey)
+  const nextKey = sessionIdentityKey(nextStoredSessionId, profileKey)
+  const previousTimer = persistTimers.get(previousKey)
+  const pending = persistLatest.get(previousKey)
+
+  if (previousTimer) {
+    clearTimeout(previousTimer)
+    persistTimers.delete(previousKey)
+  }
+
+  persistLatest.delete(previousKey)
+
+  const journal = loadStore()
+  const legacyPreviousKey = profileKey === 'default' ? previousStoredSessionId : null
+  const previousEntry = journal.entries[previousKey] ?? (legacyPreviousKey ? journal.entries[legacyPreviousKey] : undefined)
+
+  if (previousEntry) {
+    const currentNext = journal.entries[nextKey]
+
+    if (!currentNext || previousEntry.updatedAt >= currentNext.updatedAt) {
+      journal.entries[nextKey] = previousEntry
+    }
+
+    delete journal.entries[previousKey]
+
+    if (legacyPreviousKey) {
+      delete journal.entries[legacyPreviousKey]
+    }
+
+    saveStore(journal)
+  }
+
+  if (pending && !persistLatest.has(nextKey)) {
+    persistInFlightTurnState({
+      ...pending,
+      storedSessionId: nextStoredSessionId,
+      storedSessionProfile: profileKey
+    })
+  }
+}
+
+export function readInFlightTurnJournal(
+  storedSessionId: null | string,
+  profile?: null | string
+): InFlightTurnSnapshot | null {
   if (!storedSessionId) {
     return null
   }
 
   const journal = loadStore()
-  const entry = journal.entries[storedSessionId]
+  const journalKey = sessionIdentityKey(storedSessionId, profile)
+  let entry = journal.entries[journalKey]
+
+  // The original v1 schema keyed entries by raw stored id. Only the default
+  // profile can safely claim an ownerless legacy row; exposing it to every
+  // profile would recreate the transcript leak this compound key prevents.
+  if (!entry && normalizeProfileKey(profile) === 'default') {
+    entry = journal.entries[storedSessionId]
+
+    if (entry) {
+      journal.entries[journalKey] = entry
+      delete journal.entries[storedSessionId]
+      saveStore(journal)
+    }
+  }
 
   if (!entry) {
     return null
   }
 
   if (isExpired(entry)) {
-    delete journal.entries[storedSessionId]
+    delete journal.entries[journalKey]
     saveStore(journal)
 
     return null
@@ -476,9 +549,9 @@ export function readInFlightTurnJournal(storedSessionId: null | string): InFligh
 export function recoverInFlightTurnJournal(
   storedSessionId: null | string,
   baseMessages: ChatMessage[],
-  options: { keepPending?: boolean } = {}
+  options: { keepPending?: boolean; profile?: null | string } = {}
 ): InFlightRecoveryResult {
-  const snapshot = readInFlightTurnJournal(storedSessionId)
+  const snapshot = readInFlightTurnJournal(storedSessionId, options.profile)
 
   if (!snapshot) {
     return {
@@ -493,7 +566,7 @@ export function recoverInFlightTurnJournal(
   const recovered = mergeInFlightMessages(baseMessages, snapshot.messages, options)
 
   if (recovered.caughtUp) {
-    clearInFlightTurnJournal(storedSessionId)
+    clearInFlightTurnJournal(storedSessionId, options.profile)
   }
 
   return {
@@ -503,26 +576,32 @@ export function recoverInFlightTurnJournal(
   }
 }
 
-export function clearInFlightTurnJournal(storedSessionId: null | string): void {
+export function clearInFlightTurnJournal(storedSessionId: null | string, profile?: null | string): void {
   if (!storedSessionId) {
     return
   }
 
-  const timer = persistTimers.get(storedSessionId)
+  const journalKey = sessionIdentityKey(storedSessionId, profile)
+  const timer = persistTimers.get(journalKey)
 
   if (timer) {
     clearTimeout(timer)
-    persistTimers.delete(storedSessionId)
+    persistTimers.delete(journalKey)
   }
 
-  persistLatest.delete(storedSessionId)
+  persistLatest.delete(journalKey)
 
   const journal = loadStore()
+  const keys = [journalKey]
 
-  if (!(storedSessionId in journal.entries)) {
+  if (normalizeProfileKey(profile) === 'default') {
+    keys.push(storedSessionId)
+  }
+
+  if (!keys.some(key => key in journal.entries)) {
     return
   }
 
-  delete journal.entries[storedSessionId]
+  keys.forEach(key => delete journal.entries[key])
   saveStore(journal)
 }

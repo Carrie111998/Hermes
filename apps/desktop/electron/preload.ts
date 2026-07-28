@@ -224,7 +224,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:window-state-changed', listener)
   },
   onFocusSession: callback => {
-    const listener = (_event, sessionId) => callback(sessionId)
+    const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:focus-session', listener)
 
     return () => ipcRenderer.removeListener('hermes:focus-session', listener)

@@ -1,3 +1,5 @@
+import { parseSessionIdentityKey } from '@/lib/session-identity'
+
 /** New ids first, then ids still present in the persisted order. */
 export function reconcileFreshFirst(currentIds: string[], orderIds: string[]): string[] {
   const current = new Set(currentIds)
@@ -7,19 +9,86 @@ export function reconcileFreshFirst(currentIds: string[], orderIds: string[]): s
   return [...currentIds.filter(id => !retainedSet.has(id)), ...retained]
 }
 
-export function resolveManualSessionOrderIds(currentIds: string[], orderIds: string[], manual: boolean): string[] {
-  if (!manual || !currentIds.length || !orderIds.length) {
+export function resolveManualSessionOrderIds(
+  currentIds: string[],
+  orderIds: string[],
+  manual: boolean,
+  hydrating = false,
+  scopedProfiles?: readonly string[]
+): string[] {
+  if (!manual || !orderIds.length) {
     return []
+  }
+
+  if (hydrating) {
+    return orderIds
+  }
+
+  const profilesInScope = new Set(
+    scopedProfiles ?? currentIds.map(id => parseSessionIdentityKey(id).profile)
+  )
+
+  const isInScope = (id: string) => profilesInScope.has(parseSessionIdentityKey(id).profile)
+  const scopedOrderIds = orderIds.filter(isInScope)
+  const hiddenOrderIds = orderIds.filter(id => !isInScope(id))
+
+  if (!currentIds.length) {
+    return scopedProfiles ? hiddenOrderIds : []
   }
 
   const current = new Set(currentIds)
-  const retained = orderIds.filter(id => current.has(id))
+  const retained = scopedOrderIds.filter(id => current.has(id))
 
   if (!retained.length) {
-    return []
+    if (!scopedOrderIds.length) {
+      return orderIds
+    }
+
+    return hiddenOrderIds
   }
 
-  return reconcileFreshFirst(currentIds, orderIds)
+  return mergeScopedSessionOrderIds(orderIds, reconcileFreshFirst(currentIds, scopedOrderIds), [...profilesInScope])
+}
+
+/** Merge a drag order for the profiles represented by `scopedIds` without
+ * erasing persisted order for profiles whose rows are not currently visible. */
+export function mergeScopedSessionOrderIds(
+  orderIds: string[],
+  scopedIds: string[],
+  scopedProfiles?: readonly string[]
+): string[] {
+  if (!scopedIds.length && !scopedProfiles?.length) {
+    return orderIds
+  }
+
+  const nextScopedIds = [...new Set(scopedIds)]
+
+  const profilesInScope = new Set([
+    ...(scopedProfiles ?? []),
+    ...nextScopedIds.map(id => parseSessionIdentityKey(id).profile)
+  ])
+
+  const merged: string[] = []
+  let inserted = false
+
+  for (const id of orderIds) {
+    if (profilesInScope.has(parseSessionIdentityKey(id).profile)) {
+      if (!inserted) {
+        merged.push(...nextScopedIds)
+        inserted = true
+      }
+
+      continue
+    }
+
+    merged.push(id)
+  }
+
+  if (!inserted) {
+    merged.push(...nextScopedIds)
+  }
+
+  return merged
 }
 
 /** Reorder `items` by `orderIds`; items missing from the order surface first. */

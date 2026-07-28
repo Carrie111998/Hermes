@@ -15,7 +15,7 @@ import { startSessionDrag } from './session-drag'
  * the drop has to land on the tab the user can actually see.
  */
 
-vi.mock('@/store/session-states', () => ({ openSessionTile: vi.fn() }))
+vi.mock('@/store/session-states', () => ({ openSessionTile: vi.fn(async () => undefined) }))
 vi.mock('./composer/focus', () => ({ requestComposerInsertRefs: vi.fn() }))
 
 const ZONE = { left: 0, top: 0, right: 1000, bottom: 800 }
@@ -97,7 +97,7 @@ describe('session drop targeting across stacked tabs', () => {
 
     dragTo(row, 980, 400)
 
-    expect(openSessionTile).toHaveBeenCalledWith('dragged', 'right', 'session-tile:visible', undefined)
+    expect(openSessionTile).toHaveBeenCalledWith('dragged', 'right', 'session-tile:visible', undefined, 'default')
     expect(requestComposerInsertRefs).not.toHaveBeenCalled()
   })
 

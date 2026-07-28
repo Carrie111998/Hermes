@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { sessionIdentityKey } from '@/lib/session-identity'
 
 import {
   $composerAttachments,
@@ -65,6 +67,14 @@ describe('session drafts', () => {
     expect(takeSessionDraft('session-b').attachments.map(a => a.id)).toEqual(['image:b'])
   })
 
+  it('keeps opaque session scopes distinct when stored ids differ by whitespace', () => {
+    stashSessionDraft('alpha\u0000shared', 'plain', [])
+    stashSessionDraft('alpha\u0000shared ', 'trailing space', [])
+
+    expect(takeSessionDraft('alpha\u0000shared').text).toBe('plain')
+    expect(takeSessionDraft('alpha\u0000shared ').text).toBe('trailing space')
+  })
+
   it('scopes the unsaved new-session draft separately from real sessions', () => {
     stashSessionDraft(null, 'new chat draft', [])
     stashSessionDraft('session-a', 'session draft', [])
@@ -77,12 +87,13 @@ describe('session drafts', () => {
   it('persists draft text (not attachments) to localStorage', () => {
     stashSessionDraft('session-a', 'survives reload', [attachment({ id: 'file:a' })])
 
-    const persisted = JSON.parse(window.localStorage.getItem(SESSION_DRAFTS_STORAGE_KEY) ?? '{}') as Record<
-      string,
-      string
-    >
+    const persisted = JSON.parse(window.localStorage.getItem(SESSION_DRAFTS_STORAGE_KEY) ?? '{}') as {
+      drafts?: Array<{ scope: string | null; text: string }>
+      version?: number
+    }
 
-    expect(persisted['session-a']).toBe('survives reload')
+    expect(persisted.version).toBe(4)
+    expect(persisted.drafts).toContainEqual({ scope: 'session-a', text: 'survives reload' })
   })
 
   it('evicts empty drafts instead of leaving stale entries behind', () => {
@@ -131,5 +142,23 @@ describe('session drafts', () => {
 
     clearSessionDraft('from')
     clearSessionDraft('to')
+  })
+
+  it('migrates legacy v3 ownerless draft keys to the default profile without inspecting opaque id bytes', async () => {
+    const opaqueStoredId = 'alpha\u0000shared'
+
+    window.localStorage.setItem(
+      'hermes:composer-drafts:v3',
+      JSON.stringify({
+        [opaqueStoredId]: 'opaque unsent text',
+        shared: 'plain unsent text'
+      })
+    )
+    vi.resetModules()
+
+    const reloaded = await import('./composer')
+
+    expect(reloaded.takeSessionDraft(sessionIdentityKey('shared', 'default')).text).toBe('plain unsent text')
+    expect(reloaded.takeSessionDraft(sessionIdentityKey(opaqueStoredId, 'default')).text).toBe('opaque unsent text')
   })
 })

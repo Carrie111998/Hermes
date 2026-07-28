@@ -1,6 +1,9 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
+import { sessionIdentityKey } from '@/lib/session-identity'
+
 import { $clarifyRequest, $clarifyRequests } from './clarify'
+import { $activeGatewayProfile } from './profile'
 import { $activeSessionId } from './session'
 
 // Blocking interactive prompts the gateway raises mid-turn. Each maps to a
@@ -15,16 +18,18 @@ import { $activeSessionId } from './session'
 // exported $*Request view is scoped to the active session, so a background
 // prompt never hijacks the foreground.
 
-const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
+const keyFor = (sessionId: string | null | undefined, profile?: null | string): string =>
+  sessionIdentityKey(sessionId ?? '', profile ?? $activeGatewayProfile.get())
 
 interface KeyedPrompt {
+  profile?: null | string
   sessionId: string | null
 }
 
 interface PromptStore<T extends KeyedPrompt> {
   $active: ReadableAtom<null | T>
   $all: ReadableAtom<Record<string, T>>
-  clear: (sessionId?: string | null, requestId?: string) => void
+  clear: (sessionId?: string | null, requestId?: string, profile?: null | string) => void
   reset: () => void
   set: (request: T) => void
 }
@@ -38,15 +43,18 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   const idOf = (value: T): string | undefined => (value as { requestId?: string }).requestId
 
   return {
-    $active: computed([$all, $activeSessionId], (all, activeId) => all[keyFor(activeId)] ?? null),
+    $active: computed(
+      [$all, $activeSessionId, $activeGatewayProfile],
+      (all, activeId, profile) => all[keyFor(activeId, profile)] ?? null
+    ),
     $all,
     reset: () => $all.set({}),
-    set: request => $all.set({ ...$all.get(), [keyFor(request.sessionId)]: request }),
-    clear(sessionId, requestId) {
+    set: request => $all.set({ ...$all.get(), [keyFor(request.sessionId, request.profile)]: request }),
+    clear(sessionId, requestId, profile) {
       const all = $all.get()
 
       if (sessionId !== undefined) {
-        const key = keyFor(sessionId)
+        const key = keyFor(sessionId, profile)
         const current = all[key]
 
         if (current && !(requestId && idOf(current) !== requestId)) {
@@ -103,15 +111,21 @@ export const clearApprovalRequest = approval.clear
 
 /** The prompt request for one specific session — the tile counterpart of the
  *  active-session `$*Request` views (same map, fixed key). */
-export const sessionApprovalRequest = (sessionId: string | null) =>
-  computed(approval.$all, all => all[keyFor(sessionId)] ?? null)
-export const sessionSudoRequest = (sessionId: string | null) =>
-  computed(sudo.$all, all => all[keyFor(sessionId)] ?? null)
-export const sessionSecretRequest = (sessionId: string | null) =>
-  computed(secret.$all, all => all[keyFor(sessionId)] ?? null)
+export const sessionApprovalRequest = (sessionId: string | null, profile?: null | string) =>
+  computed([approval.$all, $activeGatewayProfile], (all, activeProfile) =>
+    all[keyFor(sessionId, profile ?? activeProfile)] ?? null
+  )
+export const sessionSudoRequest = (sessionId: string | null, profile?: null | string) =>
+  computed([sudo.$all, $activeGatewayProfile], (all, activeProfile) =>
+    all[keyFor(sessionId, profile ?? activeProfile)] ?? null
+  )
+export const sessionSecretRequest = (sessionId: string | null, profile?: null | string) =>
+  computed([secret.$all, $activeGatewayProfile], (all, activeProfile) =>
+    all[keyFor(sessionId, profile ?? activeProfile)] ?? null
+  )
 
-export function registerApprovalInlineAnchor(sessionId: string | null): () => void {
-  const key = keyFor(sessionId)
+export function registerApprovalInlineAnchor(sessionId: string | null, profile?: null | string): () => void {
+  const key = keyFor(sessionId, profile)
 
   const bump = (delta: number) => {
     const all = $approvalInlineAnchors.get()
@@ -126,8 +140,10 @@ export function registerApprovalInlineAnchor(sessionId: string | null): () => vo
 
 /** True when session `sessionId` has an inline approval bar mounted, so its
  *  floating fallback should stand down. Per-session (not global). */
-export const sessionApprovalInlineVisible = (sessionId: string | null) =>
-  computed($approvalInlineAnchors, anchors => (anchors[keyFor(sessionId)] ?? 0) > 0)
+export const sessionApprovalInlineVisible = (sessionId: string | null, profile?: null | string) =>
+  computed([$approvalInlineAnchors, $activeGatewayProfile], (anchors, activeProfile) =>
+    (anchors[keyFor(sessionId, profile ?? activeProfile)] ?? 0) > 0
+  )
 
 export const $sudoRequest = sudo.$active
 export const setSudoRequest = sudo.set
@@ -150,17 +166,21 @@ export const $activeSessionAwaitingInput = computed(
 /** Per-session `awaitingInput` — the tile composer's counterpart of
  *  `$activeSessionAwaitingInput` (same sources, fixed session instead of the
  *  active one). */
-export function sessionAwaitingInput(sessionId: string | null) {
-  return computed([$clarifyRequests, approval.$all, sudo.$all, secret.$all], (clarify, approvals, sudos, secrets) => {
-    const key = keyFor(sessionId)
+export function sessionAwaitingInput(sessionId: string | null, profile?: null | string) {
+  return computed(
+    [$clarifyRequests, approval.$all, sudo.$all, secret.$all, $activeGatewayProfile],
+    (clarify, approvals, sudos, secrets, activeProfile) => {
+      const key = keyFor(sessionId, profile ?? activeProfile)
+      const clarifyKey = sessionId ?? ''
 
-    return Boolean(clarify[key] || approvals[key] || sudos[key] || secrets[key])
-  })
+      return Boolean(clarify[clarifyKey] || approvals[key] || sudos[key] || secrets[key])
+    }
+  )
 }
 
 // Drop in-flight prompts for `sessionId` (a turn ended) across all three kinds —
 // or every parked prompt when no session is given (global reset / tests).
-export function clearAllPrompts(sessionId?: string | null): void {
+export function clearAllPrompts(sessionId?: string | null, profile?: null | string): void {
   if (sessionId === undefined) {
     approval.reset()
     sudo.reset()
@@ -170,7 +190,7 @@ export function clearAllPrompts(sessionId?: string | null): void {
     return
   }
 
-  approval.clear(sessionId)
-  sudo.clear(sessionId)
-  secret.clear(sessionId)
+  approval.clear(sessionId, undefined, profile)
+  sudo.clear(sessionId, undefined, profile)
+  secret.clear(sessionId, undefined, profile)
 }

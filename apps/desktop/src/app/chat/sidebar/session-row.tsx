@@ -12,6 +12,7 @@ import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
@@ -86,7 +87,7 @@ export function SidebarSessionRow({
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
   // True when a clarify prompt in this session is waiting on the user.
-  const needsInput = useStore($attentionSessionIds).includes(session.id)
+  const needsInput = useStore($attentionSessionIds).includes(sessionIdentityKey(session.id, session.profile))
 
   return (
     <SessionContextMenu
@@ -128,6 +129,7 @@ export function SidebarSessionRow({
             </SessionActionsMenu>
           </div>
         }
+        aria-current={isSelected ? 'page' : undefined}
         className={cn(
           'group row-hover relative',
           isSelected && 'bg-(--ui-row-active-background)',
@@ -174,7 +176,7 @@ export function SidebarSessionRow({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'tab')
+              openSession(session.id, () => undefined, 'tab', session.profile)
             }
           }}
           onClick={event => {
@@ -185,7 +187,7 @@ export function SidebarSessionRow({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'window')
+              openSession(session.id, () => undefined, 'window', session.profile)
 
               return
             }
@@ -195,7 +197,7 @@ export function SidebarSessionRow({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'tab')
+              openSession(session.id, () => undefined, 'tab', session.profile)
 
               return
             }

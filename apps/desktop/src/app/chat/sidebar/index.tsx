@@ -27,6 +27,7 @@ import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/he
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { profileColor } from '@/lib/profile-color'
+import { parseSessionIdentityKey, sessionIdentityKey } from '@/lib/session-identity'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
@@ -62,7 +63,14 @@ import {
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
-import { $newChatProfile, $profiles, $profileScope, ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $profiles,
+  $profileScope,
+  ALL_PROFILES,
+  normalizeProfileKey
+} from '@/store/profile'
 import {
   $activeProjectId,
   $projects,
@@ -91,11 +99,12 @@ import {
   $messagingTruncated,
   $sessionProfilesTruncated,
   $sessions,
+  $sessionsHydratedProfileScope,
   $sessionsLoading,
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
-import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
+import { $focusedSessionIdentityKey, $workingSessionIds, type SplitDir } from '@/store/session-states'
 
 import {
   type AppView,
@@ -109,7 +118,13 @@ import type { SidebarNavItem } from '../../types'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarLoadMoreRow } from './load-more-row'
-import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
+import {
+  mergeScopedSessionOrderIds,
+  orderByIds,
+  reconcileOrderIds,
+  resolveManualSessionOrderIds,
+  sameIds
+} from './order'
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import {
@@ -129,6 +144,7 @@ import {
   StartWorkButton,
   useRepoWorktreeMap
 } from './projects'
+import { mergeSidebarSearchResults } from './search-results'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
@@ -195,42 +211,16 @@ const HEADER_ACTION_BTN =
 const HEADER_NAV_BTN =
   'text-(--ui-text-tertiary) opacity-70 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100 focus-visible:opacity-100'
 
-// FTS results cover sessions that aren't in the loaded page; synthesize a
-// minimal SessionInfo so they render in the same row component (resume works
-// by id; the snippet stands in for the preview).
-function searchResultToSession(result: SessionSearchResult): SessionInfo {
-  const ts = result.session_started ?? Date.now() / 1000
-
-  return {
-    archived: false,
-    cwd: null,
-    ended_at: null,
-    id: result.session_id,
-    _lineage_root_id: result.lineage_root ?? null,
-    input_tokens: 0,
-    is_active: false,
-    last_active: ts,
-    message_count: 0,
-    model: result.model ?? null,
-    output_tokens: 0,
-    preview: result.snippet?.trim() || null,
-    source: result.source ?? null,
-    started_at: ts,
-    title: null,
-    tool_call_count: 0
-  }
-}
-
 interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   currentView: AppView
   onNavigate: (item: SidebarNavItem) => void
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreProfileSessions?: (profile: string) => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
-  onResumeSession: (sessionId: string) => void
-  onDeleteSession: (sessionId: string) => void
-  onArchiveSession: (sessionId: string) => void
-  onBranchSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, profile?: null | string) => void
+  onDeleteSession: (sessionId: string, profile?: null | string) => void
+  onArchiveSession: (sessionId: string, profile?: null | string) => void
+  onBranchSession: (sessionId: string, profile?: null | string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   /** Create a brand-new session and open it as a tile on `dir`. */
   onNewSessionSplit: (dir: SplitDir) => void
@@ -291,7 +281,7 @@ export function ChatSidebar({
   const cronOpen = useStore($sidebarCronOpen)
   // The sidebar highlight tracks the FOCUSED session — the interacted tile's
   // tab, else the main selection — so it stays 1:1 with whatever tab is active.
-  const selectedSessionId = useStore($focusedStoredSessionId)
+  const selectedSessionIdentity = useStore($focusedSessionIdentityKey)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
@@ -299,8 +289,10 @@ export function ChatSidebar({
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
   const messagingTruncated = useStore($messagingTruncated)
   const sessionsLoading = useStore($sessionsLoading)
+  const sessionsHydratedProfileScope = useStore($sessionsHydratedProfileScope)
   const sessionProfilesTruncated = useStore($sessionProfilesTruncated)
   const workingSessionIds = useStore($workingSessionIds)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
   // Only surface the profile switcher when more than one profile exists, so
@@ -368,7 +360,7 @@ export function ChatSidebar({
     }
   }, [])
 
-  const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
+  const activeSidebarSessionId = currentView === 'chat' ? selectedSessionIdentity : null
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -403,10 +395,12 @@ export function ChatSidebar({
     // them too — otherwise a pinned cron job can't resolve into the Pinned
     // section. Recents take precedence on id collisions (set last).
     for (const s of [...cronSessions, ...visibleSessions]) {
-      map.set(s.id, s)
+      map.set(sessionIdentityKey(s.id, s.profile), s)
 
-      if (s._lineage_root_id && !map.has(s._lineage_root_id)) {
-        map.set(s._lineage_root_id, s)
+      const lineageKey = s._lineage_root_id ? sessionIdentityKey(s._lineage_root_id, s.profile) : null
+
+      if (lineageKey && !map.has(lineageKey)) {
+        map.set(lineageKey, s)
       }
     }
 
@@ -418,10 +412,12 @@ export function ChatSidebar({
     const out: SessionInfo[] = []
 
     for (const pinId of pinnedSessionIds) {
-      const session = sessionByAnyId.get(pinId)
+      const parsedPin = parseSessionIdentityKey(pinId)
+      const pinIdentity = sessionIdentityKey(parsedPin.storedSessionId, parsedPin.profile)
+      const session = sessionByAnyId.get(pinIdentity)
 
-      if (session && !seen.has(session.id)) {
-        seen.add(session.id)
+      if (session && !seen.has(sessionPinId(session))) {
+        seen.add(sessionPinId(session))
         out.push(session)
       }
     }
@@ -429,16 +425,10 @@ export function ChatSidebar({
     return out
   }, [pinnedSessionIds, sessionByAnyId])
 
-  const pinnedRealIdSet = useMemo(() => new Set(pinnedSessions.map(s => s.id)), [pinnedSessions])
-  const pinnedIdSet = useMemo(() => new Set(pinnedSessionIds), [pinnedSessionIds])
-
-  // A pinned session belongs to the Pinned section and nowhere else, so every
-  // other list filters it out (the flat recents already did). Match on the live
-  // id AND the durable pin id — a backend snapshot can surface either side of a
-  // compression tip rotation.
+  const pinnedRealIdSet = useMemo(() => new Set(pinnedSessions.map(sessionPinId)), [pinnedSessions])
   const isPinnedSession = useCallback(
-    (session: SessionInfo) => pinnedRealIdSet.has(session.id) || pinnedIdSet.has(sessionPinId(session)),
-    [pinnedRealIdSet, pinnedIdSet]
+    (session: SessionInfo) => pinnedRealIdSet.has(sessionPinId(session)),
+    [pinnedRealIdSet]
   )
 
   // Full-text search across *all* sessions (not just the loaded page) so 699
@@ -457,7 +447,7 @@ export function ChatSidebar({
     setSearchPending(true)
 
     const id = window.setTimeout(() => {
-      void searchSessions(trimmedQuery)
+      void searchSessions(trimmedQuery, activeGatewayProfile)
         .then(res => {
           if (!cancelled) {
             setServerMatches(res.results)
@@ -475,32 +465,17 @@ export function ChatSidebar({
       cancelled = true
       window.clearTimeout(id)
     }
-  }, [trimmedQuery])
+  }, [activeGatewayProfile, trimmedQuery])
 
   const searchResults = useMemo(() => {
     if (!trimmedQuery) {
       return []
     }
 
-    const out = new Map<string, SessionInfo>()
+    const clientMatches = sortedSessions.filter(session => sessionMatchesSearch(session, trimmedQuery))
 
-    for (const s of sortedSessions) {
-      if (sessionMatchesSearch(s, trimmedQuery)) {
-        out.set(s.id, s)
-      }
-    }
-
-    for (const match of serverMatches) {
-      if (out.has(match.session_id)) {
-        continue
-      }
-
-      const loaded = sessionByAnyId.get(match.session_id)
-      out.set(match.session_id, loaded ?? searchResultToSession(match))
-    }
-
-    return [...out.values()]
-  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
+    return mergeSidebarSearchResults(clientMatches, serverMatches, sessionByAnyId, activeGatewayProfile)
+  }, [activeGatewayProfile, trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
 
   const unpinnedAgentSessions = useMemo(
     () => sortedSessions.filter(s => !isPinnedSession(s)),
@@ -508,10 +483,14 @@ export function ChatSidebar({
   )
 
   useEffect(() => {
+    const requestedScope = profileScope === ALL_PROFILES ? ALL_PROFILES : normalizeProfileKey(profileScope)
+
     const next = resolveManualSessionOrderIds(
-      unpinnedAgentSessions.map(s => s.id),
+      unpinnedAgentSessions.map(s => sessionIdentityKey(s.id, s.profile)),
       agentOrderIds,
-      agentOrderManual
+      agentOrderManual,
+      sessionsLoading || sessionsHydratedProfileScope !== requestedScope,
+      showAllProfiles ? profiles.map(profile => normalizeProfileKey(profile.name)) : [normalizeProfileKey(profileScope)]
     )
 
     if (!next.length && agentOrderManual) {
@@ -527,10 +506,22 @@ export function ChatSidebar({
     if (next.length && !sameIds(next, agentOrderIds)) {
       setSidebarSessionOrderIds(next)
     }
-  }, [agentOrderIds, agentOrderManual, unpinnedAgentSessions])
+  }, [
+    agentOrderIds,
+    agentOrderManual,
+    profileScope,
+    profiles,
+    sessionsHydratedProfileScope,
+    sessionsLoading,
+    showAllProfiles,
+    unpinnedAgentSessions
+  ])
 
   const agentSessions = useMemo(
-    () => (agentOrderManual ? orderByIds(unpinnedAgentSessions, s => s.id, agentOrderIds) : unpinnedAgentSessions),
+    () =>
+      agentOrderManual
+        ? orderByIds(unpinnedAgentSessions, s => sessionIdentityKey(s.id, s.profile), agentOrderIds)
+        : unpinnedAgentSessions,
     [unpinnedAgentSessions, agentOrderIds, agentOrderManual]
   )
 
@@ -1108,15 +1099,15 @@ export function ChatSidebar({
   // typed write — no id-prefix sniffing to figure out which level moved.
   const reorderSessions = (ids: string[]) => {
     setSidebarSessionOrderManual(true)
-    setSidebarSessionOrderIds(ids)
+    setSidebarSessionOrderIds(mergeScopedSessionOrderIds(agentOrderIds, ids))
   }
 
   // Persist the new project overview order (drag-to-reorder); orderByIds applies
   // it over the default sort, so stale/new ids reconcile on the next render.
   const reorderProjects = (ids: string[]) => setSidebarProjectOrderIds(ids)
 
-  // Sortable rows carry live session ids; the pinned store is keyed by durable
-  // (lineage-root) ids, so translate before persisting the new order.
+  // Sortable rows carry compound live identities; the pinned store is keyed by
+  // compound durable (lineage-root) identities, so translate before persisting.
   const reorderPinned = (ids: string[]) =>
     setPinnedSessionOrder(
       ids.map(id => {

@@ -7,6 +7,12 @@ import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
 
 export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+export type ProfileGatewayRequest = <T>(
+  profile: string,
+  method: string,
+  params?: Record<string, unknown>,
+  timeoutMs?: number
+) => Promise<T>
 
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -399,6 +405,9 @@ export interface SubmitTextOptions {
    *  dispatcher passes the invocation (`/work fix the leak`) here. */
   displayText?: string
   fromQueue?: boolean
+  /** Owning profile for a stored-session target. Required by background drains
+   *  so two profiles may safely queue the same raw stored id. */
+  profile?: null | string
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground
    *  session between enqueue and drain. */

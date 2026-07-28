@@ -8,6 +8,18 @@
 
 const DEDUPE_INTERVAL_MS = 1000
 
+interface NotificationIdentity {
+  kind?: null | string
+  profile?: null | string
+  sessionId?: null | string
+}
+
+export function notificationDedupeKey(payload: NotificationIdentity): string {
+  const profile = payload.profile?.trim() || 'default'
+
+  return `${payload.kind ?? ''}:${profile}:${payload.sessionId ?? ''}`
+}
+
 // Returns true when `key` was already claimed within the interval (caller drops
 // this one). Self-evicting: stale keys are pruned on every call, so the map
 // can't grow unbounded.

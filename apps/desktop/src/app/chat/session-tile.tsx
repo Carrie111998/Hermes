@@ -34,6 +34,7 @@ import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { sessionTitle } from '@/lib/chat-runtime'
+import { sessionMatchesIdentity } from '@/lib/session-identity'
 import { createComposerAttachmentScope } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -43,8 +44,7 @@ import {
   $gatewayState,
   $selectedStoredSessionId,
   $sessions,
-  sessionMatchesStoredId,
-  sessionPinId
+  resolveSessionPinId
 } from '@/store/session'
 import {
   $sessionStates,
@@ -74,7 +74,7 @@ const NO_MESSAGES: ChatMessage[] = []
 
 /** The tile's SessionView: the same atom shape the primary chat renders
  *  from, computed from this session's slice of `$sessionStates`. */
-function buildTileView(storedSessionId: string): SessionView {
+function buildTileView(storedSessionId: string, profile: string): SessionView {
   const $runtimeId = computed(
     $sessionTiles,
     tiles => tiles.find(t => t.storedSessionId === storedSessionId)?.runtimeId ?? null
@@ -96,6 +96,7 @@ function buildTileView(storedSessionId: string): SessionView {
     $messages,
     $messagesEmpty: computed($messages, messages => messages.length === 0),
     $model: computed($state, state => state?.model ?? ''),
+    $profile: atom(profile),
     $provider: computed($state, state => state?.provider ?? ''),
     $reasoningEffort: computed($state, state => state?.reasoningEffort ?? ''),
     $runtimeId,
@@ -125,15 +126,15 @@ function TileChat({
 
   const scope = useMemo<ComposerScope>(
     () => ({
-      $awaitingInput: sessionAwaitingInput(runtimeId),
+      $awaitingInput: sessionAwaitingInput(runtimeId, activeGatewayProfile),
       $messages: view.$messages,
       attachments,
       target: `tile:${storedSessionId}`
     }),
-    [attachments, runtimeId, storedSessionId, view.$messages]
+    [activeGatewayProfile, attachments, runtimeId, storedSessionId, view.$messages]
   )
 
-  const actions = useSessionTileActions({ runtimeId, scope, storedSessionId })
+  const actions = useSessionTileActions({ profile: activeGatewayProfile, runtimeId, scope, storedSessionId })
 
   // The same attach/pick/paste/drop pipeline the primary composer uses,
   // pointed at this tile's chips + session.
@@ -196,9 +197,10 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const tiles = useStore($sessionTiles)
   const tile = tiles.find(t => t.storedSessionId === storedSessionId)
   const runtimeId = tile?.runtimeId ?? null
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const gatewayOpen = useStore($gatewayState) === 'open'
   const resumingRef = useRef(false)
-  const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
+  const view = useMemo(() => buildTileView(storedSessionId, activeGatewayProfile), [activeGatewayProfile, storedSessionId])
 
   // A tab-strip "+"/⌘T tab is created UNLISTED — its session stays out of
   // $sessions (no sidebar clutter) until it's actually used, so the tab shows
@@ -211,7 +213,8 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const hasMessages = useStore(view.$messagesEmpty) === false
 
   useEffect(() => {
-    const alreadyListed = () => $sessions.get().some(s => sessionMatchesStoredId(s, storedSessionId))
+    const alreadyListed = () =>
+      $sessions.get().some(s => sessionMatchesIdentity(s, storedSessionId, activeGatewayProfile))
 
     if (!runtimeId || !hasMessages || alreadyListed()) {
       return
@@ -225,7 +228,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
         return
       }
 
-      void resolveStoredSession(storedSessionId)
+      void resolveStoredSession(storedSessionId, activeGatewayProfile)
         .then(resolved => {
           if (cancelled || resolved || remaining <= 0) {
             return
@@ -245,7 +248,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
         window.clearTimeout(timer)
       }
     }
-  }, [hasMessages, runtimeId, storedSessionId])
+  }, [activeGatewayProfile, hasMessages, runtimeId, storedSessionId])
 
   // Same gating as the primary's route resume (use-route-resume): never fire
   // session.resume before the gateway is OPEN. Persisted tiles mount at boot
@@ -266,7 +269,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     resumingRef.current = true
 
     delegate
-      .resumeTile(storedSessionId)
+      .resumeTile(storedSessionId, activeGatewayProfile)
       .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err)
@@ -283,7 +286,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
       .finally(() => {
         resumingRef.current = false
       })
-  }, [gatewayOpen, runtimeId, storedSessionId, tile?.error])
+  }, [activeGatewayProfile, gatewayOpen, runtimeId, storedSessionId, tile?.error])
 
   // The gateway (re)opening invalidates any latched error — it likely came
   // from a not-yet-open gateway or the previous connection. Clearing it
@@ -332,8 +335,11 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
  *  the paginated recents page, so it has no `$sessions` row at all until new
  *  activity lands it there — resolving through the tree keeps its tab titled
  *  and tinted instead of a grey "Session" placeholder. */
-export function tileStoredRow(storedSessionId: string): SessionInfo | undefined {
-  const match = (s: SessionInfo) => sessionMatchesStoredId(s, storedSessionId)
+export function tileStoredRow(
+  storedSessionId: string,
+  profile: null | string | undefined = $activeGatewayProfile.get()
+): SessionInfo | undefined {
+  const match = (s: SessionInfo) => sessionMatchesIdentity(s, storedSessionId, profile)
 
   return (
     $sessions.get().find(match) ??
@@ -443,9 +449,9 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
 
   return useSyncExternalStore(subscribe, () => {
     const stored = tileStoredRow(storedSessionId)
-    const pinId = stored ? sessionPinId(stored) : storedSessionId
+    const profile = stored?.profile ?? $activeGatewayProfile.get()
+    const pinId = resolveSessionPinId(stored, storedSessionId, profile)
     const title = tileTitle(storedSessionId)
-    const profile = stored?.profile
     const key = `${pinId}\u0000${title}\u0000${profile ?? ''}`
 
     if (cache.current?.key !== key) {
@@ -484,10 +490,10 @@ export function SessionTabMenu({
   return (
     <span className="contents" onContextMenu={event => event.stopPropagation()}>
       <SessionContextMenu
-        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
-        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
+        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId, profile)}
+        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId, profile)}
         onClose={onClose}
-        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
+        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId, profile)}
         onHideTabBar={onHideTabBar}
         onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
         pinned={pinned}
@@ -550,7 +556,11 @@ export const watchSessionTiles = paneMirror<SessionTile>({
   // two surfaces. Self-subscribing (live state + resolved color), so the strip
   // needn't re-sync when it changes.
   tabLead: storedSessionId => (
-    <SessionStatusDot session={tileStoredRow(storedSessionId)} storedSessionId={storedSessionId} />
+    <SessionStatusDot
+      profile={$activeGatewayProfile.get()}
+      session={tileStoredRow(storedSessionId)}
+      storedSessionId={storedSessionId}
+    />
   ),
   render: storedSessionId => <SessionTilePane storedSessionId={storedSessionId} />,
   tabWrap: (storedSessionId, tab) => (

@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 
 import { type Translations, useI18n } from '@/i18n'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { cn } from '@/lib/utils'
 import { $backgroundRunningSessionIds } from '@/store/composer-status'
 import { $unreadFinishedSessionIds } from '@/store/session'
@@ -80,6 +81,9 @@ export interface SessionStatusDotProps {
    *  the sidebar row's `session.id` and a pane tile's `storedSessionId` are the
    *  same stored id (`$workingSessionIds` et al. map `storedSessionId`). */
   storedSessionId: string
+  /** Owning profile when the stored row is not loaded yet (tiles/routes can
+   * render before the paginated session list contains their row). */
+  profile?: null | string
   /** The session row for color resolution — recents OR the project tree. Both
    *  call sites already hold it; passing it lets the idle dot inherit the
    *  project color even for a session older than the paginated recents page
@@ -102,7 +106,7 @@ export interface SessionStatusDotProps {
  * project color; the active states own the dot with their semantic color so an
  * attention cue is never masked by the inherited tint.
  */
-export function SessionStatusDot({ storedSessionId, session, branchStem, className }: SessionStatusDotProps) {
+export function SessionStatusDot({ storedSessionId, session, branchStem, className, profile }: SessionStatusDotProps) {
   const { t } = useI18n()
   const r = t.sidebar.row
 
@@ -110,12 +114,13 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
   // back to the resolver for a session outside the recents page.
   useStore($sessionColorById)
   const color = sessionColorFor(session) ?? null
+  const identityKey = sessionIdentityKey(storedSessionId, session?.profile ?? profile)
 
-  const needsInput = useStore($attentionSessionIds).includes(storedSessionId)
-  const isWorking = useStore($workingSessionIds).includes(storedSessionId)
-  const isStalled = useStore($stalledSessionIds).includes(storedSessionId)
-  const isUnread = useStore($unreadFinishedSessionIds).includes(storedSessionId)
-  const hasBackground = useStore($backgroundRunningSessionIds).includes(storedSessionId)
+  const needsInput = useStore($attentionSessionIds).includes(identityKey)
+  const isWorking = useStore($workingSessionIds).includes(identityKey)
+  const isStalled = useStore($stalledSessionIds).includes(identityKey)
+  const isUnread = useStore($unreadFinishedSessionIds).includes(identityKey)
+  const hasBackground = useStore($backgroundRunningSessionIds).includes(identityKey)
 
   const dotState = sessionDotState({ hasBackground, isStalled, isUnread, isWorking, needsInput })
 

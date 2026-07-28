@@ -63,7 +63,7 @@ export function rehydrateLiveSessionStatuses(
 
   for (const session of response.sessions ?? []) {
     const runtimeSessionId = session.id?.trim()
-    const storedSessionId = session.session_key?.trim()
+    const storedSessionId = session.session_key
     const needsInput = session.status === 'waiting'
     const working = session.status === 'working' || needsInput
 
@@ -85,15 +85,16 @@ export function rehydrateLiveSessionStatuses(
       existing.needsInput !== needsInput
     ) {
       publishSessionState(runtimeSessionId, {
-        ...(existing ?? createClientSessionState(storedSessionId)),
+        ...(existing ?? createClientSessionState(storedSessionId, [], profileKey)),
         busy: working,
         needsInput,
-        storedSessionId
+        storedSessionId,
+        storedSessionProfile: profileKey
       })
     }
 
     if (!working) {
-      setSessionStalled(storedSessionId, false)
+      setSessionStalled(storedSessionId, false, profileKey)
 
       continue
     }
@@ -106,7 +107,7 @@ export function rehydrateLiveSessionStatuses(
       lastActiveMs > 0 &&
       nowMs - lastActiveMs >= SESSION_WATCHDOG_TIMEOUT_MS
 
-    setSessionStalled(storedSessionId, isQuiet)
+    setSessionStalled(storedSessionId, isQuiet, profileKey)
   }
 
   // A runtime this profile's snapshot reported live LAST poll but not this one

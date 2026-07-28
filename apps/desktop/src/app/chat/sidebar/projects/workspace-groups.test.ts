@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { HermesGitWorktree } from '@/global'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import type { ProjectInfo, SessionInfo } from '@/types/hermes'
 
 import {
@@ -415,6 +416,37 @@ describe('mergeRepoWorktreeGroups (visual enhancer)', () => {
     expect(home?.sessions.map(s => s.id).sort()).toEqual(['a', 'b'])
   })
 
+  it('keeps same-id sessions from different profiles when folding the home lane', () => {
+    const repo = {
+      id: '/repo',
+      path: '/repo',
+      groups: [
+        lane({
+          id: '/repo::branch::main',
+          label: 'main',
+          isMain: true,
+          path: '/repo',
+          sessions: [makeSession('/repo', { id: 'shared', profile: 'alpha' })]
+        }),
+        lane({
+          id: '/repo::branch::old',
+          label: 'old-feature',
+          isMain: true,
+          path: '/repo',
+          sessions: [makeSession('/repo', { id: 'shared', profile: 'beta' })]
+        })
+      ]
+    }
+
+    const discovered: HermesGitWorktree[] = [
+      { branch: 'main', detached: false, isMain: true, locked: false, path: '/repo' }
+    ]
+
+    const home = mergeRepoWorktreeGroups(repo, discovered).find(group => group.isHome)
+
+    expect(home?.sessions.map(session => session.profile).sort()).toEqual(['alpha', 'beta'])
+  })
+
   it('leaves main lanes untouched on a remote backend (no git probe)', () => {
     const repo = {
       id: '/repo',
@@ -697,6 +729,25 @@ describe('overlayLiveLanes', () => {
     expect(overlaid.repos[0].groups.flatMap(g => g.sessions.map(s => s.id))).toEqual(['dup'])
   })
 
+  it('keeps colliding live session ids from different profiles in the same lane', () => {
+    const project = projectNode({
+      id: '/www/app',
+      isAuto: true,
+      repos: [{ id: '/www/app', label: 'app', path: '/www/app', sessionCount: 0, groups: [] }]
+    })
+
+    const live = [
+      makeSession('/www/app', { id: 'shared', profile: 'alpha', title: 'Alpha' }),
+      makeSession('/www/app', { id: 'shared', profile: 'beta', title: 'Beta' })
+    ]
+
+    const overlaid = overlayLiveLanes(project, live)
+    const main = overlaid.repos[0].groups.find(group => group.label === 'main')
+
+    expect(main?.sessions.map(session => session.profile).sort()).toEqual(['alpha', 'beta'])
+    expect(overlaid.sessionCount).toBe(2)
+  })
+
   it('adds a new session to an existing worktree lane keyed by a divergent id (matches by path)', () => {
     // Backend keyed the worktree lane off a branch-style id (no live git probe),
     // but the lane PATH is the worktree dir. A new session under that worktree
@@ -804,7 +855,7 @@ describe('overlayLiveLanes', () => {
     })
 
     // No live rows (both deleted from $sessions); only 'gone' is tombstoned.
-    const overlaid = overlayLiveLanes(project, [a], new Set(['gone']))
+    const overlaid = overlayLiveLanes(project, [a], new Set([sessionIdentityKey('gone', 'default')]))
 
     expect(overlaid.repos[0].groups.map(g => g.id)).toEqual(['/www/app::branch::main'])
     expect(overlaid.repos[0].groups[0].sessions.map(s => s.id)).toEqual(['keep'])
@@ -855,7 +906,7 @@ describe('overlayLivePreviews', () => {
       ]
     })
 
-    const previews = overlayLivePreviews([project], [], [], 3, new Set(['gone']))
+    const previews = overlayLivePreviews([project], [], [], 3, new Set([sessionIdentityKey('gone', 'default')]))
 
     expect(previews['/www/app'].map(s => s.id)).toEqual(['old'])
   })
@@ -864,6 +915,22 @@ describe('overlayLivePreviews', () => {
     const previews = overlayLivePreviews([homeNode([])], [makeSession(null, { id: 'fresh' })], [], 3)
 
     expect(previews[NO_PROJECT_ID].map(s => s.id)).toEqual(['fresh'])
+  })
+
+  it('evicts only the matching profile when session ids collide', () => {
+    const project = projectNode({ id: '/www/app' })
+    const alpha = makeSession('/www/app', { id: 'shared-id', profile: 'alpha' })
+    const beta = makeSession('/www/app', { id: 'shared-id', profile: 'beta' })
+
+    const previews = overlayLivePreviews(
+      [project],
+      [alpha, beta],
+      [],
+      3,
+      new Set([sessionIdentityKey('shared-id', 'alpha')])
+    )
+
+    expect(previews['/www/app']).toEqual([beta])
   })
 })
 

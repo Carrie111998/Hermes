@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import * as gatewayStore from './gateway'
 import { $gateway } from './gateway'
 import {
   dispatchNativeNotification,
@@ -10,6 +11,7 @@ import {
   setNativeNotifyKind
 } from './native-notifications'
 import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from './notify-baseline'
+import { $activeGatewayProfile } from './profile'
 import { $approvalRequest, setApprovalRequest } from './prompts'
 import { $activeSessionId, setActiveSessionId } from './session'
 
@@ -43,6 +45,7 @@ beforeEach(() => {
   }
 
   setActiveSessionId(null)
+  $activeGatewayProfile.set('default')
   setWindowState({ focused: false, hidden: true })
   __resetNativeNotifyBaselineForTests()
 })
@@ -132,11 +135,26 @@ describe('dispatchNativeNotification preferences', () => {
     expect(notify).toHaveBeenCalledTimes(1)
   })
 
-  it('forwards kind and sessionId to the bridge', () => {
-    setActiveSessionId('abc')
-    dispatchNativeNotification({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+  it('forwards stored and runtime identity to the bridge', () => {
+    setActiveSessionId('runtime-abc')
+    $activeGatewayProfile.set('beta')
+    dispatchNativeNotification({
+      body: 'hi',
+      kind: 'turnError',
+      profile: 'beta',
+      sessionId: 'runtime-abc',
+      storedSessionId: 'stored-abc',
+      title: 'boom'
+    })
     expect(notify).toHaveBeenCalledWith(
-      expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+      expect.objectContaining({
+        body: 'hi',
+        kind: 'turnError',
+        profile: 'beta',
+        runtimeSessionId: 'runtime-abc',
+        sessionId: 'stored-abc',
+        title: 'boom'
+      })
     )
   })
 })
@@ -178,6 +196,17 @@ describe('dispatchNativeNotification throttle', () => {
     dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done again' })
     expect(notify).toHaveBeenCalledTimes(1)
   })
+
+  it('does not collapse equal runtime ids from different profiles', () => {
+    const sessionId = freshSession()
+    setActiveSessionId(sessionId)
+    $activeGatewayProfile.set('alpha')
+    dispatchNativeNotification({ kind: 'turnDone', profile: 'alpha', sessionId, title: 'alpha' })
+    $activeGatewayProfile.set('beta')
+    dispatchNativeNotification({ kind: 'turnDone', profile: 'beta', sessionId, title: 'beta' })
+
+    expect(notify).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('sendTestNativeNotification', () => {
@@ -206,6 +235,7 @@ describe('respondToApprovalAction', () => {
 
   afterEach(() => {
     $gateway.set(null)
+    vi.restoreAllMocks()
   })
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
@@ -232,5 +262,29 @@ describe('respondToApprovalAction', () => {
     $gateway.set(null)
     await respondToApprovalAction('bg', 'approve')
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('does not clear a newer colliding approval while an older profile response is in flight', async () => {
+    let resolveResponse!: () => void
+
+    const pending = new Promise<void>(resolve => {
+      resolveResponse = resolve
+    })
+
+    const ownedRequest = vi.fn(async () => pending)
+
+    vi.spyOn(gatewayStore, 'gatewayForProfile').mockResolvedValue({ request: ownedRequest } as never)
+    setActiveSessionId('shared-runtime')
+    setApprovalRequest({ command: 'alpha command', description: 'alpha', profile: 'alpha', sessionId: 'shared-runtime' })
+
+    const responding = respondToApprovalAction('shared-runtime', 'approve', 'alpha')
+    await vi.waitFor(() => expect(ownedRequest).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('beta')
+    setApprovalRequest({ command: 'beta command', description: 'beta', profile: 'beta', sessionId: 'shared-runtime' })
+    resolveResponse()
+    await responding
+
+    expect($approvalRequest.get()?.command).toBe('beta command')
   })
 })

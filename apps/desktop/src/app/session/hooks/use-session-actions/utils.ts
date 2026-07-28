@@ -2,6 +2,7 @@ import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages, textWithoutImageRefs } from '@/lib/embedded-images'
+import { normalizeProfileKey as normalizeIdentityProfile, sessionMatchesIdentity } from '@/lib/session-identity'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
@@ -523,13 +524,14 @@ export function upsertOptimisticSession(
   title: string | null = null,
   preview: string | null = null,
   parentSessionId: string | null = null,
-  lastActive?: number
+  lastActive?: number,
+  profile?: null | string
 ) {
   const now = lastActive ?? Date.now() / 1000
   // Stamp the profile the session was just created on (= the live gateway's
   // profile) so the scoped sidebar shows the new row immediately instead of
   // filtering it out as "default" until the aggregator re-fetches.
-  const profileKey = normalizeProfileKey($activeGatewayProfile.get())
+  const profileKey = normalizeIdentityProfile(profile ?? $activeGatewayProfile.get())
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
@@ -554,60 +556,87 @@ export function upsertOptimisticSession(
     tool_call_count: 0
   }
 
-  setSessions(prev => [session, ...prev.filter(s => s.id !== id)])
+  setSessions(prev => [session, ...prev.filter(s => !sessionMatchesIdentity(s, id, profileKey))])
 }
 
-export function patchSessionWorkspace(sessionId: string, cwd: string | undefined) {
+export function patchSessionWorkspace(sessionId: string, cwd: string | undefined, profile?: null | string) {
   if (!cwd) {
     return
   }
 
-  setSessions(prev => prev.map(session => (session.id === sessionId ? { ...session, cwd } : session)))
+  setSessions(prev =>
+    prev.map(session => (sessionMatchesIdentity(session, sessionId, profile) ? { ...session, cwd } : session))
+  )
 }
 
 export function sessionShouldHaveTranscript(session: SessionInfo | undefined): boolean {
   return (session?.message_count ?? 0) > 0
 }
 
-function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
+export function upsertResolvedSession(session: SessionInfo, storedSessionId: string, profile?: null | string) {
+  const owner = profile ?? session.profile
   const lineage = session._lineage_root_id ?? session.id
 
   setSessions(prev => [
     session,
     ...prev.filter(existing => {
-      if (sessionMatchesStoredId(existing, storedSessionId)) {
+      if (sessionMatchesIdentity(existing, storedSessionId, owner)) {
         return false
       }
 
-      return (existing._lineage_root_id ?? existing.id) !== lineage
+      return !sessionMatchesIdentity(existing, lineage, owner)
     })
   ])
 }
 
-export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
-  const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+export async function resolveStoredSession(
+  storedSessionId: string,
+  profile?: null | string
+): Promise<SessionInfo | undefined> {
+  const requestedProfile = normalizeProfileKey(profile ?? $activeGatewayProfile.get())
+  const cached = $sessions.get().find(session => sessionMatchesIdentity(session, storedSessionId, requestedProfile))
 
   if (cached) {
     return cached
   }
 
+
   // Direct by-id on the live backend — one row lookup, no list scan. Covers
   // single-profile users and any id on the active profile (e.g. an old session
   // past the sidebar's recent window). 404 just means it's not on this profile.
   try {
-    const session = await getSession(storedSessionId)
+    const session = await getSession(storedSessionId, requestedProfile)
 
-    upsertResolvedSession(session, storedSessionId)
+    upsertResolvedSession(session, storedSessionId, requestedProfile)
 
     return session
-  } catch {
-    // Not on the active profile — fall through to the cross-profile probe.
+  } catch (error) {
+    if (profile != null) {
+      return undefined
+    }
+
+    // A sole row cached under another owner is safe only after the requested
+    // active backend has definitively said this id does not exist there.
+    if (!isSessionGoneError(error)) {
+      return undefined
+    }
+  }
+
+  const cachedAcrossProfiles = $sessions
+    .get()
+    .filter(session => session.id === storedSessionId || session._lineage_root_id === storedSessionId)
+
+  if (cachedAcrossProfiles.length === 1) {
+    return cachedAcrossProfiles[0]
   }
 
   // Multi-profile only: probe each other profile by id (still one cheap lookup
   // each) rather than pulling every profile's recent sessions. The first hit
   // carries its owning `profile`, which routes the resume to the right backend.
-  const activeKey = normalizeProfileKey($activeGatewayProfile.get())
+  // Keep the owner search anchored to the profile captured before the first
+  // await. Reading the live profile here lets a mid-lookup switch exclude the
+  // very backend that owns the target.
+  const activeKey = requestedProfile
 
   const otherProfiles = $profiles
     .get()
@@ -618,7 +647,7 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
     try {
       const session = await getSession(storedSessionId, profile)
 
-      upsertResolvedSession(session, storedSessionId)
+      upsertResolvedSession(session, storedSessionId, profile)
 
       return session
     } catch {

@@ -6,9 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { $notifications, clearNotifications } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $busy,
   $connection,
@@ -18,9 +20,10 @@ import {
   $turnStartedAt,
   setCurrentUsage,
   setMessages,
+  setSelectedStoredSessionId,
   setSessions
 } from '@/store/session'
-import { dropSessionState, publishSessionState } from '@/store/session-states'
+import { clearAllSessionStates, dropSessionState, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { SubmitTextOptions } from './utils'
@@ -90,6 +93,7 @@ function Harness({
   activeSessionIdRef: activeSessionIdRefProp,
   busyRef,
   getRoutedStoredSessionId,
+  getRoutedStoredSessionProfile,
   getRuntimeIdForStoredSession,
   getRouteToken,
   onUpdateState,
@@ -98,6 +102,7 @@ function Harness({
   openMemoryGraph,
   refreshSessions,
   requestGateway,
+  requestGatewayForProfile,
   resumeStoredSession,
   seedMessages,
   selectedStoredSessionIdRef: selectedStoredSessionIdRefProp,
@@ -108,19 +113,27 @@ function Harness({
   activeSessionIdRef?: MutableRefObject<string | null>
   busyRef?: MutableRefObject<boolean>
   getRoutedStoredSessionId?: () => null | string
+  getRoutedStoredSessionProfile?: () => null | string
   getRuntimeIdForStoredSession?: (storedSessionId: string) => null | string
   getRouteToken?: () => string
   onUpdateState?: (
     sessionId: string,
     storedSessionId: null | string | undefined,
-    state: Record<string, unknown>
+    state: Record<string, unknown>,
+    storedSessionProfile?: null | string
   ) => void
   onReady: (handle: HarnessHandle) => void
   onSeedState?: (state: Record<string, unknown>) => void
   openMemoryGraph?: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
-  resumeStoredSession?: (storedSessionId: string) => Promise<void> | void
+  requestGatewayForProfile?: <T>(
+    profile: string,
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number
+  ) => Promise<T>
+  resumeStoredSession?: (storedSessionId: string, profile?: null | string) => Promise<void> | void
   seedMessages?: unknown[]
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
   storedSessionId?: null | string
@@ -153,22 +166,24 @@ function Harness({
     busyRef: localBusyRef,
     createBackendSessionForSend: createBackendSessionForSend ?? (async () => RUNTIME_SESSION_ID),
     getRoutedStoredSessionId: getRoutedStoredSessionId ?? (() => null),
+    getRoutedStoredSessionProfile: getRoutedStoredSessionProfile ?? (() => null),
     getRuntimeIdForStoredSession: getRuntimeIdForStoredSession ?? (() => null),
     getRouteToken: getRouteToken ?? (() => 'token'),
     handleSkinCommand: () => '',
     openMemoryGraph: openMemoryGraph ?? (() => undefined),
     refreshSessions,
     requestGateway,
+    requestGatewayForProfile,
     resumeStoredSession: resumeStoredSession ?? (() => undefined),
     selectedStoredSessionIdRef,
     startFreshSessionDraft: () => undefined,
     sttEnabled: false,
-    updateSessionState: (sessionId, updater, storedSessionId) => {
+    updateSessionState: (sessionId, updater, storedSessionId, storedSessionProfile) => {
       // Seed with interrupted:true so we can prove a fresh submit clears it.
       const next = updater(stateRef.current) as unknown as Record<string, unknown>
       stateRef.current = next as never
       onSeedState?.(next)
-      onUpdateState?.(sessionId, storedSessionId, next)
+      onUpdateState?.(sessionId, storedSessionId, next, storedSessionProfile)
 
       return next as never
     }
@@ -215,6 +230,8 @@ describe('usePromptActions /title', () => {
 
   afterEach(() => {
     cleanup()
+    clearAllSessionStates()
+    $activeGatewayProfile.set('default')
     vi.restoreAllMocks()
   })
 
@@ -265,6 +282,62 @@ describe('usePromptActions /title', () => {
     // Even when queued, the sidebar reflects the chosen title optimistically.
     expect(refreshSessions).toHaveBeenCalledTimes(1)
     expect($sessions.get()[0]?.title).toBe('Fresh chat')
+  })
+
+  it('updates only alpha/shared when the profile changes before a title RPC resolves', async () => {
+    const sharedStoredId = 'shared'
+
+    setSessions(() => [
+      sessionInfo({ id: sharedStoredId, profile: 'alpha', title: 'Alpha old' }),
+      sessionInfo({ id: sharedStoredId, profile: 'beta', title: 'Beta old' })
+    ])
+    $activeGatewayProfile.set('alpha')
+    publishSessionState(
+      sharedStoredId,
+      createClientSessionState(sharedStoredId, [], 'alpha')
+    )
+
+    let resolveTitle: (value: { pending: boolean; title: string }) => void = () => undefined
+
+    const titleResult = new Promise<{ pending: boolean; title: string }>(resolve => {
+      resolveTitle = resolve
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.title') {
+        return (await titleResult) as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={sharedStoredId}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={sharedStoredId}
+      />
+    )
+
+    let submitted: Promise<boolean>
+    act(() => {
+      submitted = handle!.submitTextRaw('/title Alpha new')
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.title', expect.anything()))
+
+    $activeGatewayProfile.set('beta')
+    resolveTitle({ pending: false, title: 'Alpha new' })
+    await act(async () => {
+      await submitted
+    })
+
+    expect($sessions.get().map(session => [session.profile, session.title])).toEqual([
+      ['alpha', 'Alpha new'],
+      ['beta', 'Beta old']
+    ])
   })
 
   it('falls through to the slash worker for a bare /title (show current title)', async () => {
@@ -433,7 +506,9 @@ describe('usePromptActions /compress', () => {
 
   afterEach(() => {
     cleanup()
+    clearAllSessionStates()
     clearNotifications()
+    $activeGatewayProfile.set('default')
     setCurrentUsage({ calls: 0, input: 0, output: 0, total: 0 })
     setMessages([])
     vi.restoreAllMocks()
@@ -479,6 +554,50 @@ describe('usePromptActions /compress', () => {
     )
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+  })
+
+  it('applies a compression title only to alpha/shared when profile ids collide', async () => {
+    const sharedStoredId = 'shared'
+
+    setSessions(() => [
+      sessionInfo({ id: sharedStoredId, profile: 'alpha', title: 'Alpha old' }),
+      sessionInfo({ id: sharedStoredId, profile: 'beta', title: 'Beta old' })
+    ])
+    $activeGatewayProfile.set('alpha')
+    publishSessionState(
+      sharedStoredId,
+      createClientSessionState(sharedStoredId, [], 'alpha')
+    )
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.compress') {
+        return {
+          info: { title: 'Alpha compressed' },
+          removed: 1,
+          summary: { headline: 'Compressed alpha/shared' }
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={sharedStoredId}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={sharedStoredId}
+      />
+    )
+
+    await handle!.submitText('/compress')
+
+    expect($sessions.get().map(session => [session.profile, session.title])).toEqual([
+      ['alpha', 'Alpha compressed'],
+      ['beta', 'Beta old']
+    ])
   })
 
   it('replaces the transcript from the response messages', async () => {
@@ -675,7 +794,12 @@ describe('usePromptActions /compress', () => {
   it('does not clobber the foreground transcript when compression resolves after a session switch', async () => {
     const RUNTIME_SESSION_B = 'rt-session-b'
     const storedSessionIdRef: MutableRefObject<string | null> = { current: 'stored-a' }
-    const updates: Array<{ sessionId: string; storedSessionId: null | string | undefined }> = []
+
+    const updates: Array<{
+      profile: null | string | undefined
+      sessionId: string
+      storedSessionId: null | string | undefined
+    }> = []
 
     let resolveCompress: (value: unknown) => void = () => undefined
 
@@ -695,13 +819,16 @@ describe('usePromptActions /compress', () => {
 
     setMessages([{ id: 'foreground-b', parts: [textPart('session B transcript')], role: 'user', timestamp: 0 }])
     setCurrentUsage({ calls: 7, input: 70, output: 30, total: 100 })
+    $activeGatewayProfile.set('alpha')
 
     let handle: HarnessHandle | null = null
     await actRender(
       <Harness
         activeSessionIdRef={activeSessionIdRef}
         onReady={h => (handle = h)}
-        onUpdateState={(sessionId, storedSessionId) => updates.push({ sessionId, storedSessionId })}
+        onUpdateState={(sessionId, storedSessionId, _state, profile) =>
+          updates.push({ profile, sessionId, storedSessionId })
+        }
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
         selectedStoredSessionIdRef={storedSessionIdRef}
@@ -720,6 +847,7 @@ describe('usePromptActions /compress', () => {
 
     // Switch to session B before compression resolves.
     activeSessionIdRef.current = RUNTIME_SESSION_B
+    $activeGatewayProfile.set('beta')
     resolveCompress({
       info: { usage: { context_used: 4_000, total: 12_000 } },
       messages: [{ content: 'compressed session A transcript', role: 'system' }],
@@ -735,7 +863,7 @@ describe('usePromptActions /compress', () => {
       { id: 'foreground-b', parts: [textPart('session B transcript')], role: 'user', timestamp: 0 }
     ])
     expect($currentUsage.get()).toEqual(expect.objectContaining({ calls: 7, input: 70, output: 30, total: 100 }))
-    expect(updates).toContainEqual({ sessionId: RUNTIME_SESSION_ID, storedSessionId: 'stored-a' })
+    expect(updates).toContainEqual({ profile: 'alpha', sessionId: RUNTIME_SESSION_ID, storedSessionId: 'stored-a' })
   })
 
   it('keeps a late compression error bound to its invocation-time stored session', async () => {
@@ -926,6 +1054,8 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
   afterEach(() => {
     cleanup()
     $busy.set(false)
+    $queuedPromptsBySession.set({})
+    clearAllSessionStates()
     vi.restoreAllMocks()
   })
 
@@ -1069,7 +1199,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     // The kickoff must NOT submit mid-turn — and must NOT vanish either.
     expect(calls.map(c => c.method)).toEqual(['slash.exec'])
 
-    const queued = getQueuedPrompts(RUNTIME_SESSION_ID)
+    const queued = getQueuedPrompts(sessionIdentityKey(RUNTIME_SESSION_ID, 'default'))
     expect(queued.map(entry => entry.text)).toEqual(['ship the release notes'])
 
     const renderedText = states
@@ -1161,7 +1291,9 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     await handle!.submitText('/audit-only audit the session states')
 
     expect(calls).toEqual(['slash.exec'])
-    expect(getQueuedPrompts(RUNTIME_SESSION_ID).map(entry => entry.text)).toEqual(['audit the session states'])
+    expect(getQueuedPrompts(sessionIdentityKey(RUNTIME_SESSION_ID, 'default')).map(entry => entry.text)).toEqual([
+      'audit the session states'
+    ])
 
     dropSessionState(RUNTIME_SESSION_ID)
     $queuedPromptsBySession.set({})
@@ -1205,8 +1337,10 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(boundStoredIds).not.toHaveLength(0)
     expect(new Set(boundStoredIds)).toEqual(new Set([tileStoredId]))
     // …and the kickoff queues against the tile, never the foreground chat.
-    expect(getQueuedPrompts(tileStoredId).map(entry => entry.text)).toEqual(['run it in the tab'])
-    expect(getQueuedPrompts('primary-stored')).toEqual([])
+    expect(getQueuedPrompts(sessionIdentityKey(tileStoredId, 'default')).map(entry => entry.text)).toEqual([
+      'run it in the tab'
+    ])
+    expect(getQueuedPrompts(sessionIdentityKey('primary-stored', 'default'))).toEqual([])
 
     dropSessionState(tileRuntimeId)
     $queuedPromptsBySession.set({})
@@ -1516,6 +1650,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    $activeGatewayProfile.set('default')
+    setSelectedStoredSessionId(null)
+    clearAllSessionStates()
   })
 
   it('clears a leftover interrupted flag on a fresh submit (so the new turn streams)', async () => {
@@ -1691,6 +1828,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(accepted).toBe(true)
     // Must resume the correct stored session to get the right runtime id.
     expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      profile: 'default',
       session_id: 'stored-session-a',
       source: 'desktop'
     })
@@ -1710,6 +1848,142 @@ describe('usePromptActions submit / queue drain semantics', () => {
         ([method, params]) => method !== 'prompt.submit' || params?.session_id !== 'rt-foreground'
       )
     ).toBe(true)
+  })
+
+  it('treats alpha/shared as background while beta/shared is selected', async () => {
+    const requestGateway = vi.fn(async (method: string) =>
+      (method === 'session.resume' ? { session_id: 'rt-alpha-rebound' } : {}) as never
+    )
+
+    $activeGatewayProfile.set('beta')
+    setSelectedStoredSessionId('shared', 'beta')
+    publishSessionState('rt-beta-foreground', {
+      ...createClientSessionState('shared'),
+      storedSessionProfile: 'beta'
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="rt-beta-foreground"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="shared"
+      />
+    )
+
+    expect(
+      await handle!.submitText('queued for alpha/shared', {
+        fromQueue: true,
+        profile: 'alpha',
+        sessionId: null,
+        storedSessionId: 'shared'
+      })
+    ).toBe(true)
+    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      profile: 'alpha',
+      session_id: 'shared',
+      source: 'desktop'
+    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      { session_id: 'rt-alpha-rebound', text: 'queued for alpha/shared' },
+      1_800_000
+    )
+    expect(requestGateway).not.toHaveBeenCalledWith(
+      'prompt.submit',
+      expect.objectContaining({ session_id: 'rt-beta-foreground' }),
+      expect.anything()
+    )
+  })
+
+  it('uses the captured profile gateway for a colliding background runtime id', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const requestGatewayForProfile = vi.fn(async () => ({}) as never)
+
+    $activeGatewayProfile.set('beta')
+    setSelectedStoredSessionId('shared', 'beta')
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="rt-collision"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        requestGatewayForProfile={requestGatewayForProfile}
+        storedSessionId="shared"
+      />
+    )
+
+    expect(
+      await handle!.submitText('alpha-owned prompt', {
+        fromQueue: true,
+        profile: 'alpha',
+        sessionId: 'rt-collision',
+        storedSessionId: 'shared'
+      })
+    ).toBe(true)
+    expect(requestGatewayForProfile).toHaveBeenCalledWith(
+      'alpha',
+      'prompt.submit',
+      { session_id: 'rt-collision', text: 'alpha-owned prompt' },
+      1_800_000
+    )
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+  })
+
+  it('recovers a failed new-session submit with the durable id captured at create settle', async () => {
+    const activeSessionIdRef = { current: null } as MutableRefObject<null | string>
+    const selectedStoredSessionIdRef = { current: null } as MutableRefObject<null | string>
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = 'rt-created'
+      selectedStoredSessionIdRef.current = 'stored-created'
+      setSelectedStoredSessionId('stored-created', 'default')
+
+      return 'rt-created'
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        selectedStoredSessionIdRef.current = 'stored-selected-later'
+        setSelectedStoredSessionId('stored-selected-later', 'default')
+        throw new Error('request timed out: prompt.submit')
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'rt-recovered' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+
+    await handle!.submitText('first prompt')
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-created' })
+    )
+    expect(requestGateway).not.toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-selected-later' })
+    )
   })
 
   it('a rejected fromQueue drain returns false (entry stays queued) and a later retry sends it', async () => {
@@ -1818,6 +2092,8 @@ describe('usePromptActions submit / queue drain semantics', () => {
 describe('usePromptActions redirectPrompt', () => {
   afterEach(() => {
     cleanup()
+    $activeGatewayProfile.set('default')
+    setSelectedStoredSessionId(null)
     vi.restoreAllMocks()
   })
 
@@ -1919,6 +2195,9 @@ describe('usePromptActions redirectPrompt', () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     let redirectAttempts = 0
 
+    $activeGatewayProfile.set('alpha')
+    setSelectedStoredSessionId(STORED_SESSION_ID, 'alpha')
+
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
 
@@ -1926,6 +2205,8 @@ describe('usePromptActions redirectPrompt', () => {
         redirectAttempts += 1
 
         if (redirectAttempts === 1) {
+          $activeGatewayProfile.set('beta')
+          setSelectedStoredSessionId(STORED_SESSION_ID, 'beta')
           throw new Error('session not found')
         }
 
@@ -1953,7 +2234,7 @@ describe('usePromptActions redirectPrompt', () => {
     expect(await handle!.redirectPrompt('reconnect nudge')).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['session.redirect', 'session.resume', 'session.redirect'])
     expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge' })
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
+    expect(calls[1]?.params).toEqual({ profile: 'alpha', session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge' })
     expect(handle!.activeSessionIdRef.current).toBe(RECOVERED_SESSION_ID)
   })
@@ -2340,6 +2621,10 @@ describe('usePromptActions sleep/wake session recovery', () => {
   afterEach(() => {
     cleanup()
     $turnStartedAt.set(null)
+    $activeGatewayProfile.set('default')
+    setSelectedStoredSessionId(null)
+    clearAllSessionStates()
+    setSessions(() => [])
     vi.restoreAllMocks()
   })
 
@@ -2386,7 +2671,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(ok).toBe(true)
     // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
+    expect(calls[1]?.params).toEqual({ profile: 'default', session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
   })
 
@@ -2395,6 +2680,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
   // into the wrong profile's DB — the session then appears under both profiles.
   it('carries the owning profile from the cache into the recovery resume', async () => {
     setSessions(() => [sessionInfo({ id: STORED_SESSION_ID, profile: 'work' })])
+    setSelectedStoredSessionId(STORED_SESSION_ID, 'work')
 
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     let submitAttempts = 0
@@ -2531,7 +2817,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
       session_id: 'rt-background-stale',
       text: 'queued background message after wake'
     })
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
+    expect(calls[1]?.params).toEqual({ profile: 'default', session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({
       queued: true,
       session_id: RECOVERED_SESSION_ID,
@@ -2579,7 +2865,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     expect(calls.map(c => c.method)).toEqual(['session.interrupt', 'session.resume', 'session.interrupt'])
     expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID })
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
+    expect(calls[1]?.params).toEqual({ profile: 'default', session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
   })
 
@@ -2711,7 +2997,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
+    expect(calls[1]?.params).toEqual({ profile: 'default', session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({
       session_id: RECOVERED_SESSION_ID,
       text: 'message during starved loop'
@@ -2754,7 +3040,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(ok).toBe(true)
     expect(createBackendSessionForSend).not.toHaveBeenCalled()
     expect(calls.map(c => c.method)).toEqual(['session.resume', 'prompt.submit'])
-    expect(calls[0]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
+    expect(calls[0]?.params).toEqual({ profile: 'default', session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[1]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
   })
 
@@ -2827,7 +3113,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     )
 
     expect(await handle!.submitText('follow-up while the profile route is rebinding')).toBe(true)
-    expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID)
+    expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID, 'default')
     expect(createBackendSessionForSend).not.toHaveBeenCalled()
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
@@ -2865,10 +3151,54 @@ describe('usePromptActions sleep/wake session recovery', () => {
     )
 
     expect(await handle!.submitText('stay in the routed profile session')).toBe(true)
-    expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID)
+    expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID, 'default')
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       { session_id: RECOVERED_SESSION_ID, text: 'stay in the routed profile session' },
+      1_800_000
+    )
+  })
+
+  it('uses the explicit routed profile when selected alpha/shared collides with routed beta/shared', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'rt-alpha-stale' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'shared' }
+    let boundRuntimeId: null | string = null
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    $activeGatewayProfile.set('alpha')
+    setSelectedStoredSessionId('shared', 'alpha')
+
+    const resumeStoredSession = vi.fn(async (_storedSessionId: string, profile?: null | string) => {
+      expect(profile).toBe('beta')
+      $activeGatewayProfile.set('beta')
+      setSelectedStoredSessionId('shared', 'beta')
+      selectedStoredSessionIdRef.current = 'shared'
+      activeSessionIdRef.current = 'rt-beta-recovered'
+      boundRuntimeId = 'rt-beta-recovered'
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="rt-alpha-stale"
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => 'shared'}
+        getRoutedStoredSessionProfile={() => 'beta'}
+        getRuntimeIdForStoredSession={() => boundRuntimeId}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        resumeStoredSession={resumeStoredSession}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId="shared"
+      />
+    )
+
+    expect(await handle!.submitText('beta route prompt')).toBe(true)
+    expect(resumeStoredSession).toHaveBeenCalledWith('shared', 'beta')
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      { session_id: 'rt-beta-recovered', text: 'beta route prompt' },
       1_800_000
     )
   })
@@ -2946,7 +3276,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(await handle!.submitText('do not fork me')).toBe(false)
     expect(busyRef.current).toBe(false)
     expect($messages.get()).toEqual([])
-    expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID)
+    expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID, 'default')
     expect(createBackendSessionForSend).not.toHaveBeenCalled()
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
 
@@ -3011,6 +3341,9 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    $activeGatewayProfile.set('default')
+    setSelectedStoredSessionId(null)
+    clearAllSessionStates()
     setSessions(() => [])
   })
 
@@ -3064,7 +3397,64 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     expect(await submitting).toBe(false)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(false)
     expect(calls.find(c => c.method === 'session.resume')?.params).toEqual({
+      profile: 'default',
       session_id: STORED_SESSION_A,
+      source: 'desktop'
+    })
+  })
+
+  it('keeps recovery on alpha/shared and aborts when the route switches to beta/shared', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'alpha-runtime' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'shared' }
+    let routeToken = '/shared:?profile=alpha:'
+    let submitAttempts = 0
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+
+    $activeGatewayProfile.set('alpha')
+    setSelectedStoredSessionId('shared', 'alpha')
+    publishSessionState('alpha-runtime', {
+      ...createClientSessionState('shared'),
+      storedSessionProfile: 'alpha'
+    })
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'prompt.submit') {
+        submitAttempts += 1
+        $activeGatewayProfile.set('beta')
+        setSelectedStoredSessionId('shared', 'beta')
+        selectedStoredSessionIdRef.current = 'shared'
+        routeToken = '/shared:?profile=beta:'
+        throw new Error('4007 session not found')
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'alpha-recovered' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="alpha-runtime"
+        activeSessionIdRef={activeSessionIdRef}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId="shared"
+      />
+    )
+
+    expect(await handle!.submitText('alpha-only prompt')).toBe(false)
+    expect(submitAttempts).toBe(1)
+    expect(calls.find(c => c.method === 'session.resume')?.params).toEqual({
+      profile: 'alpha',
+      session_id: 'shared',
       source: 'desktop'
     })
   })
@@ -3101,7 +3491,9 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
 
     // The composer's scope is the lineage root (what resolveComposerSessionKey
     // actually returns for this session) — a legitimate, non-drifted submit.
-    const ok = await handle!.submitText('message into the rotated session', { composerScope: ROOT_ID })
+    const ok = await handle!.submitText('message into the rotated session', {
+      composerScope: sessionIdentityKey(ROOT_ID, 'default')
+    })
 
     expect(ok).toBe(true)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(true)
@@ -3132,7 +3524,9 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
       />
     )
 
-    const ok = await handle!.submitText('typed while B was on screen', { composerScope: STORED_SESSION_B })
+    const ok = await handle!.submitText('typed while B was on screen', {
+      composerScope: sessionIdentityKey(STORED_SESSION_B, 'default')
+    })
 
     expect(ok).toBe(false)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(false)
@@ -3157,7 +3551,9 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
       />
     )
 
-    const ok = await handle!.submitText('typed while A was on screen', { composerScope: STORED_SESSION_A })
+    const ok = await handle!.submitText('typed while A was on screen', {
+      composerScope: sessionIdentityKey(STORED_SESSION_A, 'default')
+    })
 
     expect(ok).toBe(true)
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(true)

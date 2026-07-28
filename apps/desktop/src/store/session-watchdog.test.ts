@@ -2,8 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionIdentityKey } from '@/lib/session-identity'
 
-import { $activeSessionId, $selectedStoredSessionId, $unreadFinishedSessionIds } from './session'
+import {
+  $activeSessionId,
+  $selectedStoredSessionId,
+  $unreadFinishedSessionIds,
+  setSelectedStoredSessionId
+} from './session'
 import {
   $attentionSessionIds,
   $stalledSessionIds,
@@ -14,6 +20,7 @@ import {
 } from './session-states'
 
 const WATCHDOG_MS = 8 * 60 * 1000
+const identity = (storedSessionId: string) => sessionIdentityKey(storedSessionId, 'default')
 
 function state(over: Partial<ClientSessionState> = {}): ClientSessionState {
   return { ...createClientSessionState(null), storedSessionId: 's1', ...over }
@@ -44,18 +51,43 @@ describe('session status transitions', () => {
 
     publishSessionState('rt1', { ...s, busy: true })
 
-    expect($workingSessionIds.get()).toContain('s1')
+    expect($workingSessionIds.get()).toContain(identity('s1'))
+  })
+
+  it('isolates live and settled state when profiles share a stored session id', () => {
+    const alpha = state({ busy: true, needsInput: true, storedSessionId: 'shared', storedSessionProfile: 'alpha' })
+    const beta = state({ busy: false, storedSessionId: 'shared', storedSessionProfile: 'beta' })
+    const alphaKey = sessionIdentityKey('shared', 'alpha')
+    const betaKey = sessionIdentityKey('shared', 'beta')
+
+    publishSessionState('rt-alpha', alpha)
+    publishSessionState('rt-beta', beta)
+
+    expect($workingSessionIds.get()).toEqual([alphaKey])
+    expect($attentionSessionIds.get()).toEqual([alphaKey])
+
+    vi.advanceTimersByTime(WATCHDOG_MS)
+    expect($stalledSessionIds.get()).toEqual([alphaKey])
+
+    publishSessionState('rt-alpha', { ...alpha, busy: false, needsInput: false })
+
+    expect(getRecentlySettledSessionIds()).toEqual([alphaKey])
+    expect($unreadFinishedSessionIds.get()).toEqual([alphaKey])
+    expect($workingSessionIds.get()).not.toContain(betaKey)
+    expect($attentionSessionIds.get()).not.toContain(betaKey)
+    expect($stalledSessionIds.get()).not.toContain(betaKey)
+    expect($unreadFinishedSessionIds.get()).not.toContain(betaKey)
   })
 
   it('removes a session from $workingSessionIds when busy transitions to false', () => {
     const working = state({ busy: true, storedSessionId: 's1' })
     publishSessionState('rt1', working)
 
-    expect($workingSessionIds.get()).toContain('s1')
+    expect($workingSessionIds.get()).toContain(identity('s1'))
 
     publishSessionState('rt1', { ...working, busy: false })
 
-    expect($workingSessionIds.get()).not.toContain('s1')
+    expect($workingSessionIds.get()).not.toContain(identity('s1'))
   })
 
   it('adds a session to $attentionSessionIds when needsInput is true', () => {
@@ -64,7 +96,7 @@ describe('session status transitions', () => {
 
     publishSessionState('rt1', { ...s, needsInput: true })
 
-    expect($attentionSessionIds.get()).toContain('s1')
+    expect($attentionSessionIds.get()).toContain(identity('s1'))
   })
 
   it('marks a background session unread when its turn finishes', () => {
@@ -74,11 +106,11 @@ describe('session status transitions', () => {
 
     publishSessionState('rt1', { ...working, busy: false })
 
-    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+    expect($unreadFinishedSessionIds.get()).toEqual([identity('s1')])
   })
 
   it('does NOT mark unread when the finishing session is the active one', () => {
-    $selectedStoredSessionId.set('s1')
+    setSelectedStoredSessionId('s1')
     const working = state({ busy: true, storedSessionId: 's1' })
     publishSessionState('rt1', working)
 
@@ -101,7 +133,7 @@ describe('session status transitions', () => {
 
     publishSessionState('rt1', { ...working, busy: false })
 
-    expect(getRecentlySettledSessionIds()).toEqual(['s1'])
+    expect(getRecentlySettledSessionIds()).toEqual([identity('s1')])
   })
 
   it('does not grant grace on idle→idle re-asserts', () => {
@@ -116,7 +148,7 @@ describe('session status transitions', () => {
     const idle = { ...working, busy: false }
     publishSessionState('rt1', idle)
 
-    expect(getRecentlySettledSessionIds()).toEqual(['s2'])
+    expect(getRecentlySettledSessionIds()).toEqual([identity('s2')])
 
     publishSessionState('rt1', { ...idle, busy: true })
 
@@ -147,34 +179,34 @@ describe('session watchdog', () => {
 
     vi.advanceTimersByTime(WATCHDOG_MS)
 
-    expect($workingSessionIds.get()).toContain('s1')
-    expect($stalledSessionIds.get()).toContain('s1')
+    expect($workingSessionIds.get()).toContain(identity('s1'))
+    expect($stalledSessionIds.get()).toContain(identity('s1'))
   })
 
   it('clears stalled on new activity and rearms the watchdog', () => {
     const working = state({ busy: true, storedSessionId: 's2' })
     publishSessionState('rt2', working)
     vi.advanceTimersByTime(WATCHDOG_MS)
-    expect($stalledSessionIds.get()).toContain('s2')
+    expect($stalledSessionIds.get()).toContain(identity('s2'))
 
     publishSessionState('rt2', { ...working, awaitingResponse: true })
-    expect($stalledSessionIds.get()).not.toContain('s2')
+    expect($stalledSessionIds.get()).not.toContain(identity('s2'))
 
     vi.advanceTimersByTime(WATCHDOG_MS - 1)
-    expect($stalledSessionIds.get()).not.toContain('s2')
-    expect($workingSessionIds.get()).toContain('s2')
+    expect($stalledSessionIds.get()).not.toContain(identity('s2'))
+    expect($workingSessionIds.get()).toContain(identity('s2'))
   })
 
   it('clears both running and stalled on an authoritative terminal transition', () => {
     const working = state({ busy: true, storedSessionId: 's3' })
     publishSessionState('rt3', working)
     vi.advanceTimersByTime(WATCHDOG_MS)
-    expect($stalledSessionIds.get()).toContain('s3')
+    expect($stalledSessionIds.get()).toContain(identity('s3'))
 
     publishSessionState('rt3', { ...working, busy: false })
 
-    expect($workingSessionIds.get()).not.toContain('s3')
-    expect($stalledSessionIds.get()).not.toContain('s3')
+    expect($workingSessionIds.get()).not.toContain(identity('s3'))
+    expect($stalledSessionIds.get()).not.toContain(identity('s3'))
   })
 
   it('never marks a session stalled when it settles before the window', () => {
@@ -183,14 +215,14 @@ describe('session watchdog', () => {
     publishSessionState('rt4', { ...working, busy: false })
     vi.advanceTimersByTime(WATCHDOG_MS)
 
-    expect($workingSessionIds.get()).not.toContain('s4')
-    expect($stalledSessionIds.get()).not.toContain('s4')
+    expect($workingSessionIds.get()).not.toContain(identity('s4'))
+    expect($stalledSessionIds.get()).not.toContain(identity('s4'))
   })
 
   it('clears stalled state and disarms timers on a gateway wipe', () => {
     publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
     vi.advanceTimersByTime(WATCHDOG_MS)
-    expect($stalledSessionIds.get()).toEqual(['s1'])
+    expect($stalledSessionIds.get()).toEqual([identity('s1')])
 
     clearAllSessionStates()
     vi.advanceTimersByTime(WATCHDOG_MS)
@@ -218,12 +250,12 @@ describe('computed $workingSessionIds', () => {
     publishSessionState('rt2', state({ busy: false, storedSessionId: 's2' }))
     publishSessionState('rt3', state({ busy: true, storedSessionId: null }))
 
-    expect($workingSessionIds.get()).toEqual(['s1'])
+    expect($workingSessionIds.get()).toEqual([identity('s1')])
   })
 
   it('updates when session state changes', () => {
     publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
-    expect($workingSessionIds.get()).toEqual(['s1'])
+    expect($workingSessionIds.get()).toEqual([identity('s1')])
 
     publishSessionState('rt1', state({ busy: false, storedSessionId: 's1' }))
     expect($workingSessionIds.get()).toEqual([])
@@ -243,12 +275,12 @@ describe('computed $attentionSessionIds', () => {
     publishSessionState('rt1', state({ needsInput: true, storedSessionId: 's1' }))
     publishSessionState('rt2', state({ needsInput: false, storedSessionId: 's2' }))
 
-    expect($attentionSessionIds.get()).toEqual(['s1'])
+    expect($attentionSessionIds.get()).toEqual([identity('s1')])
   })
 
   it('clears when $sessionStates is cleared', () => {
     publishSessionState('rt1', state({ needsInput: true, storedSessionId: 's1' }))
-    expect($attentionSessionIds.get()).toEqual(['s1'])
+    expect($attentionSessionIds.get()).toEqual([identity('s1')])
 
     clearAllSessionStates()
     expect($attentionSessionIds.get()).toEqual([])

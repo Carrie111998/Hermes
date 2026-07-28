@@ -69,10 +69,10 @@ function SudoDialog({ sessionId }: { sessionId: string | null }) {
           request_id: request.requestId
         })
         triggerHaptic('submit')
-        clearSudoRequest(request.sessionId, request.requestId)
+        clearSudoRequest(request.sessionId, request.requestId, request.profile)
       } catch (error) {
         if (isMissingPendingPromptRequest(error, 'password')) {
-          clearSudoRequest(request.sessionId, request.requestId)
+          clearSudoRequest(request.sessionId, request.requestId, request.profile)
 
           return
         }
@@ -172,10 +172,10 @@ function SecretDialog({ sessionId }: { sessionId: string | null }) {
           value: secret
         })
         triggerHaptic('submit')
-        clearSecretRequest(request.sessionId, request.requestId)
+        clearSecretRequest(request.sessionId, request.requestId, request.profile)
       } catch (error) {
         if (isMissingPendingPromptRequest(error, 'value')) {
-          clearSecretRequest(request.sessionId, request.requestId)
+          clearSecretRequest(request.sessionId, request.requestId, request.profile)
 
           return
         }

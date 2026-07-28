@@ -1,8 +1,29 @@
 import { describe, expect, it } from 'vitest'
 
-import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
+import { sessionIdentityKey, sessionIdentityKeysFromLegacyIds } from '@/lib/session-identity'
+
+import {
+  mergeScopedSessionOrderIds,
+  orderByIds,
+  reconcileOrderIds,
+  resolveManualSessionOrderIds,
+  sameIds
+} from './order'
 
 describe('resolveManualSessionOrderIds', () => {
+  it('preserves persisted order while an empty session list is still hydrating', () => {
+    const persisted = [sessionIdentityKey('other', 'default'), sessionIdentityKey('shared', 'default')]
+
+    expect(resolveManualSessionOrderIds([], persisted, true, true)).toEqual(persisted)
+    expect(resolveManualSessionOrderIds([], persisted, true, false)).toEqual([])
+  })
+
+  it('does not prune persisted ids from a partially hydrated session list', () => {
+    const persisted = [sessionIdentityKey('other', 'default'), sessionIdentityKey('shared', 'default')]
+
+    expect(resolveManualSessionOrderIds([persisted[0]], persisted, true, true)).toEqual(persisted)
+  })
+
   it('clears legacy auto-seeded order until the user manually reorders sessions', () => {
     expect(resolveManualSessionOrderIds(['newest', 'older'], ['older', 'newest'], false)).toEqual([])
   })
@@ -17,6 +38,66 @@ describe('resolveManualSessionOrderIds', () => {
 
   it('clears manual order when none of the saved ids still exist', () => {
     expect(resolveManualSessionOrderIds(['newest'], ['gone'], true)).toEqual([])
+  })
+
+  it('preserves a legacy default-profile manual order after identity migration', () => {
+    const current = [sessionIdentityKey('shared', 'default'), sessionIdentityKey('other', 'default')]
+    const persisted = sessionIdentityKeysFromLegacyIds(['other', 'shared'])
+
+    expect(resolveManualSessionOrderIds(current, persisted, true)).toEqual([
+      sessionIdentityKey('other', 'default'),
+      sessionIdentityKey('shared', 'default')
+    ])
+  })
+
+  it('does not erase another profile order while its rows are unloaded', () => {
+    const savedDefaultOrder = sessionIdentityKeysFromLegacyIds(['other', 'shared'])
+
+    expect(resolveManualSessionOrderIds([sessionIdentityKey('shared', 'beta')], savedDefaultOrder, true)).toBe(
+      savedDefaultOrder
+    )
+  })
+
+  it('preserves hidden-profile order after reconciling a visible profile drag', () => {
+    const alphaA = sessionIdentityKey('a1', 'alpha')
+    const alphaB = sessionIdentityKey('a2', 'alpha')
+    const betaA = sessionIdentityKey('b1', 'beta')
+    const betaB = sessionIdentityKey('b2', 'beta')
+    const afterDrag = [alphaB, alphaA, betaA, betaB]
+
+    expect(resolveManualSessionOrderIds([alphaB, alphaA], afterDrag, true, false, ['alpha'])).toEqual(afterDrag)
+  })
+
+  it('drops an empty visible profile without erasing hidden-profile order', () => {
+    const alphaA = sessionIdentityKey('a1', 'alpha')
+    const betaA = sessionIdentityKey('b1', 'beta')
+
+    expect(resolveManualSessionOrderIds([], [alphaA, betaA], true, false, ['alpha'])).toEqual([betaA])
+  })
+
+  it('drops stale rows for an empty profile explicitly included in a wider scope', () => {
+    const alphaA = sessionIdentityKey('a1', 'alpha')
+    const betaGone = sessionIdentityKey('gone', 'beta')
+
+    expect(resolveManualSessionOrderIds([alphaA], [alphaA, betaGone], true, false, ['alpha', 'beta'])).toEqual([
+      alphaA
+    ])
+  })
+})
+
+describe('mergeScopedSessionOrderIds', () => {
+  it("reorders one profile without erasing another profile's persisted order", () => {
+    const alphaA = sessionIdentityKey('a', 'alpha')
+    const alphaB = sessionIdentityKey('b', 'alpha')
+    const betaA = sessionIdentityKey('a', 'beta')
+    const betaB = sessionIdentityKey('b', 'beta')
+
+    expect(mergeScopedSessionOrderIds([alphaA, alphaB, betaA, betaB], [alphaB, alphaA])).toEqual([
+      alphaB,
+      alphaA,
+      betaA,
+      betaB
+    ])
   })
 })
 

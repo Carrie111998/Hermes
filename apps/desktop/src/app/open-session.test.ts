@@ -5,6 +5,13 @@ const openSessionTile = vi.fn()
 const openSessionInNewWindow = vi.fn()
 const canOpenSessionWindow = vi.fn(() => true)
 const workspaceIsPageGet = vi.fn(() => false)
+const activeGatewayProfileGet = vi.fn(() => 'default')
+const sessionRoute = vi.fn((id: string, _profile?: null | string) => `/c/${encodeURIComponent(id)}`)
+
+vi.mock('@/store/profile', () => ({
+  $activeGatewayProfile: { get: () => activeGatewayProfileGet() },
+  normalizeProfileKey: (profile?: null | string) => profile?.trim() || 'default'
+}))
 
 vi.mock('@/store/session-states', () => ({
   focusedSessionNeedsRoute: (focused: 'main' | 'tile' | null, workspaceIsPage: boolean) =>
@@ -20,7 +27,7 @@ vi.mock('@/store/windows', () => ({
 
 vi.mock('./routes', () => ({
   $workspaceIsPage: { get: () => workspaceIsPageGet() },
-  sessionRoute: (id: string) => `/c/${encodeURIComponent(id)}`
+  sessionRoute: (id: string, profile?: null | string) => sessionRoute(id, profile)
 }))
 
 import { openSession, openSessionIntentFromModifiers } from './open-session'
@@ -50,12 +57,14 @@ describe('openSession', () => {
     openSessionInNewWindow.mockReset()
     canOpenSessionWindow.mockReturnValue(true)
     workspaceIsPageGet.mockReturnValue(false)
+    activeGatewayProfileGet.mockReturnValue('default')
+    sessionRoute.mockClear()
   })
 
   it('in-place focuses an existing tile and does not navigate', () => {
     focusOpenSession.mockReturnValue('tile')
     openSession('s1', navigate)
-    expect(focusOpenSession).toHaveBeenCalledWith('s1')
+    expect(focusOpenSession).toHaveBeenCalledWith('s1', 'default')
     expect(navigate).not.toHaveBeenCalled()
     expect(openSessionTile).not.toHaveBeenCalled()
   })
@@ -79,10 +88,18 @@ describe('openSession', () => {
     expect(navigate).toHaveBeenCalledWith('/c/s1')
   })
 
+  it('routes a different-profile session without focusing a colliding active-profile surface', () => {
+    focusOpenSession.mockReturnValue('tile')
+    openSession('s1', navigate, 'in-place', 'work')
+    expect(focusOpenSession).not.toHaveBeenCalled()
+    expect(sessionRoute).toHaveBeenCalledWith('s1', 'work')
+    expect(navigate).toHaveBeenCalledWith('/c/s1')
+  })
+
   it('tab focuses an existing open session instead of stacking another', () => {
     focusOpenSession.mockReturnValue('tile')
     openSession('s1', navigate, 'tab')
-    expect(focusOpenSession).toHaveBeenCalledWith('s1')
+    expect(focusOpenSession).toHaveBeenCalledWith('s1', 'default')
     expect(openSessionTile).not.toHaveBeenCalled()
     expect(navigate).not.toHaveBeenCalled()
   })
@@ -90,13 +107,13 @@ describe('openSession', () => {
   it('tab opens a stacked session tile when not on screen', () => {
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'tab')
-    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, 'default')
     expect(navigate).not.toHaveBeenCalled()
   })
 
   it('window pops out when the bridge supports it', () => {
     openSession('s1', navigate, 'window')
-    expect(openSessionInNewWindow).toHaveBeenCalledWith('s1')
+    expect(openSessionInNewWindow).toHaveBeenCalledWith('s1', { profile: 'default' })
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 
@@ -105,7 +122,7 @@ describe('openSession', () => {
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'window')
     expect(openSessionInNewWindow).not.toHaveBeenCalled()
-    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, 'default')
   })
 
   it('no-ops on an empty id', () => {

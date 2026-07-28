@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { sessionTitle } from '@/lib/chat-runtime'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import type { PreviewServerRestart } from '@/store/preview'
 import type { ActionStatusResponse, SessionInfo } from '@/types/hermes'
 
@@ -34,7 +35,7 @@ export function buildRailTasks(
   previewRestart: PreviewServerRestart | null,
   actionTasks: Record<string, DesktopActionTask>
 ): RailTask[] {
-  const sessionsById = new Map(sessions.map(session => [session.id, session]))
+  const sessionsById = new Map(sessions.map(session => [sessionIdentityKey(session.id, session.profile), session]))
 
   const sessionTasks: RailTask[] = workingSessionIds.map((id, index) => {
     const session = sessionsById.get(id)

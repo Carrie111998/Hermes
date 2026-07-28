@@ -22,6 +22,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { sessionIdentityKey, sessionMatchesIdentity } from '@/lib/session-identity'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
@@ -36,15 +37,16 @@ import {
   $introPersonality,
   $introSeed,
   $resumeExhaustedSessionId,
+  $selectedSessionIdentityKey,
   $sessions,
+  resolveComposerMigrationKeys,
   resolveComposerSessionKey,
-  sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
 import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
-import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
+import { primaryRouteSelectedSessionId, routeSessionId, routeSessionIdentityKey, routeSessionProfile } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
 import { ChatDropOverlay } from './chat-drop-overlay'
@@ -86,7 +88,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onRestoreToMessage?: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
-  onRetryResume: (sessionId: string) => void
+  onRetryResume: (sessionId: string, profile?: null | string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   onDismissError?: (messageId: string) => void
 }
@@ -107,11 +109,16 @@ function ChatHeader({
   selectedSessionId
 }: ChatHeaderProps) {
   const sessions = useStore($sessions)
+  const selectedSessionIdentityKey = useStore($selectedSessionIdentityKey)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
 
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+
   const activeStoredSession =
-    (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
+    (selectedSessionId &&
+      sessions.find(session => sessionMatchesIdentity(session, selectedSessionId, activeGatewayProfile))) ||
+    null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
 
@@ -125,9 +132,11 @@ function ChatHeader({
   // state after auto-compression rotates the id.
   const selectedIsPinned = activeStoredSession
     ? pinnedSessionIds.includes(sessionPinId(activeStoredSession))
-    : selectedSessionId
-      ? pinnedSessionIds.includes(selectedSessionId)
-      : false
+    : selectedSessionIdentityKey
+      ? pinnedSessionIds.includes(selectedSessionIdentityKey)
+      : selectedSessionId
+        ? pinnedSessionIds.includes(sessionIdentityKey(selectedSessionId, activeGatewayProfile))
+        : false
 
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // are compact side panels — they drop the session-actions header + border
@@ -307,6 +316,7 @@ export function ChatView({
   const messagesEmpty = useStore(view.$messagesEmpty)
   const lastVisibleIsUser = useStore(view.$lastVisibleIsUser)
   const selectedSessionId = useStore(view.$storedId)
+  const selectedSessionIdentityKey = useStore($selectedSessionIdentityKey)
   const sessions = useStore($sessions)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
 
@@ -316,13 +326,16 @@ export function ChatView({
   // latter can be momentarily null/stale mid-switch, which used to leak into
   // the composer's scope key (#59305). A tile has no route, so it always uses
   // its own selection directly.
-  const queueSessionKey = useMemo(() => {
-    const effectiveSelectedSessionId = isPrimary
-      ? primaryRouteSelectedSessionId(location.pathname, selectedSessionId)
-      : selectedSessionId
+  const effectiveSelectedSessionId = isPrimary
+    ? primaryRouteSelectedSessionId(location.pathname, selectedSessionId)
+    : selectedSessionId
 
-    return resolveComposerSessionKey(effectiveSelectedSessionId, sessions)
-  }, [isPrimary, location.pathname, selectedSessionId, sessions])
+  const composerProfile = isPrimary ? (routeSessionProfile(location.search) ?? activeGatewayProfile) : activeGatewayProfile
+
+  const queueSessionKey = useMemo(
+    () => resolveComposerSessionKey(effectiveSelectedSessionId, sessions, composerProfile),
+    [composerProfile, effectiveSelectedSessionId, sessions]
+  )
 
   // When the tip row arrives after compression, migrate any tip-keyed stash onto
   // the durable lineage key before the composer remounts onto that key.
@@ -331,9 +344,27 @@ export function ChatView({
       return
     }
 
-    migrateSessionDraft(selectedSessionId, queueSessionKey)
-    migrateQueuedPrompts(selectedSessionId, queueSessionKey)
-  }, [queueSessionKey, selectedSessionId])
+    const { legacyLineageKey, selectedIdentity } = resolveComposerMigrationKeys(
+      selectedSessionId,
+      sessions,
+      composerProfile
+    )
+
+    // Raw pre-profile draft keys have no owner. Only the default profile may
+    // claim them; queue storage migrates its legacy record to canonical default
+    // identities at decode time, so queue migration never guesses from bytes.
+    if (composerProfile === 'default') {
+      migrateSessionDraft(selectedSessionId, queueSessionKey)
+      migrateSessionDraft(legacyLineageKey, queueSessionKey)
+      migrateQueuedPrompts(
+        legacyLineageKey ? sessionIdentityKey(legacyLineageKey, 'default') : null,
+        queueSessionKey
+      )
+    }
+
+    migrateSessionDraft(selectedIdentity, queueSessionKey)
+    migrateQueuedPrompts(selectedIdentity, queueSessionKey)
+  }, [composerProfile, queueSessionKey, selectedSessionId, sessions])
 
   // Transcript-side stops (the streaming message's hover Stop, the runtime's
   // cancel) are explicit halts, same as the composer's Stop button: park any
@@ -348,13 +379,21 @@ export function ChatView({
 
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
+  const routedSessionProfile = isPrimary ? routeSessionProfile(location.search) ?? activeGatewayProfile : null
   const isRoutedSessionView = Boolean(routedSessionId)
+
+  const routedSessionIdentity = isPrimary
+    ? routeSessionIdentityKey(location.pathname, location.search, activeGatewayProfile)
+    : routedSessionId && routedSessionProfile
+      ? sessionIdentityKey(routedSessionId, routedSessionProfile)
+      : null
 
   // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
   // direct nav). Derived in render so the swap reads instantly: the same frame
   // the id changes we drop the old transcript and show the loader, instead of
   // waiting for the resume effect (which paints a frame later) to clear them.
-  const routeSessionMismatch = isRoutedSessionView && routedSessionId !== selectedSessionId
+  const routeSessionMismatch =
+    isPrimary && isRoutedSessionView && routedSessionIdentity !== selectedSessionIdentityKey
 
   // The compact new-session pop-out skips the wordmark/tagline intro — it's a
   // scratch window, not the full-height empty state.
@@ -378,7 +417,11 @@ export function ChatView({
   // Suppress the loader and show an explicit error + manual Retry instead of
   // spinning forever. Gated on the route matching so a stale latch from another
   // session can't blank the current one.
-  const resumeExhausted = isPrimary && isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
+  const resumeExhausted =
+    isPrimary &&
+    isRoutedSessionView &&
+    Boolean(resumeExhaustedSessionId) &&
+    resumeExhaustedSessionId === routedSessionIdentity
 
   const loadingSession =
     !resumeExhausted && isRoutedSessionView && (routeSessionMismatch || (messagesEmpty && !activeSessionId))
@@ -388,7 +431,11 @@ export function ChatView({
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
-  const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
+
+  const threadKey =
+    (isPrimary ? selectedSessionIdentityKey : queueSessionKey) ||
+    activeSessionId ||
+    (isRoutedSessionView ? routedSessionIdentity || location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
     queryKey: modelOptionsQueryKey(activeGatewayProfile, activeSessionId),
@@ -526,7 +573,11 @@ export function ChatView({
                 title={t.desktop.resumeStrandedTitle}
               >
                 <div className="grid justify-items-center">
-                  <Button onClick={() => onRetryResume(routedSessionId)} size="sm" variant="outline">
+                  <Button
+                    onClick={() => onRetryResume(routedSessionId, routedSessionProfile)}
+                    size="sm"
+                    variant="outline"
+                  >
                     {t.desktop.resumeRetry}
                   </Button>
                 </div>

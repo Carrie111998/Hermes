@@ -42,6 +42,25 @@ describe('resolveTargetSessionId', () => {
     })
   })
 
+  it('uses the captured owner profile instead of resolving against a later active profile', async () => {
+    const requestGateway = vi.fn(async () => ({ session_id: RECOVERED }))
+
+    await resolveTargetSessionId(
+      deps({
+        requestGateway: requestGateway as never,
+        routedStoredSessionId: 'shared',
+        selectedStoredSessionId: 'shared',
+        targetProfile: 'alpha'
+      })
+    )
+
+    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      session_id: 'shared',
+      source: 'desktop',
+      profile: 'alpha'
+    })
+  })
+
   it('reuses the live runtime id when the cache confirms it owns the targeted stored session', async () => {
     const createSession = vi.fn(async () => 'rt-brand-new-WRONG')
     const requestGateway = vi.fn(async () => ({ session_id: 'rt-resume-WRONG' }))

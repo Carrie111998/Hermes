@@ -76,6 +76,15 @@ test('buildSessionWindowUrl encodes the session id in the hash route', () => {
   assert.ok(url.indexOf('?win=secondary') < url.indexOf('#'))
 })
 
+test('buildSessionWindowUrl carries the owning profile in the hash route', () => {
+  const url = buildSessionWindowUrl('abc123', {
+    devServer: 'http://localhost:5173',
+    profile: 'ubuntu server'
+  })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary#/abc123?profile=ubuntu%20server')
+})
+
 test('buildSessionWindowUrl builds a packaged file URL with the flag before the hash', () => {
   const url = buildSessionWindowUrl('abc', { rendererIndexPath: '/opt/app/index.html' })
 
@@ -100,6 +109,16 @@ test('instanceWindowBounds falls back to the persisted geometry with no source w
   assert.equal(instanceWindowBounds(null, fallback), fallback)
 })
 
+test('buildSessionWindowUrl carries the active profile into a new-session draft', () => {
+  const url = buildSessionWindowUrl(null, {
+    devServer: 'http://localhost:5173',
+    newSession: true,
+    profile: 'alpha profile'
+  })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&new=1#/?profile=alpha%20profile')
+})
+
 test('registry opens one window per session and focuses on re-open', () => {
   const registry = createSessionWindowRegistry()
   let built = 0
@@ -118,6 +137,19 @@ test('registry opens one window per session and focuses on re-open', () => {
   assert.equal(first, second)
   assert.equal(registry.size, 1)
   assert.equal(win.calls.focus, 1, 'second open focuses the existing window')
+})
+
+test('registry treats equal session ids in different profiles as distinct windows', () => {
+  const registry = createSessionWindowRegistry()
+  const alpha = makeFakeWindow()
+  const beta = makeFakeWindow()
+
+  const alphaResult = registry.openOrFocus('shared-id', 'alpha', () => alpha)
+  const betaResult = registry.openOrFocus('shared-id', 'beta', () => beta)
+
+  assert.equal(alphaResult, alpha)
+  assert.equal(betaResult, beta)
+  assert.equal(registry.size, 2)
 })
 
 test('registry restores + shows a minimized/hidden window on re-open', () => {
@@ -183,12 +215,17 @@ test('registry ignores empty / non-string session ids', () => {
   assert.equal(registry.size, 0)
 })
 
-test('registry trims the session id before keying', () => {
+test('registry preserves opaque session-id bytes when keying', () => {
   const registry = createSessionWindowRegistry()
-  const win = makeFakeWindow()
-  registry.openOrFocus('  s1  ', () => win)
+  const spaced = makeFakeWindow()
+  const plain = makeFakeWindow()
 
+  registry.openOrFocus('  s1  ', () => spaced)
+  registry.openOrFocus('s1', () => plain)
+
+  assert.equal(registry.has('  s1  '), true)
   assert.equal(registry.has('s1'), true)
+  assert.equal(registry.size, 2)
 })
 
 test('chatWindowWebPreferences disables background throttling so streaming paints while blurred', () => {

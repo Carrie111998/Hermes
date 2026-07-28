@@ -12,11 +12,14 @@
 import { computed } from 'nanostores'
 
 import type { HermesActiveWork } from '@/global'
+import { sessionIdentityKey } from '@/lib/session-identity'
 import { $sessions } from '@/store/session'
 import { $workingSessionIds } from '@/store/session-states'
 
 const $activeWork = computed([$workingSessionIds, $sessions], (workingIds, sessions): HermesActiveWork => {
-  const titleById = new Map(sessions.map(session => [session.id, session.title?.trim() ?? '']))
+  const titleById = new Map(
+    sessions.map(session => [sessionIdentityKey(session.id, session.profile), session.title?.trim() ?? ''])
+  )
 
   return {
     count: workingIds.length,

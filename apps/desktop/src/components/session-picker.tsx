@@ -7,15 +7,22 @@ import { listAllProfileSessions } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { Check, MessageCircle } from '@/lib/icons'
+import { normalizeProfileKey, sessionIdentityKey } from '@/lib/session-identity'
 import { cn } from '@/lib/utils'
+import type { SessionInfo } from '@/types/hermes'
 
 interface SessionPickerDialogProps {
-  /** Stored id of the session currently open, so it can be flagged in the list. */
-  activeStoredSessionId?: string | null
+  /** Compound identity of the session currently open, so only its owning profile is flagged. */
+  activeSessionIdentityKey?: string | null
   onOpenChange: (open: boolean) => void
-  onResume: (storedSessionId: string) => void
+  onResume: (storedSessionId: string, profile?: null | string) => void
   open: boolean
 }
+
+export const isSessionPickerItemActive = (
+  session: Pick<SessionInfo, 'id' | 'profile'>,
+  activeSessionIdentityKey?: null | string
+): boolean => activeSessionIdentityKey === sessionIdentityKey(session.id, session.profile)
 
 /**
  * Desktop equivalent of the TUI's sessions overlay (`/resume`, `/sessions`,
@@ -24,7 +31,7 @@ interface SessionPickerDialogProps {
  * sessions only, so `/resume` feels first-class instead of falling through to
  * the headless slash worker (which can't render the picker).
  */
-export function SessionPickerDialog({ activeStoredSessionId, onOpenChange, onResume, open }: SessionPickerDialogProps) {
+export function SessionPickerDialog({ activeSessionIdentityKey, onOpenChange, onResume, open }: SessionPickerDialogProps) {
   const { t } = useI18n()
   const [search, setSearch] = useState('')
 
@@ -62,16 +69,17 @@ export function SessionPickerDialog({ activeStoredSessionId, onOpenChange, onRes
                 {sessions.map(session => {
                   const title = sessionTitle(session)
                   const preview = session.preview?.trim()
+                  const identityKey = sessionIdentityKey(session.id, session.profile)
 
                   return (
                     <CommandItem
                       className="gap-2.5"
-                      key={session.id}
+                      key={identityKey}
                       onSelect={() => {
-                        onResume(session.id)
+                        onResume(session.id, session.profile)
                         onOpenChange(false)
                       }}
-                      value={`${title} ${preview ?? ''} ${session.id}`}
+                      value={`${title} ${preview ?? ''} ${session.id} ${normalizeProfileKey(session.profile)}`}
                     >
                       <MessageCircle className="size-4 shrink-0 text-muted-foreground" />
                       <span className="flex min-w-0 flex-col leading-snug">
@@ -81,7 +89,7 @@ export function SessionPickerDialog({ activeStoredSessionId, onOpenChange, onRes
                       <Check
                         className={cn(
                           'ml-auto size-4 shrink-0 text-foreground',
-                          session.id !== activeStoredSessionId && 'invisible'
+                          !isSessionPickerItemActive(session, activeSessionIdentityKey) && 'invisible'
                         )}
                       />
                     </CommandItem>
