@@ -1356,8 +1356,12 @@ class SessionStore:
                 row = db.get_session(entry.session_id)
                 # row is None        -> not in DB (legacy / pre-SQLite) — keep
                 # end_reason is None  -> session alive — keep
-                # end_reason not None -> session ended — prune
+                # end_reason not None -> session ended — maybe prune
                 if row is not None and row.get("end_reason") is not None:
+                    end_reason = row["end_reason"]
+                    # Keep crash-interrupted entries for /resume recovery.
+                    if end_reason == "crash_interrupted":
+                        continue
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:
@@ -2304,6 +2308,7 @@ class SessionStore:
         auto_reset_reason = None
         reset_had_activity = False
         prev_session_id: Optional[str] = None
+        superseded_resume_reason: Optional[str] = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -2339,6 +2344,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        superseded_resume_reason = entry.resume_reason
                     entry = None
                     _needs_recover = True
                 elif entry.session_id != _stale_session_id:
@@ -2354,6 +2360,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        superseded_resume_reason = entry.resume_reason
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2433,7 +2440,10 @@ class SessionStore:
             # Use the specific reset reason so state.db is auditable (e.g.
             # "resume_pending_expired" is distinguishable from a normal
             # "session_reset" caused by idle/daily expiry).
-            _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
+            if superseded_resume_reason == "restart_interrupted":
+                _db_end_reason = "crash_interrupted"
+            else:
+                _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
             try:
                 # promote_to_session_reset, not end_session: the row may
                 # already be ended with a recoverable accidental reason
