@@ -590,6 +590,7 @@ prompt_caching:
 #     timeout: 30            # LLM API call timeout (seconds)
 #     download_timeout: 30   # Image HTTP download timeout (seconds)
 #                            # Increase for slow connections or self-hosted image servers
+#     max_tokens: 0          # Output token cap (0 = provider default, 2000 for Gemini-style)
 #     reasoning_effort: ""   # Per-task thinking level: none, minimal, low, medium,
 #                            # high, xhigh, max, ultra. Empty = provider default.
 #                            # Works on every auxiliary task block (vision,

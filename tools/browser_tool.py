@@ -4284,6 +4284,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # screenshot analysis, so the default timeout must be generous.
         vision_timeout = 120.0
         vision_temperature = 0.1
+        vision_max_tokens = 2000
         try:
             from hermes_cli.config import load_config
             _cfg = load_config()
@@ -4294,6 +4295,9 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)
+            _vmt = _vision_cfg.get("max_tokens")
+            if _vmt is not None:
+                vision_max_tokens = int(_vmt)
         except Exception:
             pass
 
@@ -4308,7 +4312,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     ],
                 }
             ],
-            "max_tokens": 2000,
+            "max_tokens": vision_max_tokens,
             "temperature": vision_temperature,
             "timeout": vision_timeout,
         }
