@@ -2519,6 +2519,7 @@ export interface Translations {
       moreActions: string
       branchNewChat: string
       react: string
+      quoteInNewMessage: string
       dismissError: string
       filesChanged: (count: number) => string
       reviewChanges: string
