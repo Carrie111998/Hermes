@@ -1530,9 +1530,9 @@ def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
 def test_winpty_readiness_crosses_restricted_workspace_trust_gate_once() -> None:
     trust = (
         "\x1b[2JAccessing workspace:\r\n"
+        "Security guide\r\n"
         "Yes, I trust this folder\r\n"
         "No, continue without these permissions\r\n"
-        "Security guide\r\n"
     )
 
     class Process:
@@ -1540,7 +1540,6 @@ def test_winpty_readiness_crosses_restricted_workspace_trust_gate_once() -> None
             self.chunks = iter(
                 [
                     "\x1b[?2004h",
-                    trust,
                     trust,
                     "\x1b[?2004h",
                     "\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m",
@@ -1567,7 +1566,7 @@ def test_winpty_readiness_crosses_restricted_workspace_trust_gate_once() -> None
 
     assert "\u23f5\u23f5 don't ask on" in output
     assert process.writes == ["\r"]
-    assert process.reads == 6
+    assert process.reads == 5
 
 
 @pytest.mark.parametrize(

@@ -1660,6 +1660,18 @@ def _workspace_trust_prompt_end(output: str) -> int | None:
             "No, continue without these permissions",
             "Security guide",
         ),
+        (
+            "Accessing workspace:",
+            "Security guide",
+            "Yes, I trust this folder",
+            "No, exit",
+        ),
+        (
+            "Accessing workspace:",
+            "Security guide",
+            "Yes, I trust this folder",
+            "No, continue without these permissions",
+        ),
     )
     latest_end: int | None = None
     for signature in signatures:
