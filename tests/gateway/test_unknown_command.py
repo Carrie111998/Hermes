@@ -170,6 +170,76 @@ async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch)
         assert "Unknown command" not in result
 
 
+def _patch_plugin_command(monkeypatch, name, handler):
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_commands",
+        lambda: {name: {"handler": handler, "description": "test", "plugin": "test"}},
+    )
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_command_handler",
+        lambda requested: handler if requested == name else None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_plugin_keyboard_result_attaches_markup_to_telegram_send(monkeypatch):
+    """The exact rich plugin result shape is delivered with its keyboard."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    keyboard = gateway_run.InlineKeyboardMarkup()
+
+    async def plugin_handler(_args):
+        return ("Page 2", keyboard)
+
+    _patch_plugin_command(monkeypatch, "keyboard", plugin_handler)
+
+    result = await runner._handle_message(_make_event("/keyboard"))
+
+    assert result is None
+    runner.adapters[Platform.TELEGRAM].send.assert_awaited_once()
+    send_args = runner.adapters[Platform.TELEGRAM].send.await_args.args
+    send_kwargs = runner.adapters[Platform.TELEGRAM].send.await_args.kwargs
+    assert send_args[1] == "Page 2"
+    assert send_kwargs["reply_markup"] is keyboard
+
+
+@pytest.mark.asyncio
+async def test_bare_string_plugin_result_keeps_existing_return_behavior(monkeypatch):
+    """Bare-string plugin commands still return text for normal delivery."""
+    async def plugin_handler(_args):
+        return "legacy plugin response"
+
+    _patch_plugin_command(monkeypatch, "legacy", plugin_handler)
+    runner = _make_runner()
+
+    result = await runner._handle_message(_make_event("/legacy"))
+
+    assert result == "legacy plugin response"
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_matching_two_tuple_uses_legacy_string_coercion(monkeypatch):
+    """A two-tuple with an invalid second member is not keyboard-bearing."""
+    invalid_result = ("text", object())
+
+    async def plugin_handler(_args):
+        return invalid_result
+
+    _patch_plugin_command(monkeypatch, "invalid", plugin_handler)
+    runner = _make_runner()
+
+    result = await runner._handle_message(_make_event("/invalid"))
+
+    assert result == str(invalid_result)
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+
 # ------------------------------------------------------------------
 # command:<name> decision hook — deny / handled / rewrite
 # ------------------------------------------------------------------
