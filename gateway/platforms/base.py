@@ -5621,6 +5621,17 @@ class BasePlatformAdapter(ABC):
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
+                # Stop the refresh loop before the first final delivery. Some
+                # platforms clear typing when a message arrives, so a concurrent
+                # refresh can otherwise race the send and re-arm the indicator.
+                await _stop_typing_task()
+
+                # _stop_typing_refresh() also catches cancellation of this
+                # processor. Restore propagation before final delivery starts.
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise asyncio.CancelledError
+
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
                 _tts_cleanup_paths = {_tts_requested_path, _tts_path} - {None}
