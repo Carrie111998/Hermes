@@ -380,6 +380,39 @@ def profile_exists(name: str) -> bool:
     return get_profile_dir(canon).is_dir()
 
 
+def profile_has_terminal(name: str, *, _cache: dict = {}) -> bool:
+    """Return True when *name* is a real Hermes profile whose config.yaml
+    advertises the ``terminal`` toolset (t_a2ef2ea2 / t_c8f612f5).
+
+    Review / REWORK / RISK-VERDICT cards need a terminal-capable worker
+    (they run pytest, psql, gh, git, etc.). The dispatcher's selection loop
+    only checked ``profile_exists`` (directory presence) which is blind to
+    capability, so review cards landed on terminal-less reviewers and
+    re-blocked. This helper lets the dispatcher refuse to spawn review work
+    on a profile that cannot execute it. Cheap + read-only; falls back to
+    False on any parse error / missing file so a malformed profile never
+    silently looks terminal-capable.
+    """
+    canon = normalize_profile_name(name)
+    if canon not in _cache:
+        capable = False
+        try:
+            import yaml  # hermes_cli already depends on yaml
+            cfg_path = get_profile_dir(canon) / "config.yaml"
+            if cfg_path.is_file():
+                with open(cfg_path, "r", encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh) or {}
+                toolsets = (data.get("toolsets") or []) + [
+                    t for grp in (data.get("platform_toolsets") or {}).values()
+                    for t in (grp or [])
+                ]
+                capable = "terminal" in toolsets
+        except Exception:
+            capable = False
+        _cache[canon] = capable
+    return _cache[canon]
+
+
 # ---------------------------------------------------------------------------
 # Alias / wrapper script management
 # ---------------------------------------------------------------------------

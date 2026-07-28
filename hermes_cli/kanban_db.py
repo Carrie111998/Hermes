@@ -3982,7 +3982,27 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if row is not None:
+        return row["kind"] == "blocked"
+    trow = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if trow is None or trow["status"] != "blocked":
+        return False
+    if trow["block_kind"] == "dependency":
+        # Dependency blocks auto-clear via parent gating.
+        return False
+    gave_up = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'gave_up' "
+        "LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if gave_up is not None:
+        # Circuit-breaker path: keep the documented auto-recover semantics.
+        return False
+    # Blocked STATUS with no event provenance: fail safe -- stay blocked
+    # until an explicit unblock or an approval auto-clear (apply_approvals).
+    return True
 
 
 def recompute_ready(
@@ -4070,6 +4090,84 @@ def recompute_ready(
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
+
+
+# Approval markers recognised by the fleet relapse detector
+# (~/.hermes/scripts/kanban-approve-block-lockgate.py) -- kept in sync.
+_APPROVAL_NEGATED_RE = re.compile(
+    r"\b(no|not|without|don't|do not)\b[^\n]{0,40}REVIEW_VERDICT",
+    re.IGNORECASE,
+)
+_APPROVAL_REOPEN_RE = re.compile(
+    r"REVIEW_VERDICT=(CHANGES_REQUESTED|REJECT)|\bre-?open(ed)?\b",
+    re.IGNORECASE,
+)
+
+
+def apply_approvals(conn: sqlite3.Connection) -> list:
+    """Auto-clear approved-but-stuck cards (t_6009ccaa).
+
+    Scans tasks in (``blocked``, ``review``, ``scheduled``). A card
+    auto-clears to ``todo`` (``recompute_ready`` then promotes it to
+    ``ready`` once parents are done) when ALL hold:
+
+    * a non-negated approval marker comment exists
+      (``REVIEW_VERDICT=APPROVED`` / ``REVIEW_VERDICT: APPROVED``);
+    * no reviewer re-open (CHANGES_REQUESTED / REJECT / re-open) comment
+      was posted AFTER that approval;
+    * no open parent dependency.
+
+    Appends an ``unblocked`` event with reason ``approval-auto-clear`` so
+    :func:`_has_sticky_block` flips off durably. Returns cleared task ids.
+    """
+    cleared = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, status FROM tasks "
+            "WHERE status IN ('blocked', 'review', 'scheduled')"
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            approval = conn.execute(
+                "SELECT id, body FROM task_comments WHERE task_id = ? AND ("
+                "body LIKE '%REVIEW_VERDICT=APPROVED%' "
+                "OR body LIKE '%REVIEW_VERDICT: APPROVED%') "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if approval is None:
+                continue
+            if _APPROVAL_NEGATED_RE.search(approval["body"] or ""):
+                continue  # "No REVIEW_VERDICT=APPROVED..." is a denial
+            reopen = conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ? AND id > ?",
+                (task_id, approval["id"]),
+            ).fetchall()
+            if any(_APPROVAL_REOPEN_RE.search(r["body"] or "") for r in reopen):
+                continue  # reviewer re-opened after the approval
+            undone = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone is not None:
+                continue  # open parent dep -- leave for parent gating
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', current_run_id = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status IN ('blocked', 'review', 'scheduled')",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "unblocked",
+                {"reason": "approval-auto-clear", "comment_id": approval["id"]},
+            )
+            cleared.append(task_id)
+    return cleared
 
 
 # ---------------------------------------------------------------------------
@@ -6668,6 +6766,13 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_reviewer_incapable: list[str] = field(default_factory=list)
+    """Review / REWORK / RISK-VERDICT task ids skipped because their assignee
+    is a real Hermes profile but lacks the ``terminal`` toolset, so it cannot
+    run the verification work the card requires. Distinct from
+    skipped_nonspawnable (assignee is not a Hermes profile at all) and from
+    skipped_unassigned (no assignee). Operator-actionable ONLY as a routing
+    signal: reassign the card to a terminal-capable reviewer (t_a2ef2ea2)."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8198,6 +8303,11 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Approval auto-clear (t_6009ccaa): promote approved-but-stuck cards out
+    # of blocked/review/scheduled BEFORE dependency promotion, so a card
+    # carrying REVIEW_VERDICT=APPROVED can never strand in ``blocked`` while
+    # the fleet lock-gate flags it as a relapse every tick.
+    apply_approvals(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -8474,6 +8584,26 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Terminal-capability gate (t_a2ef2ea2): a review card needs a
+        # worker that can actually run the verification (pytest/psql/gh).
+        # The pre-existing profile_exists() check is blind to capability; a
+        # real-but-terminal-less reviewer would spawn, fail on capability,
+        # and re-block (fleet health 2026-07-28, Defect #1). Refuse and
+        # emit an audit event instead.
+        try:
+            from hermes_cli.profiles import profile_has_terminal
+        except Exception:
+            profile_has_terminal = None  # type: ignore[assignment]
+        if profile_has_terminal is not None and not profile_has_terminal(row["assignee"]):
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "reviewer_capability",
+                        {"assignee": row["assignee"],
+                         "reason": "review card assigned to non-terminal profile"},
+                    )
+            result.skipped_reviewer_incapable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
