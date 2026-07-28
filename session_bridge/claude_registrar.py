@@ -720,6 +720,16 @@ class _WinPtyProcess:
             joined = "".join(chunks)
             if len(joined) > _MAX_RESPONSE_CHARS:
                 return joined
+            normalized = _normalized_terminal_output(joined, prompt)
+            prompt_contains_failure = prompt is not None and (
+                _is_authentication_failure(prompt)
+                or _is_provider_limit_failure(prompt)
+            )
+            if not prompt_contains_failure and (
+                _is_authentication_failure(normalized)
+                or _is_provider_limit_failure(normalized)
+            ):
+                return normalized
             if not candidate_seen and _exact_registered_suffix(joined) is not None:
                 candidate_seen = True
             if candidate_seen:

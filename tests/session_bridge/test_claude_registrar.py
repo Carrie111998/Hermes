@@ -1221,6 +1221,33 @@ def test_winpty_reader_never_treats_authentication_words_in_echo_as_failure() ->
     assert process.calls == 3
 
 
+def test_winpty_timed_reader_returns_live_provider_limit_without_global_timeout() -> None:
+    limited = "You've hit your session limit · resets 6:50pm (America/New_York)"
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([limited])
+            self.calls = 0
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            self.calls += 1
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+    process = Process()
+    started = time.monotonic()
+    output = _WinPtyProcess(process).read_until(
+        1.0, prompt="registration prompt"
+    )
+
+    assert output.strip() == limited
+    assert time.monotonic() - started < 0.5
+    assert process.calls == 1
+
+
 def test_winpty_reader_drains_extra_output_after_registered_before_acceptance() -> None:
     class Process:
         def __init__(self):
