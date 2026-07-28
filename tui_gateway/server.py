@@ -11009,8 +11009,8 @@ def _(rid, params: dict) -> dict:
       content_base64 / data (str, required): base64 image bytes. Accepts a
         ``data:image/...;base64,`` prefix and embedded whitespace. ``data`` is
         an accepted alias for older desktop builds.
-      filename / ext (str, optional): extension hint. Without it, magic bytes
-        identify PNG/JPEG/GIF/WebP/BMP, falling back to ``.png``.
+      filename / ext (str, optional): extension hint. The content must still
+        match a supported PNG/JPEG/GIF/WebP/BMP magic-byte signature.
     """
     session, err = _sess(params, rid)
     if err:
