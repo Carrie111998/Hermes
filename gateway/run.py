@@ -10987,25 +10987,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         try:
             adapter = adapter or self._adapter_for_source(source)
-            setter = getattr(adapter, "set_run_lifecycle_outcome", None)
-            register = getattr(adapter, "register_run_lifecycle_terminal", None)
-            if callable(setter):
-                setter(event, outcome)
-            if callable(register):
-                register(event)
-            pop_callback = getattr(adapter, "pop_post_delivery_callback", None)
-            callback = (
-                pop_callback(session_key, generation=generation)
-                if callable(pop_callback)
-                else None
-            )
         except Exception:
             logger.debug(
-                "Recursive Discord run lifecycle bookkeeping failed for %s",
+                "Recursive Discord lifecycle adapter lookup failed for %s",
                 session_key,
                 exc_info=True,
             )
             return
+
+        try:
+            setter = getattr(adapter, "set_run_lifecycle_outcome", None)
+            if callable(setter):
+                setter(event, outcome)
+        except Exception:
+            logger.debug(
+                "Recursive Discord lifecycle outcome update failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
+        try:
+            register = getattr(adapter, "register_run_lifecycle_terminal", None)
+            if callable(register):
+                register(event)
+        except Exception:
+            logger.debug(
+                "Recursive Discord lifecycle terminal registration failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
+        callback = None
+        try:
+            pop_callback = getattr(adapter, "pop_post_delivery_callback", None)
+            if callable(pop_callback):
+                callback = pop_callback(session_key, generation=generation)
+        except Exception:
+            logger.debug(
+                "Recursive Discord lifecycle callback pop failed for %s",
+                session_key,
+                exc_info=True,
+            )
         if not callable(callback):
             return
         try:

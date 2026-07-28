@@ -265,20 +265,27 @@ def test_nonempty_agent_result_preserves_failure_and_timeout_flags():
 @pytest.mark.parametrize("failing_stage", ["set", "register", "pop"])
 async def test_recursive_lifecycle_setup_failures_are_best_effort(failing_stage):
     runner, _adapter, event = _make_discord_runner_and_event()
+    calls = []
+
+    async def deferred_callback():
+        calls.append("callback")
 
     class FailingLifecycleAdapter:
         def set_run_lifecycle_outcome(self, _event, _outcome):
+            calls.append("set")
             if failing_stage == "set":
                 raise RuntimeError("setter failed")
 
         def register_run_lifecycle_terminal(self, _event):
+            calls.append("register")
             if failing_stage == "register":
                 raise RuntimeError("registration failed")
 
         def pop_post_delivery_callback(self, _session_key, *, generation=None):
+            calls.append("pop")
             if failing_stage == "pop":
                 raise RuntimeError("pop failed")
-            return None
+            return deferred_callback
 
     await runner._finish_recursive_discord_run_lifecycle(
         event,
@@ -287,6 +294,11 @@ async def test_recursive_lifecycle_setup_failures_are_best_effort(failing_stage)
         outcome="success",
         adapter=FailingLifecycleAdapter(),
     )
+
+    expected = ["set", "register", "pop"]
+    if failing_stage != "pop":
+        expected.append("callback")
+    assert calls == expected
 
 
 @pytest.mark.asyncio
