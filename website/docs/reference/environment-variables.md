@@ -220,7 +220,7 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 | `TERMINAL_SINGULARITY_IMAGE` | Singularity image or `.sif` path |
 | `TERMINAL_MODAL_IMAGE` | Modal container image |
 | `TERMINAL_DAYTONA_IMAGE` | Daytona sandbox image |
-| `TERMINAL_TENKI_IMAGE` | Optional Tenki sandbox image/template; blank uses Tenki default |
+| `TERMINAL_TENKI_IMAGE` | Optional Tenki registry image reference; blank uses Tenki default |
 | `TERMINAL_TENKI_API_ENDPOINT` | Tenki API endpoint (default: `https://api.tenki.cloud`) |
 | `TERMINAL_TENKI_WORKSPACE_ID` | Tenki workspace ID; blank falls back to Tenki CLI config |
 | `TERMINAL_TENKI_NAME_PREFIX` | Prefix for Hermes-created Tenki sandbox names (default: `hermes`) |
@@ -252,9 +252,9 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 
 | Variable | Description |
 |----------|-------------|
-| `TERMINAL_CONTAINER_CPU` | CPU cores (default: 1) |
-| `TERMINAL_CONTAINER_MEMORY` | Memory in MB (default: 5120) |
-| `TERMINAL_CONTAINER_DISK` | Disk in MB (default: 51200) |
+| `TERMINAL_CONTAINER_CPU` | CPU cores (default: 1; Tenki accepts 1-16) |
+| `TERMINAL_CONTAINER_MEMORY` | Memory in MB (default: 5120; Tenki accepts even values from 128-65536) |
+| `TERMINAL_CONTAINER_DISK` | Disk in MB (default: 51200; Tenki accepts 5-100 GB) |
 | `TERMINAL_CONTAINER_PERSISTENT` | Persist container filesystem across sessions (default: `true`; Tenki defaults to `false` unless explicitly set) |
 | `TERMINAL_SANDBOX_DIR` | Host directory for workspaces and overlays (default: `~/.hermes/sandboxes/`) |
 

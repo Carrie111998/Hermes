@@ -16444,6 +16444,11 @@ _TERMINAL_BACKENDS: List[Dict[str, str]] = [
         "description": "Run commands in a Daytona cloud sandbox.",
     },
     {
+        "name": "tenki",
+        "label": "Tenki",
+        "description": "Run commands in a Tenki cloud sandbox.",
+    },
+    {
         "name": "ssh",
         "label": "SSH",
         "description": "Run commands on a remote host over SSH.",
@@ -16550,7 +16555,44 @@ def _probe_daytona_backend() -> tuple:
     return ("needs_setup", "Set DAYTONA_API_KEY to use the Daytona backend.")
 
 
-def _probe_terminal_backend(name: str, terminal_cfg: dict) -> tuple:
+def _probe_tenki_backend(profile_secrets: Optional[Dict[str, str]] = None) -> tuple:
+    try:
+        __import__("tenki")
+    except ImportError:
+        return (
+            "needs_setup",
+            "Tenki SDK not found — install `tenki>=0.5.1,<0.7` or run `hermes setup terminal`.",
+        )
+
+    if profile_secrets is not None:
+        # A named profile is an isolation boundary. Its .env/external-secret
+        # mapping is authoritative; never fall through to the dashboard
+        # process environment or the machine-wide `tenki login` credential.
+        has_auth = any(
+            str(profile_secrets.get(key) or "").strip()
+            for key in ("TENKI_AUTH_TOKEN", "TENKI_API_KEY")
+        )
+    else:
+        try:
+            from tools.tenki_config import has_tenki_auth
+
+            has_auth = has_tenki_auth()
+        except Exception:
+            has_auth = False
+    if has_auth:
+        return ("ready", "")
+    return (
+        "needs_setup",
+        "Tenki credentials not found — run `tenki login` or configure TENKI_AUTH_TOKEN/TENKI_API_KEY.",
+    )
+
+
+def _probe_terminal_backend(
+    name: str,
+    terminal_cfg: dict,
+    *,
+    profile_secrets: Optional[Dict[str, str]] = None,
+) -> tuple:
     """Return ``(status, detail)`` for one backend. Never raises."""
     try:
         if name == "local":
@@ -16565,6 +16607,8 @@ def _probe_terminal_backend(name: str, terminal_cfg: dict) -> tuple:
             return _probe_modal_backend()
         if name == "daytona":
             return _probe_daytona_backend()
+        if name == "tenki":
+            return _probe_tenki_backend(profile_secrets)
         return ("unavailable", f"Unknown backend: {name}")
     except Exception as exc:  # pragma: no cover — belt-and-braces guard
         return ("unavailable", f"Probe failed: {exc}")
@@ -16580,26 +16624,45 @@ async def get_terminal_backends(profile: Optional[str] = None):
     Probes are fast (<~2s each) and defensive — a probe failure surfaces as a
     status, never an error response.
     """
-    with _profile_scope(profile):
-        config = load_config()
-        terminal_cfg = config.get("terminal")
-        if not isinstance(terminal_cfg, dict):
-            terminal_cfg = {}
-        active = str(terminal_cfg.get("backend") or "local").strip().lower()
-        if active not in _TERMINAL_BACKEND_NAMES:
-            active = "local"
+    with _profile_scope(profile) as profile_dir:
+        secret_token = None
+        profile_secrets = None
+        if profile_dir is not None:
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                reset_secret_scope,
+                set_secret_scope,
+            )
 
-        backends = []
-        for row in _TERMINAL_BACKENDS:
-            status, detail = _probe_terminal_backend(row["name"], terminal_cfg)
-            backends.append({
-                "name": row["name"],
-                "label": row["label"],
-                "description": row["description"],
-                "active": row["name"] == active,
-                "status": status,
-                "detail": detail,
-            })
+            profile_secrets = build_profile_secret_scope(Path(profile_dir))
+            secret_token = set_secret_scope(profile_secrets)
+        try:
+            config = load_config()
+            terminal_cfg = config.get("terminal")
+            if not isinstance(terminal_cfg, dict):
+                terminal_cfg = {}
+            active = str(terminal_cfg.get("backend") or "local").strip().lower()
+            if active not in _TERMINAL_BACKEND_NAMES:
+                active = "local"
+
+            backends = []
+            for row in _TERMINAL_BACKENDS:
+                status, detail = _probe_terminal_backend(
+                    row["name"],
+                    terminal_cfg,
+                    profile_secrets=profile_secrets,
+                )
+                backends.append({
+                    "name": row["name"],
+                    "label": row["label"],
+                    "description": row["description"],
+                    "active": row["name"] == active,
+                    "status": status,
+                    "detail": detail,
+                })
+        finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
     return {"active": active, "backends": backends}
 
 
@@ -16632,7 +16695,9 @@ async def select_terminal_backend(
         if not isinstance(terminal_cfg, dict):
             terminal_cfg = {}
             config["terminal"] = terminal_cfg
-        terminal_cfg["backend"] = backend
+        from hermes_cli.config import apply_terminal_backend_transition
+
+        apply_terminal_backend_transition(terminal_cfg, backend)
         save_config(config)
     return {"ok": True, "backend": backend}
 

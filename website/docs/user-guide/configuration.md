@@ -126,14 +126,14 @@ terminal:
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"                 # Container image for Modal backend
   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Container image for Daytona backend
-  tenki_image: ""                                                           # Optional Tenki image/template; blank uses Tenki default
+  tenki_image: ""                                                           # Optional Tenki registry image reference; blank uses Tenki default
   tenki_api_endpoint: "https://api.tenki.cloud"
   tenki_workspace_id: ""                                                    # Blank falls back to Tenki CLI config
   tenki_sync_hermes_home: false                                             # Opt-in sync of selected ~/.hermes files
   tenki_forward_env: []                                                     # Explicit host env vars to forward into Tenki
 ```
 
-For cloud sandboxes such as Modal, Daytona, and Tenki, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later. Tenki defaults to `container_persistent: false` so sandboxes are terminated when Hermes cleans them up; when persistence is enabled, Hermes pauses and later resumes the matching Tenki sandbox.
+For cloud sandboxes such as Modal, Daytona, and Tenki, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later. Tenki defaults to `container_persistent: false`; when persistence is enabled, cleanup normally snapshots and terminates the sandbox, then the next environment restores that snapshot. Hermes only keeps the live sandbox paused when it cannot confirm a durable snapshot.
 
 ### Backend Overview
 
@@ -391,6 +391,9 @@ terminal:
   backend: tenki
   cwd: "/home/tenki"
   container_persistent: false      # Default for Tenki
+  container_cpu: 1                # Tenki supports 1-16 cores
+  container_memory: 5120          # Tenki supports even values, 128-65536 MB
+  container_disk: 51200           # MB; Tenki supports 5-100 GB
   tenki_api_endpoint: "https://api.tenki.cloud"
   tenki_workspace_id: ""           # Falls back to Tenki CLI config
   tenki_name_prefix: "hermes"
@@ -405,15 +408,15 @@ terminal:
 
 **Required:** Tenki CLI login, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`. Hermes also reads the Tenki CLI config for the current workspace ID.
 
-**Persistence:** Tenki is terminate-only by default. Set `container_persistent: true` only if you intentionally want Hermes to pause and resume a task-named sandbox.
+**Persistence:** Tenki is ephemeral by default: Hermes terminates the sandbox during cleanup. With `container_persistent: true`, Hermes first creates a durable snapshot, records its ID in the active profile's `tenki_snapshots.json`, attempts to delete the superseded remote snapshot, and then terminates the sandbox. The next environment restores the recorded snapshot. If snapshot durability or local pointer persistence cannot be confirmed, Hermes preserves the prior pointer and pauses the live sandbox instead of terminating the only copy; a later run can rediscover and resume it.
 
 **Sudo:** Tenki sandboxes use the sandbox's own sudoers policy. Hermes never prompts for or forwards the host `SUDO_PASSWORD` to Tenki. The default Tenki image supports passwordless sudo.
 
-**Optional `.hermes` sync:** Set `tenki_sync_hermes_home: true` if a Tenki sandbox needs the same selected credential, skill, and cache files that Modal and Daytona receive. Leave it off when Tenki is only an execution sandbox and secrets should remain with the supervisor process.
+**Optional `.hermes` sync:** Set `tenki_sync_hermes_home: true` if a Tenki sandbox needs selected credential, skill, and cache files from `~/.hermes`. This setting only synchronizes that selected `.hermes` data; it does **not** copy the sandbox working directory or arbitrary command outputs back to the host. Leave it off when Tenki is only an execution sandbox and secrets should remain with the supervisor process.
 
 **Credential forwarding:** `terminal.env_passthrough` intentionally blocks common credential names such as `GITHUB_TOKEN` and `GH_TOKEN`. For Git or package-manager tokens that must be visible inside Tenki sandboxes, list the variable names in `terminal.tenki_forward_env`; Hermes resolves them profile-scope-aware (from your current shell / the active profile scope first, then `~/.hermes/.env`). The supervisor's own Tenki control-plane token (`TENKI_AUTH_TOKEN` / `TENKI_API_KEY`) is **not** forwarded by default; add it to `tenki_forward_env` only when child sandboxes must create nested Tenki sandboxes, and note that anything forwarded is readable by (model-controlled) guest code.
 
-> **Multiplexing caveat:** forwarded credentials are not profile-isolated under the multiplexing gateway's shared terminal cache — two profiles served by one gateway process can reuse the same live sandbox. Avoid forwarding sensitive credentials (especially the control-plane token) into sandboxes when running multiple profiles from a single multiplexed gateway.
+When the multiplexing gateway serves several profiles, Hermes keys Tenki environments and availability checks by profile. Each profile therefore resolves its own backend settings, workspace, auth scope, sandbox cache, file operations, and snapshots.
 
 **Fully remote supervisor pattern:** To make Hermes itself live remotely, run the Hermes process inside a long-lived Tenki supervisor sandbox and configure that process with `terminal.backend: tenki`. The supervisor owns `~/.hermes`, model credentials, sessions, memory, and gateway/dashboard processes. Terminal, file, `execute_code`, and delegated subagent execution then create child Tenki sandboxes on demand. Give the supervisor Tenki credentials with `tenki login`, `TENKI_AUTH_TOKEN`, or `TENKI_API_KEY`; child sandboxes do not need host sudo passwords.
 
@@ -452,22 +455,11 @@ If terminal commands fail immediately or the terminal tool is reported as disabl
 
 When in doubt, set `terminal.backend` back to `local` and verify that commands run there first.
 
-### Remote-to-Host File Sync on Teardown
+### Selected `.hermes` Sync for Remote Backends
 
-For the **SSH**, **Modal**, **Daytona**, and **Tenki** backends (anywhere the agent's working tree lives on a different machine than the host running Hermes), Hermes tracks files the agent touched inside the remote sandbox and, on session teardown / sandbox cleanup, **syncs the modified files back to the host** under `~/.hermes/cache/remote-syncs/<session-id>/`. Tenki also supports opt-in selected `.hermes` credential/skill/cache sync with `terminal.tenki_sync_hermes_home: true`; it is disabled by default.
+SSH, Modal, and Daytona synchronize selected files that Hermes itself needs in the remote environment: declared credential files, skills, and supported `~/.hermes/cache` entries. Tenki participates only when `terminal.tenki_sync_hermes_home: true`. Credential files are upload-only; sync-back never overwrites their host copies.
 
-- Triggers on: session close, `/new`, `/reset`, gateway message timeout, `delegate_task` subagent completion when the child used a remote backend.
-- Covers the whole tree the agent modified, not just files it explicitly opened. Additions, edits, and deletions are all captured.
-- The remote sandbox may have been torn down by the time you go looking; the local `~/.hermes/cache/remote-syncs/…` copy is the authoritative record of what the agent changed.
-- Large binary outputs (model checkpoints, raw datasets) are capped by size — the sync skips files over `file_sync_max_mb` (default `100`). Bump that if you expect bigger artifacts to come back.
-
-```yaml
-terminal:
-  file_sync_max_mb: 100     # default — sync files up to 100 MB each
-  file_sync_enabled: true   # default — set false to skip the sync entirely
-```
-
-This is how you recover results from ephemeral cloud sandboxes that get destroyed after the session ends, without having to tell the agent to explicitly `scp` or `modal volume put` every artifact.
+This is **not** a working-tree backup. Hermes does not automatically collect arbitrary files created under the remote command working directory, and there is no `~/.hermes/cache/remote-syncs/<session-id>/` recovery copy. Before an ephemeral sandbox is cleaned up, explicitly download, commit, upload, or otherwise transfer every output you need. With Tenki's default non-persistent mode, cleanup terminates the sandbox.
 
 ### Docker Volume Mounts
 

@@ -29,7 +29,11 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
-from tools.registry import discover_builtin_tools, registry
+from tools.registry import (
+    _CHECK_FN_TTL_SECONDS,
+    discover_builtin_tools,
+    registry,
+)
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
@@ -321,15 +325,25 @@ def get_tool_definitions(
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
+            cfg_path_key = str(cfg_path.resolve())
             cfg_stat = cfg_path.stat()
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
+            try:
+                cfg_path_key = str(cfg_path)
+            except UnboundLocalError:
+                cfg_path_key = ""
             cfg_fp = None
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
+            cfg_path_key,
             cfg_fp,
+            # The outer schema cache must eventually re-enter registry
+            # check_fn probes after credentials/services change. Otherwise it
+            # can outlive the inner availability TTL indefinitely.
+            int(time.monotonic() // _CHECK_FN_TTL_SECONDS),
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),

@@ -7357,6 +7357,46 @@ def _normalize_terminal_backend_defaults(
     return config
 
 
+_PRE_TENKI_SETTINGS_KEY = "_pre_tenki_backend_settings"
+
+
+def apply_terminal_backend_transition(
+    terminal: Dict[str, Any],
+    backend: str,
+) -> None:
+    """Switch terminal backend while round-tripping Tenki-safe overrides."""
+    backend = str(backend or "").strip().lower()
+    current = str(
+        terminal.get("backend") or terminal.get("env_type") or "local"
+    ).strip().lower()
+    if backend == "tenki" and current != "tenki":
+        if _PRE_TENKI_SETTINGS_KEY not in terminal:
+            keys = ("container_persistent", "cwd")
+            terminal[_PRE_TENKI_SETTINGS_KEY] = {
+                "present": [key for key in keys if key in terminal],
+                "values": {
+                    key: terminal[key]
+                    for key in keys
+                    if key in terminal
+                },
+            }
+        terminal["container_persistent"] = False
+        terminal["cwd"] = "/home/tenki"
+    elif current == "tenki" and backend != "tenki":
+        saved = terminal.pop(_PRE_TENKI_SETTINGS_KEY, None)
+        if isinstance(saved, dict):
+            present = set(saved.get("present") or [])
+            values = saved.get("values")
+            if not isinstance(values, dict):
+                values = {}
+            for key in ("container_persistent", "cwd"):
+                if key in present and key in values:
+                    terminal[key] = values[key]
+                else:
+                    terminal.pop(key, None)
+    terminal["backend"] = backend
+
+
 def is_provider_enabled(provider_cfg: Optional[Dict[str, Any]]) -> bool:
     """Return whether a ``providers.<name>`` config block is enabled.
 

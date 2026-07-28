@@ -491,12 +491,16 @@ def test_modal_setup_persists_direct_mode_when_user_chooses_their_own_account(tm
     assert config["terminal"]["modal_mode"] == "direct"
 
 
-def test_tenki_setup_switch_resets_inherited_persistent_container(monkeypatch):
+def test_tenki_setup_switch_resets_inherited_persistent_container(tmp_path, monkeypatch):
     config = {
         "terminal": {
             "backend": "docker",
             "container_persistent": True,
             "cwd": "/workspace",
+            # YAML blank scalars load as None and must not become explicit
+            # "None" overrides when setup saves the config.
+            "tenki_api_endpoint": None,
+            "tenki_workspace_id": None,
         }
     }
 
@@ -507,19 +511,80 @@ def test_tenki_setup_switch_resets_inherited_persistent_container(monkeypatch):
         raise AssertionError(f"Unexpected prompt_choice call: {question}")
 
     monkeypatch.setitem(sys.modules, "tenki", types.ModuleType("tenki"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TENKI_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("TENKI_API_ENDPOINT", "https://profile.tenki.test")
+    monkeypatch.setenv("TENKI_WORKSPACE_ID", "workspace-from-profile")
     monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
     monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: "")
-    monkeypatch.setattr("hermes_cli.setup.save_config", lambda _config: None)
     monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda *_args, **_kwargs: None)
 
     from hermes_cli.setup import setup_terminal_backend
+    from hermes_cli.config import load_config_readonly
+    from tools.tenki_config import (
+        resolve_tenki_api_endpoint,
+        resolve_tenki_workspace_id,
+    )
 
     setup_terminal_backend(config)
 
     assert config["terminal"]["backend"] == "tenki"
     assert config["terminal"]["container_persistent"] is False
     assert config["terminal"]["cwd"] == "/home/tenki"
+    # Resolved fallbacks are displayed, not frozen into config. A later
+    # profile/CLI change must still be able to supply different values.
+    assert config["terminal"]["tenki_api_endpoint"] == ""
+    assert config["terminal"]["tenki_workspace_id"] == ""
+
+    reloaded = load_config_readonly()["terminal"]
+    assert reloaded["tenki_api_endpoint"] == ""
+    assert reloaded["tenki_workspace_id"] == ""
+
+    monkeypatch.setenv("TENKI_API_ENDPOINT", "https://later-profile.tenki.test")
+    monkeypatch.setenv("TENKI_WORKSPACE_ID", "workspace-from-later-profile")
+    assert (
+        resolve_tenki_api_endpoint(reloaded["tenki_api_endpoint"])
+        == "https://later-profile.tenki.test"
+    )
+    assert (
+        resolve_tenki_workspace_id(reloaded["tenki_workspace_id"])
+        == "workspace-from-later-profile"
+    )
+
+
+def test_tenki_setup_preserves_explicit_endpoint_and_workspace(tmp_path, monkeypatch):
+    config = {
+        "terminal": {
+            "backend": "tenki",
+            "tenki_api_endpoint": " https://explicit.tenki.test ",
+            "tenki_workspace_id": " workspace-explicit ",
+        }
+    }
+
+    def fake_prompt_choice(question, choices, default=0):
+        if question == "Select terminal backend:":
+            return choices.index("Tenki Agent - Tenki cloud sandbox")
+        raise AssertionError(f"Unexpected prompt_choice call: {question}")
+
+    monkeypatch.setitem(sys.modules, "tenki", types.ModuleType("tenki"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("TENKI_API_ENDPOINT", "https://fallback.tenki.test")
+    monkeypatch.setenv("TENKI_WORKSPACE_ID", "workspace-fallback")
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: "")
+    monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda *_args, **_kwargs: None)
+
+    from hermes_cli.setup import setup_terminal_backend
+    from hermes_cli.config import load_config_readonly
+
+    setup_terminal_backend(config)
+
+    assert config["terminal"]["tenki_api_endpoint"] == "https://explicit.tenki.test"
+    assert config["terminal"]["tenki_workspace_id"] == "workspace-explicit"
+    reloaded = load_config_readonly()["terminal"]
+    assert reloaded["tenki_api_endpoint"] == "https://explicit.tenki.test"
+    assert reloaded["tenki_workspace_id"] == "workspace-explicit"
 
 
 # test_setup_slack_* moved to tests/gateway/test_slack_plugin_setup.py — the

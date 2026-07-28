@@ -1375,16 +1375,86 @@ class TestEnvironmentHints:
         assert "Linux 6.8.0" in line
         assert "root" in line
 
-    def test_probe_container_config_uses_shared_builder(self, monkeypatch):
-        """The probe must pass the canonical container config from
-        ``_container_config_from_env_config`` — a stale inline copy omitted
-        ``tenki_sync_hermes_home`` / ``tenki_forward_env`` (and
-        ``docker_network``), so probe environments were built with different
-        settings than real ones."""
+    def test_tenki_prompt_probe_uses_static_fallback_without_creating_sandbox(self, monkeypatch):
         import agent.prompt_builder as _pb
         import tools.terminal_tool as _tt
 
         monkeypatch.setenv("TERMINAL_ENV", "tenki")
+        monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+        monkeypatch.setenv("TERMINAL_TENKI_SYNC_HERMES_HOME", "true")
+        monkeypatch.setenv("TERMINAL_TENKI_FORWARD_ENV", '["NOTION_TOKEN"]')
+        monkeypatch.setenv("NOTION_TOKEN", "must-not-enter-a-probe")
+        _pb._clear_backend_probe_cache()
+
+        factory_calls = []
+
+        def record_create(**kwargs):
+            factory_calls.append(kwargs)
+            return object()
+
+        monkeypatch.setattr(_tt, "_create_environment", record_create)
+
+        assert _pb._probe_remote_backend("tenki") is None
+        hint = _pb.build_environment_hints()
+        assert factory_calls == []
+        assert "Terminal backend: tenki" in hint
+        assert "defers sandbox creation until the first tool call" in hint
+        assert "probe directly" not in hint
+
+    def test_multiplexed_profile_hint_uses_scoped_tenki_backend(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import agent.prompt_builder as _pb
+        import tools.terminal_tool as _tt
+        from agent.secret_scope import is_multiplex_active, set_multiplex_active
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli import config as hermes_config
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        (profile_home / "config.yaml").write_text(
+            "terminal:\n"
+            "  backend: tenki\n"
+            "  cwd: /home/tenki\n",
+            encoding="utf-8",
+        )
+        (profile_home / ".env").write_text(
+            "TENKI_AUTH_TOKEN=profile-token\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        previous = is_multiplex_active()
+        set_multiplex_active(True)
+        hermes_config._LOAD_CONFIG_CACHE.clear()
+        hermes_config._RAW_CONFIG_CACHE.clear()
+        _pb._clear_backend_probe_cache()
+        factory_calls = []
+        monkeypatch.setattr(
+            _tt,
+            "_create_environment",
+            lambda **kwargs: factory_calls.append(kwargs),
+        )
+        try:
+            with _profile_runtime_scope(profile_home):
+                assert _tt._get_env_config()["env_type"] == "tenki"
+                hint = _pb.build_environment_hints()
+        finally:
+            set_multiplex_active(previous)
+
+        assert factory_calls == []
+        assert "Terminal backend: tenki" in hint
+        assert "Host:" not in hint
+
+    def test_probe_container_config_uses_shared_builder(self, monkeypatch):
+        """The probe must pass the canonical container config from
+        ``_container_config_from_env_config`` — a stale inline copy omitted
+        backend settings such as ``docker_network``."""
+        import agent.prompt_builder as _pb
+        import tools.terminal_tool as _tt
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
         _pb._clear_backend_probe_cache()
 
         class _FakeEnv:
@@ -1392,8 +1462,8 @@ class TestEnvironmentHints:
                 return {
                     "returncode": 0,
                     "output": (
-                        "os=Linux\nkernel=6.8.0\nhome=/home/tenki\n"
-                        "cwd=/home/tenki\nuser=tenki\n"
+                        "os=Linux\nkernel=6.8.0\nhome=/root\n"
+                        "cwd=/workspace\nuser=root\n"
                     ),
                 }
 
@@ -1405,11 +1475,10 @@ class TestEnvironmentHints:
 
         monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
 
-        assert _pb._probe_remote_backend("tenki") is not None
+        assert _pb._probe_remote_backend("docker") is not None
         container_config = created["container_config"]
         assert container_config is not None
-        for key in ("tenki_sync_hermes_home", "tenki_forward_env", "docker_network"):
-            assert key in container_config
+        assert "docker_network" in container_config
 
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
@@ -1759,4 +1828,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-

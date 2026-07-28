@@ -136,6 +136,7 @@ def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
 
 # Import config helpers
 from hermes_cli.config import (
+    apply_terminal_backend_transition,
     cfg_get,
     DEFAULT_CONFIG,
     get_hermes_home,
@@ -1224,7 +1225,8 @@ def setup_terminal_backend(config: dict):
         print_info(f"Keeping current backend: {current_backend}")
         return
 
-    config.setdefault("terminal", {})["backend"] = selected_backend
+    terminal_config = config.setdefault("terminal", {})
+    apply_terminal_backend_transition(terminal_config, selected_backend)
 
     if selected_backend == "local":
         print_success("Terminal backend: Local")
@@ -1449,12 +1451,16 @@ def setup_terminal_backend(config: dict):
         )
 
         terminal = config.setdefault("terminal", {})
-        endpoint = resolve_tenki_api_endpoint(terminal.get("tenki_api_endpoint", ""))
-        workspace_id = resolve_tenki_workspace_id(terminal.get("tenki_workspace_id", ""))
+        # Keep fallback-derived values dynamic. Persisting the currently
+        # resolved endpoint/workspace would turn a Tenki CLI or environment
+        # fallback into an explicit config override, so later CLI/profile
+        # changes could never take effect.
+        for key in ("tenki_api_endpoint", "tenki_workspace_id"):
+            value = terminal.get(key)
+            terminal[key] = value.strip() if isinstance(value, str) else ""
+        endpoint = resolve_tenki_api_endpoint(terminal["tenki_api_endpoint"])
+        workspace_id = resolve_tenki_workspace_id(terminal["tenki_workspace_id"])
 
-        terminal["tenki_api_endpoint"] = endpoint
-        if workspace_id:
-            terminal["tenki_workspace_id"] = workspace_id
         terminal.setdefault("tenki_image", "")
         terminal.setdefault("tenki_name_prefix", "hermes")
         terminal.setdefault("tenki_allow_inbound", False)
@@ -1463,12 +1469,8 @@ def setup_terminal_backend(config: dict):
         terminal.setdefault("tenki_idle_timeout", 0)
         terminal.setdefault("tenki_pause_retention", 0)
         terminal.setdefault("tenki_sync_hermes_home", False)
-        if current_backend == "tenki":
-            terminal.setdefault("container_persistent", False)
-            terminal.setdefault("cwd", "/home/tenki")
-        else:
-            terminal["container_persistent"] = False
-            terminal["cwd"] = "/home/tenki"
+        terminal.setdefault("container_persistent", False)
+        terminal.setdefault("cwd", "/home/tenki")
 
         print_info(f"  Endpoint:  {endpoint}")
         print_info(f"  Workspace: {workspace_id or '(not found; run tenki login)'}")
