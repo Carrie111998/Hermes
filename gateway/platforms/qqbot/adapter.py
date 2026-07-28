@@ -2,7 +2,7 @@
 QQ Bot platform adapter using the Official QQ Bot API (v2).
 
 Connects to the QQ Bot WebSocket Gateway for inbound events and uses the
-REST API (``api.sgroup.qq.com``) for outbound messages and media uploads.
+REST API (``api.bot.qq.com``) for outbound messages and media uploads.
 
 Configuration in config.yaml:
     platforms:

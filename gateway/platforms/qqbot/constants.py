@@ -8,7 +8,7 @@ import os
 # QQBot adapter version — bump on functional changes to the adapter package.
 # ---------------------------------------------------------------------------
 
-QQBOT_VERSION = "1.1.0"
+QQBOT_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # API endpoints
@@ -18,7 +18,10 @@ QQBOT_VERSION = "1.1.0"
 # or test environments.  Default: q.qq.com (production).
 PORTAL_HOST = os.getenv("QQ_PORTAL_HOST", "q.qq.com")
 
-API_BASE = "https://api.sgroup.qq.com"
+# QQ Bot API base URL.  The platform migrated from api.sgroup.qq.com to
+# api.bot.qq.com (see issue #73378).  Set QQ_API_BASE to override — e.g. for
+# corporate proxies that still point at the old domain, or for testing.
+API_BASE = os.getenv("QQ_API_BASE", "https://api.bot.qq.com")
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 GATEWAY_URL_PATH = "/gateway"
 
