@@ -3824,6 +3824,24 @@ function resolveHermesBackend(backendArgs) {
     return createActiveBackend(backendArgs)
   }
 
+  if (activeRuntime.usabilityReason === 'repair') {
+    rememberLog('[bootstrap] desktop-managed active runtime failed preflight; repairing the active install before external fallback')
+
+    return {
+      kind: 'bootstrap-needed',
+      label: 'Hermes Agent runtime needs repair; bootstrap required',
+      command: null,
+      args: backendArgs,
+      bootstrap: true,
+      env: {},
+      shell: false,
+      activeRoot: ACTIVE_HERMES_ROOT,
+      installStamp: INSTALL_STAMP,
+      isPackaged: IS_PACKAGED,
+      platform: process.platform
+    }
+  }
+
   if (bootstrapRepairRequested) {
     rememberLog('[bootstrap] repair requested; bypassing the usable active runtime to re-run the installer')
   }

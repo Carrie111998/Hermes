@@ -35,9 +35,17 @@ test('classifyActiveRuntime uses a healthy active runtime even when the marker i
   })
 })
 
-test('classifyActiveRuntime refuses an unusable runtime even if a valid marker exists', () => {
+test('a valid marker plus an unusable active runtime requires managed repair before external fallback', () => {
   assert.deepEqual(classifyActiveRuntime(VALID_MARKER, 1, false), {
     hasValidMarker: true,
+    shouldUseActiveRuntime: false,
+    usabilityReason: 'repair'
+  })
+})
+
+test('an unusable unmarked runtime remains eligible for ordinary external fallback', () => {
+  assert.deepEqual(classifyActiveRuntime(null, 1, false), {
+    hasValidMarker: false,
     shouldUseActiveRuntime: false,
     usabilityReason: 'unusable'
   })

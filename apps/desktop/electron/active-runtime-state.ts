@@ -6,7 +6,7 @@ export interface BootstrapMarkerLike {
 export interface ActiveRuntimeState {
   hasValidMarker: boolean
   shouldUseActiveRuntime: boolean
-  usabilityReason: 'usable' | 'unusable'
+  usabilityReason: 'usable' | 'unusable' | 'repair'
 }
 
 export function hasValidBootstrapMarker(
@@ -46,7 +46,12 @@ export function classifyActiveRuntime(
     return {
       hasValidMarker,
       shouldUseActiveRuntime: false,
-      usabilityReason: 'unusable'
+      // A valid marker says Desktop owns this canonical install. If its
+      // preflight fails, repair that install before any PATH/system-Python
+      // fallback can silently change the user's backend. Without a valid
+      // marker, this is an unowned/incomplete location and normal external
+      // candidate resolution remains appropriate.
+      usabilityReason: hasValidMarker ? 'repair' : 'unusable'
     }
   }
 
