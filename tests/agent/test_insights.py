@@ -808,6 +808,44 @@ class TestSkillUsageAccuracy:
         assert top["skill"] == "axolotl"
         assert top["manage_count"] == 1
 
+    def test_result_lookup_not_bounded_by_session_id_in_clause(self, db):
+        """The tool-result correlation query must not filter by
+        ``session_id IN (...)`` — that clause's parameter count scales with
+        the number of distinct sessions in the window and can exceed
+        SQLite's bound-variable limit (``sqlite3.OperationalError: too many
+        SQL variables``) once a report spans enough sessions. Force a tiny
+        limit here so the regression reproduces regardless of how the
+        SQLite build on any given machine is compiled.
+        """
+        import sqlite3
+
+        num_sessions = 10
+        for i in range(num_sessions):
+            session_id = f"many-{i}"
+            db.create_session(session_id=session_id, source="cli", model="test")
+            db.append_message(
+                session_id, role="assistant", content="load a skill",
+                tool_calls=[self._skill_view_call("call_1", "axolotl")],
+            )
+            db.append_message(
+                session_id, role="tool", tool_call_id="call_1",
+                content=json.dumps({"success": True, "name": "axolotl", "path": "axolotl/SKILL.md"}),
+            )
+        db._conn.commit()
+
+        # Applied only now, after setup writes (which themselves bind more
+        # than 4 params) — isolates the limit to the query under test.
+        db._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 4)
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        assert skills["summary"]["distinct_skills_used"] == 1
+        top = skills["top_skills"][0]
+        assert top["skill"] == "axolotl"
+        assert top["view_count"] == num_sessions
+
 
 # =========================================================================
 # Formatting

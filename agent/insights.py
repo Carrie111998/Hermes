@@ -339,7 +339,6 @@ class InsightsEngine:
             )
 
         calls: List[Dict[str, Any]] = []
-        session_ids: set = set()
         for row in cursor.fetchall():
             try:
                 tool_calls = row["tool_calls"]
@@ -378,7 +377,6 @@ class InsightsEngine:
                     "call_id": call.get("id"),
                     "args_name": skill_name,
                 })
-                session_ids.add(row["session_id"])
 
         if not calls:
             return []
@@ -386,14 +384,17 @@ class InsightsEngine:
         # Correlate against tool-result rows (role='tool') to know whether a
         # call succeeded and, for skill_view, to read the tool's resolved
         # canonical name / file field. A result always lands at or after its
-        # call's timestamp, so the same cutoff bounds this fetch too.
+        # call's timestamp, so the same cutoff bounds this fetch too. Not
+        # filtered by session_id — the IN (...) clause could exceed SQLite's
+        # bound-variable limit for large session sets — the lookup below is
+        # keyed by (session_id, tool_call_id), so extra rows from other
+        # sessions are simply never matched.
         results_by_call: Dict[tuple, Any] = {}
-        placeholders = ",".join("?" for _ in session_ids)
         result_cursor = self._conn.execute(
-            f"""SELECT session_id, tool_call_id, content FROM messages
+            """SELECT session_id, tool_call_id, content FROM messages
                 WHERE role = 'tool' AND tool_call_id IS NOT NULL
-                  AND timestamp >= ? AND session_id IN ({placeholders})""",
-            (cutoff, *session_ids),
+                  AND timestamp >= ?""",
+            (cutoff,),
         )
         for row in result_cursor.fetchall():
             results_by_call[(row["session_id"], row["tool_call_id"])] = row["content"]
