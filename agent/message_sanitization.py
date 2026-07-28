@@ -43,7 +43,7 @@ def _sanitize_structure_surrogates(payload: Any) -> bool:
     """Replace surrogate code points in nested dict/list payloads in-place.
 
     Mirror of ``_sanitize_structure_non_ascii`` but for surrogate recovery.
-    Used to scrub nested structured fields (e.g. ``reasoning_details`` — an
+    Used to scrub nested structured fields (e.g. ``reasoning_details`` - an
     array of dicts with ``summary``/``text`` strings) that flat per-field
     checks don't reach.  Returns True if any surrogates were replaced.
     """
@@ -123,7 +123,7 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                         fn["arguments"] = _SURROGATE_RE.sub('\ufffd', fn_args)
                         found = True
         # Walk any additional string / nested fields (reasoning,
-        # reasoning_content, reasoning_details, etc.) — surrogates from
+        # reasoning_content, reasoning_details, etc.) - surrogates from
         # byte-level reasoning models (xiaomi/mimo, kimi, glm) can lurk
         # in these fields and aren't covered by the per-field checks above.
         # Matches _sanitize_messages_non_ascii's coverage (PR #10537).
@@ -149,7 +149,7 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
     sequence with their ``\\uXXXX`` equivalents. Pass-through for everything
     else.
 
-    Ported from #12093 — complements the other repair passes in
+    Ported from #12093 - complements the other repair passes in
     ``_repair_tool_call_arguments`` when ``json.loads(strict=False)`` is
     not enough (e.g. llama.cpp backends that emit literal apostrophes or
     tabs alongside other malformations).
@@ -162,7 +162,7 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
         ch = raw[i]
         if in_string:
             if ch == "\\" and i + 1 < n:
-                # Already-escaped char — pass through as-is
+                # Already-escaped char - pass through as-is
                 out.append(ch)
                 out.append(raw[i + 1])
                 i += 2
@@ -272,7 +272,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     # Last resort: replace with empty object so the API request doesn't
     # crash the entire session.
     logger.warning(
-        "Unrepairable tool_call arguments for %s — "
+        "Unrepairable tool_call arguments for %s - "
         "replaced with empty object (was: %s)",
         tool_name, raw_stripped[:80],
     )
@@ -285,14 +285,14 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     A turn cut short by ``/stop`` can leave the transcript ending on a raw
     ``tool`` message (a tool finished, or its execution was cancelled, but the
     model never streamed a closing assistant turn). Persisting that tail means
-    the next user message lands as ``… tool → user`` — a role-alternation
+    the next user message lands as ``... tool → user`` - a role-alternation
     violation that strict providers (Gemini, Claude) react to by hallucinating
     a continuation of the user's message and ignoring prior context, which
     reads to the user as "lost context" (#48879).
 
     ``finalize_turn`` closes this on the happy interrupt path, but the
     retry/backoff/error interrupt aborts in ``conversation_loop`` ``return``
-    early and never reach it — this shared helper closes the sequence on all of
+    early and never reach it - this shared helper closes the sequence on all of
     them. ``final_response`` is usually empty on an interrupt, so an explicit
     placeholder is used rather than an empty-content assistant turn.
 
@@ -393,7 +393,7 @@ def _strip_images_from_messages(messages: list) -> bool:
 
     Preserves message alternation invariants:
       * ``tool``-role messages whose content was entirely images are replaced
-        with a plaintext placeholder, NOT deleted — deleting them would leave
+        with a plaintext placeholder, NOT deleted - deleting them would leave
         the paired ``tool_call_id`` on the prior assistant message unmatched,
         which providers reject with HTTP 400.
       * Non-tool messages whose content becomes empty are dropped.  In
@@ -420,9 +420,9 @@ def _strip_images_from_messages(messages: list) -> bool:
             if new_parts:
                 msg["content"] = new_parts
             elif msg.get("role") == "tool":
-                # Preserve tool_call_id linkage — providers require every
+                # Preserve tool_call_id linkage - providers require every
                 # assistant tool_call to have a matching tool response.
-                msg["content"] = "[image content removed — server does not support images]"
+                msg["content"] = "[image content removed - server does not support images]"
             else:
                 # Synthetic image-only user/assistant message with no text;
                 # safe to drop.
@@ -461,6 +461,52 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
     return found
 
 
+def strip_empty_content_assistant_tool_calls(messages: list) -> list:
+    """Return a NEW list with assistant messages whose content is empty
+    AND whose tool_calls is non-empty removed.
+
+    Some providers (#63200 — DeepSeek strict mode, and any OpenAI-compatible
+    API that enforces the 'assistant tool_calls must be followed by tool
+    messages for every tool_call_id' invariant) reject the request when
+    an assistant turn arrives with ``content=""`` and ``tool_calls=[...]``
+    but the very next message is NOT one of the required tool results.
+    Hermes can produce such messages in two paths:
+
+    1. Codex Responses streaming — ``codex_responses_adapter.py`` emits
+       ``{"role": "assistant", "content": ""}`` as the required following
+       item for a reasoning-only turn. If that turn also produced
+       tool_calls, the persisted message has both empty content and
+       tool_calls.
+    2. Reasoning-only tool-call turns — the model streams reasoning
+       + tool_calls without any visible content. ``build_assistant_message``
+       writes the dict with ``content=""`` and ``tool_calls=[...]``
+       because the model genuinely produced no visible content.
+
+    The fix: callers pass the outgoing API copy and use the returned list.
+    The original ``messages`` reference is NEVER mutated. Callers must
+    do ``api_messages = strip_empty_content_assistant_tool_calls(api_messages)``
+    (or assign back) — the function does not mutate the input.
+
+    NOTE: this is NOT a substitute for closing an interrupted
+    tool-call sequence — that's a different bug (Gemini/Claude reject
+    ``tool → user`` alternation). See
+    :func:`close_interrupted_tool_sequence` for that fix.
+    """
+    if not isinstance(messages, list):
+        return []
+    return [
+        msg
+        for msg in messages
+        if not (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and msg.get("content") in ("", None)
+            and isinstance(msg.get("tool_calls"), list)
+            and msg["tool_calls"]
+        )
+    ]
+
+
 __all__ = [
     "_SURROGATE_RE",
     "close_interrupted_tool_sequence",
@@ -474,4 +520,5 @@ __all__ = [
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
     "_sanitize_structure_non_ascii",
-]
+    "strip_empty_content_assistant_tool_calls",
+] 

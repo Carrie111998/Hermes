@@ -46,6 +46,7 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
+    strip_empty_content_assistant_tool_calls,
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -916,6 +917,14 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Strip assistant messages with empty content AND non-empty
+        # tool_calls (#63200) — strict providers like DeepSeek reject
+        # them with HTTP 400. Internal `messages` is untouched so session
+        # persistence and resume keep the full transcript; only the
+        # outgoing wire-format copy is filtered. The function returns
+        # a new list — assign back to api_messages.
+        api_messages = strip_empty_content_assistant_tool_calls(api_messages)
 
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)
