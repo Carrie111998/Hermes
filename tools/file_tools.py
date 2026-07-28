@@ -361,77 +361,6 @@ def _resolve_base_dir(
     return base.resolve()
 
 
-# Root directories that, when seen as the first path segment without a leading
-# "/", strongly indicate the model intended an absolute path but dropped the
-# leading slash (e.g. "home/user/dev/notes/x.md" instead of
-# "/home/user/dev/notes/x.md").  Used by _coerce_missing_leading_slash() below
-# as a *fast path*; the structural doubling check in _resolve_path_for_task is
-# the authoritative detector and catches roots not on this list too.
-_ABSOLUTE_PATH_ROOTS = frozenset(
-    (
-        "home", "Users", "tmp", "etc", "usr", "var",
-        "opt", "mnt", "data", "root", "boot", "private",
-    )
-)
-
-
-def _coerce_missing_leading_slash(filepath: str, base_dir: Path | PurePosixPath | None = None) -> str:
-    """Prepend "/" to cwd-shaped relative paths that look like absolute paths.
-
-    Models sometimes emit an absolute path without its leading slash, e.g.
-    ``home/user/dev/notes/x.md``.  Left untreated, ``_resolve_path_for_task``
-    joins this with the task base directory and produces a doubled path like
-    ``/home/user/dev/home/user/dev/notes/x.md`` (issue #67185).
-
-    Detection is **structural**, not allowlist-driven, so it works for any
-    root directory the model might drop the slash on:
-
-    1. If *base_dir* is supplied and the relative path, when joined with it,
-       reproduces the base dir as a *suffix* of itself (i.e. the joined path
-       contains ``<base>/<base-tail>``), the path is cwd-shaped and the missing
-       "/" is prepended.  This is the authoritative check and does not depend
-       on any hard-coded root list.
-    2. As a fast path for the common case, if the first segment of the path is a
-       well-known filesystem root (``home``, ``Users``, ``tmp``, ...) the slash
-       is prepended without needing the base dir.  This keeps the helper usable
-       from call sites that only have the raw path.
-
-    The function never fires on already-absolute paths (leading ``/``) or tilde
-    paths (handled by ``_expand_tilde``).  Legitimate relative paths that do not
-    reproduce the base dir are left untouched.
-    """
-    if not filepath or filepath.startswith(("/", "~")):
-        return filepath
-
-    # Fast path: first segment is a well-known filesystem root.
-    first_segment = filepath.split("/", 1)[0]
-    if first_segment in _ABSOLUTE_PATH_ROOTS:
-        return "/" + filepath
-
-    # Structural path: the joined path would nest the base dir inside itself.
-    if base_dir is not None:
-        base_str = str(base_dir)
-        if base_str and not _path_starts_with(filepath, base_str):
-            # A cwd-shaped relative path reproduces the base dir as a prefix of
-            # itself when joined.  Detect: base_str is a suffix of filepath's
-            # would-be absolute form, i.e. filepath starts with the *tail* of
-            # base_str after its leading "/".
-            tail = base_str.lstrip("/")
-            if tail and filepath.startswith(tail + "/"):
-                return "/" + filepath
-
-    return filepath
-
-
-def _path_starts_with(path: str, prefix: str) -> bool:
-    """True if *path* begins with *prefix* as a path-segment boundary."""
-    if not prefix:
-        return True
-    if path == prefix:
-        return True
-    return path.startswith(prefix.rstrip("/") + "/")
-
-
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory.
 
@@ -445,7 +374,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     container_paths = _uses_container_paths(task_id)
     if container_paths:
         base_dir = _resolve_base_dir(task_id, container_paths=True)
-        expanded = _expand_tilde(_coerce_missing_leading_slash(filepath, base_dir))
+        expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
             return _normalize_without_host_deref(expanded)
         resolved = base_dir / expanded
@@ -455,7 +384,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     from tools.environments.local import _msys_to_windows_path
 
     base_dir = _resolve_base_dir(task_id, container_paths=False)
-    expanded = _expand_tilde(_msys_to_windows_path(_coerce_missing_leading_slash(filepath, base_dir)))
+    expanded = _expand_tilde(_msys_to_windows_path(filepath))
     if sys.platform == "win32":
         import ntpath
 
@@ -471,13 +400,20 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     #   /home/user/dev/home/user/dev/notes/x.md  (issue #67185).
     #
     # Example: base_dir = /home/user/dev, filepath = "home/user/dev/notes/x.md"
-    #   → base_dir.lstrip("/") = "home/user/dev"
-    #   → filepath.startswith("home/user/dev/") → True → prepend "/"
-    base_dir = _resolve_base_dir(task_id, container_paths=False)
+    #   → base_dir tail segments = ('home', 'user', 'dev')
+    #   → filepath prefix segments = ['home', 'user', 'dev', ...]
+    #   → match → prepend "/"
+    #
+    # This is purely structural — no hard-coded root allowlist — so it works
+    # for any base directory the model might drop the slash on, and it never
+    # fires on legitimate relative paths that don't reproduce the base dir.
     if not expanded.startswith("/"):
-        base_tail = str(base_dir).lstrip("/")
-        if base_tail and expanded.startswith(base_tail + "/"):
-            expanded = "/" + expanded
+        base_parts = base_dir.parts[1:]  # strip leading '/'
+        file_parts = expanded.split("/")
+        for n in range(min(len(base_parts), len(file_parts) - 1), 0, -1):
+            if list(base_parts[-n:]) == file_parts[:n]:
+                expanded = "/" + expanded
+                break
 
     p = Path(expanded)
     if p.is_absolute():
