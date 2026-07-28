@@ -787,6 +787,43 @@ class TestWebServerEndpoints:
         assert providers["honcho"]["setup"]["dependencies_installed"] is True
         assert providers["honcho"]["status"] == "needs_config"
 
+    def test_memory_provider_setup_uses_durable_lazy_installer(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.lazy_deps as lazy_deps
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.setenv(
+            "HERMES_LAZY_INSTALL_TARGET", str(tmp_path / "lazy-packages")
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"security": {"allow_lazy_installs": True}},
+        )
+        monkeypatch.setattr(web_server, "_dependency_importable", lambda dep: False)
+
+        captured = {}
+
+        def fake_install(specs, *, timeout=300):
+            captured["specs"] = specs
+            captured["timeout"] = timeout
+            captured["target"] = os.environ.get("HERMES_LAZY_INSTALL_TARGET")
+            return lazy_deps._InstallResult(True, "installed", "")
+
+        monkeypatch.setattr(lazy_deps, "_venv_pip_install", fake_install)
+
+        results = web_server._install_memory_provider_pip_dependencies(
+            ["honcho-ai==2.2.0"]
+        )
+
+        assert results[0]["status"] == "installed"
+        assert captured == {
+            "specs": ("honcho-ai==2.2.0",),
+            "timeout": 240,
+            "target": str(tmp_path / "lazy-packages"),
+        }
+
     def test_post_memory_provider_setup_runs_declared_external_install(self, monkeypatch):
         import subprocess
 

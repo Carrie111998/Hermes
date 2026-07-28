@@ -755,6 +755,43 @@ def feature_missing(feature: str) -> tuple[str, ...]:
     return tuple(s for s in feature_specs(feature) if not _is_satisfied(s))
 
 
+def install_specs(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
+    """Install trusted setup-time specs through the lazy-dependency backend.
+
+    Memory-provider setup surfaces read dependency specs from a discovered
+    plugin manifest rather than from :data:`LAZY_DEPS`.  They still need the
+    same immutable-image behavior as ``ensure()``: honor the user's lazy
+    install kill switch, redirect into ``HERMES_LAZY_INSTALL_TARGET`` when
+    configured, constrain shared dependencies, and activate the durable
+    target on ``sys.path``.
+
+    Specs are restricted to the same package/version grammar accepted by
+    ``ensure()``.  Callers remain responsible for deciding which manifest is
+    trusted and whether a package is already installed.
+    """
+    normalized = tuple(str(spec).strip() for spec in specs if str(spec).strip())
+    if not normalized:
+        return _InstallResult(True, "", "")
+
+    for spec in normalized:
+        if not _spec_is_safe(spec):
+            return _InstallResult(
+                False,
+                "",
+                f"refusing to install unsafe spec {spec!r}",
+            )
+
+    if not _allow_lazy_installs():
+        return _InstallResult(
+            False,
+            "",
+            "lazy installs disabled (security.allow_lazy_installs=false or "
+            "the active venv is sealed without a durable install target)",
+        )
+
+    return _venv_pip_install(normalized, timeout=timeout)
+
+
 def ensure(feature: str, *, prompt: bool = True) -> None:
     """Make sure all packages for ``feature`` are importable.
 

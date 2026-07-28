@@ -516,10 +516,10 @@ def _ensure_sdk_installed() -> bool:
         return False
 
     print("  Installing honcho-ai...", flush=True)
-    from hermes_cli.tools_config import _pip_install
+    from tools.lazy_deps import install_specs
 
-    result = _pip_install(["honcho-ai==2.2.0"])
-    if result.returncode == 0:
+    result = install_specs(("honcho-ai==2.2.0",))
+    if result.success:
         print("  Installed.\n")
         return True
     else:

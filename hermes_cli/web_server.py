@@ -5901,16 +5901,23 @@ def _install_memory_provider_pip_dependencies(dependencies: List[str]) -> List[D
             _command_result(kind="pip", name=", ".join(dependencies), status="already_installed")
         ]
 
-    uv_path = shutil.which("uv")
-    if uv_path:
-        command: Any = [uv_path, "pip", "install", "--python", sys.executable, "--quiet", *missing]
-        display = f"uv pip install --python {sys.executable} {' '.join(missing)}"
-    else:
-        command = [sys.executable, "-m", "pip", "install", "--quiet", *missing]
-        display = f"{sys.executable} -m pip install {' '.join(missing)}"
+    # Use the same installer as first-use lazy dependencies.  On the managed
+    # image the active venv is intentionally sealed and
+    # HERMES_LAZY_INSTALL_TARGET points at a writable durable volume; invoking
+    # uv with ``--python sys.executable`` here bypassed that target and made
+    # every dashboard-driven provider install fail with EACCES (#72981).
+    from tools.lazy_deps import install_specs
+
+    display = f"hermes dependency installer {' '.join(missing)}"
 
     try:
-        completed = _run_setup_command(command, display=display, timeout=240)
+        installed = install_specs(tuple(missing), timeout=240)
+        completed = subprocess.CompletedProcess(
+            args=display,
+            returncode=0 if installed.success else 1,
+            stdout=installed.stdout,
+            stderr=installed.stderr,
+        )
     except Exception as exc:
         return [
             _command_result(

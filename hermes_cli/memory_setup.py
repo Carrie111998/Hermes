@@ -162,12 +162,12 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
 
     print(f"\n  Installing dependencies: {', '.join(missing)}")
 
-    from hermes_cli.tools_config import _pip_install
+    from tools.lazy_deps import install_specs
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
     try:
-        result = _pip_install(["--quiet"] + missing, timeout=120)
-        if result.returncode == 0:
+        result = install_specs(tuple(missing), timeout=120)
+        if result.success:
             print(f"  ✓ Installed {', '.join(missing)}")
         else:
             print(f"  ⚠ Failed to install {', '.join(missing)}")

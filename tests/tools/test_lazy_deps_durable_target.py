@@ -88,6 +88,60 @@ class TestGatingWithTarget:
         )
         assert ld._allow_lazy_installs() is True
 
+    def test_setup_specs_use_durable_installer(self, monkeypatch, tmp_path):
+        target = tmp_path / "lazy"
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: {}, raising=False
+        )
+
+        captured = {}
+
+        def fake_install(specs, *, timeout=300):
+            captured["specs"] = specs
+            captured["timeout"] = timeout
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
+
+        result = ld.install_specs(("honcho-ai==2.2.0",), timeout=240)
+
+        assert result.success
+        assert captured == {
+            "specs": ("honcho-ai==2.2.0",),
+            "timeout": 240,
+        }
+
+    def test_setup_specs_block_when_sealed_without_target(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: {}, raising=False
+        )
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda *args, **kwargs: pytest.fail("installer must not run"),
+        )
+
+        result = ld.install_specs(("honcho-ai==2.2.0",))
+
+        assert not result.success
+        assert "sealed without a durable install target" in result.stderr
+
+    def test_setup_specs_reject_unsafe_manifest_value(self, monkeypatch):
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda *args, **kwargs: pytest.fail("installer must not run"),
+        )
+
+        result = ld.install_specs(("honcho-ai; touch /tmp/nope",))
+
+        assert not result.success
+        assert "unsafe spec" in result.stderr
+
 
 # ---------------------------------------------------------------------------
 # ABI stamp / durable-store rebuild safety
