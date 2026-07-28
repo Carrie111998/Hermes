@@ -939,10 +939,11 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
 
     try:
         from tools import write_approval as wa
-    except Exception:
-        # If the gate module can't load, fail open (current behaviour) rather
-        # than blocking all memory writes.
-        return None
+    except Exception as exc:
+        return tool_error(
+            f"Memory write blocked: approval subsystem unavailable ({exc}).",
+            success=False,
+        )
 
     # Build a small inline summary/detail for the foreground approval prompt.
     label = "user profile" if target == "user" else "memory"
@@ -992,8 +993,11 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     """
     try:
         from tools import write_approval as wa
-    except Exception:
-        return None
+    except Exception as exc:
+        return tool_error(
+            f"Memory write blocked: approval subsystem unavailable ({exc}).",
+            success=False,
+        )
 
     label = "user profile" if target == "user" else "memory"
     summary = f"apply {len(operations)} op(s) to {label}"

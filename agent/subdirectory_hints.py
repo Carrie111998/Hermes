@@ -82,6 +82,15 @@ class SubdirectoryHintTracker:
 
         Returns formatted hint text to append to the tool result, or None.
         """
+        # Safe/ignore-rules sessions must remain governance-isolated for their
+        # entire lifetime. Startup suppression is insufficient because this
+        # tracker otherwise discovers AGENTS.md/CLAUDE.md lazily after tools run.
+        if (
+            os.environ.get("HERMES_SAFE_MODE") == "1"
+            or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        ):
+            return None
+
         dirs = self._extract_directories(tool_name, tool_args)
         if not dirs:
             return None

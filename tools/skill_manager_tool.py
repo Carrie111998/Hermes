@@ -1345,8 +1345,11 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
     try:
         from tools import write_approval as wa
-    except Exception:
-        return None  # fail open
+    except Exception as exc:
+        return tool_error(
+            f"Skill write blocked: approval subsystem unavailable ({exc}).",
+            success=False,
+        )
 
     decision = wa.evaluate_gate(wa.SKILLS)
     if decision.allow:
