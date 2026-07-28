@@ -17446,6 +17446,8 @@ class GatewayRunner(
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            tenant_id=os.environ.get("HERMES_TENANT_ID", ""),
+            organization_id=os.environ.get("HERMES_ORGANIZATION_ID", ""),
         )
 
     def _clear_session_env(self, tokens: list) -> None:

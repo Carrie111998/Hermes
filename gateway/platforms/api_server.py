@@ -5690,6 +5690,7 @@ class APIServerAdapter(BasePlatformAdapter):
         the turn — a session resumed later on a delivering interface, e.g. the
         CLI or a gateway platform, re-binds fresh and is NOT blocked).
         """
+        import os
         from gateway.session_context import set_session_vars
 
         return set_session_vars(
@@ -5698,6 +5699,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             async_delivery=False,
+            tenant_id=os.environ.get("HERMES_TENANT_ID", ""),
+            organization_id=os.environ.get("HERMES_ORGANIZATION_ID", ""),
         )
 
     async def _run_agent(

@@ -429,3 +429,22 @@ def set_tenant_context(tenant_id: str, organization_id: str = "") -> None:
     _SESSION_TENANT_ID.set(tenant_id)
     if organization_id:
         _SESSION_ORGANIZATION_ID.set(organization_id)
+
+
+def resolve_tenant_id(profile: str = "") -> str:
+    """Resolve tenant_id from deployment configuration.
+
+    Resolution order:
+    1. Already-bound session ContextVar (returns immediately if non-empty)
+    2. HERMES_TENANT_ID environment variable
+    3. Empty string (authority store will use DEFAULT_TENANT_ID)
+
+    The profile parameter is accepted for future per-profile tenant mapping
+    in managed multi-tenant gateways.
+    """
+    import os
+
+    existing = _SESSION_TENANT_ID.get()
+    if existing is not _UNSET and existing:
+        return existing
+    return os.environ.get("HERMES_TENANT_ID", "")
