@@ -257,3 +257,56 @@ class TestOneTurnNeverPersisted:
         # ...but NEVER written through to the persistent session store.
         runner.async_session_store.set_model_override.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_session_switch_still_writes_through(
+        self, tmp_path, monkeypatch
+    ):
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+
+        result = await runner._handle_model_command(
+            self._event("/model gpt-5.5 --session")
+        )
+
+        assert result is not None
+        runner.async_session_store.set_model_override.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("reset_reason", "expected_pending"),
+        [
+            ("idle", False),
+            ("context_rollover", True),
+        ],
+    )
+    async def test_model_switch_preserves_pending_context_checkpoint_only(
+        self,
+        tmp_path,
+        monkeypatch,
+        reset_reason,
+        expected_pending,
+    ):
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        entry = SessionEntry(
+            session_key=build_session_key(_make_source()),
+            session_id="segment-2",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            was_auto_reset=True,
+            auto_reset_reason=reset_reason,
+            prev_session_id="segment-1",
+        )
+        runner.async_session_store.get_or_create_session = AsyncMock(
+            return_value=entry
+        )
+        runner._session_db = SimpleNamespace(
+            update_session_model=AsyncMock()
+        )
+
+        result = await runner._handle_model_command(
+            self._event("/model gpt-5.5 --session")
+        )
+
+        assert result is not None
+        assert entry.was_auto_reset is expected_pending

@@ -106,6 +106,7 @@ class TestUnknownTopLevelKeys:
         assert set(DEFAULT_CONFIG.keys()).issubset(_KNOWN_ROOT_KEYS)
         assert _EXTRA_KNOWN_ROOT_KEYS.issubset(_KNOWN_ROOT_KEYS)
         assert _KNOWN_ROOT_KEYS == frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
+        assert "context_rollover" in _KNOWN_ROOT_KEYS
 
     def test_provider_like_unknown_root_keeps_misplaced_message(self):
         """Preserve existing base_url/api_key root-level guidance."""

@@ -541,6 +541,75 @@ class SessionResetPolicy:
 
 
 @dataclass
+class ContextRolloverPolicy:
+    """Controls invisible, model-aware context-segment rollover.
+
+    This policy is deliberately separate from ``SessionResetPolicy`` because
+    crossing a model-context threshold does not end the user's logical
+    conversation. The gateway replaces only the physical context segment and
+    carries deterministic continuity into its linked child.
+    """
+
+    enabled: bool = False
+    threshold_ratio: float = 0.70
+    max_prompt_tokens: int = 0
+    notify: bool = False
+    exclude_platforms: tuple = ("api_server", "webhook")
+
+    def resolve_threshold(self, usable_input_budget_tokens: int) -> int:
+        """Return the effective prompt-token threshold, or 0 when unresolved."""
+        if not self.enabled:
+            return 0
+
+        candidates: List[int] = []
+        if usable_input_budget_tokens > 0:
+            candidates.append(
+                max(1, int(usable_input_budget_tokens * self.threshold_ratio))
+            )
+        if self.max_prompt_tokens > 0:
+            candidates.append(self.max_prompt_tokens)
+        return min(candidates) if candidates else 0
+
+    def should_notify(self, platform_name: str, had_activity: bool) -> bool:
+        """Return whether a human-visible rollover diagnostic should be sent."""
+        return bool(
+            self.notify
+            and had_activity
+            and platform_name not in self.exclude_platforms
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "threshold_ratio": self.threshold_ratio,
+            "max_prompt_tokens": self.max_prompt_tokens,
+            "notify": self.notify,
+            "exclude_platforms": list(self.exclude_platforms),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ContextRolloverPolicy":
+        data = _coerce_dict(data)
+        ratio = _coerce_float(data.get("threshold_ratio"), 0.70)
+        ratio = min(0.95, max(0.10, ratio))
+        exclude = data.get("exclude_platforms")
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            threshold_ratio=ratio,
+            max_prompt_tokens=max(
+                0,
+                _coerce_int(data.get("max_prompt_tokens"), 0),
+            ),
+            notify=_coerce_bool(data.get("notify"), False),
+            exclude_platforms=(
+                tuple(str(value) for value in exclude)
+                if isinstance(exclude, (list, tuple))
+                else ("api_server", "webhook")
+            ),
+        )
+
+
+@dataclass
 class ChannelOverride:
     """
     Per-channel override for model, provider, and system prompt.
@@ -883,6 +952,12 @@ class GatewayConfig:
     default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
     reset_by_type: Dict[str, SessionResetPolicy] = field(default_factory=dict)
     reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
+
+    # Model-aware replacement of a physical context segment inside the same
+    # logical conversation. Off by default for backward compatibility.
+    context_rollover: ContextRolloverPolicy = field(
+        default_factory=ContextRolloverPolicy
+    )
     
     # Reset trigger commands
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
@@ -1058,6 +1133,7 @@ class GatewayConfig:
             "reset_by_platform": {
                 p.value: v.to_dict() for p, v in self.reset_by_platform.items()
             },
+            "context_rollover": self.context_rollover.to_dict(),
             "reset_triggers": self.reset_triggers,
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
@@ -1110,6 +1186,10 @@ class GatewayConfig:
         default_policy = SessionResetPolicy()
         if "default_reset_policy" in data:
             default_policy = SessionResetPolicy.from_dict(data["default_reset_policy"])
+
+        context_rollover = ContextRolloverPolicy.from_dict(
+            data.get("context_rollover", {})
+        )
         
         sessions_dir = get_hermes_home() / "sessions"
         if "sessions_dir" in data:
@@ -1194,6 +1274,7 @@ class GatewayConfig:
             default_reset_policy=default_policy,
             reset_by_type=reset_by_type,
             reset_by_platform=reset_by_platform,
+            context_rollover=context_rollover,
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=quick_commands,
             sessions_dir=sessions_dir,
@@ -1308,6 +1389,15 @@ def load_gateway_config() -> GatewayConfig:
                 sr = gateway_section.get("session_reset")
             if sr and isinstance(sr, dict):
                 gw_data["default_reset_policy"] = sr
+
+            cr = yaml_cfg.get("context_rollover")
+            if (
+                "context_rollover" not in yaml_cfg
+                and isinstance(gateway_section, dict)
+            ):
+                cr = gateway_section.get("context_rollover")
+            if isinstance(cr, dict):
+                gw_data["context_rollover"] = cr
 
             qc = yaml_cfg.get("quick_commands")
             if qc is None and isinstance(gateway_section, dict):

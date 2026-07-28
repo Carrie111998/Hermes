@@ -1854,6 +1854,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
     "session_reset",         # top-level form read by gateway/config.py + setup
+    "context_rollover",      # model-aware gateway context-segment rollover
     "group_sessions_per_user",   # top-level form bridged by gateway/config.py
     "thread_sessions_per_user",  # top-level form bridged by gateway/config.py
     "stt_echo_transcripts",      # top-level form bridged by gateway/config.py

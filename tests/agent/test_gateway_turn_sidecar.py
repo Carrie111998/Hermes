@@ -125,6 +125,13 @@ RESET_NOTE = (
     "[System note: The user's previous session expired due to inactivity. "
     "This is a fresh conversation with no prior context.]"
 )
+CONTEXT_ROLLOVER_NOTE = (
+    "[System note: This is a new context segment in the same conversation.]\n\n"
+    "[CONTEXT SEGMENT ROLLOVER - REFERENCE ONLY]\n"
+    "Previous context segment id: previous-1\n"
+    "Latest real dialogue from the previous session:\n\n"
+    "USER:\nContinue the rollout."
+)
 VC_NOTE = "[Voice channel now: dev-vc (2 members)]"
 
 
@@ -197,6 +204,24 @@ class TestMultimodalFallback:
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"][-1] == {"type": "text", "text": RESET_NOTE}
         # No string sidecar for list content.
+        assert "api_content" not in msg
+
+    def test_context_rollover_checkpoint_is_durable_on_multimodal_content(self):
+        agent = _FakeAgent()
+        agent._gateway_turn_context_notes = CONTEXT_ROLLOVER_NOTE
+        content = [
+            {"type": "text", "text": "continue"},
+            {"type": "image_url", "image_url": {"url": "https://x/img.png"}},
+        ]
+
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent, user_message=content)
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"][-1] == {
+            "type": "text",
+            "text": CONTEXT_ROLLOVER_NOTE,
+        }
         assert "api_content" not in msg
 
     def test_helper_appends_only_to_lists(self):
