@@ -511,6 +511,8 @@ environment-invalid. None is attributable to this integration.
 
 ## Sanitization for publication
 
+Commit: `8c2791137`.
+
 This fork tracks a **public** upstream, so the branch was scrubbed of
 deployment-specific data before being pushed. A local `pre-push` hook exists to
 stop exactly this class of leak; it was repaired rather than bypassed (see
