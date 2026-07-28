@@ -236,6 +236,58 @@ json_escape() {
         -e 's/"/\\"/g'
 }
 
+# Check if uv output indicates a TLS certificate error.
+# Returns 0 (true) if a cert error is detected, 1 (false) otherwise.
+uv_is_cert_error() {
+    local output="$1"
+    if [ -z "$output" ]; then return 1; fi
+    echo "$output" | grep -qE \
+        -e "invalid peer certificate" \
+        -e "UnknownIssuer" \
+        -e "certificate verify failed" \
+        -e "CERTIFICATE_VERIFY_FAILED" \
+        -e "UNABLE_TO_GET_ISSUER_CERT" \
+        -e "SELF_SIGNED_CERT_IN_CHAIN" \
+        -e "CERT_HAS_EXPIRED"
+}
+
+# Run a uv command with automatic retry using system certificates on TLS failure.
+# Usage: uv_with_system_certs_retry <uv command and args...>
+# Example: uv_with_system_certs_retry sync --extra all --locked
+uv_with_system_certs_retry() {
+    local output
+    local exit_code
+
+    # First attempt: normal uv invocation
+    output="$("$UV_CMD" "$@" 2>&1)"
+    exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        echo "$output"
+        return 0
+    fi
+
+    # Check for TLS certificate error
+    if uv_is_cert_error "$output"; then
+        log_warn "This looks like a TLS certificate-trust failure, not a generic network problem."
+        log_info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a"
+        log_info "  certificate the OS trusts but uv's bundled trust store does not."
+        log_info "  Retrying with UV_SYSTEM_CERTS=1 (uses OS certificate store)..."
+        
+        output="$(UV_SYSTEM_CERTS=1 "$UV_CMD" "$@" 2>&1)"
+        exit_code=$?
+        if [ $exit_code -eq 0 ]; then
+            log_success "Retry with UV_SYSTEM_CERTS=1 succeeded."
+            log_info "For future runs, you can set UV_SYSTEM_CERTS=1 before invoking uv."
+            echo "$output"
+            return 0
+        fi
+        log_error "Retry with UV_SYSTEM_CERTS=1 also failed. The issue may be unrelated to certificates."
+    fi
+
+    echo "$output"
+    return $exit_code
+}
+
 # npm rewrites tracked package-lock.json files non-deterministically during
 # `npm install` / `npm run pack`. On a managed install those diffs are never
 # intentional, but they leave the checkout dirty — which forces `hermes update`
@@ -578,7 +630,10 @@ install_uv() {
     fi
     # UV_UNMANAGED_INSTALL tells the astral installer to place the binary
     # directly into $HERMES_HOME/bin instead of ~/.local/bin.
-    if UV_UNMANAGED_INSTALL="$HERMES_HOME/bin" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
+    # The astral installer downloads uv over HTTPS. On corporate networks
+    # with TLS inspection, this can fail. Retry with UV_SYSTEM_CERTS=1.
+    local _install_script="UV_UNMANAGED_INSTALL=\"$HERMES_HOME/bin\" sh \"$_uv_installer\""
+    if eval "$_install_script" >>"$_uv_install_log" 2>&1; then
         rm -f "$_uv_installer"
         if [ -x "$_managed_uv" ]; then
             UV_CMD="$_managed_uv"
@@ -593,6 +648,31 @@ install_uv() {
         UV_VERSION=$($UV_CMD --version 2>/dev/null)
         log_success "Managed uv installed ($UV_VERSION)"
     else
+        # Check if the failure was a TLS cert error and retry
+        if uv_is_cert_error "$(cat "$_uv_install_log")"; then
+            log_warn "This looks like a TLS certificate-trust failure, not a generic network problem."
+            log_info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a"
+            log_info "  certificate the OS trusts but uv's bundled trust store does not."
+            log_info "  Retrying with UV_SYSTEM_CERTS=1..."
+            
+            if UV_SYSTEM_CERTS=1 eval "$_install_script" >>"$_uv_install_log" 2>&1; then
+                rm -f "$_uv_installer"
+                if [ -x "$_managed_uv" ]; then
+                    UV_CMD="$_managed_uv"
+                    rm -f "$_uv_install_log"
+                    UV_VERSION=$($UV_CMD --version 2>/dev/null)
+                    log_success "Retry with UV_SYSTEM_CERTS=1 succeeded. Managed uv installed ($UV_VERSION)"
+                    return 0
+                else
+                    log_error "uv installer reported success but binary not found at $_managed_uv"
+                    log_info "Installer output:"
+                    sed 's/^/    /' "$_uv_install_log" >&2
+                    rm -f "$_uv_install_log" "$_uv_installer"
+                    exit 1
+                fi
+            fi
+        fi
+        
         log_error "Failed to install uv"
         log_info "Installer output:"
         sed 's/^/    /' "$_uv_install_log" >&2
@@ -626,7 +706,7 @@ check_python() {
 
     # Let uv handle Python — it can download and manage Python versions
     # First check if a suitable Python is already available
-    if PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION" 2>/dev/null)"; then
+    if PYTHON_PATH=$(uv_with_system_certs_retry python find "$PYTHON_VERSION" 2>/dev/null); then
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
         log_success "Python found: $PYTHON_FOUND_VERSION"
         return 0
@@ -634,8 +714,8 @@ check_python() {
 
     # Python not found — use uv to install it (no sudo needed!)
     log_info "Python $PYTHON_VERSION not found, installing via uv..."
-    if "$UV_CMD" python install "$PYTHON_VERSION"; then
-        PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION")"
+    if uv_with_system_certs_retry python install "$PYTHON_VERSION"; then
+        PYTHON_PATH=$(uv_with_system_certs_retry python find "$PYTHON_VERSION")
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
         log_success "Python installed: $PYTHON_FOUND_VERSION"
     else
@@ -1346,7 +1426,10 @@ setup_venv() {
     fi
 
     # uv creates the venv and pins the Python version in one step
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
+    if ! uv_with_system_certs_retry venv venv --python "$PYTHON_VERSION"; then
+        log_error "Failed to create virtual environment"
+        exit 1
+    fi
 
     # Neutralize any inherited UV_PYTHON (e.g. UV_PYTHON=3.14 left in the
     # user's shell env). uv honours UV_PYTHON over an existing venv for the
@@ -1500,7 +1583,7 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" uv_with_system_certs_retry sync --extra all --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -1581,7 +1664,7 @@ PY
     install_tier() {
         local name="$1"; local spec="$2"
         log_info "Trying tier: $name ..."
-        if $UV_CMD pip install -e "$spec" 2>"$ALL_INSTALL_LOG"; then
+        if uv_with_system_certs_retry pip install -e "$spec" 2>"$ALL_INSTALL_LOG"; then
             log_success "Main package installed ($name)"
             _installed=true
             _tier_name="$name"
