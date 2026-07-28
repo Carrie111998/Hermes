@@ -52,6 +52,11 @@
       "note": "Take official deps; re-apply fork-only optional extras after merge."
     },
     {
+      "pattern": "tools/lazy_deps.py",
+      "action": "official_with_overlay",
+      "note": "Take upstream LAZY_DEPS map; re-apply fork tool.ai_scientist pin block after merge."
+    },
+    {
       "pattern": "skills/media/youtube-content/**",
       "action": "upstream",
       "note": "Official helper tracks youtube-transcript-api v1.x and Hermes uv execution."
