@@ -37,6 +37,12 @@ describe('orderByIds', () => {
     const items = [{ id: 'fresh' }, { id: 'a' }, { id: 'b' }]
     expect(orderByIds(items, id, ['b', 'a'])).toEqual([{ id: 'fresh' }, { id: 'b' }, { id: 'a' }])
   })
+
+  it('skips duplicate ids in the persisted order (siblings sharing git root)', () => {
+    const items = [{ id: 'repo-x' }]
+    // orderIds contains the same id twice (polluted persisted state)
+    expect(orderByIds(items, id, ['repo-x', 'repo-x', 'repo-x'])).toEqual([{ id: 'repo-x' }])
+  })
 })
 
 describe('reconcileOrderIds', () => {
@@ -50,6 +56,13 @@ describe('reconcileOrderIds', () => {
 
   it('puts newly-seen ids ahead of the retained saved order', () => {
     expect(reconcileOrderIds(['fresh', 'a', 'b'], ['b', 'a', 'gone'])).toEqual(['fresh', 'b', 'a'])
+  })
+
+  it('dedupes duplicate ids in currentIds (siblings sharing git root)', () => {
+    // Two projects whose sessions share the same repo node id
+    expect(reconcileOrderIds(['repo-x', 'repo-x', 'repo-x'], [])).toEqual(['repo-x'])
+    // Persisted order already has duplicates; reconcile cleans them
+    expect(reconcileOrderIds(['repo-x', 'repo-x'], ['repo-x', 'repo-x'])).toEqual(['repo-x'])
   })
 })
 
