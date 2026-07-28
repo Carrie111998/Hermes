@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import weakref
@@ -3815,6 +3816,23 @@ class BasePlatformAdapter(ABC):
         """
         return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
 
+    def _auto_tts_output_path(self) -> Optional[str]:
+        """Return a platform-specific temporary output path for auto-TTS.
+
+        Telegram decides between ``sendVoice`` and ``sendAudio`` from the
+        generated file extension. Auto-TTS runs after the agent's session
+        context has been cleared, so the TTS tool can no longer infer that the
+        destination is Telegram. Give it an explicit unique ``.ogg`` path so
+        every Telegram auto-TTS reply is repaired/encoded as Ogg Opus and sent
+        as a native voice bubble. Other platforms keep the provider default.
+        """
+        if self.platform == Platform.TELEGRAM:
+            return str(
+                Path(tempfile.gettempdir())
+                / f"hermes_auto_tts_{uuid.uuid4().hex}.ogg"
+            )
+        return None
+
     async def play_tts(
         self,
         chat_id: str,
@@ -5526,8 +5544,12 @@ class BasePlatformAdapter(ABC):
                             speech_text = self.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
+                            tts_kwargs = {"text": speech_text}
+                            tts_output_path = self._auto_tts_output_path()
+                            if tts_output_path:
+                                tts_kwargs["output_path"] = tts_output_path
                             tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
+                                text_to_speech_tool, **tts_kwargs
                             )
                             tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")

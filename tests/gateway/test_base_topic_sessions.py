@@ -260,6 +260,18 @@ class TestBasePlatformTopicSessions:
 
 
 class TestTelegramAutoTtsCaptionDelivery:
+    def test_telegram_auto_tts_output_paths_are_unique_ogg(self):
+        adapter = DummyTelegramAdapter()
+
+        first = adapter._auto_tts_output_path()
+        second = adapter._auto_tts_output_path()
+
+        assert first is not None
+        assert second is not None
+        assert first.endswith(".ogg")
+        assert second.endswith(".ogg")
+        assert first != second
+
     @staticmethod
     def _make_voice_event(chat_id: str = "-1001", thread_id: str = "17585") -> MessageEvent:
         return MessageEvent(
@@ -296,9 +308,10 @@ class TestTelegramAutoTtsCaptionDelivery:
         with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
             "tools.tts_tool.text_to_speech_tool",
             return_value=json.dumps({"file_path": str(tts_path)}),
-        ):
+        ) as tts_tool:
             await adapter._process_message_background(event, build_session_key(event.source))
 
+        assert tts_tool.call_args.kwargs["output_path"].endswith(".ogg")
         adapter.play_tts.assert_awaited_once()
         assert adapter.play_tts.await_args.kwargs["caption"] == "Short reply"
         assert adapter.sent == []
