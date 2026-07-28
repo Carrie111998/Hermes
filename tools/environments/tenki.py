@@ -17,13 +17,16 @@ import time
 import uuid
 from contextlib import contextmanager
 from contextvars import copy_context
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from hermes_constants import get_hermes_home
 from tools.environments.base import (
     BaseEnvironment,
+    _atomic_save_json_durable,
     _ThreadedProcessHandle,
+    _windows_replace_file_write_through,
 )
 from tools.environments.file_sync import (
     FileSyncManager,
@@ -80,12 +83,32 @@ class _SnapshotPointerConflict(RuntimeError):
     """A stale writer attempted to replace newer or retired recovery state."""
 
 
-def _load_json_store(path: Path) -> dict:
+@dataclass(frozen=True)
+class _RemoteBinding:
+    """One task's durable binding to its remote Tenki sandbox lineage.
+
+    ``conflicted`` means a fork was positively observed and may never be
+    forgotten by a later omission-prone listing; ``unresolvable`` additionally
+    means at least one branch had no authoritative id, so no exact lookup can
+    ever prove it terminated. The default instance is "no binding recorded".
+    """
+
+    remote_id: str | None = None
+    attempt_id: str | None = None
+    validated: bool = False
+    conflicted: bool = False
+    conflict_ids: tuple[str, ...] = ()
+    unresolvable: bool = False
+
+
+def _load_recovery_registry(path: Path) -> dict:
     """Load Tenki recovery state, failing closed when it is unreadable.
 
-    Treating a malformed existing registry as empty would let the next
-    read-modify-write erase the only snapshot pointer, create attempt, or
-    exact remote binding. A missing file is the sole valid empty state.
+    Deliberately the opposite of :func:`base._load_json_store`, which returns
+    ``{}`` on any read error: treating a malformed existing registry as empty
+    would let the next read-modify-write erase the only snapshot pointer,
+    create attempt, or exact remote binding. A missing file is the sole valid
+    empty state.
     """
     if not path.exists():
         return {}
@@ -118,33 +141,67 @@ def _task_ownership_lock_path(profile_home: Path, task_id: str) -> Path:
     return profile_home / "locks" / "tenki" / f"{task_hash}.lock"
 
 
+def _lock_open_file(lock_file: Any, *, blocking: bool, requirement: str) -> None:
+    """Take one exclusive cross-process lock on *lock_file*'s first byte.
+
+    *blocking* selects between waiting for the holder (the snapshot registry,
+    which must serialize pointer RMW) and failing fast (task ownership, which
+    must never wait on another Hermes process). Locking is mandatory on both
+    paths: without a kernel lock two processes can each report success while
+    silently losing one task's sole recovery pointer or forking its sandbox,
+    so an unsupported platform fails closed.
+    """
+    if _fcntl is not None:
+        flags = _fcntl.LOCK_EX if blocking else _fcntl.LOCK_EX | _fcntl.LOCK_NB
+        _fcntl.flock(lock_file.fileno(), flags)
+        return
+    if _msvcrt is not None:
+        # Windows byte-range locks require a real byte at the current file
+        # position. Concurrent initializers may append more than one byte,
+        # but every process locks byte zero.
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(" ")
+            lock_file.flush()
+        lock_file.seek(0)
+        _msvcrt.locking(
+            lock_file.fileno(),
+            _msvcrt.LK_LOCK if blocking else _msvcrt.LK_NBLCK,
+            1,
+        )
+        return
+    raise RuntimeError(
+        f"{requirement} requires fcntl or msvcrt cross-process file locking"
+    )
+
+
+def _unlock_open_file(lock_file: Any) -> None:
+    """Best-effort kernel unlock; closing the file stays with the caller."""
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+        elif _msvcrt is not None:
+            lock_file.seek(0)
+            _msvcrt.locking(
+                lock_file.fileno(),
+                _msvcrt.LK_UNLCK,
+                1,
+            )
+    except OSError:
+        pass
+
+
 def _acquire_task_ownership_lock(profile_home: Path, task_id: str):
     """Acquire one profile/task lifetime lock or fail without remote mutation."""
     lock_path = _task_ownership_lock_path(profile_home, task_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+", encoding="utf-8")
     try:
-        if _fcntl is not None:
-            _fcntl.flock(
-                lock_file.fileno(),
-                _fcntl.LOCK_EX | _fcntl.LOCK_NB,
-            )
-        elif _msvcrt is not None:
-            lock_file.seek(0, os.SEEK_END)
-            if lock_file.tell() == 0:
-                lock_file.write(" ")
-                lock_file.flush()
-            lock_file.seek(0)
-            _msvcrt.locking(
-                lock_file.fileno(),
-                _msvcrt.LK_NBLCK,
-                1,
-            )
-        else:
-            raise RuntimeError(
-                "Tenki task ownership requires fcntl or msvcrt "
-                "cross-process file locking"
-            )
+        _lock_open_file(
+            lock_file,
+            blocking=False,
+            requirement="Tenki task ownership",
+        )
     except (BlockingIOError, OSError) as exc:
         lock_file.close()
         raise RuntimeError(
@@ -161,17 +218,7 @@ def _release_task_ownership_lock(lock_file: Any) -> None:
     if lock_file is None:
         return
     try:
-        if _fcntl is not None:
-            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
-        elif _msvcrt is not None:
-            lock_file.seek(0)
-            _msvcrt.locking(
-                lock_file.fileno(),
-                _msvcrt.LK_UNLCK,
-                1,
-            )
-    except OSError:
-        pass
+        _unlock_open_file(lock_file)
     finally:
         lock_file.close()
 
@@ -225,7 +272,7 @@ def _legacy_profile_tokens() -> tuple[str, ...]:
 def _load_snapshots(store_path: Path | None = None) -> dict:
     path = store_path or _snapshot_store_path()
     with _snapshot_store_lock(path):
-        return _load_json_store(path)
+        return _load_recovery_registry(path)
 
 
 def _save_snapshots(data: dict, store_path: Path | None = None) -> None:
@@ -236,36 +283,6 @@ def _save_snapshots(data: dict, store_path: Path | None = None) -> None:
 
 def _snapshot_platform() -> str:
     return os.name
-
-
-def _windows_replace_file_write_through(source: str, destination: Path) -> None:
-    """Atomically replace *destination* with Windows write-through semantics."""
-    import ctypes
-    from ctypes import wintypes
-
-    move_file_ex = ctypes.WinDLL(
-        "kernel32",
-        use_last_error=True,
-    ).MoveFileExW
-    move_file_ex.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-    )
-    move_file_ex.restype = wintypes.BOOL
-    flags = 0x1 | 0x8  # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
-    if move_file_ex(
-        os.path.abspath(source),
-        os.path.abspath(destination),
-        flags,
-    ):
-        return
-    error_code = ctypes.get_last_error()
-    raise OSError(
-        error_code,
-        ctypes.FormatError(error_code),
-        str(destination),
-    )
 
 
 @contextmanager
@@ -280,113 +297,58 @@ def _snapshot_store_lock(path: Path):
         lock_file = lock_path.open("a+", encoding="utf-8")
         os_locked = False
         try:
-            if _fcntl is not None:
-                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
-                os_locked = True
-            elif _msvcrt is not None:
-                # Windows byte-range locks require a real byte at the current
-                # file position. Concurrent initializers may append more than
-                # one byte, but every process locks byte zero.
-                lock_file.seek(0, os.SEEK_END)
-                if lock_file.tell() == 0:
-                    lock_file.write(" ")
-                    lock_file.flush()
-                lock_file.seek(0)
-                _msvcrt.locking(
-                    lock_file.fileno(),
-                    _msvcrt.LK_LOCK,
-                    1,
-                )
-                os_locked = True
-            else:
-                # Pointer RMW without a kernel lock can report success in two
-                # processes while silently losing one task's sole recovery
-                # pointer. Persistent state must fail closed on unsupported
-                # platforms.
-                raise RuntimeError(
-                    "Tenki snapshot registry requires fcntl or msvcrt "
-                    "cross-process file locking"
-                )
+            _lock_open_file(
+                lock_file,
+                blocking=True,
+                requirement="Tenki snapshot registry",
+            )
+            os_locked = True
             yield
         finally:
-            if os_locked and _fcntl is not None:
-                try:
-                    _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            elif os_locked and _msvcrt is not None:
-                try:
-                    lock_file.seek(0)
-                    _msvcrt.locking(
-                        lock_file.fileno(),
-                        _msvcrt.LK_UNLCK,
-                        1,
-                    )
-                except OSError:
-                    pass
+            if os_locked:
+                _unlock_open_file(lock_file)
             lock_file.close()
 
 
 def _atomic_save_snapshots(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            import json
+    """Apply Tenki's recovery-pointer policy to the durable write primitive.
 
-            json.dump(data, tmp, indent=2)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            temp_path = tmp.name
-        platform = _snapshot_platform()
-        if platform == "nt":
-            try:
-                _windows_replace_file_write_through(temp_path, path)
-            except OSError as exc:
-                raise _SnapshotPointerCommitUncertain(
-                    f"could not durably replace snapshot-pointer file {path}"
-                ) from exc
-            return
-        if platform != "posix":
-            raise RuntimeError(
-                "Tenki snapshot registry cannot prove rename durability on "
-                f"platform {platform!r}"
-            )
+    The mechanism lives in ``base._atomic_save_json_durable``; this supplies the
+    Tenki-specific policy: an uncertain commit surfaces as
+    ``_SnapshotPointerCommitUncertain`` so callers keep both the old and the new
+    remote snapshot alive, and the platform/Windows-replace hooks stay resolved
+    from this module so they remain individually substitutable.
+    """
+    _atomic_save_json_durable(
+        path,
+        data,
+        subject="snapshot-pointer",
+        store_label="Tenki snapshot registry",
+        commit_uncertain_error=_SnapshotPointerCommitUncertain,
+        platform=_snapshot_platform(),
+        replace_write_through=_windows_replace_file_write_through,
+    )
 
-        os.replace(temp_path, path)
-        # The file contents were fsynced before replace; fsync the containing
-        # directory too so the pointer rename itself survives a host crash.
-        # A POSIX failure is an *uncertain commit*: the visible file is new,
-        # but a crash may roll the directory entry back. The caller must keep
-        # both remote snapshots and the live sandbox in that state.
-        dir_fd: int | None = None
-        try:
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            dir_fd = os.open(path.parent, flags)
-            os.fsync(dir_fd)
-        except OSError as exc:
-            raise _SnapshotPointerCommitUncertain(
-                f"could not fsync snapshot-pointer directory {path.parent}"
-            ) from exc
-        finally:
-            if dir_fd is not None:
-                try:
-                    os.close(dir_fd)
-                except OSError:
-                    pass
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+
+@contextmanager
+def _mutate_store(store_path: Path | None):
+    """Read-modify-write the recovery registry under its cross-process lock.
+
+    Resolves the active profile's store path, takes the lock, fail-closed loads
+    the registry, yields it for mutation, and durably republishes it. The save
+    runs on every normal exit *including an early ``return``* from the body:
+    several callers deliberately republish unchanged state to re-establish
+    durability after an uncertain commit. A body that raises skips the save and
+    releases the lock, leaving the previous durable state visible.
+
+    Callers whose no-op path must NOT write (or that need the save inside their
+    own ``try``) cannot use this and manage the lock themselves.
+    """
+    path = store_path or _snapshot_store_path()
+    with _snapshot_store_lock(path):
+        snapshots = _load_recovery_registry(path)
+        yield snapshots
+        _atomic_save_snapshots(path, snapshots)
 
 
 def _snapshot_key(task_id: str) -> str:
@@ -407,6 +369,16 @@ def _create_attempt_key(task_id: str) -> str:
 
 def _remote_binding_key(task_id: str) -> str:
     return f"{_REMOTE_BINDING_NAMESPACE}:{task_id}"
+
+
+def _record_field(value: Any, field: str) -> Any:
+    """Read *field* from a registry record, tolerating the bare-string shape.
+
+    Early unpublished builds wrote a plain id string where the current format
+    writes a dict, and a registry written by one of those builds must still be
+    comparable rather than silently read as absent.
+    """
+    return value.get(field) if isinstance(value, dict) else value
 
 
 def _create_attempt_state(
@@ -431,29 +403,28 @@ def _get_create_attempt(
     task_id: str,
     store_path: Path | None = None,
 ) -> str | None:
+    # Test helper: no production caller. Kept as the readable projection the
+    # suite asserts against.
     return _create_attempt_state(task_id, store_path)[0]
 
 
 def _remote_binding_state(
     task_id: str,
     store_path: Path | None = None,
-) -> tuple[
-    str | None,
-    str | None,
-    bool,
-    bool,
-    tuple[str, ...],
-    bool,
-]:
+) -> _RemoteBinding:
     snapshots = _load_snapshots(store_path)
     value = snapshots.get(_remote_binding_key(task_id))
     if isinstance(value, str) and value:
         # This unversioned shape was used only by unpublished development
         # candidates. It cannot prove how ownership was established, so never
         # auto-adopt it as a supported Hermes lineage.
-        return value, None, False, True, (value,), False
+        return _RemoteBinding(
+            remote_id=value,
+            conflicted=True,
+            conflict_ids=(value,),
+        )
     if not isinstance(value, dict):
-        return None, None, False, False, (), False
+        return _RemoteBinding()
     remote_id = value.get("remote_id")
     attempt_id = value.get("attempt_id")
     conflict_ids = value.get("conflict_ids")
@@ -473,13 +444,18 @@ def _remote_binding_state(
         attempt_id if isinstance(attempt_id, str) and attempt_id else None
     )
     conflicted = bool(value.get("conflicted", False))
-    return (
-        parsed_remote_id,
-        parsed_attempt_id,
-        bool(value.get("validated", False)) and parsed_attempt_id is not None,
-        conflicted,
-        parsed_conflict_ids,
-        bool(value.get("unresolvable", conflicted and not parsed_conflict_ids)),
+    return _RemoteBinding(
+        remote_id=parsed_remote_id,
+        attempt_id=parsed_attempt_id,
+        validated=(
+            bool(value.get("validated", False))
+            and parsed_attempt_id is not None
+        ),
+        conflicted=conflicted,
+        conflict_ids=parsed_conflict_ids,
+        unresolvable=bool(
+            value.get("unresolvable", conflicted and not parsed_conflict_ids)
+        ),
     )
 
 
@@ -487,7 +463,9 @@ def _get_remote_binding(
     task_id: str,
     store_path: Path | None = None,
 ) -> str | None:
-    return _remote_binding_state(task_id, store_path)[0]
+    # Test helper: no production caller. Kept as the readable projection the
+    # suite asserts against.
+    return _remote_binding_state(task_id, store_path).remote_id
 
 
 def _begin_create_attempt(
@@ -497,17 +475,11 @@ def _begin_create_attempt(
     store_path: Path | None = None,
 ) -> None:
     """Durably journal one unique remote create before issuing its RPC."""
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         key = _create_attempt_key(task_id)
         existing = snapshots.get(key)
         if existing not in (None, attempt_id):
-            existing_id = (
-                existing.get("attempt_id")
-                if isinstance(existing, dict)
-                else existing
-            )
+            existing_id = _record_field(existing, "attempt_id")
             if existing_id != attempt_id:
                 raise _SnapshotPointerConflict(
                     f"task {task_id} already has unresolved create attempt "
@@ -517,7 +489,6 @@ def _begin_create_attempt(
             "attempt_id": attempt_id,
             "expires_at": expires_at,
         }
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _clear_create_attempt(
@@ -526,28 +497,21 @@ def _clear_create_attempt(
     store_path: Path | None = None,
 ) -> None:
     """Durably clear exactly the create attempt whose remote is gone."""
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         key = _create_attempt_key(task_id)
         existing = snapshots.get(key)
         if existing is None:
             # A prior removal may be visible after an uncertain directory/
-            # write-through commit. Re-publish that marker-free state so this
-            # retry establishes durability before ownership can be released.
-            _atomic_save_snapshots(path, snapshots)
+            # write-through commit. Returning here still re-publishes that
+            # marker-free state, so this retry establishes durability before
+            # ownership can be released.
             return
-        existing_id = (
-            existing.get("attempt_id")
-            if isinstance(existing, dict)
-            else existing
-        )
+        existing_id = _record_field(existing, "attempt_id")
         if existing_id != attempt_id:
             raise _SnapshotPointerConflict(
                 f"create attempt advanced from {attempt_id} to {existing_id}"
             )
         snapshots.pop(key, None)
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _store_remote_binding(
@@ -563,22 +527,22 @@ def _store_remote_binding(
         raise ValueError(
             "a validated Tenki binding requires its durable create attempt id"
         )
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         attempt_key = _create_attempt_key(task_id)
-        existing_attempt = snapshots.get(attempt_key)
-        if isinstance(existing_attempt, dict):
-            existing_attempt = existing_attempt.get("attempt_id")
+        existing_attempt = _record_field(
+            snapshots.get(attempt_key),
+            "attempt_id",
+        )
         if attempt_id is not None and existing_attempt != attempt_id:
             raise _SnapshotPointerConflict(
                 f"create attempt advanced from {attempt_id} to "
                 f"{existing_attempt}"
             )
         binding_key = _remote_binding_key(task_id)
-        existing_binding = snapshots.get(binding_key)
-        if isinstance(existing_binding, dict):
-            existing_binding = existing_binding.get("remote_id")
+        existing_binding = _record_field(
+            snapshots.get(binding_key),
+            "remote_id",
+        )
         if existing_binding not in (None, remote_id):
             raise _SnapshotPointerConflict(
                 f"remote binding advanced from {remote_id} to "
@@ -593,7 +557,6 @@ def _store_remote_binding(
         }
         if attempt_id is not None:
             snapshots.pop(attempt_key, None)
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _replace_create_attempt_with_lineage_conflict(
@@ -606,15 +569,11 @@ def _replace_create_attempt_with_lineage_conflict(
 ) -> None:
     """Atomically replace an uncertain create with a durable conflict."""
     ids = sorted(set(remote_ids))
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         attempt_key = _create_attempt_key(task_id)
-        existing_attempt = snapshots.get(attempt_key)
-        existing_attempt_id = (
-            existing_attempt.get("attempt_id")
-            if isinstance(existing_attempt, dict)
-            else existing_attempt
+        existing_attempt_id = _record_field(
+            snapshots.get(attempt_key),
+            "attempt_id",
         )
         if existing_attempt_id != attempt_id:
             raise _SnapshotPointerConflict(
@@ -635,7 +594,6 @@ def _replace_create_attempt_with_lineage_conflict(
             "unresolvable": unresolvable,
         }
         snapshots.pop(attempt_key, None)
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _mark_remote_binding_validated(
@@ -644,16 +602,10 @@ def _mark_remote_binding_validated(
     store_path: Path | None = None,
 ) -> None:
     """Durably publish positive sole-lineage validation for a bound remote."""
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         key = _remote_binding_key(task_id)
         existing = snapshots.get(key)
-        existing_id = (
-            existing.get("remote_id")
-            if isinstance(existing, dict)
-            else existing
-        )
+        existing_id = _record_field(existing, "remote_id")
         if existing_id != remote_id:
             raise _SnapshotPointerConflict(
                 f"remote binding advanced from {remote_id} to {existing_id}"
@@ -668,7 +620,6 @@ def _mark_remote_binding_validated(
             existing = {"remote_id": remote_id, "attempt_id": None}
         existing["validated"] = True
         snapshots[key] = existing
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _mark_remote_binding_conflicted(
@@ -680,16 +631,10 @@ def _mark_remote_binding_conflicted(
     store_path: Path | None = None,
 ) -> None:
     """Permanently remember an observed fork despite later list omissions."""
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         key = _remote_binding_key(task_id)
         existing = snapshots.get(key)
-        existing_id = (
-            existing.get("remote_id")
-            if isinstance(existing, dict)
-            else existing
-        )
+        existing_id = _record_field(existing, "remote_id")
         if existing_id != remote_id:
             raise _SnapshotPointerConflict(
                 f"remote binding advanced from {remote_id} to {existing_id}"
@@ -706,7 +651,6 @@ def _mark_remote_binding_conflicted(
         conflict_record["conflict_ids"] = sorted(set(conflict_ids))
         conflict_record["unresolvable"] = unresolvable
         snapshots[key] = conflict_record
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _store_unmanaged_lineage_conflict(
@@ -718,9 +662,7 @@ def _store_unmanaged_lineage_conflict(
 ) -> None:
     """Record visible task-name collisions without claiming their ownership."""
     ids = sorted(set(remote_ids))
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         if snapshots.get(_create_attempt_key(task_id)) is not None:
             raise _SnapshotPointerConflict(
                 f"task {task_id} acquired a create attempt during collision check"
@@ -742,7 +684,6 @@ def _store_unmanaged_lineage_conflict(
             "conflict_ids": ids,
             "unresolvable": unresolvable,
         }
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _clear_remote_binding(
@@ -750,22 +691,19 @@ def _clear_remote_binding(
     remote_id: str,
     store_path: Path | None = None,
 ) -> None:
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         key = _remote_binding_key(task_id)
-        existing = snapshots.get(key)
-        if isinstance(existing, dict):
-            existing = existing.get("remote_id")
+        existing = _record_field(snapshots.get(key), "remote_id")
         if existing is None:
-            _atomic_save_snapshots(path, snapshots)
+            # Returning still re-publishes this binding-free state, so an
+            # earlier removal left visible by an uncertain commit becomes
+            # durable before ownership can be released.
             return
         if existing != remote_id:
             raise _SnapshotPointerConflict(
                 f"remote binding advanced from {remote_id} to {existing}"
             )
         snapshots.pop(key, None)
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _pending_snapshot_retirements(
@@ -784,9 +722,11 @@ def _queue_snapshot_retirement(
     snapshot_id: str,
     store_path: Path | None = None,
 ) -> None:
+    # Deliberately NOT _mutate_store: an already-tombstoned snapshot must exit
+    # without writing at all, and that helper always republishes on return.
     path = store_path or _snapshot_store_path()
     with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+        snapshots = _load_recovery_registry(path)
         if _snapshot_retired_key(snapshot_id) in snapshots:
             return
         snapshots[_snapshot_retirement_key(snapshot_id)] = snapshot_id
@@ -799,15 +739,12 @@ def _queue_snapshot_pointer_retirement(
     store_path: Path | None = None,
 ) -> None:
     """Atomically detach one unusable pointer and journal its retirement."""
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         for key in (_snapshot_key(task_id), task_id):
             if snapshots.get(key) == snapshot_id:
                 snapshots.pop(key, None)
         if _snapshot_retired_key(snapshot_id) not in snapshots:
             snapshots[_snapshot_retirement_key(snapshot_id)] = snapshot_id
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _confirm_snapshot_store_durable(
@@ -832,7 +769,7 @@ def _confirm_snapshot_store_durable(
             # MOVEFILE_WRITE_THROUGH. This also upgrades state left by an
             # uncertain prior replacement before a retirement retry can delete
             # a remote recovery copy.
-            _atomic_save_snapshots(path, _load_json_store(path))
+            _atomic_save_snapshots(path, _load_recovery_registry(path))
             return
         if platform != "posix":
             raise RuntimeError(
@@ -867,37 +804,38 @@ def _store_snapshot(
     store_path: Path | None = None,
 ) -> str | None:
     """Atomically install *snapshot_id* and return its predecessor, if any."""
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
-        key = _snapshot_key(task_id)
-        if _snapshot_retired_key(snapshot_id) in snapshots:
-            raise _SnapshotPointerConflict(
-                f"snapshot {snapshot_id} was already retired"
-            )
-        previous = snapshots.get(key)
-        if previous is None:
-            previous = snapshots.get(task_id)
-        snapshots[key] = snapshot_id
-        snapshots.pop(task_id, None)
-        if (
-            isinstance(previous, str)
-            and previous
-            and previous != snapshot_id
-        ):
-            # Journal the predecessor in the same atomic commit as the new
-            # pointer. A crash or transient delete failure can then retry
-            # retirement without ever forgetting the old remote snapshot.
-            snapshots[_snapshot_retirement_key(previous)] = previous
-        try:
-            _atomic_save_snapshots(path, snapshots)
-        except _SnapshotPointerCommitUncertain as exc:
-            exc.previous_snapshot_id = (
-                previous if isinstance(previous, str) and previous else None
-            )
-            exc.new_snapshot_id = snapshot_id
-            raise
-        return previous if isinstance(previous, str) and previous else None
+    previous: Any = None
+    # _mutate_store commits on exit from the ``with`` block, so the annotating
+    # handler has to wrap the block itself. Only the commit can raise this
+    # type, so the wider span does not widen what is caught.
+    try:
+        with _mutate_store(store_path) as snapshots:
+            key = _snapshot_key(task_id)
+            if _snapshot_retired_key(snapshot_id) in snapshots:
+                raise _SnapshotPointerConflict(
+                    f"snapshot {snapshot_id} was already retired"
+                )
+            previous = snapshots.get(key)
+            if previous is None:
+                previous = snapshots.get(task_id)
+            snapshots[key] = snapshot_id
+            snapshots.pop(task_id, None)
+            if (
+                isinstance(previous, str)
+                and previous
+                and previous != snapshot_id
+            ):
+                # Journal the predecessor in the same atomic commit as the new
+                # pointer. A crash or transient delete failure can then retry
+                # retirement without ever forgetting the old remote snapshot.
+                snapshots[_snapshot_retirement_key(previous)] = previous
+    except _SnapshotPointerCommitUncertain as exc:
+        exc.previous_snapshot_id = (
+            previous if isinstance(previous, str) and previous else None
+        )
+        exc.new_snapshot_id = snapshot_id
+        raise
+    return previous if isinstance(previous, str) and previous else None
 
 
 def _migrate_snapshot_pointer(
@@ -907,9 +845,7 @@ def _migrate_snapshot_pointer(
     store_path: Path | None = None,
 ) -> None:
     """CAS-migrate one legacy pointer without overwriting newer state."""
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        snapshots = _load_json_store(path)
+    with _mutate_store(store_path) as snapshots:
         if _snapshot_retired_key(snapshot_id) in snapshots:
             raise _SnapshotPointerConflict(
                 f"legacy snapshot {snapshot_id} was already retired"
@@ -941,7 +877,6 @@ def _migrate_snapshot_pointer(
         # Same-task legacy format is the plain task key.
         if snapshots.get(task_id) == snapshot_id:
             snapshots.pop(task_id, None)
-        _atomic_save_snapshots(path, snapshots)
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -1066,69 +1001,6 @@ def _tenki_resource_value(
     return None
 
 
-def _rewrite_sudo_noninteractive(command: str) -> tuple[str, int]:
-    """Add ``-n`` to real sudo invocations so Tenki never prompts."""
-    from tools.terminal_tool import _looks_like_env_assignment, _read_shell_token
-
-    out: list[str] = []
-    i = 0
-    n = len(command)
-    command_start = True
-    sudo_count = 0
-
-    while i < n:
-        ch = command[i]
-
-        if ch.isspace():
-            out.append(ch)
-            if ch == "\n":
-                command_start = True
-            i += 1
-            continue
-
-        if ch == "#" and command_start:
-            comment_end = command.find("\n", i)
-            if comment_end == -1:
-                out.append(command[i:])
-                break
-            out.append(command[i:comment_end])
-            i = comment_end
-            continue
-
-        if command.startswith("&&", i) or command.startswith("||", i) or command.startswith(";;", i):
-            out.append(command[i:i + 2])
-            i += 2
-            command_start = True
-            continue
-
-        if ch in ";|&(":
-            out.append(ch)
-            i += 1
-            command_start = True
-            continue
-
-        if ch == ")":
-            out.append(ch)
-            i += 1
-            command_start = False
-            continue
-
-        token, next_i = _read_shell_token(command, i)
-        if command_start and token == "sudo":
-            out.append("sudo -n")
-            sudo_count += 1
-        else:
-            out.append(token)
-
-        if command_start and _looks_like_env_assignment(token):
-            command_start = True
-        else:
-            command_start = False
-        i = next_i
-
-    return "".join(out), sudo_count
-
-
 class TenkiEnvironment(BaseEnvironment):
     """Tenki sandbox backend.
 
@@ -1182,12 +1054,7 @@ class TenkiEnvironment(BaseEnvironment):
         self._create_outcome_uncertain = False
         self._create_attempt_id: str | None = None
         self._create_attempt_expires_at: float | None = None
-        self._remote_binding_id: str | None = None
-        self._remote_binding_attempt_id: str | None = None
-        self._remote_binding_validated = False
-        self._remote_binding_conflicted = False
-        self._remote_binding_conflict_ids: tuple[str, ...] = ()
-        self._remote_binding_unresolvable = False
+        self._remote_binding = _RemoteBinding()
         self._create_lineage_ambiguous = False
         self._lock = threading.Lock()
         self._lifecycle_condition = threading.Condition(self._lock)
@@ -1263,20 +1130,13 @@ class TenkiEnvironment(BaseEnvironment):
                 self._task_id,
                 self._snapshot_store,
             )
-            (
-                self._remote_binding_id,
-                self._remote_binding_attempt_id,
-                self._remote_binding_validated,
-                self._remote_binding_conflicted,
-                self._remote_binding_conflict_ids,
-                self._remote_binding_unresolvable,
-            ) = _remote_binding_state(
+            self._remote_binding = _remote_binding_state(
                 self._task_id,
                 self._snapshot_store,
             )
             if self._create_attempt_id is not None and (
-                self._remote_binding_id is not None
-                or self._remote_binding_conflicted
+                self._remote_binding.remote_id is not None
+                or self._remote_binding.conflicted
             ):
                 raise RuntimeError(
                     "Tenki task has both an unresolved create and a remote "
@@ -1611,6 +1471,23 @@ class TenkiEnvironment(BaseEnvironment):
             kwargs["workspace_id"] = self._workspace_id
         return kwargs
 
+    def _fail_ambiguous_lineage(
+        self,
+        message: str,
+        cause: BaseException | None = None,
+    ) -> NoReturn:
+        """Mark this task's lineage unusable and fail closed in one step.
+
+        The flag and the raise are inseparable: a raise that forgot the flag
+        would let ``_abort_failed_initialization`` release task ownership (and
+        ``cleanup`` terminate a sandbox) while two remote lineages may still be
+        live. Passing *cause* preserves explicit exception chaining.
+        """
+        self._create_lineage_ambiguous = True
+        if cause is not None:
+            raise RuntimeError(message) from cause
+        raise RuntimeError(message)
+
     def _assert_no_unmanaged_persistent_sandbox(self) -> None:
         """Refuse visible name collisions that have no local ownership state.
 
@@ -1658,20 +1535,17 @@ class TenkiEnvironment(BaseEnvironment):
         except BaseException:
             self._create_lineage_ambiguous = True
             raise
-        self._remote_binding_id = (
-            None
-            if unidentified_collision
-            else sorted(set(remote_ids))[0]
+        self._remote_binding = _RemoteBinding(
+            remote_id=(
+                None
+                if unidentified_collision
+                else sorted(set(remote_ids))[0]
+            ),
+            conflicted=True,
+            conflict_ids=tuple(sorted(set(remote_ids))),
+            unresolvable=unidentified_collision,
         )
-        self._remote_binding_attempt_id = None
-        self._remote_binding_validated = False
-        self._remote_binding_conflicted = True
-        self._remote_binding_conflict_ids = (
-            tuple(sorted(set(remote_ids)))
-        )
-        self._remote_binding_unresolvable = unidentified_collision
-        self._create_lineage_ambiguous = True
-        raise RuntimeError(
+        self._fail_ambiguous_lineage(
             "Tenki found an unmanaged persistent sandbox collision for task "
             f"{self._task_id}; terminate the reported remote ids before retrying"
         )
@@ -1735,8 +1609,8 @@ class TenkiEnvironment(BaseEnvironment):
             if self._cleanup_in_progress or self._cleanup_complete:
                 raise RuntimeError("Tenki cleanup is in progress")
             if (
-                self._remote_binding_id is not None
-                or self._remote_binding_conflicted
+                self._remote_binding.remote_id is not None
+                or self._remote_binding.conflicted
             ):
                 self._resolve_remote_binding()
             if self._create_outcome_uncertain:
@@ -1747,7 +1621,7 @@ class TenkiEnvironment(BaseEnvironment):
                     )
             if self._sandbox is not None:
                 sandbox = self._sandbox
-                if not self._remote_binding_validated:
+                if not self._remote_binding.validated:
                     self._validate_created_lineage()
                 if self._ensure_sandbox_ready(sandbox):
                     self._after_sandbox_ownership_confirmed()
@@ -1908,7 +1782,7 @@ class TenkiEnvironment(BaseEnvironment):
     def _validate_created_lineage(self) -> None:
         """Validate exact ownership; use list only to detect visible conflicts."""
         sandbox = self._sandbox
-        expected_attempt_id = self._remote_binding_attempt_id
+        expected_attempt_id = self._remote_binding.attempt_id
         remote_id = self._sandbox_identity(sandbox)
         client = self._client
         get_sandbox = getattr(client, "get", None)
@@ -1916,7 +1790,7 @@ class TenkiEnvironment(BaseEnvironment):
         if (
             expected_attempt_id is None
             or remote_id is None
-            or remote_id != self._remote_binding_id
+            or remote_id != self._remote_binding.remote_id
             or not self._sandbox_has_owned_identity(
                 sandbox,
                 expected_attempt_id,
@@ -1924,8 +1798,7 @@ class TenkiEnvironment(BaseEnvironment):
             or not callable(get_sandbox)
             or not callable(list_sandboxes)
         ):
-            self._create_lineage_ambiguous = True
-            raise RuntimeError(
+            self._fail_ambiguous_lineage(
                 f"Tenki cannot validate the new lineage for task {self._task_id}"
             )
         try:
@@ -1984,19 +1857,19 @@ class TenkiEnvironment(BaseEnvironment):
                     store_path=self._snapshot_store,
                 )
             except BaseException as exc:
-                self._create_lineage_ambiguous = True
-                raise RuntimeError(
+                self._fail_ambiguous_lineage(
                     "Tenki detected multiple lineages but could not durably "
-                    f"record the conflict for task {self._task_id}"
-                ) from exc
-            self._remote_binding_validated = False
-            self._remote_binding_conflicted = True
-            self._remote_binding_conflict_ids = tuple(
-                sorted(set(conflict_ids))
+                    f"record the conflict for task {self._task_id}",
+                    exc,
+                )
+            self._remote_binding = replace(
+                self._remote_binding,
+                validated=False,
+                conflicted=True,
+                conflict_ids=tuple(sorted(set(conflict_ids))),
+                unresolvable=unresolvable,
             )
-            self._remote_binding_unresolvable = unresolvable
-            self._create_lineage_ambiguous = True
-            raise RuntimeError(
+            self._fail_ambiguous_lineage(
                 "Tenki detected multiple active sandbox lineages for task "
                 f"{self._task_id}; leaving every lineage untouched"
             )
@@ -2011,7 +1884,7 @@ class TenkiEnvironment(BaseEnvironment):
                 "Tenki could not durably record sole-lineage validation for "
                 f"task {self._task_id}"
             ) from exc
-        self._remote_binding_validated = True
+        self._remote_binding = replace(self._remote_binding, validated=True)
 
     def _wait_created_sandbox_ready(self, sandbox: Any) -> None:
         """Wait only after the exact newly created Sandbox handle is owned."""
@@ -2299,7 +2172,7 @@ class TenkiEnvironment(BaseEnvironment):
         """Reference-check, remote-delete, and tombstone under one store lock."""
         path = self._snapshot_store
         with _snapshot_store_lock(path):
-            snapshots = _load_json_store(path)
+            snapshots = _load_recovery_registry(path)
             pending_key = _snapshot_retirement_key(snapshot_id)
             if snapshots.get(pending_key) != snapshot_id:
                 return True
@@ -2578,7 +2451,9 @@ class TenkiEnvironment(BaseEnvironment):
         # Tenki sandboxes should rely on their own sudoers policy. Do not ask
         # the user for a host sudo password, and do not send SUDO_PASSWORD to a
         # remote cloud sandbox. The default Tenki image supports NOPASSWD sudo.
-        transformed, sudo_count = _rewrite_sudo_noninteractive(command)
+        from tools.terminal_tool import _rewrite_sudo_command_words
+
+        transformed, sudo_count = _rewrite_sudo_command_words(command, "sudo -n")
         if sudo_count == 0:
             return command, None
         if self._sudo_nopasswd_works():
@@ -2741,19 +2616,20 @@ class TenkiEnvironment(BaseEnvironment):
                 exc,
             )
             return False
-        self._remote_binding_id = remote_id
-        self._remote_binding_attempt_id = attempt_id
-        self._remote_binding_validated = validated
-        self._remote_binding_conflicted = False
-        self._remote_binding_conflict_ids = ()
-        self._remote_binding_unresolvable = False
+        self._remote_binding = _RemoteBinding(
+            remote_id=remote_id,
+            attempt_id=attempt_id,
+            validated=validated,
+        )
         if attempt_id is not None:
             self._create_attempt_id = None
             self._create_attempt_expires_at = None
         return True
 
     def _clear_remote_binding_marker(self, sandbox: Any) -> bool:
-        remote_id = self._remote_binding_id or self._sandbox_identity(sandbox)
+        remote_id = (
+            self._remote_binding.remote_id or self._sandbox_identity(sandbox)
+        )
         if remote_id is None:
             return True
         try:
@@ -2771,12 +2647,7 @@ class TenkiEnvironment(BaseEnvironment):
                 exc,
             )
             return False
-        self._remote_binding_id = None
-        self._remote_binding_attempt_id = None
-        self._remote_binding_validated = False
-        self._remote_binding_conflicted = False
-        self._remote_binding_conflict_ids = ()
-        self._remote_binding_unresolvable = False
+        self._remote_binding = _RemoteBinding()
         return True
 
     @staticmethod
@@ -2795,63 +2666,54 @@ class TenkiEnvironment(BaseEnvironment):
 
     def _resolve_remote_binding(self) -> None:
         """Resolve a durable task binding through authoritative Client.get."""
-        remote_id = self._remote_binding_id
+        binding = self._remote_binding
+        remote_id = binding.remote_id
         if (
-            (remote_id is None and not self._remote_binding_conflicted)
+            (remote_id is None and not binding.conflicted)
             or self._sandbox is not None
         ):
             return
-        if self._remote_binding_conflicted:
-            if (
-                not self._remote_binding_conflict_ids
-                and not self._remote_binding_unresolvable
-            ):
-                self._create_lineage_ambiguous = True
-                raise RuntimeError(
+        if binding.conflicted:
+            if not binding.conflict_ids and not binding.unresolvable:
+                self._fail_ambiguous_lineage(
                     "Tenki task has a malformed durable persistent-lineage "
                     f"conflict for {self._task_id}"
                 )
             client = self._create_client()
             active_ids: list[str] = []
-            for conflict_id in self._remote_binding_conflict_ids:
+            for conflict_id in binding.conflict_ids:
                 try:
                     candidate = client.get(conflict_id)
                 except BaseException as exc:
                     if self._remote_definitively_absent(exc):
                         continue
-                    self._create_lineage_ambiguous = True
-                    raise RuntimeError(
+                    self._fail_ambiguous_lineage(
                         "Tenki could not resolve every remote in the durable "
-                        f"lineage conflict for task {self._task_id}"
-                    ) from exc
+                        f"lineage conflict for task {self._task_id}",
+                        exc,
+                    )
                 if self._sandbox_identity(candidate) != conflict_id:
-                    self._create_lineage_ambiguous = True
-                    raise RuntimeError(
+                    self._fail_ambiguous_lineage(
                         "Tenki conflict lookup returned a different sandbox id"
                     )
                 if self._sandbox_state(candidate) not in self._terminal_states:
                     active_ids.append(conflict_id)
             if active_ids:
-                self._create_lineage_ambiguous = True
-                raise RuntimeError(
+                self._fail_ambiguous_lineage(
                     "Tenki task has a durable persistent-lineage conflict; "
                     f"active remote ids for {self._task_id}: "
                     + ", ".join(active_ids)
                 )
-            if self._remote_binding_unresolvable:
-                self._create_lineage_ambiguous = True
-                known_ids = ", ".join(
-                    self._remote_binding_conflict_ids
-                ) or "<none>"
-                raise RuntimeError(
+            if binding.unresolvable:
+                known_ids = ", ".join(binding.conflict_ids) or "<none>"
+                self._fail_ambiguous_lineage(
                     "Tenki task has an unresolvable durable "
                     f"persistent-lineage conflict for {self._task_id}; "
                     f"known remote ids: {known_ids}; manual remote cleanup "
                     "and local conflict removal are required"
                 )
             if not self._clear_remote_binding_marker(None):
-                self._create_lineage_ambiguous = True
-                raise RuntimeError(
+                self._fail_ambiguous_lineage(
                     "Tenki could not clear a fully terminated lineage conflict "
                     f"for task {self._task_id}"
                 )
@@ -2889,7 +2751,7 @@ class TenkiEnvironment(BaseEnvironment):
             return
         if self._persistent:
             self._sandbox = sandbox
-            if not self._remote_binding_validated:
+            if not self._remote_binding.validated:
                 self._validate_created_lineage()
             return
 
@@ -2989,12 +2851,13 @@ class TenkiEnvironment(BaseEnvironment):
         self._create_attempt_id = None
         self._create_attempt_expires_at = None
         self._create_outcome_uncertain = False
-        self._remote_binding_id = ids[0] if ids else None
-        self._remote_binding_attempt_id = attempt_id
-        self._remote_binding_validated = False
-        self._remote_binding_conflicted = True
-        self._remote_binding_conflict_ids = ids
-        self._remote_binding_unresolvable = unresolvable
+        self._remote_binding = _RemoteBinding(
+            remote_id=ids[0] if ids else None,
+            attempt_id=attempt_id,
+            conflicted=True,
+            conflict_ids=ids,
+            unresolvable=unresolvable,
+        )
         self._create_lineage_ambiguous = True
         return True
 
@@ -3353,7 +3216,7 @@ class TenkiEnvironment(BaseEnvironment):
                     f"exist for task {self._task_id}"
                 )
             if sandbox is None:
-                if self._remote_binding_id is not None:
+                if self._remote_binding.remote_id is not None:
                     self._resolve_remote_binding()
                     sandbox = self._sandbox
                     client = self._client

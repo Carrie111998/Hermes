@@ -1391,7 +1391,7 @@ def test_tenki_unidentified_collision_is_durably_unresolvable(
 
     with pytest.raises(RuntimeError, match="unmanaged persistent sandbox"):
         TenkiEnvironment(task_id="persist", persistent_filesystem=True)
-    assert tenki_module._remote_binding_state("persist") == (
+    assert tenki_module._remote_binding_state("persist") == tenki_module._RemoteBinding(
         None,
         None,
         False,
@@ -1456,7 +1456,7 @@ def test_tenki_mixed_unmanaged_collision_preserves_known_ids(
     with pytest.raises(RuntimeError, match="unmanaged persistent sandbox"):
         TenkiEnvironment(task_id=task_id, persistent_filesystem=True)
 
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         known.id,
         None,
         False,
@@ -1582,7 +1582,7 @@ def test_tenki_exact_binding_survives_list_omission_on_create_and_restart(
     )
     remote = first._sandbox
     assert len(_FakeSandboxFactory.created_kwargs) == 1
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         remote.id,
         remote.info.metadata["hermes_create_attempt"],
         True,
@@ -2172,7 +2172,7 @@ def test_tenki_snapshot_pointer_updates_are_serialized_and_atomic(
     active_loads = 0
     max_active_loads = 0
     state_lock = threading.Lock()
-    original_load = tenki_module._load_json_store
+    original_load = tenki_module._load_recovery_registry
 
     def tracked_load(path):
         nonlocal active_loads, max_active_loads
@@ -2186,7 +2186,7 @@ def test_tenki_snapshot_pointer_updates_are_serialized_and_atomic(
             with state_lock:
                 active_loads -= 1
 
-    monkeypatch.setattr(tenki_module, "_load_json_store", tracked_load)
+    monkeypatch.setattr(tenki_module, "_load_recovery_registry", tracked_load)
     start = threading.Barrier(3)
 
     def save(task_id, snapshot_id):
@@ -2673,7 +2673,7 @@ def test_tenki_ambiguous_persistent_lineages_are_never_terminated(
     assert new_remote.terminated is False
     attempt_id = new_remote.info.metadata["hermes_create_attempt"]
     assert tenki_module._get_create_attempt(task_id) is None
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         min(old_remote.id, new_remote.id),
         attempt_id,
         False,
@@ -2819,10 +2819,8 @@ def test_tenki_known_conflict_clears_only_after_exact_remote_is_terminal(
 
     assert successor._sandbox is not existing
     assert len(_FakeSandboxFactory.created_kwargs) == 1
-    assert tenki_module._remote_binding_state(task_id)[2:4] == (
-        True,
-        False,
-    )
+    _binding = tenki_module._remote_binding_state(task_id)
+    assert (_binding.validated, _binding.conflicted) == (True, False)
     successor.cleanup()
 
 
@@ -3074,10 +3072,8 @@ def test_tenki_terminal_list_row_requires_authoritative_get_before_clear(
 
     assert env._sandbox is authoritative
     assert len(_FakeSandboxFactory.created_kwargs) == 0
-    assert tenki_module._remote_binding_state(task_id)[2:4] == (
-        True,
-        False,
-    )
+    _binding = tenki_module._remote_binding_state(task_id)
+    assert (_binding.validated, _binding.conflicted) == (True, False)
     env.cleanup()
 
 
@@ -3126,7 +3122,7 @@ def test_tenki_expired_attempt_never_adopts_unmanaged_match(
         )
 
     assert tenki_module._get_create_attempt(task_id) is None
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         unmanaged.id,
         "expired-attempt",
         False,
@@ -3190,7 +3186,7 @@ def test_tenki_hidden_exact_conflict_preserves_visible_known_id(
     with pytest.raises(RuntimeError, match="prior create is unresolved"):
         TenkiEnvironment(task_id=task_id, persistent_filesystem=True)
 
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         visible.id,
         "hidden-exact-attempt",
         False,
@@ -3254,7 +3250,7 @@ def test_tenki_unvalidated_binding_requires_durable_expected_attempt(
             persistent_filesystem=True,
         )
 
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         remote.id,
         "expected-attempt",
         False,
@@ -3375,7 +3371,7 @@ def test_tenki_unvalidated_binding_stays_fail_closed_when_list_omits_remote(
 
     created = _FakeSandboxFactory.sandboxes[0]
     assert tenki_module._get_create_attempt(task_id) is None
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         created.id,
         created.info.metadata["hermes_create_attempt"],
         False,
@@ -3471,7 +3467,7 @@ def test_tenki_post_create_mixed_conflict_preserves_known_ids(
         TenkiEnvironment(task_id=task_id, persistent_filesystem=True)
 
     created = _FakeSandboxFactory.sandboxes[0]
-    assert tenki_module._remote_binding_state(task_id) == (
+    assert tenki_module._remote_binding_state(task_id) == tenki_module._RemoteBinding(
         created.id,
         created.info.metadata["hermes_create_attempt"],
         False,
