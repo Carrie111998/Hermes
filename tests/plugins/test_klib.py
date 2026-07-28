@@ -114,10 +114,10 @@ class TestKlibCommands:
         assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
         assert isinstance(result, tuple)
         text, keyboard = result
-        assert r"docs/1\.md" in text
-        assert r"docs/5\.md" in text
-        assert r"docs/6\.md" not in text
-        assert r"Page 1 of 2\." in text
+        assert "**docs/1.md**" in text
+        assert "**docs/5.md**" in text
+        assert "docs/6.md" not in text
+        assert "Page 1 of 2." in text
         assert _callback_for_button(keyboard, "Next").startswith("klib:page:2:")
         assert len(text) <= 2800
 
@@ -148,12 +148,12 @@ class TestKlibCommands:
 
         assert isinstance(result, tuple)
         text, keyboard = result
-        assert text.count(r"docs/shared\.md") == 1
+        assert text.count("docs/shared.md") == 1
         assert "first hit" in text
         assert "duplicate hit" not in text
-        assert r"docs/4\.md" in text
-        assert r"docs/5\.md" not in text
-        assert r"Page 1 of 2\." in text
+        assert "**docs/4.md**" in text
+        assert "docs/5.md" not in text
+        assert "Page 1 of 2." in text
         assert _callback_for_button(keyboard, "Next").startswith("klib:page:2:")
 
     def test_exactly_page_size_results_remain_bare_string(self, monkeypatch):
@@ -189,7 +189,7 @@ class TestKlibCommands:
 
         assert isinstance(result, tuple)
         text, keyboard = result
-        assert r"Page 1 of 2\." in text
+        assert "Page 1 of 2." in text
         assert isinstance(keyboard, mod.InlineKeyboardMarkup)
         expected_session_id = hashlib.sha256(
             f"chat-a:six files:{fixed_time}".encode()
@@ -239,7 +239,8 @@ class TestKlibCommands:
         prev_data = _callback_for_button(page_two_keyboard, "Prev")
         round_trip_text, _ = _run(mod._handle_klib_callback(prev_data, "chat-a"))
 
-        assert r"Page 2 of 2\." in page_two_text
+        assert "Page 2 of 2." in page_two_text
+        assert "**docs/6.md**" in page_two_text
         assert round_trip_text == initial_text
 
     def test_mismatched_chat_id_uses_expired_session_rejection(self, monkeypatch):
@@ -322,7 +323,7 @@ class TestKlibCommands:
             mod._handle_klib_callback(f"klib:page:6:{session_id}", "chat-a")
         )
 
-        assert r"Page 5 of 5\." in page_five
+        assert "Page 5 of 5." in page_five
         assert no_more == (mod._NO_MORE_RESULTS_REPLY, None)
         assert len(requests) == 1
 
@@ -351,10 +352,10 @@ class TestKlibCommands:
 
         assert len(requests) == 1
         assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
-        assert r"docs/dominant\.md" in result
-        assert r"docs/other\-1\.md" in result
-        assert r"docs/other\-2\.md" in result
-        assert r"docs/other\-3\.md" in result
+        assert "**docs/dominant.md**" in result
+        assert "**docs/other-1.md**" in result
+        assert "**docs/other-2.md**" in result
+        assert "**docs/other-3.md**" in result
         assert "Showing top 4 of 4 distinct files." not in result
 
     def test_successful_query_with_zero_results_is_friendly(self, monkeypatch):
@@ -441,7 +442,7 @@ class TestKlibCommands:
 
         result = _run(mod._handle_klib(raw_args))
 
-        assert r"Usage: /klib <query\>" in result
+        assert "Usage: /klib <query>" in result
         assert calls == []
 
     def test_key_file_read_failure_is_friendly(self, monkeypatch, tmp_path):
@@ -509,9 +510,9 @@ class TestKlibCommands:
         assert len(requests) == 1
         assert requests[0].url.path == "/read"
         assert requests[0].url.params["path"] == "docs/manual.md"
-        assert r"docs/manual\.md" in result
-        assert r"\# Manual" in result
-        assert "Full text from klib\\." in result
+        assert "docs/manual.md" in result
+        assert "# Manual" in result
+        assert "Full text from klib." in result
         assert "\n\n" in result
         assert len(result) <= 2800
 
@@ -603,10 +604,10 @@ class TestKlibCommands:
 
         result = _run(mod._handle_klib(raw_args))
 
-        assert r"Usage: /klib read <path\>" in result
+        assert "Usage: /klib read <path>" in result
         assert calls == []
 
-    def test_query_escapes_markdownv2_file_path(self, monkeypatch):
+    def test_query_returns_raw_file_path_in_bold_label(self, monkeypatch):
         mod = _load_plugin_init()
         _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
         _install_transport(
@@ -627,9 +628,10 @@ class TestKlibCommands:
 
         result = _run(mod._handle_klib("issue lookup"))
 
-        assert r"wiki/ccs/ccj\-issue\-108\.md" in result
+        assert "1. **wiki/ccs/ccj-issue-108.md** — relevant page" in result
+        assert r"wiki/ccs/ccj\-issue\-108\.md" not in result
 
-    def test_query_escapes_markdownv2_snippet(self, monkeypatch):
+    def test_query_returns_raw_markdownv2_snippet(self, monkeypatch):
         mod = _load_plugin_init()
         _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
         _install_transport(
@@ -648,9 +650,11 @@ class TestKlibCommands:
             ),
         )
 
-        result = _run(mod._handle_klib("cost"))
+        result = _run(mod._handle_klib("cost > $100"))
 
-        assert r"cost \> $100 \(approx\) \[see note\]\.\!" in result
+        assert "klib results for 'cost > $100':" in result
+        assert "cost > $100 (approx) [see note].!" in result
+        assert r"cost \> $100 \(approx\) \[see note\]\.\!" not in result
 
     def test_semantic_prefix_sends_semantic_mode(self, monkeypatch):
         mod = _load_plugin_init()
