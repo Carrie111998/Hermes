@@ -5,21 +5,42 @@ funds with MMM Investment. `index.html` is the deliverable: one file, no build s
 view it, no network requests at all. Open it in a browser, upload it to any static host,
 or paste its contents into a vendor profile that accepts HTML.
 
-The page is a store, not a school: four departments of kits (practical/trade, situation
-handling & self-command, design & motion, AI & emerging tech), bundles, a funding-setup
-service for families without an ESA account yet, a carbon reinvestment ledger, and an
-ordering flow built around invoice-then-approval rather than a checkout cart.
+The page is a store, not a school: five departments of kits (practical/trade, situation
+handling & self-command, design & motion, AI & emerging tech, homeschool essentials),
+bundles, a funding-setup service for families without an ESA account yet, a carbon
+reinvestment ledger, and an ordering flow built around invoice-then-approval rather than
+a checkout cart.
+
+## Storefront mockups (`store/`)
+
+`store/shop.html`, `store/product.html`, and `store/order.html` are three linked
+prototype pages — a category grid, a fully-built product detail page, and an order/quote
+review page with a working (localStorage-only) cart — built to show what running this as
+an actual browsable store looks like, rather than one long scrolling page. Open
+`store/shop.html`, click a product, add it to your order, and click through to
+`store/order.html` to see the whole loop, including the "Request itemized quote" button,
+which builds a pre-filled `mailto:` with the cart contents. There's no checkout or payment
+step anywhere, on purpose — education funds pay against an approved invoice, not a card.
+
+Every card in the shop links to the one built product page (the AI Literacy Bench Kit) as
+a stand-in for what every SKU's page would look like in production. Each mockup carries a
+"Prototype — not the live site" banner and prices flagged as illustrative; see
+`PRICING.md` for how those prices were actually calculated. These pages are not yet linked
+from `index.html` — wire that up once you've picked a direction.
 
 ## Editing
 
-Edit `src/page.html`, then rebuild:
+Edit `src/page.html` for the main page, or anything under `store/src/` for the storefront
+mockups, then rebuild everything at once:
 
 ```
 python3 build.py
 ```
 
-That inlines the four subset webfonts from `fonts/` and writes `index.html`.
-Editing `index.html` directly works too, but the next build overwrites it.
+That inlines the four subset webfonts from `fonts/` into `index.html`, and inlines the
+same fonts plus `store/shared_style.css` (the mockups' shared design tokens) into each
+`store/*.html`. Editing the built files directly works too, but the next build overwrites
+them.
 
 ## Before it goes live
 
@@ -44,6 +65,13 @@ search `src/page.html` for `class="fill"` to get all of them.
 | 13 | Direct-purchase terms (non-program buyers) | FAQ |
 | 14 | Returns policy | FAQ |
 | 15 | Legal business name | FAQ, footer |
+
+Product and bundle prices are no longer arbitrary placeholders in the store mockups —
+they're computed from a cost × markup formula documented in `PRICING.md`, using
+illustrative example costs. Replace the cost column there with what you actually pay
+suppliers, and every price recalculates from the same formula. The published `index.html`
+still leaves its own prices as `[___]` placeholders since it doesn't (yet) share the
+`store/` product data.
 
 Three claims on this page are assertions about the business rather than copy, and
 each is worth a second look before publishing:
