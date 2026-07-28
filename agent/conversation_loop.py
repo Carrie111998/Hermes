@@ -849,6 +849,15 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
         effective = sp
+        # Inject current time — the cached system prompt is frozen at
+        # session start, so this line keeps the agent temporally anchored
+        # on every turn.  Uses hermes_time.now() which respects the
+        # user's configured timezone.
+        try:
+            from hermes_time import current_time_line
+            effective = effective + "\n" + current_time_line()
+        except Exception:
+            pass
         if agent.ephemeral_system_prompt:
             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
         if not _rewrite_system_content_blocks(api_messages[0], effective):
@@ -1534,6 +1543,13 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
+        # Inject current time — per-turn temporal anchor (see same
+        # pattern in sync_system_prompt_to_api_messages for rationale).
+        try:
+            from hermes_time import current_time_line
+            effective_system = effective_system + "\n" + current_time_line() if effective_system else current_time_line()
+        except Exception:
+            pass
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
