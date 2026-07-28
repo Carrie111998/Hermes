@@ -376,6 +376,9 @@ export interface Translations {
         title: string
         intro: string
         restartHint: string
+        createTitle: string
+        createDesc: string
+        generatePet: string
         on: string
         off: string
         scaleTitle: string
@@ -1037,7 +1040,7 @@ export interface Translations {
       hatching: string
       hatchingSub: string
       hatched: string
-      hatchRow: (state: string, done: number, total: number) => string
+      hatchPose: (state: string, done: number, total: number) => string
       hatchComposing: string
       hatchSaving: string
       namePlaceholder: string
@@ -1052,6 +1055,15 @@ export interface Translations {
       referenceImageInvalid: string
       adopt: string
       startOver: string
+      advanced: string
+      style: string
+      model: string
+      seed: string
+      drafts: string
+      concurrency: string
+      poseAttempts: string
+      auto: string
+      random: string
     }
     installTheme: {
       title: string
