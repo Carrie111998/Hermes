@@ -31,6 +31,10 @@ Repeated line hits from the same file are collapsed using the first hit in
 klib's response. The `read` form fetches and returns the full page text, with
 the Telegram reply capped at 2800 characters.
 
+Klib returns query text, file paths, snippets, and page content as raw text.
+The downstream gateway formatter applies MarkdownV2 escaping once; result file
+labels are marked bold with standard `**label**` syntax.
+
 Pagination sessions are kept in memory for 30 minutes and are bound to the
 Telegram chat that started the search. Expired, unknown, invalid, or
 cross-chat pagination callbacks are rejected without revealing search results.

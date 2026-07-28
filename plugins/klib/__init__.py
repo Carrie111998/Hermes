@@ -14,9 +14,8 @@ messages instead.
 
 from __future__ import annotations
 
-import logging
 import hashlib
-import re
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -39,37 +38,27 @@ _SESSION_TTL = 1800
 
 _PAGINATION_SESSIONS: dict[str, dict[str, Any]] = {}
 
-# Keep this local because klib is platform-agnostic; importing the Telegram
-# adapter's private helper would couple this plugin to one gateway platform
-# and would require changing a forbidden file.
-_MDV2_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#\+\-=|{}.!\\])")
-
-
-def _escape_mdv2(text: str) -> str:
-    """Escape Telegram MarkdownV2 special characters in dynamic text."""
-    return _MDV2_ESCAPE_RE.sub(r"\\\1", text)
-
 
 def _truncate_display(value: str, length: int) -> str:
-    """Normalize, escape, and truncate a dynamic value safely for MarkdownV2."""
+    """Normalize and truncate a dynamic value without changing its text."""
     normalized = " ".join(value.split())
-    return _truncate_reply(_escape_mdv2(normalized), length)
+    return _truncate_reply(normalized, length)
 
 
 def _static_reply(value: str) -> str:
-    """Escape static reply text whose punctuation must also be valid MDV2."""
-    return _escape_mdv2(value)
+    """Return raw plugin text for the downstream platform formatter."""
+    return value
 
 
-_NOT_CONFIGURED_REPLY = _static_reply(
+_NOT_CONFIGURED_REPLY = (
     "klib: not configured or disabled. An admin must set "
     "klib.enabled: true and klib.base_url in config.yaml first."
 )
 
-_INVALID_PAGINATION_REPLY = _static_reply(
+_INVALID_PAGINATION_REPLY = (
     "klib: pagination session expired or is invalid."
 )
-_NO_MORE_RESULTS_REPLY = _static_reply("klib: no more results.")
+_NO_MORE_RESULTS_REPLY = "klib: no more results."
 
 try:
     from hermes_cli.plugins import InlineKeyboardMarkup
@@ -104,14 +93,10 @@ def _load_klib_config() -> dict[str, Any]:
 
 
 def _truncate_reply(value: str, length: int) -> str:
-    """Truncate escaped reply text without leaving an incomplete escape."""
+    """Truncate reply text without modifying its characters."""
     if len(value) <= length:
         return value
     truncated = value[: max(0, length - 1)].rstrip()
-    # Escaped MarkdownV2 punctuation is a two-character sequence.  Avoid
-    # cutting between the backslash and the character it protects.
-    if len(truncated) and (len(truncated) - len(truncated.rstrip("\\"))) % 2:
-        truncated = truncated[:-1].rstrip()
     return truncated + "…"
 
 
@@ -159,7 +144,7 @@ def _format_result_lines(
 
         label = _truncate_display(label or f"Result {index}", 180)
         snippet = _truncate_display(snippet, _SNIPPET_LENGTH)
-        line = f"{_escape_mdv2(str(index))}{_static_reply('.')} {label}"
+        line = f"{index}. **{label}**"
         if snippet:
             line += f" — {snippet}"
         lines.append(line)
@@ -184,8 +169,7 @@ def _format_results(query: str, results: list[Any]) -> str:
 
     if total > shown:
         lines.append(
-            f"Showing top {_escape_mdv2(str(shown))} of "
-            f"{_escape_mdv2(str(total))} distinct files{_static_reply('.')}"
+            f"Showing top {shown} of {total} distinct files."
         )
 
     reply = "\n".join(lines)
@@ -198,8 +182,7 @@ def _format_page(query: str, results: list[Any], page: int) -> str:
     start = (page - 1) * _PAGE_SIZE
     page_results = results[start : start + _PAGE_SIZE]
     lines = [
-        f"Page {_escape_mdv2(str(page))} of "
-        f"{_escape_mdv2(str(total_pages))}{_static_reply('.')}",
+        f"Page {page} of {total_pages}.",
     ]
     lines.extend(_format_result_lines(query, page_results, start_index=start + 1))
     return _truncate_reply("\n".join(lines), _MAX_REPLY_LENGTH)
@@ -339,7 +322,7 @@ async def _query_klib(
     if not 200 <= response.status_code < 300:
         return (
             "klib: service returned HTTP status "
-            f"{_escape_mdv2(str(response.status_code))}{_static_reply('.')}"
+            f"{response.status_code}."
         )
 
     try:
@@ -400,7 +383,7 @@ async def _read_klib(
     if not 200 <= response.status_code < 300:
         return (
             "klib: service returned HTTP status "
-            f"{_escape_mdv2(str(response.status_code))}{_static_reply('.')}"
+            f"{response.status_code}."
         )
 
     try:
@@ -415,10 +398,7 @@ async def _read_klib(
     ):
         return _static_reply("klib: received an invalid response format.")
 
-    reply = (
-        f"klib: {_escape_mdv2(payload['path'].strip())}\n"
-        f"{_escape_mdv2(payload['raw'])}"
-    )
+    reply = f"klib: {payload['path'].strip()}\n{payload['raw']}"
     return _truncate_reply(reply, _MAX_REPLY_LENGTH)
 
 
