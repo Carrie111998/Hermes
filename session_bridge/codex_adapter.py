@@ -1911,8 +1911,6 @@ def _verified_sidebar_projection(
     if invalid_expected:
         raise SidebarVerificationError("marker_conflict")
     exact = [payload for payload in decoded if payload == expected]
-    if len(exact) > 1:
-        raise SidebarVerificationError("marker_conflict")
     related = [
         payload
         for payload in decoded
@@ -1923,7 +1921,7 @@ def _verified_sidebar_projection(
         )
     ]
     if exact:
-        if related or (strict and len(decoded) != 1):
+        if related or (strict and len(exact) != len(decoded)):
             raise SidebarVerificationError("marker_conflict")
         return VerifiedSidebarThread(
             thread_id=projection.native_id,

@@ -848,39 +848,83 @@ def test_sidebar_thread_verifier_rejects_wrong_authenticated_lineage(
     assert raised.value.code == code
 
 
-def test_sidebar_thread_verifier_rejects_invalid_signature_and_duplicate_marker() -> (
+def test_sidebar_thread_verifier_rejects_invalid_signature() -> None:
+    valid = encode_bridge_marker(_sidebar_expected(), SECRET)
+    invalid = encode_bridge_marker(_sidebar_expected(), b"different-secret")
+    read = _codex_read(
+        turns=[
+            {
+                "id": "registration",
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "id": "item-1",
+                        "content": [{"type": "text", "text": invalid}],
+                    }
+                ],
+            }
+        ]
+    )
+    client = FakeRequestClient({
+        "thread/read": [_codex_direct_read(read), read],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.verify_thread(thread_id=CODEX_ID, expected=_sidebar_expected())
+
+    assert raised.value.code == "marker_conflict"
+
+
+def test_sidebar_thread_verifier_accepts_repeated_identical_marker_in_exact_task() -> (
     None
 ):
     valid = encode_bridge_marker(_sidebar_expected(), SECRET)
-    invalid = encode_bridge_marker(_sidebar_expected(), b"different-secret")
-    for content in (invalid, f"{valid}\n{valid}"):
-        read = _codex_read(
-            turns=[
-                {
-                    "id": "registration",
-                    "items": [
-                        {
-                            "type": "userMessage",
-                            "id": "item-1",
-                            "content": [{"type": "text", "text": content}],
-                        }
-                    ],
-                }
-            ]
-        )
-        client = FakeRequestClient({
-            "thread/read": [_codex_direct_read(read), read],
-        })
-        verifier = SidebarThreadVerifier(
-            CodexSourceAdapter(client, marker_secret=SECRET),
-            marker_secret=SECRET,
-            reconciliation_interval=0,
-        )
+    read = _codex_read(
+        turns=[
+            {
+                "id": "registration",
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "id": "item-1",
+                        "content": [{"type": "text", "text": valid}],
+                    }
+                ],
+            },
+            {
+                "id": "recovery",
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "id": "item-2",
+                        "content": [{"type": "text", "text": valid}],
+                    }
+                ],
+            },
+        ]
+    )
+    client = FakeRequestClient({
+        "thread/read": [_codex_direct_read(read), read],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
 
-        with pytest.raises(SidebarVerificationError) as raised:
-            verifier.verify_thread(thread_id=CODEX_ID, expected=_sidebar_expected())
+    verified = verifier.verify_thread(
+        thread_id=CODEX_ID,
+        expected=_sidebar_expected(),
+    )
 
-        assert raised.value.code == "marker_conflict"
+    assert verified.thread_id == CODEX_ID
+    assert verified.source_session_id == "claude:source-1"
+    assert verified.bridge_id == "bridge-1"
 
 
 def test_sidebar_marker_lookup_recovers_one_exact_thread_read_only() -> None:
