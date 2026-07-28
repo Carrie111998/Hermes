@@ -51,6 +51,7 @@ from .store import (
     SIDEBAR_PRECREATE_RESOLUTION_CODE,
     SIDEBAR_RETRYABLE_ERRORS,
     SIDEBAR_TERMINAL_RESOLUTION_CODE,
+    SIDEBAR_UNBOUND_RESOLUTION_CODE,
     SessionBridgeStore,
     redact_codex_thread_id,
 )
@@ -1449,6 +1450,7 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     fixed_resolution_codes = (
         SIDEBAR_TERMINAL_RESOLUTION_CODE,
         SIDEBAR_PRECREATE_RESOLUTION_CODE,
+        SIDEBAR_UNBOUND_RESOLUTION_CODE,
     )
     shaped_resolution_codes = {
         code: _nonnegative_status_int(

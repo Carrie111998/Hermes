@@ -2119,6 +2119,7 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "by_resolution_code": {
             "native_thread_unrecoverable": 0,
             "precutover_create_unrecoverable": 0,
+            "native_create_unrecoverable": 0,
         },
     }
     assert sidebar["execution_blockers"] == []
@@ -2202,20 +2203,21 @@ def test_session_status_exposes_only_sanitized_hydration_observability(
     assert private not in rendered
 
 
-def test_sidebar_status_preserves_both_fixed_terminal_resolution_codes() -> None:
+def test_sidebar_status_preserves_all_fixed_terminal_resolution_codes() -> None:
     status = _sidebar_status({
-        "counts": {"sidebar_failed": 2},
+        "counts": {"sidebar_failed": 3},
         "blocking_failed_count": 0,
-        "terminally_resolved_failed_count": 2,
+        "terminally_resolved_failed_count": 3,
         "ineffective_terminal_resolution_count": 0,
         "terminal_resolution_ledger_valid": True,
         "terminal_resolutions": {
-            "total": 2,
-            "effective": 2,
+            "total": 3,
+            "effective": 3,
             "ineffective": 0,
             "by_resolution_code": {
                 "native_thread_unrecoverable": 1,
                 "precutover_create_unrecoverable": 1,
+                "native_create_unrecoverable": 1,
             },
         },
         "execution_blockers": [],
@@ -2225,6 +2227,7 @@ def test_sidebar_status_preserves_both_fixed_terminal_resolution_codes() -> None
     assert status["terminal_resolutions"]["by_resolution_code"] == {
         "native_thread_unrecoverable": 1,
         "precutover_create_unrecoverable": 1,
+        "native_create_unrecoverable": 1,
     }
     assert status["execution_blockers"] == []
 
@@ -2272,6 +2275,7 @@ def test_sidebar_status_rejects_unknown_or_mismatched_resolution_counts(
     assert status["terminal_resolutions"]["by_resolution_code"] == {
         "native_thread_unrecoverable": 1,
         "precutover_create_unrecoverable": 0,
+        "native_create_unrecoverable": 0,
     }
     assert status["execution_blockers"] == [
         "sidebar_terminal_resolution_ledger_invalid"
