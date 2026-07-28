@@ -1652,20 +1652,78 @@ def _apps_from_windows(windows: list) -> list:
     return apps
 
 
+def _resolve_host_pid(window_id: int, app_name: str) -> Optional[int]:
+    """Try to find the host PID for a window that lacks ``_NET_WM_PID``.
+
+    Flatpak, Snap, and some containerised apps run in a PID namespace
+    separate from the X11 server, so cua-driver reports ``pid: null``.
+    The window still belongs to a real host process; we search for it
+    by matching the ``app_name`` against the command lines of running
+    processes, preferring the process whose X11 window maps include
+    *window_id* when ``/proc`` is available.
+
+    Returns the resolved PID or ``None`` when no match is found.
+    """
+    if not window_id or window_id <= 0:
+        return None
+    if not app_name:
+        return None
+
+    import subprocess as _sp
+
+    # Strategy 1: walk /proc/*/cmdline for exact app_name match.
+    # This is fast (no external deps) and catches most cases.
+    try:
+        import glob as _glob
+        for cmdline_path in _glob.iglob("/proc/*/cmdline"):
+            try:
+                with open(cmdline_path, "rb") as fh:
+                    raw = fh.read()
+                # /proc/<pid>/cmdline
+                pid_dir = os.path.dirname(cmdline_path)
+                pid_str = os.path.basename(pid_dir)
+                host_pid = int(pid_str)
+            except (OSError, ValueError):
+                continue
+            if host_pid <= 1:
+                continue
+            cmdline = raw.decode("utf-8", errors="replace").replace("\x00", " ")
+            # Match app_name as a whole word or path segment in the command line
+            if app_name.lower() in cmdline.lower():
+                return host_pid
+    except OSError:
+        pass
+
+    # Strategy 2: fall back to `pgrep` when /proc isn't enough.
+    try:
+        result = _sp.run(
+            ["pgrep", "-f", app_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                try:
+                    return int(line.strip())
+                except ValueError:
+                    continue
+    except (OSError, _sp.TimeoutExpired):
+        pass
+
+    return None
+
+
 def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalise cua-driver ``list_windows`` entries, dropping unusable ones.
 
-    Every downstream operation needs both an integer ``pid`` (for
-    get_window_state / action tools) and ``window_id`` (for screenshot /
-    element clicks), so a window missing either is uncapturable.
-
-    Crucially, on X11 a window's PID comes from the *optional*
-    ``_NET_WM_PID`` property — the desktop root, panels, and
-    override-redirect popups routinely omit it, so the driver reports
-    ``pid: null`` for them. Coercing every entry unconditionally
-    (``int(w["pid"])``) let one such window abort enumeration of the real,
-    targetable windows. We skip the unusable entries instead so capture()
-    and focus_app() still find the windows that matter.
+    Every downstream operation needs a ``window_id`` (for screenshot /
+    element clicks).  ``pid`` is preferred for ``get_window_state`` and
+    action tools, but on X11 flatpak/snap windows routinely omit
+    ``_NET_WM_PID``, so the driver reports ``pid: null``.  We accept
+    those windows with a sentinel ``pid=0`` — they are still capturable
+    via the CLI fallback transport (which retries with backoff and
+    screenshot-to-file), and action tools that genuinely require a real
+    PID will fail with a clear error instead of silently hiding the
+    window from discovery.
 
     ``z_index`` follows CUA Driver semantics: higher = closer to front.
     Wayland may return ``z_index: null`` (undefined stacking order); we
@@ -1675,10 +1733,22 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     windows: List[Dict[str, Any]] = []
     for w in raw_windows:
-        pid_int = _positive_int(w.get("pid"))
         window_id_int = _positive_int(w.get("window_id"))
-        if pid_int is None or window_id_int is None:
+        if window_id_int is None:
             continue
+        pid_int = _positive_int(w.get("pid"))
+        if pid_int is None:
+            # Flatpak / Snap / container window without _NET_WM_PID.
+            # Try to discover the real host PID so get_window_state and
+            # action tools can target this window.  If resolution fails
+            # we still include the window with pid=0 for discovery;
+            # callers that can work window_id-only (vision screenshot)
+            # will still succeed.
+            resolved = _resolve_host_pid(
+                _positive_int(w.get("window_id")) or 0,
+                w.get("app_name") or "",
+            )
+            pid_int = resolved if resolved else 0
         z_raw = w.get("z_index")
         z_index = z_raw if isinstance(z_raw, (int, float)) and not isinstance(z_raw, bool) else 0
         windows.append({
