@@ -3411,6 +3411,20 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        # Optional pre-turn context: prepend a deterministically-maintained state
+        # file (e.g. campaign save-state) to this turn's system prompt, so the model
+        # always sees current truth without relying on it to look things up. Set
+        # HERMES_PRETURN_CONTEXT_FILE to the file path.
+        _ctxf = os.environ.get("HERMES_PRETURN_CONTEXT_FILE", "").strip()
+        if _ctxf:
+            try:
+                with open(os.path.expanduser(_ctxf), encoding="utf-8") as _cf:
+                    _ctx = _cf.read().strip()
+                if _ctx:
+                    _pre = f"[CURRENT CAMPAIGN STATE — authoritative, maintained externally]\n{_ctx}\n"
+                    system_prompt = (_pre + "\n" + system_prompt) if system_prompt else _pre
+            except OSError:
+                pass
         # Runtime selection — mirrors _handle_session_chat (lock wins,
         # otherwise session-persisted model then per-request values).
         runtime_request = self._effective_session_runtime_request(
