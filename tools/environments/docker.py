@@ -314,6 +314,78 @@ def find_docker() -> Optional[str]:
     return None
 
 
+def _runtime_names(executable: str) -> set[str]:
+    """Return the basename of *executable* plus its symlink target basename.
+
+    Compatibility symlinks (commonly ``docker -> podman``) must resolve to the
+    real runtime; a stat failure degrades to the literal name rather than
+    raising.
+    """
+    names = {Path(executable).name.lower()}
+    try:
+        names.add(Path(executable).resolve().name.lower())
+    except (OSError, RuntimeError):
+        pass
+    return names
+
+
+def _is_podman_remote_runtime(executable: str) -> bool:
+    """Return whether *executable* is a Podman *remote* client.
+
+    ``podman-remote`` (and ``podman --remote``) forwards every container
+    operation to a service that may run on another host, under another user,
+    with another subuid map.  Two assumptions this module makes then stop
+    holding:
+
+    * bind-mount sources are resolved on the SERVER's filesystem, so a local
+      path in ``docker_volumes`` may not exist there or may point elsewhere;
+    * ``--userns keep-id`` maps to the SERVICE user, not to the caller, so
+      ``docker_run_as_host_user`` cannot promise host-visible ownership.
+
+    Deciding rootless-vs-rootful from the local process is therefore wrong for
+    this flavour.  Rather than guess — or silently fall through to the Docker
+    branch and hand back files owned by somebody else — the caller refuses the
+    combination outright.  See ``DockerEnvironment.__init__``.
+    """
+    return any(name.startswith("podman-remote") for name in _runtime_names(executable))
+
+
+def _is_podman_runtime(executable: str) -> bool:
+    """Return whether *executable* resolves to a LOCAL Podman CLI.
+
+    Excludes ``podman-remote`` (see :func:`_is_podman_remote_runtime`) because
+    the identity policy below is only sound for a runtime sharing this
+    process's user namespace.
+    """
+    if _is_podman_remote_runtime(executable):
+        return False
+    return any(
+        name == "podman" or name.startswith("podman.")
+        for name in _runtime_names(executable)
+    )
+
+
+def _podman_is_rootless() -> bool:
+    """Return whether local Podman would run in rootless mode.
+
+    Podman selects rootless purely from the effective UID of the invoking
+    process: non-root means a user namespace with a subuid map, root means
+    plain rootful containers.  ``podman info --format {{.Host.Security.Rootless}}``
+    reports exactly this, so the euid check is equivalent and avoids spawning a
+    probe on every container creation.
+
+    This matters because ``--userns keep-id`` is a ROOTLESS-ONLY option: under
+    rootful Podman it is rejected, so applying it there would turn a working
+    setup into a container that refuses to start.  Rootful Podman already maps
+    UIDs identically to Docker, so ``--user UID:GID`` alone is both necessary
+    and sufficient.
+    """
+    try:
+        return os.geteuid() != 0
+    except AttributeError:  # pragma: no cover - non-POSIX
+        return False
+
+
 # Security flags applied to every container.
 # The container itself is the security boundary (isolated from host).
 # We drop all capabilities then add back the minimum needed:
@@ -604,6 +676,24 @@ def _extra_args_egress_collisions(
         elif arg in network_flags or any(arg.startswith(f"{flag}=") for flag in network_flags):
             collisions.append(arg)
         i += 1
+    return sorted(set(collisions))
+
+
+def _extra_args_identity_collisions(extra_args: list[str]) -> list[str]:
+    """Return extra args that conflict with backend-controlled user identity."""
+    collisions: list[str] = []
+    for arg in extra_args:
+        if (
+            arg in {"--user", "-u", "--userns"}
+            or arg.startswith("--user=")
+            or arg.startswith("--userns=")
+            or (
+                arg.startswith("-u")
+                and not arg.startswith("--")
+                and len(arg) > 2
+            )
+        ):
+            collisions.append(arg)
     return sorted(set(collisions))
 
 
@@ -1219,16 +1309,43 @@ class DockerEnvironment(BaseEnvironment):
         for key in sorted(merged_env):
             env_args.extend(["-e", f"{key}={merged_env[key]}"])
 
+        # Resolve the container executable before identity args: Podman needs
+        # an explicit keep-id user namespace while Docker only accepts --user.
+        # Resolving once also keeps non-PATH Docker Desktop installs working.
+        self._docker_exe = find_docker() or "docker"
+
         # Optional: run the container as the host user so files written into
         # bind-mounted dirs (/workspace, /root, docker_volumes entries) are
         # owned by that user on the host instead of by root. Skip cleanly on
         # platforms without POSIX uid/gid (e.g. native Windows Docker).
         user_args: list[str] = []
         if run_as_host_user:
+            # podman-remote cannot honour this flag: the container runs under a
+            # service that may live on another host with another subuid map, so
+            # neither keep-id nor a bare --user can promise the CALLER sees the
+            # files as their own. Refuse loudly instead of silently taking the
+            # Docker branch and handing back files owned by somebody else.
+            if _is_podman_remote_runtime(self._docker_exe):
+                raise ValueError(
+                    "docker_run_as_host_user is not supported with podman-remote "
+                    f"({self._docker_exe}): bind mounts and the keep-id user "
+                    "namespace resolve on the remote service, not on this host, "
+                    "so host-visible file ownership cannot be guaranteed. Use a "
+                    "local container runtime or set docker_run_as_host_user: false."
+                )
             user_spec = _resolve_host_user_spec()
             if user_spec is not None:
-                user_args = ["--user", user_spec]
-                logger.info("Docker: running container as host user %s", user_spec)
+                # keep-id is rootless-only. Rootful Podman rejects it, and maps
+                # UIDs exactly like Docker, so it takes the Docker branch.
+                if _is_podman_runtime(self._docker_exe) and _podman_is_rootless():
+                    user_args = ["--userns", "keep-id", "--user", user_spec]
+                    logger.info(
+                        "Podman (rootless): keeping host user namespace and running as %s",
+                        user_spec,
+                    )
+                else:
+                    user_args = ["--user", user_spec]
+                    logger.info("Docker: running container as host user %s", user_spec)
             else:
                 logger.warning(
                     "docker_run_as_host_user is enabled but this platform does "
@@ -1237,10 +1354,6 @@ class DockerEnvironment(BaseEnvironment):
                 )
                 # Fall back to the full cap set — without --user, an image's
                 # init may still need s6-setuidgid/gosu/su to drop privileges.
-
-        # Resolve the docker executable once so it works even when
-        # /usr/local/bin is not in PATH (common on macOS gateway/service).
-        self._docker_exe = find_docker() or "docker"
 
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
         # and exec /run/s6/basedir/bin/init during startup. For those images we
@@ -1262,13 +1375,23 @@ class DockerEnvironment(BaseEnvironment):
 
         logger.info(f"Docker volume_args: {volume_args}")
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
-        # Appended last so they can override defaults if needed.
+        # Passed through unchanged after validating the narrow controls Hermes
+        # owns.
         validated_extra = []
         for arg in (extra_args or []):
             if not isinstance(arg, str):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
+        if run_as_host_user:
+            _identity_collisions = _extra_args_identity_collisions(validated_extra)
+            if _identity_collisions:
+                raise ValueError(
+                    "docker_extra_args conflicts with docker_run_as_host_user "
+                    f"identity control: {_identity_collisions}. Remove --user, "
+                    "-u, and --userns options; Hermes sets the host UID/GID "
+                    "and Podman keep-id mapping."
+                )
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
                 validated_extra, _critical_egress_names,

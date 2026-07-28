@@ -547,6 +547,316 @@ def test_run_as_host_user_passes_uid_gid(monkeypatch):
     assert run_args[idx + 1] == "1234:5678", (
         f"expected --user 1234:5678, got --user {run_args[idx + 1]}"
     )
+    assert "--userns" not in run_args, "Docker must not receive Podman's keep-id mode"
+
+
+def test_rootless_podman_keeps_host_uid_gid(monkeypatch, tmp_path):
+    """Rootless Podman must keep the host IDs without mutating the bind mount.
+
+    Regression: Podman was accepted as a Docker-compatible fallback, but the
+    real ``run`` argv only contained ``--user UID:GID``. Without Podman's
+    ``--userns keep-id`` mapping, files created through a bind mount can be
+    translated to a different host owner.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman")
+    # Pinned rather than inherited from the test runner's euid, so the case
+    # under test is the rootless one on every machine and in CI as root.
+    monkeypatch.setattr(docker_env, "_podman_is_rootless", lambda: True)
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(tmp_path),
+        auto_mount_cwd=True,
+        run_as_host_user=True,
+    )
+
+    run_args = _run_args_from_calls(calls)
+    identity_args = [
+        "--userns",
+        "keep-id",
+        "--user",
+        "1234:5678",
+    ]
+    assert any(
+        run_args[index:index + len(identity_args)] == identity_args
+        for index in range(len(run_args) - len(identity_args) + 1)
+    ), f"Podman identity arguments missing from real run argv: {run_args}"
+
+
+def test_rootful_podman_omits_keep_id(monkeypatch, tmp_path):
+    """Rootful Podman must take the Docker branch: --user only, no keep-id.
+
+    ``--userns keep-id`` is rootless-only; rootful Podman rejects it, so
+    emitting it there converts a working setup into a container that refuses to
+    start. Rootful Podman already maps UIDs like Docker, so the bare --user is
+    both necessary and sufficient.
+
+    This is a decision-logic test: rootful Podman cannot be exercised for real
+    in this environment (see the module docstring of
+    tests/tools/test_rootless_podman_owner.py), so live rootful coverage is
+    explicitly NOT claimed.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman")
+    monkeypatch.setattr(docker_env, "_podman_is_rootless", lambda: False)
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(tmp_path),
+        auto_mount_cwd=True,
+        run_as_host_user=True,
+    )
+
+    run_args = _run_args_from_calls(calls)
+    assert "--userns" not in run_args, (
+        f"rootful Podman must not receive keep-id: {run_args}"
+    )
+    assert not any(arg.startswith("--userns=") for arg in run_args), run_args
+    index = run_args.index("--user")
+    assert run_args[index + 1] == "1234:5678"
+
+
+def test_podman_is_rootless_follows_effective_uid(monkeypatch):
+    """Rootless mode is exactly 'the invoking process is not root'.
+
+    Same rule ``podman info --format {{.Host.Security.Rootless}}`` reports, so
+    the euid check is equivalent without spawning a probe per container.
+    """
+    monkeypatch.setattr(docker_env.os, "geteuid", lambda: 1000)
+    assert docker_env._podman_is_rootless() is True
+    monkeypatch.setattr(docker_env.os, "geteuid", lambda: 0)
+    assert docker_env._podman_is_rootless() is False
+
+
+def test_podman_remote_is_not_classified_as_local_podman(tmp_path):
+    """podman-remote must not be swept into the local-Podman policy."""
+    assert docker_env._is_podman_remote_runtime("/usr/bin/podman-remote")
+    assert not docker_env._is_podman_runtime("/usr/bin/podman-remote")
+    # Also via a compatibility symlink, the same way `docker -> podman` is
+    # followed.
+    remote = tmp_path / "podman-remote"
+    remote.touch()
+    wrapper = tmp_path / "docker"
+    wrapper.symlink_to(remote)
+    assert docker_env._is_podman_remote_runtime(str(wrapper))
+    assert not docker_env._is_podman_runtime(str(wrapper))
+
+
+def test_podman_remote_rejects_run_as_host_user(monkeypatch, tmp_path):
+    """podman-remote + docker_run_as_host_user must fail loudly, not silently.
+
+    Bind mounts and the keep-id namespace resolve on the remote service, which
+    may run on another host under another subuid map, so host-visible ownership
+    cannot be promised. Falling through to the Docker branch would hand back
+    files owned by somebody else with no warning.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman-remote")
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="podman-remote"):
+        _make_dummy_env(
+            cwd="/workspace",
+            host_cwd=str(tmp_path),
+            auto_mount_cwd=True,
+            run_as_host_user=True,
+        )
+
+    # Checked against `calls` directly: _run_args_from_calls() asserts that a
+    # run happened, so it cannot express "no run happened".
+    run_calls = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
+    ]
+    assert not run_calls, (
+        f"no container may be created once the runtime is refused: {run_calls}"
+    )
+
+
+def test_podman_remote_allowed_without_host_user_mode(monkeypatch, tmp_path):
+    """Without run_as_host_user there is no ownership promise to break."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman-remote")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(tmp_path),
+        auto_mount_cwd=True,
+        run_as_host_user=False,
+    )
+
+    run_args = _run_args_from_calls(calls)
+    assert run_args, "container should still be created"
+    assert "--userns" not in run_args
+    assert "--user" not in run_args
+
+    mount = f"{tmp_path}:/workspace"
+    assert mount in run_args
+    assert f"{mount}:U" not in run_args
+    assert not any(arg.endswith(":U") for arg in run_args)
+
+
+def test_podman_runtime_detection_follows_docker_compat_symlink(tmp_path):
+    """A ``docker`` compatibility symlink to Podman still needs keep-id."""
+    podman = tmp_path / "podman"
+    podman.touch()
+    docker_wrapper = tmp_path / "docker"
+    docker_wrapper.symlink_to(podman)
+
+    assert docker_env._is_podman_runtime(str(docker_wrapper))
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        # Separated flag + value.
+        ["--user", "0:0"],
+        ["-u", "0:0"],
+        ["--userns", "host"],
+        # Attached with '=' — including the empty-value forms, which are still
+        # an attempt to seize the control Hermes owns.
+        ["--user="],
+        ["--user=0:0"],
+        ["--user=1234:1234"],
+        ["--userns="],
+        ["--userns=host"],
+        # keep-id in particular: correct for rootless Podman, but the backend
+        # decides that now. A profile still carrying it from the config-level
+        # workaround must fail loudly rather than emit --userns twice.
+        ["--userns=keep-id"],
+        # Concatenated short form. Handled by the length>2 branch of
+        # _extra_args_identity_collisions; previously implemented but untested.
+        ["-u1234:1234"],
+        ["-u0:0"],
+        # Buried among legitimate flags, not just alone at position 0.
+        ["--shm-size=1g", "-u1234:1234", "--label", "x=y"],
+    ],
+)
+def test_run_as_host_user_rejects_conflicting_extra_args(
+    monkeypatch,
+    extra_args,
+):
+    """docker_extra_args must not override backend-controlled identity."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman")
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError, match="docker_extra_args.*identity"):
+        _make_dummy_env(
+            run_as_host_user=True,
+            extra_args=extra_args,
+        )
+
+    run_calls = [
+        call for call in calls
+        if isinstance(call[0], list)
+        and len(call[0]) >= 2
+        and call[0][1] == "run"
+    ]
+    assert not run_calls, "invalid identity overrides must fail before container creation"
+
+
+def test_run_as_host_user_preserves_unrelated_extra_args(monkeypatch):
+    """Non-identity docker_extra_args retain their existing behavior."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/podman")
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        run_as_host_user=True,
+        extra_args=["--shm-size=1g"],
+    )
+
+    run_args = _run_args_from_calls(calls)
+    assert "--shm-size=1g" in run_args
+
+
+def test_identity_extra_args_remain_allowed_without_host_user_mode(monkeypatch):
+    """Identity flags stay user-controlled when Hermes host-user mode is off."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        run_as_host_user=False,
+        extra_args=["--user", "777:888"],
+    )
+
+    run_args = _run_args_from_calls(calls)
+    index = run_args.index("--user")
+    assert run_args[index + 1] == "777:888"
+
+
+@pytest.mark.parametrize(
+    ("runtime", "expected_identity"),
+    [
+        (
+            "/usr/bin/podman",
+            ["--userns", "keep-id", "--user", "1234:5678"],
+        ),
+        (
+            "/usr/bin/docker",
+            ["--user", "1234:5678"],
+        ),
+    ],
+)
+def test_recreate_container_preserves_identity_args(
+    monkeypatch,
+    runtime,
+    expected_identity,
+):
+    """Fresh recovery must reuse the original Docker/Podman identity policy."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: runtime)
+    monkeypatch.setattr(
+        docker_env,
+        "_resolve_host_user_spec",
+        lambda: "1234:5678",
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+    environment = _make_dummy_env(
+        run_as_host_user=True,
+        persist_across_processes=True,
+    )
+
+    monkeypatch.setattr(
+        environment,
+        "_find_reusable_container",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(environment, "init_session", lambda: None)
+    calls.clear()
+
+    assert environment._recreate_container()
+    run_args = _run_args_from_calls(calls)
+    assert any(
+        run_args[index:index + len(expected_identity)] == expected_identity
+        for index in range(len(run_args) - len(expected_identity) + 1)
+    ), f"identity arguments missing from recreation argv: {run_args}"
+
+    if runtime.endswith("/docker"):
+        assert "--userns" not in run_args
 
 
 def test_run_as_host_user_drops_setuid_setgid_caps(monkeypatch):
