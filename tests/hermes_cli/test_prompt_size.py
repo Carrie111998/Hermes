@@ -11,6 +11,7 @@ from hermes_cli.prompt_size import (
     _SKILLS_BLOCK_RE,
     _build_inspection_agent,
     _compute_skills_breakdown,
+    _compute_tool_metrics,
     compute_prompt_breakdown,
     render_breakdown,
 )
@@ -62,6 +63,13 @@ def test_breakdown_keys_and_shape(isolated_home):
         assert data[key]["chars"] >= 0
     assert data["tools"]["count"] >= 0
     assert data["tools"]["json_bytes"] >= 0
+    assert data["tools"]["visible_count"] == data["tools"]["count"]
+    assert data["tools"]["visible_json_bytes"] == data["tools"]["json_bytes"]
+    assert data["tools"]["raw_count"] >= 0
+    assert data["tools"]["raw_json_bytes"] >= 0
+    assert data["tools"]["deferred_count"] >= 0
+    assert data["tools"]["deferred_json_bytes"] >= 0
+    assert data["tools"]["tier"] in (0, 1, 2)
     # System prompt is non-trivial even with empty home (identity + guidance).
     assert data["system_prompt"]["bytes"] > 0
 
@@ -279,6 +287,44 @@ def test_render_breakdown_is_plain_text(isolated_home):
     assert "Tool schemas" in out
     # Plain text — no JSON braces leaking in.
     assert not out.strip().startswith("{")
+
+
+def test_tool_metrics_report_raw_visible_and_deferred(monkeypatch):
+    raw = [
+        {"type": "function", "function": {
+            "name": "terminal", "description": "Run commands",
+            "parameters": {"type": "object", "properties": {}},
+        }},
+        {"type": "function", "function": {
+            "name": "cronjob", "description": "Manage scheduled jobs",
+            "parameters": {"type": "object", "properties": {"action": {"type": "string"}}},
+        }},
+    ]
+    from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+    cfg = ToolSearchConfig.from_raw({
+        "enabled": "on",
+        "defer_core_toolsets": ["cronjob"],
+    })
+    visible = assemble_tool_defs(raw, context_length=200_000, config=cfg).tool_defs
+    agent = SimpleNamespace(
+        tools=visible,
+        enabled_toolsets=["hermes-cli"],
+        disabled_toolsets=None,
+    )
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kwargs: raw)
+    monkeypatch.setattr("tools.tool_search.load_config", lambda: cfg)
+    monkeypatch.setattr("model_tools._resolve_active_context_length", lambda: 200_000)
+
+    metrics = _compute_tool_metrics(agent)
+
+    assert metrics["raw_count"] == 2
+    assert metrics["visible_count"] == len(visible)
+    assert metrics["count"] == metrics["visible_count"]
+    assert metrics["deferred_count"] == 1
+    assert metrics["deferred_json_bytes"] > 0
+    assert metrics["tier"] == 1
+    assert metrics["listing_form"] == "full"
 
 
 def test_json_serializable(isolated_home):

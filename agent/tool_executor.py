@@ -267,10 +267,18 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
+    tool_search_config = getattr(agent, "_tool_search_config", None)
+    policy_fingerprint = None
+    if tool_search_config is not None:
+        policy_fingerprint = (
+            getattr(tool_search_config, "enabled", None),
+            tuple(sorted(getattr(tool_search_config, "defer_core_toolsets", ()))),
+        )
     cache_key = (
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        policy_fingerprint,
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -282,7 +290,10 @@ def _tool_search_scoped_names(agent) -> frozenset:
             quiet_mode=True,
             skip_tool_search_assembly=True,
         ) or []
-        names = _ts.scoped_deferrable_names(scoped_defs)
+        names = _ts.scoped_deferrable_names(
+            scoped_defs,
+            config=tool_search_config,
+        )
     except Exception:
         names = frozenset()
     try:
@@ -290,6 +301,73 @@ def _tool_search_scoped_names(agent) -> frozenset:
     except Exception:
         pass
     return names
+
+
+def _unwrap_tool_search_call(agent, function_name: str, function_args: dict):
+    """Resolve a tool_call bridge under the session-pinned policy.
+
+    Returns ``(name, args, block_result)`` where ``block_result`` is a complete
+    JSON tool-result string. Any resolution error or exception
+    fails closed. Leaving an unresolved bridge to recurse through
+    ``handle_function_call(skip_pre_tool_call_hook=True)`` would let the live
+    config resolve a different underlying tool after hooks and guardrails had
+    inspected only the bridge name.
+    """
+    try:
+        from tools import tool_search as _ts
+    except Exception:
+        if function_name == "tool_call":
+            return (
+                function_name,
+                function_args,
+                json.dumps({
+                    "error": "Tool Search bridge is unavailable; tool was not executed."
+                }, ensure_ascii=False),
+            )
+        return function_name, function_args, None
+
+    if function_name != _ts.TOOL_CALL_NAME:
+        return function_name, function_args, None
+
+    try:
+        underlying, underlying_args, error = _ts.resolve_underlying_call(
+            function_args,
+            config=getattr(agent, "_tool_search_config", None),
+        )
+    except Exception:
+        return (
+            function_name,
+            function_args,
+            json.dumps({
+                "error": "Tool Search bridge resolution failed; tool was not executed."
+            }, ensure_ascii=False),
+        )
+
+    if error or not underlying:
+        detail = error or "underlying tool name was not resolved"
+        return (
+            function_name,
+            function_args,
+            json.dumps({
+                "error": f"Tool Search bridge rejected this call: {detail}"
+            }, ensure_ascii=False),
+        )
+    if underlying not in _tool_search_scoped_names(agent):
+        return (
+            function_name,
+            function_args,
+            json.dumps({
+                "error": (
+                    f"'{underlying}' is not available in this session. "
+                    "Use tool_search to find tools you can call."
+                )
+            }, ensure_ascii=False),
+        )
+    probe_error = _ts.validate_deferred_call_args(underlying, underlying_args)
+    if probe_error is not None:
+        # Preserve upstream's structured describe-first payload verbatim.
+        return function_name, function_args, probe_error
+    return underlying, underlying_args, None
 
 
 def _apply_tool_request_middleware_for_agent(
@@ -429,31 +507,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # scope check), so we enforce session toolset scope HERE. A tool
         # the session was not granted is rejected before any checkpoint,
         # hook, or dispatch fires.
-        _ts_scope_block = None
-        try:
-            from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
-                if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
-                        # Probe-validate before unwrapping (ironclaw#5149):
-                        # missing required args return the parameter schema
-                        # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
-                        if _probe_err is not None:
-                            _ts_scope_block = _probe_err
-                        else:
-                            function_name = _underlying
-                            function_args = _underlying_args
-                    else:
-                        _ts_scope_block = json.dumps({
-                            "error": (
-                                f"'{_underlying}' is not available in this session. "
-                                "Use tool_search to find tools you can call."
-                            ),
-                        }, ensure_ascii=False)
-        except Exception:
-            pass
+        function_name, function_args, _ts_scope_block = _unwrap_tool_search_call(
+            agent, function_name, function_args
+        )
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
@@ -1135,39 +1191,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
-        _ts_scope_block: Optional[str] = None
-        try:
-            from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
-                if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
-                        # Probe-validate before unwrapping (ironclaw#5149):
-                        # missing required args return the parameter schema
-                        # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
-                        if _probe_err is not None:
-                            # This path wraps _block_msg in {"error": ...} —
-                            # flatten the probe payload to one plain string.
-                            try:
-                                _probe = json.loads(_probe_err)
-                                _ts_scope_block = (
-                                    f"{_probe.get('error', '')} Parameters schema: "
-                                    f"{json.dumps(_probe.get('parameters', {}), ensure_ascii=False)}. "
-                                    f"{_probe.get('hint', '')}"
-                                ).strip()
-                            except Exception:
-                                _ts_scope_block = _probe_err
-                        else:
-                            function_name = _underlying
-                            function_args = _underlying_args
-                    else:
-                        _ts_scope_block = (
-                            f"'{_underlying}' is not available in this session. "
-                            "Use tool_search to find tools you can call."
-                        )
-        except Exception:
-            pass
+        function_name, function_args, _ts_block_result = _unwrap_tool_search_call(
+            agent, function_name, function_args
+        )
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
@@ -1180,8 +1206,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
         _block_error_type = "plugin_block"
-        if _ts_scope_block is not None:
-            _block_msg = _ts_scope_block
+        if _ts_block_result is not None:
             _block_error_type = "tool_scope_block"
         else:
             try:
@@ -1200,12 +1225,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
-        if _block_msg is None:
+        if _ts_block_result is None and _block_msg is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = (
+            _ts_block_result is not None
+            or _block_msg is not None
+            or _guardrail_block_decision is not None
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -1282,7 +1311,28 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
-        if _block_msg is not None:
+        if _ts_block_result is not None:
+            # Bridge resolution/scope/probe block: preserve its structured
+            # tool-result JSON (especially parameters + hint) verbatim.
+            function_result = _ts_block_result
+            tool_duration = 0.0
+            try:
+                _ts_error_message = str(json.loads(_ts_block_result).get("error") or "")
+            except Exception:
+                _ts_error_message = _ts_block_result
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type=_block_error_type,
+                error_message=_ts_error_message,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
@@ -1566,6 +1616,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    tool_search_config=getattr(agent, "_tool_search_config", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -1608,6 +1659,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    tool_search_config=getattr(agent, "_tool_search_config", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:

@@ -230,6 +230,85 @@ def _compute_toolsets_breakdown(tools: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _compute_tool_metrics(agent: Any) -> Dict[str, Any]:
+    """Measure raw and model-visible tool schemas for one inspection agent.
+
+    Existing ``count``/``json_bytes`` fields remain aliases for the final
+    visible payload. The additive fields expose what Tool Search removed and
+    which disclosure tier produced the payload.
+    """
+    visible = getattr(agent, "tools", None) or []
+    visible_json = json.dumps(visible, ensure_ascii=False)
+
+    raw = visible
+    deferred: List[Dict[str, Any]] = []
+    tier = 0
+    listing_form = "none"
+    try:
+        from model_tools import get_tool_definitions, _resolve_active_context_length
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            assemble_tool_defs,
+            classify_tools,
+            load_config as load_tool_search_config,
+        )
+
+        raw = get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        # Some memory/provider integrations append session-local schemas after
+        # the registry snapshot is built. Include those in the raw baseline,
+        # but never mistake Tool Search's own bridges for raw capabilities.
+        raw_names = {
+            td.get("function", {}).get("name")
+            for td in raw
+            if isinstance(td, dict)
+        }
+        for td in visible:
+            name = td.get("function", {}).get("name") if isinstance(td, dict) else None
+            if name and name not in raw_names and name not in BRIDGE_TOOL_NAMES:
+                raw.append(td)
+                raw_names.add(name)
+        config = load_tool_search_config()
+        assembly = assemble_tool_defs(
+            raw,
+            context_length=_resolve_active_context_length(),
+            config=config,
+        )
+        if assembly.activated:
+            _, deferred = classify_tools(raw, config=config)
+            tier = assembly.tier
+            listing_form = assembly.listing_form
+    except Exception:
+        # Prompt-size must remain a diagnostic even if a plugin/check_fn is
+        # broken. Fall back to the already-built visible snapshot.
+        raw = visible
+        deferred = []
+
+    raw_json = json.dumps(raw, ensure_ascii=False)
+    deferred_json = json.dumps(deferred, ensure_ascii=False)
+    raw_bytes = _bytes(raw_json)
+    visible_bytes = _bytes(visible_json)
+    return {
+        # Backward-compatible aliases.
+        "count": len(visible),
+        "json_bytes": visible_bytes,
+        # Progressive-disclosure observability.
+        "raw_count": len(raw),
+        "raw_json_bytes": raw_bytes,
+        "visible_count": len(visible),
+        "visible_json_bytes": visible_bytes,
+        "deferred_count": len(deferred),
+        "deferred_json_bytes": _bytes(deferred_json) if deferred else 0,
+        "net_json_bytes_saved": raw_bytes - visible_bytes,
+        "tier": tier,
+        "listing_form": listing_form,
+    }
+
+
 def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     """Return a dict of prompt-size measurements for a fresh session.
 
@@ -273,7 +352,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
 
     # Tool-schema JSON — the other half of the fixed per-call payload.
     tools = getattr(agent, "tools", None) or []
-    tools_json = json.dumps(tools, ensure_ascii=False)
+    tool_metrics = _compute_tool_metrics(agent)
 
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
@@ -288,7 +367,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
-        "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
+        "tools": tool_metrics,
         "sections": sections,
         "skills_breakdown": _compute_skills_breakdown(skills_index),
         "toolsets_breakdown": _compute_toolsets_breakdown(tools),
@@ -321,7 +400,6 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("")
     tools = data["tools"]
     lines.append(f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools)")
-
     # Per-toolset schema cost — which toolset's tools cost the most to ship.
     toolsets = data.get("toolsets_breakdown") or []
     if toolsets:
@@ -356,6 +434,19 @@ def render_breakdown(data: Dict[str, Any]) -> str:
         remaining = len(skills) - len(shown)
         if remaining > 0:
             lines.append(f"    … and {remaining} more (use --json for the full list)")
+
+    lines.append(
+        f"    raw pre-disclosure : {tools['raw_json_bytes']:>8,} B  "
+        f"({_fmt_kb(tools['raw_json_bytes'])}, {tools['raw_count']} tools)"
+    )
+    lines.append(
+        f"    deferred           : {tools['deferred_json_bytes']:>8,} B  "
+        f"({_fmt_kb(tools['deferred_json_bytes'])}, {tools['deferred_count']} tools; "
+        f"tier {tools['tier']}, {tools['listing_form']})"
+    )
+    lines.append(
+        f"    net schema savings : {tools['net_json_bytes_saved']:>+8,} B"
+    )
     return "\n".join(lines)
 
 

@@ -44,6 +44,33 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_reuses_agent_pinned_tool_search_policy(monkeypatch):
+    """A live config edit cannot alter an existing agent's visible bridge."""
+    from tools import mcp_tool
+    from tools.tool_search import ToolSearchConfig
+    import model_tools
+
+    pinned = ToolSearchConfig.from_raw({"enabled": "on"})
+    captured = {}
+    agent = types.SimpleNamespace(
+        tools=[],
+        valid_tool_names=set(),
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+        _tool_search_config=pinned,
+        _tool_snapshot_generation=0,
+    )
+
+    def fake_get_tool_definitions(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", fake_get_tool_definitions)
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert captured["tool_search_config"] is pinned
+
+
 def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch):
     """No new tools → empty set, and the snapshot object is not swapped."""
     agent = _agent(["read_file", "terminal"])

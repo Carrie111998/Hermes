@@ -238,6 +238,246 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
+def test_sequential_tool_search_resolution_error_fails_closed_before_dispatch():
+    """A bridge/pinned-policy mismatch must never recurse with hooks skipped."""
+    agent = _make_agent("tool_call")
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "browser_type", "arguments": {"ref": "@e1", "text": "x"}}),
+        "c-ts-seq",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=(None, None, "not deferred by this session policy"),
+        ),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-ts-seq"
+    assert "not deferred by this session policy" in messages[0]["content"]
+
+
+def test_concurrent_tool_search_resolution_error_fails_closed_before_dispatch():
+    """The concurrent executor must enforce the same fail-closed bridge gate."""
+    agent = _make_agent("tool_call")
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "browser_type", "arguments": {"ref": "@e1", "text": "x"}}),
+        "c-ts-concurrent",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=(None, None, "not deferred by this session policy"),
+        ),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-ts-concurrent"
+    assert "not deferred by this session policy" in messages[0]["content"]
+
+
+def test_sequential_bridge_dispatch_receives_session_pinned_policy():
+    agent = _make_agent("tool_search")
+    pinned = object()
+    setattr(agent, "_tool_search_config", pinned)
+    tc = _mock_tool_call("tool_search", json.dumps({"query": "browser"}), "c-pin-seq")
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"matches": []}),
+    ) as mock_hfc:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    assert mock_hfc.call_args.kwargs["tool_search_config"] is pinned
+
+
+def test_concurrent_bridge_dispatch_receives_session_pinned_policy():
+    agent = _make_agent("tool_search")
+    pinned = object()
+    setattr(agent, "_tool_search_config", pinned)
+    tc = _mock_tool_call(
+        "tool_search", json.dumps({"query": "browser"}), "c-pin-concurrent"
+    )
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"matches": []}),
+    ) as mock_hfc:
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    assert mock_hfc.call_args.kwargs["tool_search_config"] is pinned
+
+
+def test_sequential_probe_validation_preserves_structured_result():
+    agent = _make_agent("tool_call")
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "mcp_executor_probe", "arguments": {}}),
+        "c-probe-seq",
+    )
+    messages = []
+    probe = {
+        "error": "missing required argument: document_id",
+        "parameters": {
+            "type": "object",
+            "required": ["document_id"],
+            "properties": {"document_id": {"type": "string"}},
+        },
+        "hint": "Retry with arguments matching the schema.",
+    }
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=("mcp_executor_probe", {}, None),
+        ),
+        patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            return_value=frozenset({"mcp_executor_probe"}),
+        ),
+        patch(
+            "tools.tool_search.validate_deferred_call_args",
+            return_value=json.dumps(probe),
+        ),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    mock_hfc.assert_not_called()
+    assert json.loads(messages[0]["content"]) == probe
+
+
+def test_concurrent_probe_validation_preserves_structured_result():
+    agent = _make_agent("tool_call")
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "mcp_executor_probe", "arguments": {}}),
+        "c-probe-concurrent",
+    )
+    messages = []
+    probe = {
+        "error": "missing required argument: document_id",
+        "parameters": {
+            "type": "object",
+            "required": ["document_id"],
+            "properties": {"document_id": {"type": "string"}},
+        },
+        "hint": "Retry with arguments matching the schema.",
+    }
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=("mcp_executor_probe", {}, None),
+        ),
+        patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            return_value=frozenset({"mcp_executor_probe"}),
+        ),
+        patch(
+            "tools.tool_search.validate_deferred_call_args",
+            return_value=json.dumps(probe),
+        ),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    mock_hfc.assert_not_called()
+    assert json.loads(messages[0]["content"]) == probe
+
+
+def test_sequential_bridge_plugin_policy_observes_and_blocks_underlying_tool():
+    agent = _make_agent("tool_call")
+    args = {"ref": "@e1", "text": "x"}
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "browser_type", "arguments": args}),
+        "c-ts-hook-seq",
+    )
+    messages = []
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=("browser_type", args, None),
+        ),
+        patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            return_value=frozenset({"browser_type"}),
+        ),
+        patch(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            return_value="underlying browser policy",
+        ) as policy,
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    mock_hfc.assert_not_called()
+    assert policy.call_args.args[:2] == ("browser_type", args)
+    assert "underlying browser policy" in messages[0]["content"]
+
+
+def test_concurrent_bridge_plugin_policy_observes_and_blocks_underlying_tool():
+    agent = _make_agent("tool_call")
+    args = {"ref": "@e1", "text": "x"}
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": "browser_type", "arguments": args}),
+        "c-ts-hook-concurrent",
+    )
+    messages = []
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=("browser_type", args, None),
+        ),
+        patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            return_value=frozenset({"browser_type"}),
+        ),
+        patch(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            return_value="underlying browser policy",
+        ) as policy,
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    mock_hfc.assert_not_called()
+    assert policy.call_args.args[:2] == ("browser_type", args)
+    assert "underlying browser policy" in messages[0]["content"]
+
+
 def test_default_run_conversation_warns_without_guardrail_halt():
     agent = _make_agent("web_search", max_iterations=10)
     same_args = {"query": "same"}
