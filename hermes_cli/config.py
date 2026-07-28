@@ -834,13 +834,22 @@ def _ensure_default_soul_md(home: Path) -> None:
     the old comment-only scaffold (seeded by older install.sh / install.ps1 /
     docker images, which shadowed the runtime default) get upgraded in place to
     DEFAULT_SOUL_MD. A SOUL.md the user actually customized is never touched.
+
+    Uses a single ``read_text`` call instead of ``exists() + read_text`` to
+    eliminate any TOCTOU race window where the file exists at check time but
+    vanishes before read — that would fall through to the write path and flatten
+    a custom SOUL.md (#73355).
     """
     soul_path = home / "SOUL.md"
-    if soul_path.exists():
-        try:
-            existing = soul_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            return
+    try:
+        existing = soul_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # First run — seed the default SOUL.md.
+        pass
+    except (OSError, UnicodeDecodeError):
+        # File exists but can't be read — leave it alone.
+        return
+    else:
         if not is_legacy_template_soul(existing):
             return
         # Legacy empty template -> upgrade to the real default in place.
