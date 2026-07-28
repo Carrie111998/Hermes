@@ -511,21 +511,23 @@ Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip i
 By default a worker's word is final: `kanban_complete` flips the card `done` on the model's say-so. For work with a deterministic, checkable definition of done — a test suite, a build, a lint pass — you can make the board check instead of trust. A card created with `--verify-cmd` (or `--verify auto`) carries a **verified-completion gate**: when the dispatched worker calls `kanban_complete`, the gate runs first, and only a green result lets the completion through. A red result rejects the completion, counts one failure toward the retry budget, and feeds the failure output straight back to the worker, which keeps its claim and fixes the problem **in the same session** before retrying. When the budget is exhausted the card lands in `blocked` for human review with the failure evidence attached as a comment — never silently `done`.
 
 ```bash
+# --verify-cmd: must exit 0 before kanban_complete succeeds.
+# --max-retries: verify reds share the crash/timeout budget, so raise it.
 hermes kanban create "Fix the flaky websocket reconnect test" \
     --assignee backend \
     --workspace worktree \
-    --verify-cmd "pytest tests/ws -q" \    # must exit 0 before kanban_complete succeeds
-    --max-retries 4                        # verify reds share the crash/timeout budget
+    --verify-cmd "pytest tests/ws -q" \
+    --max-retries 4
 ```
 
 The two modes:
 
 - **`--verify-cmd CMD`** runs `CMD` via `/bin/sh -c` in the task's workspace at completion time (10-minute timeout, process-group-killed on expiry, output redacted and capped to 2000 chars). Exit 0 = pass. Anything else — including a timeout, a missing workspace, or a spawn error — is a counted red: for a correctness gate, failing open would contradict the whole point.
-- **`--verify auto`** executes nothing. It consults the verification evidence ledger (the passive record of what the agent actually proved in its workspace): the completion is accepted only when the worker has run the project's verify command **to completion, in its own session, with no file edits after it, at full scope**. Targeted runs (`pytest tests/test_one.py`) never count — targeted checks are never upgraded into a repo-green claim. Tests run via a delegated subagent do not count either (they record under the subagent's session), and after a context-compression event pre-compression evidence may not be found — in both cases the fix is the one the rejection message states: re-run the verify command.
+- **`--verify auto`** executes nothing. It consults the verification evidence ledger (the passive record of what the agent actually proved in its workspace): the completion is accepted only when the worker has run the project's verify command **to completion, in its own session, with no file edits after it, at full scope**. Targeted runs (`pytest tests/test_one.py`) never count — targeted checks are never upgraded into a repo-green claim. Tests run via a delegated subagent do not count either (they record under the subagent's session), and after a context-compression event pre-compression evidence may not be found — in both cases the fix is the one the rejection message states: re-run the verify command. Evidence must also postdate the current dispatch: green evidence left behind by a previous incarnation of the task (after a crash, timeout, or requeue) never vouches for a new run's edits.
 
 Mechanics worth knowing:
 
-- The gate lives at the worker tool surface (`kanban_complete`) and is enforced **only for the dispatched worker** completing its own card. Orchestrator profiles that try to tool-close a verify-gated child get a deterministic, uncounted rejection naming the two legitimate paths: let the worker finish, or override as a human. Human surfaces — `hermes kanban complete` from the CLI (which prints a bypass notice to stderr) and the dashboard — bypass the gate: the invariant is "never `done` on an LLM's say-so", not "never `done` by a human".
+- The gate lives at the worker tool surface (`kanban_complete`) and is enforced **only for the dispatched worker** completing its own card. Orchestrator profiles that try to tool-close a verify-gated child get a deterministic, uncounted rejection naming the two legitimate paths: let the worker finish, or have a human override. The human override is one deliberate flag away, and audited: `hermes kanban complete <id> --skip-verify` completes a gated card and records the bypass on the task (a `verify_bypassed` event plus a comment); without the flag the CLI refuses, because the CLI is reachable from any worker's terminal tool. The dashboard's complete action also bypasses the gate. The invariant is "never `done` on an LLM's say-so", not "never `done` by a human".
 - Every rejected attempt is recorded as a `completion_blocked_evidence` event (gate, command, exit code, redacted output excerpt), so `hermes kanban show` and the dashboard carry the full audit trail. On exhaustion the card auto-blocks exactly like the crash breaker (`gave_up`), and `hermes kanban unblock` is the retry verb — it resets the failure counter, granting a fresh budget.
 - A re-dispatched worker (after a crash or requeue) sees the gate contract and the latest red evidence in its worker context, so it starts from the failure rather than from scratch.
 - Cmd-mode traps: the command runs on the **worker's host** in the task's `workspace_path`, so remote terminal backends (where the real work happens off-host) and scratch-workspace cards whose command expects a repo will red-verify every attempt and end blocked — use worktree workspaces and host-local workers. Keep verify commands side-effect-light: a timed-out verify is process-group-killed, but a worker killed mid-verify can leave the command running in the worktree until it exits on its own.
@@ -749,7 +751,7 @@ hermes kanban claim <id> [--ttl SECONDS]
 hermes kanban comment <id> "<text>" [--author NAME]
 
 # Bulk verbs — accept multiple ids:
-hermes kanban complete <id>... [--result "..."]
+hermes kanban complete <id>... [--result "..."] [--skip-verify]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
@@ -1037,6 +1039,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
 | `completion_blocked_evidence` | `{gate, command, exit_code, output_excerpt, failures, effective_limit, limit_source, exhausted, counted, stale_run?, summary_preview}` | A verified-completion attempt was rejected (`--verify-cmd` / `--verify auto` cards only). Emitted on **every** rejection so the audit trail is complete; `exhausted: true` marks the attempt that tripped the breaker (the card auto-blocks via `gave_up` in the same stroke); `counted: false` + `stale_run: true` marks an uncounted audit entry from a superseded run (a mid-verify reclaim/requeue) that touched neither the budget nor the board state. |
+| `verify_bypassed` | `{mode, command, actor, flag}` | A human completed a verify-gated card from the CLI with `--skip-verify`, bypassing the gate. The completion itself is recorded as usual (`completed`); this row plus a `verify-gate` comment are the audit trail that the `done` was **not** verified. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 
