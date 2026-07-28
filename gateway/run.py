@@ -3549,7 +3549,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # one turn per process (#70300).  Standard completions ride the
         # per-watcher path; watch_match / watch_disabled events are coalesced
         # at the post-turn drain.
-        self._completion_notification_batches: dict = {}
+        #
+        # Pending state is tracked in PendingCompletionRegistry (explicit
+        # state machine) instead of the old dict-of-lists approach.
+        self._completion_registry = self.PendingCompletionRegistry()
         self._completion_notification_batch_tasks: dict = {}
         self._completion_notification_batch_lock = threading.Lock()
         self._completion_notification_batch_window = 0.1
@@ -18510,6 +18513,151 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if result is False:
             return GatewayRunner.CompletionDisposition.RETRY
         return GatewayRunner.CompletionDisposition.DROP_UNROUTABLE
+
+    class PendingCompletionRegistry:
+        """Explicit state machine for completion notification delivery.
+
+        Replaces the split state across ``_completion_notification_batches``,
+        per-waiter ``Future``\\s, and per-route ``asyncio.Task``\\s with a
+        single registry where every entry has an explicit state, attempt
+        counter, and backoff deadline.
+
+        Lifecycle-owned by ``GatewayRunner``: created at gateway start,
+        drained to ``STOPPING`` at shutdown before adapter teardown.
+        """
+
+        MAX_ATTEMPTS = 5
+        BASE_BACKOFF = 0.5  # seconds, doubled each retry
+
+        class State(enum.Enum):
+            PENDING = "pending"
+            CLAIMED = "claimed"
+            DELIVERED = "delivered"        # terminal
+            FAILED = "failed"              # terminal (attempts exhausted)
+            SUPERSEDED = "superseded"      # terminal (delivered elsewhere)
+            UNROUTABLE = "unroutable"      # terminal (no gateway route)
+            STOPPING = "stopping"          # terminal (gateway shutdown)
+
+        def __init__(self):
+            import threading as _threading
+            self._lock = _threading.Lock()
+            self._entries: dict[str, dict] = {}
+            self._stopping = False
+
+        # -- public API -------------------------------------------------
+
+        def enqueue(
+            self, identity: str, route_key: tuple, payload: dict,
+        ) -> "asyncio.Future":
+            """Create a PENDING entry and return its Future.
+
+            The Future will be resolved when the batch flush completes
+            (with a ``CompletionDisposition``).
+            """
+            import asyncio as _asyncio
+            future = _asyncio.get_running_loop().create_future()
+            with self._lock:
+                self._entries[identity] = {
+                    "identity": identity,
+                    "route_key": route_key,
+                    "state": self.State.PENDING,
+                    "attempts": 0,
+                    "next_attempt_at": 0.0,
+                    "payload": payload,
+                    "batch_id": None,
+                    "future": future,
+                }
+            return future
+
+        def claim_batch(
+            self, identities: list[str], batch_id: str,
+        ) -> tuple[list[dict], list[str]]:
+            """Atomically transition PENDING→CLAIMED for every identity.
+
+            Returns ``(fresh, skipped)`` — entries that were claimed and
+            identities that were already in a non-PENDING state.
+            """
+            fresh: list[dict] = []
+            skipped: list[str] = []
+            with self._lock:
+                for ident in identities:
+                    entry = self._entries.get(ident)
+                    if entry is None or entry["state"] is not self.State.PENDING:
+                        skipped.append(ident)
+                        continue
+                    entry["state"] = self.State.CLAIMED
+                    entry["batch_id"] = batch_id
+                    fresh.append(entry)
+            return fresh, skipped
+
+        def deliver(self, identity: str) -> None:
+            """Transition CLAIMED→DELIVERED."""
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is not None and entry["state"] is self.State.CLAIMED:
+                    entry["state"] = self.State.DELIVERED
+
+        def retry(self, identity: str) -> Optional[float]:
+            """Transition CLAIMED→PENDING with incremented attempt counter.
+
+            Returns the backoff deadline (monotonic seconds) or ``None``
+            if attempts are exhausted (entry moved to FAILED).
+            """
+            import time as _time
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is None or entry["state"] is not self.State.CLAIMED:
+                    return None
+                entry["attempts"] += 1
+                if entry["attempts"] >= self.MAX_ATTEMPTS:
+                    entry["state"] = self.State.FAILED
+                    return None
+                deadline = _time.monotonic() + self.BASE_BACKOFF * (2 ** (entry["attempts"] - 1))
+                entry["next_attempt_at"] = deadline
+                entry["state"] = self.State.PENDING
+                entry["batch_id"] = None
+                return deadline
+
+        def supersede(self, identity: str) -> None:
+            """Transition to SUPERSEDED (already delivered by another path)."""
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is not None:
+                    entry["state"] = self.State.SUPERSEDED
+
+        def mark_unroutable(self, identity: str) -> None:
+            """Transition to UNROUTABLE (no gateway route)."""
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is not None:
+                    entry["state"] = self.State.UNROUTABLE
+
+        def signal_stop(self) -> list[dict]:
+            """Move all non-terminal entries to STOPPING.  Returns the list."""
+            stopped: list[dict] = []
+            _terminal = {
+                self.State.DELIVERED, self.State.FAILED,
+                self.State.SUPERSEDED, self.State.UNROUTABLE,
+            }
+            with self._lock:
+                self._stopping = True
+                for entry in self._entries.values():
+                    if entry["state"] not in _terminal:
+                        entry["state"] = self.State.STOPPING
+                        stopped.append(entry)
+            return stopped
+
+        @property
+        def is_stopping(self) -> bool:
+            with self._lock:
+                return self._stopping
+
+        def resolve_futures(self, entries: list[dict], disposition: "CompletionDisposition") -> None:
+            """Resolve every entry's Future with *disposition* if not done."""
+            for entry in entries:
+                future = entry.get("future")
+                if future is not None and not future.done():
+                    future.set_result(disposition)
 
     @staticmethod
     def _completion_notification_batch_key(evt: dict) -> tuple:
