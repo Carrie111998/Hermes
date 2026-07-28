@@ -238,3 +238,65 @@ def test_search_without_vectors_never_encodes(hoisted_retriever, monkeypatch):
         f"encode_text called {len(calls)}x with zero vector candidates — "
         "lazy hoist regressed to eager"
     )
+# ---------------------------------------------------------------------------
+# retrieval_count bookkeeping — the retriever is the live read path, so it
+# must record retrievals too. Previously only MemoryStore.search_facts (which
+# has no callers) incremented, leaving the counter permanently zero.
+# ---------------------------------------------------------------------------
+
+def _counts(store):
+    return dict(
+        store._conn.execute("SELECT fact_id, retrieval_count FROM facts").fetchall()
+    )
+
+
+def test_search_increments_retrieval_count(retriever_with_facts):
+    """search() bumps the counter for facts it actually returns."""
+    store = retriever_with_facts.store
+    assert set(_counts(store).values()) == {0}
+
+    results = retriever_with_facts.search("compaction")
+    assert len(results) >= 1
+
+    after = _counts(store)
+    for fact in results:
+        assert after[fact["fact_id"]] == 1
+    # Facts that were not returned stay untouched
+    returned = {f["fact_id"] for f in results}
+    assert all(c == 0 for fid, c in after.items() if fid not in returned)
+
+
+def test_probe_increments_retrieval_count(retriever_with_facts):
+    """probe() shares the same bookkeeping path as search()."""
+    store = retriever_with_facts.store
+    results = retriever_with_facts.probe("compaction")
+
+    after = _counts(store)
+    for fact in results:
+        assert after[fact["fact_id"]] >= 1
+
+
+def test_zero_hit_search_records_nothing(retriever_with_facts):
+    """An empty result set must not touch any counter."""
+    store = retriever_with_facts.store
+    before = _counts(store)
+    retriever_with_facts.search("zzzznomatchzzzz")
+    assert _counts(store) == before
+
+
+def test_record_retrievals_is_idempotent_per_call(retriever_with_facts):
+    """Two searches produce two increments — the counter accumulates."""
+    store = retriever_with_facts.store
+    first = retriever_with_facts.search("compaction")
+    fact_id = first[0]["fact_id"]
+    assert _counts(store)[fact_id] == 1
+    retriever_with_facts.search("compaction")
+    assert _counts(store)[fact_id] == 2
+
+
+def test_record_retrievals_empty_list_is_noop(retriever_with_facts):
+    """Guard clause: empty id list must not issue a malformed UPDATE."""
+    store = retriever_with_facts.store
+    before = _counts(store)
+    store.record_retrievals([])
+    assert _counts(store) == before

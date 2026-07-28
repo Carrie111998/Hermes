@@ -119,6 +119,7 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+        self.store.record_retrievals([f["fact_id"] for f in results])
         return results
 
     def probe(
@@ -199,7 +200,9 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self.store.record_retrievals([f["fact_id"] for f in results])
+        return results
 
     def related(
         self,
