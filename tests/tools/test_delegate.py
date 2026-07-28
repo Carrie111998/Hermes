@@ -2070,7 +2070,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
         self.assertEqual(
             MockAgent.call_args[1]["enabled_toolsets"],
-            ["web", "browser", "mcp-MiniMax"],
+            ["web", "browser", "mcp-MiniMax", "delegation_reply"],
         )
 
     @patch(
@@ -2098,7 +2098,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
         self.assertEqual(
             MockAgent.call_args[1]["enabled_toolsets"],
-            ["web", "browser"],
+            ["web", "browser", "delegation_reply"],
         )
 
 
