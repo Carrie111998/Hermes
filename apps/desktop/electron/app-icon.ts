@@ -34,6 +34,7 @@ export function appIconCandidates({
   // 1) Packaged extraResources copy — byte-identical to the PE stamp source.
   if (resourcesPath) {
     out.push(path.join(resourcesPath, 'icon.ico'))
+
     if (platform === 'darwin') {
       out.push(path.join(resourcesPath, 'icon.icns'))
       out.push(path.join(resourcesPath, 'icon.png'))
@@ -43,9 +44,11 @@ export function appIconCandidates({
   // 2) Dev / asar-packaged assets next to the app (files: assets/**).
   for (const root of roots) {
     out.push(path.join(root, 'assets', 'icon.ico'))
+
     if (platform === 'darwin') {
       out.push(path.join(root, 'assets', 'icon.icns'))
     }
+
     out.push(path.join(root, 'assets', 'icon.png'))
   }
 
@@ -59,12 +62,18 @@ export function appIconCandidates({
   // Dedupe while preserving order.
   const seen = new Set<string>()
   const unique: string[] = []
+
   for (const candidate of out) {
     const key = platform === 'win32' ? candidate.toLowerCase() : candidate
-    if (seen.has(key)) continue
+
+    if (seen.has(key)) {
+      continue
+    }
+
     seen.add(key)
     unique.push(candidate)
   }
+
   return unique
 }
 

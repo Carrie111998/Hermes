@@ -1,5 +1,5 @@
 import type { Icon } from '@tabler/icons-react'
-import { memo, type HTMLAttributes } from 'react'
+import { type HTMLAttributes, memo } from 'react'
 
 import { cn } from '@/lib/utils'
 

@@ -31,8 +31,8 @@ import {
 } from 'electron'
 import nodePty from 'node-pty'
 
-import { resolveAppIconPath } from './app-icon'
 import { classifyActiveRuntime } from './active-runtime-state'
+import { resolveAppIconPath } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
