@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -296,6 +296,78 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON capability_grants(tenant_id, principal_type, principal_id);
         CREATE INDEX IF NOT EXISTS idx_capability_grants_resource
             ON capability_grants(tenant_id, resource, action);
+        """,
+    ),
+    # v6 → v7: billing engine tables (RFC-0.24.0).
+    (
+        6,
+        """
+        CREATE TABLE IF NOT EXISTS billing_plans (
+            plan_id         TEXT        PRIMARY KEY,
+            name            TEXT        NOT NULL,
+            tier            TEXT        NOT NULL
+                CHECK (tier IN ('free', 'starter', 'pro', 'enterprise')),
+            monthly_task_limit    INTEGER NOT NULL DEFAULT 0,
+            monthly_permit_limit  INTEGER NOT NULL DEFAULT 0,
+            monthly_effect_limit  INTEGER NOT NULL DEFAULT 0,
+            price_cents     INTEGER     NOT NULL DEFAULT 0,
+            stripe_price_id TEXT,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- Seed a free plan so every tenant has a usable default.
+        INSERT INTO billing_plans (plan_id, name, tier, monthly_task_limit,
+                                   monthly_permit_limit, monthly_effect_limit, price_cents)
+        VALUES ('free', 'Free', 'free', 100, 100, 500, 0)
+        ON CONFLICT (plan_id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS tenant_subscriptions (
+            tenant_id       UUID        NOT NULL PRIMARY KEY,
+            plan_id         TEXT        NOT NULL REFERENCES billing_plans(plan_id),
+            stripe_customer_id    TEXT,
+            stripe_subscription_id TEXT,
+            billing_cycle_start   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            billing_cycle_end     TIMESTAMPTZ NOT NULL
+                DEFAULT (NOW() + INTERVAL '30 days'),
+            status          TEXT        NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'past_due', 'canceled', 'trialing')),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- Give the default tenant a free subscription.
+        INSERT INTO tenant_subscriptions (tenant_id, plan_id)
+        VALUES ('00000000-0000-0000-0000-000000000000', 'free')
+        ON CONFLICT (tenant_id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS usage_meters (
+            meter_id        UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id       UUID        NOT NULL,
+            organization_id TEXT        NOT NULL,
+            meter_type      TEXT        NOT NULL
+                CHECK (meter_type IN ('task_claim', 'permit_consume', 'effect_record')),
+            reference_id    TEXT        NOT NULL,
+            recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            billing_period  TEXT        NOT NULL,
+            UNIQUE (meter_type, reference_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_usage_meters_tenant_period
+            ON usage_meters(tenant_id, billing_period);
+
+        CREATE TABLE IF NOT EXISTS invoices (
+            invoice_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id       UUID        NOT NULL,
+            billing_period  TEXT        NOT NULL,
+            line_items      JSONB       NOT NULL DEFAULT '[]',
+            total_cents     INTEGER     NOT NULL DEFAULT 0,
+            status          TEXT        NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft', 'issued', 'paid', 'void')),
+            stripe_invoice_id TEXT,
+            issued_at       TIMESTAMPTZ,
+            paid_at         TIMESTAMPTZ,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (tenant_id, billing_period)
+        );
         """,
     ),
 ]
@@ -1609,6 +1681,377 @@ def enforce_capability(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Billing: Plans
+# ---------------------------------------------------------------------------
+
+
+def create_plan(
+    conn: "psycopg.Connection",
+    *,
+    plan_id: str,
+    name: str,
+    tier: str,
+    monthly_task_limit: int = 0,
+    monthly_permit_limit: int = 0,
+    monthly_effect_limit: int = 0,
+    price_cents: int = 0,
+    stripe_price_id: str = "",
+) -> dict:
+    """Create a billing plan. Returns the plan dict."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO billing_plans
+                (plan_id, name, tier, monthly_task_limit, monthly_permit_limit,
+                 monthly_effect_limit, price_cents, stripe_price_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (plan_id) DO NOTHING
+            RETURNING *
+            """,
+            (plan_id, name, tier, monthly_task_limit, monthly_permit_limit,
+             monthly_effect_limit, price_cents, stripe_price_id or None),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else get_plan(conn, plan_id=plan_id)
+
+
+def get_plan(conn: "psycopg.Connection", *, plan_id: str) -> Optional[dict]:
+    """Get a plan by ID."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM billing_plans WHERE plan_id = %s", (plan_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def list_plans(conn: "psycopg.Connection") -> list[dict]:
+    """List all billing plans."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM billing_plans ORDER BY price_cents ASC")
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Billing: Subscriptions
+# ---------------------------------------------------------------------------
+
+
+def subscribe_tenant(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    plan_id: str,
+    stripe_customer_id: str = "",
+    stripe_subscription_id: str = "",
+) -> dict:
+    """Subscribe a tenant to a plan. Upserts if subscription already exists."""
+    tid = str(tenant_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO tenant_subscriptions
+                (tenant_id, plan_id, stripe_customer_id, stripe_subscription_id,
+                 billing_cycle_start, billing_cycle_end)
+            VALUES (%s, %s, %s, %s, NOW(), NOW() + INTERVAL '30 days')
+            ON CONFLICT (tenant_id) DO UPDATE SET
+                plan_id = EXCLUDED.plan_id,
+                stripe_customer_id = EXCLUDED.stripe_customer_id,
+                stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+                billing_cycle_start = NOW(),
+                billing_cycle_end = NOW() + INTERVAL '30 days',
+                status = 'active'
+            RETURNING *
+            """,
+            (tid, plan_id, stripe_customer_id or None, stripe_subscription_id or None),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def get_subscription(conn: "psycopg.Connection", *, tenant_id: UUID | str) -> Optional[dict]:
+    """Get the current subscription for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM tenant_subscriptions WHERE tenant_id = %s",
+            (str(tenant_id),),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def cancel_subscription(conn: "psycopg.Connection", *, tenant_id: UUID | str) -> bool:
+    """Cancel a tenant's subscription."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE tenant_subscriptions SET status = 'canceled'
+            WHERE tenant_id = %s AND status != 'canceled'
+            """,
+            (str(tenant_id),),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def update_subscription_status(
+    conn: "psycopg.Connection", *, tenant_id: UUID | str, status: str
+) -> bool:
+    """Update subscription status (e.g. from Stripe webhook)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE tenant_subscriptions SET status = %s WHERE tenant_id = %s",
+            (status, str(tenant_id)),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+# ---------------------------------------------------------------------------
+# Billing: Usage metering
+# ---------------------------------------------------------------------------
+
+
+def _current_billing_period() -> str:
+    """Return the current billing period as YYYY-MM."""
+    now = datetime.now(timezone.utc)
+    return f"{now.year:04d}-{now.month:02d}"
+
+
+def record_usage(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    organization_id: str,
+    meter_type: str,
+    reference_id: str,
+    billing_period: str = "",
+) -> bool:
+    """Record a billable usage event. Idempotent via (meter_type, reference_id).
+
+    Returns True if newly recorded, False if duplicate.
+    """
+    period = billing_period or _current_billing_period()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO usage_meters
+                (tenant_id, organization_id, meter_type, reference_id, billing_period)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (meter_type, reference_id) DO NOTHING
+            RETURNING meter_id
+            """,
+            (str(tenant_id), organization_id, meter_type, reference_id, period),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return row is not None
+
+
+def get_usage_summary(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    billing_period: str = "",
+) -> dict:
+    """Get usage counts by meter_type for a tenant in a billing period."""
+    period = billing_period or _current_billing_period()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT meter_type, COUNT(*) as count
+            FROM usage_meters
+            WHERE tenant_id = %s AND billing_period = %s
+            GROUP BY meter_type
+            """,
+            (str(tenant_id), period),
+        )
+        rows = cur.fetchall()
+    result = {"task_claim": 0, "permit_consume": 0, "effect_record": 0}
+    for row in rows:
+        result[row["meter_type"]] = row["count"]
+    return result
+
+
+def check_quota(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    meter_type: str,
+) -> tuple[bool, int, int]:
+    """Check if a tenant is within their quota for a meter type.
+
+    Returns (allowed, used, limit). Enterprise tier always allowed.
+    """
+    tid = str(tenant_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT bp.tier, bp.monthly_task_limit, bp.monthly_permit_limit,
+                   bp.monthly_effect_limit
+            FROM tenant_subscriptions ts
+            JOIN billing_plans bp ON bp.plan_id = ts.plan_id
+            WHERE ts.tenant_id = %s AND ts.status IN ('active', 'trialing')
+            """,
+            (tid,),
+        )
+        sub_row = cur.fetchone()
+
+    if not sub_row:
+        return (False, 0, 0)
+
+    limit_map = {
+        "task_claim": sub_row["monthly_task_limit"],
+        "permit_consume": sub_row["monthly_permit_limit"],
+        "effect_record": sub_row["monthly_effect_limit"],
+    }
+    limit = limit_map.get(meter_type, 0)
+
+    if sub_row["tier"] == "enterprise":
+        usage = get_usage_summary(conn, tenant_id=tid)
+        used = usage.get(meter_type, 0)
+        return (True, used, 0)
+
+    usage = get_usage_summary(conn, tenant_id=tid)
+    used = usage.get(meter_type, 0)
+
+    if sub_row["tier"] == "free":
+        return (used < limit, used, limit)
+
+    # Paid tiers: soft limit (allow overage, will be billed)
+    return (True, used, limit)
+
+
+# ---------------------------------------------------------------------------
+# Billing: Invoices
+# ---------------------------------------------------------------------------
+
+
+def generate_invoice(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    billing_period: str = "",
+) -> dict:
+    """Generate an invoice for a tenant's billing period.
+
+    Calculates line items from usage meters and the tenant's plan.
+    Idempotent: returns existing invoice if already generated.
+    """
+    period = billing_period or _current_billing_period()
+    tid = str(tenant_id)
+
+    # Check for existing invoice
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM invoices WHERE tenant_id = %s AND billing_period = %s",
+            (tid, period),
+        )
+        existing = cur.fetchone()
+    if existing:
+        return dict(existing)
+
+    # Get subscription and plan
+    sub = get_subscription(conn, tenant_id=tid)
+    if not sub:
+        return {}
+    plan = get_plan(conn, plan_id=sub["plan_id"])
+    if not plan:
+        return {}
+
+    usage = get_usage_summary(conn, tenant_id=tid, billing_period=period)
+
+    line_items = []
+    total_cents = plan["price_cents"]
+
+    if total_cents > 0:
+        line_items.append({
+            "description": f"{plan['name']} plan - base fee",
+            "amount_cents": plan["price_cents"],
+        })
+
+    # Overage for paid tiers
+    if plan["tier"] in ("starter", "pro"):
+        overage_rates = {"task_claim": 10, "permit_consume": 5, "effect_record": 2}
+        limits = {
+            "task_claim": plan["monthly_task_limit"],
+            "permit_consume": plan["monthly_permit_limit"],
+            "effect_record": plan["monthly_effect_limit"],
+        }
+        for meter_type, rate in overage_rates.items():
+            used = usage.get(meter_type, 0)
+            limit = limits[meter_type]
+            if used > limit:
+                overage = used - limit
+                cost = overage * rate
+                total_cents += cost
+                line_items.append({
+                    "description": f"{meter_type} overage: {overage} × ${rate/100:.2f}",
+                    "amount_cents": cost,
+                })
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO invoices (tenant_id, billing_period, line_items, total_cents, status)
+            VALUES (%s, %s, %s, %s, 'draft')
+            ON CONFLICT (tenant_id, billing_period) DO NOTHING
+            RETURNING *
+            """,
+            (tid, period, json.dumps(line_items), total_cents),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def mark_invoice_paid(
+    conn: "psycopg.Connection",
+    *,
+    invoice_id: str,
+    stripe_invoice_id: str = "",
+) -> bool:
+    """Mark an invoice as paid."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE invoices
+            SET status = 'paid', paid_at = NOW(), stripe_invoice_id = %s
+            WHERE invoice_id = %s AND status != 'paid'
+            """,
+            (stripe_invoice_id or None, invoice_id),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def get_invoice(conn: "psycopg.Connection", *, invoice_id: str) -> Optional[dict]:
+    """Get an invoice by ID."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM invoices WHERE invoice_id = %s::uuid", (invoice_id,))
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def list_invoices(conn: "psycopg.Connection", *, tenant_id: UUID | str) -> list[dict]:
+    """List all invoices for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM invoices WHERE tenant_id = %s ORDER BY billing_period DESC",
+            (str(tenant_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Backend detection
+# ---------------------------------------------------------------------------
+
+
 def get_authority_backend() -> str:
     """Detect which authority backend to use.
 
@@ -1666,6 +2109,20 @@ __all__ = [
     "check_capability",
     "list_capabilities",
     "enforce_capability",
+    "create_plan",
+    "get_plan",
+    "list_plans",
+    "subscribe_tenant",
+    "get_subscription",
+    "cancel_subscription",
+    "update_subscription_status",
+    "record_usage",
+    "get_usage_summary",
+    "check_quota",
+    "generate_invoice",
+    "mark_invoice_paid",
+    "get_invoice",
+    "list_invoices",
     "get_authority_backend",
     "get_authority_connection",
     "DEFAULT_TENANT_ID",
