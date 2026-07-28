@@ -69,6 +69,26 @@ def _ra():
     return run_agent
 
 
+def _format_auth_credential_status(
+    credential: Any, *, uses_entra_id: bool = False
+) -> str:
+    """Return a credential-safe verbose initialization status.
+
+    Initialization banners are commonly copied into support reports.  Report
+    only a static source or the fact that a credential is present; never
+    include its value, length, prefix, suffix, or any other derived preview.
+    Presence does not imply that the credential is valid.
+    """
+    if uses_entra_id:
+        return "🔑 Authentication credential source: Microsoft Entra ID"
+    if isinstance(credential, str):
+        if credential and credential not in {"dummy-key", "no-key-required"}:
+            return "🔑 Authentication credential: present"
+    elif credential is not None:
+        return "🔑 Authentication credential: present"
+    return "⚠️  Authentication credential: missing or not required"
+
+
 def _moa_reference_output_allowed(agent: Any) -> bool:
     """Keep MoA display events off only the machine-readable ``-Q`` surface."""
     return not (
@@ -1059,10 +1079,12 @@ def init_agent(
                 # invoke or inspect the callable in the banner.
                 from agent.azure_identity_adapter import is_token_provider
 
-                if is_token_provider(effective_key):
-                    print("🔑 Using credentials: Microsoft Entra ID")
-                elif isinstance(effective_key, str) and len(effective_key) > 12:
-                    print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+                print(
+                    _format_auth_credential_status(
+                        effective_key,
+                        uses_entra_id=is_token_provider(effective_key),
+                    )
+                )
     elif agent.provider == "moa":
         from agent.moa_loop import build_moa_facade
         agent.api_mode = "chat_completions"
@@ -1338,13 +1360,13 @@ def init_agent(
                 # never invokes or inspects the callable.
                 from agent.azure_identity_adapter import is_token_provider
 
-                key_used = client_kwargs.get("api_key", "none")
-                if is_token_provider(key_used):
-                    print("🔑 Using credentials: Microsoft Entra ID")
-                elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
-                    print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
-                else:
-                    print("⚠️  Warning: API key appears invalid or missing")
+                key_used = client_kwargs.get("api_key")
+                print(
+                    _format_auth_credential_status(
+                        key_used,
+                        uses_entra_id=is_token_provider(key_used),
+                    )
+                )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
 

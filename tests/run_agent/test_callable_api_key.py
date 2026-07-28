@@ -290,33 +290,32 @@ class TestCliEnsureRuntimeCredentialsCallable:
 
 
 class TestInlinedDisplayMasks:
-    """The masked-credential display sites are now inlined per-site (no
-    shared helper). Each site uses the ``is_token_provider`` predicate
-    to short-circuit on callables and print a static
-    ``"Microsoft Entra ID"`` label, then falls through to its own
-    context-appropriate string mask. This replaces a unified helper
-    that would have forced one mask shape across sites with legitimately
-    different display needs (banner vs diagnostic vs UI vs preview)."""
+    """Credential display remains context-specific outside init banners.
 
-    def test_run_agent_banner_uses_is_token_provider_guard(self):
+    The two initialization banners share one strict status formatter because
+    neither context may reveal credential-derived characters. Other display
+    sites keep their own context-appropriate handling.
+    """
+
+    def test_run_agent_banners_use_safe_status_formatter(self):
         """The masked-banner sites live in ``agent/agent_init.py``
         (the ``__init__`` body was extracted into ``init_agent`` after
         this feature was first written). Both the OpenAI and Anthropic
-        client init paths must guard their banner prints with
-        ``is_token_provider`` so a callable Entra ID provider doesn't
-        crash ``len(api_key)``."""
+        client init paths must identify callable Entra ID providers and route
+        all other credentials through the shared no-preview formatter."""
         from pathlib import Path
         src = (Path(__file__).resolve().parent.parent.parent
                / "agent" / "agent_init.py").read_text()
         assert src.count("is_token_provider(") >= 2, (
-            "agent/agent_init.py must guard BOTH masked-banner paths "
+            "agent/agent_init.py must guard BOTH credential-banner paths "
             "(chat_completions and anthropic_messages) with "
             "is_token_provider()."
         )
-        assert src.count('"🔑 Using credentials: Microsoft Entra ID"') >= 2, (
-            "agent/agent_init.py banner blocks should print a static "
-            "'Microsoft Entra ID' label for callable api_keys — no "
-            "placeholder plumbing, no describe-mask fallback."
+        assert src.count("_format_auth_credential_status(") >= 3, (
+            "both banner paths must call the shared credential-safe formatter"
+        )
+        assert '"🔑 Authentication credential source: Microsoft Entra ID"' in src, (
+            "the shared formatter must report Entra ID as a static source"
         )
 
     def test_cli_show_config_handles_callable(self):
