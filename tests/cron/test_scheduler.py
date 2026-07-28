@@ -2629,6 +2629,11 @@ class TestRunJobModelResolution:
         assert success is False
         assert error is not None
         assert "no model configured" in error
+        assert (
+            "hermes cron edit no-model-job --model <name> --provider <provider>"
+            in error
+        )
+        assert "cronjob action=update" not in error
         # AIAgent must never be constructed with an empty model — that's
         # precisely the bug we're guarding against.
         mock_agent_cls.assert_not_called()

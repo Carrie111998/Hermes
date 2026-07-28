@@ -3153,9 +3153,9 @@ def run_job(
         # Model resolution precedence: per-job override > cron.model (the
         # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
         # (string or ``{default: ...}``). The per-job value is intentionally
-        # re-read from storage every tick so a ``cronjob action=update
-        # model=...`` after a failed run takes effect on the next tick — there
-        # is no in-memory cache.
+        # re-read from storage every tick so a ``hermes cron edit <job_id>
+        # --model ... --provider ...`` after a failed run takes effect on the
+        # next tick — there is no in-memory cache.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
@@ -3219,9 +3219,9 @@ def run_job(
                 f"(job.model={job.get('model')!r}, "
                 f"HERMES_MODEL={os.getenv('HERMES_MODEL', '')!r}, "
                 "config.yaml model.default missing or empty). "
-                f"Set a per-job model via "
-                f"`cronjob action=update job_id={job_id} model=<name>` or set a "
-                "default with `hermes model <name>`."
+                "Set a per-job model via "
+                f"`hermes cron edit {job_id} --model <name> --provider <provider>` "
+                "or set a default with `hermes model <name>`."
             )
 
         # Apply IPv4 preference if configured.
@@ -3422,7 +3422,7 @@ def run_job(
                     "Job '%s': SKIPPED — global inference config drifted since "
                     "creation (%s) and this job is unpinned. Skipped to prevent "
                     "unintended spend. Pin explicitly to proceed: "
-                    "`cronjob action=update job_id=%s provider=<p> model=<m>`.",
+                    "`hermes cron edit %s --provider <provider> --model <model>`.",
                     job_id,
                     _changes,
                     job_id,
@@ -3431,8 +3431,8 @@ def run_job(
                     f"Skipped to prevent unintended spend: global inference config "
                     f"drifted since this job was created ({_changes}), and this job "
                     f"is unpinned. No inference call was made. To run on the new "
-                    f"config, pin it explicitly: `cronjob action=update "
-                    f"job_id={job_id} provider=<provider> model=<model>` "
+                    f"config, pin it explicitly: `hermes cron edit {job_id} "
+                    f"--provider <provider> --model <model>` "
                     f"(or pin the original values to keep them). See #44585."
                 )
 

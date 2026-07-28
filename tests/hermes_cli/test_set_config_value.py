@@ -418,7 +418,8 @@ class TestCronModelDriftConfigWarning:
         assert "1 enabled unpinned cron job" in captured.out
         assert "model_snapshot" in captured.out
         assert "fail closed" in captured.out
-        assert "cronjob action=update job_id=<job_id> provider=<provider> model=<model>" in captured.out
+        assert "hermes cron edit <job_id> --model <model> --provider <provider>" in captured.out
+        assert "cronjob action=update" not in captured.out
         assert "do not print this prompt" not in captured.out
 
     def test_provider_change_warns_for_unpinned_snapshot_jobs(
@@ -447,7 +448,8 @@ class TestCronModelDriftConfigWarning:
         assert "1 enabled unpinned cron job" in captured.out
         assert "provider_snapshot" in captured.out
         assert "new global provider" in captured.out
-        assert "cronjob action=update job_id=<job_id> provider=<provider> model=<model>" in captured.out
+        assert "hermes cron edit <job_id> --model <model> --provider <provider>" in captured.out
+        assert "cronjob action=update" not in captured.out
 
     def test_pinned_jobs_and_missing_snapshots_do_not_warn(
         self,

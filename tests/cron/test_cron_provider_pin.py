@@ -107,7 +107,7 @@ class TestProviderDriftGuard:
         assert "openrouter" in blob
         assert "nous" in blob
         assert "spend" in blob
-        assert "cronjob action=update" in blob
+        assert "hermes cron edit" in blob
         assert "44585" in blob
 
     def test_c_no_snapshot_runs_backcompat(self, tmp_path):

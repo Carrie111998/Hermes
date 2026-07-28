@@ -537,8 +537,8 @@ class TestUnifiedCronjobTool:
 class TestAgentCannotSetModelPin:
     """Per-job inference pins are user-owned (dashboard / `hermes cron`
     --model / hand-edited jobs). The agent-facing tool schema must not expose
-    model/provider/base_url, and the registered handler must ignore them even
-    if a model hallucinates the old parameters."""
+    model/provider/base_url, and the registered handler must reject them when
+    an upgraded long-lived session still sends the stale arguments."""
 
     def test_schema_has_no_inference_pin_params(self):
         from tools.cronjob_tools import CRONJOB_SCHEMA
@@ -548,8 +548,7 @@ class TestAgentCannotSetModelPin:
         assert "provider" not in props
         assert "base_url" not in props
 
-    def test_handler_ignores_hallucinated_model_args(self):
-        from cron.jobs import get_job
+    def test_handler_rejects_stale_model_args(self):
         from tools.registry import registry
 
         result = json.loads(
@@ -565,16 +564,14 @@ class TestAgentCannotSetModelPin:
                 },
             )
         )
-        assert result["success"] is True
-        stored = get_job(result["job_id"])
-        assert stored is not None
-        assert stored["model"] is None
-        assert stored["provider"] is None
-        assert stored["base_url"] is None
+        assert "error" in result
+        assert "user-owned" in result["error"]
+        assert "hermes cron create" in result["error"]
+        assert "job_id" not in result
 
-    def test_handler_update_leaves_user_pin_untouched(self):
-        """An update through the agent handler must not clear or change a
-        user-set pin (grandfathered agent-era pins included)."""
+    def test_handler_rejects_stale_update_without_partial_mutation(self):
+        """A stale update must fail atomically instead of reporting success
+        while silently ignoring the requested model pin."""
         from cron.jobs import get_job
         from tools.registry import registry
 
@@ -600,12 +597,31 @@ class TestAgentCannotSetModelPin:
                 },
             )
         )
-        assert updated["success"] is True
+        assert "error" in updated
+        assert "hermes cron edit" in updated["error"]
         stored = get_job(job_id)
         assert stored is not None
         assert stored["model"] == "anthropic/claude-sonnet-4"
         assert stored["provider"] == "anthropic"
-        assert stored["name"] == "renamed"
+        assert stored["name"] != "renamed"
+
+    @pytest.mark.parametrize("action", ["UPDATE", " update "])
+    def test_handler_normalizes_stale_update_action(self, action):
+        from tools.registry import registry
+
+        result = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": action,
+                    "job_id": "cron-123",
+                    "provider": "openrouter",
+                },
+            )
+        )
+        assert "error" in result
+        assert "hermes cron edit <job_id>" in result["error"]
+        assert "hermes cron create" not in result["error"]
 
 
 class TestLocalDeliveryNotice:

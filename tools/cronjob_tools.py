@@ -1065,11 +1065,27 @@ def check_cronjob_requirements() -> bool:
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="cronjob",
-    toolset="cronjob",
-    schema=CRONJOB_SCHEMA,
-    handler=lambda args, **kw: cronjob(
+
+def _cronjob_handler(args, **kw):
+    """Dispatch agent cron calls while rejecting user-owned pin arguments."""
+    stale_pin_args = [
+        key for key in ("model", "provider", "base_url") if key in args
+    ]
+    if stale_pin_args:
+        action = str(args.get("action") or "").strip().lower()
+        if action == "update":
+            command = "hermes cron edit <job_id>"
+        else:
+            command = "hermes cron create"
+        return tool_error(
+            "Per-job inference pins are user-owned and cannot be changed by the "
+            "agent-facing cronjob tool. No cron mutation was made. Use "
+            f"`{command} --model <model> --provider <provider>` instead; manage "
+            "custom base URLs in the dashboard or job configuration. "
+            f"Rejected stale arguments: {', '.join(stale_pin_args)}."
+        )
+
+    return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
         prompt=args.get("prompt"),
@@ -1092,7 +1108,14 @@ registry.register(
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         task_id=kw.get("task_id"),
-    ),
+    )
+
+
+registry.register(
+    name="cronjob",
+    toolset="cronjob",
+    schema=CRONJOB_SCHEMA,
+    handler=_cronjob_handler,
     check_fn=check_cronjob_requirements,
     emoji="⏰",
 )
