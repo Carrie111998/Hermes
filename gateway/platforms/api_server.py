@@ -6957,6 +6957,23 @@ class APIServerAdapter(BasePlatformAdapter):
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
 
+        # Split-runtime: a worker suspended in client_tool_gateway is parked on
+        # a threading.Event, so agent.interrupt() cannot reach it — that flag is
+        # only observed between conversation steps.  Cancel the run's pending
+        # client-tool calls so the thread unwinds now instead of holding a run
+        # slot until the relay timeout (api_server.gateway_timeout, 300s).
+        try:
+            from tools import client_tool_gateway as _ctg
+
+            cancelled = _ctg.clear_session(run_id)
+            if cancelled:
+                logger.info(
+                    "[api_server] stop cancelled %d pending client tool call(s) for run %s",
+                    cancelled, run_id,
+                )
+        except Exception:
+            logger.debug("[api_server] client-tool cleanup on stop failed", exc_info=True)
+
         if agent is not None:
             try:
                 agent.interrupt("Stop requested via API")
