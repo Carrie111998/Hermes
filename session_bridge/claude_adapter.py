@@ -87,6 +87,8 @@ class ClaudeReadableSource(Protocol):
 
     def find_native_sessions(self, native_id: str) -> list[Path]: ...
 
+    def find_native_sessions_by_stem(self, native_id: str) -> list[Path]: ...
+
     def parse(self, path: Path) -> ClaudeParseResult: ...
 
 
@@ -344,6 +346,14 @@ class ClaudeSourceAdapter:
             if probed_native_id == wanted:
                 matches.append(path)
         return matches
+
+    def find_native_sessions_by_stem(self, native_id: str) -> list[Path]:
+        """Return authoritative Claude transcript filenames without record probes."""
+
+        if not isinstance(native_id, str) or not native_id.strip():
+            return []
+        wanted = native_id.strip()
+        return [path for path in self.discover() if path.stem == wanted]
 
     def projection_has_exact_marker(
         self, projection: SessionProjection, marker: str

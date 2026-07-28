@@ -1415,7 +1415,9 @@ class ClaudeNativeRegistrar:
             self._sleep(self._poll_interval)
 
     def _read_exact(self, native_id: str) -> _ExactTranscript | None:
-        finder = getattr(self._source, "find_native_sessions", None)
+        finder = getattr(self._source, "find_native_sessions_by_stem", None)
+        if not callable(finder):
+            finder = getattr(self._source, "find_native_sessions", None)
         if callable(finder):
             paths = list(finder(native_id))
         else:

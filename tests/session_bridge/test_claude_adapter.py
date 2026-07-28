@@ -11,6 +11,7 @@ from typing import BinaryIO
 import pytest
 
 from hermes_state import SessionDB
+import session_bridge.claude_adapter as claude_adapter_module
 from session_bridge.claude_adapter import ClaudeCursor, ClaudeSourceAdapter
 from session_bridge.models import (
     BridgeMarkerPayload,
@@ -1357,6 +1358,25 @@ def test_find_native_sessions_returns_every_exact_uuid_match_across_projects(
     second.write_text("{}\n", encoding="utf-8")
     adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
     assert adapter.find_native_sessions(BASIC_SESSION_ID) == [first, second]
+
+
+def test_find_native_sessions_by_stem_does_not_probe_unrelated_transcripts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    first = tmp_path / "C--first" / f"{BASIC_SESSION_ID}.jsonl"
+    second = tmp_path / "D--second" / f"{BASIC_SESSION_ID}.jsonl"
+    unrelated = tmp_path / "E--third" / "unrelated.jsonl"
+    for path in (first, second, unrelated):
+        path.parent.mkdir()
+        path.write_text("{}\n", encoding="utf-8")
+
+    def forbidden_probe(path: Path) -> str | None:
+        raise AssertionError(f"unexpected transcript probe: {path}")
+
+    monkeypatch.setattr(claude_adapter_module, "_probe_native_id", forbidden_probe)
+
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    assert adapter.find_native_sessions_by_stem(BASIC_SESSION_ID) == [first, second]
 
 
 def test_find_native_session_skips_corrupt_probe_before_valid_target(tmp_path):

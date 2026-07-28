@@ -147,6 +147,7 @@ class FakeSource:
         found = self.find_native_session(native_id)
         return [] if found is None else [found]
 
+
     def parse(self, path: Path) -> FakeParse:
         if self.parse_error is not None:
             raise self.parse_error
@@ -162,6 +163,19 @@ class FakeSource:
         self, projection: SessionProjection, marker: str
     ) -> bool:
         return any(marker in (message.content or "") for message in projection.messages)
+
+
+class ExactStemSource(FakeSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exact_stem_calls: list[str] = []
+
+    def find_native_sessions_by_stem(self, native_id: str) -> list[Path]:
+        self.exact_stem_calls.append(native_id)
+        return []
+
+    def find_native_sessions(self, native_id: str) -> list[Path]:
+        raise AssertionError("registrar used the unbounded compatibility lookup")
 
 
 class FakeStore:
@@ -1095,6 +1109,23 @@ def test_duplicate_exact_uuid_is_fatal_before_spawn_or_commit() -> None:
     ).process(item)
     assert result.status == "failed" and result.error_code == "duplicate_uuid"
     assert factory.spawns == [] and store.calls[0][0] == "fail"
+
+
+def test_reconciliation_uses_authoritative_stem_lookup_without_legacy_probe() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    source = ExactStemSource()
+    store = FakeStore()
+
+    result = registrar(source, FakeFactory(), store).process(item)
+
+    assert result.status == "absent"
+    assert source.exact_stem_calls == [item.reserved_claude_uuid]
+    assert store.calls[0][0] == "absent"
 
 
 def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
