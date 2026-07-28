@@ -56,6 +56,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from agent.redact import redact_sensitive_text
 from hermes_cli import __version__, __release_date__
 from hermes_cli.config import (
     cfg_get,
@@ -1366,6 +1367,10 @@ _AUDIO_MIME_EXTENSIONS: Dict[str, str] = {
     "video/webm": ".webm",
 }
 _MAX_TRANSCRIPTION_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _redact_audio_error(error: Any, fallback: str) -> str:
+    return redact_sensitive_text(str(error or fallback), force=True)
 
 
 def _audio_extension_for_mime(mime_type: str) -> str:
@@ -4438,7 +4443,10 @@ async def transcribe_audio_upload(
         raise
     except Exception as exc:
         _log.exception("Desktop voice transcription failed")
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=_redact_audio_error(exc, "Transcription failed"),
+        )
     finally:
         if temp_path:
             try:
@@ -4449,7 +4457,7 @@ async def transcribe_audio_upload(
     if not result.get("success"):
         raise HTTPException(
             status_code=400,
-            detail=result.get("error") or "Transcription failed",
+            detail=_redact_audio_error(result.get("error"), "Transcription failed"),
         )
 
     return {
@@ -4595,7 +4603,10 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
         raise
     except Exception as exc:
         _log.exception("Desktop voice TTS failed")
-        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=_redact_audio_error(exc, "Speech synthesis failed"),
+        )
 
     try:
         result = json.loads(result_json) if isinstance(result_json, str) else result_json
@@ -4605,7 +4616,7 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
     if not result.get("success"):
         raise HTTPException(
             status_code=400,
-            detail=result.get("error") or "Speech synthesis failed",
+            detail=_redact_audio_error(result.get("error"), "Speech synthesis failed"),
         )
 
     file_path = result.get("file_path")
