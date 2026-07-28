@@ -231,16 +231,20 @@ func testBackendStatus(port int) bool {
 
 // testBackendAuth verifies the session token unlocks a gated API.
 // /api/status is public, so LISTEN+status-OK can still be token-drift.
+// Matches Desktop electron/watchdog-backend.ts: Authorization Bearer +
+// X-Hermes-Session-Token (post-7/20 gate accepts Bearer).
 func testBackendAuth(port int, token string) bool {
 	if port <= 0 || strings.TrimSpace(token) == "" {
 		return false
 	}
+	tok := strings.TrimSpace(token)
 	client := &http.Client{Timeout: 3 * time.Second}
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port), nil)
 	if err != nil {
 		return false
 	}
-	req.Header.Set("X-Hermes-Session-Token", token)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Hermes-Session-Token", tok)
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -491,7 +495,7 @@ func startPackagedDesktop(cfg Config, logger *Logger, bm *BackendManager) bool {
 	cmd := exec.Command(cfg.PackagedExe)
 	cmd.Dir = work
 	manifest := readLaunchManifest(cfg, bm)
-	cmd.Env = append(os.Environ(), desktopLaunchEnv(cfg, manifest)...)
+	cmd.Env = append(stripInheritedDesktopRemotes(os.Environ()), desktopLaunchEnv(cfg, manifest)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		logger.Infof("failed to launch Desktop: %v", err)

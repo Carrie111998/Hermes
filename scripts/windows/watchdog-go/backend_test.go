@@ -104,6 +104,40 @@ func TestDesktopLaunchEnvIncludesRemoteWhenManifest(t *testing.T) {
 	}
 }
 
+func TestDesktopLaunchEnvClearsIncompleteRemotes(t *testing.T) {
+	cfg := Config{HermesHome: "C:\\h", HermesRoot: "C:\\repo"}
+	env := desktopLaunchEnv(cfg, nil)
+	joined := stringsJoinEnv(env)
+	if !containsSubstr(joined, "HERMES_DESKTOP_REMOTE_URL=") || !containsSubstr(joined, "HERMES_DESKTOP_REMOTE_TOKEN=") {
+		t.Fatalf("expected explicit empty remotes, got %q", joined)
+	}
+	if containsSubstr(joined, "HERMES_DESKTOP_REMOTE_URL=http") {
+		t.Fatalf("nil manifest must not inject remote URL: %q", joined)
+	}
+	env2 := desktopLaunchEnv(cfg, &DesktopBackendManifest{BaseURL: "http://127.0.0.1:9119", Token: ""})
+	joined2 := stringsJoinEnv(env2)
+	if containsSubstr(joined2, "HERMES_DESKTOP_REMOTE_URL=http://127.0.0.1:9119") {
+		t.Fatalf("URL-only manifest must clear, not set URL: %q", joined2)
+	}
+}
+
+func TestStripInheritedDesktopRemotes(t *testing.T) {
+	base := []string{
+		"PATH=C:\\Windows",
+		"HERMES_DESKTOP_REMOTE_URL=http://stale:9118",
+		"HERMES_DESKTOP_REMOTE_TOKEN=old",
+		"FOO=bar",
+	}
+	got := stripInheritedDesktopRemotes(base)
+	joined := stringsJoinEnv(got)
+	if containsSubstr(joined, "HERMES_DESKTOP_REMOTE_URL=") || containsSubstr(joined, "HERMES_DESKTOP_REMOTE_TOKEN=") {
+		t.Fatalf("strip must drop remotes, got %q", joined)
+	}
+	if !containsSubstr(joined, "PATH=C:\\Windows") || !containsSubstr(joined, "FOO=bar") {
+		t.Fatalf("strip must keep unrelated env, got %q", joined)
+	}
+}
+
 func stringsJoinEnv(env []string) string {
 	out := ""
 	for _, e := range env {

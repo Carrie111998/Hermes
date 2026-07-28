@@ -215,9 +215,15 @@ async def _lifespan(app: "FastAPI"):
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
     # dashboard` is unaffected — it relies on its own gateway.
+    #
+    # Watchdog-managed serve (HERMES_WATCHDOG_MANAGED=1) must stay responsive
+    # for Desktop /api/sessions probes. Running the in-process cron ticker here
+    # lets long MoA/agent jobs saturate the event loop and freeze HTTP (LISTEN
+    # but /api/status = 000), which is exactly the post-sync Desktop boot failure.
+    # Leave cron to `hermes gateway` when the watchdog owns the serve.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
-    if os.getenv("HERMES_DESKTOP") == "1":
+    if os.getenv("HERMES_DESKTOP") == "1" and os.getenv("HERMES_WATCHDOG_MANAGED") != "1":
         cron_stop = threading.Event()
         cron_thread = threading.Thread(
             target=_start_desktop_cron_ticker,
@@ -226,6 +232,8 @@ async def _lifespan(app: "FastAPI"):
             name="desktop-cron-ticker",
         )
         cron_thread.start()
+    elif os.getenv("HERMES_WATCHDOG_MANAGED") == "1":
+        _log.info("Skipping desktop cron ticker for watchdog-managed backend")
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))

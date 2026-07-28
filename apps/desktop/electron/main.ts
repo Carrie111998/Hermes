@@ -151,6 +151,7 @@ import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
+import { resolveWatchdogPrewarmedBackend } from './watchdog-backend'
 import {
   RemoteLivenessTracker,
   RemoteRevalidationCoordinator,
@@ -8154,6 +8155,43 @@ async function startHermes() {
 
     if (setup.kind === 'remote') {
       return setup.connection
+    }
+
+    // Post-merge local ladder: if the Go watchdog already published a healthy
+    // desktop-backend.json (URL+token, gated /api/sessions OK), reuse it instead
+    // of cold-spawning another serve --port 0. This is how shortcut launches
+    // without HERMES_DESKTOP_REMOTE_* still attach to managed :9119.
+    const prewarmed = await resolveWatchdogPrewarmedBackend({
+      platform: process.platform,
+      timeoutMs: 5_000
+    })
+
+    if (prewarmed) {
+      await advanceBootProgress(
+        'backend.watchdog',
+        `Using watchdog prewarmed backend at ${prewarmed.baseUrl}`,
+        50
+      )
+      rememberLog(`Watchdog prewarmed backend ready at ${prewarmed.baseUrl}`)
+      await waitForHermes(prewarmed.baseUrl, prewarmed.token)
+      updateBootProgress({
+        phase: 'backend.ready',
+        message: 'Watchdog-managed Hermes backend is ready',
+        progress: 94,
+        running: true,
+        error: null
+      })
+
+      return {
+        baseUrl: prewarmed.baseUrl,
+        mode: 'local',
+        source: 'watchdog',
+        authMode: 'token',
+        token: prewarmed.token,
+        wsUrl: buildGatewayWsUrl(prewarmed.baseUrl, prewarmed.token),
+        logs: hermesLog.slice(-80),
+        ...getWindowState()
+      }
     }
 
     const backend = setup.backend

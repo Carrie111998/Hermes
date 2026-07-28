@@ -326,6 +326,13 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 		bm.port = 0
 		// Drift replace must mint a fresh token; the live occupant rejected ours.
 		bm.token = ""
+	} else if listeners := listeningPIDsOnPort(port); len(listeners) > 0 {
+		// LISTEN-but-dead (HTTP 000) blocks bind; force-clear before spawn.
+		bm.logger.Infof("managed port %d has LISTEN without /api/status; clearing zombie pid(s)=%v", port, listeners)
+		if !waitManagedPortCleared(port, 15*time.Second, bm.logger) {
+			bm.clearManifest()
+			return nil, fmt.Errorf("managed port %d zombie LISTEN uncleared", port)
+		}
 	}
 
 	preferredToken := strings.TrimSpace(bm.token)
@@ -459,11 +466,37 @@ func desktopLaunchEnv(cfg Config, manifest *DesktopBackendManifest) []string {
 	if webDist != "" {
 		env = append(env, "HERMES_DESKTOP_DASHBOARD_WEB_DIST="+webDist)
 	}
-	if manifest != nil && manifest.BaseURL != "" && manifest.Token != "" {
+	if manifest != nil && strings.TrimSpace(manifest.BaseURL) != "" && strings.TrimSpace(manifest.Token) != "" {
 		env = append(env,
-			"HERMES_DESKTOP_REMOTE_URL="+manifest.BaseURL,
-			"HERMES_DESKTOP_REMOTE_TOKEN="+manifest.Token,
+			"HERMES_DESKTOP_REMOTE_URL="+strings.TrimSpace(manifest.BaseURL),
+			"HERMES_DESKTOP_REMOTE_TOKEN="+strings.TrimSpace(manifest.Token),
+		)
+	} else {
+		// Explicit clear: inherited User/process remotes must not reach Desktop as
+		// URL-without-TOKEN (hard boot error) or a stale remote override.
+		env = append(env,
+			"HERMES_DESKTOP_REMOTE_URL=",
+			"HERMES_DESKTOP_REMOTE_TOKEN=",
 		)
 	}
 	return env
+}
+
+// stripInheritedDesktopRemotes drops HERMES_DESKTOP_REMOTE_* from a base env
+// block so later appends (set or clear) are unambiguous on Windows.
+func stripInheritedDesktopRemotes(base []string) []string {
+	out := make([]string, 0, len(base))
+	for _, e := range base {
+		eq := strings.IndexByte(e, '=')
+		if eq <= 0 {
+			out = append(out, e)
+			continue
+		}
+		key := e[:eq]
+		if key == "HERMES_DESKTOP_REMOTE_URL" || key == "HERMES_DESKTOP_REMOTE_TOKEN" {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
