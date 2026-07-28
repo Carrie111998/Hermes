@@ -488,14 +488,13 @@ def get_board(
                 "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
             )
         ]
-        # List of distinct assignees for the lane-by-profile sub-grouping.
-        assignees = [
-            r["assignee"]
-            for r in conn.execute(
-                "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
-            )
-        ]
+        # Assignee names for the toolbar filter, bulk-reassign and diagnostic
+        # reassign pickers (and the lane-by-profile sub-grouping). Union the
+        # profiles on disk with those currently used on the board so a
+        # freshly-created profile appears in the picker before it owns any
+        # task — matching GET /api/assignees instead of the tasks-only
+        # DISTINCT this used to run, which hid task-less profiles. See #73235.
+        assignees = [a["name"] for a in kanban_db.known_assignees(conn)]
 
         return {
             "columns": [
