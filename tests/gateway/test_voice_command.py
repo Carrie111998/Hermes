@@ -2836,7 +2836,8 @@ class TestVoiceReception:
 
     # -- _on_packet DAVE passthrough behavior --
 
-    def _make_receiver_with_nacl(self, dave_session=None, mapped_ssrcs=None):
+    def _make_receiver_with_nacl(self, dave_session=None, mapped_ssrcs=None,
+                                 allowed_ids=None, members=None):
         """Create a receiver that can process _on_packet with mocked NaCl + Opus."""
         from plugins.platforms.discord.adapter import VoiceReceiver
         vc = MagicMock()
@@ -2848,8 +2849,8 @@ class TestVoiceReception:
         vc._connection.hook = None
         vc.user = SimpleNamespace(id=9999)
         vc.channel = MagicMock()
-        vc.channel.members = []
-        receiver = VoiceReceiver(vc)
+        vc.channel.members = members if members is not None else []
+        receiver = VoiceReceiver(vc, allowed_user_ids=allowed_ids)
         receiver.start()
         # Pre-map SSRCs if provided
         if mapped_ssrcs:
@@ -2895,18 +2896,96 @@ class TestVoiceReception:
         assert len(receiver._buffers[100]) > 0
         dave.decrypt.assert_called_once()
 
-    def test_on_packet_dave_unknown_ssrc_passthrough(self):
-        """Unknown SSRC + DAVE → skip DAVE, attempt Opus decode (passthrough)."""
+    def test_on_packet_dave_unknown_ssrc_encrypted_dropped(self):
+        """Unknown SSRC + DAVE + identity not inferable → payload never decoded.
+
+        Regression: with DAVE active, an unmapped SSRC means the payload is
+        still DAVE-encrypted.  Feeding it to the Opus decoder buffers noise
+        that survives the energy gate and corrupts the first utterance.
+        """
+        dave = MagicMock()
+        # Members present but two candidates → inference cannot resolve.
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+            SimpleNamespace(id=43, name="Bob"),
+        ]
+        receiver = self._make_receiver_with_nacl(
+            dave_session=dave, members=members,
+        )
+
+        with patch("nacl.secret.Aead") as mock_aead, \
+                patch("discord.opus.Decoder") as mock_decoder_cls:
+            mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
+            receiver._on_packet(self._build_rtp_packet(ssrc=100))
+
+        dave.decrypt.assert_not_called()
+        mock_decoder_cls.assert_not_called()
+        assert len(receiver._buffers.get(100, b"")) == 0
+        assert 100 not in receiver._decoders
+
+    def test_on_packet_dave_unknown_ssrc_drop_logged_content_free(self, caplog):
+        """The unknown-SSRC drop is instrumented without user ID or payload."""
         dave = MagicMock()
         receiver = self._make_receiver_with_nacl(dave_session=dave)
-        self._inject_mock_decoder(receiver, 100)
+
+        with caplog.at_level("INFO"), patch("nacl.secret.Aead") as mock_aead:
+            mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
+            receiver._on_packet(self._build_rtp_packet(ssrc=100))
+
+        drop_lines = [r.getMessage() for r in caplog.records
+                      if "unresolved sender" in r.getMessage()]
+        assert drop_lines, "expected a content-free drop log line"
+        for line in drop_lines:
+            assert "42" not in line  # no user ID
+            assert "f8fffe" not in line  # no payload bytes
+
+    def test_on_packet_dave_unknown_ssrc_inferred_user_decrypts(self):
+        """Unknown SSRC + DAVE + sole allowed member → infer at packet time.
+
+        The first real utterance must be preserved when identity is
+        inferable: SSRC mapped immediately, DAVE decrypt runs with the
+        inferred sender, PCM buffered under the mapped SSRC.
+        """
+        dave = MagicMock()
+        dave.decrypt.return_value = b"\xf8\xff\xfe"
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+        ]
+        receiver = self._make_receiver_with_nacl(
+            dave_session=dave, allowed_ids={"42"}, members=members,
+        )
+        mock_decoder = self._inject_mock_decoder(receiver, 100)
 
         with patch("nacl.secret.Aead") as mock_aead:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
             receiver._on_packet(self._build_rtp_packet(ssrc=100))
 
-        dave.decrypt.assert_not_called()
-        assert 100 in receiver._buffers
+        assert receiver._ssrc_to_user[100] == 42
+        dave.decrypt.assert_called_once()
+        assert dave.decrypt.call_args[0][0] == 42
+        mock_decoder.decode.assert_called_once()
+        assert len(receiver._buffers[100]) > 0
+
+    def test_on_packet_dave_unknown_ssrc_recovers_after_speaking(self):
+        """Packets dropped while unresolved; SPEAKING maps → normal decrypt."""
+        dave = MagicMock()
+        dave.decrypt.return_value = b"\xf8\xff\xfe"
+        receiver = self._make_receiver_with_nacl(dave_session=dave)
+
+        with patch("nacl.secret.Aead") as mock_aead:
+            mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
+            # First packet: unresolved → dropped, no decoder created.
+            receiver._on_packet(self._build_rtp_packet(ssrc=100, seq=1))
+            assert len(receiver._buffers.get(100, b"")) == 0
+
+            # SPEAKING event arrives late.
+            receiver.map_ssrc(100, 42)
+            self._inject_mock_decoder(receiver, 100)
+            receiver._on_packet(self._build_rtp_packet(ssrc=100, seq=2))
+
+        dave.decrypt.assert_called_once()
         assert len(receiver._buffers[100]) > 0
 
     def test_on_packet_dave_unencrypted_error_passthrough(self):
@@ -2973,6 +3052,59 @@ class TestVoiceReception:
 
         assert 100 in receiver._buffers
         assert 200 in receiver._buffers
+
+
+class TestSpeechActivityProbes:
+    """Calibration probes for the sustained-energy speech gate.
+
+    Documents which representative mic-route signals pass or are rejected
+    by ACTIVE_FRAME_RMS / MIN_ACTIVE_SPEECH_DURATION.  RMS of a full-scale
+    square wave equals its amplitude; amplitude A ≈ 20*log10(A/32768) dBFS:
+
+      - desktop/headset speech:   1000-8000  (-30 to -12 dBFS)  → pass
+      - quiet mobile/low-gain:     200-400   (-44 to -38 dBFS)  → pass
+      - gate floor:                100       (-50 dBFS)         → pass
+      - comfort noise / hiss:       10-40    (-70 to -58 dBFS)  → reject
+      - digital silence:             0                          → reject
+      - join pop/click (one frame):  any amplitude              → reject
+
+    Residual risk: a mic route delivering sustained speech below -50 dBFS
+    RMS (very low gain, heavy OS-level suppression) is rejected as
+    non-speech.  The floor stays deliberately permissive; raising it would
+    let decoded comfort noise reach STT again.
+    """
+
+    @staticmethod
+    def _gate(pcm: bytes):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        return VoiceReceiver._pcm_speech_activity(pcm)
+
+    @pytest.mark.parametrize("amplitude", [1000, 4000, 8000])
+    def test_desktop_headset_speech_passes(self, amplitude):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, amplitude))
+        assert has_speech, stats
+
+    @pytest.mark.parametrize("amplitude", [200, 400])
+    def test_quiet_mobile_low_gain_speech_passes(self, amplitude):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, amplitude))
+        assert has_speech, stats
+
+    def test_gate_floor_amplitude_passes(self):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, 100))
+        assert has_speech, stats
+
+    @pytest.mark.parametrize("amplitude", [0, 10, 40])
+    def test_comfort_noise_and_silence_rejected(self, amplitude):
+        has_speech, stats = self._gate(_voice_like_pcm(0.6, amplitude))
+        assert not has_speech, stats
+
+    @pytest.mark.parametrize("amplitude", [1000, 8000, 30000])
+    def test_single_frame_click_rejected(self, amplitude):
+        """A lone 20ms pop amid silence never reaches STT, however loud."""
+        frame = _voice_like_pcm(0.02, amplitude)
+        silence = b"\x00" * (len(_voice_like_pcm(0.6)) - len(frame))
+        has_speech, stats = self._gate(frame + silence)
+        assert not has_speech, stats
 
 
 class TestVoiceTTSPlayback:
