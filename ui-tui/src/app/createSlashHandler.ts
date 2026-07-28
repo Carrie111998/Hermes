@@ -109,11 +109,21 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
         return void handler(`/${d.target}${argTail}`)
       }
 
-      if (d.type === 'skill') {
-        sys(translate(ui.locale, 'command.loadingSkill', { name: d.name }))
+      // A skill/bundle dispatch's `message` is the expanded skill body —
+      // model-facing scaffolding. `display` is the invocation the gateway
+      // projected; the transcript shows that instead. An ordinary send has no
+      // projection and goes through unchanged. No client-side fallback here:
+      // the TUI spawns its gateway from this same checkout, so the two can't
+      // version-skew (unlike the desktop, which can meet an older backend).
+      const sendDispatch = (display: string | undefined, message: string) => {
+        const shown = display?.trim()
 
+        return shown ? send(message, true, shown) : send(message)
+      }
+
+      if (d.type === 'skill') {
         return d.message?.trim()
-          ? send(d.message)
+          ? sendDispatch(d.display, d.message)
           : sys(translate(ui.locale, 'command.skillPayloadMissing', { command: parsed.name }))
       }
 
@@ -123,7 +133,7 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
         }
 
         return d.message?.trim()
-          ? send(d.message)
+          ? sendDispatch(d.display, d.message)
           : sys(translate(ui.locale, 'command.emptyMessage', { command: parsed.name }))
       }
 

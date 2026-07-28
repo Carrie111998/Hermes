@@ -74,7 +74,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
   }, [composerState.input, composerState.inputBuf])
 
   const send = useCallback(
-    (text: string, showUserMessage = true) => {
+    (text: string, showUserMessage = true, displayText?: string) => {
       const expand = expandSnips(composerState.pasteSnips)
 
       submitPrompt(
@@ -87,7 +87,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
           setLastUserMsg,
           sys
         },
-        showUserMessage
+        showUserMessage,
+        displayText
       )
     },
     [appendMessage, composerActions, composerState.pasteSnips, gw, setLastUserMsg, sys]

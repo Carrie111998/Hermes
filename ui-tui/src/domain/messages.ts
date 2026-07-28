@@ -76,6 +76,13 @@ export const toTranscriptMessages = (rows: unknown, locale: Locale = 'en'): Msg[
       continue
     }
 
+    if (display_kind === 'auto_continue') {
+      out.push({ kind: 'event', role: 'system', text: translate(locale, 'transcript.resumedInterruptedTurn') })
+      pending = []
+
+      continue
+    }
+
     if (display_kind === 'async_delegation_complete') {
       const meta = (row as TranscriptRow).display_metadata
       const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined

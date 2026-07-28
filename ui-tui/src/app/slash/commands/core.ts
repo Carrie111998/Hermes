@@ -637,9 +637,7 @@ export const coreCommands: SlashCommand[] = [
       // `/focus status` reports without writing, matching the CLI surface.
       if (mode === 'status' || mode === 'show' || mode === '?') {
         return ctx.transcript.sys(
-          current
-            ? translate(ctx.ui.locale, 'focus.statusOn')
-            : translate(ctx.ui.locale, 'focus.statusOff')
+          current ? translate(ctx.ui.locale, 'focus.statusOn') : translate(ctx.ui.locale, 'focus.statusOff')
         )
       }
 
@@ -657,9 +655,7 @@ export const coreCommands: SlashCommand[] = [
 
       queueMicrotask(() =>
         ctx.transcript.sys(
-          next
-            ? translate(ctx.ui.locale, 'focus.enabled')
-            : translate(ctx.ui.locale, 'focus.disabled')
+          next ? translate(ctx.ui.locale, 'focus.enabled') : translate(ctx.ui.locale, 'focus.disabled')
         )
       )
     }

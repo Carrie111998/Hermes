@@ -31,6 +31,20 @@ const REASONING_DISPLAY_KEYS = {
   show: 'sys.reasoningDisplayShow'
 } as const satisfies Record<string, TranslationKey>
 
+const APPROVAL_MODE_KEYS = {
+  manual: 'approvalMode.manual',
+  smart: 'approvalMode.smart',
+  off: 'approvalMode.off'
+} as const satisfies Record<string, TranslationKey>
+
+type ApprovalMode = keyof typeof APPROVAL_MODE_KEYS
+
+const isApprovalMode = (value: string): value is ApprovalMode =>
+  Object.prototype.hasOwnProperty.call(APPROVAL_MODE_KEYS, value)
+
+const approvalModeLabel = (locale: Parameters<typeof translate>[0], value?: string) =>
+  translate(locale, APPROVAL_MODE_KEYS[value && isApprovalMode(value) ? value : 'manual'])
+
 const THEME_MODE_KEYS: Record<string, TranslationKey> = {
   auto: 'theme.auto',
   dark: 'theme.dark',
@@ -625,6 +639,33 @@ export const sessionCommands: SlashCommand[] = [
             ctx.transcript.sys(translate(ctx.ui.locale, r.value === '1' ? 'sys.yoloOn' : 'sys.yoloOff'))
           )
         )
+    }
+  },
+
+  {
+    name: 'approvals',
+    run: (arg, ctx) => {
+      const mode = arg.trim().toLowerCase()
+      const showMode = (value?: string) =>
+        ctx.transcript.sys(
+          translate(ctx.ui.locale, 'sys.approvalMode', {
+            mode: approvalModeLabel(ctx.ui.locale, value)
+          })
+        )
+
+      if (!mode) {
+        return ctx.gateway
+          .rpc<ConfigGetValueResponse>('config.get', { key: 'approvals.mode' })
+          .then(ctx.guarded<ConfigGetValueResponse>(r => showMode(r.value)))
+      }
+
+      if (!isApprovalMode(mode)) {
+        return ctx.transcript.sys(translate(ctx.ui.locale, 'sys.usageApprovals'))
+      }
+
+      ctx.gateway
+        .rpc<ConfigSetResponse>('config.set', { key: 'approvals.mode', value: mode })
+        .then(ctx.guarded<ConfigSetResponse>(r => showMode(r.value)))
     }
   },
 

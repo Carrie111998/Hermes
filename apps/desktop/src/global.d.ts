@@ -124,6 +124,7 @@ declare global {
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
       watchPreviewFile: (url: string) => Promise<HermesPreviewWatch>
       stopPreviewFileWatch: (id: string) => Promise<boolean>
+      setActiveWork?: (payload: HermesActiveWork) => void
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void
       setTranslucency?: (payload: { intensity: number }) => void
@@ -271,14 +272,9 @@ declare global {
       // searches that window (not the primary). `onFoundInPage` returns the
       // unsubscribe fn; the renderer wires it via `initFindInPageListener`
       // in store/find-in-page.ts and tears it down when the FindBar unmounts.
-      findInPage: (
-        query: string,
-        options?: { forward?: boolean; findNext?: boolean }
-      ) => Promise<{ count: number }>
+      findInPage: (query: string, options?: { forward?: boolean; findNext?: boolean }) => Promise<{ count: number }>
       stopFindInPage: () => Promise<void>
-      onFoundInPage: (
-        callback: (result: { activeMatchOrdinal: number; count: number }) => void
-      ) => () => void
+      onFoundInPage: (callback: (result: { activeMatchOrdinal: number; count: number }) => void) => () => void
     }
   }
 }
@@ -463,8 +459,16 @@ export interface HermesTitleBarTheme {
   foreground: string
 }
 
+/** Turns in flight, so the main process can confirm before a quit kills them. */
+export interface HermesActiveWork {
+  count: number
+  titles: string[]
+}
+
 export interface HermesWindowState {
   isFullscreen: boolean
+  isMinimized?: boolean
+  isVisible?: boolean
   nativeOverlayWidth: number
   windowButtonPosition: { x: number; y: number } | null
 }

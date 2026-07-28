@@ -56,15 +56,44 @@ describe('schema localization', () => {
   it('covers configuration fields introduced by the latest upstream release', () => {
     const fields = {
       'mcp.auto_reload_on_config_change': 'MCP → 配置变更时自动重载',
+      'agent.gateway_startup_restore_drain_timeout': 'Agent → 启动恢复排空超时',
+      'desktop.auto_continue.enabled': '桌面端 → 中断轮次自动继续 → 启用',
+      'desktop.auto_continue.freshness_minutes': '桌面端 → 中断轮次自动继续 → 有效期(分钟)',
+      'desktop.auto_continue.max_attempts': '桌面端 → 中断轮次自动继续 → 最大尝试次数',
+      'stt.language': '语音识别 → 全局语言',
+      'stt.local.initial_prompt': '语音识别 → 本地 → 初始提示词',
+      'stt.groq.model': '语音识别 → Groq → 默认模型',
+      'stt.groq.language': '语音识别 → Groq → 语言',
+      'stt.openai.language': '语音识别 → OpenAI → 语言',
+      'stt.mistral.language': '语音识别 → Mistral → 语言',
+      'stt.xai.language': '语音识别 → xAI → 语言',
       'tts.minimax.model': '语音合成 → MiniMax → 默认模型',
       'tts.minimax.voice_id': '语音合成 → MiniMax → 语音 ID',
       'tts.kittentts.model': '语音合成 → KittenTTS → 默认模型',
       'tts.kittentts.voice': '语音合成 → KittenTTS → 语音',
+      'tool_loop_guardrails.loop_caps.max_web_searches': '工具循环保护 → 单轮调用上限 → 最大网页搜索次数',
+      'tool_loop_guardrails.loop_caps.max_subagents': '工具循环保护 → 单轮调用上限 → 最大子 Agent 数',
+      'voice.stop_phrases': '语音 → 停止短语',
       'x_search.reasoning_effort': 'X 搜索 → 推理强度'
     }
 
     for (const [key, expected] of Object.entries(fields)) {
       expect(resolveSchemaLabel(zhSchema, key, 'English fallback')).toBe(expected)
+    }
+  })
+
+  it('explains the latest runtime safety and recovery settings in Chinese', () => {
+    for (const key of [
+      'agent.gateway_startup_restore_drain_timeout',
+      'tool_loop_guardrails.loop_caps.max_web_searches',
+      'tool_loop_guardrails.loop_caps.max_subagents',
+      'stt.language',
+      'voice.stop_phrases',
+      'desktop.auto_continue.enabled',
+      'desktop.auto_continue.freshness_minutes',
+      'desktop.auto_continue.max_attempts'
+    ]) {
+      expect(resolveSchemaDescription(zhSchema, key, 'English fallback')).not.toBe('English fallback')
     }
   })
 

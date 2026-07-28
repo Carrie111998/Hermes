@@ -1108,6 +1108,18 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
+        # Max seconds the gateway waits for boot auto-resume turns to finish
+        # before it releases the startup-restore inbound gate.  While startup
+        # restore is in progress the gateway QUEUES every inbound message
+        # instead of replying, so no channel gets an answer until this gate
+        # opens.  Without a bound, one pathologically long resumed turn holds
+        # the gate shut and every channel's inbound piles up unanswered for as
+        # long as that turn runs.  On timeout the gate releases and the slow
+        # resume turn keeps running in the background; duplicate-agent
+        # protection is unaffected because the resume slot is claimed
+        # synchronously before the gate runs.  Set to 0 to disable the bound
+        # (historical "wait forever" behaviour).
+        "gateway_startup_restore_drain_timeout": 30,
         # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
         # seconds. When the base stale timeout is at its default (180s) and a
         # local endpoint is detected, this finite ceiling replaces the former
@@ -1408,6 +1420,18 @@ DEFAULT_CONFIG = {
             "exact_failure": 5,
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
+        },
+        # Per-turn runaway-loop caps (inspired by Claude Code v2.1.212,
+        # Week 29, July 2026). Hard ceilings on how many times a runaway-prone
+        # tool may be called within a SINGLE agent loop (turn); the counters
+        # reset at the start of every turn, so a legitimate multi-turn session
+        # is never starved. They are always-on and fire regardless of the
+        # warn/hard-stop thresholds above. A single turn issuing dozens of web
+        # searches or spawning dozens of subagents is already pathological, so
+        # the defaults are low. Set either to 0 to disable that cap (unlimited).
+        "loop_caps": {
+            "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
+            "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
         },
     },
 
@@ -2298,15 +2322,31 @@ DEFAULT_CONFIG = {
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
         "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
+        # Global language hint applied to EVERY provider unless a per-provider
+        # language overrides it. Defaults to "en" — Whisper auto-detection
+        # frequently misidentifies short/accented clips, which reads as
+        # "STT transcribed the wrong language". Set to "" to restore
+        # auto-detect, or to your language code ("es", "zh", "uk", ...).
+        "language": "en",
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+            "initial_prompt": "",
+        },
+        "groq": {
+            "model": "whisper-large-v3-turbo",  # whisper-large-v3, whisper-large-v3-turbo, distil-whisper-large-v3-en
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+        },
+        "xai": {
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "elevenlabs": {
             "model_id": "scribe_v2",  # scribe_v2, scribe_v1
@@ -2328,6 +2368,10 @@ DEFAULT_CONFIG = {
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
         "barge_in": True,             # Stop TTS playback when the user starts talking
+        # Saying EXACTLY one of these phrases (and nothing else) ends the
+        # voice chat instead of being sent to the agent. Case-insensitive,
+        # surrounding punctuation ignored. Set [] to disable.
+        "stop_phrases": ["stop"],
     },
     
     "human_delay": {
@@ -3296,14 +3340,15 @@ DEFAULT_CONFIG = {
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
     "sessions": {
-        # When true, prune ended sessions older than retention_days once
+        # When true, prune ended sessions inactive for retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
-        # Only touches ended sessions — active sessions are always preserved.
+        # Activity is the latest message timestamp, falling back to creation
+        # time for empty sessions. Active sessions are always preserved.
         # Default false: session history is valuable for search recall, and
         # silently deleting it could surprise users.  Opt in explicitly.
         "auto_prune": False,
-        # How many days of ended-session history to keep.  Matches the
-        # default of ``hermes sessions prune``.
+        # How many inactive days of ended-session history to keep. Matches
+        # the default of ``hermes sessions prune``.
         "retention_days": 90,
         # When true, auto-archive (soft-hide, never delete) sessions that
         # haven't been touched in ``auto_archive_days`` days, once per
