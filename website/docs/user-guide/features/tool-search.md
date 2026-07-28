@@ -15,13 +15,13 @@ problem. When activated, MCP and plugin tools are replaced in the
 model-visible tools array by three bridge tools, and the model loads each
 specific tool's schema on demand.
 
-:::info Built-in Hermes tools never defer
-The tools that make up Hermes' core capability set (`terminal`,
-`read_file`, `write_file`, `patch`, `search_files`, `todo`, `memory`,
-`browser_*`, `web_search`, `web_extract`, `clarify`, `execute_code`,
-`delegate_task`, `session_search`, and the rest of
-`_HERMES_CORE_TOOLS`) are *always* loaded directly. Only MCP tools and
-non-core plugin tools are eligible for deferral.
+:::info A protected core kernel never defers
+Hermes keeps its recovery and discovery waist (`terminal`, `process`, file
+read/write/search/patch tools, web search/extract, skill listing/view, and
+`clarify`) directly available under every configuration. Other built-in
+toolsets stay eager by default but can be explicitly placed behind Tool Search
+with `defer_core_toolsets`. MCP and non-core plugin tools remain deferrable by
+default.
 :::
 
 ## How it works
@@ -81,6 +81,8 @@ tools:
     max_search_limit: 20
     listing: auto       # embed a grouped name+description catalog manifest
     listing_max_tokens: 20000
+    # Optional. Use only after model/task evals; the protected kernel ignores it.
+    defer_core_toolsets: [browser, cronjob, image_gen, tts, vision]
 ```
 
 | Key | Default | Meaning |
@@ -91,6 +93,30 @@ tools:
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 | `listing` | `auto` | Embed a skills-style manifest of every deferred tool (name + first sentence of its description, ≤60 chars, grouped by MCP server) in the `tool_search` bridge description. `auto` includes it when it fits the budget (falling back to names-only, then to the tier-2 server summary); `on`/`off` force either way. |
 | `listing_max_tokens` | `20000` | Absolute cap on the embedded listing, regardless of context size. Range 200–60000. |
+| `defer_core_toolsets` | `[]` | Reviewed optional built-in toolsets whose schemas should defer. Supported: `browser`, `cronjob`, `image_gen`, `tts`, `vision`. Unsupported names are ignored; protected recovery/discovery tools remain eager. |
+
+### Deferring optional built-in toolsets
+
+Use `defer_core_toolsets` as a measured profile posture, not a universal
+default. It is most useful for large, infrequent surfaces such as browser
+automation, scheduling, image generation, text-to-speech, and vision. The
+catalog keeps their names and short descriptions discoverable while loading
+full schemas only when needed.
+
+The trade-off is an extra describe/call step on a cold capability and greater
+dependence on model routing quality. Compare eager and deferred profiles on
+representative tasks before enabling it broadly; keep a rollback snapshot of
+the profile config.
+
+The disclosure policy is pinned when an agent session starts. After changing
+`defer_core_toolsets`, restart long-lived gateway workers and start a fresh
+session; existing sessions intentionally retain their original callable
+catalog.
+
+Use `hermes prompt-size --json` to measure the posture. Its `tools` block keeps
+the legacy `count`/`json_bytes` fields and also reports raw and visible schema
+bytes, deferred count/bytes, net schema savings, disclosure tier, and listing
+form.
 
 ### Why the listing exists
 

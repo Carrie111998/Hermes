@@ -1388,10 +1388,20 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    # Pin progressive-disclosure policy for the lifetime of this agent. A
+    # config edit may create a different tool payload for new sessions, but it
+    # must not silently change the callable bridge catalog of an existing one.
+    try:
+        from tools.tool_search import load_config as _load_tool_search_config
+        agent._tool_search_config = _load_tool_search_config()
+    except Exception:
+        agent._tool_search_config = None
+
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        tool_search_config=agent._tool_search_config,
     )
     
     # Show tool configuration and store valid tool names for validation

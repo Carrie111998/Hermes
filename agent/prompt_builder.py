@@ -2069,7 +2069,9 @@ def build_context_files_prompt(
         )
         project_context = ""
     else:
-        # Priority-based project context: first match wins
+        # Priority-based project context: first recognized source wins. A
+        # blocked higher-priority file remains the selected safe placeholder;
+        # lower-priority files never gain authority because of a scanner hit.
         project_context = (
             _load_hermes_md(cwd_path, context_length)
             or _load_agents_md(cwd_path, context_length)

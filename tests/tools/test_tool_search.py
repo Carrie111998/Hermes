@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from types import SimpleNamespace
 from typing import List, Dict, Any
 
 import pytest
@@ -82,9 +83,37 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_deferred_core_toolsets_default_empty(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw(None)
+        assert cfg.defer_core_toolsets == frozenset()
+
+    def test_deferred_core_toolsets_accepts_trimmed_unique_names(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "defer_core_toolsets": [" cronjob ", "image_gen", "cronjob", ""],
+        })
+        assert cfg.defer_core_toolsets == frozenset({"cronjob", "image_gen"})
+
+    def test_deferred_core_toolsets_rejects_non_list_values(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({"defer_core_toolsets": "cronjob"})
+        assert cfg.defer_core_toolsets == frozenset()
+
+    def test_deferred_core_toolsets_ignore_unreviewed_names(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "defer_core_toolsets": ["memory", "terminal", "unknown", "vision"],
+        })
+        assert cfg.defer_core_toolsets == frozenset({"vision"})
+
 
 # ---------------------------------------------------------------------------
-# Classification — the hard invariant: core tools NEVER defer.
+# Classification — core tools eager by default; protected kernel never defers.
 # ---------------------------------------------------------------------------
 
 
@@ -126,6 +155,49 @@ class TestClassification:
         names = {(td.get("function") or {}).get("name") for td in visible}
         assert "xx_unknown_tool" in names
         assert deferrable == []
+
+    def test_configured_optional_core_toolset_can_defer(self, monkeypatch):
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+
+        monkeypatch.setattr(
+            registry,
+            "get_entry",
+            lambda name: type("Entry", (), {"toolset": "cronjob"})()
+            if name == "cronjob" else None,
+        )
+        cfg = ToolSearchConfig.from_raw({"defer_core_toolsets": ["cronjob"]})
+        assert is_deferrable_tool_name("cronjob", config=cfg)
+
+    def test_protected_core_kernel_never_defers_even_if_configured(self, monkeypatch):
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+
+        monkeypatch.setattr(
+            registry,
+            "get_entry",
+            lambda name: type("Entry", (), {"toolset": "terminal"})(),
+        )
+        cfg = ToolSearchConfig.from_raw({"defer_core_toolsets": ["terminal"]})
+        assert not is_deferrable_tool_name("terminal", config=cfg)
+
+    def test_unreviewed_core_toolset_never_defers(self, monkeypatch):
+        from tools.registry import registry
+        from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+
+        monkeypatch.setattr(
+            registry,
+            "get_entry",
+            lambda name: type("Entry", (), {"toolset": "memory"})(),
+        )
+        cfg = ToolSearchConfig(
+            enabled="on",
+            threshold_pct=5.0,
+            search_default_limit=5,
+            max_search_limit=20,
+            defer_core_toolsets=frozenset({"memory"}),
+        )
+        assert not is_deferrable_tool_name("memory", config=cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +326,30 @@ class TestAssembly:
         )
         assert not result.activated
         assert {t["function"]["name"] for t in result.tool_defs} == {"terminal", "read_file"}
+
+    def test_configured_optional_core_toolset_uses_bridge(self, monkeypatch):
+        from tools.registry import registry
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        entries = {
+            "terminal": type("Entry", (), {"toolset": "terminal"})(),
+            "cronjob": type("Entry", (), {"toolset": "cronjob"})(),
+        }
+        monkeypatch.setattr(registry, "get_entry", lambda name: entries.get(name))
+        defs = [_td("terminal", "Run shell"), _td("cronjob", "Manage schedules")]
+        result = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "defer_core_toolsets": ["cronjob"],
+            }),
+        )
+        names = {t["function"]["name"] for t in result.tool_defs}
+        assert result.activated
+        assert "terminal" in names
+        assert "cronjob" not in names
+        assert {"tool_search", "tool_describe", "tool_call"} <= names
 
     @staticmethod
     def _register_mcp(name):
@@ -628,6 +724,237 @@ class TestRegression_ToolsetScoping:
         # core tools are never deferrable
         assert "terminal" not in names
 
+
+class TestOptionalCoreBridgeDispatch:
+    def test_bridge_catalog_uses_explicit_pinned_policy_when_live_config_drops_tool(
+        self, monkeypatch
+    ):
+        import model_tools
+        from tools import tool_search as ts
+        from tools.registry import registry
+
+        name = "browser_pinned_catalog_probe"
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+            schema=_td(name, "Pinned catalog probe."),
+            toolset="browser",
+        )
+        original_core_names = ts._core_tool_names()
+        monkeypatch.setattr(
+            ts,
+            "_core_tool_names",
+            lambda: original_core_names | frozenset({name}),
+        )
+        pinned = ts.ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_toolsets": ["browser"],
+        })
+        live_changed = ts.ToolSearchConfig.from_raw({"enabled": "on"})
+        monkeypatch.setattr(ts, "load_config", lambda: live_changed)
+        model_tools._clear_tool_defs_cache()
+
+        searched = json.loads(model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "pinned catalog probe"},
+            enabled_toolsets=["browser"],
+            tool_search_config=pinned,
+        ))
+        assert name in {match["name"] for match in searched["matches"]}
+
+        described = json.loads(model_tools.handle_function_call(
+            function_name="tool_describe",
+            function_args={"name": name},
+            enabled_toolsets=["browser"],
+            tool_search_config=pinned,
+        ))
+        assert described["name"] == name
+
+    def test_bridge_catalog_does_not_leak_live_policy_tool_into_pinned_session(
+        self, monkeypatch
+    ):
+        import model_tools
+        from tools import tool_search as ts
+        from tools.registry import registry
+
+        name = "browser_live_catalog_probe"
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+            schema=_td(name, "Live catalog probe."),
+            toolset="browser",
+        )
+        original_core_names = ts._core_tool_names()
+        monkeypatch.setattr(
+            ts,
+            "_core_tool_names",
+            lambda: original_core_names | frozenset({name}),
+        )
+        pinned = ts.ToolSearchConfig.from_raw({"enabled": "on"})
+        live_changed = ts.ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_toolsets": ["browser"],
+        })
+        monkeypatch.setattr(ts, "load_config", lambda: live_changed)
+        model_tools._clear_tool_defs_cache()
+
+        searched = json.loads(model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "live catalog probe"},
+            enabled_toolsets=["browser"],
+            tool_search_config=pinned,
+        ))
+        assert name not in {match["name"] for match in searched["matches"]}
+
+        described = json.loads(model_tools.handle_function_call(
+            function_name="tool_describe",
+            function_args={"name": name},
+            enabled_toolsets=["browser"],
+            tool_search_config=pinned,
+        ))
+        assert "error" in described
+
+    def test_configured_optional_core_tool_describes_and_calls(self, monkeypatch):
+        import model_tools
+        from tools import tool_search as ts
+        from tools.registry import registry
+
+        name = "browser_context_engineering_probe"
+
+        def handler(args, task_id=None, **kwargs):
+            return json.dumps({"ok": True, "value": args.get("value")})
+
+        registry.register(
+            name=name,
+            handler=handler,
+            schema=_td(
+                name,
+                "Exercise optional core bridge dispatch.",
+                {"value": {"type": "string"}},
+            ),
+            toolset="browser",
+        )
+        original_core_names = ts._core_tool_names()
+        monkeypatch.setattr(
+            ts,
+            "_core_tool_names",
+            lambda: original_core_names | frozenset({name}),
+        )
+        cfg = ts.ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_toolsets": ["browser"],
+        })
+        monkeypatch.setattr(ts, "load_config", lambda: cfg)
+        model_tools._clear_tool_defs_cache()
+
+        visible = model_tools.get_tool_definitions(
+            enabled_toolsets=["browser"],
+            quiet_mode=True,
+        )
+        visible_names = {td["function"]["name"] for td in visible}
+        assert name not in visible_names
+        assert {"tool_search", "tool_describe", "tool_call"} <= visible_names
+
+        described = json.loads(model_tools.handle_function_call(
+            function_name="tool_describe",
+            function_args={"name": name},
+            enabled_toolsets=["browser"],
+        ))
+        assert described["name"] == name
+
+        called = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": name, "arguments": {"value": "verified"}},
+            enabled_toolsets=["browser"],
+        ))
+        assert called == {"ok": True, "value": "verified"}
+
+    def test_executor_scope_cache_isolated_by_pinned_policy(self, monkeypatch):
+        import model_tools
+        from agent.tool_executor import _tool_search_scoped_names
+        from tools.tool_search import ToolSearchConfig
+
+        defs = [_td("terminal"), _td("cronjob")]
+        monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kwargs: defs)
+        agent = SimpleNamespace(
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+            _tool_search_config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "defer_core_toolsets": ["cronjob"],
+            }),
+        )
+
+        assert "cronjob" in _tool_search_scoped_names(agent)
+
+        # Existing cached names cannot bleed into a different pinned policy.
+        agent._tool_search_config = ToolSearchConfig.from_raw({"enabled": "on"})
+        assert "cronjob" not in _tool_search_scoped_names(agent)
+
+    def test_explicit_pinned_policy_overrides_changed_live_config(self, monkeypatch):
+        import model_tools
+        from tools import tool_search as ts
+        from tools.registry import registry
+
+        name = "browser_pinned_policy_probe"
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+            schema=_td(name, "Pinned policy probe."),
+            toolset="browser",
+        )
+        original_core_names = ts._core_tool_names()
+        monkeypatch.setattr(
+            ts,
+            "_core_tool_names",
+            lambda: original_core_names | frozenset({name}),
+        )
+        live_changed = ts.ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_toolsets": ["browser"],
+        })
+        pinned = ts.ToolSearchConfig.from_raw({"enabled": "on"})
+        monkeypatch.setattr(ts, "load_config", lambda: live_changed)
+        model_tools._clear_tool_defs_cache()
+
+        visible = model_tools.get_tool_definitions(
+            enabled_toolsets=["browser"],
+            quiet_mode=True,
+            tool_search_config=pinned,
+        )
+        visible_names = {td["function"]["name"] for td in visible}
+        assert name in visible_names
+
+        model_tools._clear_tool_defs_cache()
+        live_visible = model_tools.get_tool_definitions(
+            enabled_toolsets=["browser"],
+            quiet_mode=True,
+        )
+        live_names = {td["function"]["name"] for td in live_visible}
+        assert name not in live_names
+
+    def test_core_name_discovery_failure_keeps_non_mcp_tools_visible(self, monkeypatch):
+        from tools import tool_search as ts
+        from tools.registry import registry
+
+        browser_name = "browser_core_discovery_failure_probe"
+        plugin_name = "plugin_core_discovery_failure_probe"
+        mcp_name = "mcp_core_discovery_failure_probe"
+        entries = {
+            browser_name: type("Entry", (), {"toolset": "browser"})(),
+            plugin_name: type("Entry", (), {"toolset": "plugin-probe"})(),
+            mcp_name: type("Entry", (), {"toolset": "mcp-probe"})(),
+        }
+        monkeypatch.setattr(ts, "_core_tool_names", lambda: frozenset())
+        monkeypatch.setattr(registry, "get_entry", lambda name: entries.get(name))
+        cfg = ts.ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_toolsets": ["browser"],
+        })
+
+        assert not ts.is_deferrable_tool_name(browser_name, config=cfg)
+        assert not ts.is_deferrable_tool_name(plugin_name, config=cfg)
+        assert ts.is_deferrable_tool_name(mcp_name, config=cfg)
 
 
 # ---------------------------------------------------------------------------
