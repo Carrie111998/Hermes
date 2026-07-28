@@ -3143,9 +3143,23 @@ class WorkflowEngine:
                 # ── Ready state (waiting for dispatcher) ──
                 if state.status == "ready":
                     # Card is waiting for the kanban dispatcher to claim it.
-                    # Nothing to do here — the dispatcher will pick it up.
-                    # We keep it in pending so we detect when it transitions
-                    # to "running" or "blocked".
+                    # Check actual card status — it may have transitioned to
+                    # "running" or "blocked" since our last poll.
+                    if state.kanban_card_id:
+                        try:
+                            card = self.get_card_status(state.kanban_card_id)
+                            card_status = card.get("status", "").lower()
+                            if card_status == "running":
+                                state.status = "running"
+                                state.started_at = datetime.now(timezone.utc).isoformat()
+                                continue
+                            elif card_status == "blocked":
+                                state.status = "blocked"
+                                continue
+                        except Exception:
+                            pass
+                    # Nothing to do — the dispatcher will pick it up.
+                    # We keep it in pending so we detect when it transitions.
                     continue
 
                 # ── Blocked state ──
