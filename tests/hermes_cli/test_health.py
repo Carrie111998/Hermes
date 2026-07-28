@@ -172,6 +172,20 @@ def test_state_db_snapshot_retries_across_wal_checkpoint(tmp_path, monkeypatch):
     assert row.status == "healthy"
 
 
+def test_state_db_snapshot_copies_rollback_journal(tmp_path):
+    db_path = tmp_path / "state.db"
+    snapshot_path = tmp_path / "snapshot" / "state.db"
+    snapshot_path.parent.mkdir()
+    db_path.write_bytes(b"database generation")
+    journal_path = Path(f"{db_path}-journal")
+    journal_path.write_bytes(b"rollback journal generation")
+
+    health_mod._copy_coherent_state_snapshot(db_path, snapshot_path)
+
+    assert snapshot_path.read_bytes() == db_path.read_bytes()
+    assert Path(f"{snapshot_path}-journal").read_bytes() == journal_path.read_bytes()
+
+
 def test_collect_health_critical_exit_two_for_bad_config(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()
@@ -204,6 +218,39 @@ def test_bad_config_diagnostic_does_not_disclose_source_line(tmp_path, monkeypat
         assert code == 2
         assert sentinel not in output
         assert "line 2, column 1" in output
+
+
+def test_bad_config_diagnostic_does_not_disclose_tag_or_alias(tmp_path):
+    home = tmp_path / "profile"
+    home.mkdir()
+    sqlite3.connect(home / "state.db").close()
+    sentinel = "SUPER_SECRET_CREDENTIAL_123"
+
+    for malformed in (
+        f"key: !{sentinel} value\n",
+        f"key: *{sentinel}\n",
+    ):
+        (home / "config.yaml").write_text(malformed, encoding="utf-8")
+        for output_args in (("--json",), ()):
+            proc = _run_health_cli(home, *output_args)
+            assert proc.returncode == 2, proc.stderr
+            assert sentinel not in proc.stdout
+            assert "config.yaml invalid" in proc.stdout
+
+
+def test_unexpected_health_failure_does_not_disclose_exception_text(monkeypatch, capsys):
+    sentinel = "SUPER_SECRET_CREDENTIAL_123"
+
+    def fail_collection():
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(health_mod, "collect_health", fail_collection)
+    for json_output in (True, False):
+        code = health_mod.run_health(SimpleNamespace(json=json_output, quiet=False))
+        output = capsys.readouterr().out
+        assert code == 2
+        assert sentinel not in output
+        assert "health collection failed (RuntimeError)" in output
 
 
 def test_collect_health_critical_exit_two_for_non_mapping_config(tmp_path, monkeypatch):

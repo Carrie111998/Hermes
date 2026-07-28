@@ -87,11 +87,8 @@ def _read_raw_config(config_path: Path) -> tuple[dict[str, Any] | None, HealthRo
         # ``str(MarkedYAMLError)`` includes the offending source line. Never
         # echo it: malformed config may contain credentials and health output
         # is commonly persisted by monitoring systems.
-        problem = getattr(exc, "problem", None)
         mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
         diagnostic = type(exc).__name__
-        if isinstance(problem, str) and problem:
-            diagnostic += f": {problem.replace(chr(10), ' ')[:160]}"
         location = ""
         if mark is not None:
             line = getattr(mark, "line", None)
@@ -170,24 +167,30 @@ def _sha256_file(path: Path) -> str:
 
 
 def _copy_coherent_state_snapshot(db_path: Path, snapshot_path: Path) -> None:
-    """Copy one unchanged DB/WAL generation without opening the live profile."""
-    wal_path = Path(f"{db_path}-wal")
-    snapshot_wal_path = Path(f"{snapshot_path}-wal")
+    """Copy one unchanged DB plus journal generation without opening the profile."""
+    sidecars = ("-wal", "-journal")
     for _attempt in range(3):
         snapshot_path.unlink(missing_ok=True)
-        snapshot_wal_path.unlink(missing_ok=True)
+        for suffix in sidecars:
+            Path(f"{snapshot_path}{suffix}").unlink(missing_ok=True)
         try:
             copied_db_hash = _copy_with_sha256(db_path, snapshot_path)
-            copied_wal_hash = (
-                _copy_with_sha256(wal_path, snapshot_wal_path)
-                if wal_path.exists()
-                else None
-            )
+            copied_sidecar_hashes = {}
+            for suffix in sidecars:
+                source = Path(f"{db_path}{suffix}")
+                copied_sidecar_hashes[suffix] = (
+                    _copy_with_sha256(source, Path(f"{snapshot_path}{suffix}"))
+                    if source.exists()
+                    else None
+                )
             source_db_hash = _sha256_file(db_path)
-            source_wal_hash = _sha256_file(wal_path) if wal_path.exists() else None
+            source_sidecar_hashes = {}
+            for suffix in sidecars:
+                source = Path(f"{db_path}{suffix}")
+                source_sidecar_hashes[suffix] = _sha256_file(source) if source.exists() else None
         except FileNotFoundError:
             continue
-        if copied_db_hash == source_db_hash and copied_wal_hash == source_wal_hash:
+        if copied_db_hash == source_db_hash and copied_sidecar_hashes == source_sidecar_hashes:
             return
     raise _StateDbSnapshotBusy("state.db changed while the read-only snapshot was copied")
 
@@ -404,6 +407,10 @@ def run_health(args) -> int:
     try:
         result = collect_health()
     except Exception as exc:
+        # Exception messages and arguments can contain config values, paths,
+        # credentials, or other user-controlled data. Keep automation output
+        # source-independent while retaining the exception class for triage.
+        diagnostic = type(exc).__name__
         result = {
             "schema_version": 1,
             "status": "critical",
@@ -413,7 +420,7 @@ def run_health(args) -> int:
             "hermes_version": HERMES_VERSION,
             "checks": [asdict(HealthRow(
                 "health_collection", "health collection", "critical",
-                f"health collection failed: {exc}", "run: hermes doctor",
+                f"health collection failed ({diagnostic})", "run: hermes doctor",
             ))],
         }
     if getattr(args, "json", False):
