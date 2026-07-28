@@ -7602,7 +7602,7 @@ def _kill_stale_dashboard_processes(
             # handle the restart; respawning with start_new_session=True
             # would detach the child from its supervisor (#73379).
             try:
-                with open(f"/proc/{pid}/status") as _f:
+                with open(f"/proc/{pid}/status", encoding="utf-8") as _f:
                     for _line in _f:
                         if _line.startswith("PPid:"):
                             pid_ppid[pid] = int(_line.split()[1])
