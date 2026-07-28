@@ -90,7 +90,7 @@ charterforge business payment-rails --test-webhook --rail nevermined
 
 **Goal:** Production-capable authority database with connection pooling
 
-**Status:** 🔶 Postgres authority store implemented. CI + integration tests pending.
+**Status:** 🔶 Postgres authority + DB CLI complete. Alembic migrations pending.
 
 ### Deliverables
 
@@ -101,22 +101,28 @@ charterforge business payment-rails --test-webhook --rail nevermined
   - Automatic backend detection (postgres vs sqlite)
   - Optional dependency: `charterforge[postgres]`
 
+- [x] **Database CLI Commands**
+  - `charterforge db init --postgres-url <url>`
+  - `charterforge db upgrade`
+  - `charterforge db status`
+  - Backend auto-detection + forced selection
+
+- [x] **CI Integration**
+  - Postgres service container in GH Actions
+  - Integration tests against real Postgres
+
 - [ ] **Schema Migration**
   - `alembic` migrations for authority tables
-  - Commands: `charterforge db upgrade`, `charterforge db downgrade`
-  - Initialize: `charterforge db init --postgres`
+  - `charterforge db downgrade` implementation
 
 - [ ] **Health Check**
   - `charterforge business readiness --check` validates Postgres connection
   - Dashboard: `/health` endpoint returns database status
 
-- [ ] **CI Integration**
-  - Postgres service container in GH Actions
-  - Integration tests against real Postgres
-
 ### Tests
 
-- 16 unit tests for authority operations
+- 16 authority operation tests (postgres_authority.py)
+- 8 db command tests (db_commands.py)
 - Schema isolation per test via unique search_path
 - Backend detection tests
 
