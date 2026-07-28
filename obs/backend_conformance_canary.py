@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -256,7 +257,19 @@ def run_canary(*, bus: Any = None) -> dict:
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO,
+    # stream=sys.stdout, NOT logging's default stderr. The wrapper
+    # (~/.hermes/ops/canary/canary-backend-conformance.ps1) runs this under
+    # PowerShell 5.1 as `& $python -m ... *>> $log`, and PS 5.1 wraps EVERY
+    # native-command stderr write in a NativeCommandError ErrorRecord — ~5 lines
+    # of `python.exe : ` / `At <script>:36 char:5` / CategoryInfo ceremony around
+    # each ordinary INFO line (2872 of them in the log by 2026-07-28). This is
+    # NOT a suppression: `*>>` still captures every stream, StreamHandler flushes
+    # on each record, and the `logger.exception("canary run failed")` traceback
+    # below now lands on stdout as plain readable text rather than a wrapped
+    # ErrorRecord. stderr is deliberately left untouched, so an interpreter-level
+    # failure (import error, hard crash) still emits a NativeCommandError — which
+    # from here on actually MEANS something instead of firing every 10 minutes.
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         results = run_canary()
