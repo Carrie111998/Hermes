@@ -388,11 +388,26 @@ def _read_openai_version_fast() -> str | None:
     return None
 
 
+_FAST_PROJECT_ROOT: str | None = None
+
+
+def _set_fast_project_root() -> None:
+    global _FAST_PROJECT_ROOT
+    if _FAST_PROJECT_ROOT is not None:
+        return
+    try:
+        _FAST_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        _FAST_PROJECT_ROOT = "<unknown>"
+
+
 def _print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
+    _set_fast_project_root()
+
     print(f"Hermes Agent v{__version__} ({__release_date__})")
-    print(f"Install directory: {PROJECT_ROOT}")
+    print(f"Install directory: {_FAST_PROJECT_ROOT}")
 
     print(f"Python: {sys.version.split()[0]}")
 
