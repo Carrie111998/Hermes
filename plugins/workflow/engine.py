@@ -1065,17 +1065,26 @@ class WorkflowEngine:
             lookup[nid] = st.result
 
         # ── Node metadata namespace ──
-        # Expose {nodes.<node-id>.name} — the node's ID with the short
-        # run ID appended, so YAML authors can reference a node's
-        # disambiguated name without manually appending {run_short_id}.
-        # e.g. {nodes.coder-implement.name} → "coder-implement (123456)"
+        # Expose {nodes.<node-id>.name} and {nodes.<node-id>.card_id}
+        # so YAML authors can reference a node's disambiguated name
+        # and its kanban task ID directly without manual template tricks.
+        # e.g. {nodes.coder-implement.name} → "coder-implement (185117)"
+        #      {nodes.coder-implement.card_id} → "t_abc1234"
         run_short_id = lookup.get("run_short_id", "")
         nodes_ns: dict[str, dict] = {}
         for nid in workflow.nodes:
+            entry: dict[str, str] = {}
             if run_short_id:
-                nodes_ns[nid] = {"name": f"{nid} ({run_short_id})"}
+                entry["name"] = f"{nid} ({run_short_id})"
             else:
-                nodes_ns[nid] = {"name": nid}
+                entry["name"] = nid
+            # Card ID — only available for dispatched nodes
+            st = states.get(nid)
+            if st and st.kanban_card_id:
+                entry["card_id"] = st.kanban_card_id
+            else:
+                entry["card_id"] = ""
+            nodes_ns[nid] = entry
         lookup["nodes"] = nodes_ns
 
         for phase_label, members in by_phase.items():
