@@ -1451,6 +1451,35 @@ def _tts_response_format_from_path(output_path: str) -> str:
     return "mp3"
 
 
+def _create_openai_speech_with_format_fallback(
+    client: Any,
+    create_kwargs: Dict[str, Any],
+) -> Any:
+    """Retry format-specific compatibility failures with universally supported MP3."""
+    try:
+        return client.audio.speech.create(**create_kwargs)
+    except Exception as exc:
+        requested_format = create_kwargs.get("response_format")
+        is_format_rejection = getattr(exc, "status_code", None) in (
+            400,
+            422,
+        ) and "response_format" in str(exc)
+        if requested_format in (None, "mp3") or not is_format_rejection:
+            raise
+
+        logger.info(
+            "TTS backend rejected response_format=%r (%s); retrying as mp3",
+            requested_format,
+            type(exc).__name__,
+        )
+        retry_kwargs = {
+            **create_kwargs,
+            "response_format": "mp3",
+            "extra_headers": {"x-idempotency-key": str(uuid.uuid4())},
+        }
+        return client.audio.speech.create(**retry_kwargs)
+
+
 # ===========================================================================
 # Provider: OpenAI TTS (also used by every OpenAI-compatible TTS endpoint —
 # DeepInfra delegates here via _generate_deepinfra_tts).
@@ -1559,7 +1588,7 @@ def _generate_openai_tts(
             create_kwargs["instructions"] = instructions
         if language:
             create_kwargs["extra_body"] = {"lang_code": language}
-        response = client.audio.speech.create(**create_kwargs)
+        response = _create_openai_speech_with_format_fallback(client, create_kwargs)
 
         response.stream_to_file(output_path)
         return output_path
