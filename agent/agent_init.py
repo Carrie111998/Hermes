@@ -1560,6 +1560,22 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Optional executable override for the Codex app-server runtime. Keep the
+    # default PATH lookup for ordinary installs, while allowing managed
+    # workstations to pin the same Codex build used by another long-lived
+    # client that shares CODEX_HOME. Mixing Codex versions against one
+    # models_cache.json can make an older process reject a cache schema written
+    # by a newer process before a turn ever reaches the model.
+    agent.codex_app_server_binary = "codex"
+    try:
+        _model_section = _agent_cfg.get("model", {})
+        if isinstance(_model_section, dict):
+            _codex_binary = str(_model_section.get("codex_binary") or "").strip()
+            if _codex_binary:
+                agent.codex_app_server_binary = _codex_binary
+    except Exception:
+        agent.codex_app_server_binary = "codex"
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

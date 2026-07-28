@@ -175,6 +175,19 @@ In a Hermes session:
 /codex-runtime codex_app_server
 ```
 
+Hermes normally launches `codex` from `PATH`. Managed installations with
+multiple Codex clients sharing one `CODEX_HOME` can pin the exact executable
+in `config.yaml`:
+
+```yaml
+model:
+  openai_runtime: codex_app_server
+  codex_binary: /absolute/path/to/codex
+```
+
+Use the same Codex build for clients that share `CODEX_HOME`; different
+versions can write incompatible model-cache schemas.
+
 That command:
 - Verifies the `codex` CLI is installed (blocks with an install hint if not).
 - Persists `model.openai_runtime: codex_app_server` to your config.yaml.

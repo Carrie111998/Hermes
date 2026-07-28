@@ -85,6 +85,41 @@ class TestApiModeAccepted:
         assert agent.client is None
         assert agent._client_kwargs == {}
 
+    def test_codex_binary_config_reaches_app_server_session(self, monkeypatch):
+        configured_binary = "/managed/codex"
+        captured = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"codex_binary": configured_binary}},
+        )
+
+        def capture_init(self, **kwargs):
+            captured.update(kwargs)
+            self.thread_id = None
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-configured-binary",
+                thread_id="thread-configured-binary",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", capture_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("use the configured binary")
+
+        assert result["completed"] is True
+        assert captured["codex_bin"] == configured_binary
+
+    def test_codex_binary_defaults_to_path_lookup(self):
+        agent = _make_codex_agent()
+        assert agent.codex_app_server_binary == "codex"
+
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):

@@ -873,6 +873,7 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_bin=getattr(agent, "codex_app_server_binary", "codex"),
             developer_instructions=developer_instructions,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
