@@ -1290,6 +1290,12 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # The profile home whose plugin config this manager was last
+        # discovered against (``""`` = the launch profile, discovered at
+        # process start). Used by :meth:`activate_for_profile` to skip a
+        # redundant force-reload when the requested profile is already
+        # active — see issue #73230.
+        self._active_profile_home: str = ""
 
     # -----------------------------------------------------------------------
     # Public
@@ -1332,6 +1338,34 @@ class PluginManager:
         except BaseException:
             self._discovered = False
             raise
+
+    def activate_for_profile(self, profile_home: str | Path | None) -> bool:
+        """Activate the selected profile's plugin configuration.
+
+        The global :class:`PluginManager` is discovered once at process start
+        against the launch profile's ``config.yaml``. A profile-neutral
+        Desktop backend that serves a *different* selected profile must
+        re-discover so the hook registry reflects the selected profile's
+        ``plugins.enabled`` — otherwise plugins enabled only for that profile
+        (e.g. Langfuse) never register their hooks and silently no-op for
+        Desktop sessions (#73230). CLI and Telegram sessions don't share the
+        defect because each runs under a single profile.
+
+        Must be called *within* ``profile_home``'s ``HERMES_HOME`` override
+        scope (the caller binds it around agent construction): discovery
+        reads config via :func:`hermes_constants.get_hermes_home`, which
+        honours that context-local override.
+
+        Returns ``True`` when re-discovery ran, ``False`` when the profile is
+        already the manager's active profile (no-op — avoids clearing and
+        reloading the registry for the launch profile on every agent build).
+        """
+        key = str(profile_home) if profile_home else ""
+        if key == self._active_profile_home:
+            return False
+        self._active_profile_home = key
+        self.discover_and_load(force=True)
+        return True
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -2063,6 +2097,17 @@ def discover_plugins(force: bool = False) -> None:
     manifests and reload state in the current process.
     """
     get_plugin_manager().discover_and_load(force=force)
+
+
+def activate_profile_plugins(profile_home: str | Path | None) -> bool:
+    """Activate the selected profile's plugin config in the global manager.
+
+    Thin wrapper around :meth:`PluginManager.activate_for_profile`. Must be
+    called within ``profile_home``'s ``HERMES_HOME`` override scope (the
+    caller binds it around agent construction). No-op when the profile is
+    already the manager's active profile. See issue #73230.
+    """
+    return get_plugin_manager().activate_for_profile(profile_home)
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:

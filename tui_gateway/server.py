@@ -5969,6 +5969,16 @@ def _make_agent(
     if synthetic is not None:
         return synthetic
 
+    # Activate the selected profile's plugin config before constructing the
+    # agent. The process-global PluginManager is discovered once at launch
+    # against the launch profile; a Desktop backend serving a different
+    # profile must re-discover under that profile's HERMES_HOME (bound by the
+    # caller around _make_agent) so profile-only plugins (e.g. Langfuse)
+    # register their hooks (#73230). No-op for the launch profile.
+    from hermes_cli.plugins import activate_profile_plugins
+
+    activate_profile_plugins(get_hermes_home_override())
+
     from run_agent import AIAgent
 
     # MCP tool discovery runs in a background daemon thread at startup so a
