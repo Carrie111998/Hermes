@@ -25,6 +25,7 @@ Design:
 
 import json
 import logging
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -86,6 +87,101 @@ from tools.threat_patterns import first_threat_message as _first_threat_message
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
     return _first_threat_message(content, scope="strict")
+
+
+# ---------------------------------------------------------------------------
+# Policy-claim detection
+# ---------------------------------------------------------------------------
+
+# Directive verbs/patterns paired with a model/provider name signal an
+# operational policy claim rather than a routine preference.  Matched via
+# word-boundary regex to avoid substring false positives (e.g. "kanban"
+# must not match "ban").
+_POLICY_CLAIM_DIRECTIVE_RE = re.compile(
+    r'\b(?:'
+    r'ban|bans|block|blocks|disable|disables|prohibit|prohibits'
+    r'|never\s+use|do\s+not\s+use|don\'t\s+use|must\s+not\s+use'
+    r'|stop\s+using|stopped\s+using|no\s+longer\s+use'
+    r'|removed?\s+from\s+(?:the\s+)?(?:chain|routing|fallback)'
+    r'|blacklist|blacklists|off-limits|deprecated?|discontinue'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Routing/use verbs — when these co-occur with permanence language and a
+# model name, the entry is treated as a routing directive.
+_ROUTING_VERB_RE = re.compile(
+    r'\b(?:use|route|send|direct|delegate|fallback)\b',
+    re.IGNORECASE,
+)
+
+# Broad model/provider name patterns.  Intentionally generous — false
+# positives cause a confirmation prompt, not data loss.
+_POLICY_CLAIM_MODEL_RE = re.compile(
+    r'\b(?:'
+    r'gpt-?\d[\w.-]*|o[13](?:-mini|-preview)?'
+    r'|claude|gemini|llama\d*|grok|deepseek'
+    r'|anthropic|openai|xai|google|meta'
+    r'|mistral|mi[rx]tral|codestral|cohere|perplexity'
+    r'|sonar|dbrx|command-r'
+    r'|nvidia|nemotron|qwq|qwen\d*|groq'
+    r'|doubao|kimi|ernie|spark|hunyuan|bedrock|azure'
+    r'|together|fireworks|replicate'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Absolute/durable language that signals permanence, not a one-time trial.
+# Only fires when ALSO paired with a routing/use verb (checked in the
+# classifier body) — "Going forward, use claude" is a routing directive;
+# "Going forward, claude is fast" is an observation.
+_POLICY_CLAIM_PERMANENCE_RE = re.compile(
+    r'\b(?:permanent|forever|indefinitely|from\s+now\s+on|going\s+forward)\b',
+    re.IGNORECASE,
+)
+
+
+def _detect_policy_claim(content: str) -> Optional[str]:
+    """Return a reason string if *content* looks like an unconfirmed
+    operational policy claim, or ``None`` if the content appears to be a
+    normal preference / note / correction.
+
+    An operational policy claim is one that:
+    - Names a specific model or provider
+    - Uses directive language (ban, block, disable, prohibit, never)
+    - OR uses absolute/durable language + routing verb about a model/provider
+
+    The caller is responsible for staging the write rather than allowing
+    it to flow through to disk unchecked.
+    """
+    if not content or not content.strip():
+        return None
+
+    lower = content.lower()
+
+    # Fast path: no model/provider name → not a policy claim.
+    if not _POLICY_CLAIM_MODEL_RE.search(lower):
+        return None
+
+    # Check for directive language about models/providers (word-boundary).
+    m = _POLICY_CLAIM_DIRECTIVE_RE.search(lower)
+    if m:
+        return (
+            f"contains '{m.group()}' paired with a model/provider name "
+            f"— looks like an operational policy claim"
+        )
+
+    # Check for absolute/durable language AND a routing/use verb —
+    # "Going forward, use claude" is a routing directive; "Going forward,
+    # claude is fast" is an observation.
+    if (_POLICY_CLAIM_PERMANENCE_RE.search(lower) and
+            _ROUTING_VERB_RE.search(lower)):
+        return (
+            "uses absolute/durable language plus a routing verb about a "
+            "model/provider — looks like a permanent routing directive"
+        )
+
+    return None
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
@@ -965,6 +1061,153 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     )
 
 
+def _check_policy_claim_gate(action: str, target: str, content: Optional[str],
+                             old_text: Optional[str]) -> Optional[str]:
+    """Stage writes that look like unconfirmed operational policy claims.
+
+    Runs AFTER the existing write-approval gate.  When the approval gate
+    is off (the default) and the content appears to be a model/provider
+    ban, prohibition, or permanent routing directive, the write is staged
+    instead of silently persisted.  The user can then review and approve
+    it via ``/memory pending``.
+
+    Returns a JSON tool-result string when the write should be staged,
+    or None when it is safe to proceed.
+    """
+    if action not in {"add", "replace"}:
+        return None
+    if not content or not content.strip():
+        return None
+
+    reason = _detect_policy_claim(content)
+    if reason is None:
+        return None
+
+    try:
+        from tools import write_approval as wa
+    except Exception as e:
+        logger.warning(
+            "Policy-claim gate: cannot import write_approval, "
+            "failing open (%s)", e,
+        )
+        return None
+
+    label = "user profile" if target == "user" else "memory"
+    summary = f"policy claim in {label}: {reason[:80]}"
+
+    payload: Dict[str, Any] = {
+        "action": action,
+        "target": target,
+        "content": content,
+        "old_text": old_text,
+    }
+    try:
+        record = wa.stage_write(
+            wa.MEMORY, payload,
+            summary=summary,
+            origin=wa.current_origin(),
+        )
+    except Exception as e:
+        logger.warning(
+            "Policy-claim gate: stage_write failed, failing open (%s)", e,
+        )
+        return None
+
+    logger.info("Policy-claim gate: staged claim (pending_id=%s, reason=%s)",
+                record.get("id"), reason)
+
+    return json.dumps(
+        {
+            "success": True,
+            "staged": True,
+            "policy_claim": True,
+            "pending_id": record["id"],
+            "message": (
+                f"Staged for confirmation — this entry looks like an "
+                f"operational policy claim ({reason}). It has been staged, "
+                f"not saved. Review with /memory pending. To confirm, the "
+                f"user must approve it explicitly."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _check_policy_claim_batch(
+    target: str, operations: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Stage a batch if any operation contains an unconfirmed policy claim.
+
+    Returns a JSON tool-result string when the entire batch should be
+    staged, or None when it is safe to proceed.
+    """
+    reasons = []
+    for op in operations:
+        op = op or {}
+        act = op.get("action", "?")
+        if act not in ("add", "replace"):
+            continue
+        c = op.get("content") or ""
+        if not c.strip():
+            continue
+        r = _detect_policy_claim(c)
+        if r:
+            reasons.append(f"{act}: {r}")
+
+    if not reasons:
+        return None
+
+    try:
+        from tools import write_approval as wa
+    except Exception as e:
+        logger.warning(
+            "Policy-claim batch gate: cannot import write_approval, "
+            "failing open (%s)", e,
+        )
+        return None
+
+    label = "user profile" if target == "user" else "memory"
+    summary = f"policy claim(s) in batch to {label}: {'; '.join(reasons)[:120]}"
+
+    payload: Dict[str, Any] = {
+        "action": "batch",
+        "target": target,
+        "operations": operations,
+    }
+    try:
+        record = wa.stage_write(
+            wa.MEMORY, payload,
+            summary=summary,
+            origin=wa.current_origin(),
+        )
+    except Exception as e:
+        logger.warning(
+            "Policy-claim batch gate: stage_write failed, failing open (%s)", e,
+        )
+        return None
+
+    logger.info(
+        "Policy-claim batch gate: staged batch (pending_id=%s, operations=%d)",
+        record.get("id"), len(operations),
+    )
+
+    return json.dumps(
+        {
+            "success": True,
+            "staged": True,
+            "policy_claim": True,
+            "pending_id": record["id"],
+            "message": (
+                f"Staged for confirmation — {len(reasons)} operation(s) in "
+                f"this batch look like operational policy claims. The batch "
+                f"has been staged, not saved. Review with /memory pending. "
+                f"To confirm, the user must approve it explicitly."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
     """Evaluate the write gate for a batch of memory operations.
 
@@ -1081,6 +1324,10 @@ def memory_tool(
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
+        # Policy-claim gate for batch operations (#64681).
+        policy_result = _check_policy_claim_batch(target, operations)
+        if policy_result is not None:
+            return policy_result
         result = store.apply_batch(target, operations)
         return json.dumps(result, ensure_ascii=False)
 
@@ -1106,6 +1353,14 @@ def memory_tool(
     gate_result = _apply_write_gate(action, target, content, old_text)
     if gate_result is not None:
         return gate_result
+
+    # Policy-claim gate: runs regardless of write_approval setting.
+    # If the content looks like an unconfirmed model/provider ban,
+    # prohibition, or permanent routing directive, stage it for user
+    # confirmation (issue #64681).
+    policy_result = _check_policy_claim_gate(action, target, content, old_text)
+    if policy_result is not None:
+        return policy_result
 
     if action == "add":
         result = store.add(target, content)

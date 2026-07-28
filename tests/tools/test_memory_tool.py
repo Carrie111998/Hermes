@@ -8,6 +8,8 @@ from tools.memory_tool import (
     MemoryStore,
     memory_tool,
     _scan_memory_content,
+    _detect_policy_claim,
+    MEMORY_SCHEMA,
 )
 
 
@@ -627,3 +629,127 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# Policy claim detection
+# =========================================================================
+
+class TestDetectPolicyClaim:
+    """Tests for _detect_policy_claim, the pre-write classifier that detects
+    unconfirmed operational policy claims (model/provider bans, prohibitions,
+    permanent routing directives) so they can be staged for user confirmation
+    rather than silently persisted (issue #64681).
+    """
+
+    @staticmethod
+    def _detect(content: str):
+        return _detect_policy_claim(content)
+
+    # ── Positive cases: should trigger ──
+
+    def test_ban_model(self):
+        """'User bans gpt-5.6-sol' should be detected as a policy claim."""
+        assert self._detect("User bans gpt-5.6-sol") is not None
+
+    def test_block_provider(self):
+        """'Block OpenAI provider' should be detected."""
+        assert self._detect("Block OpenAI provider from now on") is not None
+
+    def test_never_use_model(self):
+        """'never use claude sonnet' should be detected."""
+        assert self._detect("never use claude sonnet") is not None
+
+    def test_disable_model(self):
+        """'Disable gemini models entirely' should be detected."""
+        assert self._detect("Disable gemini models entirely") is not None
+
+    def test_prohibit_provider(self):
+        """'prohibit anthropic routing' should be detected."""
+        assert self._detect("prohibit anthropic routing") is not None
+
+    def test_permanent_ban(self):
+        """'permanent ban on gpt-5.6-sol' should be detected."""
+        assert self._detect("permanent ban on gpt-5.6-sol") is not None
+
+    def test_going_forward_routing(self):
+        """Absolute durability language about a model should be detected."""
+        assert self._detect("Going forward, use only claude for code review") is not None
+
+    # ── Negative cases: should NOT trigger ──
+
+    def test_normal_preference(self):
+        """A routine preference should not be detected."""
+        assert self._detect("User prefers compact responses") is None
+
+    def test_markdown_preference(self):
+        """A formatting preference should not be detected."""
+        assert self._detect("Use markdown for code blocks") is None
+
+    def test_model_mention_no_directive(self):
+        """Just mentioning a model is fine."""
+        assert self._detect("The gpt-5.6 model is fast") is None
+
+    def test_role_mapping(self):
+        """The role-mapping pattern from the incident should not trigger."""
+        assert self._detect("Sol=complex; Terra=RFQ; Luna=routine") is None
+
+    def test_always_prefer_no_model(self):
+        """'always prefer' without a model/provider name should not trigger."""
+        assert self._detect("always prefer bullet points in responses") is None
+
+    def test_only_speaks(self):
+        """'only speaks' pattern (not routing) should not trigger."""
+        assert self._detect("User only speaks English") is None
+
+    def test_remove_stale_entries(self):
+        """'remove' about old projects (not a model) should not trigger."""
+        assert self._detect("remove stale memory entries about old projects") is None
+
+    def test_ban_without_model_name(self):
+        """'ban' without a model/provider name should not trigger."""
+        assert self._detect("User bans all caps in responses") is None
+
+    def test_empty_content(self):
+        """Empty content should not trigger."""
+        assert self._detect("") is None
+        assert self._detect("   ") is None
+
+    # ── Reviewer-found edge cases ──
+
+    def test_kanban_substring_false_positive(self):
+        """'kanban' should NOT match 'ban' substring (word-boundary regex)."""
+        assert self._detect(
+            "Track claude tasks on the kanban board"
+        ) is None
+
+    def test_codeblock_substring_false_positive(self):
+        """'codeblock' should NOT match 'block' substring."""
+        assert self._detect(
+            "Format gemini output in a codeblock"
+        ) is None
+
+    def test_going_forward_no_routing_verb(self):
+        """Permanence language without a routing verb should not trigger."""
+        assert self._detect(
+            "Going forward, claude gives concise code reviews"
+        ) is None
+
+    def test_going_forward_with_routing_verb(self):
+        """Permanence language WITH a routing verb should trigger."""
+        assert self._detect(
+            "Going forward, use claude for code reviews"
+        ) is not None
+
+    def test_model_with_digits_no_hyphen(self):
+        """'gpt5' without hyphen should be detected."""
+        assert self._detect("stop using gpt5 for routing") is not None
+
+    def test_missing_models(self):
+        """Models like 'qwen', 'groq' added per review should be detected."""
+        assert self._detect("never use qwen for code") is not None
+        assert self._detect("block groq routing") is not None
+
+    def test_dont_use_contraction(self):
+        """Contraction 'don't use' should be detected."""
+        assert self._detect("don't use gemini anymore") is not None
