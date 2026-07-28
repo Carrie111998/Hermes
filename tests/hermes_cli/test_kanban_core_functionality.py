@@ -543,10 +543,25 @@ def test_task_age_helper(kanban_home):
     try:
         tid = kb.create_task(conn, title="x")
         task = kb.get_task(conn, tid)
+        assert task is not None
         age = kb.task_age(task)
         assert age["created_age_seconds"] is not None
         assert age["started_age_seconds"] is None
         assert age["time_to_complete_seconds"] is None
+    finally:
+        conn.close()
+
+
+def test_task_age_ignores_completion_without_valid_start(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="corrupt timestamps")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        task.created_at = "%s"
+        task.started_at = "bad"
+        task.completed_at = int(time.time())
+        assert kb.task_age(task)["time_to_complete_seconds"] is None
     finally:
         conn.close()
 

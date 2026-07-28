@@ -3168,8 +3168,9 @@ def create_task(
                             project_repo, ".worktrees", task_id
                         )
                     if not branch_name:
-                        # _pdb was imported above when project_obj was resolved.
                         try:
+                            from hermes_cli import projects_db as _pdb
+
                             branch_name = _pdb.branch_name_for(
                                 project_obj, task_id, title=title or ""
                             )
@@ -4060,7 +4061,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def recompute_ready(
     conn: sqlite3.Connection,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -7908,7 +7909,7 @@ def _record_task_failure(
     error: str,
     *,
     outcome: str,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
@@ -8081,7 +8082,7 @@ def _record_spawn_failure(
     task_id: str,
     error: str,
     *,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
 ) -> bool:
     return _record_task_failure(
         conn,
@@ -9289,7 +9290,9 @@ def _default_spawn(
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if _IS_WINDOWS
+            else 0,
         )
     except FileNotFoundError:
         log_f.close()
@@ -9706,7 +9709,8 @@ def task_age(task: Task) -> dict:
     _co = _to_epoch(task.completed_at)
     age_since_created = now - _c if _c is not None else None
     age_since_started = now - _s if _s is not None else None
-    time_to_complete = _co - (_s or _c) if _co is not None else None
+    start = _s or _c
+    time_to_complete = _co - start if _co is not None and start is not None else None
     return {
         "created_age_seconds": age_since_created,
         "started_age_seconds": age_since_started,
