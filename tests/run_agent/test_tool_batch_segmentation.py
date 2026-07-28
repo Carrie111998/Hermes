@@ -146,11 +146,10 @@ class TestPlanToolBatchSegments:
             _tc("web_search", call_id="r2"),
         ]
         segments = _plan_tool_batch_segments(calls)
-        # w2 conflicts with w1 → closes the first run; w2+r2 form the second.
-        assert _kinds(segments) == ["parallel", "parallel"]
+        # write_file is always a sequential barrier regardless of path overlap.
+        assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[0][1]] == ["w1", "r1"]
         assert [tc.id for tc in segments[1][1]] == ["w2", "r2"]
-        # Order and completeness preserved.
         assert _flatten_ids(segments) == ["w1", "r1", "w2", "r2"]
 
     def test_path_scoped_tool_without_path_is_a_barrier(self):
@@ -469,11 +468,11 @@ class TestPathCanonicalization:
 
         # With execution_cwd supplied the relative path resolves under exec_cwd.
         path_with_cwd = _extract_parallel_scope_path(
-            "write_file", {"path": "x.txt"}, execution_cwd=exec_cwd
+            "read_file", {"path": "x.txt"}, execution_cwd=exec_cwd
         )
         # The absolute path under exec_cwd must match.
         path_absolute = _extract_parallel_scope_path(
-            "write_file", {"path": str(exec_cwd / "x.txt")}
+            "read_file", {"path": str(exec_cwd / "x.txt")}
         )
 
         assert path_with_cwd is not None

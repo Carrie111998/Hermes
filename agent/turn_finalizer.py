@@ -410,18 +410,32 @@ def finalize_turn(
     # the truth is surfaced on every turn, so over-claiming is
     # structurally impossible past the model.
     #
-    # Gate: only applied when a real text response exists for this
-    # turn and the user didn't interrupt.  Empty/interrupted turns
-    # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
-        try:
-            _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
-            if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
+    # Gate: append when failures remain.  Interrupted/empty turns still
+    # surface the advisory (fail closed).
+    try:
+        from agent.file_mutation_verifier import sync_legacy_failed_state
+
+        sync_legacy_failed_state(agent)
+        _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
+        if _failed and agent._file_mutation_verifier_enabled():
+            footer = agent._format_file_mutation_failure_footer(_failed)
+            if footer:
+                if final_response:
                     final_response = final_response.rstrip() + "\n\n" + footer
-        except Exception as _ver_err:
-            logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+                else:
+                    final_response = footer
+    except Exception as _ver_err:
+        logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+        try:
+            if agent._file_mutation_verifier_enabled():
+                from agent.file_mutation_verifier import _GENERIC_FOOTER_FALLBACK
+
+                if final_response:
+                    final_response = final_response.rstrip() + "\n\n" + _GENERIC_FOOTER_FALLBACK
+                else:
+                    final_response = _GENERIC_FOOTER_FALLBACK
+        except Exception:
+            pass
 
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content
@@ -612,6 +626,15 @@ def finalize_turn(
     # (the response is still returned either way — #8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
+    try:
+        from agent.file_mutation_verifier import get_verifier
+
+        _verifier = get_verifier(agent)
+        if _verifier is not None:
+            _verifier.clear_turn()
+        agent._file_mutation_verifier = None
+    except Exception:
+        pass
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.

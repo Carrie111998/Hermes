@@ -3195,42 +3195,58 @@ class AIAgent:
         args: Dict[str, Any],
         result: Any,
         is_error: bool,
+        *,
+        raw_result: Any = None,
+        dispatch: Optional[str] = None,
+        blocked: bool = False,
+        effective_task_id: str = "default",
+        turn_generation: Optional[int] = None,
     ) -> None:
-        """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
+        """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier."""
+        from agent.file_mutation_verifier import (
+            DispatchTriState,
+            ensure_verifier,
+            sync_legacy_failed_state,
+        )
 
-        On failure, store ``{path: {error_preview, tool}}`` entries.  On
-        success, remove any prior failure entries for the same paths (the
-        model recovered within the turn).  Silently no-ops if the per-turn
-        state dict hasn't been initialised yet (e.g. a tool dispatched
-        outside ``run_conversation``).
-        """
-        if tool_name not in _FILE_MUTATING_TOOLS:
-            return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
             return
-        targets = _extract_file_mutation_targets(tool_name, args)
-        if not targets:
-            return
-        landed = file_mutation_result_landed(tool_name, result)
-        if landed:
-            changed = getattr(self, "_turn_file_mutation_paths", None)
-            if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
-        if is_error and not landed:
-            preview = _extract_error_preview(result)
-            for path in targets:
-                # Keep the FIRST error we saw for a given path unless we
-                # later see success.  A repeated failure with a different
-                # message shouldn't silently overwrite the original.
-                if path not in state:
-                    state[path] = {
-                        "tool": tool_name,
-                        "error_preview": preview,
-                    }
+
+        verifier = ensure_verifier(self)
+        if dispatch is None:
+            tri = (
+                DispatchTriState.NOT_DISPATCHED
+                if blocked
+                else DispatchTriState.DISPATCHED
+            )
         else:
-            for path in targets:
-                state.pop(path, None)
+            tri = DispatchTriState(dispatch)
+        raw = raw_result if raw_result is not None else result
+        verifier.record_tool_outcome(
+            tool_name=tool_name,
+            effective_args=args,
+            effective_task_id=effective_task_id or "default",
+            raw_result=raw,
+            dispatch=tri,
+            model_is_error=is_error,
+            blocked=blocked,
+            turn_generation=turn_generation,
+        )
+        verifier.observe_after_tool(
+            tool_name=tool_name,
+            effective_task_id=effective_task_id or "default",
+            blocked=blocked,
+        )
+        sync_legacy_failed_state(self)
+        if tool_name in _FILE_MUTATING_TOOLS and not blocked and tri is DispatchTriState.DISPATCHED:
+            landed = file_mutation_result_landed(tool_name, raw)
+            if landed:
+                changed = getattr(self, "_turn_file_mutation_paths", None)
+                if changed is not None:
+                    changed.update(
+                        _extract_landed_file_mutation_paths(tool_name, args, raw)
+                    )
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
@@ -3302,32 +3318,14 @@ class AIAgent:
         bare-path media extractor can never auto-attach a protected file
         (e.g. ``~/.hermes/config.yaml``) to a messaging channel (#35584).
         """
+        from agent.file_mutation_verifier import format_failure_footer
+
         if not failed:
             return ""
-        lines = [
-            "⚠️ File-mutation verifier: "
-            f"{len(failed)} file(s) were NOT modified this turn despite any "
-            "wording above that may suggest otherwise. Run `git status` or "
-            "`read_file` to confirm."
-        ]
-        shown = 0
-        for path, info in failed.items():
-            if shown >= 10:
-                break
-            preview = (info.get("error_preview") or "").strip()
-            tool = info.get("tool") or "patch"
-            if preview:
-                lines.append(f"  • `{path}` — [{tool}] {preview}")
-            else:
-                lines.append(f"  • `{path}` — [{tool}] failed")
-            shown += 1
-        remaining = len(failed) - shown
-        if remaining > 0:
-            lines.append(f"  • … and {remaining} more")
-        # Neutralize any path the preview text echoed (the bullet path is
-        # already backticked above; the lookbehind keeps it from being
-        # double-wrapped).
-        return cls._neutralize_footer_paths("\n".join(lines))
+        return format_failure_footer(
+            dict(failed),
+            format_paths=cls._neutralize_footer_paths,
+        )
 
     def _turn_completion_explainer_enabled(self) -> bool:
         """Check whether the end-of-turn completion explainer footer is on.

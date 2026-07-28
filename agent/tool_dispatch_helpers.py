@@ -57,8 +57,10 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "web_search",
 })
 
-# File tools can run concurrently when they target independent paths.
-_PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
+# Read-only path tools can run concurrently when they target independent paths.
+# Structured mutations (write_file/patch) are always sequential barriers —
+# request/execution middleware may alias paths after planning.
+_PATH_SCOPED_TOOLS = frozenset({"read_file"})
 
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(
@@ -149,6 +151,10 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
         tool_name = tool_call.function.name
 
         if tool_name in _NEVER_PARALLEL_TOOLS:
+            _add_sequential(tool_call)
+            continue
+
+        if tool_name in _FILE_MUTATING_TOOLS:
             _add_sequential(tool_call)
             continue
 
@@ -353,26 +359,20 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
         body = args.get("patch") or ""
         if not isinstance(body, str) or not body:
             return []
+        try:
+            from tools.patch_parser import OperationType, parse_v4a_patch
+
+            operations, parse_error = parse_v4a_patch(body)
+        except Exception:
+            return []
+        if parse_error:
+            return []
         paths: List[str] = []
-        for _m in re.finditer(
-            r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            p = _m.group(1).strip()
-            if p:
-                paths.append(p)
-        for _m in re.finditer(
-            r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            src = _m.group(1).strip()
-            dst = _m.group(2).strip()
-            if src:
-                paths.append(src)
-            if dst:
-                paths.append(dst)
+        for op in operations:
+            if op.file_path:
+                paths.append(op.file_path)
+            if op.operation == OperationType.MOVE and op.new_path:
+                paths.append(op.new_path)
         return paths
     return []
 

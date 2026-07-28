@@ -119,17 +119,14 @@ class TestExtractErrorPreview:
 
 
 def _bare_agent() -> AIAgent:
-    """Skip __init__ and only attach the per-turn state dict.
+    """Skip __init__ and only attach the per-turn state dict."""
+    from agent.file_mutation_verifier import TurnFileMutationVerifier
 
-    AIAgent.__init__ takes ~60 parameters and touches network, auth, and
-    the filesystem.  For these tests we only need the two methods —
-    ``_record_file_mutation_result`` and ``_format_file_mutation_failure_footer``.
-    Using ``object.__new__`` mirrors the gateway-test pattern documented in
-    the agent pitfalls list.
-    """
     agent = object.__new__(AIAgent)
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    agent._file_mutation_verifier = TurnFileMutationVerifier()
+    agent._file_mutation_verifier.reset_turn(1)
     return agent
 
 
@@ -285,15 +282,20 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "x"}), is_error=True,
         )
 
-    def test_missing_path_arg_recorded_nowhere(self):
+    def test_missing_path_arg_fails_closed(self):
         agent = _bare_agent()
         agent._record_file_mutation_result(
             "patch", {"mode": "replace"},  # no path
             json.dumps({"error": "path required"}), is_error=True,
         )
-        # No path → nothing to key on, state stays empty.  The per-turn
-        # state is about file paths, not individual tool-call IDs.
-        assert agent._turn_failed_file_mutations == {}
+        # No parseable path → fail closed: record an unknown-target entry
+        # so the failure still surfaces in the turn-end footer instead of
+        # being dropped.
+        failed = agent._turn_failed_file_mutations
+        assert list(failed) == ["(unknown file-mutation target)"]
+        entry = failed["(unknown file-mutation target)"]
+        assert entry["tool"] == "patch"
+        assert "path required" in entry["error_preview"]
 
 
 # ---------------------------------------------------------------------------

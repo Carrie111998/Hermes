@@ -20,6 +20,7 @@ Public API (signatures preserved from the original 2,400-line version):
     check_tool_availability(quiet) -> tuple
 """
 
+import contextvars
 import os
 import json
 import re
@@ -28,6 +29,28 @@ import logging
 import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
+
+_tool_registry_dispatched: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "tool_registry_dispatched",
+    default=False,
+)
+
+
+def begin_tool_registry_dispatch_tracking() -> contextvars.Token:
+    """Reset per-tool dispatch tracking (thread/task-local)."""
+    return _tool_registry_dispatched.set(False)
+
+
+def end_tool_registry_dispatch_tracking(token: contextvars.Token) -> None:
+    _tool_registry_dispatched.reset(token)
+
+
+def mark_tool_registry_dispatched() -> None:
+    _tool_registry_dispatched.set(True)
+
+
+def tool_registry_was_dispatched() -> bool:
+    return bool(_tool_registry_dispatched.get())
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -1327,6 +1350,7 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    mark_tool_registry_dispatched()
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1335,6 +1359,7 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    mark_tool_registry_dispatched()
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
