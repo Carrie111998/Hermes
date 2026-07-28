@@ -6917,13 +6917,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
 
 
+    def _bind_secret_capture_lifecycle(self) -> None:
+        """Bind this CLI's secret callback until lifecycle shutdown."""
+        if getattr(self, "_secret_capture_context_token", None) is not None:
+            return
+        self._secret_capture_context_token = bind_secret_capture_callback(
+            self._secret_capture_callback
+        )
+
+    def _reset_secret_capture_lifecycle(self) -> None:
+        """Restore the callback that preceded this CLI lifecycle."""
+        token = getattr(self, "_secret_capture_context_token", None)
+        if token is None:
+            return
+        self._secret_capture_context_token = None
+        reset_secret_capture_callback(token)
+
     def _install_tool_callbacks(self) -> None:
         """Install tool callbacks that need the live prompt UI."""
         if getattr(self, "_tool_callbacks_installed", False):
             return
         set_sudo_password_callback(self._sudo_password_callback)
         set_approval_callback(self._approval_callback)
-        set_secret_capture_callback(self._secret_capture_callback)
+        self._bind_secret_capture_lifecycle()
         try:
             from tools.computer_use_tool import set_approval_callback as _set_cu_cb
 
@@ -13125,8 +13141,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             The agent's response, or None on error
         """
         # Single-query and direct chat callers do not go through run(), so
-        # register secure secret capture here as well.
-        set_secret_capture_callback(self._secret_capture_callback)
+        # establish the same scoped lifecycle binding here as well.
+        self._bind_secret_capture_lifecycle()
 
         # Reset the per-turn interrupt flag. Any subsequent path that
         # discovers an interrupt (below, after run_conversation) will flip
@@ -16968,7 +16984,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Unregister callbacks to avoid dangling references
             set_sudo_password_callback(None)
             set_approval_callback(None)
-            set_secret_capture_callback(None)
+            self._reset_secret_capture_lifecycle()
             # Flush any in-memory turn transcript before marking the session
             # closed.  On SIGHUP/SIGTERM/window close the agent thread may not
             # reach its normal run_conversation() persistence path before the

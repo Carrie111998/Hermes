@@ -4,10 +4,13 @@ import time
 from unittest.mock import patch
 
 import cli as cli_module
-import tools.skills_tool as skills_tool_module
 from cli import HermesCLI
 from hermes_cli.callbacks import prompt_for_secret
-from tools.skills_tool import set_secret_capture_callback
+from tools.skills_tool import (
+    _get_secret_capture_callback,
+    bind_secret_capture_callback,
+    reset_secret_capture_callback,
+)
 
 
 class _FakeBuffer:
@@ -122,7 +125,7 @@ def test_secret_capture_timeout_clears_hidden_input_buffer():
     assert cleared["value"] is True
 
 
-def test_cli_chat_registers_secret_capture_callback():
+def test_cli_chat_restores_outer_secret_capture_callback_on_lifecycle_reset():
     clean_config = {
         "model": {
             "default": "anthropic/claude-opus-4.6",
@@ -134,17 +137,25 @@ def test_cli_chat_registers_secret_capture_callback():
         "terminal": {"env_type": "local"},
     }
 
-    with patch("cli.get_tool_definitions", return_value=[]), patch.dict(
-        "os.environ", {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}, clear=False
-    ), patch.dict(cli_module.__dict__, {"CLI_CONFIG": clean_config}):
-        cli_obj = HermesCLI()
-        with patch.object(cli_obj, "_ensure_runtime_credentials", return_value=False):
-            cli_obj.chat("hello")
-
+    outer_callback = object()
+    outer_token = bind_secret_capture_callback(outer_callback)
+    cli_obj = None
     try:
-        assert (
-            skills_tool_module._get_secret_capture_callback()
-            == cli_obj._secret_capture_callback
-        )
+        with patch("cli.get_tool_definitions", return_value=[]), patch.dict(
+            "os.environ", {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}, clear=False
+        ), patch.dict(cli_module.__dict__, {"CLI_CONFIG": clean_config}):
+            cli_obj = HermesCLI()
+            with patch.object(cli_obj, "_ensure_runtime_credentials", return_value=False):
+                cli_obj.chat("hello")
+                cli_obj.chat("hello again")
+
+        assert _get_secret_capture_callback() == cli_obj._secret_capture_callback
+        cli_obj._reset_secret_capture_lifecycle()
+        assert _get_secret_capture_callback() is outer_callback
     finally:
-        set_secret_capture_callback(None)
+        if (
+            cli_obj is not None
+            and getattr(cli_obj, "_secret_capture_context_token", None) is not None
+        ):
+            cli_obj._reset_secret_capture_lifecycle()
+        reset_secret_capture_callback(outer_token)
