@@ -38,7 +38,16 @@ const debugEntry = (command: string, env: Record<string, string>) =>
 
 export default defineConfig(({ command }) => ({
   base: './',
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    {
+      name: 'resolve-shiki-root',
+      resolveId(id) {
+        return id === 'shiki' ? path.resolve(__dirname, '../../node_modules/shiki/dist/index.mjs') : null
+      }
+    }
+  ],
   css: {
     // Pin an explicit (empty) PostCSS config. Tailwind is handled entirely by
     // `@tailwindcss/vite`, so the renderer needs no PostCSS plugins — and
