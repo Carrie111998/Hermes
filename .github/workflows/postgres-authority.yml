@@ -75,10 +75,13 @@ jobs:
               issue_permit, consume_permit, revoke_permit,
               record_effect, get_effect,
               get_active_runs, cleanup_expired_claims,
-              get_authority_backend, SCHEMA_VERSION
+              create_tenant, get_tenant, suspend_tenant,
+              activate_tenant, check_tenant_claim_quota,
+              get_authority_backend, DEFAULT_TENANT_ID, SCHEMA_VERSION
           )
           print(f'✓ postgres_authority module loaded')
           print(f'  Schema version: {SCHEMA_VERSION}')
+          print(f'  Default tenant: {DEFAULT_TENANT_ID}')
           print(f'  Backend detection: {get_authority_backend()}')
           "
 
