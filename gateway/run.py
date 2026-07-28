@@ -23950,6 +23950,37 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+def _discover_hooks_before_protected_result_recovery(
+    profile_homes: list[Any] | None = None,
+) -> None:
+    """Reach pending outbound attestation capture before recovery can block.
+
+    This deliberately uses throwaway registries: discovery may capture a
+    prepared release, but adapters and cron remain stopped until the durable
+    protected-result recovery gate below succeeds.
+    """
+    from gateway.hooks import HookRegistry
+    from hermes_cli.config import get_hermes_home
+
+    homes = profile_homes or [None]
+    for home in homes:
+        if isinstance(home, tuple):
+            if len(home) != 2 or not isinstance(home[1], (str, os.PathLike)):
+                continue
+            path = home[1]
+        else:
+            path = home
+        profile_home = get_hermes_home() if path is None else Path(path)
+        try:
+            HookRegistry(hooks_dir=profile_home / "hooks").discover_and_load()
+        except Exception as exc:
+            logger.warning(
+                "Gateway hook discovery before protected-result recovery failed for %s: %s",
+                profile_home,
+                exc,
+            )
+
+
 def _recover_protected_final_results_at_gateway_startup(profile_homes: list[Any] | None = None) -> list[str]:
     """Drain durable observers once before the Gateway admits new work."""
     from cron.scheduler import recover_protected_final_result_repairs_for_home
@@ -24473,6 +24504,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         except Exception as exc:
             logger.error("Could not resolve multiplex Profiles for protected-result recovery: %s", exc)
             return False
+    _discover_hooks_before_protected_result_recovery(multiplex_profile_homes)
     recovery_errors = (
         _recover_protected_final_results_at_gateway_startup(multiplex_profile_homes)
         if multiplex_profile_homes

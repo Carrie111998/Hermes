@@ -18,9 +18,30 @@ from gateway.outbound_boundary import (
 
 
 def _activate(hook_dir):
+    keg = hook_dir.parents[1] / "Cellar" / "hermes-agent-kit" / "1.0.0"
+    runtime_root = keg / "libexec"
+    runtime_scripts = runtime_root / "scripts"
+    runtime_scripts.mkdir(parents=True, exist_ok=True)
+    seam = runtime_scripts / "outbound_actionable_seam.py"
+    seam.write_text("# activated runtime seam\n", encoding="utf-8")
+    seam_sha = hashlib.sha256(seam.read_bytes()).hexdigest()
+    module_hashes = {"outbound_actionable_seam.py": seam_sha}
+    generation = hashlib.sha256(
+        json.dumps(module_hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    runtime_identity = {
+        "generation_sha256": generation,
+        "module_hashes": module_hashes,
+        "entry_path": str(seam.absolute()),
+        "executed_sha256": seam_sha,
+        "selected_source": "homebrew_keg",
+        "precedence_reason": "activated_release",
+        "raw_root": str(runtime_root.absolute()),
+        "canonical_root": str(runtime_root.resolve()),
+    }
     version_tuple = {
         "hak_commit": "h", "hak_tag": "v", "hak_source_path": "source", "hak_archive_path": "archive", "hak_archive_sha256": "sha256:archive",
-        "homebrew_keg_path": "keg", "homebrew_keg_sha256": "sha256:keg", "core_commit": "core",
+        "homebrew_keg_path": str(keg.absolute()), "homebrew_keg_sha256": "sha256:keg", "core_commit": "core",
         "core_runtime_path": "runtime", "core_patch_path": "patch", "core_patch_sha256": "sha256:patch",
     }
     from gateway.outbound_boundary import _release_tuple_digest
@@ -54,24 +75,27 @@ def _activate(hook_dir):
         ).hexdigest(),
     }), encoding="utf-8")
     os.chmod(release, 0o600)
+    file_fingerprint = {
+        name: "sha256:" + hashlib.sha256((hook_dir / name).read_bytes()).hexdigest()
+        for name in (
+            "HOOK.yaml", "handler.py", "kit-bundle-manifest.json", "kit-root.txt",
+            "kit_root_paths.py", "runtime_loader_attestation.py", "release-tuple.json",
+        )
+    }
     shared = hook_dir.parents[1] / "shared-activation.json"
     payload = {
         "schema_version": "outbound-actionable-dual-activation/v1",
         "tuple_digest": tuple_digest,
         "version_tuple": version_tuple,
         "profiles": [
-            {"profile_id": "atlas", "hook_dir": str(hook_dir.absolute()), "fingerprint": {
-                name: "sha256:" + hashlib.sha256((hook_dir / name).read_bytes()).hexdigest()
-                for name in (
-                    "HOOK.yaml", "handler.py", "kit-bundle-manifest.json", "kit-root.txt",
-                    "kit_root_paths.py", "runtime_loader_attestation.py", "release-tuple.json",
-                )
-            } | {
-                "kit_root_paths": "sha256:resolver",
-                "runtime_loader_identity": "sha256:runtime-identity",
-                "runtime_loader_generation": "sha256:runtime-generation",
-            }, "runtime_identity": {}},
-            {"profile_id": "yuange", "hook_dir": str(hook_dir.parent / "peer"), "fingerprint": {}, "runtime_identity": {}},
+            {"profile_id": "atlas", "hook_dir": str(hook_dir.absolute()), "fingerprint": file_fingerprint | {
+                "kit_root_paths": file_fingerprint["kit_root_paths.py"].removeprefix("sha256:"),
+                "runtime_loader_identity": "sha256:" + hashlib.sha256(
+                    json.dumps(runtime_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "runtime_loader_generation": generation,
+            }, "runtime_identity": runtime_identity},
+            {"profile_id": "yuange", "hook_dir": str(hook_dir.parent / "peer"), "fingerprint": {}, "runtime_identity": runtime_identity},
         ],
     }
     data = json.dumps(payload, sort_keys=True).encode("utf-8") + b"\n"
@@ -272,9 +296,9 @@ def test_pending_capture_executes_the_verified_handler_bytes_after_path_replacem
     from gateway import outbound_boundary
     original_exec = outbound_boundary._exec_pinned_handler
 
-    def replace_after_read(module_name, handler, source):
+    def replace_after_read(module_name, handler, source, **kwargs):
         (hook_dir / "handler.py").write_text("raise RuntimeError('replacement executed')\n", encoding="utf-8")
-        return original_exec(module_name, handler, source)
+        return original_exec(module_name, handler, source, **kwargs)
 
     monkeypatch.setattr(outbound_boundary, "_exec_pinned_handler", replace_after_read)
     outbound_boundary.capture_pending_outbound_attestation(hook_dir)
@@ -490,8 +514,8 @@ def test_inert_capture_requires_a_well_formed_external_preparation_record(tmp_pa
     assert outbound_boundary._prepared_release_for_hook(hook_dir) is None
 
 
-@pytest.mark.parametrize("peer_count", [0, 2])
-def test_prepared_manifest_accepts_nonempty_unique_ordered_profiles(tmp_path, peer_count):
+@pytest.mark.parametrize("peer_count", [1, 2])
+def test_prepared_manifest_accepts_at_least_two_unique_ordered_profiles(tmp_path, peer_count):
     from gateway import outbound_boundary
 
     hook_dir = tmp_path / "hooks" / "outbound-actionable"
@@ -515,7 +539,7 @@ def test_prepared_manifest_accepts_nonempty_unique_ordered_profiles(tmp_path, pe
 
 @pytest.mark.parametrize(
     "invalid",
-    ["empty", "duplicate-profile-id", "duplicate-hook-dir", "relative-hook-dir", "missing-current-hook"],
+    ["empty", "single", "duplicate-profile-id", "duplicate-hook-dir", "relative-hook-dir", "missing-current-hook"],
 )
 def test_prepared_manifest_rejects_ambiguous_or_unbound_profiles(tmp_path, invalid):
     from gateway import outbound_boundary
@@ -529,6 +553,8 @@ def test_prepared_manifest_rejects_ambiguous_or_unbound_profiles(tmp_path, inval
     ))
     if invalid == "empty":
         profiles = []
+    elif invalid == "single":
+        profiles = profiles[:1]
     elif invalid == "duplicate-profile-id":
         profiles[1]["profile_id"] = profiles[0]["profile_id"]
     elif invalid == "duplicate-hook-dir":
@@ -542,8 +568,8 @@ def test_prepared_manifest_rejects_ambiguous_or_unbound_profiles(tmp_path, inval
     assert outbound_boundary._prepared_release_for_hook(hook_dir) is None
 
 
-@pytest.mark.parametrize("peer_count", [0, 2])
-def test_activation_manifest_accepts_nonempty_unique_ordered_profiles(tmp_path, peer_count):
+@pytest.mark.parametrize("peer_count", [1, 2])
+def test_activation_manifest_accepts_at_least_two_unique_ordered_profiles(tmp_path, peer_count):
     from gateway import outbound_boundary
 
     hook_dir = tmp_path / "hooks" / "outbound-actionable"
@@ -564,12 +590,47 @@ def test_activation_manifest_accepts_nonempty_unique_ordered_profiles(tmp_path, 
 
     assert outbound_boundary.outbound_activation_is_ready(hook_dir) is True
     assert outbound_boundary._activated_handler_snapshot(hook_dir) is not None
-    assert outbound_boundary.load_installed_outbound_hooks(tmp_path) is not None
+    hooks = outbound_boundary.load_installed_outbound_hooks(tmp_path)
+    assert hooks is not None
+    assert hooks.outbound_profile_id == "research"
+
+
+def test_activated_handler_pins_declared_runtime_and_rehashes_before_each_call(tmp_path, monkeypatch):
+    hook_dir = tmp_path / "hooks" / "outbound-actionable"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "HOOK.yaml").write_text(
+        "name: outbound-actionable\nevents: [outbound:before_send]\n", encoding="utf-8",
+    )
+    (hook_dir / "handler.py").write_text(
+        "def handle(*_args):\n"
+        "    return {'decision': 'allow', 'runtime_root': __hermes_runtime_root__, "
+        "'modules': sorted(__hermes_pinned_runtime_modules__)}\n",
+        encoding="utf-8",
+    )
+    _activate(hook_dir)
+    monkeypatch.setenv("HERMES_AGENT_KIT_HOME", "/attacker/opt")
+    monkeypatch.setenv("HERMES_AGENT_KIT_SCRIPTS", "/attacker/scripts")
+
+    hooks = load_installed_outbound_hooks(tmp_path)
+    first = outbound_before_send_sync(hooks, {"content": "safe"})
+    activation = json.loads((hook_dir / "release-activation.json").read_text(encoding="utf-8"))
+    shared = json.loads(Path(activation["activation_path"]).read_text(encoding="utf-8"))
+    identity = shared["profiles"][0]["runtime_identity"]
+
+    assert first.decision == "allow"
+    assert first.raw["runtime_root"] == identity["raw_root"]
+    assert first.raw["modules"] == ["outbound_actionable_seam.py"]
+
+    Path(identity["entry_path"]).write_text("# mutable opt drift\n", encoding="utf-8")
+    second = outbound_before_send_sync(hooks, {"content": "safe"})
+
+    assert second.decision == "deny"
+    assert second.reason == "boundary_unavailable"
 
 
 @pytest.mark.parametrize(
     "invalid",
-    ["empty", "duplicate-profile-id", "duplicate-hook-dir", "relative-hook-dir", "profile-hook-mismatch"],
+    ["empty", "single", "duplicate-profile-id", "duplicate-hook-dir", "relative-hook-dir", "profile-hook-mismatch"],
 )
 def test_activation_manifest_rejects_ambiguous_or_unbound_profiles(tmp_path, invalid):
     from gateway.outbound_boundary import outbound_activation_is_ready
@@ -586,6 +647,8 @@ def test_activation_manifest_rejects_ambiguous_or_unbound_profiles(tmp_path, inv
     profile_id = "atlas"
     if invalid == "empty":
         profiles = []
+    elif invalid == "single":
+        profiles = profiles[:1]
     elif invalid == "duplicate-profile-id":
         profiles[1]["profile_id"] = profiles[0]["profile_id"]
     elif invalid == "duplicate-hook-dir":
@@ -863,9 +926,9 @@ def test_active_registry_executes_pinned_handler_bytes_after_path_replacement(tm
     from gateway import outbound_boundary
     original_exec = outbound_boundary._exec_pinned_handler
 
-    def replace_after_read(module_name, handler, source):
+    def replace_after_read(module_name, handler, source, **kwargs):
         (hook_dir / "handler.py").write_text("raise RuntimeError('replacement executed')\n", encoding="utf-8")
-        return original_exec(module_name, handler, source)
+        return original_exec(module_name, handler, source, **kwargs)
 
     monkeypatch.setattr(outbound_boundary, "_exec_pinned_handler", replace_after_read)
     hooks = load_installed_outbound_hooks(tmp_path)

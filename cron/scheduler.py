@@ -1595,6 +1595,7 @@ def _deliver_protected_final_result(
     wrap_response: bool,
     occurrence_id: str,
     gate_mode: str,
+    declared_target_id: str | None = None,
 ) -> str | None:
     """Deliver one claimed final result without a post-claim route fallback."""
     from cron.output_provenance import ProvenanceError
@@ -1623,8 +1624,17 @@ def _deliver_protected_final_result(
         chat_id=chat_id,
     )
     route_digest = _canonical_digest(route)
-    target_id = _canonical_digest(route)
-    profile_id = home.name
+    target_id = declared_target_id or _canonical_digest({
+        "platform": platform_name,
+        "chat_id": str(chat_id),
+        "thread_id": str(thread_id) if thread_id is not None else "",
+    })
+    profile_id = str(getattr(hooks, "outbound_profile_id", "") or "").strip()
+    if not profile_id:
+        return (
+            f"protected final-result boundary denied {platform_name}:{chat_id}: "
+            "activated profile identity unavailable"
+        )
     declared_profile_id = str(job.get("profile_id") or "")
     if declared_profile_id and declared_profile_id != profile_id:
         return f"protected final-result boundary denied {platform_name}:{chat_id}: profile identity mismatch"
@@ -1795,15 +1805,30 @@ def recover_protected_final_result_repairs(*, provenance_store: Any, hooks: Any)
 
 def recover_protected_final_result_repairs_for_home(home: str | os.PathLike[str] | None = None) -> list[str]:
     """Recover one Profile's durable observer work without taking cron's job lock."""
-    from cron.output_provenance import ProvenanceStore
+    from cron.output_provenance import ProvenanceError, ProvenanceStore
     from gateway.outbound_boundary import load_installed_outbound_hooks
 
     profile_home = _get_hermes_home() if home is None else home
+    provenance_store = ProvenanceStore(profile_home)
+    # A newly prepared release intentionally has no active hook until its first
+    # Gateway process records loader attestation. Do not make that bootstrap
+    # impossible when there is no durable observer work to recover. If work is
+    # pending, the active hook is still mandatory and startup remains closed.
+    pending = getattr(provenance_store, "pending_post_send_repairs", None)
+    if callable(pending):
+        try:
+            if not pending():
+                return []
+        except ProvenanceError:
+            root = getattr(provenance_store, "root", None)
+            if isinstance(root, Path) and not root.exists():
+                return []
+            raise
     hooks = load_installed_outbound_hooks(profile_home)
     if hooks is None:
         return []
     return recover_protected_final_result_repairs(
-        provenance_store=ProvenanceStore(profile_home), hooks=hooks,
+        provenance_store=provenance_store, hooks=hooks,
     )
 
 
@@ -1949,6 +1974,11 @@ def _deliver_result(
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        declared_target_id = _canonical_digest({
+            "platform": platform_name,
+            "chat_id": str(chat_id),
+            "thread_id": str(thread_id) if thread_id is not None else "",
+        })
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -2161,6 +2191,7 @@ def _deliver_result(
                     if final_result_gate_mode in _FINAL_RESULT_GATE_MODES
                     else "enforce"
                 ),
+                declared_target_id=declared_target_id,
             )
             if protected_error:
                 logger.warning("Job '%s': %s", job["id"], protected_error)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from concurrent.futures import TimeoutError
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,8 +14,9 @@ from cron.output_provenance import ProvenanceStore
 
 
 class _Hooks:
-    def __init__(self, decision: dict):
+    def __init__(self, decision: dict, *, profile_id: str = "atlas"):
         self.decision = decision
+        self.outbound_profile_id = profile_id
         self.events: list[str] = []
         self.contexts: list[dict] = []
 
@@ -153,6 +155,39 @@ def test_protected_final_result_timeout_is_indeterminate_without_resend(
     assert target["post_send_repair"]["context"]["send_result"] == {"error": "in_flight_timeout"}
 
 
+def test_route_metadata_drift_reuses_declared_target_and_never_resends(tmp_path, monkeypatch):
+    from cron.scheduler import _deliver_result
+
+    store = ProvenanceStore(tmp_path)
+    store.bootstrap()
+    hooks = _Hooks({"decision": "allow", "reason": "safe"})
+    loop, send = _pinned_live_transport(monkeypatch, result={"success": True, "delivered": True})
+    monkeypatch.setattr("cron.scheduler._get_hermes_home", lambda: tmp_path)
+    route_versions = iter(("relay-metadata-v1", "relay-metadata-v2"))
+
+    def bind_drifting_route(*, route_metadata, route, **_kwargs):
+        route["transport_platform"] = "relay"
+        route["transport_metadata"] = next(route_versions)
+        return dict(route_metadata)
+
+    monkeypatch.setattr("cron.scheduler._protected_transport_metadata", bind_drifting_route)
+    with patch("gateway.config.load_gateway_config", return_value=_config()):
+        first = _deliver_result(
+            _job(), "business-safe final result", protect_final_result=True,
+            outbound_hooks=hooks, provenance_store=store, loop=loop,
+        )
+        second = _deliver_result(
+            _job(), "business-safe final result", protect_final_result=True,
+            outbound_hooks=hooks, provenance_store=store, loop=loop,
+        )
+
+    assert first is None
+    assert "occurrence target route changed" in second
+    send.assert_awaited_once()
+    targets = next(iter(_ledger(store)["occurrences"].values()))["targets"]
+    assert len(targets) == 1
+
+
 def test_post_send_repair_replays_only_persisted_observer_context(tmp_path):
     from cron.scheduler import repair_protected_final_result_after_send
 
@@ -182,6 +217,25 @@ def test_post_send_repair_replays_only_persisted_observer_context(tmp_path):
         "observer_event_id": f"after-send:{claim['capability_id']}:{claim['claim_id']}:sent",
     }]
     assert store.pending_post_send_repairs() == []
+
+
+def test_prepared_startup_without_pending_observer_does_not_require_active_hook(monkeypatch, tmp_path):
+    from cron.scheduler import recover_protected_final_result_repairs_for_home
+
+    class EmptyStore:
+        def __init__(self, home):
+            assert Path(home) == tmp_path
+
+        def pending_post_send_repairs(self):
+            return []
+
+    monkeypatch.setattr("cron.output_provenance.ProvenanceStore", EmptyStore)
+    monkeypatch.setattr(
+        "gateway.outbound_boundary.load_installed_outbound_hooks",
+        lambda _home: (_ for _ in ()).throw(AssertionError("inactive prepared hook must not be loaded")),
+    )
+
+    assert recover_protected_final_result_repairs_for_home(tmp_path) == []
 
 
 def test_post_send_repair_failure_remains_pending_without_transport(tmp_path):
@@ -999,6 +1053,28 @@ def test_protected_delivery_rejects_job_profile_id_that_differs_from_active_home
         )
 
     assert result == "protected final-result boundary denied telegram:123: profile identity mismatch"
+
+
+def test_root_profile_uses_activated_profile_id_instead_of_home_basename(monkeypatch, tmp_path):
+    from cron.scheduler import _deliver_result
+
+    root_home = tmp_path / ".hermes"
+    store = ProvenanceStore(root_home)
+    store.bootstrap()
+    job = _job()
+    job["profile_id"] = "Atlas"
+    hooks = _Hooks({"decision": "allow"}, profile_id="Atlas")
+    monkeypatch.setattr("cron.scheduler._get_hermes_home", lambda: root_home)
+
+    with patch("gateway.config.load_gateway_config", return_value=_config()):
+        result = _deliver_result(
+            job, "safe", protect_final_result=True,
+            outbound_hooks=hooks, provenance_store=store,
+        )
+
+    assert "profile identity mismatch" not in result
+    target = next(iter(next(iter(_ledger(store)["occurrences"].values()))["targets"].values()))
+    assert target["proof"]["profile_id"] == "Atlas"
 
 
 def test_legacy_standalone_fallback_runs_in_a_fresh_thread_when_loop_is_active(monkeypatch):

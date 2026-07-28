@@ -45,6 +45,28 @@ def test_gateway_startup_recovery_sweeps_every_multiplex_profile(monkeypatch):
     ]
 
 
+def test_pre_recovery_hook_discovery_reaches_every_multiplex_profile(monkeypatch):
+    from gateway.run import _discover_hooks_before_protected_result_recovery
+
+    discovered = []
+
+    class Registry:
+        def __init__(self, *, hooks_dir):
+            self.hooks_dir = hooks_dir
+
+        def discover_and_load(self):
+            discovered.append(str(self.hooks_dir))
+
+    monkeypatch.setattr("gateway.hooks.HookRegistry", Registry)
+
+    _discover_hooks_before_protected_result_recovery([
+        ("atlas", "/profiles/atlas"),
+        ("yuange", "/profiles/yuange"),
+    ])
+
+    assert discovered == ["/profiles/atlas/hooks", "/profiles/yuange/hooks"]
+
+
 @pytest.mark.asyncio
 async def test_gateway_start_invokes_protected_recovery_before_starting_the_scheduler(monkeypatch, tmp_path):
     import gateway.run as gateway_run
@@ -128,10 +150,22 @@ async def test_gateway_start_blocks_before_adapter_start_when_recovery_is_pendin
 
     _patch_gateway_boot_dependencies(monkeypatch, tmp_path, Runner)
     monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
-    monkeypatch.setattr(gateway_run, "_recover_protected_final_results_at_gateway_startup", lambda: ["repair pending"])
+    class Registry:
+        def __init__(self, **_kwargs):
+            pass
+
+        def discover_and_load(self):
+            calls.append("hook_discovery")
+
+    monkeypatch.setattr("gateway.hooks.HookRegistry", Registry)
+    monkeypatch.setattr(
+        gateway_run,
+        "_recover_protected_final_results_at_gateway_startup",
+        lambda: calls.append("recovery") or ["repair pending"],
+    )
 
     assert await gateway_run.start_gateway(config=GatewayConfig(), replace=False, verbosity=0) is False
-    assert calls == []
+    assert calls == ["hook_discovery", "recovery"]
 
 
 @pytest.mark.asyncio

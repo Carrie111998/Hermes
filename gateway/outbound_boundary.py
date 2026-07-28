@@ -61,6 +61,23 @@ class OutboundDecision:
         return self.decision in {"allow", "rewrite"}
 
 
+@dataclass(frozen=True)
+class _ActivatedRuntime:
+    version_tuple: dict[str, Any]
+    runtime_identity: dict[str, Any]
+    fingerprint: dict[str, Any]
+    root: Path
+    module_sources: dict[str, bytes]
+
+
+@dataclass(frozen=True)
+class _ActivatedHandlerSnapshot:
+    handler: Path
+    source: bytes
+    dependencies: dict[str, bytes]
+    runtime: _ActivatedRuntime
+
+
 def build_outbound_context(**values: Any) -> dict[str, Any]:
     """Return a detached event context without deriving authority from fields."""
     return dict(values)
@@ -147,7 +164,7 @@ def _ordered_profile_for_hook(
     profile_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Validate one ordered profile manifest and return this hook's entry."""
-    if not isinstance(profiles, list) or not profiles:
+    if not isinstance(profiles, list) or len(profiles) < 2:
         return None
     if profile_id is not None and (not isinstance(profile_id, str) or not profile_id.strip()):
         return None
@@ -235,6 +252,7 @@ def outbound_activation_is_ready(hook_dir: Path) -> bool:
             and shared.get("version_tuple") == version_tuple
             and isinstance(own_entry, dict)
             and isinstance(own_entry.get("runtime_identity"), dict)
+            and _validated_activated_runtime(version_tuple, own_entry) is not None
         )
     except (KeyError, OSError, TypeError, ValueError, UnicodeError, BoundaryLoadError):
         return False
@@ -279,16 +297,11 @@ def _prepared_release_for_hook(hook_dir: Path) -> tuple[dict[str, Any], dict[str
         return None
 
 
-def _prepared_runtime_root(entry: dict[str, Any]) -> Path | None:
-    """Verify the already prepared seam bundle before its handler can import it."""
-    identity = entry.get("runtime_identity")
-    if not isinstance(identity, dict):
+def _runtime_module_sources(root: Path, module_hashes: Any) -> dict[str, bytes] | None:
+    """Rehash every module named by an immutable runtime identity."""
+    if not isinstance(module_hashes, dict) or not module_hashes:
         return None
-    raw_root = identity.get("raw_root")
-    module_hashes = identity.get("module_hashes")
-    if not isinstance(raw_root, str) or not raw_root or not isinstance(module_hashes, dict) or not module_hashes:
-        return None
-    root = Path(raw_root)
+    sources: dict[str, bytes] = {}
     try:
         if not root.is_dir() or root.is_symlink():
             return None
@@ -305,9 +318,85 @@ def _prepared_runtime_root(entry: dict[str, Any]) -> Path | None:
             contents = _read_regular_bytes(root / "scripts" / relative)
             if contents is None or hashlib.sha256(contents).hexdigest() != expected:
                 return None
+            sources[name] = contents
     except OSError:
         return None
-    return root
+    return sources
+
+
+def _prepared_runtime_root(entry: dict[str, Any]) -> Path | None:
+    """Verify the already prepared seam bundle before its handler can import it."""
+    identity = entry.get("runtime_identity")
+    if not isinstance(identity, dict):
+        return None
+    raw_root = identity.get("raw_root")
+    if not isinstance(raw_root, str) or not raw_root:
+        return None
+    root = Path(raw_root)
+    return root if _runtime_module_sources(root, identity.get("module_hashes")) is not None else None
+
+
+def _validated_activated_runtime(
+    version_tuple: dict[str, Any], entry: dict[str, Any],
+) -> _ActivatedRuntime | None:
+    """Bind current modules to the activation identity and versioned keg."""
+    identity = entry.get("runtime_identity")
+    fingerprint = entry.get("fingerprint")
+    if not isinstance(identity, dict) or not isinstance(fingerprint, dict):
+        return None
+    raw_keg = version_tuple.get("homebrew_keg_path")
+    raw_root = identity.get("raw_root")
+    canonical_root = identity.get("canonical_root")
+    if not all(isinstance(value, str) and value for value in (raw_keg, raw_root, canonical_root)):
+        return None
+    keg = Path(raw_keg)
+    root = Path(raw_root)
+    expected_root = keg / "libexec"
+    try:
+        keg_info = os.lstat(keg)
+        root_info = os.lstat(root)
+        if (
+            not keg.is_absolute()
+            or not root.is_absolute()
+            or stat.S_ISLNK(keg_info.st_mode)
+            or not stat.S_ISDIR(keg_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode)
+            or not stat.S_ISDIR(root_info.st_mode)
+            or root != expected_root
+            or root.resolve(strict=True) != expected_root
+            or str(root.resolve(strict=True)) != canonical_root
+        ):
+            return None
+    except OSError:
+        return None
+    module_hashes = identity.get("module_hashes")
+    sources = _runtime_module_sources(root, module_hashes)
+    if sources is None or "outbound_actionable_seam.py" not in sources:
+        return None
+    entry_path = root / "scripts" / "outbound_actionable_seam.py"
+    generation = hashlib.sha256(
+        json.dumps(module_hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    identity_digest = _sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    if (
+        identity.get("entry_path") != str(entry_path)
+        or identity.get("executed_sha256") != module_hashes["outbound_actionable_seam.py"]
+        or identity.get("generation_sha256") != generation
+        or fingerprint.get("runtime_loader_identity") != identity_digest
+        or fingerprint.get("runtime_loader_generation") != generation
+        or "sha256:" + str(fingerprint.get("kit_root_paths") or "")
+        != fingerprint.get("kit_root_paths.py")
+    ):
+        return None
+    return _ActivatedRuntime(
+        version_tuple=dict(version_tuple),
+        runtime_identity=dict(identity),
+        fingerprint=dict(fingerprint),
+        root=root,
+        module_sources=sources,
+    )
 
 
 @contextmanager
@@ -339,16 +428,37 @@ def capture_pending_outbound_attestation(hook_dir: Path) -> None:
     runtime_root = _prepared_runtime_root(own_entry)
     if runtime_root is None:
         return
+    runtime_identity = own_entry.get("runtime_identity")
+    runtime_modules = _runtime_module_sources(
+        runtime_root,
+        runtime_identity.get("module_hashes") if isinstance(runtime_identity, dict) else None,
+    )
+    if runtime_modules is None:
+        return
     expected_manifest = release_payload["bundle_manifest_sha256"]
     entries = _validated_bundle_manifest(hook_dir, manifest, expected_manifest)
     expected_handler = entries.get("handler.py") if entries else None
     handler_bytes = _read_regular_bytes(handler) if isinstance(expected_handler, str) else None
     if handler_bytes is None or _sha256(handler_bytes) != expected_handler:
         return
+    dependencies: dict[str, bytes] = {}
+    for name in ("kit_root_paths.py", "runtime_loader_attestation.py"):
+        expected = entries.get(name) if entries else None
+        if expected is None:
+            continue
+        contents = _read_regular_bytes(hook_dir / name)
+        if contents is None or _sha256(contents) != expected:
+            return
+        dependencies[name] = contents
     try:
         with _pinned_prepared_runtime(runtime_root):
             module = _exec_pinned_handler(
-                "hermes_pending_outbound_attestation", handler, handler_bytes,
+                "hermes_pending_outbound_attestation",
+                handler,
+                handler_bytes,
+                runtime_root=runtime_root,
+                dependencies=dependencies,
+                runtime_modules=runtime_modules,
             )
             capture = getattr(module, "capture_runtime_attestation", None)
             if callable(capture):
@@ -357,11 +467,23 @@ def capture_pending_outbound_attestation(hook_dir: Path) -> None:
         return
 
 
-def _exec_pinned_handler(module_name: str, handler: Path, source: bytes) -> types.ModuleType:
+def _exec_pinned_handler(
+    module_name: str,
+    handler: Path,
+    source: bytes,
+    *,
+    runtime_root: Path | None = None,
+    dependencies: dict[str, bytes] | None = None,
+    runtime_modules: dict[str, bytes] | None = None,
+) -> types.ModuleType:
     """Execute exactly the handler bytes that manifest verification consumed."""
     module = types.ModuleType(module_name)
     module.__file__ = str(handler)
     module.__package__ = ""
+    module.__dict__["__hermes_pinned_handler_source__"] = source
+    module.__dict__["__hermes_pinned_dependencies__"] = dict(dependencies or {})
+    module.__dict__["__hermes_pinned_runtime_modules__"] = dict(runtime_modules or {})
+    module.__dict__["__hermes_runtime_root__"] = str(runtime_root) if runtime_root is not None else ""
     sys.modules[module_name] = module
     try:
         exec(compile(source, str(handler), "exec", dont_inherit=True), module.__dict__)
@@ -407,7 +529,7 @@ def _bundle_manifest_is_valid(root: Path, path: Path, expected_sha256: str | Non
     return _validated_bundle_manifest(root, path, expected_sha256) is not None
 
 
-def _activated_handler_snapshot(hook_dir: Path) -> tuple[Path, bytes] | None:
+def _activated_handler_snapshot(hook_dir: Path) -> _ActivatedHandlerSnapshot | None:
     """Pin all active controls and handler bytes to one self-consistent snapshot."""
     release_bytes = _read_private_bytes(hook_dir / "release-tuple.json")
     activation_bytes = _read_private_bytes(hook_dir / "release-activation.json")
@@ -455,13 +577,60 @@ def _activated_handler_snapshot(hook_dir: Path) -> tuple[Path, bytes] | None:
             or not isinstance(own_entry.get("runtime_identity"), dict)
         ):
             return None
+        runtime = _validated_activated_runtime(version_tuple, own_entry)
+        manifest_entries = _validated_bundle_manifest(
+            hook_dir,
+            hook_dir / BUNDLE_MANIFEST_NAME,
+            release_payload["bundle_manifest_sha256"],
+        )
+        if runtime is None or manifest_entries is None:
+            return None
         handler = hook_dir / "handler.py"
         source = _read_regular_bytes(handler)
-        if source is None or fingerprint.get("handler.py") != _sha256(source):
+        if (
+            source is None
+            or fingerprint.get("handler.py") != _sha256(source)
+            or manifest_entries.get("handler.py") != _sha256(source)
+        ):
             return None
-        return handler, source
+        dependencies: dict[str, bytes] = {}
+        for name in ("kit_root_paths.py", "runtime_loader_attestation.py"):
+            dependency = _read_regular_bytes(hook_dir / name)
+            if dependency is None or manifest_entries.get(name) != _sha256(dependency):
+                return None
+            dependencies[name] = dependency
+        return _ActivatedHandlerSnapshot(
+            handler=handler,
+            source=source,
+            dependencies=dependencies,
+            runtime=runtime,
+        )
     except (KeyError, OSError, StopIteration, TypeError, ValueError, UnicodeError, BoundaryLoadError):
         return None
+
+
+def _guard_activated_handler(handler: Any, runtime: _ActivatedRuntime) -> Any:
+    """Revalidate the activation runtime immediately before each invocation."""
+    entry = {
+        "runtime_identity": runtime.runtime_identity,
+        "fingerprint": runtime.fingerprint,
+    }
+
+    def require_current_runtime() -> None:
+        if _validated_activated_runtime(runtime.version_tuple, entry) is None:
+            raise BoundaryLoadError("installed outbound boundary runtime changed")
+
+    if asyncio.iscoroutinefunction(handler):
+        async def guarded(*args: Any, **kwargs: Any) -> Any:
+            require_current_runtime()
+            return await handler(*args, **kwargs)
+    else:
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            require_current_runtime()
+            return handler(*args, **kwargs)
+    guarded.__name__ = getattr(handler, "__name__", "handle")
+    guarded.__doc__ = getattr(handler, "__doc__", None)
+    return guarded
 
 
 def load_activated_outbound_handler(hook_dir: Path, module_name: str) -> types.ModuleType:
@@ -471,8 +640,18 @@ def load_activated_outbound_handler(hook_dir: Path, module_name: str) -> types.M
         if not _private_regular(hook_dir / "release-tuple.json") or not _private_regular(hook_dir / "release-activation.json"):
             raise BoundaryLoadError("installed outbound boundary is not release-activated")
         raise BoundaryLoadError("installed outbound boundary activation changed")
-    handler, source = snapshot
-    return _exec_pinned_handler(module_name, handler, source)
+    module = _exec_pinned_handler(
+        module_name,
+        snapshot.handler,
+        snapshot.source,
+        runtime_root=snapshot.runtime.root,
+        dependencies=snapshot.dependencies,
+        runtime_modules=snapshot.runtime.module_sources,
+    )
+    handle = getattr(module, "handle", None)
+    if callable(handle):
+        module.handle = _guard_activated_handler(handle, snapshot.runtime)
+    return module
 
 
 def load_installed_outbound_hooks(home: str | Path) -> Any | None:
@@ -556,6 +735,7 @@ def load_installed_outbound_hooks(home: str | Path) -> Any | None:
         for item in hooks.loaded_hooks
     ):
         raise BoundaryLoadError("installed outbound boundary is missing before-send handler")
+    hooks.outbound_profile_id = profile_id
     return hooks
 
 
