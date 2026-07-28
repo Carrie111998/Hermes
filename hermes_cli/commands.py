@@ -123,6 +123,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("context", "Show detailed context window view with usage gauge, category breakdown, compression stats, and throughput", "Session",
                aliases=("ctx",), args_hint="[all]", subcommands=("all",)),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
+    CommandDef("ping", "Reply with 'pong' - verifies the inbound path is alive (used to detect silent Slack socket-mode drops)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
