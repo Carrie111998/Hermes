@@ -4037,11 +4037,21 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+            if cur_status == "blocked":
+                if _has_sticky_block(conn, task_id):
+                    # Worker / operator asked for human review — do not
+                    # silently auto-recover.  ``unblock_task`` is the only
+                    # legitimate exit (it emits ``"unblocked"`` which flips
+                    # this predicate back).
+                    continue
+                # Blind-spot guard (t_6009ccaa): status='blocked' with no
+                # 'blocked' event row (direct status write / verdict-router
+                # hold / approval-hold hook without a blocked event). Must
+                # NOT be silently auto-promoted to 'ready' when parents are
+                # done. The circuit-breaker case (failures ≥ limit set by
+                # _record_task_failure) is also caught here and stays blocked,
+                # preserving the existing fall-through behaviour at lines
+                # 4062-4069 (both paths agree: stay blocked).
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
