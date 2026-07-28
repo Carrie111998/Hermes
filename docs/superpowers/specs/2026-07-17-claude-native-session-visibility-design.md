@@ -1,6 +1,7 @@
 # Claude Native Session Visibility Design
 
 Date: 2026-07-17
+Status: Implemented and accepted
 
 ## Objective
 
@@ -311,3 +312,64 @@ The implementation was recovered from the retired
 `session-bridge-ship` worktree and audited again on 2026-07-27. The final
 evidence and acceptance disposition are recorded in
 `docs/superpowers/audits/2026-07-27-session-bridge-acceptance-audit.md`.
+The canonical copy now lives in the active `agent-src` tree; the retired
+worktree path is not an implementation or deployment authority.
+
+Current acceptance evidence includes:
+
+- 19 visible native Claude registrations with zero pending, leased, retry, or
+  failed jobs and zero lineage repair/blocker rows;
+- an exact Codex-to-Claude UUID/transcript/desktop-registry canary;
+- a final 30-day dry run with zero remaining candidates, zero duplicates,
+  zero open/degraded/fatal reasons, and 13,757 documented exclusions;
+- repeated genuine continuous empty cycles with no replacement creation;
+- current substantive Claude Code sessions linked to native Codex tasks, plus
+  deterministic first-open previews for new imports and in-place readable
+  hydration for authenticated immutable legacy placeholders.
+- independent Claude and Codex scan loops, a bounded startup reconciliation
+  gate, and state-database-only continuous Codex inventory so one slow provider
+  operation cannot halt discovery;
+- preservation-safe recovery for a real Claude desktop transcript containing
+  two native session IDs: the exact filename identity is indexed from only its
+  own records, while the other identity remains in its separate canonical
+  transcript;
+- an authoritative final incremental Claude scan with `failed=0` and durable
+  progress at `indexed_total=41,411, remaining=0`;
+- a restart-safe newest-range sidebar catch-up lane that preserves the older
+  backlog cursor instead of skipping eligible sessions hidden behind more than
+  one bounded probe page of stable ineligible rows;
+- live recovery of the exact previously catalog-only mixed-ID source
+  `claude:afe1d37a-281c-4909-973e-45211bb36493` into native Codex task
+  `019fa83f-7e2b-71b3-99ce-37dccb7c2df7`, whose native `thread/read` contains
+  the continuation brief and actual last five Claude messages before the
+  signed provenance block;
+- one complete Codex bootstrap inventory whenever the durable seen-set is
+  empty, preventing an outage recovery or fresh state database from applying a
+  newer continuous watermark to every pre-existing native task;
+- exact Codex continuation refreshes through one native `thread/read`, with
+  authoritative inventory fallback only when a lean response omits lifecycle
+  metadata;
+- restart-safe continuation reconciliation in batches of five, preventing the
+  aggregate continuation set from exhausting the single startup deadline.
+
+## Final acceptance record
+
+The final accepted implementation is commit `c557537af`. Its exact Session
+Bridge suite completed **2,456 tests with 10 skips and zero failures**.
+
+The clean production candidate started as PID **88812** at
+**2026-07-28 12:29:23 UTC** and completed the required 30-minute soak through
+**12:59:44 UTC**. Every sampled health check had empty recent error codes,
+current provider scans, no degraded reason, and empty delivery and hydration
+queues. The endpoint accounted exactly for **1,118 Claude + 10 Hermes = 1,128
+eligible** sources as **1,122 visible + 6 terminally resolved = 1,128**, with
+zero pending or retry work. Readable hydration was quiescent at **93 visible**
+with no open or failed jobs.
+
+Read-only database verification found zero duplicate visible source, bridge,
+idempotency, or native-thread identities; zero visible rows without links; and
+zero open sidebar or hydration jobs. The Windows descendant tree remained
+bounded at **14**. Native `thread/read` for Codex task
+`019fa83f-7e2b-71b3-99ce-37dccb7c2df7` proved that the recovered Claude
+session opens with its Continuation Brief and actual last five messages before
+the signed provenance block.
