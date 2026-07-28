@@ -1,0 +1,56 @@
+name: fluxer-platform
+label: Fluxer
+kind: platform
+version: 1.0.0
+description: >
+  Native Fluxer gateway adapter for Hermes Agent. Connects directly to
+  Fluxer's REST API and real-time Gateway for DMs and server channels, with
+  replies, typing indicators, file attachments, allowlists, mention gating,
+  reconnect/resume, and home-channel cron delivery.
+author: NousResearch
+requires_env:
+  - name: FLUXER_BOT_TOKEN
+    description: "Fluxer bot token"
+    prompt: "Fluxer bot token"
+    password: true
+optional_env:
+  - name: FLUXER_API_URL
+    description: "Fluxer REST API base; defaults to https://api.fluxer.app/v1"
+    prompt: "Fluxer API URL"
+    password: false
+  - name: FLUXER_GATEWAY_URL
+    description: "Optional Fluxer Gateway WebSocket URL override"
+    prompt: "Fluxer Gateway URL"
+    password: false
+  - name: FLUXER_ALLOWED_USERS
+    description: "Comma-separated Fluxer user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: FLUXER_ALLOW_ALL_USERS
+    description: "Allow any Fluxer user to trigger the bot (development only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: FLUXER_HOME_CHANNEL
+    description: "Default Fluxer channel ID for cron and notification delivery"
+    prompt: "Home channel ID"
+    password: false
+  - name: FLUXER_REQUIRE_MENTION
+    description: "Require bot mention in server channels (default true)"
+    prompt: "Require mention? (true/false)"
+    password: false
+  - name: FLUXER_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated server channel IDs where mention is not required"
+    prompt: "Free-response channel IDs (comma-separated)"
+    password: false
+  - name: FLUXER_ALLOWED_CHANNELS
+    description: "Optional comma-separated server-channel allowlist"
+    prompt: "Allowed channel IDs (comma-separated)"
+    password: false
+  - name: FLUXER_PROXY
+    description: "Optional HTTP/SOCKS proxy for Fluxer REST and Gateway traffic"
+    prompt: "Proxy URL"
+    password: false
+  - name: FLUXER_MAX_UPLOAD_BYTES
+    description: "Maximum bytes read for one outbound upload (default 25 MiB)"
+    prompt: "Maximum upload bytes"
+    password: false

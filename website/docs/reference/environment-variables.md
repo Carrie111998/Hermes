@@ -454,6 +454,19 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `MATTERMOST_REQUIRE_MENTION` | Require `@mention` in channels (default: `true`). Set to `false` to respond to all messages. |
 | `MATTERMOST_FREE_RESPONSE_CHANNELS` | Comma-separated channel IDs where bot responds without `@mention` |
 | `MATTERMOST_REPLY_MODE` | Reply style: `thread` (threaded replies) or `off` (flat messages, default) |
+| `FLUXER_BOT_TOKEN` | Fluxer bot token from User Settings → Applications |
+| `FLUXER_API_URL` | Fluxer REST API base (default: `https://api.fluxer.app/v1`) |
+| `FLUXER_GATEWAY_URL` | Optional Fluxer Gateway WebSocket URL override; normally discovered from `/gateway/bot` |
+| `FLUXER_ALLOWED_USERS` | Comma-separated Fluxer user IDs allowed to message the bot |
+| `FLUXER_ALLOW_ALL_USERS` | Allow any Fluxer user without an allowlist (development only) |
+| `FLUXER_ALLOWED_CHANNELS` | Optional comma-separated server-channel allowlist; DMs remain available |
+| `FLUXER_REQUIRE_MENTION` | Require the bot to be mentioned in server channels (default: `true`) |
+| `FLUXER_FREE_RESPONSE_CHANNELS` | Comma-separated server channels where a mention is not required |
+| `FLUXER_HOME_CHANNEL` | Fluxer channel ID for cron and notification delivery |
+| `FLUXER_HOME_CHANNEL_NAME` | Display name for the Fluxer home channel |
+| `FLUXER_PROXY` | Optional HTTP/SOCKS proxy for Fluxer REST and Gateway traffic |
+| `FLUXER_MAX_DOWNLOAD_BYTES` | Maximum bytes buffered for one inbound Fluxer attachment (default: 25 MiB) |
+| `FLUXER_MAX_UPLOAD_BYTES` | Maximum bytes read for one outbound Fluxer upload (default: 25 MiB) |
 | `MATRIX_HOMESERVER` | Matrix homeserver URL (e.g. `https://matrix.org`) |
 | `MATRIX_ACCESS_TOKEN` | Matrix access token for bot authentication |
 | `MATRIX_USER_ID` | Matrix user ID (e.g. `@hermes:matrix.org`) — required for password login, optional with access token |

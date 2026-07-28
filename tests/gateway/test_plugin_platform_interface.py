@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PLATFORMS_DIR = PROJECT_ROOT / "plugins" / "platforms"
 
 
@@ -54,6 +54,12 @@ class _MockPluginContext:
 
     def __init__(self):
         self.registered_names: list[str] = []
+
+    def register_cli_command(self, **_kwargs: Any) -> None:
+        """Accept optional CLI registration performed by platform plugins."""
+
+    def register_hook(self, *_args: Any, **_kwargs: Any) -> None:
+        """Accept optional lifecycle-hook registration performed by plugins."""
 
     def register_platform(
         self,
@@ -104,6 +110,7 @@ def test_plugin_registers_valid_platform_entry(platform_name: str, clean_registr
     assert platform_name in ctx.registered_names
 
     from gateway.platform_registry import platform_registry
+
     entry = platform_registry.get(platform_name)
     assert entry is not None, f"{platform_name} did not register an entry"
     assert entry.name == platform_name
@@ -120,6 +127,7 @@ def test_platform_entry_has_required_fields(platform_name: str, clean_registry):
     module.register(ctx)
 
     from gateway.platform_registry import platform_registry
+
     entry = platform_registry.get(platform_name)
     assert entry is not None
 
@@ -139,13 +147,16 @@ def test_platform_entry_has_required_fields(platform_name: str, clean_registry):
 
 
 @pytest.mark.parametrize("platform_name", _PLATFORM_NAMES)
-def test_adapter_factory_produces_valid_adapter(platform_name: str, clean_registry):
+def test_adapter_factory_produces_valid_adapter(
+    platform_name: str, clean_registry, monkeypatch
+):
     """The adapter factory must return an object with the base interface."""
     module = _import_platform_module(platform_name)
     ctx = _MockPluginContext()
     module.register(ctx)
 
     from gateway.platform_registry import platform_registry
+
     entry = platform_registry.get(platform_name)
     assert entry is not None
 
@@ -157,6 +168,9 @@ def test_adapter_factory_produces_valid_adapter(platform_name: str, clean_regist
     mock_config.api_key = None
     mock_config.home_channel = None
     mock_config.reply_to_mode = "first"
+
+    for env_name in entry.required_env:
+        monkeypatch.setenv(env_name, "contract-test-placeholder")
 
     adapter = entry.adapter_factory(mock_config)
     assert adapter is not None, f"{platform_name} adapter_factory returned None"
@@ -170,6 +184,7 @@ def test_adapter_factory_produces_valid_adapter(platform_name: str, clean_regist
     # Should be a BasePlatformAdapter subclass if importable
     try:
         from gateway.platforms.base import BasePlatformAdapter
+
         assert isinstance(adapter, BasePlatformAdapter)
     except Exception:
         pytest.skip("BasePlatformAdapter not available for isinstance check")
@@ -183,11 +198,14 @@ def test_check_fn_returns_bool(platform_name: str, clean_registry):
     module.register(ctx)
 
     from gateway.platform_registry import platform_registry
+
     entry = platform_registry.get(platform_name)
     assert entry is not None
 
     result = entry.check_fn()
-    assert isinstance(result, bool), f"{platform_name}.check_fn() returned {type(result)}, expected bool"
+    assert isinstance(result, bool), (
+        f"{platform_name}.check_fn() returned {type(result)}, expected bool"
+    )
 
 
 @pytest.mark.parametrize("platform_name", _PLATFORM_NAMES)
@@ -198,11 +216,12 @@ def test_validate_config_if_present(platform_name: str, clean_registry):
     module.register(ctx)
 
     from gateway.platform_registry import platform_registry
+
     entry = platform_registry.get(platform_name)
     assert entry is not None
 
     if entry.validate_config is None:
-        pytest.skip("No validate_config provided")
+        return
 
     mock_config = MagicMock()
     mock_config.extra = {}
@@ -218,11 +237,12 @@ def test_is_connected_if_present(platform_name: str, clean_registry):
     module.register(ctx)
 
     from gateway.platform_registry import platform_registry
+
     entry = platform_registry.get(platform_name)
     assert entry is not None
 
     if entry.is_connected is None:
-        pytest.skip("No is_connected provided")
+        return
 
     mock_config = MagicMock()
     mock_config.extra = {}
