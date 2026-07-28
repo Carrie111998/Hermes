@@ -1676,7 +1676,6 @@ def test_winpty_readiness_crosses_cursor_positioned_workspace_trust_gate() -> No
                 [
                     "\x1b[?2004h",
                     trust,
-                    "\x1b[?2004h",
                     "\x1b[2m\u23f5\u23f5\x1b[0m",
                 ]
             )
@@ -1701,7 +1700,7 @@ def test_winpty_readiness_crosses_cursor_positioned_workspace_trust_gate() -> No
 
     assert "\u23f5\u23f5" in output
     assert process.writes == ["\r"]
-    assert process.reads == 5
+    assert process.reads == 4
 
 
 @pytest.mark.parametrize(

@@ -601,7 +601,10 @@ class _WinPtyProcess:
                     and now >= ready_settle_deadline
                     and not trust_redraw_pending
                     and not post_trust_modal_seen
-                    and _claude_launch_input_ready(readiness_output)
+                    and _claude_launch_input_ready(
+                        readiness_output,
+                        terminal_state_output="".join(chunks),
+                    )
                 ):
                     return "".join(chunks)
                 raise _PtyReadinessTimeout(
@@ -667,7 +670,10 @@ class _WinPtyProcess:
             if (
                 not trust_redraw_pending
                 and not post_trust_modal_seen
-                and _claude_launch_input_ready(readiness_output)
+                and _claude_launch_input_ready(
+                    readiness_output,
+                    terminal_state_output=joined,
+                )
             ):
                 ready_settle_deadline = (
                     time.monotonic() + _READINESS_SETTLE_SECONDS
@@ -1689,7 +1695,7 @@ def _readiness_timeout_reason(
         return "workspace_trust_redraw_incomplete"
     if _workspace_trust_prompt_prefix_start(output) is not None:
         return "workspace_trust_pending"
-    if not _bracketed_paste_enabled(readiness_output):
+    if not _bracketed_paste_enabled(output):
         return "terminal_input_not_enabled"
     if not _claude_main_repl_ready(readiness_output):
         return "main_repl_footer_missing"
@@ -1813,11 +1819,18 @@ def _claude_main_input_ready(output: str) -> bool:
     return _bracketed_paste_enabled(output) and _claude_main_repl_ready(output)
 
 
-def _claude_launch_input_ready(output: str) -> bool:
+def _claude_launch_input_ready(
+    output: str, *, terminal_state_output: str | None = None
+) -> bool:
     """Reject an unaccepted trust gate before recognizing the main input."""
 
-    return not _workspace_trust_prompt_visible(output) and _claude_main_input_ready(
-        output
+    terminal_output = (
+        output if terminal_state_output is None else terminal_state_output
+    )
+    return (
+        not _workspace_trust_prompt_visible(output)
+        and _bracketed_paste_enabled(terminal_output)
+        and _claude_main_repl_ready(output)
     )
 
 
