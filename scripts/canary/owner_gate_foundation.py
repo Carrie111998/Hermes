@@ -31,6 +31,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
 PROJECT = "adventico-ai-platform"
+# Compute Engine's ``projects.get.id`` is a stable Compute resource identity,
+# not the Cloud Resource Manager project number.  Keep both identities pinned
+# and validate each only against the API contract that owns it.
+COMPUTE_PROJECT_ID = "3798016304160181927"
 REGION = "europe-west3"
 ZONE = "europe-west3-a"
 VM_NAME = "muncho-owner-gate-01"

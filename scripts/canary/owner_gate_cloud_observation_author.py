@@ -1815,7 +1815,7 @@ def _build_unsigned(
     project_fact = facts.get("GET", _url(f"{compute}/projects/{project}"))
     if (
         project_fact.get("name") != project
-        or str(project_fact.get("id")) != ancestry_evidence.project_number
+        or str(project_fact.get("id")) != foundation.COMPUTE_PROJECT_ID
     ):
         _error("owner_gate_cloud_observation_project_invalid")
     project_metadata = _instance_metadata(project_fact.get("commonInstanceMetadata"))

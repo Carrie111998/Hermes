@@ -917,7 +917,7 @@ def _raw(
         author._url(f"{compute}/projects/{project}"),
         {
             "name": project,
-            "id": PROJECT_NUMBER,
+            "id": foundation.COMPUTE_PROJECT_ID,
             "commonInstanceMetadata": {
                 "items": [
                     {"key": "block-project-ssh-keys", "value": "true"},
@@ -1410,6 +1410,23 @@ def test_realistic_fixed_rest_fixture_authors_validator_compatible_observation(
         plan_sha256=plan.sha256,
         mutation_binding_present=phase == "post_iam",
     )
+
+
+def test_compute_project_id_is_distinct_from_resource_manager_project_number() -> None:
+    assert foundation.COMPUTE_PROJECT_ID == "3798016304160181927"
+    assert foundation.COMPUTE_PROJECT_ID != PROJECT_NUMBER
+
+
+def test_resource_manager_project_number_is_rejected_as_compute_project_id() -> None:
+    def mutate(raw, _plan) -> None:
+        key = next(
+            key
+            for key in raw
+            if key.endswith(f"/compute/v1/projects/{foundation.PROJECT}")
+        )
+        raw[key]["id"] = PROJECT_NUMBER
+
+    _reject(mutate, match="project_invalid")
 
 
 def _reject(mutator, *, phase: str = "inert", match: str | None = None) -> None:
