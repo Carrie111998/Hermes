@@ -166,3 +166,73 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Verified completion flags (#70806)
+# ---------------------------------------------------------------------------
+
+def _created_task_id(out: str) -> str:
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m, f"no task id in output: {out!r}"
+    return m.group(1)
+
+
+def test_create_verify_cmd_flag_persists(kanban_home):
+    out = kc.run_slash("create t --verify-cmd 'pytest -q'")
+    assert "Created" in out
+    tid = _created_task_id(out)
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+    assert t.verify_mode == "cmd"
+    assert t.verify_cmd == "pytest -q"
+    show = kc.run_slash(f"show {tid}")
+    assert "verify:    cmd: pytest -q" in show
+
+
+def test_create_verify_auto_flag_persists(kanban_home):
+    out = kc.run_slash("create t --verify auto")
+    assert "Created" in out
+    tid = _created_task_id(out)
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+    assert t.verify_mode == "auto"
+    assert t.verify_cmd is None
+    show = kc.run_slash(f"show {tid}")
+    assert "verify:    auto (ledger evidence)" in show
+
+
+def test_create_verify_flags_mutually_exclusive(kanban_home):
+    out = kc.run_slash("create t --verify-cmd 'pytest -q' --verify auto")
+    assert "mutually exclusive" in out
+    with kb.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_create_json_includes_verify_fields(kanban_home):
+    out = kc.run_slash("create gated --verify-cmd 'pytest -q' --json")
+    d = json.loads(out)
+    assert d["verify_mode"] == "cmd"
+    assert d["verify_cmd"] == "pytest -q"
+
+    plain = json.loads(kc.run_slash("create plain --json"))
+    assert plain["verify_mode"] is None
+    assert plain["verify_cmd"] is None
+
+
+def test_show_omits_verify_line_without_config(kanban_home):
+    out = kc.run_slash("create plain")
+    tid = _created_task_id(out)
+    show = kc.run_slash(f"show {tid}")
+    assert "verify:" not in show
+
+
+def test_cli_complete_bypasses_gate_with_stderr_notice(kanban_home):
+    """Manual CLI completion is the loud human override — it bypasses the
+    gate but says so on stderr."""
+    out = kc.run_slash("create gated --verify-cmd 'exit 1'")
+    tid = _created_task_id(out)
+    done = kc.run_slash(f"complete {tid}")
+    assert "Completed" in done
+    assert "bypasses" in done
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "done"
