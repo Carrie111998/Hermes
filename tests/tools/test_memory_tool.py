@@ -496,7 +496,14 @@ class TestMemoryStorePersistence:
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
         # Write file with duplicates
         mem_file = tmp_path / "MEMORY.md"
-        mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry")
+        # encoding is required: the delimiter is non-ASCII and write_text
+        # otherwise uses the locale default (cp1252 on Windows), so the reader
+        # met undecodable bytes and load_from_disk degraded to an empty list —
+        # the test failed for an encoding reason that looked like a dedup bug.
+        mem_file.write_text(
+            "duplicate entry\n§\nduplicate entry\n§\nunique entry",
+            encoding="utf-8",
+        )
 
         store = MemoryStore()
         store.load_from_disk()

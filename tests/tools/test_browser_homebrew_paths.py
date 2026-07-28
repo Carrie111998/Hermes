@@ -1,5 +1,7 @@
 """Tests for macOS Homebrew PATH discovery in browser_tool.py."""
 
+from tests.os_env import PLATFORM_ENV
+
 import json
 import os
 from pathlib import Path
@@ -62,25 +64,26 @@ class TestDiscoverHomebrewNodeDirs:
     def test_finds_versioned_node_dirs(self):
         """Should discover node@20/bin, node@24/bin etc."""
         entries = ["node@20", "node@24", "openssl", "node", "python@3.12"]
+        # The implementation builds these with os.path.join, so the separator
+        # is the platform's. Build the expectations the same way instead of
+        # hardcoding "/" — otherwise the isdir mock never matches on Windows
+        # and the discovery silently returns nothing.
+        node20 = os.path.join("/opt/homebrew/opt", "node@20", "bin")
+        node24 = os.path.join("/opt/homebrew/opt", "node@24", "bin")
 
         def mock_isdir(p):
             if p == "/opt/homebrew/opt":
                 return True
             # node@20/bin and node@24/bin exist
-            if p in {
-                "/opt/homebrew/opt/node@20/bin",
-                "/opt/homebrew/opt/node@24/bin",
-            }:
-                return True
-            return False
+            return p in {node20, node24}
 
         with patch("os.path.isdir", side_effect=mock_isdir), \
              patch("os.listdir", return_value=entries):
             result = _discover_homebrew_node_dirs()
 
         assert len(result) == 2
-        assert "/opt/homebrew/opt/node@20/bin" in result
-        assert "/opt/homebrew/opt/node@24/bin" in result
+        assert node20 in result
+        assert node24 in result
 
     def test_excludes_plain_node(self):
         """'node' (unversioned) should be excluded — covered by /opt/homebrew/bin."""
@@ -278,7 +281,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.dict(
                  os.environ,
-                 {
+                 {**PLATFORM_ENV, 
                      "PATH": "/usr/bin:/bin",
                      "HOME": "/home/test",
                      "HERMES_HOME": hermes_home,
@@ -330,7 +333,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.dict(
                  os.environ,
-                 {
+                 {**PLATFORM_ENV, 
                      "PATH": "/usr/bin:/bin",
                      "HOME": "/home/test",
                      "HERMES_HOME": hermes_home,
@@ -408,7 +411,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "HOME": "/home/test"}, clear=True):
+             patch.dict(os.environ, {**PLATFORM_ENV, "PATH": "/usr/bin:/bin", "HOME": "/home/test"}, clear=True):
             # The function reads from temp files for stdout/stderr
             with patch("builtins.open", mock_open(read_data=fake_json)):
                 _run_browser_command("test-task", "navigate", ["https://example.com"])
@@ -457,7 +460,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "HOME": "/home/test"}, clear=True):
+             patch.dict(os.environ, {**PLATFORM_ENV, "PATH": "/usr/bin:/bin", "HOME": "/home/test"}, clear=True):
             with patch("builtins.open", mock_open(read_data=fake_json)):
                 _run_browser_command("test-task", "navigate", ["https://example.com"])
 
@@ -506,7 +509,7 @@ class TestRunBrowserCommandPathConstruction:
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "HOME": "/home/test"}, clear=True):
+             patch.dict(os.environ, {**PLATFORM_ENV, "PATH": "/usr/bin:/bin", "HOME": "/home/test"}, clear=True):
             with patch("builtins.open", mock_open(read_data=fake_json)):
                 _run_browser_command("test-task", "navigate", ["https://example.com"])
 

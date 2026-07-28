@@ -2311,6 +2311,14 @@ def _run_single_child(
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        # H-01: a crashed child still produces a non-empty ``final_response`` —
+        # the outer loop writes "I apologize, but I encountered an error ..."
+        # into it — so summary-presence alone reported the delegated work as
+        # done and the parent proceeded on an apology. Shared predicate so this
+        # cannot drift from the finalizer's own definition.
+        from agent.turn_finalizer import turn_crashed
+
+        child_crashed = turn_crashed(result.get("turn_exit_reason"))
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -2318,10 +2326,30 @@ def _run_single_child(
         # transport bug (misrouted provider, adapter returning empty
         # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
         # it instead of silently accepting zero-content "success".
-        _empty_sentinel = summary.strip() == "(empty)"
+        # Keyed on the exit reason as well as the literal: when the child DID
+        # produce reasoning but no answer, conversation_loop delivers this same
+        # terminal as a labeled "⚠️ ...only internal reasoning..." excerpt
+        # rather than the sentinel. That text is non-empty and is not a crash
+        # prefix, so matching the literal alone reported a child that never
+        # answered as status="completed", handing the parent raw
+        # chain-of-thought as if it were the delegated result.
+        from agent.turn_finalizer import EMPTY_TERMINAL_EXIT_REASON
 
+        _empty_sentinel = (
+            summary.strip() == "(empty)"
+            or str(result.get("turn_exit_reason") or "") == EMPTY_TERMINAL_EXIT_REASON
+        )
+
+        # Keyed on the crash exit reasons specifically, NOT on `completed`:
+        # a child that hits max_iterations but produces usable output is
+        # deliberately still "completed", with exit_reason telling the parent
+        # how it ended. Gating on `completed` wholesale would silently
+        # reclassify those as failures.
         if interrupted:
             status = "interrupted"
+        elif child_crashed:
+            # Checked before the summary branch: the crash apology IS a summary.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -2371,6 +2399,11 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif child_crashed:
+            # Without this the crash falls through to "max_iterations", which is
+            # a specific and wrong diagnosis — the parent would retry a budget
+            # problem that never happened.
+            exit_reason = "crashed"
         elif completed:
             exit_reason = "completed"
         else:
@@ -2464,9 +2497,13 @@ def _run_single_child(
         except Exception:
             _files_read = []
         try:
+            # None = no path filter. This passed [] and meant "all writes"
+            # (see the old trailing comment), but an empty filter matched
+            # nothing, so files_written was empty in EVERY subagent.complete
+            # event ever emitted.
             _files_written_map = file_state.writes_since(
-                "", wall_start, []
-            )  # all writes since wall_start
+                "", wall_start, None
+            )
         except Exception:
             _files_written_map = {}
         _files_written = sorted(
@@ -2999,11 +3036,17 @@ def delegate_task(
             completed_count = 0
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-            # Daemon workers (tools.daemon_pool): the `with` block still joins
-            # normally, but if the parent is interrupted while a child is
-            # wedged, the abandoned worker must not block interpreter exit.
+            # Deliberately NOT a `with` block. ThreadPoolExecutor.__exit__
+            # calls shutdown(wait=True) unconditionally, so the interrupt
+            # bail-out below used to `break` out of the polling loop and then
+            # block right here for the slowest child anyway — the escape hatch
+            # did not escape. Ownership of shutdown is explicit instead, with
+            # the wait policy chosen by how the loop actually ended.
             from tools.daemon_pool import DaemonThreadPoolExecutor
-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
+            executor = DaemonThreadPoolExecutor(max_workers=max_children)
+            _interrupted = False
+            _still_running: list[int] = []
+            try:
                 futures = {}
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
@@ -3029,12 +3072,38 @@ def delegate_task(
                 pending = set(futures.keys())
                 while pending:
                     if getattr(parent_agent, "_interrupt_requested", False) is True:
-                        # Parent interrupted — collect whatever finished and
-                        # abandon the rest.  Children already received the
+                        # Parent interrupted. Keep every completed result, stop
+                        # anything that has not started, and record what may
+                        # still be running so the caller is not told that work
+                        # simply vanished. Children already received the
                         # interrupt signal; we just can't wait forever.
+                        _interrupted = True
                         for f in pending:
                             idx = futures[f]
-                            if f.done():
+                            # cancel() succeeds only for work that never
+                            # started; a running child cannot be pre-empted, so
+                            # a False return is exactly how we learn which
+                            # tasks remain in flight.
+                            _cancelled = f.cancel()
+                            if not _cancelled and not f.done():
+                                _still_running.append(idx)
+                            # Order matters: a cancelled future reports done()
+                            # as True, and result() on it raises
+                            # CancelledError — which would be logged as a child
+                            # error rather than as work that never ran.
+                            if _cancelled:
+                                entry = {
+                                    "task_index": idx,
+                                    "status": "cancelled",
+                                    "summary": None,
+                                    "error": "Parent agent interrupted — child never started",
+                                    "api_calls": 0,
+                                    "duration_seconds": 0,
+                                    "_child_role": getattr(
+                                        _child_by_index.get(idx), "_delegate_role", None
+                                    ),
+                                }
+                            elif f.done():
                                 try:
                                     entry = f.result()
                                 except Exception as exc:
@@ -3054,7 +3123,10 @@ def delegate_task(
                                     "task_index": idx,
                                     "status": "interrupted",
                                     "summary": None,
-                                    "error": "Parent agent interrupted — child did not finish in time",
+                                    "error": (
+                                        "Parent agent interrupted — child was still "
+                                        "running and may not have stopped yet"
+                                    ),
                                     "api_calls": 0,
                                     "duration_seconds": 0,
                                     "_child_role": getattr(
@@ -3115,6 +3187,26 @@ def delegate_task(
                                 )
                             except Exception as e:
                                 logger.debug("Spinner update_text failed: %s", e)
+
+            finally:
+                if _interrupted:
+                    # Never wait here. cancel_futures drops queued work that
+                    # never started; anything already running is a daemon
+                    # thread that has been signalled and must not hold the
+                    # parent hostage. This is the whole point of the fix —
+                    # __exit__ would have joined unconditionally.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    if _still_running:
+                        logger.warning(
+                            "delegate_task: interrupted with %d child task(s) still "
+                            "running (indices %s); their threads are daemons and were "
+                            "signalled, but may not have stopped yet",
+                            len(_still_running), sorted(_still_running),
+                        )
+                else:
+                    # Normal completion: every future is already done, so this
+                    # joins immediately and keeps the previous semantics.
+                    executor.shutdown(wait=True)
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])

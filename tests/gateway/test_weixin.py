@@ -1,5 +1,7 @@
 """Tests for the Weixin platform adapter."""
 
+from tests.os_env import PLATFORM_ENV
+
 import asyncio
 import base64
 import json
@@ -187,7 +189,7 @@ class TestWeixinConfig:
 
         with patch.dict(
             os.environ,
-            {
+            {**PLATFORM_ENV, 
                 "WEIXIN_ACCOUNT_ID": "bot-account",
                 "WEIXIN_TOKEN": "bot-token",
                 "WEIXIN_BASE_URL": "https://ilink.example.com/",

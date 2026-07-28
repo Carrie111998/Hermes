@@ -86,7 +86,16 @@ class TestInterpretExitCode:
     def test_git_diff_exit_1(self):
         result = _interpret_exit_code("git diff HEAD~1", 1)
         assert result is not None
-        assert "normal" in result.lower()
+        # Asserts the property, not the wording. This matched the literal word
+        # "normal", which came from a blanket git entry that also told the model
+        # a failed `git push` was "often normal" (H-26). The note is now
+        # subcommand-specific; what matters is that diff's exit 1 is explained.
+        assert "expected" in result.lower() or "normal" in result.lower()
+        assert "diff" in result.lower()
+
+    def test_git_push_exit_1_is_not_explained_away(self):
+        """The other half of H-26: a failed push must carry no reassurance."""
+        assert _interpret_exit_code("git push origin main", 1) is None
 
     # ---- pipeline / chain handling ----
 

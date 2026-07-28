@@ -1888,6 +1888,23 @@ atexit.register(_atexit_cleanup)
 # wastes a turn investigating something that just means "no matches".
 # This lookup adds a human-readable note so the agent can move on.
 
+# git subcommands where exit 1 reports "differences found" / "no match" rather
+# than failure. Everything NOT here (push, commit, merge, pull, fetch, rebase,
+# clone, apply, ...) exits 1 on a genuine error.
+_GIT_EXIT1_MEANS_DIFFERENCES = frozenset({
+    "diff", "diff-index", "diff-tree", "diff-files",
+    "grep",           # no match
+    "check-ignore",   # no path matched
+    "merge-base",     # --is-ancestor: not an ancestor
+    "check-attr",
+})
+
+# git global flags that consume the NEXT token, so it must not be mistaken for
+# the subcommand (`git -C /repo diff` was read as subcommand "/repo").
+_GIT_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree",
+                              "--namespace", "--exec-path"})
+
+
 def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     """Return a human-readable note when a non-zero exit code is non-erroneous.
 
@@ -1941,9 +1958,36 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
             22: "HTTP response code indicated error (e.g. 404, 500)",
             28: "Operation timed out",
         },
-        # git: 1 is context-dependent but often normal (e.g. git diff with changes)
-        "git":   {1: "Non-zero exit (often normal — e.g. 'git diff' returns 1 when files differ)"},
     }
+
+    # git is subcommand-dependent, so it cannot live in the table above. Exit 1
+    # means "differences found" or "no match" for a handful of query
+    # subcommands; for push, commit, merge, pull, rebase and the rest it is a
+    # real failure. The previous blanket entry told the model that EVERY
+    # failing git command was "often normal", which is precisely the note that
+    # makes a failed push look like nothing happened.
+    if base_cmd == "git" and exit_code == 1:
+        subcommand = ""
+        skip_next = False
+        for word in (words[words.index("git") + 1:] if "git" in words else []):
+            if skip_next:
+                skip_next = False
+                continue          # this token is the previous flag's VALUE
+            if word in _GIT_VALUE_FLAGS:
+                skip_next = True  # `git -C <path> diff`, `git -c k=v diff`
+                continue
+            if word.startswith("-") or "=" in word:
+                continue          # `--no-pager`, `--git-dir=...`
+            subcommand = word
+            break
+        if subcommand in _GIT_EXIT1_MEANS_DIFFERENCES:
+            return (
+                f"Non-zero exit is expected here — 'git {subcommand}' returns 1 to "
+                "report differences/no-match, not failure."
+            )
+        # Anything else: say nothing. Returning None leaves the normal
+        # error-reporting path intact rather than reassuring the model.
+        return None
 
     cmd_semantics = semantics.get(base_cmd)
     if cmd_semantics and exit_code in cmd_semantics:

@@ -37,9 +37,39 @@ __all__ = ["DaemonThreadPoolExecutor"]
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
+    def _worker_args(self, executor_ref):
+        """Build ``_worker``'s positional args for the running CPython.
+
+        This class mirrors a private stdlib function, so its call signature is
+        version-coupled and HAS already changed:
+
+          * 3.8–3.13 — ``_worker(executor_reference, work_queue, initializer,
+            initargs)``
+          * 3.14+    — ``_worker(executor_reference, ctx, work_queue)`` where
+            ``ctx`` comes from ``self._create_worker_context()``; the
+            ``_initializer``/``_initargs`` attributes are gone.
+
+        Passing the 3.13 shape on 3.14 raised ``AttributeError: no attribute
+        '_initializer'`` on the FIRST submit, which broke every delegate_task
+        on a 3.14 interpreter (the CLI runs 3.14 even where the gateway venv
+        is still 3.11). Branch on the attribute that actually exists rather
+        than on a version tuple.
+        """
+        create_ctx = getattr(self, "_create_worker_context", None)
+        if create_ctx is not None:                      # 3.14+
+            return (executor_ref, create_ctx(), self._work_queue)
+        return (                                        # 3.8–3.13
+            executor_ref,
+            self._work_queue,
+            self._initializer,
+            self._initargs,
+        )
+
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.13) with two changes:
-        # daemon=True and no _threads_queues registration.
+        # Mirrors CPython's implementation with two changes: daemon=True and
+        # no _threads_queues registration.  Both are required — the daemon flag
+        # keeps the interpreter's own non-daemon join from waiting, and staying
+        # out of _threads_queues keeps _python_exit from joining.
         if self._idle_semaphore.acquire(timeout=0):
             return
 
@@ -52,12 +82,7 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
             t = threading.Thread(
                 name=thread_name,
                 target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
+                args=self._worker_args(weakref.ref(self, weakref_cb)),
                 daemon=True,
             )
             t.start()

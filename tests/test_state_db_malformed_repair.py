@@ -616,3 +616,33 @@ def test_select_cached_agent_history_prefers_longer_live_transcript():
     # No live transcript / not a list → no-op.
     assert _select_cached_agent_history(persisted, None) is persisted
     assert _select_cached_agent_history(persisted, "nope") is persisted
+
+
+def test_select_cached_agent_history_ignores_nonpersistent_scaffolding():
+    """Internal retry/verification pairs are not evidence of disk lag."""
+    from gateway.run import _select_cached_agent_history
+
+    persisted = [
+        {"role": "user", "content": "run the checks"},
+        {"role": "assistant", "content": "checks passed"},
+    ]
+    live = persisted + [
+        {
+            "role": "assistant",
+            "content": "premature completion",
+            "_verification_stop_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "verify first",
+            "_verification_stop_synthetic": True,
+        },
+    ]
+
+    assert _select_cached_agent_history(persisted, live) is persisted
+
+    # A real unpersisted message must still activate the corruption guard; the
+    # internal pair is removed from the history returned to the model.
+    missing_from_disk = {"role": "assistant", "content": "durable answer"}
+    selected = _select_cached_agent_history(persisted, live + [missing_from_disk])
+    assert selected == persisted + [missing_from_disk]

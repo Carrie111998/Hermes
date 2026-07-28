@@ -1,5 +1,7 @@
 """Tests for the Raft channel adapter."""
 
+from tests.os_env import PLATFORM_ENV
+
 import asyncio
 import json
 import os
@@ -362,7 +364,7 @@ class TestRaftActivityHttp:
 
             assert is_env_passthrough("RAFT_PROFILE")
             assert _scrub_child_env({"RAFT_PROFILE": "dev"}, is_windows=False)["RAFT_PROFILE"] == "dev"
-            with patch.dict(os.environ, {"PATH": "/usr/bin", "RAFT_PROFILE": "dev"}, clear=True):
+            with patch.dict(os.environ, {**PLATFORM_ENV, "PATH": "/usr/bin", "RAFT_PROFILE": "dev"}, clear=True):
                 assert _make_run_env({})["RAFT_PROFILE"] == "dev"
         finally:
             clear_env_passthrough()

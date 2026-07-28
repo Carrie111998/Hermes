@@ -109,6 +109,15 @@ def _classify_write_denial(path: str) -> Optional[str]:
         if resolved.startswith(prefix):
             return "credential"
 
+    # Project-local secret files. These were already blocked for READS
+    # (get_read_block_error), but not for writes — so the agent could
+    # overwrite or delete a .env it is not permitted to open. Being able to
+    # destroy a credential store you cannot read is a strictly worse
+    # asymmetry than either capability alone, and the equivalent terminal
+    # operation is classified dangerous.
+    if os.path.basename(resolved).lower() in _BLOCKED_PROJECT_ENV_BASENAMES:
+        return "credential"
+
     mcp_tokens_dir_name = "mcp-tokens"
 
     hermes_dirs = []
@@ -126,10 +135,10 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # falsify conversation history and invalidate resume/compression state.
         try:
             if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
-                return True
+                return "credential"
             sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
             if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
-                return True
+                return "credential"
         except Exception:
             pass
         try:

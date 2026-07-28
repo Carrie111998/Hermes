@@ -4,6 +4,8 @@ Verifies that the interactive setup writes env vars that correctly drive the
 Feishu adapter: credentials, connection mode, DM policy, and group policy.
 """
 
+from tests.os_env import PLATFORM_ENV
+
 import os
 from unittest.mock import patch
 
@@ -319,12 +321,12 @@ class TestSetupFeishuAdapterIntegration:
         )
         return env
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, PLATFORM_ENV, clear=True)
     def test_qr_env_produces_valid_adapter_settings(self):
         """QR setup → adapter initializes with websocket mode."""
         env = self._make_env_from_setup()
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, **env}, clear=True):
             from gateway.config import PlatformConfig
             from plugins.platforms.feishu.adapter import FeishuAdapter
             adapter = FeishuAdapter(PlatformConfig())
@@ -333,24 +335,24 @@ class TestSetupFeishuAdapterIntegration:
             assert adapter._domain_name == "feishu"
             assert adapter._connection_mode == "websocket"
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, PLATFORM_ENV, clear=True)
     def test_open_dm_env_sets_correct_adapter_state(self):
         """Setup with 'allow all DMs' → adapter sees allow-all flag."""
         env = self._make_env_from_setup(dm_idx=1)
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, **env}, clear=True):
             from plugins.platforms.feishu.adapter import FeishuAdapter
             from gateway.config import PlatformConfig
             # Verify adapter initializes without error and env var is correct.
             FeishuAdapter(PlatformConfig())
             assert os.getenv("FEISHU_ALLOW_ALL_USERS") == "true"
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, PLATFORM_ENV, clear=True)
     def test_group_open_env_sets_adapter_group_policy(self):
         """Setup with 'open groups' → adapter group_policy is 'open'."""
         env = self._make_env_from_setup(group_idx=0)
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.dict(os.environ, {**PLATFORM_ENV, **env}, clear=True):
             from gateway.config import PlatformConfig
             from plugins.platforms.feishu.adapter import FeishuAdapter
             adapter = FeishuAdapter(PlatformConfig())

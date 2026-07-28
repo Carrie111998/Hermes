@@ -222,8 +222,26 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        # Use the CHECKED reader and say something when a read fails. _read_file
+        # discards the read_ok flag, so an unreadable MEMORY.md (locked by a
+        # sister process, permissions, a truncated write) degraded to [] and the
+        # entire memory + user-profile block vanished for the whole session with
+        # no log, no warning, and no visible difference from "no memories yet".
+        # Nothing is written back, so the DATA is safe — but the agent silently
+        # loses everything it knows, which is not something to discover later.
+        self.memory_entries, _mem_ok = self._read_entries_checked(mem_dir / "MEMORY.md")
+        self.user_entries, _user_ok = self._read_entries_checked(mem_dir / "USER.md")
+        for _label, _ok, _path in (
+            ("MEMORY.md", _mem_ok, mem_dir / "MEMORY.md"),
+            ("USER.md", _user_ok, mem_dir / "USER.md"),
+        ):
+            if not _ok:
+                logger.error(
+                    "memory: %s at %s could not be read — this session is running "
+                    "with that block EMPTY, which is indistinguishable from having "
+                    "no memories. Nothing was written back, so the file is intact.",
+                    _label, _path,
+                )
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -737,13 +755,48 @@ class MemoryStore:
 
         limit = self._char_limit(target)
         content = ENTRY_DELIMITER.join(entries)
+
+        # Enforce the limit, don't merely report it. This computed `limit` and
+        # rendered a percentage against it, but emitted `content` in full
+        # regardless — memory was bounded on WRITE and unbounded on READ, so an
+        # oversized MEMORY.md (grown by a sister session, an external editor, or
+        # a restored backup) went into the volatile system-prompt tier whole and
+        # silently displaced conversation budget.
+        #
+        # Whole entries are dropped from the OLDEST end rather than slicing
+        # characters: entries are delimited records, and half an entry is worse
+        # than no entry — it can invert a fact's meaning. The drop is stated in
+        # the header so neither the model nor the user thinks memory is intact.
+        dropped = 0
+        if limit > 0 and len(content) > limit:
+            kept = list(entries)
+            while kept and len(ENTRY_DELIMITER.join(kept)) > limit:
+                kept.pop(0)
+                dropped += 1
+            if not kept:
+                # A single entry larger than the whole budget: keep a bounded
+                # head so the block is never silently empty.
+                kept = [entries[-1][: max(0, limit - 3)] + "..."]
+                dropped = len(entries) - 1
+            entries = kept
+            content = ENTRY_DELIMITER.join(entries)
+
         current = len(content)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
+        overflow = (
+            f" — {dropped} older entr{'y' if dropped == 1 else 'ies'} omitted, over budget"
+            if dropped else ""
+        )
         if target == "user":
-            header = f"{MEMORY_BLOCK_HEADERS['user']} [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"{MEMORY_BLOCK_HEADERS['user']} [{pct}% — {current:,}/{limit:,} chars{overflow}]"
         else:
-            header = f"{MEMORY_BLOCK_HEADERS['memory']} [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"{MEMORY_BLOCK_HEADERS['memory']} [{pct}% — {current:,}/{limit:,} chars{overflow}]"
+        if dropped:
+            logger.warning(
+                "memory block %r exceeded its %d-char budget; omitted %d oldest entr%s",
+                target, limit, dropped, "y" if dropped == 1 else "ies",
+            )
 
         separator = "═" * 46
         return f"{separator}\n{header}\n{separator}\n{content}"

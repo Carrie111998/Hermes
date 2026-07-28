@@ -240,16 +240,23 @@ class TestUtilities:
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        # Mock os.name and uname for non-macOS, non-Windows
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
+        # Select the non-macOS, non-Windows branch. Patch the module constant,
+        # NOT os.name: pathlib.Path dispatches on os.name, so patching it makes
+        # every subsequent Path(...) in the process raise NotImplementedError
+        # and takes pytest itself down with an INTERNALERROR.
+        import tools.mcp_oauth as mco
+        monkeypatch.setattr(mco, "_IS_WINDOWS", False)
+        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})(),
+                            raising=False)
         assert _can_open_browser() is False
 
     def test_can_open_browser_true_with_display(self, monkeypatch):
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.setenv("DISPLAY", ":0")
-        monkeypatch.setattr(os, "name", "posix")
+        # See above: patch the module constant, never os.name.
+        import tools.mcp_oauth as mco
+        monkeypatch.setattr(mco, "_IS_WINDOWS", False)
         assert _can_open_browser() is True
 
 

@@ -1637,6 +1637,27 @@ def _restart_notification_pending() -> bool:
     return (_hermes_home / ".restart_notify.json").exists()
 
 
+def _update_notification_age(pending: dict) -> Optional[float]:
+    """Seconds since the /update that wrote this pending marker.
+
+    Read from the payload's ``timestamp`` rather than the marker's mtime:
+    deferring a notification rewrites the marker each pass, so its mtime is
+    always seconds old no matter how long the notification has been stuck.
+    Returns None when the timestamp is missing or unparseable, which the
+    caller treats as "cannot age out" so a malformed marker never causes a
+    real notification to be dropped.
+    """
+    raw = pending.get("timestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        written = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    now = datetime.now(written.tzinfo) if written.tzinfo else datetime.now()
+    return max(0.0, (now - written).total_seconds())
+
+
 def _planned_restart_notification_path() -> Path:
     return _hermes_home / ".restart_pending.json"
 
@@ -2199,6 +2220,9 @@ from gateway.delivery import (
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.worker_bridge_watchers import GatewayWorkerBridgeWatchersMixin
+from gateway.worker_bridge_ultra import GatewayWorkerBridgeUltraMixin
+from gateway.worker_task_dispatcher import GatewayWorkerTaskDispatcherMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -3335,7 +3359,18 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayKanbanWatchersMixin,
+    # MUST precede GatewayWorkerBridgeWatchersMixin in the MRO: that
+    # mixin's _worker_bridge_tick calls self._ultra_route_transitions
+    # and self._ultra_pump, which live here. Without it every alert
+    # tick carrying transitions raised AttributeError.
+    GatewayWorkerBridgeUltraMixin,
+    GatewayWorkerBridgeWatchersMixin,
+    GatewayWorkerTaskDispatcherMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -8726,6 +8761,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
 
+        self._start_worker_bridge_watchers()
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -8810,6 +8847,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # be permanently abandoned (NS: silent loss of platform-reconnect / kanban /
     # handoff for the rest of the process life).
     _SUPERVISED_HEALTHY_SECS = 300
+
+    def _start_worker_bridge_watchers(self) -> None:
+        """Start the created-task dispatcher and configured alert watcher."""
+        # This thin dispatcher remains the sole owner of ``created`` tasks.
+        self._spawn_supervised(
+            self._worker_task_dispatcher_watcher,
+            "worker_task_dispatcher_watcher",
+        )
+
+        config = _load_gateway_config()
+        worker_bridge = (
+            config.get("worker_bridge", {}) if isinstance(config, dict) else {}
+        )
+        gateway_alerts = (
+            worker_bridge.get("gateway_alerts", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
+        failure_successors = (
+            worker_bridge.get("failure_successors", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
+        review_continuation = (
+            worker_bridge.get("review_continuation", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
+        stage_successors = (
+            worker_bridge.get("stage_successors", {})
+            if isinstance(worker_bridge, dict)
+            else {}
+        )
+        alerts_enabled = (
+            isinstance(gateway_alerts, dict)
+            and gateway_alerts.get("enabled") is True
+        )
+        failure_successors_enabled = not (
+            isinstance(failure_successors, dict)
+            and failure_successors.get("enabled") is False
+        )
+        review_continuation_enabled = not (
+            isinstance(review_continuation, dict)
+            and review_continuation.get("enabled") is False
+        )
+        stage_successors_enabled = not (
+            isinstance(stage_successors, dict)
+            and stage_successors.get("enabled") is False
+        )
+        # Every successor policy runs inside the notifier watcher's tick, so the
+        # watcher must start if ANY of them is live. Gating it on alerts and
+        # failure successors alone silently disabled review continuations and
+        # stage successors for anyone who enabled only those.
+        if not (
+            alerts_enabled
+            or failure_successors_enabled
+            or review_continuation_enabled
+            or stage_successors_enabled
+        ):
+            return
+
+        # The recovered watcher handles terminal notifications, orphaned
+        # ``queued`` tasks, idle nudges, and bounded successor policies.
+        self._spawn_supervised(
+            self._worker_bridge_notifier_watcher,
+            "worker_bridge_notifier_watcher",
+        )
 
     def _spawn_supervised(self, coro_factory, name, *, restart=True, _attempt=0, on_spawn=None):
         """Launch a long-lived background task with task-level supervision.
@@ -17166,6 +17270,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
+    # How long a pending update notification may keep waiting for its target
+    # platform to reconnect before it is abandoned. Deferral preserves the
+    # marker so a platform that reconnects shortly after the update still gets
+    # notified, but a platform that is misconfigured (or simply never enabled)
+    # would otherwise defer forever: the watcher re-arms on every gateway
+    # start, so its own 30-minute deadline never retires the marker. Comfortably
+    # longer than the update timeout so a slow-but-real update still delivers.
+    _UPDATE_NOTIFICATION_MAX_AGE = 3600.0
+
 
 
     def _schedule_update_notification_watch(self) -> None:
@@ -17293,7 +17406,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Read any remaining output
                 if output_path.exists():
                     try:
-                        content = output_path.read_text(encoding="utf-8")
+                        content = output_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
                         if len(content) > bytes_sent:
                             buffer += content[bytes_sent:]
                             bytes_sent = len(content)
@@ -17332,7 +17447,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Check for new output
             if output_path.exists():
                 try:
-                    content = output_path.read_text(encoding="utf-8")
+                    content = output_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
                     if len(content) > bytes_sent:
                         buffer += content[bytes_sent:]
                         bytes_sent = len(content)
@@ -17464,7 +17581,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text(encoding="utf-8")
+                # `hermes update` emits UTF-8 (✓/→ progress markers). Without an
+                # explicit codec this decodes as the Windows ANSI codepage and
+                # the notification arrives mojibake, or raises on an undefined
+                # byte. errors="replace" keeps arbitrary subprocess output from
+                # breaking the notifier outright.
+                output = output_path.read_text(encoding="utf-8", errors="replace")
 
             # Resolve adapter
             platform = Platform(platform_str)
@@ -17479,6 +17601,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # update succeeded or timed out. Preserve the markers instead so
                 # a later retry (the watcher poll loop, or the next gateway
                 # startup) can deliver the result once the adapter is back.
+                #
+                # Bounded, though: a platform that never reconnects would defer
+                # on every 2s poll forever. Age is measured from the payload
+                # timestamp because deferral rewrites the marker (and so its
+                # mtime) on every pass.
+                age = _update_notification_age(pending)
+                if age is not None and age > self._UPDATE_NOTIFICATION_MAX_AGE:
+                    logger.warning(
+                        "Update notification abandoned after %.0fs: %s adapter never "
+                        "connected; discarding markers",
+                        age,
+                        platform_str,
+                    )
+                    return True
                 logger.info(
                     "Update notification deferred: %s adapter not connected yet",
                     platform_str,

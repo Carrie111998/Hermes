@@ -1,6 +1,8 @@
 """Tests for HermesCLI initialization -- catches configuration bugs
 that only manifest at runtime (not in mocked unit tests)."""
 
+from tests.os_env import PLATFORM_ENV
+
 import os
 import sys
 from types import SimpleNamespace
@@ -198,7 +200,7 @@ class TestPromptToolkitTerminalCompatibility:
 
         # Bare local POSIX (no SSH/WSL markers): both enter and c-j submit.
         with _patch.object(_sys, "platform", "linux"), \
-             _patch.dict(_os.environ, {}, clear=True), \
+             _patch.dict(_os.environ, PLATFORM_ENV, clear=True), \
              _patch("builtins.open", side_effect=OSError("no /proc")):
             kb = KeyBindings()
             _bind_prompt_submit_keys(kb, submit_handler)

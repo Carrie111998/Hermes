@@ -157,10 +157,29 @@ class FileStateRegistry:
             stamp = self._reads.get(task_id, {}).get(resolved)
             last_writer = self._last_writer.get(resolved)
 
-        # Case 3: never read AND we have no write record — net-new file or
-        # first touch by this agent.  Let existing _check_sensitive_path
-        # and file-exists logic handle it; nothing to warn about here.
+        # Case 3: never read AND no write record.  This is a net-new file OR a
+        # blind overwrite of existing content — and the two are not the same
+        # thing.  The comment here used to defer to "file-exists logic", but no
+        # such check exists on the write path, so overwriting a file this agent
+        # had never opened produced no warning and a success-shaped result: the
+        # previous content was simply gone.
+        #
+        # Warn, never block.  Writing a brand-new file is the common, correct
+        # case, and a hard block would break it; the signal only needs to reach
+        # the model before it treats a destructive overwrite as routine.  An
+        # empty existing file carries nothing to lose, so it stays silent.
         if stamp is None and last_writer is None:
+            try:
+                if os.path.getsize(resolved) > 0:
+                    return (
+                        f"{resolved} already exists with content and this agent "
+                        "never read it. Writing replaces the file wholesale — "
+                        "read it first if you meant to preserve or edit what is "
+                        "there, or use patch for a targeted change."
+                    )
+            except OSError:
+                # Missing or unreadable — genuinely net-new, nothing to warn about.
+                return None
             return None
 
         try:
@@ -219,17 +238,25 @@ class FileStateRegistry:
         self,
         exclude_task_id: str,
         since_ts: float,
-        paths: Iterable[str],
+        paths: Optional[Iterable[str]] = None,
     ) -> Dict[str, List[str]]:
         """Return ``{writer_task_id: [paths]}`` for writes done after
         ``since_ts`` by agents OTHER than ``exclude_task_id``.
 
         Used by delegate_task to append a "subagent modified files the
         parent previously read" reminder to the delegation result.
+
+        ``paths`` filters the result. ``None`` means NO filter — report every
+        write. An empty iterable still means "match nothing", which is what it
+        has always meant; the distinction matters because delegate_task passed
+        ``[]`` intending "all writes" (its own comment said so) and therefore
+        reported ``files_written`` as empty in every subagent.complete event
+        ever emitted. Making ``[]`` mean "everything" would instead have made
+        the sibling-write reminder list files the parent never read.
         """
         if _disabled():
             return {}
-        paths_set = set(paths)
+        paths_set = None if paths is None else set(paths)
         out: Dict[str, List[str]] = defaultdict(list)
         with self._state_lock:
             for p, (writer_tid, ts) in self._last_writer.items():
@@ -237,7 +264,7 @@ class FileStateRegistry:
                     continue
                 if ts < since_ts:
                     continue
-                if p in paths_set:
+                if paths_set is None or p in paths_set:
                     out[writer_tid].append(p)
         return dict(out)
 
@@ -311,9 +338,14 @@ def lock_path(resolved_or_path: str | Path):
 def writes_since(
     exclude_task_id: str,
     since_ts: float,
-    paths: Iterable[str | Path],
+    paths: Optional[Iterable[str | Path]] = None,
 ) -> Dict[str, List[str]]:
-    return _registry.writes_since(exclude_task_id, since_ts, [str(p) for p in paths])
+    # None passes straight through as "no filter"; only a real iterable is
+    # normalized to strings.
+    return _registry.writes_since(
+        exclude_task_id, since_ts,
+        None if paths is None else [str(p) for p in paths],
+    )
 
 
 def known_reads(task_id: str) -> List[str]:

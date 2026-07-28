@@ -27,6 +27,20 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 
+# Turn-exit reasons that mean the turn CRASHED rather than finished.
+# Module-level because delegate_tool needs the same list: a crashed child still
+# produces a non-empty apology as its final_response, so anything deriving
+# success from "there is output" reports the crash as a completion.
+CRASH_EXIT_PREFIXES = ("local_processing_error(", "error_near_max_iterations(")
+
+# The turn-exit reason for "model never produced visible text". Consumers must
+# key on this rather than on the "(empty)" literal: conversation_loop delivers
+# this same terminal as a labeled reasoning excerpt whenever the model DID
+# think but emitted no answer, so the literal only covers the no-reasoning
+# half. Matching the string alone let a reasoning-only child read as a normal
+# answer — non-empty, not a crash prefix — and report success.
+EMPTY_TERMINAL_EXIT_REASON = "empty_response_exhausted"
+
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
@@ -64,6 +78,26 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
     ]
+
+
+# Exit reasons written by the outer-loop exception handler
+# (agent/conversation_loop.py:6659-6672). That handler puts an apology string
+# into ``final_response`` and breaks WITHOUT setting ``failed``, so a crash is
+# otherwise shaped exactly like a successful answer.
+#
+# Exported as a predicate rather than duplicated at each call site: the finalizer
+# and delegate_tool must agree on what "crashed" means, and two copies of a
+# prefix tuple drift the moment a new exit reason is added.
+
+
+def turn_crashed(turn_exit_reason) -> bool:
+    """True when the turn ended in an internal crash rather than an answer.
+
+    Deliberately excludes ``guardrail_halt``: a hard stop after N identical tool
+    failures is an intentional early exit the operator opts into, and it is
+    test-locked as a completed turn.
+    """
+    return str(turn_exit_reason or "").startswith(CRASH_EXIT_PREFIXES)
 
 
 def finalize_turn(
@@ -192,9 +226,39 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+
+    # A crash exit is NOT a completion. The two crash paths in
+    # conversation_loop (search: ``local_processing_error(`` /
+    # ``error_near_max_iterations(``) write an apology into final_response and
+    # break WITHOUT setting ``failed``. Every ingredient of the old expression
+    # was therefore satisfied on a crash, and the turn reported completed=True:
+    # cron/scheduler.py marked the job "ok" and delegate_task handed the parent
+    # a completed status for work that died mid-way. cron's own comment assumed
+    # run_agent set failed=True on those paths; it does not.
+    #
+    # Deliberately no line numbers or counts here. This comment previously
+    # said ``failed = True`` "appears exactly once, at :1582, in that
+    # 6698-line loop" — all three facts went stale in a single upstream merge
+    # (now three sites, 6900 lines, crash paths moved ~200 lines). PATCH_LEDGER
+    # asks reviewers to hand-check this region after every merge, and this is
+    # the only recorded rationale for keeping ``not crashed``; a reviewer who
+    # tests a false claim can reasonably conclude the patch is obsolete and
+    # delete it. Verify by the searchable property instead.
+    #
+    # Other ``failed = True`` sites are fine and need no coordination: they set
+    # ``failed``, so the ``not failed`` term already excludes them. Upstream's
+    # ``session_persistence_failed`` exit is one such — it is NOT in
+    # CRASH_EXIT_PREFIXES because it does not need to be.
+    #
+    # Guardrail halts are deliberately NOT included. That path is a bounded,
+    # test-locked stop with its own reporting, and treating it as failure would
+    # change documented behaviour rather than fix a defect.
+    crashed = turn_crashed(_turn_exit_reason)
+
     completed = (
         final_response is not None
         and not failed
+        and not crashed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -443,7 +507,11 @@ def finalize_turn(
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
-                _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
+                _is_empty_terminal = (
+                    _stripped == ""
+                    or _stripped == "(empty)"
+                    or str(_turn_exit_reason) == EMPTY_TERMINAL_EXIT_REASON
+                )
                 # A short fragment that is not a normal text_response exit
                 # and lacks sentence-ending punctuation is treated as a
                 # truncated partial (the "The" case from #34452).

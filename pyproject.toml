@@ -342,8 +342,13 @@ markers = [
     "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
     "requires_wal: needs the runtime to actually enable SQLite WAL mode (skipped where Hermes falls back to journal_mode=DELETE)",
 ]
-# integration tests take way too long to run in the normal CI environments
-addopts = "-m 'not integration'"
+# Keep unrelated globally-installed plugins from breaking this suite during
+# pytest's entry-point auto-discovery (before test collection even starts).
+# In particular, langsmith pulls in a platform-specific pydantic-core wheel.
+# The project does not use the plugin, so block it while retaining the pytest
+# plugins declared by the development environment.
+# Integration tests take way too long to run in the normal CI environments.
+addopts = "-p no:langsmith_plugin -m 'not integration'"
 
 [tool.ty.environment]
 python-version = "3.13"

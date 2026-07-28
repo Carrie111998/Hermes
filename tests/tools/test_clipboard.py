@@ -7,6 +7,8 @@ Coverage:
                               image attachment state, queue tuple routing
 """
 
+from tests.os_env import PLATFORM_ENV
+
 import base64
 import os
 import queue
@@ -561,7 +563,7 @@ class TestLinuxSave:
         dest = tmp_path / "out.png"
         with patch("hermes_cli.clipboard._is_wsl", return_value=True):
             with patch("hermes_cli.clipboard._wsl_save", return_value=False):
-                with patch.dict(os.environ, {}, clear=True):
+                with patch.dict(os.environ, PLATFORM_ENV, clear=True):
                     with patch("hermes_cli.clipboard._xclip_save", return_value=True) as m:
                         assert _linux_save(dest) is True
                         m.assert_called_once_with(dest)
@@ -586,7 +588,7 @@ class TestLinuxSave:
     def test_xclip_used_on_plain_x11(self, tmp_path):
         dest = tmp_path / "out.png"
         with patch("hermes_cli.clipboard._is_wsl", return_value=False):
-            with patch.dict(os.environ, {}, clear=True):
+            with patch.dict(os.environ, PLATFORM_ENV, clear=True):
                 with patch("hermes_cli.clipboard._xclip_save", return_value=True) as m:
                     assert _linux_save(dest) is True
                     m.assert_called_once_with(dest)
@@ -866,7 +868,7 @@ class TestHasClipboardImage:
         with patch("hermes_cli.clipboard.sys") as mock_sys:
             mock_sys.platform = "linux"
             with patch("hermes_cli.clipboard._is_wsl", return_value=False):
-                with patch.dict(os.environ, {}, clear=True):
+                with patch.dict(os.environ, PLATFORM_ENV, clear=True):
                     with patch("hermes_cli.clipboard._xclip_has_image", return_value=True) as m:
                         assert has_clipboard_image() is True
                         m.assert_called_once()
