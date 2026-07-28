@@ -2747,7 +2747,15 @@ class APIServerAdapter(BasePlatformAdapter):
         ``extra`` is the canonical platform-config channel; it exists because
         the top-level block is where an operator naturally puts this and the
         shared-key bridge in ``gateway.config`` does not carry the key into
-        ``extra``.  Resolved once and memoized — this is consulted per run.
+        ``extra``.
+
+        (1) and (2) are adapter-wide.  (3) is resolved **per profile**: under
+        ``gateway.multiplex_profiles`` one adapter serves every profile, and
+        the request middleware has already entered the routed profile's
+        runtime scope, so ``load_config()`` here reads that profile's config.
+        The result is memoized per profile name — caching a single value would
+        let whichever profile issued the first run decide the flag for all of
+        them.
 
         Off by default: only when it is true AND a run actually carries a
         ``tools`` array does the relay path activate, so existing server-side
@@ -2755,18 +2763,24 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if self._split_runtime:
             return True
-        cached = getattr(self, "_split_runtime_from_config", None)
-        if cached is None:
+        # "" is the un-prefixed/single-profile case (the default profile).
+        profile_key = _api_request_profile.get() or ""
+        cache = getattr(self, "_split_runtime_config_cache", None)
+        if cache is None:
+            cache = {}
+            self._split_runtime_config_cache = cache
+        if profile_key not in cache:
             try:
                 from hermes_cli.config import load_config
 
                 cfg = load_config() or {}
                 api_cfg = cfg.get("api_server", {}) or {}
-                cached = _coerce_request_bool(api_cfg.get("split_runtime", False))
+                cache[profile_key] = _coerce_request_bool(
+                    api_cfg.get("split_runtime", False)
+                )
             except Exception:
-                cached = False
-            self._split_runtime_from_config = cached
-        return cached
+                cache[profile_key] = False
+        return cache[profile_key]
 
     # ------------------------------------------------------------------
     # HTTP Handlers

@@ -6076,3 +6076,46 @@ class TestSplitRuntimeRelayOverHTTP:
                 json={"call_id": "c1", "output": "x"},
             )
             assert resp.status == 404
+
+
+class TestSplitRuntimePerProfileResolution:
+    """split_runtime resolution must be per-profile under multiplexing."""
+
+    def test_config_fallback_is_cached_per_profile(self, monkeypatch):
+        from gateway.platforms import api_server as mod
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        assert adapter._split_runtime is False
+
+        # Simulate two profiles whose top-level api_server blocks disagree.
+        per_profile = {"assistant": True, "study": False, "": False}
+        seen = []
+
+        def _fake_load_config():
+            profile = mod._api_request_profile.get() or ""
+            seen.append(profile)
+            return {"api_server": {"split_runtime": per_profile[profile]}}
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _fake_load_config)
+
+        for profile, expected in (("assistant", True), ("study", False), ("", False)):
+            token = mod._api_request_profile.set(profile or None)
+            try:
+                assert adapter._split_runtime_enabled() is expected
+                # Second call for the same profile is served from the cache.
+                assert adapter._split_runtime_enabled() is expected
+            finally:
+                mod._api_request_profile.reset(token)
+
+        # One config read per distinct profile, not per call.
+        assert sorted(seen) == ["", "assistant", "study"]
+
+    def test_adapter_level_flag_short_circuits_config(self, monkeypatch):
+        def _boom():
+            raise AssertionError("config must not be consulted when extra sets the flag")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"split_runtime": True})
+        )
+        assert adapter._split_runtime_enabled() is True
