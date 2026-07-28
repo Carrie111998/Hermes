@@ -2344,7 +2344,7 @@ class WorkflowEngine:
                                     if rev_state.kanban_card_id and rev_state.status == "blocked":
                                         with kanban_db.connect_closing(board=self.kanban_board) as _conn:
                                             kanban_db.unblock_task(_conn, rev_state.kanban_card_id)
-                                        rev_state.status = "ready"
+                                        rev_state.status = "running"
                                         rev_state.completed_at = None
                                         rev_state.result = None
                                         print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
