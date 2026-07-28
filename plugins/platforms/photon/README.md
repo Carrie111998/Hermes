@@ -179,14 +179,14 @@ deliberate:
    for every version between the current pin and the target.
 2. Bump the exact pin in `sidecar/package.json`, then run `npm install`
    inside `sidecar/` to regenerate `package-lock.json`. Commit both.
-3. Migrate `sidecar/index.mjs` against the new typings. `spectrum-ts` re-exports
-   `@spectrum-ts/core` (the framework: `Spectrum`, content builders,
-   `Space`/`Message`) and `@spectrum-ts/imessage` (the provider), so the source
-   of truth is `sidecar/node_modules/@spectrum-ts/{core,imessage}/dist/*.d.ts`
-   (the hosted docs can lag).
-4. Re-run mixed text/attachment inbound coverage. Spectrum 8.1.1 and newer
-   preserve ordered iMessage parts upstream; verify the target version still
-   emits every text and attachment part in order with `flattenGroups` enabled.
+3. Migrate `sidecar/spectrum-runtime.mjs` against the new typings. The sidecar
+   imports framework primitives from `@spectrum-ts/core`, managed iMessage from
+   `spectrum-ts/providers/imessage`, and local macOS iMessage from
+   `@spectrum-ts/imessage-local`.
+4. Run the sidecar tests. They verify the installed provider exports as well as
+   the executable local/cloud selection behavior. Then re-run mixed
+   text/attachment inbound coverage and verify every part remains ordered with
+   `flattenGroups` enabled.
 5. Run `pytest tests/plugins/platforms/photon/`.
 6. Verify end-to-end: `hermes photon status`, a DM and a group roundtrip,
    and an agent reply into a group right after a gateway restart (exercises

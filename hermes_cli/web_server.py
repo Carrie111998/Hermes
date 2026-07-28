@@ -8660,9 +8660,11 @@ def _catalog_lookup(platform_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _messaging_env_info(key: str) -> dict[str, Any]:
+def _messaging_env_info(
+    key: str, *, include_internal: bool = False
+) -> dict[str, Any]:
     info = OPTIONAL_ENV_VARS.get(key) or _MESSAGING_ENV_FALLBACKS.get(key) or {}
-    return {
+    result = {
         "description": info.get("description", ""),
         "prompt": info.get("prompt", key),
         "help": info.get("help", ""),
@@ -8672,12 +8674,14 @@ def _messaging_env_info(key: str) -> dict[str, Any]:
         "default_value": info.get("default"),
         "options": info.get("options") or [],
         "visible_when": info.get("visible_when"),
-        "config_key": info.get("config_key"),
     }
+    if include_internal:
+        result["config_key"] = info.get("config_key")
+    return result
 
 
 def _messaging_config_path(key: str) -> tuple[str, ...]:
-    raw_path = _messaging_env_info(key).get("config_key")
+    raw_path = _messaging_env_info(key, include_internal=True).get("config_key")
     if not isinstance(raw_path, str):
         return ()
     return tuple(part for part in raw_path.split(".") if part)

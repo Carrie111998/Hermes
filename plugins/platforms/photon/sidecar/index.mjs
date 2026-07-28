@@ -38,7 +38,7 @@
 // On SIGINT/SIGTERM the sidecar calls `app.stop()` (3s graceful) before
 // exiting. Logs go to stderr; Python supervises restart.
 //
-// Requires spectrum-ts 8.x — pinned exactly in package.json because the SDK
+// Requires Spectrum 12.x — pinned exactly in package.json because the SDK
 // ships breaking majors; see README "Upgrading spectrum-ts".
 //
 // Env vars (required):
@@ -61,6 +61,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { normalizeReplyContent } from "./reply-content.mjs";
+import { createSpectrumRuntime } from "./spectrum-runtime.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -220,10 +221,7 @@ if (!sharedToken || (!localMode && (!projectId || !projectSecret))) {
   process.exit(2);
 }
 
-// Lazy-load spectrum-ts so a missing install fails with a clear message
-// instead of a cryptic module-resolution error during import.
-let Spectrum,
-  imessage,
+let app,
   attachment,
   voice,
   spectrumText,
@@ -231,33 +229,26 @@ let Spectrum,
   spectrumTyping;
 try {
   ({
-    Spectrum,
+    app,
     attachment,
     voice,
-    text: spectrumText,
-    markdown: spectrumMarkdown,
-    typing: spectrumTyping,
-  } = await import("spectrum-ts"));
-  ({ imessage } = await import("spectrum-ts/providers/imessage"));
+    spectrumText,
+    spectrumMarkdown,
+    spectrumTyping,
+  } = await createSpectrumRuntime({
+    localMode,
+    projectId,
+    projectSecret,
+    telemetry,
+  }));
 } catch (e) {
   console.error(
-    "photon-sidecar: spectrum-ts is not installed. Run `npm install` " +
+    "photon-sidecar: Spectrum dependencies could not be loaded. Run `npm install` " +
       "inside plugins/platforms/photon/sidecar/. Original error: " +
       (e && e.stack ? e.stack : String(e))
   );
   process.exit(3);
 }
-
-const spectrumConfig = {
-  providers: [localMode ? imessage.config({ local: true }) : imessage.config()],
-  options: { flattenGroups: true },
-  telemetry,
-};
-if (!localMode) {
-  spectrumConfig.projectId = projectId;
-  spectrumConfig.projectSecret = projectSecret;
-}
-const app = await Spectrum(spectrumConfig);
 
 // ---------------------------------------------------------------------------
 // Inbound: forward `app.messages` (gRPC stream) to the Python consumer.

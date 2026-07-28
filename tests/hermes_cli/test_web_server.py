@@ -3575,6 +3575,7 @@ class TestWebServerEndpoints:
             {"value": "cloud", "label": "Photon cloud"},
             {"value": "local", "label": "Local Mac"},
         ]
+        assert "config_key" not in mode
         assert fields["PHOTON_PROJECT_ID"]["visible_when"] == {
             "key": "PHOTON_IMESSAGE_MODE",
             "values": ["cloud"],

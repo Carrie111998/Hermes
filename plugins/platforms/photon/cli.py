@@ -311,7 +311,7 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     photon_auth.print_credential_summary(print)
     node_bin = os.getenv("PHOTON_NODE_BIN") or shutil.which("node")
     sidecar_installed = (_SIDECAR_DIR / "node_modules").exists()
-    print(f"  node binary         : {node_bin or '✗ missing (install Node 18+)'}")
+    print(f"  node binary         : {node_bin or '✗ missing (install Node 20+)'}")
     print(f"  sidecar deps        : {'✓ installed' if sidecar_installed else '✗ run `hermes photon install-sidecar`'}")
     print(f"  telemetry           : {'on' if _telemetry_enabled() else 'off'} (`hermes photon telemetry on|off`)")
     return 0

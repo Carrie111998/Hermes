@@ -26,8 +26,9 @@ def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
 
 
 def _make_local_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
-    monkeypatch.delenv("PHOTON_PROJECT_ID", raising=False)
-    monkeypatch.delenv("PHOTON_PROJECT_SECRET", raising=False)
+    # Local mode must not leak stale cloud credentials into the child.
+    monkeypatch.setenv("PHOTON_PROJECT_ID", "stale-cloud-id")
+    monkeypatch.setenv("PHOTON_PROJECT_SECRET", "stale-cloud-secret")
     cfg = PlatformConfig(enabled=True, token="", extra={"imessage_mode": "local"})
     return PhotonAdapter(cfg)
 
@@ -151,18 +152,6 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
         lambda: hidden_flags,
     )
 
-    class _PatchResult:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    def _fake_run(cmd: List[str], **kwargs: Any) -> _PatchResult:
-        spawned["patch_cmd"] = cmd
-        spawned["patch_kwargs"] = kwargs
-        return _PatchResult()
-
-    monkeypatch.setattr(photon_adapter.subprocess, "run", _fake_run)
-
     class _FakeProc:
         pid = 999
         stdout = None
@@ -193,7 +182,6 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
     kwargs = spawned["kwargs"]
     assert kwargs["stdin"] is subprocess.PIPE
     assert kwargs["env"]["PHOTON_SIDECAR_WATCH_STDIN"] == "1"
-    assert spawned["patch_kwargs"]["creationflags"] == hidden_flags
     assert kwargs["creationflags"] == hidden_flags
 
 

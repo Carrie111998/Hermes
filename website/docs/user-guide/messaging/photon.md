@@ -67,11 +67,10 @@ photon:
   imessage_mode: local
 ```
 
-Local mode uses Spectrum's open-source macOS Messages path
-(`imessage.config({ local: true })`). It does not use Photon dashboard
-login, `PHOTON_PROJECT_ID`, or `PHOTON_PROJECT_SECRET`. Grant Full Disk
-Access to the process that starts Hermes so the sidecar can read the
-Messages database.
+Local mode uses Spectrum's dedicated open-source macOS provider
+(`@spectrum-ts/imessage-local`). It does not use Photon dashboard login,
+`PHOTON_PROJECT_ID`, or `PHOTON_PROJECT_SECRET`. Grant Full Disk Access to
+the process that starts Hermes so the sidecar can read the Messages database.
 
 Spectrum local mode can start a DM from a bare E.164 number and rehydrate an
 existing DM or group from its chat GUID. That means cold cron delivery works

@@ -1,7 +1,7 @@
 {
   "name": "@hermes-agent/photon-sidecar",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Spectrum-ts bridge for the Hermes Agent Photon platform plugin.",
   "type": "module",
   "main": "index.mjs",
@@ -13,7 +13,9 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "spectrum-ts": "8.2.1"
+    "@spectrum-ts/core": "12.4.0",
+    "@spectrum-ts/imessage-local": "12.4.0",
+    "spectrum-ts": "12.4.0"
   },
   "overrides": {
     "protobufjs": "8.6.1",

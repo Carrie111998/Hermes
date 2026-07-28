@@ -251,7 +251,7 @@ def _imessage_mode(extra: Optional[dict] = None) -> str:
     return "cloud"
 
 
-def _apply_yaml_config(yaml_cfg: dict, photon_cfg: dict) -> Optional[dict]:
+def _apply_yaml_config(_yaml_cfg: dict, photon_cfg: dict) -> Optional[dict]:
     """Bridge Photon behavior settings from config.yaml into PlatformConfig.extra.
 
     Runtime credentials still live in .env/auth.json, but the iMessage delivery
@@ -260,42 +260,23 @@ def _apply_yaml_config(yaml_cfg: dict, photon_cfg: dict) -> Optional[dict]:
         photon:
           imessage_mode: local
 
-    and the generic platform form:
+    and the standard platform-extra form:
 
         platforms:
           photon:
             extra:
               imessage_mode: local
     """
-    candidates: list[Any] = []
-
-    if isinstance(photon_cfg, dict):
-        if "imessage_mode" in photon_cfg:
-            candidates.append(photon_cfg.get("imessage_mode"))
-        extra = photon_cfg.get("extra")
-        if isinstance(extra, dict) and "imessage_mode" in extra:
-            candidates.append(extra.get("imessage_mode"))
-
-    for section_name in ("gateway", "platforms"):
-        section = yaml_cfg.get(section_name)
-        platforms = section.get("platforms") if section_name == "gateway" and isinstance(section, dict) else section
-        if not isinstance(platforms, dict):
-            continue
-        nested = platforms.get("photon")
-        if not isinstance(nested, dict):
-            continue
-        if "imessage_mode" in nested:
-            candidates.append(nested.get("imessage_mode"))
-        extra = nested.get("extra")
-        if isinstance(extra, dict) and "imessage_mode" in extra:
-            candidates.append(extra.get("imessage_mode"))
-
-    if not candidates:
+    if not isinstance(photon_cfg, dict):
         return None
 
-    # Top-level ``photon:`` is the most explicit user-facing shape and should
-    # win over nested fallback config when both are present.
-    mode = _imessage_mode({"imessage_mode": candidates[0]})
+    raw_mode = photon_cfg.get("imessage_mode")
+    if raw_mode is None and isinstance(photon_cfg.get("extra"), dict):
+        raw_mode = photon_cfg["extra"].get("imessage_mode")
+    if raw_mode is None:
+        return None
+
+    mode = _imessage_mode({"imessage_mode": raw_mode})
     return {"imessage_mode": mode}
 
 
@@ -1033,9 +1014,11 @@ class PhotonAdapter(BasePlatformAdapter):
 
         env = os.environ.copy()
         env["PHOTON_IMESSAGE_MODE"] = self._imessage_mode
-        if self._project_id:
+        if self._imessage_mode == "local":
+            env.pop("PHOTON_PROJECT_ID", None)
+            env.pop("PHOTON_PROJECT_SECRET", None)
+        else:
             env["PHOTON_PROJECT_ID"] = self._project_id
-        if self._project_secret:
             env["PHOTON_PROJECT_SECRET"] = self._project_secret
         env["PHOTON_SIDECAR_PORT"] = str(self._sidecar_port)
         env["PHOTON_SIDECAR_BIND"] = self._sidecar_bind
