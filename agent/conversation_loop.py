@@ -1093,6 +1093,8 @@ def run_conversation(
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -1111,6 +1113,13 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
+        persist_user_display_kind: Optional presentation type for a
+            synthesized user turn (``auto_continue``, ``model_switch``, …).
+            Display-only: transcript surfaces render the row as a timeline
+            event instead of a user bubble, while the model still receives
+            the message unchanged.
+        persist_user_display_metadata: Optional payload for that event
+            (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
 
     Returns:
@@ -1153,6 +1162,8 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        persist_user_display_kind=persist_user_display_kind,
+        persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -3206,7 +3217,12 @@ def run_conversation(
                                     _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
                                 except (TypeError, ValueError):  # pragma: no cover
                                     pass
-                            agent._session_db.update_token_counts(
+                            # Enqueued, not written: the background writer
+                            # applies the delta off the turn thread (a cold
+                            # state.db UPDATE here stalled the tool loop for
+                            # up to hundreds of ms per API call). Drained at
+                            # turn finalize via _persist_session.
+                            agent._session_db.queue_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
