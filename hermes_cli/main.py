@@ -4592,6 +4592,10 @@ def cmd_doctor(args):
 def cmd_security(args):
     """Dispatch `hermes security <subcmd>`."""
     sub = getattr(args, "security_command", None)
+    if sub == "inventory":
+        from hermes_cli.autonomy_inventory import cmd_security_inventory
+
+        sys.exit(int(cmd_security_inventory(args) or 0))
     if sub in ("audit", None):
         from hermes_cli.security_audit import cmd_security_audit
 

@@ -9463,6 +9463,7 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id_str = self._effective_message_thread_id(message)
         chat_topic = None
         topic_skill = None
+        topic_prompt = None
 
         if chat_type == "dm" and thread_id_str:
             topic_info = self._get_dm_topic_info(str(chat.id), thread_id_str)
@@ -9508,6 +9509,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         if tid is not None and str(tid) == thread_id_str:
                             chat_topic = topic.get("name")
                             topic_skill = topic.get("skill")
+                            topic_prompt = topic.get("prompt")
                             break
                     break
 
@@ -9580,6 +9582,10 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id_str or _chat_id_str,
             _chat_id_str if thread_id_str else None,
         )
+        if isinstance(topic_prompt, str) and topic_prompt.strip():
+            _channel_prompt = "\n\n".join(
+                part for part in (_channel_prompt, topic_prompt.strip()) if part
+            )
 
         return MessageEvent(
             text=message.text or "",

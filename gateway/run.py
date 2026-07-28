@@ -20378,7 +20378,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.profiles import (
             get_active_profile_name,
             get_profile_dir,
+            normalize_profile_name,
             profile_exists,
+            validate_profile_name,
         )
         from hermes_constants import get_hermes_home
         
@@ -20387,6 +20389,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             name = (source.profile or "").strip()
             if name:
+                name = normalize_profile_name(name)
+                validate_profile_name(name)
                 explicit_profile = name  # User explicitly set this profile
             if not name:
                 name = self._profile_name_for_source(source)
@@ -20396,27 +20400,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 name = get_active_profile_name() or "default"
             
             profile_dir = get_profile_dir(name)
-            # Warn if an explicit profile doesn't exist on disk
+            # Explicit routing must fail closed. Falling back to the gateway's
+            # global home would expose another profile's context and secrets.
             if explicit_profile and not profile_exists(name):
-                logger.warning(
-                    "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
-                    explicit_profile,
-                    source.platform.value,
-                    source.chat_id,
-                    getattr(source, "guild_id", None),
+                raise ValueError(
+                    f"Explicitly routed profile does not exist: {explicit_profile}"
                 )
-                return get_hermes_home()
             return profile_dir
         except Exception:
+            if explicit_profile or (source.profile or "").strip():
+                logger.error(
+                    "Refusing explicitly routed source with invalid/unavailable "
+                    "profile=%r platform=%s",
+                    explicit_profile or "<invalid>",
+                    source.platform.value,
+                )
+                raise
             # Catch normalization errors, path errors, etc.
             logger.warning(
-                "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
-                "falling back to global HERMES_HOME: %s",
+                "Failed to resolve default profile directory for platform=%s; "
+                "falling back to global HERMES_HOME",
                 source.platform.value,
-                source.chat_id,
-                getattr(source, "guild_id", None),
-                explicit_profile or "(no profile)",
                 exc_info=True,
             )
             return get_hermes_home()

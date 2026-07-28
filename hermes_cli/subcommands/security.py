@@ -59,4 +59,23 @@ def build_security_parser(subparsers, *, cmd_security: Callable) -> None:
         help="Skip scanning pinned MCP servers in config.yaml",
     )
     audit_parser.set_defaults(func=cmd_security)
+    inventory_parser = security_subparsers.add_parser(
+        "inventory",
+        help="Inventory redacted autonomy and governance surfaces",
+        description=(
+            "Build an offline, read-only inventory of skills, tools, MCP "
+            "servers, permissions, scheduled work, and interface exposure."
+        ),
+    )
+    inventory_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    inventory_parser.add_argument(
+        "--output",
+        default="",
+        help="Write the JSON inventory to this path",
+    )
+    inventory_parser.set_defaults(func=cmd_security)
     security_parser.set_defaults(func=cmd_security)

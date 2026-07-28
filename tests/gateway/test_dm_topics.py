@@ -702,6 +702,36 @@ def test_group_topic_skill_binding():
     assert event.source.chat_topic == "Engineering"
 
 
+def test_group_topic_prompt_binding_without_legacy_profile_override():
+    """Topic prompts survive while profile selection stays with profile_routes."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(group_topics_config=[
+        {
+            "chat_id": -1001234567890,
+            "topics": [{
+                "name": "Research",
+                "thread_id": 11,
+                "worker_profile": "legacy-researcher",
+                "prompt": "Act only as the trading research desk.",
+            }],
+        }
+    ])
+    msg = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=11,
+        text="check a hypothesis",
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.channel_prompt == "Act only as the trading research desk."
+    assert event.source.profile is None
+
+
 def test_group_topic_skill_binding_second_topic():
     """A different thread_id in the same group should resolve its own skill."""
     from gateway.platforms.base import MessageType

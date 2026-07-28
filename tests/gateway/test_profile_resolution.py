@@ -119,10 +119,10 @@ class TestResolutionOrder:
 
 
 class TestMissingProfileWarning:
-    """Tests for warning when a profile doesn't exist on disk."""
+    """Explicit routes fail closed when their profile is unavailable."""
     
     def test_nonexistent_profile_warning(self, mock_runner, discord_source, caplog):
-        """When source.profile points to a nonexistent profile, log a WARNING."""
+        """A nonexistent stamped profile must never fall back to global state."""
         discord_source.profile = "nonexistent"
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
@@ -130,22 +130,19 @@ class TestMissingProfileWarning:
                 mock_get_dir.return_value = Path("/hermes/profiles/nonexistent")
                 with patch("hermes_cli.profiles.profile_exists", return_value=False):
                     with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
-                        with caplog.at_level(logging.WARNING):
-                            result = mock_runner._resolve_profile_home_for_source(discord_source)
-                            
-                            # Should fall back to global HERMES_HOME
-                            assert result == Path("/hermes")
-                            
-                            # Should have logged a warning
-                            assert len(caplog.records) == 1
-                            assert caplog.records[0].levelname == "WARNING"
-                            assert "nonexistent" in caplog.records[0].message
-                            assert "does not exist" in caplog.records[0].message
-                            assert "discord" in caplog.records[0].message
-                            assert "123456" in caplog.records[0].message
+                        with caplog.at_level(logging.ERROR), pytest.raises(
+                            ValueError, match="nonexistent"
+                        ):
+                            mock_runner._resolve_profile_home_for_source(discord_source)
+
+                        assert len(caplog.records) == 1
+                        assert caplog.records[0].levelname == "ERROR"
+                        assert "nonexistent" in caplog.records[0].message
+                        assert "discord" in caplog.records[0].message
+                        assert "123456" not in caplog.records[0].message
     
     def test_nonexistent_routing_profile_warning(self, mock_runner, discord_source, caplog):
-        """When routing returns a nonexistent profile, log a WARNING."""
+        """A nonexistent profile_routes target must fail closed."""
         discord_source.profile = None
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
@@ -156,15 +153,13 @@ class TestMissingProfileWarning:
                         # Routing returns a profile that doesn't exist
                         mock_runner._profile_name_for_source = MagicMock(return_value="routed")
                         
-                        with caplog.at_level(logging.WARNING):
-                            result = mock_runner._resolve_profile_home_for_source(discord_source)
-                            
-                            # Should fall back to global HERMES_HOME
-                            assert result == Path("/hermes")
-                            
-                            # Should have logged a warning
-                            assert len(caplog.records) == 1
-                            assert "routed" in caplog.records[0].message
+                        with caplog.at_level(logging.ERROR), pytest.raises(
+                            ValueError, match="routed"
+                        ):
+                            mock_runner._resolve_profile_home_for_source(discord_source)
+
+                        assert len(caplog.records) == 1
+                        assert "routed" in caplog.records[0].message
     
     def test_empty_source_profile_no_warning(self, mock_runner, discord_source, caplog):
         """When source.profile is empty, silent fallback to active profile (no warning)."""
@@ -206,23 +201,21 @@ class TestExceptionHandling:
     """Tests for exception handling in profile resolution."""
     
     def test_get_profile_dir_exception_logs_warning(self, mock_runner, discord_source, caplog):
-        """When get_profile_dir raises an exception, log a WARNING with context."""
+        """An explicit profile resolution error fails closed without chat IDs."""
         discord_source.profile = "bad-profile"
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
             with patch("hermes_cli.profiles.get_profile_dir", side_effect=ValueError("Invalid profile name")):
                 with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
-                    with caplog.at_level(logging.WARNING):
-                        result = mock_runner._resolve_profile_home_for_source(discord_source)
-                        
-                        # Should fall back to global HERMES_HOME
-                        assert result == Path("/hermes")
-                        
-                        # Should have logged a warning with exception info
-                        assert len(caplog.records) == 1
-                        assert caplog.records[0].levelname == "WARNING"
-                        assert "bad-profile" in caplog.records[0].message
-                        assert "Failed to resolve profile directory" in caplog.records[0].message
+                    with caplog.at_level(logging.ERROR), pytest.raises(
+                        ValueError, match="Invalid profile name"
+                    ):
+                        mock_runner._resolve_profile_home_for_source(discord_source)
+
+                    assert len(caplog.records) == 1
+                    assert caplog.records[0].levelname == "ERROR"
+                    assert "bad-profile" in caplog.records[0].message
+                    assert "123456" not in caplog.records[0].message
     
     def test_exception_with_no_profile_name(self, mock_runner, discord_source, caplog):
         """Exception when no profile was set should still log a warning."""
@@ -238,8 +231,7 @@ class TestExceptionHandling:
                         
                         assert result == Path("/hermes")
                         
-                        # Warning should mention "(no profile)"
-                        assert "(no profile)" in caplog.records[0].message
+                        assert "default profile" in caplog.records[0].message
 
 
 class TestRoutingConsultation:
@@ -250,7 +242,9 @@ class TestRoutingConsultation:
         discord_source.profile = None
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
+            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir, patch(
+                "hermes_cli.profiles.profile_exists", return_value=True
+            ):
                 mock_get_dir.return_value = Path("/hermes/profiles/routed")
                 
                 mock_runner._profile_name_for_source = MagicMock(return_value="routed")
@@ -265,7 +259,9 @@ class TestRoutingConsultation:
         discord_source.profile = "from-source"
         
         with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
+            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir, patch(
+                "hermes_cli.profiles.profile_exists", return_value=True
+            ):
                 mock_get_dir.return_value = Path("/hermes/profiles/from-source")
                 
                 mock_runner._profile_name_for_source = MagicMock(return_value="routed")
