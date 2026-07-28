@@ -2522,10 +2522,16 @@ class MCPServerTask:
             # If any of the spawned PIDs are still alive, the SDK's
             # teardown failed (common when the task is cancelled mid-way
             # on Linux, where setsid() children escape the parent cgroup).
-            # Mark them as orphans so the next cleanup sweep can reap them.
+            # Immediately terminate the survivor instead of only marking
+            # it for deferred cleanup — an orphaned server can hold
+            # exclusive resources (e.g. gbrain's PGLite lock) until
+            # the cron-driven sweep, and a retry within that window
+            # fails permanently (#72887).
             if new_pids:
                 from gateway.status import _pid_exists
+                import signal as _signal
                 _killpg = getattr(os, "killpg", None)
+                _sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
                 with _lock:
                     for _pid in new_pids:
                         _stdio_pids.pop(_pid, None)
@@ -2546,6 +2552,32 @@ class MCPServerTask:
                             except (ProcessLookupError, PermissionError, OSError):
                                 pgroup_alive = False
                         if pid_alive or pgroup_alive:
+                            # Immediate termination: the connection context is
+                            # exiting abnormally (cancellation / timeout) and
+                            # the subprocess survived the SDK's pipe-close
+                            # teardown because it lives in its own process
+                            # group.  The handshake never completed, so there
+                            # is no live session state to preserve — send
+                            # SIGTERM + SIGKILL directly so the child cannot
+                            # hold resources past this block.
+                            if _killpg is not None and pgid is not None:
+                                try:
+                                    _killpg(pgid, _signal.SIGTERM)
+                                except (ProcessLookupError, PermissionError, OSError):
+                                    pass
+                                try:
+                                    _killpg(pgid, _sigkill)
+                                except (ProcessLookupError, PermissionError, OSError):
+                                    pass
+                            elif pid_alive:
+                                try:
+                                    os.kill(pid, _signal.SIGTERM)
+                                except (ProcessLookupError, PermissionError, OSError):
+                                    pass
+                                try:
+                                    os.kill(pid, _sigkill)
+                                except (ProcessLookupError, PermissionError, OSError):
+                                    pass
                             _orphan_stdio_pids.add(pid)
                             _orphan_stdio_pid_servers[pid] = self.name
                         else:
