@@ -10171,6 +10171,58 @@ class TestServeIndexMissingIndex:
         assert "SPA-rebuilt" in resp.text
 
 
+class TestServeIndexInitialProfile:
+    """Direct SPA routes retain the profile passed to dashboard launch."""
+
+    def test_injects_initial_profile_for_direct_chat_deep_links(
+        self, tmp_path, monkeypatch
+    ):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        dist = tmp_path / "web_dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text(
+            "<html><head></head><body>SPA</body></html>", encoding="utf-8"
+        )
+        monkeypatch.setattr(ws, "WEB_DIST", dist)
+        monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
+
+        spa_app = FastAPI()
+        spa_app.state.initial_profile = "research"
+        ws.mount_spa(spa_app)
+
+        response = TestClient(spa_app).get("/chat?resume=session-1")
+
+        assert response.status_code == 200
+        assert 'window.__HERMES_INITIAL_PROFILE__="research";' in response.text
+
+    def test_escapes_initial_profile_in_inline_bootstrap(
+        self, tmp_path, monkeypatch
+    ):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        dist = tmp_path / "web_dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text(
+            "<html><head></head><body>SPA</body></html>", encoding="utf-8"
+        )
+        monkeypatch.setattr(ws, "WEB_DIST", dist)
+        monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
+
+        spa_app = FastAPI()
+        spa_app.state.initial_profile = "</script><script>alert(1)</script>"
+        ws.mount_spa(spa_app)
+
+        response = TestClient(spa_app).get("/")
+
+        assert "</script><script>alert(1)</script>" not in response.text
+        assert "\\u003c/script>" in response.text
+
+
 class TestDashboardComponentHealth:
     """Component-health rollup: error middleware, /api/status components, self-test."""
 

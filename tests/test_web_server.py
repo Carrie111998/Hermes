@@ -85,6 +85,19 @@ def test_start_server_applies_process_local_ssh_bootstrap_state(monkeypatch):
     assert captured["port"] == 0
 
 
+def test_start_server_preserves_initial_profile_for_spa_deep_links(monkeypatch):
+    _stub_uvicorn(monkeypatch)
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        initial_profile="research",
+    )
+
+    assert web_server.app.state.initial_profile == "research"
+
+
 def test_start_server_disables_ws_ping_on_loopback(monkeypatch):
     """Loopback binds (the Desktop case) MUST disable uvicorn's protocol-level
     keepalive ping so an event-loop stall can never trigger a false disconnect.

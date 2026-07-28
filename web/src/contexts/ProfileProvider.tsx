@@ -8,6 +8,15 @@ import {
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api, setManagementProfile } from "@/lib/api";
 import { ProfileContext } from "@/contexts/profile-context";
+import { initialProfileScope } from "@/contexts/profile-scope";
+
+declare global {
+  interface Window {
+    /** Profile passed to `hermes dashboard --open-profile`, injected by the
+     * server so direct SPA deep links retain the launch scope. */
+    __HERMES_INITIAL_PROFILE__?: string;
+  }
+}
 
 /**
  * Machine-level management-profile scope.
@@ -38,11 +47,14 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
   const { pathname } = useLocation();
   const [profiles, setProfiles] = useState<string[]>([]);
   const [currentProfile, setCurrentProfile] = useState("default");
+  const launchProfile =
+    typeof window === "undefined" ? "" : window.__HERMES_INITIAL_PROFILE__;
 
-  // Initial value comes from the URL (deep link / refresh / unified-launch
-  // preselect); afterwards state leads and the URL follows.
+  // Initial value comes from an explicit URL first, then the unified-launch
+  // profile injected by the server. Afterwards state leads and the URL
+  // follows.
   const [profile, setProfileState] = useState(
-    () => searchParams.get("profile") ?? "",
+    () => initialProfileScope(searchParams.get("profile"), launchProfile),
   );
 
   // Mirror into the api module synchronously on every render where it
@@ -96,7 +108,7 @@ export function ProfileProvider({ children }: { children: ReactNode }) {
         // sticky active profile so Chat and management pages match what the
         // Profiles page shows as "active" (machine dashboard runs as
         // `current`, usually default).
-        if (urlProfile === null && active !== current) {
+        if (urlProfile === null && !launchProfile && active !== current) {
           setManagementProfile(active);
           setProfileState(active);
         }

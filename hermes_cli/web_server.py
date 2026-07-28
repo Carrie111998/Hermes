@@ -18812,12 +18812,27 @@ def mount_spa(application: FastAPI):
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        # ``--open-profile`` historically lived only in the one URL opened by
+        # _maybe_open_browser().  A direct SPA deep link (notably
+        # /chat?resume=...) therefore lost the launch profile and silently
+        # fell back to the machine/default scope.  Preserve it in the same
+        # no-cache bootstrap as the session/auth flags so every entry route
+        # can initialize the same management/chat scope.  Escape ``<`` to
+        # prevent a profile name containing ``</script>`` from terminating
+        # the inline script.
+        initial_profile = str(
+            getattr(application.state, "initial_profile", "") or ""
+        )
+        initial_profile_js = json.dumps(
+            initial_profile, ensure_ascii=False
+        ).replace("<", "\\u003c")
         if gated:
             bootstrap_script = (
                 f"<script>"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_INITIAL_PROFILE__={initial_profile_js};"
                 f"</script>"
             )
         else:
@@ -18826,6 +18841,7 @@ def mount_spa(application: FastAPI):
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_INITIAL_PROFILE__={initial_profile_js};"
                 f"</script>"
             )
         if prefix:
@@ -20080,6 +20096,9 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host)
+    # The SPA is mounted at import time, so expose this launch-time value
+    # through app.state for _serve_index() to read per request.
+    app.state.initial_profile = initial_profile
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
