@@ -1174,9 +1174,9 @@ class _CuaDriverSession:
 
     _SESSION_EXPIRED_PATTERNS = (
         "has ended",
-        "session .* ended",
-        "session .* expired",
-        "session .* invalid",
+        "session.*ended",
+        "session.*expired",
+        "session.*invalid",
         "call start_session",
     )
 
