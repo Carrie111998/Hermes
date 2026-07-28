@@ -339,6 +339,19 @@ cron:
   wrap_response: false
 ```
 
+To keep wrapping but customize its format, set `cron.wrap_template`. The
+template supports `{task_name}`, `{job_id}`, and `{content}` placeholders:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  wrap_response: true
+  wrap_template: "── [Cron: {task_name}] ──\n\n{content}\n"
+```
+
+If the template is missing or invalid, Hermes uses the built-in wrapper so a
+formatting mistake cannot prevent delivery.
+
 ### Continuable jobs (reply to a cron delivery)
 
 By default a cron delivery is fire-and-forget: the message is sent, but it does

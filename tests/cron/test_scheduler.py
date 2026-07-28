@@ -682,6 +682,70 @@ class TestDeliverResultWrapping:
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: abc-123" in sent_content
 
+    def test_delivery_uses_custom_wrap_template(self):
+        """cron.wrap_template should interpolate the documented fields."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch(
+                 "cron.scheduler.load_config",
+                 return_value={
+                     "cron": {
+                         "wrap_response": True,
+                         "wrap_template": "[{task_name}:{job_id}]\n{content}",
+                     }
+                 },
+             ):
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Custom output.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "[daily-report:test-job]\nCustom output."
+
+    def test_delivery_falls_back_when_custom_wrap_template_is_invalid(self, caplog):
+        """A malformed template must not prevent cron result delivery."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch(
+                 "cron.scheduler.load_config",
+                 return_value={
+                     "cron": {
+                         "wrap_response": True,
+                         "wrap_template": "{unknown_field}: {content}",
+                     }
+                 },
+             ):
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Fallback output.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert "Cronjob Response: daily-report" in sent_content
+        assert "Fallback output." in sent_content
+        assert "Invalid cron.wrap_template" in caplog.text
+
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
         from gateway.config import Platform
