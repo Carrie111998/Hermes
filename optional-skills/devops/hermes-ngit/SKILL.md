@@ -372,6 +372,64 @@ Use `~/repos/ngit-enable-repo/ngit-enable-repo.sh` to announce a repo to Nostr a
 **Current Configuration:** this repo (hermes-ngit) is configured with triple push to
 GitHub + Radicle + Nostr via `origin` pushurls. `git push` updates all three.
 
+## Recovery: State-event "purgatory" accumulation (NIP-34 30617)
+
+**Symptom.** After you `git branch -D` old merged PR branches and later `git push`,
+the grasp server rejects the push with a `purgatory` error listing branches that no
+longer exist locally (seen on `cowx`).
+
+**Root cause.** Each `ngit init` publishes a NIP-34 kind 30617 repository *state*
+event. Grasp servers (relay.ngit.dev, gitnostr.com) do **not** honor NIP-33
+replaceable semantics — old state events accumulate in "purgatory" instead of being
+replaced. The server checks every push against the **union of all purgatory events**,
+so every branch ever declared must still exist locally at its exact declared commit,
+even after you deleted it post-merge.
+
+**Probe first** — this tells you whether the server checks the latest state only or the
+union (the fix differs):
+```bash
+git branch enrich <declared-commit>
+git branch -f main <another-declared-commit>
+git push --force nostr://<npub>/relay.ngit.dev/<repo> main enrich
+```
+- **Accepted** → server checks latest state only → just re-run `ngit init --clean -f -d`.
+- **Rejected** (lists other branches) → server checks the union → do the full reconcile.
+
+**Full reconcile** (when the union is checked):
+```bash
+# Phase 1 — recreate every declared branch at its exact commit
+git branch <name1> <sha1>
+git branch <name2> <sha2>
+# … all N declared branches, including:
+git branch -f main <declared-main-sha>
+
+# Phase 2 — satisfy the union so the push is accepted
+git push --force --all origin
+
+# Phase 3 — publish a single combined state event
+ngit init --clean -f -d        # both relays should report "already in sync"
+
+# Phase 4 — drop the stale branches, push the desired state
+git branch -f main <current-head-sha>
+git branch -D <stale-1> <stale-2> …
+git push --force --prune origin
+ngit init --clean -f -d
+```
+
+**Caveats (observed on `cowx`, 2026-07-27):**
+- All declared commits must still exist in the local object store (they will, if
+  they're ancestors of current `main`). If any are missing, the union can never be
+  satisfied — then publish Nostr kind 5 deletion events (`nak event -k 5 -t e <id>
+  --sec <nsec> -l relay.ngit.dev`) against the stale state-event IDs, or ask the grasp
+  operator to clear purgatory.
+- `gitnostr.com` is flaky: a direct push may fail with "No state events in purgatory"
+  until `ngit init` has published a state event there. Treat **relay.ngit.dev as the
+  primary grasp server**; state events sync between grasp servers automatically.
+- A Radicle pushurl key-registration error means the `rad` node isn't running —
+  `rad node start` then retry. (Unrelated to purgatory.)
+- If GitHub `main` is ahead after the fix (CI bots), recover with
+  `git fetch git@github.com:rinchen/<repo>.git main && git rebase FETCH_HEAD && git push origin main`.
+
 ## Rationale
 
 ngit provides a permissionless, Nostr-native Git hosting layer with no central forge and
