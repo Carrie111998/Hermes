@@ -29,6 +29,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -1725,3 +1726,47 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 
 
+# =========================================================================
+# Kanban lifecycle guidance
+# =========================================================================
+
+
+class TestKanbanGuidance:
+    """Regression: the kanban worker lifecycle is exclusive and terminal.
+
+    Guards against the observed failure mode where workers called
+    kanban_complete and then kept running terminal/tests, and one worker
+    spawned a duplicate follow-up card off the broad "create a child for
+    any follow-up work" instruction.
+    """
+
+    def test_kanban_guidance_lifecycle_is_exclusive_and_terminal(self):
+        # The worker owns exactly one card.
+        assert "ONE task" in KANBAN_GUIDANCE
+        assert "only that card" in KANBAN_GUIDANCE
+
+        # No automatic session-start, previous-session memory work, or
+        # delegation before orienting on the current card.
+        assert (
+            "Before `kanban_show` do not run session-start protocol, "
+            "previous-session memory work, or delegation" in KANBAN_GUIDANCE
+        )
+
+        # Acceptance work the body asks for stays in the current card.
+        assert "Acceptance work the body asks for" in KANBAN_GUIDANCE
+        assert "current card" in KANBAN_GUIDANCE
+
+        # Child tasks are created only when the body explicitly authorizes
+        # decomposition — the broad instruction that produced duplicate
+        # follow-up cards must be gone.
+        assert (
+            "only when the card body explicitly authorizes decomposition"
+            in KANBAN_GUIDANCE
+        )
+        assert "If follow-up work appears, create it" not in KANBAN_GUIDANCE
+
+        # kanban_complete and kanban_block are final tool calls: immediate
+        # return, no further tools/tests/comments/follow-ups.
+        assert "`kanban_complete` and `kanban_block` are terminal" in KANBAN_GUIDANCE
+        assert "return immediately" in KANBAN_GUIDANCE
+        assert "no further tool calls" in KANBAN_GUIDANCE
