@@ -205,6 +205,7 @@ from gateway.platforms.base import (
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     utf16_len,
+    sanitize_remote_image_url_for_plaintext,
 )
 from plugins.platforms.telegram.telegram_ids import (
     normalize_telegram_chat_id,
@@ -585,6 +586,11 @@ class TelegramAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    # ``send_image`` consumes remote URLs through Telegram's Bot API or the
+    # SSRF-safe download/upload fallback. It sanitizes the URL itself before
+    # the only plaintext fallback, so signed query credentials may reach the
+    # private transports intact.
+    supports_native_remote_images = True
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
     # UTF-8 characters. Content above this is sent via the legacy chunking path.
     RICH_MESSAGE_MAX_CHARS = 32768
@@ -7990,7 +7996,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), _redact_telegram_error_text(e),
-                    exc_info=True,
                 )
                 # Fallback: send each photo in this chunk individually
                 await super().send_multiple_images(
@@ -8222,7 +8227,13 @@ class TelegramAdapter(BasePlatformAdapter):
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
-            return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
+            return await super().send_image(
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+                metadata=metadata,
+            )
 
         try:
             # Telegram can send photos directly from URLs (up to ~5MB)
@@ -8256,7 +8267,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] URL-based send_photo failed, trying file upload: %s",
                 self.name,
                 _redact_telegram_error_text(e),
-                exc_info=True,
             )
             # Fallback: download and upload as file (supports up to 10MB)
             try:
@@ -8298,11 +8308,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
                     self.name,
-                    e2,
-                    exc_info=True,
+                    _redact_telegram_error_text(e2),
                 )
                 # Final fallback: send URL as text
-                return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
+                return await super().send_image(
+                    chat_id,
+                    sanitize_remote_image_url_for_plaintext(image_url),
+                    caption,
+                    reply_to,
+                    metadata=metadata,
+                )
 
     async def send_animation(
         self,
@@ -8347,7 +8362,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Failed to send Telegram animation, falling back to photo: %s",
                 self.name,
                 _redact_telegram_error_text(e),
-                exc_info=True,
             )
             # Fallback: try as a regular photo
             return await self.send_image(chat_id, animation_url, caption, reply_to, metadata=metadata)

@@ -28,6 +28,9 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    redact_transport_error_text,
+    safe_url_for_log,
+    sanitize_remote_image_url_for_plaintext,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -114,6 +117,7 @@ class MattermostAdapter(BasePlatformAdapter):
     """Gateway adapter for Mattermost (self-hosted or cloud)."""
 
     splits_long_messages = True  # send() chunks via truncate_message(MAX_POST_LENGTH)
+    supports_native_remote_images = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.MATTERMOST)
@@ -542,9 +546,15 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Download a URL and upload it as a file attachment."""
         from tools.url_safety import is_safe_url
+        terminal_url = sanitize_remote_image_url_for_plaintext(url)
         if not is_safe_url(url):
             logger.warning("Mattermost: blocked unsafe URL (SSRF protection)")
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
+            return await self.send(
+                chat_id,
+                f"{caption or ''}\n{terminal_url}".strip(),
+                reply_to,
+                metadata=metadata,
+            )
 
         import aiohttp
 
@@ -558,11 +568,16 @@ class MattermostAdapter(BasePlatformAdapter):
                     if resp.status >= 500 or resp.status == 429:
                         if attempt < 2:
                             logger.debug("Mattermost download retry %d/2 for %s (status %d)",
-                                         attempt + 1, url[:80], resp.status)
+                                         attempt + 1, safe_url_for_log(url), resp.status)
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
                     if resp.status >= 400:
-                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
+                        return await self.send(
+                            chat_id,
+                            f"{caption or ''}\n{terminal_url}".strip(),
+                            reply_to,
+                            metadata=metadata,
+                        )
                     file_data = await resp.read()
                     ct = resp.content_type or "application/octet-stream"
                     break
@@ -570,16 +585,39 @@ class MattermostAdapter(BasePlatformAdapter):
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
-                logger.warning("Mattermost: failed to download %s after %d attempts: %s", url, attempt + 1, exc)
-                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
+                logger.warning(
+                    "Mattermost: failed to download %s after %d attempts: %s",
+                    safe_url_for_log(url),
+                    attempt + 1,
+                    redact_transport_error_text(exc),
+                )
+                return await self.send(
+                    chat_id,
+                    f"{caption or ''}\n{terminal_url}".strip(),
+                    reply_to,
+                    metadata=metadata,
+                )
 
         if file_data is None:
-            logger.warning("Mattermost: download returned no data for %s", url)
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
+            logger.warning(
+                "Mattermost: download returned no data for %s",
+                safe_url_for_log(url),
+            )
+            return await self.send(
+                chat_id,
+                f"{caption or ''}\n{terminal_url}".strip(),
+                reply_to,
+                metadata=metadata,
+            )
 
         file_id = await self._upload_file(chat_id, file_data, fname, ct)
         if not file_id:
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
+            return await self.send(
+                chat_id,
+                f"{caption or ''}\n{terminal_url}".strip(),
+                reply_to,
+                metadata=metadata,
+            )
 
         payload: Dict[str, Any] = _with_mentions_disabled({
             "channel_id": chat_id,
@@ -693,13 +731,17 @@ class MattermostAdapter(BasePlatformAdapter):
                                 if resp.status >= 400:
                                     logger.warning(
                                         "Mattermost: failed to download image (HTTP %d): %s",
-                                        resp.status, image_url[:80],
+                                        resp.status, safe_url_for_log(image_url),
                                     )
                                     continue
                                 file_data = await resp.read()
                                 ct = resp.content_type or "image/png"
                         except Exception as dl_err:
-                            logger.warning("Mattermost: download failed for %s: %s", image_url[:80], dl_err)
+                            logger.warning(
+                                "Mattermost: download failed for %s: %s",
+                                safe_url_for_log(image_url),
+                                redact_transport_error_text(dl_err),
+                            )
                             continue
                         fname = image_url.rsplit("/", 1)[-1].split("?")[0] or f"image_{len(file_ids)}.png"
 
@@ -729,7 +771,9 @@ class MattermostAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning(
                     "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
-                    chunk_idx + 1, len(chunks), e, exc_info=True,
+                    chunk_idx + 1,
+                    len(chunks),
+                    redact_transport_error_text(e),
                 )
                 await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
 

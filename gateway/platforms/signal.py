@@ -42,6 +42,8 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_url,
     utf16_len,
+    redact_transport_error_text,
+    safe_url_for_log,
 )
 from gateway.platforms.helpers import redact_phone
 from gateway.platforms.media_cache import DEFAULT_EXT_TO_MIME, mime_for_ext
@@ -274,6 +276,7 @@ def _sig_secret(name: str, default: str = "") -> str:
 class SignalAdapter(BasePlatformAdapter):
     """Signal messenger adapter using signal-cli HTTP daemon."""
 
+    supports_native_remote_images = True
     platform = Platform.SIGNAL
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     splits_long_messages = True  # send() chunks after markdown → Signal formatting conversion
@@ -1336,19 +1339,28 @@ class SignalAdapter(BasePlatformAdapter):
                 try:
                     file_path = await cache_image_from_url(image_url)
                 except Exception as e:
-                    logger.warning("Signal: failed to download image %s: %s", image_url, e)
+                    logger.warning(
+                        "Signal: failed to download image %s: %s",
+                        safe_url_for_log(image_url),
+                        redact_transport_error_text(e),
+                    )
                     skipped_download += 1
                     continue
 
             if not file_path or not Path(file_path).exists():
-                logger.warning("Signal: image file not found for %s", image_url)
+                logger.warning(
+                    "Signal: image file not found for %s",
+                    safe_url_for_log(image_url),
+                )
                 skipped_missing += 1
                 continue
 
             file_size = Path(file_path).stat().st_size
             if file_size > SIGNAL_MAX_ATTACHMENT_SIZE:
                 logger.warning(
-                    "Signal: image too large (%d bytes), skipping %s", file_size, image_url
+                    "Signal: image too large (%d bytes), skipping %s",
+                    file_size,
+                    safe_url_for_log(image_url),
                 )
                 skipped_oversize += 1
                 continue
@@ -1507,8 +1519,9 @@ class SignalAdapter(BasePlatformAdapter):
             try:
                 file_path = await cache_image_from_url(image_url)
             except Exception as e:
-                logger.warning("Signal: failed to download image: %s", e)
-                return SendResult(success=False, error=str(e))
+                safe_error = redact_transport_error_text(e)
+                logger.warning("Signal: failed to download image: %s", safe_error)
+                return SendResult(success=False, error=safe_error)
 
         if not file_path or not Path(file_path).exists():
             return SendResult(success=False, error="Image file not found")

@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    sanitize_remote_image_url_for_plaintext,
 )
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
 
@@ -719,6 +720,7 @@ class PhotonAdapter(BasePlatformAdapter):
     # Mark it explicitly so streaming suppresses the visible cursor instead
     # of leaving a stale tofu square (▉) behind when edit attempts fail.
     SUPPORTS_MESSAGE_EDITING = False
+    supports_native_remote_images = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
@@ -2064,7 +2066,12 @@ class PhotonAdapter(BasePlatformAdapter):
             local_path = await cache_image_from_url(image_url)
         except Exception:
             # Couldn't fetch the URL — fall back to sending it as text.
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+            )
         return await self._sidecar_send_attachment(
             chat_id, local_path, caption=caption,
         )

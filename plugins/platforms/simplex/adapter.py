@@ -65,6 +65,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    redact_transport_error_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,7 @@ class SimplexAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    supports_native_remote_images = True
 
     def __init__(self, config: PlatformConfig, **kwargs):
         platform = Platform("simplex")
@@ -1018,8 +1020,9 @@ class SimplexAdapter(BasePlatformAdapter):
 
                 file_path = await cache_image_from_url(image_url)
             except Exception as e:
-                logger.warning("SimpleX: failed to download image: %s", e)
-                return SendResult(success=False, error=str(e))
+                safe_error = redact_transport_error_text(e)
+                logger.warning("SimpleX: failed to download image: %s", safe_error)
+                return SendResult(success=False, error=safe_error)
 
         if not file_path or not Path(file_path).exists():
             return SendResult(success=False, error="Image file not found")

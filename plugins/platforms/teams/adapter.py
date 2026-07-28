@@ -109,6 +109,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_url,
     cache_media_bytes,
+    redact_transport_error_text,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -773,6 +774,7 @@ class TeamsAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
     splits_long_messages = True  # send() chunks via truncate_message()
+    supports_native_remote_images = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("teams"))
@@ -1334,8 +1336,9 @@ class TeamsAdapter(BasePlatformAdapter):
 
             return SendResult(success=True, message_id=getattr(result, "id", None))
         except Exception as e:
-            logger.error("[teams] send_%s failed: %s", media_label, e, exc_info=True)
-            return SendResult(success=False, error=str(e), retryable=True)
+            safe_error = redact_transport_error_text(e)
+            logger.error("[teams] send_%s failed: %s", media_label, safe_error)
+            return SendResult(success=False, error=safe_error, retryable=True)
 
     async def send_image(
         self,

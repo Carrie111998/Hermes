@@ -169,6 +169,9 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
+    redact_transport_error_text,
+    safe_url_for_log,
+    sanitize_remote_image_url_for_plaintext,
     utf16_len,
     validate_inbound_media_size,
 )
@@ -1050,6 +1053,7 @@ class DiscordAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_native_remote_images = True
     # Safety ceiling on split deliveries (#86581): a degenerate turn can
     # produce tens of thousands of characters — without a cap the adapter
     # posts every 2000-char chunk back-to-back and floods the channel (the
@@ -4115,7 +4119,9 @@ class DiscordAdapter(BasePlatformAdapter):
                             if status != 200:
                                 logger.warning(
                                     "[%s] Failed to download image (HTTP %d) in batch: %s",
-                                    self.name, status, image_url[:80],
+                                    self.name,
+                                    status,
+                                    safe_url_for_log(image_url),
                                 )
                                 continue
                             ct = headers.get("content-type", "image/png")
@@ -4128,7 +4134,12 @@ class DiscordAdapter(BasePlatformAdapter):
                                 ext = "webp"
                             files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
-                            logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
+                            logger.warning(
+                                "[%s] Download failed for %s: %s",
+                                self.name,
+                                safe_url_for_log(image_url),
+                                redact_transport_error_text(dl_err),
+                            )
                             continue
 
                 if not files:
@@ -4152,8 +4163,10 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
-                    self.name, chunk_idx + 1, len(chunks), e,
-                    exc_info=True,
+                    self.name,
+                    chunk_idx + 1,
+                    len(chunks),
+                    redact_transport_error_text(e),
                 )
                 await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
             finally:
@@ -5410,7 +5423,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL during Discord send_image", self.name)
-            return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
+            return await super().send_image(
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+                metadata=metadata,
+            )
 
         try:
             import aiohttp
@@ -5468,15 +5487,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+            )
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send image attachment, falling back to URL: %s",
                 self.name,
-                e,
-                exc_info=True,
+                redact_transport_error_text(e),
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(image_url),
+                caption,
+                reply_to,
+            )
 
     async def send_animation(
         self,
@@ -5492,7 +5520,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not is_safe_url(animation_url):
             logger.warning("[%s] Blocked unsafe animation URL during Discord send_animation", self.name)
-            return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
+            return await super().send_animation(
+                chat_id,
+                sanitize_remote_image_url_for_plaintext(animation_url),
+                caption,
+                reply_to,
+                metadata=metadata,
+            )
 
         try:
             import aiohttp
@@ -5538,15 +5572,13 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning(
                 "[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp",
                 self.name,
-                exc_info=True,
             )
             return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send animation attachment, falling back to URL: %s",
                 self.name,
-                e,
-                exc_info=True,
+                redact_transport_error_text(e),
             )
             return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
 

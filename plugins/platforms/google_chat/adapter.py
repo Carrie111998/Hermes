@@ -2880,6 +2880,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
         the image (caption + URL) — same anti-tombstone pattern used by
         ``send()``. Otherwise create a new message.
         """
+        from gateway.platforms.base import sanitize_remote_image_url_for_plaintext
+
+        image_url = sanitize_remote_image_url_for_plaintext(image_url)
         thread_id = self._resolve_thread_id(reply_to, metadata, chat_id=chat_id)
         text_parts: List[str] = []
         if caption:

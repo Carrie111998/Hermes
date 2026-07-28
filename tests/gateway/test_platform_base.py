@@ -23,6 +23,73 @@ from gateway.platforms.base import (
 )
 
 
+class _PlaintextImageFallbackAdapter(BasePlatformAdapter):
+    """Exercise BasePlatformAdapter.send_image's plaintext URL fallback."""
+
+    name = "plaintext-image-fallback"
+
+    def __init__(self):
+        self.sent = []
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, **kwargs):
+        self.sent.append(content)
+        return SendResult(success=True)
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+
+class _NativeImageAdapter(_PlaintextImageFallbackAdapter):
+    supports_native_remote_images = True
+
+    def __init__(self):
+        super().__init__()
+        self.sent_images = []
+
+    async def send_image(self, chat_id, image_url, caption=None, **kwargs):
+        self.sent_images.append((chat_id, image_url, caption))
+        return SendResult(success=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheme", ["https", "HTTPS"])
+@pytest.mark.parametrize(
+    "query_key",
+    ["token", "to%6ben", "%74oken", "X-Amz-Signature"],
+)
+async def test_plaintext_image_fallback_sanitizes_signed_url(scheme, query_key):
+    adapter = _PlaintextImageFallbackAdapter()
+    signed_url = (
+        f"{scheme}://example.com/image.png"
+        f"?{query_key}=opaqueImageCredential123&width=1024"
+    )
+
+    await adapter.send_multiple_images("chat1", [(signed_url, "preview")])
+
+    assert len(adapter.sent) == 1
+    assert "opaqueImageCredential123" not in adapter.sent[0]
+    assert f"{query_key}=***" in adapter.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_explicit_native_image_transport_preserves_signed_url():
+    adapter = _NativeImageAdapter()
+    signed_url = (
+        "https://example.com/image.png"
+        "?X-Amz-Signature=opaqueImageCredential123&width=1024"
+    )
+
+    await adapter.send_multiple_images("chat1", [(signed_url, "preview")])
+
+    assert adapter.sent_images == [("chat1", signed_url, "preview")]
+
+
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
     """Encrypted Bitwarden cache is covered by the media credential guard."""
     import gateway.platforms.base as base
@@ -75,6 +142,58 @@ class TestSafeUrlForLog:
         assert "supersecret" not in result
         assert "token=abc" not in result
         assert "user:pass@" not in result
+
+    @pytest.mark.parametrize(
+        ("module_name", "class_name"),
+        [
+            ("gateway.platforms.bluebubbles", "BlueBubblesAdapter"),
+            ("gateway.platforms.qqbot.adapter", "QQAdapter"),
+            ("gateway.platforms.signal", "SignalAdapter"),
+            ("gateway.platforms.weixin", "WeixinAdapter"),
+            ("gateway.platforms.whatsapp_cloud", "WhatsAppCloudAdapter"),
+            ("gateway.platforms.yuanbao", "YuanbaoAdapter"),
+            ("plugins.platforms.discord.adapter", "DiscordAdapter"),
+            ("plugins.platforms.feishu.adapter", "FeishuAdapter"),
+            ("plugins.platforms.matrix.adapter", "MatrixAdapter"),
+            ("plugins.platforms.mattermost.adapter", "MattermostAdapter"),
+            ("plugins.platforms.photon.adapter", "PhotonAdapter"),
+            ("plugins.platforms.simplex.adapter", "SimplexAdapter"),
+            ("plugins.platforms.slack.adapter", "SlackAdapter"),
+            ("plugins.platforms.teams.adapter", "TeamsAdapter"),
+            ("plugins.platforms.telegram.adapter", "TelegramAdapter"),
+            ("plugins.platforms.wecom.adapter", "WeComAdapter"),
+            ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter"),
+        ],
+    )
+    def test_private_remote_image_adapters_declare_capability(
+        self,
+        module_name,
+        class_name,
+    ):
+        from importlib import import_module
+
+        adapter_class = getattr(import_module(module_name), class_name)
+
+        assert adapter_class.supports_native_remote_images is True
+
+    def test_plaintext_remote_image_url_masks_signed_query(self):
+        from gateway.platforms.base import sanitize_remote_image_url_for_plaintext
+
+        result = sanitize_remote_image_url_for_plaintext(
+            "https://example.com/private.png?X-Amz-Signature=supersecret"
+        )
+
+        assert result == "https://example.com/private.png?X-Amz-Signature=***"
+        assert "supersecret" not in result
+
+    def test_transport_error_masks_signed_query(self):
+        from gateway.platforms.base import redact_transport_error_text
+
+        result = redact_transport_error_text(
+            "GET https://example.com/private.png?X-Amz-Signature=supersecret failed"
+        )
+
+        assert "supersecret" not in result
 
 
 class TestCacheAudioFromBytes:
