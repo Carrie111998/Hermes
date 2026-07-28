@@ -1320,10 +1320,27 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
 
 
 def _finalize_single_query(cli) -> None:
-    """Close one-shot CLI resources before releasing the active session lease."""
+    """Close one-shot CLI resources before releasing the active session lease.
+
+    ``chat -q`` bypasses :meth:`HermesCLI.run`, whose interactive teardown
+    closes the SQLite session.  Its agent therefore owns the final durable
+    boundary: ``AIAgent.close()`` writes ``ended_at`` and ``end_reason`` before
+    the worker process exits, making the completed row eligible for retention
+    pruning.  Do this after memory shutdown (which consumes the transcript) and
+    before releasing the lease; neither a cleanup failure nor a close failure
+    may strand the lease.
+    """
     try:
         _notify_single_query_session_finalize(cli)
-        _run_cleanup(notify_session_finalize=False)
+        try:
+            _run_cleanup(notify_session_finalize=False)
+        finally:
+            agent = getattr(cli, "agent", None)
+            if agent is not None and hasattr(agent, "close"):
+                try:
+                    agent.close()
+                except Exception:
+                    logger.debug("single-query agent close failed", exc_info=True)
     finally:
         cli._release_active_session()
 

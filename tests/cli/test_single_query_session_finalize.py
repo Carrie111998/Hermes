@@ -34,6 +34,78 @@ def test_finalize_single_query_runs_cleanup_without_reemitting_finalize_before_r
     ]
 
 
+def test_finalize_single_query_closes_owned_agent_before_releasing_lease(monkeypatch):
+    """A ``chat -q`` process has no interactive ``HermesCLI.run`` teardown.
+
+    Closing the agent is the real session-store seam: ``AIAgent.close()`` sets
+    ``ended_at`` / ``end_reason`` through ``SessionDB.end_session``.  Releasing
+    the lease alone used to leave one-shot and Kanban-worker rows live forever.
+    """
+    calls = []
+
+    class FakeAgent:
+        def close(self):
+            calls.append("agent-close")
+
+    fake_cli = SimpleNamespace(
+        agent=FakeAgent(),
+        _release_active_session=lambda: calls.append("release"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_notify_single_query_session_finalize",
+        lambda _cli: calls.append("finalize"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_cleanup",
+        lambda **kwargs: calls.append(("cleanup", kwargs)),
+    )
+
+    cli._finalize_single_query(fake_cli)
+
+    assert calls == [
+        "finalize",
+        ("cleanup", {"notify_session_finalize": False}),
+        "agent-close",
+        "release",
+    ]
+
+
+def test_finalize_single_query_ends_real_session_and_makes_it_prunable(tmp_path, monkeypatch):
+    """The production CLI seam must persist a terminal state, not just notify."""
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        api_key="unused",
+        base_url="http://127.0.0.1:9/v1",
+        provider="openai",
+        model="gpt-test",
+        enabled_toolsets=[],
+        quiet_mode=True,
+        platform="cli",
+        session_db=db,
+    )
+    session_id = getattr(agent, "session_id")
+    db.create_session(session_id, "cli")
+    fake_cli = SimpleNamespace(agent=agent, _release_active_session=lambda: None)
+    monkeypatch.setattr(cli, "_notify_single_query_session_finalize", lambda _cli: None)
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **_kwargs: None)
+
+    try:
+        cli._finalize_single_query(fake_cli)
+        row = db.get_session(session_id)
+        assert row is not None
+        assert row["ended_at"] is not None
+        assert row["end_reason"] == "agent_close"
+        assert db.prune_sessions(older_than_days=0, source="cli") == 1
+        assert db.get_session(session_id) is None
+    finally:
+        db.close()
+
+
 def test_finalize_single_query_releases_session_when_cleanup_fails(monkeypatch):
     calls = []
     fake_cli = SimpleNamespace(_release_active_session=lambda: calls.append("release"))
@@ -188,8 +260,10 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
         lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
     )
 
-    cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
 
+    assert exc_info.value.code == 0
     assert calls == [
         ("claim", "cli", False),
         "query-label",
