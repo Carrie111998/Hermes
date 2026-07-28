@@ -1,0 +1,69 @@
+name: buzz-platform
+label: Buzz
+kind: platform
+version: 1.0.0
+description: >
+  Native Buzz gateway transport for Hermes Agent. Receives authenticated
+  Nostr events over WebSocket and uses the Buzz CLI for signed outbound
+  delivery.
+author: Chris Brisson (ScaleLeanChris)
+requires_env:
+  - name: BUZZ_RELAY_URL
+    description: "Buzz relay URL, such as https://buzz.example.com"
+    prompt: "Buzz relay URL"
+    url: "https://github.com/block/buzz"
+    password: false
+  - name: BUZZ_PRIVATE_KEY
+    description: "Nostr private key for the Hermes identity in Buzz"
+    prompt: "Buzz private key"
+    password: true
+optional_env:
+  - name: BUZZ_AUTH_TAG
+    description: "NIP-OA owner attestation issued by the Buzz relay"
+    prompt: "Buzz owner attestation"
+    password: true
+  - name: BUZZ_CHANNELS
+    description: "Comma-separated Buzz channel IDs Hermes should monitor"
+    prompt: "Buzz channel IDs"
+    password: false
+  - name: BUZZ_DM_CHANNELS
+    description: "Comma-separated Buzz DM channel IDs to subscribe to explicitly"
+    prompt: "Buzz DM channel IDs"
+    password: false
+  - name: BUZZ_DISCOVER_DMS
+    description: "Discover and subscribe to Buzz DMs automatically"
+    prompt: "Discover Buzz DMs? (true/false)"
+    password: false
+  - name: BUZZ_HOME_CHANNEL
+    description: "Default Buzz channel ID for cron and proactive messages"
+    prompt: "Buzz home channel"
+    password: false
+  - name: BUZZ_ALLOWED_USERS
+    description: "Comma-separated Buzz pubkeys allowed to direct Hermes"
+    prompt: "Allowed Buzz pubkeys"
+    password: false
+  - name: BUZZ_ALLOW_ALL_USERS
+    description: "Allow any Buzz member to direct Hermes"
+    prompt: "Allow all Buzz users? (true/false)"
+    password: false
+  - name: BUZZ_REQUIRE_MENTION
+    description: "Require an address tag, reply, or wake word in shared channels"
+    prompt: "Require a mention? (true/false)"
+    password: false
+  - name: BUZZ_WAKE_WORDS
+    description: "Comma-separated text wake words, default Hermes,Maximus"
+    prompt: "Buzz wake words"
+    password: false
+  - name: BUZZ_PROFILE_NAME
+    description: "Display name published for the Hermes Buzz identity"
+    prompt: "Buzz profile name"
+    password: false
+  - name: BUZZ_PROFILE_ABOUT
+    description: "Short profile description for the Hermes Buzz identity"
+    prompt: "Buzz profile description"
+    password: false
+  - name: BUZZ_CLI
+    description: "Path or command name for the Buzz CLI"
+    prompt: "Buzz CLI path"
+    url: "https://github.com/block/buzz"
+    password: false
