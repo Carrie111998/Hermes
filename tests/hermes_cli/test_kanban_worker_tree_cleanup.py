@@ -69,7 +69,7 @@ def _spawn_worker_with_new_session_descendant(pid_file: Path) -> subprocess.Pope
         "child = os.fork()\n"
         "if child == 0:\n"
         "    os.setsid()\n"
-        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        f"    pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
         "time.sleep(30)\n"
     )
     return subprocess.Popen(
