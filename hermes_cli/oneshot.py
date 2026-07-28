@@ -254,10 +254,19 @@ def _run_agent(
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
+    from hermes_cli.mcp_startup import (
+        start_background_mcp_discovery,
+        wait_for_mcp_discovery,
+    )
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
+
+    start_background_mcp_discovery(
+        logger=logging.getLogger(__name__),
+        thread_name="oneshot-mcp-discovery",
+    )
 
     cfg = load_config()
 
@@ -331,6 +340,13 @@ def _run_agent(
     # Read the effective fallback chain from profile config so oneshot workers
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
+
+    # MCP discovery runs in the background so provider/config setup can overlap
+    # with connection startup. Before AIAgent takes its one-time tool snapshot,
+    # join that thread using the existing bounded timeout. Without this gate,
+    # one-shot sessions nondeterministically omit MCP tools depending on which
+    # side wins the startup race.
+    wait_for_mcp_discovery()
 
     agent = AIAgent(
         api_key=runtime.get("api_key"),

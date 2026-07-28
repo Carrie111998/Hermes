@@ -858,6 +858,76 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["prompt"] == "recall this"
 
 
+def test_oneshot_waits_for_mcp_discovery_before_agent_snapshot(monkeypatch):
+    """The one-shot agent must not snapshot tools before MCP discovery."""
+    from hermes_cli.oneshot import _run_agent
+
+    events = []
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            events.append("agent")
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def chat(self, _prompt):
+            return "ok"
+
+    def mod(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.models",
+        mod("hermes_cli.models", detect_provider_for_model=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {
+                "api_key": "k",
+                "base_url": "u",
+                "provider": "p",
+                "api_mode": "chat_completions",
+                "credential_pool": None,
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: set()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.mcp_startup",
+        mod(
+            "hermes_cli.mcp_startup",
+            start_background_mcp_discovery=lambda **_kwargs: events.append("start"),
+            wait_for_mcp_discovery=lambda: events.append("wait"),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.oneshot._create_session_db_for_oneshot",
+        lambda: None,
+    )
+
+    assert _run_agent("use the configured MCP") == "ok"
+    assert events == ["start", "wait", "agent"]
+
+
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     captured = {}
     active_path_during_call = None
