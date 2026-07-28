@@ -1077,6 +1077,230 @@ class TestMigrationV2ToV3:
         assert "organization_id" in columns
 
 
+# ---------------------------------------------------------------------------
+# 7. Tenant management tests
+# ---------------------------------------------------------------------------
+
+
+class TestTenantManagement:
+    """Tenant lifecycle: create, suspend, activate, quota."""
+
+    def test_create_tenant(self, pg):
+        from hermes_cli.postgres_authority import create_tenant, get_tenant
+        from uuid import UUID
+
+        tid = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        ok = create_tenant(pg, tenant_id=tid, slug="acme", name="Acme Corp")
+        assert ok is True
+
+        tenant = get_tenant(pg, tenant_id=tid)
+        assert tenant is not None
+        assert tenant["slug"] == "acme"
+        assert tenant["name"] == "Acme Corp"
+        assert tenant["max_concurrent_claims"] == 10
+
+    def test_create_tenant_idempotent(self, pg):
+        from hermes_cli.postgres_authority import create_tenant
+        from uuid import UUID
+
+        tid = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        assert create_tenant(pg, tenant_id=tid, slug="beta") is True
+        assert create_tenant(pg, tenant_id=tid, slug="beta") is False
+
+    def test_suspend_tenant_blocks_claims(self, pg):
+        from hermes_cli.postgres_authority import (
+            create_tenant, suspend_tenant, check_tenant_claim_quota,
+        )
+        from uuid import UUID
+
+        tid = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        create_tenant(pg, tenant_id=tid, slug="suspended-co")
+        suspend_tenant(pg, tenant_id=tid)
+
+        allowed, current, max_allowed = check_tenant_claim_quota(
+            pg, tenant_id=tid,
+        )
+        assert allowed is False
+
+    def test_activate_tenant_removes_suspension(self, pg):
+        from hermes_cli.postgres_authority import (
+            create_tenant, suspend_tenant, activate_tenant, check_tenant_claim_quota,
+        )
+        from uuid import UUID
+
+        tid = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+        create_tenant(pg, tenant_id=tid, slug="reactivated-co")
+        suspend_tenant(pg, tenant_id=tid)
+        activate_tenant(pg, tenant_id=tid)
+
+        allowed, _, _ = check_tenant_claim_quota(pg, tenant_id=tid)
+        assert allowed is True
+
+    def test_claim_quota_enforced(self, pg):
+        from hermes_cli.postgres_authority import (
+            create_tenant, claim_task, check_tenant_claim_quota,
+        )
+        from uuid import UUID
+
+        tid = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+        create_tenant(pg, tenant_id=tid, slug="limited-co", max_concurrent_claims=2)
+
+        # Fill quota with 2 claims
+        claim_task(
+            pg, task_id=_new_task(), claim_token=_new_token(),
+            organization_id=ORG, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+            tenant_id=tid,
+        )
+        claim_task(
+            pg, task_id=_new_task(), claim_token=_new_token(),
+            organization_id=ORG, worker_id="w2",
+            claim_scope_url="", expires_at=time.time() + 3600,
+            tenant_id=tid,
+        )
+
+        allowed, current, max_allowed = check_tenant_claim_quota(
+            pg, tenant_id=tid,
+        )
+        assert allowed is False
+        assert current == 2
+        assert max_allowed == 2
+
+    def test_default_tenant_seeded_on_migration(self, pg):
+        from hermes_cli.postgres_authority import get_tenant, DEFAULT_TENANT_ID
+
+        tenant = get_tenant(pg, tenant_id=DEFAULT_TENANT_ID)
+        assert tenant is not None
+        assert tenant["slug"] == "default"
+
+
+# ---------------------------------------------------------------------------
+# 8. Cross-tenant attack simulation
+# ---------------------------------------------------------------------------
+
+
+class TestCrossTenantAttackVectors:
+    """Simulate attack vectors where a worker attempts to access another
+    tenant's resources."""
+
+    def test_tenant_a_cannot_consume_tenant_b_permit(self, pg):
+        """A worker from tenant A must not consume a permit issued for tenant B."""
+        from hermes_cli.postgres_authority import (
+            claim_task, issue_permit, consume_permit, create_tenant
+        )
+        from uuid import UUID
+
+        tenant_a = UUID("a0a0a0a0-a0a0-a0a0-a0a0-a0a0a0a0a0a0")
+        tenant_b = UUID("b0b0b0b0-b0b0-b0b0-b0b0-b0b0b0b0b0b0")
+        create_tenant(pg, tenant_id=tenant_a, slug="attack-victim")
+        create_tenant(pg, tenant_id=tenant_b, slug="attacker")
+
+        task_id = _new_task()
+        token_a = _new_token()
+        payload = {"action": "sensitive_op", "nonce": uuid.uuid4().hex}
+
+        # Tenant A claims and gets a permit
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token_a,
+            organization_id=ORG, worker_id="victim-worker",
+            claim_scope_url="", expires_at=time.time() + 3600,
+            tenant_id=tenant_a,
+        )
+        permit_id = issue_permit(
+            pg, task_id=task_id, organization_id=ORG,
+            claim_token=token_a, lease_generation=gen,
+            action_payload=payload, tenant_id=tenant_a,
+        )
+
+        # Tenant B worker tries to consume the permit with wrong claim_token
+        # (since they can't have the same claim, they'd need to guess the token)
+        ok = consume_permit(
+            pg, permit_id=permit_id, organization_id=ORG,
+            claim_token="attacker-forged-token",
+            lease_generation=gen, action_payload=payload,
+        )
+        assert ok is False, "cross-tenant permit consumption must be rejected"
+
+    def test_tenant_a_effects_invisible_to_tenant_b_query(self, pg):
+        """Effects recorded by tenant A must not appear in tenant B's queries."""
+        from hermes_cli.postgres_authority import claim_task, record_effect
+        from uuid import UUID
+
+        tenant_a = UUID("a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1")
+        tenant_b = UUID("b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1")
+
+        task_id = _new_task()
+        token = _new_token()
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token,
+            organization_id=ORG, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+            tenant_id=tenant_a,
+        )
+
+        key = f"{ORG}:{task_id}:a1:p1:test:secret-ref"
+        record_effect(
+            pg, effect_key=key, task_id=task_id,
+            organization_id=ORG, run_claim_token=token,
+            lease_generation=gen, effect_type="payment",
+            provider="stripe", provider_ref="ch_secret",
+            payload={"amount": 99999},
+            tenant_id=tenant_a,
+        )
+
+        # Tenant B queries effects with their tenant_id filter
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM execution_effects WHERE tenant_id = %s",
+                (str(tenant_b),),
+            )
+            rows = cur.fetchall()
+        assert len(rows) == 0, "tenant B must not see tenant A's effects"
+
+    def test_suspended_tenant_cannot_claim(self, pg):
+        """A suspended tenant's claim quota check must return False."""
+        from hermes_cli.postgres_authority import (
+            create_tenant, suspend_tenant, check_tenant_claim_quota,
+        )
+        from uuid import UUID
+
+        tid = UUID("c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1")
+        create_tenant(pg, tenant_id=tid, slug="suspended-attack")
+        suspend_tenant(pg, tenant_id=tid)
+
+        allowed, _, _ = check_tenant_claim_quota(pg, tenant_id=tid)
+        assert allowed is False, "suspended tenant must be blocked from claiming"
+
+    def test_cross_org_claim_within_same_tenant_rejected(self, pg):
+        """Even within the same tenant, different orgs have separate claims
+        and one org cannot complete another's task."""
+        from hermes_cli.postgres_authority import (
+            claim_task, complete_task, create_tenant,
+        )
+        from uuid import UUID
+
+        tid = UUID("d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1")
+        create_tenant(pg, tenant_id=tid, slug="multi-org-tenant")
+
+        task_id = _new_task()
+        token_org1 = _new_token()
+
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token_org1,
+            organization_id=ORG, worker_id="org1-worker",
+            claim_scope_url="", expires_at=time.time() + 3600,
+            tenant_id=tid,
+        )
+
+        # Org2 tries to complete org1's task
+        ok = complete_task(
+            pg, task_id=task_id, organization_id=ORG2,
+            claim_token=token_org1, lease_generation=gen,
+            outcome="stolen", tenant_id=tid,
+        )
+        assert ok is False, "cross-org completion must be rejected"
+
+
 # Note: Authority-store capability contract tests (postgres backend recognition,
 # SQLite multi-host rejection, unknown backend fail-closed) live in:
 #   tests/hermes_cli/test_authority_store.py

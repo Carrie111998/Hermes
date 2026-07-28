@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -210,6 +210,26 @@ _MIGRATIONS: list[tuple[int, str]] = [
             NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';
         CREATE INDEX IF NOT EXISTS idx_execution_effects_tenant
             ON execution_effects(tenant_id);
+        """,
+    ),
+    # v3 → v4: tenants registry table + per-tenant concurrent claim limit.
+    (
+        3,
+        """
+        CREATE TABLE IF NOT EXISTS tenants (
+            id              UUID        PRIMARY KEY,
+            slug            TEXT        NOT NULL UNIQUE,
+            name            TEXT        NOT NULL DEFAULT '',
+            max_concurrent_claims INTEGER NOT NULL DEFAULT 10,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            active_at       TIMESTAMPTZ,
+            suspended_at    TIMESTAMPTZ
+        );
+
+        -- Seed the default tenant so existing rows satisfy FK if added later.
+        INSERT INTO tenants (id, slug, name)
+        VALUES ('00000000-0000-0000-0000-000000000000', 'default', 'Default Tenant')
+        ON CONFLICT (id) DO NOTHING;
         """,
     ),
 ]
@@ -1101,6 +1121,122 @@ def cleanup_expired_claims(conn: "psycopg.Connection") -> int:
 
 
 # ---------------------------------------------------------------------------
+# Tenant management
+# ---------------------------------------------------------------------------
+
+
+def create_tenant(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+    slug: str,
+    name: str = "",
+    max_concurrent_claims: int = 10,
+) -> bool:
+    """Register a new tenant. Idempotent — returns False if slug/id already exists."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO tenants (id, slug, name, max_concurrent_claims)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            """,
+            (str(tenant_id), slug, name, max_concurrent_claims),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+
+
+def get_tenant(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+) -> Optional[dict[str, Any]]:
+    """Look up a tenant by ID."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM tenants WHERE id = %s", (str(tenant_id),))
+        return cur.fetchone()
+
+
+def suspend_tenant(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+) -> bool:
+    """Suspend a tenant — claims will be rejected while suspended."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE tenants SET suspended_at = NOW()
+            WHERE id = %s AND suspended_at IS NULL
+            RETURNING id
+            """,
+            (str(tenant_id),),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+
+
+def activate_tenant(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+) -> bool:
+    """Activate a tenant — removes suspension."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE tenants SET suspended_at = NULL, active_at = NOW()
+            WHERE id = %s
+            RETURNING id
+            """,
+            (str(tenant_id),),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+
+
+def check_tenant_claim_quota(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+) -> tuple[bool, int, int]:
+    """Check if a tenant can acquire another claim.
+
+    Returns:
+        (allowed, current_count, max_allowed)
+        allowed is False if tenant is suspended or at quota.
+    """
+    resolved = str(tenant_id or DEFAULT_TENANT_ID)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT max_concurrent_claims, suspended_at FROM tenants WHERE id = %s",
+            (resolved,),
+        )
+        tenant = cur.fetchone()
+        if not tenant:
+            return (True, 0, 10)
+
+        if tenant["suspended_at"] is not None:
+            return (False, 0, 0)
+
+        max_claims = tenant["max_concurrent_claims"]
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM task_claims
+            WHERE tenant_id = %s AND expires_at > NOW()
+            """,
+            (resolved,),
+        )
+        current = cur.fetchone()["n"]
+        return (current < max_claims, current, max_claims)
+
+
+# ---------------------------------------------------------------------------
 # Environment / backend detection
 # ---------------------------------------------------------------------------
 
@@ -1148,6 +1284,11 @@ __all__ = [
     "get_effect",
     "get_active_runs",
     "cleanup_expired_claims",
+    "create_tenant",
+    "get_tenant",
+    "suspend_tenant",
+    "activate_tenant",
+    "check_tenant_claim_quota",
     "get_authority_backend",
     "get_authority_connection",
     "DEFAULT_TENANT_ID",
