@@ -948,6 +948,111 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+    assert "Model: m" in text
+
+
+@pytest.mark.parametrize("mixed_batch", [False, True], ids=["single", "mixed-batch"])
+def test_profile_backed_async_completion_hides_route_models(
+    monkeypatch, mixed_batch
+):
+    from unittest.mock import MagicMock
+
+    import tools.delegate_tool as dt
+
+    profiles = {
+        "fast": {
+            "provider": "openai-codex",
+            "model": "private-fast-model-id",
+            "reasoning_effort": "medium",
+        },
+        "verifier": {
+            "provider": "openai-codex",
+            "model": "private-verifier-model-id",
+            "reasoning_effort": "max",
+        },
+    }
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "profile-parent"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+
+    def build_child(**kwargs):
+        child = MagicMock()
+        child._delegate_role = "leaf"
+        child._delegate_worker_profile = kwargs.get("worker_profile")
+        child._delegate_provider = kwargs.get("provider")
+        child._delegate_model = kwargs.get("model")
+        child._delegate_reasoning_effort = kwargs.get("reasoning_config", {}).get(
+            "effort"
+        )
+        return child
+
+    def run_child(task_index, goal, child=None, parent_agent=None, **_kwargs):
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": f"done: {goal}",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": child._delegate_model,
+            "exit_reason": "completed",
+        }
+
+    def resolve_credentials(route_cfg, _parent):
+        return {
+            "model": route_cfg["model"],
+            "provider": route_cfg["provider"],
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "command": None,
+            "args": None,
+        }
+
+    monkeypatch.setattr(dt, "_load_config", lambda: {"worker_profiles": profiles})
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", resolve_credentials)
+
+    if mixed_batch:
+        output = dt.delegate_task(
+            tasks=[
+                {"goal": "fast task", "worker_profile": "fast"},
+                {"goal": "verify task", "worker_profile": "verifier"},
+            ],
+            background=True,
+            parent_agent=parent,
+        )
+    else:
+        output = dt.delegate_task(
+            goal="fast task",
+            worker_profile="fast",
+            background=True,
+            parent_agent=parent,
+        )
+
+    delegation_id = json.loads(output)["delegation_id"]
+    evt = _drain_for(delegation_id)
+    assert evt is not None
+    assert evt.get("model") is None
+    assert all("model" not in result for result in evt["results"])
+    serialized_event = json.dumps(evt)
+    for route_value in (
+        "openai-codex",
+        "private-fast-model-id",
+        "private-verifier-model-id",
+        "medium",
+        "max",
+    ):
+        assert route_value not in serialized_event
+
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "Model:" not in text
+    assert "private-fast-model-id" not in text
+    assert "private-verifier-model-id" not in text
 
 
 def test_delegate_task_background_waits_inside_kanban_worker(monkeypatch):

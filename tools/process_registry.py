@@ -2104,11 +2104,12 @@ def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
     Carries the FULL original task source (goal, the context the parent
-    supplied, toolsets, role, model) plus dispatch time, status, and the
-    complete result summary. When this re-enters the conversation the agent
-    may be deep in unrelated context and won't remember why the subagent
-    existed, so the block is written to stand entirely on its own — enough to
-    use the result OR re-dispatch if the world has moved on.
+    supplied, toolsets, role, and legacy model metadata when available) plus
+    dispatch time, status, and the complete result summary. Profile-selected
+    model IDs are deliberately absent. When this re-enters the conversation
+    the agent may be deep in unrelated context and won't remember why the
+    subagent existed, so the block is written to stand entirely on its own —
+    enough to use the result OR re-dispatch if the world has moved on.
     """
     import time as _time
 
@@ -2117,7 +2118,7 @@ def _format_async_delegation(evt: dict) -> str:
     context = evt.get("context")
     toolsets = evt.get("toolsets")
     role = evt.get("role") or "leaf"
-    model = evt.get("model") or "?"
+    model = evt.get("model")
     status = evt.get("status") or "completed"
     summary = evt.get("summary")
     error = evt.get("error")
@@ -2152,7 +2153,10 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(f"Context you provided: {context}")
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        route_line = f"Role: {role}"
+        if model:
+            route_line += f"   Model: {model}"
+        lines.append(f"{route_line}   Total duration: {total_dur}s")
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
@@ -2214,7 +2218,7 @@ def _format_async_delegation(evt: dict) -> str:
         lines.append(f"Context you provided: {context}")
     if toolsets:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
-    lines.append(f"Role: {role}   Model: {model}")
+    lines.append(f"Role: {role}   Model: {model or '?'}")
     lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
     lines.append("--- RESULT ---")
     if status in ("completed", "success") and summary:

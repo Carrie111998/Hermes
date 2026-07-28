@@ -22,6 +22,8 @@ import {
 
 import { Panel, PanelEmpty, PanelHeader } from '../overlays/panel'
 
+import { routeMetadataLabels } from './route-metadata'
+
 // Mirrors statusGlyph() in tool-fallback.tsx so subagent rows speak the
 // same visual vocabulary as the chat tool blocks.
 function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNode {
@@ -312,7 +314,7 @@ function SubagentRow({ node, depth = 0, nowMs }: { node: SubagentNode; depth?: n
   const fileLines = [...node.filesWritten.map(p => `+ ${p}`), ...node.filesRead.map(p => `· ${p}`)]
 
   const subtitle = [
-    node.model,
+    ...routeMetadataLabels(node),
     fmtDuration(durationSeconds, t.agents),
     node.toolCount ? t.agents.toolsCount(node.toolCount) : '',
     fmtTokens((node.inputTokens ?? 0) + (node.outputTokens ?? 0), t.agents),

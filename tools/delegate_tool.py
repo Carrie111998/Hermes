@@ -961,6 +961,7 @@ def _build_child_progress_callback(
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    route_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -969,7 +970,7 @@ def _build_child_progress_callback(
       Gateway: batches tool names and relays to parent's progress callback
 
     The identity kwargs (``subagent_id``, ``parent_id``, ``depth``, ``model``,
-    ``toolsets``) are threaded into every relayed event so the TUI can
+    ``toolsets``) and optional route metadata are threaded into every relayed event so the TUI can
     reconstruct the live spawn tree and route per-branch controls (kill,
     pause) back by ``subagent_id``.  All are optional for backward compat —
     older callers that ignore them still produce a flat list on the TUI.
@@ -1013,6 +1014,16 @@ def _build_child_progress_callback(
         # event lets UIs open/inspect the subagent's session directly.
         if session_ref and session_ref.get("session_id"):
             kw["child_session_id"] = str(session_ref["session_id"])
+        if route_metadata:
+            for key in (
+                "worker_profile",
+                "provider",
+                "model",
+                "reasoning_effort",
+            ):
+                value = route_metadata.get(key)
+                if isinstance(value, str) and value:
+                    kw[key] = value
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -1189,6 +1200,22 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+_WORKER_REASONING_UNSET = object()
+
+
+def _reasoning_effort_label(value: Any) -> Optional[str]:
+    """Return a display-safe effort label from an effective reasoning config."""
+    if isinstance(value, str):
+        label = value.strip()
+        return label or None
+    if not isinstance(value, dict):
+        return None
+    if value.get("enabled") is False:
+        return "off"
+    effort = value.get("effort")
+    return effort if isinstance(effort, str) and effort else None
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1198,6 +1225,7 @@ def _build_child_agent(
     max_iterations: int,
     task_count: int,
     parent_agent,
+    worker_profile: Optional[str] = None,
     # Credential overrides from delegation config (provider:model resolution)
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
@@ -1205,6 +1233,8 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_config: Any = _WORKER_REASONING_UNSET,
+    inherit_parent_fallback: bool = True,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1334,6 +1364,9 @@ def _build_child_agent(
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
     child_session_ref: Dict[str, Any] = {}
+    child_route_metadata: Dict[str, Any] = {}
+    if worker_profile:
+        child_route_metadata["worker_profile"] = worker_profile
     child_progress_cb = _build_child_progress_callback(
         task_index,
         goal,
@@ -1345,6 +1378,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        route_metadata=child_route_metadata,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -1432,33 +1466,42 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # A worker profile carries a fully validated reasoning config. Without a
+    # profile, preserve the historical delegation override > parent inheritance
+    # behavior exactly.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+    if override_reasoning_config is not _WORKER_REASONING_UNSET:
+        child_reasoning = override_reasoning_config
+    else:
+        child_reasoning = parent_reasoning
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        getattr(parent_agent, "_fallback_chain", None) or None
+        if inherit_parent_fallback
+        else None
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1557,6 +1600,27 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    actual_provider = getattr(child, "provider", None)
+    if not isinstance(actual_provider, str) or not actual_provider:
+        actual_provider = effective_provider
+    actual_model = getattr(child, "model", None)
+    if not isinstance(actual_model, str) or not actual_model:
+        actual_model = effective_model
+    actual_reasoning = getattr(child, "reasoning_config", None)
+    if not isinstance(actual_reasoning, (dict, str)):
+        actual_reasoning = child_reasoning
+    reasoning_effort = _reasoning_effort_label(actual_reasoning)
+    child._delegate_worker_profile = worker_profile
+    child._delegate_provider = actual_provider
+    child._delegate_model = actual_model
+    child._delegate_reasoning_effort = reasoning_effort
+    child_route_metadata.update(
+        {
+            "provider": actual_provider,
+            "model": actual_model,
+            "reasoning_effort": reasoning_effort,
+        }
+    )
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -1602,6 +1666,10 @@ def _build_child_agent(
             child_subagent_id=subagent_id,
             child_role=effective_role,
             child_goal=goal,
+            worker_profile=worker_profile,
+            provider=actual_provider,
+            model=actual_model,
+            reasoning_effort=reasoning_effort,
         )
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
@@ -2632,8 +2700,12 @@ def _finalize_child_results(
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
-        _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
+        for entry in results:
+            child = child_by_index.get(entry.get("task_index", -1))
+            if getattr(child, "_delegate_worker_profile", None) is not None:
+                entry.pop("model", None)
+        _apply_summary_budget(results, parent_agent)
 
         if parent_agent and getattr(parent_agent, "_memory_manager", None):
             for entry in results:
@@ -2662,6 +2734,8 @@ def _finalize_child_results(
 
         children_cost_total = 0.0
         for entry in results:
+            child_index = entry.get("task_index", -1)
+            child = child_by_index.get(child_index)
             child_role = entry.pop("_child_role", None)
             child_cost = entry.pop("_child_cost_usd", 0.0)
             try:
@@ -2672,14 +2746,18 @@ def _finalize_child_results(
             if invoke_hook is None:
                 continue
             try:
-                child_index = entry.get("task_index", -1)
-                child = child_by_index.get(child_index)
                 invoke_hook(
                     "subagent_stop",
                     parent_session_id=parent_session_id,
                     parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
                     child_session_id=getattr(child, "session_id", None),
                     child_role=child_role,
+                    worker_profile=getattr(child, "_delegate_worker_profile", None),
+                    provider=getattr(child, "_delegate_provider", None),
+                    model=getattr(child, "_delegate_model", None),
+                    reasoning_effort=getattr(
+                        child, "_delegate_reasoning_effort", None
+                    ),
                     child_summary=entry.get("summary"),
                     child_status=entry.get("status"),
                     tool_call_history=_subagent_stop_tool_call_history(
@@ -2758,6 +2836,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    worker_profile: Optional[str] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
@@ -2834,16 +2913,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2878,6 +2947,58 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve every semantic profile before any credential lookup or child
+    # construction. This keeps malformed/unknown routes fail-closed for the
+    # whole batch rather than starting earlier tasks before a later task fails.
+    try:
+        top_profile_route = (
+            _resolve_worker_profile(cfg, worker_profile)
+            if worker_profile is not None
+            else None
+        )
+        task_profile_names = []
+        task_profile_routes = []
+        for task in task_list:
+            if "worker_profile" in task:
+                profile_name = task.get("worker_profile")
+                profile_route = _resolve_worker_profile(cfg, profile_name)
+            else:
+                profile_name = worker_profile
+                profile_route = top_profile_route
+            task_profile_names.append(profile_name)
+            task_profile_routes.append(profile_route)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    # Resolve credentials only after the full profile set is valid. Legacy
+    # tasks share the historical delegation config bundle; each exact profile
+    # resolves from provider+model only, so profile definitions cannot smuggle
+    # endpoint, credential, API-mode, or ACP transport overrides.
+    try:
+        legacy_creds = None
+        profile_creds = {}
+        task_credentials = []
+        for profile_name, profile_route in zip(
+            task_profile_names, task_profile_routes
+        ):
+            if profile_route is None:
+                if legacy_creds is None:
+                    legacy_creds = _resolve_delegation_credentials(cfg, parent_agent)
+                creds = legacy_creds
+            else:
+                if profile_name not in profile_creds:
+                    profile_creds[profile_name] = _resolve_delegation_credentials(
+                        {
+                            "provider": profile_route["provider"],
+                            "model": profile_route["model"],
+                        },
+                        parent_agent,
+                    )
+                creds = profile_creds[profile_name]
+            task_credentials.append(creds)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2923,6 +3044,9 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        profile_route = task_profile_routes[i]
+        profile_name = task_profile_names[i]
+        creds = task_credentials[i]
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -2934,12 +3058,19 @@ def delegate_task(
             max_iterations=effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
+            worker_profile=profile_name,
             override_provider=creds["provider"],
             override_base_url=creds["base_url"],
             override_api_key=creds["api_key"],
             override_api_mode=creds["api_mode"],
             override_request_overrides=creds.get("request_overrides"),
             override_max_tokens=creds.get("max_output_tokens"),
+            override_reasoning_config=(
+                profile_route["reasoning_effort"]
+                if profile_route is not None
+                else _WORKER_REASONING_UNSET
+            ),
+            inherit_parent_fallback=profile_route is None,
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
@@ -3291,6 +3422,15 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        # Profile routes are operator-owned metadata: keep them on internal
+        # lifecycle events, never on the completion record reinjected into the
+        # parent model. A mixed batch has no truthful single model label anyway.
+        _completion_model = (
+            task_credentials[0].get("model")
+            if task_credentials
+            and all(route is None for route in task_profile_routes)
+            else None
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3298,7 +3438,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_completion_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3450,6 +3590,90 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+_WORKER_PROFILE_ROUTE_FIELDS = ("provider", "model", "reasoning_effort")
+_WORKER_PROFILE_REASONING_EFFORTS = frozenset(
+    {"minimal", "low", "medium", "high", "max"}
+)
+_WORKER_PROFILE_FLOATING_MODEL_SELECTORS = frozenset(
+    {"auto", "default", "latest"}
+)
+_WORKER_PROFILE_SELECTOR_SEPARATORS = ("/", ":", "@", "-", "_")
+
+
+def _is_floating_model_selector(model: str) -> bool:
+    """Reject obvious aliases/wildcards instead of pretending they are pins."""
+    lowered = model.lower()
+    if "*" in lowered or "?" in lowered:
+        return True
+    if lowered in _WORKER_PROFILE_FLOATING_MODEL_SELECTORS:
+        return True
+    return any(
+        lowered.endswith(f"{separator}{selector}")
+        for separator in _WORKER_PROFILE_SELECTOR_SEPARATORS
+        for selector in _WORKER_PROFILE_FLOATING_MODEL_SELECTORS
+    )
+
+
+def _resolve_worker_profile(cfg: dict, worker_profile: object) -> dict:
+    """Return the operator-pinned routing tuple for an exact profile name."""
+    if not (
+        isinstance(worker_profile, str)
+        and worker_profile
+        and worker_profile == worker_profile.strip()
+    ):
+        raise ValueError(
+            "worker_profile must be a non-empty string without surrounding whitespace."
+        )
+    profiles = cfg.get("worker_profiles")
+    if not isinstance(profiles, dict) or worker_profile not in profiles:
+        raise ValueError(f"Unknown worker profile '{worker_profile}'.")
+    profile = profiles[worker_profile]
+    if not isinstance(profile, dict):
+        raise ValueError(f"Worker profile '{worker_profile}' must be a mapping.")
+    if set(profile) != set(_WORKER_PROFILE_ROUTE_FIELDS):
+        required = ", ".join(_WORKER_PROFILE_ROUTE_FIELDS)
+        raise ValueError(
+            f"Worker profile '{worker_profile}' must define exactly: {required}."
+        )
+
+    provider = profile["provider"]
+    model = profile["model"]
+    if not all(
+        isinstance(value, str) and value and value == value.strip()
+        for value in (provider, model)
+    ):
+        raise ValueError(
+            f"Worker profile '{worker_profile}' provider and model must be "
+            "non-empty strings without surrounding whitespace."
+        )
+    if _is_floating_model_selector(model):
+        raise ValueError(
+            f"Worker profile '{worker_profile}' model must be a statically "
+            "pinned exact model ID; floating selectors and wildcards are not "
+            "allowed."
+        )
+
+    from hermes_constants import parse_reasoning_effort
+
+    configured_effort = profile["reasoning_effort"]
+    reasoning_effort = parse_reasoning_effort(configured_effort)
+    if reasoning_effort is None:
+        raise ValueError(
+            f"Invalid reasoning_effort in worker profile '{worker_profile}'."
+        )
+    if configured_effort not in _WORKER_PROFILE_REASONING_EFFORTS:
+        allowed = ", ".join(sorted(_WORKER_PROFILE_REASONING_EFFORTS))
+        raise ValueError(
+            f"Worker profile '{worker_profile}' reasoning_effort must be one of: "
+            f"{allowed}."
+        )
+    return {
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+    }
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -3728,7 +3952,11 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Route selection is semantic only: pass an operator-approved "
+        "worker_profile name when one is explicitly available. Never provide "
+        "raw provider, model, reasoning effort, credentials, or endpoints. "
+        "Omit worker_profile to preserve the legacy delegation route and "
+        "inheritance behavior.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3790,7 +4018,9 @@ def _build_dynamic_schema_overrides() -> dict:
 
     Plugged into ToolEntry.dynamic_schema_overrides so every
     get_definitions() pass rewrites the description fields to the user's
-    actual limits.
+    actual limits. AIAgent snapshots the resulting definitions into
+    ``agent.tools`` at construction; the conversation loop reuses that same
+    list, so this is per-agent/session dynamic rather than per-turn dynamic.
     """
     overrides_params = {
         **DELEGATE_TASK_SCHEMA["parameters"],
@@ -3842,6 +4072,18 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "worker_profile": {
+                # Intentionally no config-derived enum: configured names are
+                # validated exactly at runtime, while the model-facing schema
+                # remains stable for the lifetime of the agent/session.
+                "type": "string",
+                "description": (
+                    "Exact case-sensitive name of an operator-defined semantic "
+                    "worker profile. Use only profiles explicitly named in "
+                    "session policy. Omit to preserve the configured legacy "
+                    "delegation route."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3851,6 +4093,14 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "worker_profile": {
+                            "type": "string",
+                            "description": (
+                                "Exact case-sensitive name of an operator-defined "
+                                "semantic worker profile for this task. Use only "
+                                "profiles explicitly named in session policy."
+                            ),
                         },
                         "role": {
                             "type": "string",
@@ -3909,7 +4159,13 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     return not is_subagent
 
 
-_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
+_MODEL_HIDDEN_TASK_FIELDS = {
+    "acp_command",
+    "acp_args",
+    "provider",
+    "model",
+    "reasoning_effort",
+}
 
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:
@@ -3939,6 +4195,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        worker_profile=args.get("worker_profile"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

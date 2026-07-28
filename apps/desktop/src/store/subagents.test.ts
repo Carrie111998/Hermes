@@ -27,6 +27,27 @@ describe('subagent store', () => {
     expect(item?.summary).toBe('done')
   })
 
+  it('keeps worker route metadata across lifecycle updates', () => {
+    upsertSubagent('s1', {
+      goal: 'verify change',
+      model: 'gpt-verifier-canary',
+      provider: 'openai-codex',
+      reasoning_effort: 'max',
+      status: 'queued',
+      subagent_id: 'a1',
+      task_index: 0,
+      worker_profile: 'verifier'
+    })
+    upsertSubagent('s1', { status: 'running', subagent_id: 'a1', task_index: 0 }, false, 'subagent.start')
+
+    expect(listFor('s1')[0]).toMatchObject({
+      model: 'gpt-verifier-canary',
+      provider: 'openai-codex',
+      reasoningEffort: 'max',
+      workerProfile: 'verifier'
+    })
+  })
+
   it('builds parent/child trees', () => {
     upsertSubagent('s1', { goal: 'parent', status: 'running', subagent_id: 'p', task_index: 0 })
     upsertSubagent('s1', { goal: 'child', parent_id: 'p', status: 'queued', subagent_id: 'c', task_index: 1 })

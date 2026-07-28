@@ -19,6 +19,8 @@ export interface SubagentProgress {
   /** The child's own stored session id — lets UIs open its session window. */
   sessionId?: string
   model?: string
+  provider?: string
+  reasoningEffort?: string
   status: SubagentStatus
   taskCount: number
   taskIndex: number
@@ -35,6 +37,7 @@ export interface SubagentProgress {
   summary?: string
   /** Active tool while running — cleared on terminal status. */
   currentTool?: string
+  workerProfile?: string
 }
 
 export interface SubagentNode extends SubagentProgress {
@@ -160,6 +163,8 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     goal: str(payload.goal) || prev?.goal || 'Subagent',
     sessionId: str(payload.child_session_id) || prev?.sessionId,
     model: str(payload.model) || prev?.model,
+    provider: str(payload.provider) || prev?.provider,
+    reasoningEffort: str(payload.reasoning_effort) || prev?.reasoningEffort,
     status,
     taskCount: num(payload.task_count) ?? prev?.taskCount ?? 1,
     taskIndex: num(payload.task_index) ?? prev?.taskIndex ?? 0,
@@ -174,7 +179,8 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     filesWritten: filesWritten.length ? filesWritten : (prev?.filesWritten ?? []),
     stream,
     summary: str(payload.summary) || prev?.summary,
-    currentTool: TERMINAL.has(status) ? undefined : tool || prev?.currentTool
+    currentTool: TERMINAL.has(status) ? undefined : tool || prev?.currentTool,
+    workerProfile: str(payload.worker_profile) || prev?.workerProfile
   }
 }
 

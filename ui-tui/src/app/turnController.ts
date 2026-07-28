@@ -1034,6 +1034,8 @@ class TurnController {
         model: p.model,
         notes: [],
         parentId: p.parent_id ?? null,
+        provider: p.provider,
+        reasoningEffort: p.reasoning_effort,
         startedAt: Date.now(),
         status: 'running',
         taskCount: p.task_count ?? 1,
@@ -1068,10 +1070,13 @@ class TurnController {
         outputTail,
         outputTokens: p.output_tokens ?? base.outputTokens,
         parentId: p.parent_id ?? base.parentId,
+        provider: p.provider ?? base.provider,
+        reasoningEffort: p.reasoning_effort ?? base.reasoningEffort,
         reasoningTokens: p.reasoning_tokens ?? base.reasoningTokens,
         taskCount: p.task_count ?? base.taskCount,
         toolCount: p.tool_count ?? base.toolCount,
         toolsets: p.toolsets ?? base.toolsets,
+        workerProfile: p.worker_profile ?? base.workerProfile,
         ...patch(base)
       }
 

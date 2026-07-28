@@ -1221,6 +1221,20 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  # worker_profiles:                          # Optional capability router. Names are exact and case-sensitive.
+  #   fast:                                   # The model selects only this semantic name.
+  #     provider: "openai-codex"              # Full pinned tuple is required for every profile.
+  #     model: "your-pinned-fast-model-id"    # Exact ID only; no latest/auto/default/wildcards.
+  #     reasoning_effort: "medium"
+  #   verifier:
+  #     provider: "openai-codex"
+  #     model: "your-pinned-verifier-model-id"
+  #     reasoning_effort: "max"
+  # Profile reasoning_effort must be one of: minimal, low, medium, high, max.
+  # Reserve minimal/low profiles for trivial, mechanical, low-risk work.
+  # Profiles cannot contain API keys, base URLs, API modes, or ACP commands.
+  # Unknown/malformed profiles fail closed; omitting worker_profile preserves
+  # the legacy delegation provider/model/reasoning behavior above.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)

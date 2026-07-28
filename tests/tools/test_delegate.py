@@ -11,6 +11,8 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+from pathlib import Path
+import tempfile
 import threading
 import time
 import types
@@ -88,6 +90,16 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_schema_exposes_only_semantic_worker_profile(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        task_props = props["tasks"]["items"]["properties"]
+
+        self.assertEqual(props["worker_profile"]["type"], "string")
+        self.assertEqual(task_props["worker_profile"]["type"], "string")
+        for raw_field in ("provider", "model", "reasoning_effort"):
+            self.assertNotIn(raw_field, props)
+            self.assertNotIn(raw_field, task_props)
+
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
         not the framework defaults. Without this, models that read 'default 3'
@@ -111,6 +123,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {max_children}", desc)
         # Top-level description names the user's spawn-depth limit explicitly.
         self.assertIn(f"max_spawn_depth={max_depth}", desc)
+        self.assertIn("worker_profile", desc)
+        self.assertNotIn("Subagent model is NOT selectable per call", desc)
         # tasks parameter description repeats the concurrency cap.
         self.assertIn(f"up to {max_children}", tasks_desc)
         # role parameter description names the spawn-depth limit.
@@ -1227,6 +1241,525 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
         self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
+
+
+class TestWorkerProfileResolution(unittest.TestCase):
+    def test_loads_profile_from_real_profile_scoped_config(self):
+        from tools.delegate_tool import _resolve_worker_profile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.yaml"
+            config_path.write_text(
+                "delegation:\n"
+                "  worker_profiles:\n"
+                "    trivial:\n"
+                "      provider: openai-codex\n"
+                "      model: gpt-trivial-canary\n"
+                "      reasoning_effort: minimal\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"HERMES_HOME": tmp_dir},
+                clear=False,
+            ):
+                os.environ.pop("HERMES_IGNORE_USER_CONFIG", None)
+                cfg = _load_config()
+
+        self.assertEqual(
+            _resolve_worker_profile(cfg, "trivial"),
+            {
+                "provider": "openai-codex",
+                "model": "gpt-trivial-canary",
+                "reasoning_effort": {"enabled": True, "effort": "minimal"},
+            },
+        )
+
+    def test_resolves_exact_full_pinned_route(self):
+        from tools.delegate_tool import _resolve_worker_profile
+
+        cfg = {
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                }
+            }
+        }
+
+        self.assertEqual(
+            _resolve_worker_profile(cfg, "fast"),
+            {
+                "provider": "openai-codex",
+                "model": "gpt-fast-canary",
+                "reasoning_effort": {"enabled": True, "effort": "medium"},
+            },
+        )
+
+    def test_rejects_unknown_and_case_mismatched_names(self):
+        from tools.delegate_tool import _resolve_worker_profile
+
+        cfg = {
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                }
+            }
+        }
+
+        for requested in ("missing", "FAST"):
+            with self.subTest(requested=requested):
+                with self.assertRaisesRegex(ValueError, "Unknown worker profile"):
+                    _resolve_worker_profile(cfg, requested)
+
+    def test_rejects_blank_padded_and_non_string_selectors(self):
+        from tools.delegate_tool import _resolve_worker_profile
+
+        cfg = {"worker_profiles": {}}
+        for requested in ("", " fast ", [], {}):
+            with self.subTest(requested=requested):
+                with self.assertRaisesRegex(ValueError, "non-empty string"):
+                    _resolve_worker_profile(cfg, requested)
+
+    def test_rejects_malformed_or_unsafe_profile_definitions(self):
+        from tools.delegate_tool import _resolve_worker_profile
+
+        valid = {
+            "provider": "openai-codex",
+            "model": "gpt-fast-canary",
+            "reasoning_effort": "medium",
+        }
+        cases = [
+            ("non-mapping", "not-a-mapping", "must be a mapping"),
+            (
+                "missing field",
+                {"provider": "openai-codex", "model": "gpt-fast-canary"},
+                "must define exactly",
+            ),
+            (
+                "empty provider",
+                {**valid, "provider": ""},
+                "non-empty strings",
+            ),
+            (
+                "padded model",
+                {**valid, "model": " gpt-fast-canary "},
+                "non-empty strings",
+            ),
+            (
+                "floating model selector",
+                {**valid, "model": "latest"},
+                "statically pinned",
+            ),
+            (
+                "namespaced floating model selector",
+                {**valid, "model": "openrouter/auto"},
+                "statically pinned",
+            ),
+            (
+                "wildcard model selector",
+                {**valid, "model": "gpt-*"},
+                "statically pinned",
+            ),
+            (
+                "invalid effort",
+                {**valid, "reasoning_effort": "turbo"},
+                "Invalid reasoning_effort",
+            ),
+            (
+                "disabled reasoning outside deployment policy",
+                {**valid, "reasoning_effort": False},
+                "must be one of",
+            ),
+            (
+                "unsafe extra",
+                {**valid, "api_key": "must-not-be-routable"},
+                "must define exactly",
+            ),
+        ]
+
+        for label, profile, error in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, error):
+                    _resolve_worker_profile({"worker_profiles": {"fast": profile}}, "fast")
+
+    def test_accepts_operator_pinned_worker_effort_levels(self):
+        from tools.delegate_tool import _resolve_worker_profile
+
+        for effort in ("minimal", "low", "medium", "high", "max"):
+            with self.subTest(effort=effort):
+                route = _resolve_worker_profile(
+                    {
+                        "worker_profiles": {
+                            "simple": {
+                                "provider": "openai-codex",
+                                "model": "gpt-simple-canary",
+                                "reasoning_effort": effort,
+                            }
+                        }
+                    },
+                    "simple",
+                )
+                self.assertEqual(
+                    route["reasoning_effort"],
+                    {"enabled": True, "effort": effort},
+                )
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                }
+            }
+        },
+    )
+    def test_unknown_profile_fails_before_credentials_or_child_build(
+        self, _mock_cfg, mock_credentials, mock_build
+    ):
+        result = json.loads(
+            delegate_task(
+                goal="inspect",
+                worker_profile="missing",
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("Unknown worker profile", result["error"])
+        mock_credentials.assert_not_called()
+        mock_build.assert_not_called()
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                }
+            }
+        },
+    )
+    def test_batch_validates_all_profiles_before_credentials_or_child_build(
+        self, _mock_cfg, mock_credentials, mock_build
+    ):
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {"goal": "first", "worker_profile": "fast"},
+                    {"goal": "second", "worker_profile": "missing"},
+                ],
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("Unknown worker profile", result["error"])
+        mock_credentials.assert_not_called()
+        mock_build.assert_not_called()
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                },
+                "verifier": {
+                    "provider": "openai-codex",
+                    "model": "gpt-verifier-canary",
+                    "reasoning_effort": "max",
+                },
+            }
+        },
+    )
+    def test_batch_routes_each_item_through_its_own_profile(
+        self, _mock_cfg, mock_credentials, mock_build
+    ):
+        def credentials_for(route_cfg, _parent):
+            return {
+                "provider": route_cfg["provider"],
+                "model": route_cfg["model"],
+                "base_url": None,
+                "api_key": None,
+                "api_mode": "codex_responses",
+                "request_overrides": {},
+                "max_output_tokens": None,
+            }
+
+        mock_credentials.side_effect = credentials_for
+        mock_build.side_effect = [_make_role_mock_child(), _make_role_mock_child()]
+
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {"goal": "first", "worker_profile": "fast"},
+                    {"goal": "second", "worker_profile": "verifier"},
+                ],
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            [call.args[0] for call in mock_credentials.call_args_list],
+            [
+                {"provider": "openai-codex", "model": "gpt-fast-canary"},
+                {"provider": "openai-codex", "model": "gpt-verifier-canary"},
+            ],
+        )
+        child_kwargs = [call.kwargs for call in mock_build.call_args_list]
+        self.assertEqual(
+            [kwargs["model"] for kwargs in child_kwargs],
+            ["gpt-fast-canary", "gpt-verifier-canary"],
+        )
+        self.assertEqual(
+            [kwargs["worker_profile"] for kwargs in child_kwargs],
+            ["fast", "verifier"],
+        )
+        self.assertEqual(
+            [kwargs["override_reasoning_config"] for kwargs in child_kwargs],
+            [
+                {"enabled": True, "effort": "medium"},
+                {"enabled": True, "effort": "max"},
+            ],
+        )
+        self.assertEqual(
+            [kwargs["inherit_parent_fallback"] for kwargs in child_kwargs],
+            [False, False],
+        )
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "provider": "legacy-provider",
+            "model": "legacy-model",
+            "reasoning_effort": "high",
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                }
+            },
+        },
+    )
+    def test_single_profile_pins_route_reasoning_and_disables_parent_fallback(
+        self, _mock_cfg, mock_credentials
+    ):
+        mock_credentials.return_value = {
+            "provider": "openai-codex",
+            "model": "gpt-fast-canary",
+            "base_url": "https://profile.example/v1",
+            "api_key": "resolved-at-runtime",
+            "api_mode": "codex_responses",
+            "request_overrides": {},
+            "max_output_tokens": None,
+        }
+        parent = _make_mock_parent()
+        parent._fallback_chain = [{"provider": "other", "model": "fallback"}]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            child._delegate_saved_tool_names = []
+            child._credential_pool = None
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child.model = "gpt-fast-canary"
+            MockAgent.return_value = child
+
+            result = json.loads(
+                delegate_task(
+                    goal="inspect",
+                    worker_profile="fast",
+                    parent_agent=parent,
+                )
+            )
+
+        routed_cfg = mock_credentials.call_args.args[0]
+        self.assertEqual(
+            routed_cfg,
+            {"provider": "openai-codex", "model": "gpt-fast-canary"},
+        )
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "openai-codex")
+        self.assertEqual(kwargs["model"], "gpt-fast-canary")
+        self.assertEqual(
+            kwargs["reasoning_config"],
+            {"enabled": True, "effort": "medium"},
+        )
+        self.assertIsNone(kwargs["fallback_model"])
+        self.assertEqual(child._delegate_worker_profile, "fast")
+        self.assertEqual(child._delegate_provider, "openai-codex")
+        self.assertEqual(child._delegate_model, "gpt-fast-canary")
+        self.assertEqual(child._delegate_reasoning_effort, "medium")
+        for route_key in ("worker_profile", "provider", "model", "reasoning_effort"):
+            self.assertNotIn(route_key, result["results"][0])
+        serialized_result = json.dumps(result)
+        for route_value in ("openai-codex", "gpt-fast-canary", "medium"):
+            self.assertNotIn(route_value, serialized_result)
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "provider": "legacy-provider",
+            "model": "legacy-model",
+            "reasoning_effort": "high",
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                }
+            },
+        },
+    )
+    def test_omitted_profile_preserves_legacy_route_reasoning_and_fallback(
+        self, _mock_cfg, mock_credentials
+    ):
+        mock_credentials.return_value = {
+            "provider": "legacy-provider",
+            "model": "legacy-model",
+            "base_url": "https://legacy.example/v1",
+            "api_key": "resolved-at-runtime",
+            "api_mode": "chat_completions",
+            "request_overrides": {},
+            "max_output_tokens": None,
+        }
+        parent = _make_mock_parent()
+        fallback = [{"provider": "other", "model": "fallback"}]
+        parent._fallback_chain = fallback
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            child._delegate_saved_tool_names = []
+            child._credential_pool = None
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child.model = "legacy-model"
+            MockAgent.return_value = child
+
+            result = json.loads(delegate_task(goal="inspect", parent_agent=parent))
+
+        routed_cfg = mock_credentials.call_args.args[0]
+        self.assertEqual(routed_cfg["provider"], "legacy-provider")
+        self.assertIn("worker_profiles", routed_cfg)
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "legacy-provider")
+        self.assertEqual(kwargs["model"], "legacy-model")
+        self.assertEqual(
+            kwargs["reasoning_config"],
+            {"enabled": True, "effort": "high"},
+        )
+        self.assertEqual(kwargs["fallback_model"], fallback)
+        self.assertIsNone(child._delegate_worker_profile)
+        self.assertEqual(child._delegate_provider, "legacy-provider")
+        self.assertEqual(child._delegate_model, "legacy-model")
+        self.assertEqual(child._delegate_reasoning_effort, "high")
+        self.assertEqual(result["results"][0]["model"], "legacy-model")
+
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "worker_profiles": {
+                "fast": {
+                    "provider": "openai-codex",
+                    "model": "gpt-fast-canary",
+                    "reasoning_effort": "medium",
+                }
+            }
+        },
+    )
+    def test_batch_null_item_profile_cannot_disable_top_level_profile(
+        self, _mock_cfg, mock_credentials, mock_build
+    ):
+        result = json.loads(
+            delegate_task(
+                tasks=[{"goal": "first", "worker_profile": None}],
+                worker_profile="fast",
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("non-empty string", result["error"])
+        mock_credentials.assert_not_called()
+        mock_build.assert_not_called()
+
+
+    def test_stop_hook_includes_internal_route_metadata_without_result_leak(self):
+        from tools.delegate_tool import _finalize_child_results
+
+        parent = _make_mock_parent()
+        parent._memory_manager = None
+        parent.session_id = "parent-session"
+        parent._current_turn_id = "turn-1"
+        child = types.SimpleNamespace(
+            session_id="child-session",
+            _delegate_worker_profile="fast",
+            _delegate_provider="openai-codex",
+            _delegate_model="gpt-fast-canary",
+            _delegate_reasoning_effort="medium",
+        )
+        entry = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "duration_seconds": 0.1,
+            "model": "gpt-fast-canary",
+            "tool_trace": [],
+            "_child_role": "leaf",
+            "_child_cost_usd": 0.0,
+        }
+        task = {"goal": "inspect"}
+
+        with patch("hermes_cli.plugins.invoke_hook") as invoke_hook:
+            _finalize_child_results([entry], [task], [(0, task, child)], parent)
+
+        kwargs = invoke_hook.call_args.kwargs
+        self.assertEqual(kwargs["worker_profile"], "fast")
+        self.assertEqual(kwargs["provider"], "openai-codex")
+        self.assertEqual(kwargs["model"], "gpt-fast-canary")
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
+        for internal_key in (
+            "_child_role",
+            "_child_cost_usd",
+            "worker_profile",
+            "provider",
+            "model",
+            "reasoning_effort",
+        ):
+            self.assertNotIn(internal_key, entry)
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):
@@ -2480,6 +3013,70 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_worker_profiles_are_forwarded_without_raw_route_fields(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "test",
+                    "worker_profile": "fast",
+                    "provider": "must-not-forward",
+                    "model": "must-not-forward",
+                    "reasoning_effort": "must-not-forward",
+                    "tasks": [
+                        {
+                            "goal": "nested",
+                            "worker_profile": "verifier",
+                            "provider": "must-not-forward",
+                            "model": "must-not-forward",
+                            "reasoning_effort": "must-not-forward",
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(captured["worker_profile"], "fast")
+        self.assertEqual(captured["tasks"][0]["worker_profile"], "verifier")
+        for raw_field in ("provider", "model", "reasoning_effort"):
+            self.assertNotIn(raw_field, captured)
+            self.assertNotIn(raw_field, captured["tasks"][0])
+
+    def test_registry_fallback_forwards_worker_profiles(self):
+        from tools.registry import registry
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            registry.dispatch(
+                "delegate_task",
+                {
+                    "goal": "test",
+                    "worker_profile": "fast",
+                    "provider": "must-not-forward",
+                    "tasks": [
+                        {"goal": "nested", "worker_profile": "verifier"}
+                    ],
+                },
+                parent_agent=_make_mock_parent(depth=0),
+            )
+
+        self.assertEqual(captured["worker_profile"], "fast")
+        self.assertEqual(captured["tasks"][0]["worker_profile"], "verifier")
+        self.assertNotIn("provider", captured)
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
@@ -2508,6 +3105,31 @@ class TestDelegateEventEnum(unittest.TestCase):
 
         cb("tool.started", tool_name="terminal", preview="ls")
         parent._delegate_spinner.print_above.assert_called()
+
+    def test_progress_callback_includes_route_metadata(self):
+        parent = _make_mock_parent()
+        parent._delegate_spinner = None
+        parent.tool_progress_callback = MagicMock()
+        route_metadata = {
+            "worker_profile": "fast",
+            "provider": "openai-codex",
+            "model": "gpt-fast-canary",
+            "reasoning_effort": "medium",
+        }
+
+        cb = _build_child_progress_callback(
+            0,
+            "test goal",
+            parent,
+            route_metadata=route_metadata,
+        )
+        cb("subagent.start")
+
+        kwargs = parent.tool_progress_callback.call_args.kwargs
+        self.assertEqual(kwargs["worker_profile"], "fast")
+        self.assertEqual(kwargs["provider"], "openai-codex")
+        self.assertEqual(kwargs["model"], "gpt-fast-canary")
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
 
     def test_progress_callback_normalises_thinking(self):
         """Both _thinking and reasoning.available route to TASK_THINKING."""

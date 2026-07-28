@@ -495,6 +495,8 @@ export interface SubagentEventPayload {
   input_tokens?: number
   iteration?: number
   model?: string
+  provider?: string
+  reasoning_effort?: string
   output_tail?: { is_error?: boolean; preview?: string; tool?: string }[]
   output_tokens?: number
   parent_id?: null | string
@@ -509,6 +511,7 @@ export interface SubagentEventPayload {
   tool_name?: string
   tool_preview?: string
   toolsets?: string[]
+  worker_profile?: string
 }
 
 // ── Delegation control RPCs ──────────────────────────────────────────

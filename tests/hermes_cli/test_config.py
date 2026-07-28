@@ -119,6 +119,35 @@ class TestLoadConfigDefaults:
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
 
+    def test_worker_profiles_default_empty_and_deep_merge_from_user_config(self, tmp_path):
+        assert DEFAULT_CONFIG["delegation"]["worker_profiles"] == {}
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "delegation": {
+                            "worker_profiles": {
+                                "fast": {
+                                    "provider": "openai-codex",
+                                    "model": "gpt-fast-canary",
+                                    "reasoning_effort": "medium",
+                                }
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config()
+
+        assert config["delegation"]["worker_profiles"]["fast"]["model"] == "gpt-fast-canary"
+        assert (
+            config["delegation"]["max_iterations"]
+            == DEFAULT_CONFIG["delegation"]["max_iterations"]
+        )
+
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config_path = tmp_path / "config.yaml"

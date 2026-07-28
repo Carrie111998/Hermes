@@ -1158,6 +1158,35 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().subagents.find(s => s.id === 'sa-weird')?.status).toBe('completed')
   })
 
+  it('keeps worker route metadata across partial subagent events', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        goal: 'verify child',
+        model: 'gpt-verifier-canary',
+        provider: 'openai-codex',
+        reasoning_effort: 'max',
+        subagent_id: 'sa-route',
+        task_index: 0,
+        worker_profile: 'verifier'
+      },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: { goal: 'verify child', subagent_id: 'sa-route', task_index: 0 },
+      type: 'subagent.progress'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-route')).toMatchObject({
+      model: 'gpt-verifier-canary',
+      provider: 'openai-codex',
+      reasoningEffort: 'max',
+      workerProfile: 'verifier'
+    })
+  })
+
   it('nudges toward /agents on the first spawn_requested of a turn', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
