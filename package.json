@@ -11,7 +11,7 @@
     "tests-js"
   ],
   "scripts": {
-    "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'",
+    "postinstall": "echo '\u2705 Browser tools ready. Run: python run_agent.py --help'",
     "install:root": "npm install --workspaces=false",
     "install:web": "npm install --workspace web",
     "install:tui": "npm install --workspace ui-tui",
@@ -40,7 +40,17 @@
   },
   "overrides": {
     "lodash": "4.18.1",
-    "yauzl": "^3.3.1"
+    "yauzl": "^3.3.1",
+    "eslint": ">=10.8.0",
+    "@electron/asar": ">=3.5.0",
+    "@electron/universal": ">=1.6.0",
+    "dir-compare": ">=4.5.0",
+    "filelist": ">=1.0.7",
+    "jake": ">=10.9.5",
+    "glob": ">=10.6.0",
+    "minimatch": ">=10.0.3",
+    "brace-expansion": ">=5.0.8",
+    "react-router-dom": ">=7.11.0 < 7.12.0"
   },
   "engines": {
     "node": ">=20.0.0"
