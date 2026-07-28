@@ -615,8 +615,63 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    # Pre-translate MCP servers for the ACP client path only.  Reading and
+    # translating at init time (rather than on every turn) avoids repeated
+    # YAML parsing.  The external ACP agent opens the connections -- Hermes
+    # does NOT register these servers in-process (no double-connect).
+    _is_acp = (
+        api_mode == "acp_client"
+        or (provider_name in {"acp-client", "acp_client"})
+    )
+    # Also check plugin-registered ACP runtime providers: a display provider
+    # like ``claude-code-acp`` resolves to ``api_mode = "acp_client"`` via the
+    # runtime registry.  This lets /acp-client-runtime write the logical
+    # provider name into config without the core knowing any vendor-specific
+    # names.
+    if not _is_acp and provider_name:
+        # Get actual model config + requested model for the resolver
+        _init_model = model or ""
+        # Consult the ACP runtime provider registry
+        try:
+            from hermes_cli.acp_runtime_provider_registry import (
+                resolve_acp_runtime_provider,
+                get_acp_runtime_provider,
+            )
+            if get_acp_runtime_provider(provider_name):
+                from hermes_cli.config import load_config as _load_config
+                _cfg_for_resolver = _load_config() if not _init_model else {"model": {"default": _init_model}}
+                _desc = resolve_acp_runtime_provider(provider_name, _init_model or None, _cfg_for_resolver)
+                if _desc and _desc.get("api_mode") == "acp_client":
+                    _is_acp = True
+        except Exception:
+            pass
+    if _is_acp:
+        try:
+            from tools.mcp_tool import _load_mcp_config
+            from agent.transports.acp_client_session import _translate_mcp_servers
+            agent.acp_mcp_servers = _translate_mcp_servers(_load_mcp_config())
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                "ACP: could not load mcp_servers config: %s", _exc
+            )
+            agent.acp_mcp_servers = []
+    else:
+        agent.acp_mcp_servers = []
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "acp_client"}:
         agent.api_mode = api_mode
+    elif agent.provider in {"acp-client", "acp_client"}:
+        # ACP client transport: any ACP-compliant agent via JSON-RPC stdio.
+        # Gated strictly by provider name so no accidental overlap with
+        # copilot-acp or other acp://... base_url forms.
+        # provider may arrive as canonical "acp_client" (post-alias, from
+        # resolve_runtime_provider) or as "acp-client" (raw config value).
+        agent.api_mode = "acp_client"
+    elif _is_acp:
+        # Plugin-registered display provider (e.g. ``claude-code-acp``) that
+        # resolves to acp_client transport via the runtime registry.
+        # No vendor-specific names in core.
+        agent.api_mode = "acp_client"
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
     elif agent.provider in {"xai", "xai-oauth"}:
@@ -706,7 +761,7 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
+        and agent.provider not in {"copilot-acp", "acp_client", "acp-client"}
         and not str(agent.base_url or "").lower().startswith("acp://copilot")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
@@ -1109,6 +1164,18 @@ def init_agent(
         if not agent.quiet_mode:
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
+    elif agent.api_mode == "acp_client":
+        # Local-command ACP transport: routes inference to any ACP-compliant
+        # agent via JSON-RPC over stdio. No HTTP client is needed — the turn
+        # is routed via _run_acp_client_turn -> ACPClientSession(command, args).
+        # Auth is handled entirely by the spawned binary itself; no API key
+        # is required at the Hermes layer.
+        agent.client = None
+        agent._client_kwargs = {}
+        agent.api_key = ""
+        if not agent.quiet_mode:
+            _acp_cmd = agent.acp_command or "(acp command not set)"
+            print(f"🤖 AI Agent initialized with ACP client transport (command: {_acp_cmd})")
     else:
         if api_key and base_url:
             # Explicit credentials from CLI/gateway — construct directly.

@@ -3882,6 +3882,7 @@ class AIAgent:
         - Terminal sandbox environments
         - Browser daemon sessions
         - Active child agents (subagent delegation)
+        - ACP / Codex client subprocess sessions
         - OpenAI/httpx client connections
 
         Safe to call multiple times (idempotent).  Each cleanup step is
@@ -3908,7 +3909,13 @@ class AIAgent:
         except Exception:
             pass
 
-        # 4. Close active child agents
+        # 4. Close external subprocess sessions (ACP client, Codex app-server).
+        # These own long-lived child processes spawned lazily on first turn.
+        # Without closing them here, /new, gateway shutdown, and subagent exit
+        # would leave orphaned agent subprocesses.
+        self._close_external_sessions()
+
+        # 5. Close active child agents
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
@@ -3921,7 +3928,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3930,7 +3937,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -3941,7 +3948,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 7. Finalize the owned SQLite session row unless this agent is only a
+        # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,
         # or background-review forks that share the live parent's session_id and
@@ -3956,6 +3963,31 @@ class AIAgent:
                     session_db.end_session(session_id, "agent_close")
         except Exception:
             pass
+
+    def _close_external_sessions(self) -> None:
+        """Best-effort teardown of lazily-created external subprocess sessions.
+
+        Closes ``_acp_session`` (ACPClientSession) and ``_codex_session``
+        (CodexAppServerSession) if present.  These are created lazily on first
+        turn and own long-lived child processes; without explicit teardown they
+        would be orphaned when the agent is closed (``/new``, gateway shutdown,
+        subagent exit).
+
+        Each session is closed in its own try/except and the attribute is
+        cleared to ``None`` in a ``finally`` block so a failing ``close()``
+        does not prevent the reference from being dropped (allowing GC to
+        reclaim the wrapper) nor block the remaining close() steps.
+        """
+        for attr in ("_acp_session", "_codex_session"):
+            session = getattr(self, attr, None)
+            if session is None:
+                continue
+            try:
+                session.close()
+            except Exception:
+                pass
+            finally:
+                setattr(self, attr, None)
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -6918,6 +6950,19 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+    def _run_acp_client_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.acp_runtime.run_acp_client_turn``."""
+        from agent.acp_runtime import run_acp_client_turn
+        return run_acp_client_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
 
 def main(
     query: str = None,

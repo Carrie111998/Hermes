@@ -357,6 +357,10 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Optional opt-in: route inference to any ACP-compliant agent via
+    # JSON-RPC over stdio. Gated behind api_mode == "acp_client" AND
+    # provider == "acp-client" (or explicit api_mode config). Default unchanged.
+    "acp_client",
 }
 
 
@@ -1788,12 +1792,70 @@ def resolve_runtime_provider(
                 runtime["requested_provider"] = requested_provider
                 return runtime
 
+    # ------------------------------------------------------------------
+    # Plugin-registered ACP runtime providers (e.g. ``claude-code-acp``)
+    # ------------------------------------------------------------------
+    # This lookup MUST happen BEFORE ``resolve_provider()`` because
+    # ``resolve_provider()`` raises ``AuthError("Unknown provider")`` for
+    # plugin-registered provider names that are not in the built-in
+    # PROVIDER_REGISTRY.  When the requested provider matches a registered
+    # runtime resolver that produces ``api_mode == "acp_client"``, we return
+    # a standardised descriptor directly — using the real model_cfg and
+    # target_model from the descriptor — instead of falling through to the
+    # generic ``acp_client`` block which only knows about ``acp_command`` /
+    # ``acp_args`` from config.
+    model_cfg = _get_model_config()
+    _effective_model = target_model or model_cfg.get("default") or None
+    _lookup_key = requested_provider
+    if _lookup_key and _lookup_key not in {"auto", "acp_client", "acp-client"}:
+        # Runtime registry (primary — the correct registry for the main agent's
+        # ACP runtime).
+        try:
+            from hermes_cli.acp_runtime_provider_registry import (
+                resolve_acp_runtime_provider,
+                get_acp_runtime_provider,
+            )
+            if get_acp_runtime_provider(_lookup_key):
+                _desc = resolve_acp_runtime_provider(
+                    _lookup_key, _effective_model, model_cfg,
+                )
+                if _desc and _desc.get("api_mode") == "acp_client":
+                    _acp_command = str(_desc.get("command") or "").strip()
+                    _acp_args = list(_desc.get("args") or [])
+                    _desc_model = (
+                        _desc.get("model")
+                        or target_model
+                        or model_cfg.get("default")
+                        or ""
+                    )
+                    return {
+                        "provider": "acp_client",
+                        "api_mode": "acp_client",
+                        "base_url": "",
+                        "api_key": "",
+                        "command": _acp_command,
+                        "args": _acp_args,
+                        "model": _desc_model,
+                        "source": "runtime-registry",
+                        "requested_provider": requested_provider,
+                    }
+        except Exception:
+            logger.debug(
+                "ACP runtime provider lookup failed for %r",
+                _lookup_key,
+                exc_info=True,
+            )
+
     provider = resolve_provider(
         requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
-    model_cfg = _get_model_config()
+
+    # When the resolved provider is already the canonical acp_client (set
+    # directly in config as ``acp-client``), the generic ``acp_client`` block
+    # below handles it.
+
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,
         requested_provider=requested_provider,
@@ -1997,6 +2059,32 @@ def resolve_runtime_provider(
             "command": creds.get("command", ""),
             "args": list(creds.get("args") or []),
             "source": creds.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
+
+    if provider == "acp_client":
+        # Local-command ACP transport: routes inference to any ACP-compliant
+        # agent via JSON-RPC over stdio. Auth is handled by the spawned binary
+        # itself — no API key is needed at the Hermes layer. The command and
+        # args are stored in config.yaml by /acp-client-runtime and forwarded
+        # unchanged to agent_init, which passes them to ACPClientSession.
+        acp_command = str(model_cfg.get("acp_command") or "").strip()
+        acp_args = list(model_cfg.get("acp_args") or [])
+        if not acp_command:
+            raise AuthError(
+                "acp_client provider requires acp_command to be set in config.yaml. "
+                "Run '/acp-client-runtime on <command>' to configure it.",
+                provider="acp_client",
+                code="missing_acp_command",
+            )
+        return {
+            "provider": "acp_client",
+            "api_mode": "acp_client",
+            "base_url": "",
+            "api_key": "",
+            "command": acp_command,
+            "args": acp_args,
+            "source": "config",
             "requested_provider": requested_provider,
         }
 

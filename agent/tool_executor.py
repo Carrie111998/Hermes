@@ -44,6 +44,10 @@ from tools.terminal_tool import (
     get_active_env,
 )
 from tools.thread_context import propagate_context_to_thread
+from tools.tool_timeout_context import (
+    set_current_tool_timeout,
+    reset_current_tool_timeout,
+)
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -697,6 +701,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=agent._print_fn)
         spinner.start()
 
+    _timeout_ctx_token = None
     try:
         runnable_calls = [
             (i, tc, name, args)
@@ -708,6 +713,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         timed_out_indices: set[int] = set()
         timeout_s = _resolve_concurrent_tool_timeout()
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        # Set the generic tool-timeout context so that tool handlers running
+        # inside worker threads can read the effective outer timeout.
+        # propagate_context_to_thread snapshots this context at submit time.
+        _timeout_ctx_token = set_current_tool_timeout(timeout_s)
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
             # Daemon workers: an interrupted/timed-out batch is abandoned with
@@ -856,6 +865,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     cancel_futures=abandon_executor,
                 )
     finally:
+        if _timeout_ctx_token is not None:
+            reset_current_tool_timeout(_timeout_ctx_token)
         if spinner:
             # Build a summary message for the spinner stop
             completed = sum(1 for r in results if r is not None)
@@ -1084,6 +1095,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    # Set the generic tool-timeout context so tool handlers (including
+    # plugin backends like claude-code-acp) can read the effective outer
+    # timeout and clamp their own timeout accordingly.
+    _timeout_ctx_token = set_current_tool_timeout(_resolve_concurrent_tool_timeout())
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -1822,6 +1837,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+
+    # Reset the tool-timeout context set at the top of this function.
+    reset_current_tool_timeout(_timeout_ctx_token)
 
 
 

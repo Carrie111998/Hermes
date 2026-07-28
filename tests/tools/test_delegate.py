@@ -3311,5 +3311,153 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestAcpClientDelegation(unittest.TestCase):
+    """Tests for acp_client provider delegation: empty key allowed, provider/api_mode preserved."""
+
+    # ── _resolve_delegation_credentials ──────────────────────────────
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_acp_client_empty_api_key_allowed(self, mock_resolve):
+        """acp_client auth is handled by the spawned binary — an intentionally
+        empty api_key must NOT raise ValueError."""
+        mock_resolve.return_value = {
+            "provider": "acp_client",
+            "api_mode": "acp_client",
+            "base_url": "",
+            "api_key": "",
+            "command": "/usr/local/bin/my-acp-agent",
+            "args": ["--stdio"],
+            "source": "config",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "", "provider": "acp_client"}
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["provider"], "acp_client")
+        self.assertEqual(creds["api_mode"], "acp_client")
+        self.assertEqual(creds["command"], "/usr/local/bin/my-acp-agent")
+        self.assertEqual(creds["args"], ["--stdio"])
+        self.assertEqual(creds["api_key"], "")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_non_acp_client_empty_api_key_still_raises(self, mock_resolve):
+        """Non-acp_client providers must still raise ValueError on empty key."""
+        mock_resolve.return_value = {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "some-model", "provider": "openrouter"}
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_delegation_credentials(cfg, parent)
+        self.assertIn("no API key", str(ctx.exception))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_acp_client_credentials_retain_command_args_api_mode(self, mock_resolve):
+        """Resolved acp_client credentials must carry command/args/api_mode through."""
+        mock_resolve.return_value = {
+            "provider": "acp_client",
+            "api_mode": "acp_client",
+            "base_url": "",
+            "api_key": "",
+            "command": "/opt/acp/bin/agent",
+            "args": ["--port", "0", "--stdio"],
+            "source": "config",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "acp-model", "provider": "acp_client"}
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["api_mode"], "acp_client")
+        self.assertEqual(creds["command"], "/opt/acp/bin/agent")
+        self.assertEqual(creds["args"], ["--port", "0", "--stdio"])
+        self.assertEqual(creds["provider"], "acp_client")
+
+    # ── _build_child_agent ───────────────────────────────────────────
+
+    def test_build_child_agent_acp_client_preserves_provider_and_api_mode(self):
+        """When override_acp_command + override_api_mode=acp_client, _build_child_agent
+        must NOT rewrite provider to copilot-acp or api_mode to chat_completions.
+        The provider stays acp_client and api_mode stays acp_client."""
+        parent = _make_mock_parent(depth=0)
+        captured = {}
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("shutil.which", return_value="/usr/local/bin/my-acp-agent"):
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="acp_client test",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_provider="acp_client",
+                override_api_mode="acp_client",
+                override_acp_command="my-acp-agent",
+                override_acp_args=["--stdio"],
+            )
+
+            _, kwargs = MockAgent.call_args
+            captured["provider"] = kwargs.get("provider")
+            captured["api_mode"] = kwargs.get("api_mode")
+            captured["acp_command"] = kwargs.get("acp_command")
+            captured["acp_args"] = kwargs.get("acp_args")
+
+        self.assertEqual(captured["provider"], "acp_client")
+        self.assertEqual(captured["api_mode"], "acp_client")
+        self.assertEqual(captured["acp_command"], "my-acp-agent")
+        self.assertEqual(captured["acp_args"], ["--stdio"])
+
+    def test_build_child_agent_legacy_copilot_override_not_regressed(self):
+        """Legacy copilot-acp override (override_acp_command + non-acp_client api_mode)
+        must still force provider=copilot-acp, api_mode=chat_completions — same as before."""
+        parent = _make_mock_parent(depth=0)
+        captured = {}
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("shutil.which", return_value="/usr/local/bin/copilot"):
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="copilot legacy test",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_acp_command="copilot",
+                override_acp_args=["--foo"],
+                # No explicit override_provider / override_api_mode —
+                # simulates the legacy path where copilot-acp was auto-inferred
+            )
+
+            _, kwargs = MockAgent.call_args
+            captured["provider"] = kwargs.get("provider")
+            captured["api_mode"] = kwargs.get("api_mode")
+            captured["acp_command"] = kwargs.get("acp_command")
+
+        self.assertEqual(captured["provider"], "copilot-acp")
+        self.assertEqual(captured["api_mode"], "chat_completions")
+        self.assertEqual(captured["acp_command"], "copilot")
+
+    # ── Schema safety ────────────────────────────────────────────────
+
+    def test_schema_top_level_and_tasks_never_expose_acp_command_args(self):
+        """Neither top-level schema nor per-task properties must contain
+        acp_command or acp_args — these are operator-controlled only."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertNotIn("acp_command", props)
+        self.assertNotIn("acp_args", props)
+        task_item_props = props["tasks"]["items"]["properties"]
+        self.assertNotIn("acp_command", task_item_props)
+        self.assertNotIn("acp_args", task_item_props)
+
+
 if __name__ == "__main__":
     unittest.main()

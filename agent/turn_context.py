@@ -763,6 +763,11 @@ def build_turn_context(
             ).lower()
             in {"native", "off"}
         )
+        # ACP client turns are driven inside an ACP subprocess that manages
+        # its own context window; Hermes-side preflight compression is
+        # redundant there (and would churn the session the ACP binding
+        # keys off).
+        _acp_native_context = (getattr(agent, "api_mode", None) == "acp_client")
 
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens
@@ -819,7 +824,12 @@ def build_turn_context(
                         _compress_block_reason = _info(_preflight_tokens)[1]
                     except Exception:
                         _compress_block_reason = None
-        if _should_compress_now:
+        if _acp_native_context:
+            logger.info(
+                "Skipping Hermes preflight compression for ACP client "
+                "(ACP runtime manages its own context window)"
+            )
+        elif _should_compress_now:
             _preflight_compressed = True
             # Compression is actually running (block cleared / was never
             # blocked) — reset the dedup so a future blocked-over-threshold
