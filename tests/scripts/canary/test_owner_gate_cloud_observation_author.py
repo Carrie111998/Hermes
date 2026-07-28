@@ -1429,6 +1429,44 @@ def test_resource_manager_project_number_is_rejected_as_compute_project_id() -> 
     _reject(mutate, match="project_invalid")
 
 
+def test_omitted_subnet_route_type_is_normalized() -> None:
+    plan, ancestry, _cloud_key = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    routes_key = next(key for key in raw if key.endswith("/global/routes"))
+    route = next(
+        item
+        for item in raw[routes_key]["items"]
+        if item["destRange"] == foundation.OWNER_GATE_SUBNET_CIDR
+    )
+    route.pop("routeType")
+
+    observation = author._unsigned_from_raw(
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        raw=raw,
+        collected_at_unix=NOW,
+        package_sha256="3" * 64,
+        foundation_identities=_identities(plan, ancestry),
+        verified_probe=_verified_probe("inert"),
+    )
+
+    assert observation["subnet"]["cidr"] == foundation.OWNER_GATE_SUBNET_CIDR
+
+
+def test_explicit_non_subnet_route_type_is_rejected() -> None:
+    def mutate(raw, _plan) -> None:
+        routes_key = next(key for key in raw if key.endswith("/global/routes"))
+        route = next(
+            item
+            for item in raw[routes_key]["items"]
+            if item["destRange"] == foundation.OWNER_GATE_SUBNET_CIDR
+        )
+        route["routeType"] = "STATIC"
+
+    _reject(mutate, match="network_invalid")
+
+
 def _reject(mutator, *, phase: str = "inert", match: str | None = None) -> None:
     plan, ancestry, _cloud_key = _context()
     raw = _raw(plan, ancestry, phase=phase)

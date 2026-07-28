@@ -763,9 +763,11 @@ def _subnet_projection(
         for prefix in _RESOURCE_PREFIXES:
             next_hop_network = next_hop_network.removeprefix(prefix)
         if destination == target:
+            # Compute may omit routeType for its provider-generated local
+            # subnet route; an explicit non-SUBNET value still fails closed.
             if (
                 next_hop_network != network
-                or route.get("routeType") != "SUBNET"
+                or route.get("routeType", "SUBNET") != "SUBNET"
                 or route.get("priority") != 0
             ):
                 _error("owner_gate_cloud_observation_network_invalid")
