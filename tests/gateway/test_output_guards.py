@@ -18,13 +18,22 @@ from gateway.output_guards import (
 
 @pytest.fixture(autouse=True)
 def _reset_pipeline():
-    reset_default_pipeline()
-    # Clear any guard env flags between tests.
-    for k in list(os.environ):
-        if k.startswith("HERMES_GUARD_"):
+    """Isolate the process-wide guard pipeline + env flags for every test.
+
+    The pipeline is a module-level singleton and the guard flags are read from
+    env/config, so a test that enables an opt-in guard (em-dash stripping) can
+    otherwise leak into unrelated tests that later import the same singleton.
+    Clear env FIRST, then reset, on both setup and teardown so the ordering
+    can't leave a rebuilt-but-dirty pipeline behind.
+    """
+    def _clean():
+        for k in [k for k in os.environ if k.startswith("HERMES_GUARD_")]:
             del os.environ[k]
+        reset_default_pipeline()
+
+    _clean()
     yield
-    reset_default_pipeline()
+    _clean()
 
 
 def _tg(**kw):
@@ -109,19 +118,29 @@ def test_default_pipeline_order():
 
 
 def test_secret_redaction_all_platforms():
-    # Secret redaction is not telegram-gated.
+    # Secret redaction is not telegram-gated. Assert the behaviour contract
+    # (the raw credential does not survive) rather than a specific mask
+    # marker: the authoritative redactor in agent.redact uses "***" while the
+    # gateway's belt-and-suspenders pass uses "[REDACTED]", and which one wins
+    # is an upstream implementation detail.
+    secret = "sk-" + "a" * 40
     ctx = GuardContext(platform="discord", is_final_response=True)
-    out = apply_output_guards_sync("key sk-" + "a" * 40, ctx)
-    assert "[REDACTED]" in out
+    out = apply_output_guards_sync(f"key {secret}", ctx)
+    assert out is not None
+    assert secret not in out
 
 
-def test_provider_error_rewrite_telegram_only():
+def test_provider_error_rewrite_all_chat_surfaces():
+    # Upstream widened this from Telegram (#28533) to every chat surface
+    # (#39293): a raw provider envelope can carry a leaked token, so no chat
+    # platform should ever see it. Programmatic surfaces are excluded upstream
+    # of the pipeline by _GATEWAY_RAW_TEXT_PLATFORMS, not by this guard.
     raw = "HTTP 401 incorrect api key"
-    tg = apply_output_guards_sync(raw, _tg())
-    assert "authentication failed" in tg.lower()
-    # Non-telegram keeps raw text.
-    other = apply_output_guards_sync(raw, GuardContext(platform="discord"))
-    assert other == raw
+    for platform in ("telegram", "discord", "whatsapp", "slack", "signal", "matrix"):
+        out = apply_output_guards_sync(raw, GuardContext(platform=platform))
+        assert out is not None
+        assert "HTTP 401" not in out, f"{platform} leaked the raw provider envelope"
+        assert "authentication failed" in out.lower()
 
 
 def test_normal_text_untouched():

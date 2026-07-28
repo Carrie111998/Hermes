@@ -214,12 +214,15 @@ def _secret_redaction_guard(text: str, ctx: GuardContext) -> GuardResult:
 def _provider_error_guard(text: str, ctx: GuardContext) -> GuardResult:
     """Rewrite raw provider/API error envelopes into a short safe reply.
 
-    Telegram-only, matching the prior behaviour of
-    ``_sanitize_gateway_final_response`` — other platforms still get the raw
-    text so nothing regresses for them.
+    Applies to every chat surface, not just Telegram. Upstream widened this
+    invariant from Telegram (#28533) to all chat platforms (#39293): a provider
+    error body can carry a leaked bearer token, request IDs, or policy text,
+    and none of it should reach a chat user on any platform. The caller
+    (``_sanitize_gateway_final_response``) has already excluded programmatic
+    surfaces via ``_GATEWAY_RAW_TEXT_PLATFORMS``, so anything reaching this
+    guard is a human-facing surface that should get the safe category instead
+    of the raw envelope.
     """
-    if ctx.platform != "telegram":
-        return None
     try:
         from gateway.run import (
             _looks_like_gateway_provider_error,
