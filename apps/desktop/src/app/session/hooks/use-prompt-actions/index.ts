@@ -174,6 +174,7 @@ interface PromptActionsOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   branchCurrentSession: () => Promise<boolean>
+  branchStoredSession: (storedSessionId: string, sessionProfile?: string | null) => Promise<boolean>
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
@@ -205,6 +206,7 @@ export function usePromptActions({
   activeSessionIdRef,
   busyRef,
   branchCurrentSession,
+  branchStoredSession,
   createBackendSessionForSend,
   getRoutedStoredSessionId,
   getRuntimeIdForStoredSession,
@@ -496,6 +498,7 @@ export function usePromptActions({
     activeSessionIdRef,
     appendSessionTextMessage,
     branchCurrentSession,
+    branchStoredSession,
     busyRef,
     copy,
     createBackendSessionForSend,
