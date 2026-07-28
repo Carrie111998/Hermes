@@ -2179,6 +2179,7 @@ from gateway.config import (
     load_gateway_config,
 )
 from gateway.session import (
+    _hash_chat_id,
     AsyncSessionStore,
     SessionEntry,
     SessionStore,
@@ -20341,6 +20342,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not routes:
             return None
         from gateway.profile_routing import match_profile_route
+
+        def _route_id(value: Optional[str]) -> str:
+            return _hash_chat_id(str(value)) if value is not None else "none"
+
         try:
             matched = match_profile_route(
                 routes,
@@ -20350,18 +20355,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Profile route matching failed for %s/%s, falling back to default",
-                source.platform, source.chat_id, exc_info=True,
+                "Profile route matching failed for platform=%s chat=%s thread=%s "
+                "parent=%s error_type=%s; falling back to default",
+                source.platform.value,
+                _route_id(source.chat_id),
+                _route_id(getattr(source, "thread_id", None)),
+                _route_id(getattr(source, "parent_chat_id", None)),
+                type(exc).__name__,
             )
             return None
         if matched:
+            logger.debug(
+                "Profile route matched: platform=%s chat=%s thread=%s parent=%s "
+                "profile=%s",
+                source.platform.value,
+                _route_id(source.chat_id),
+                _route_id(getattr(source, "thread_id", None)),
+                _route_id(getattr(source, "parent_chat_id", None)),
+                matched.profile,
+            )
             return matched.profile
         logger.debug(
-            "No profile route matched: platform=%s chat_id=%s thread_id=%s parent_chat_id=%s",
-            source.platform.value, source.chat_id,
-            getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None),
+            "No profile route matched: platform=%s chat=%s thread=%s parent=%s",
+            source.platform.value,
+            _route_id(source.chat_id),
+            _route_id(getattr(source, "thread_id", None)),
+            _route_id(getattr(source, "parent_chat_id", None)),
         )
         return None
 

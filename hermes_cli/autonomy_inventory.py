@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
+import os
 import re
+import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +31,29 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s,;\"']+")
+_ENV_ASSIGNMENT = re.compile(
+    r"(?i)\b([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))"
+    r"(\s*=\s*)([^\s,;]+)"
+)
+_CLI_SECRET = re.compile(
+    r"(?i)(--(?:api[-_]?key|token|secret|password)(?:\s+|=))([^\s,;]+)"
+)
+_URL_USERINFO = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_URL_SECRET_QUERY = re.compile(
+    r"(?i)([?&](?:api[-_]?key|key|token|secret|password)=)([^&#\s]+)"
+)
+_TEXT_SECRET_FIELD = re.compile(
+    r"""(?ix)
+    (
+        ["']?(?:api[-_]?key|key|token|secret|password|authorization)["']?
+        \s*[:=]\s*
+    )
+    (
+        ["'][^"']*["'] | [^\s,}\]]+
+    )
+    """
+)
 _RECOMMENDED_SECTIONS = (
     "objective",
     "preconditions",
@@ -36,15 +64,33 @@ _RECOMMENDED_SECTIONS = (
 )
 
 
-def _redact(value: Any) -> Any:
-    """Recursively redact values stored below sensitive-looking keys."""
+def _redact_string(value: str, known_values: frozenset[str]) -> str:
+    result = value
+    for secret in sorted(known_values, key=len, reverse=True):
+        if secret:
+            result = result.replace(secret, "<redacted>")
+    result = _URL_USERINFO.sub(r"\1<redacted>@", result)
+    result = _URL_SECRET_QUERY.sub(r"\1<redacted>", result)
+    result = _BEARER_VALUE.sub("Bearer <redacted>", result)
+    result = _ENV_ASSIGNMENT.sub(r"\1\2<redacted>", result)
+    result = _CLI_SECRET.sub(r"\1<redacted>", result)
+    result = _TEXT_SECRET_FIELD.sub(r"\1<redacted>", result)
+    return result
+
+
+def _redact(value: Any, known_values: frozenset[str] = frozenset()) -> Any:
+    """Recursively redact sensitive keys and secret-shaped string fragments."""
     if isinstance(value, dict):
         return {
-            str(key): "<redacted>" if _SENSITIVE_KEY.search(str(key)) else _redact(item)
+            str(key): "<redacted>"
+            if _SENSITIVE_KEY.search(str(key))
+            else _redact(item, known_values)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_redact(item) for item in value]
+        return [_redact(item, known_values) for item in value]
+    if isinstance(value, str):
+        return _redact_string(value, known_values)
     return value
 
 
@@ -79,6 +125,27 @@ def _env_key_names(path: Path) -> list[str]:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             names.add(name)
     return sorted(names)
+
+
+def _known_env_values(path: Path) -> frozenset[str]:
+    values: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        value = line.partition("=")[2].strip().strip("\"'")
+        if len(value) >= 4:
+            values.add(value)
+    for value in os.environ.values():
+        if len(value) >= 4:
+            values.add(value)
+    return frozenset(values)
 
 
 def _frontmatter_is_yaml(content: str) -> tuple[bool, str | None]:
@@ -143,22 +210,61 @@ def inventory_skills(skills_dir: Path | None = None) -> list[dict[str, Any]]:
 
 
 def inventory_tools() -> dict[str, Any]:
-    from tools.registry import discover_builtin_tools, registry
+    import tools.registry as registry_module
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    imported = discover_builtin_tools()
-    toolsets = {
-        name: {
-            "available": registry.is_toolset_available(name),
-            "tools": registry.get_tool_names_for_toolset(name),
+    registry = registry_module.registry
+    with registry._lock, registry_module._check_fn_cache_lock:
+        registry_state = {
+            "_tools": dict(registry._tools),
+            "_plugin_override_policy": dict(registry._plugin_override_policy),
+            "_toolset_checks": dict(registry._toolset_checks),
+            "_toolset_aliases": dict(registry._toolset_aliases),
+            "_generation": registry._generation,
         }
-        for name in registry.get_registered_toolset_names()
-    }
-    return {
-        "imported_modules": imported,
-        "tool_count": len(registry.get_all_tool_names()),
-        "toolsets": toolsets,
-        "aliases": registry.get_registered_toolset_aliases(),
-    }
+        cache_state = dict(registry_module._check_fn_cache)
+        last_good_state = dict(registry_module._check_fn_last_good)
+    modules_before = set(sys.modules)
+    environ_before = dict(os.environ)
+    dont_write_bytecode = sys.dont_write_bytecode
+    with tempfile.TemporaryDirectory(prefix="hermes-inventory-") as isolated_home:
+        home_token = set_hermes_home_override(isolated_home)
+        try:
+            sys.dont_write_bytecode = True
+            imported = registry_module.discover_builtin_tools()
+            toolsets = {
+                name: {
+                    "available": None,
+                    "availability_checked": False,
+                    "tools": registry.get_tool_names_for_toolset(name),
+                }
+                for name in registry.get_registered_toolset_names()
+            }
+            return {
+                "imported_modules": imported,
+                "tool_count": len(registry.get_all_tool_names()),
+                "toolsets": toolsets,
+                "aliases": registry.get_registered_toolset_aliases(),
+            }
+        finally:
+            reset_hermes_home_override(home_token)
+            sys.dont_write_bytecode = dont_write_bytecode
+            os.environ.clear()
+            os.environ.update(environ_before)
+            with registry._lock, registry_module._check_fn_cache_lock:
+                for name, value in registry_state.items():
+                    current = getattr(registry, name)
+                    if isinstance(current, dict):
+                        current.clear()
+                        current.update(value)
+                    else:
+                        setattr(registry, name, value)
+                registry_module._check_fn_cache.clear()
+                registry_module._check_fn_cache.update(cache_state)
+                registry_module._check_fn_last_good.clear()
+                registry_module._check_fn_last_good.update(last_good_state)
+            for name in set(sys.modules) - modules_before:
+                sys.modules.pop(name, None)
 
 
 def inventory_mcp(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -214,7 +320,9 @@ def _scheduled_files(home: Path) -> list[str]:
 def build_inventory() -> dict[str, Any]:
     home = Path(get_hermes_home())
     config = read_raw_config()
-    env_keys = _env_key_names(Path(get_env_path()))
+    env_path = Path(get_env_path())
+    env_keys = _env_key_names(env_path)
+    known_values = _known_env_values(env_path)
     agent_config = config.get("agent") if isinstance(config.get("agent"), dict) else {}
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -230,14 +338,16 @@ def build_inventory() -> dict[str, Any]:
             "values_redacted": True,
         },
         "permissions": {
-            "approvals": _redact(config.get("approvals", {})),
-            "command_allowlist": _redact(config.get("command_allowlist", [])),
-            "security": _redact(config.get("security", {})),
+            "approvals": _redact(config.get("approvals", {}), known_values),
+            "command_allowlist": _redact(
+                config.get("command_allowlist", []), known_values
+            ),
+            "security": _redact(config.get("security", {}), known_values),
             "agent_disabled_toolsets": agent_config.get("disabled_toolsets", []),
         },
-        "memory": _redact(config.get("memory", {})),
+        "memory": _redact(config.get("memory", {}), known_values),
         "cron": {
-            "config": _redact(config.get("cron", {})),
+            "config": _redact(config.get("cron", {}), known_values),
             "files": _scheduled_files(home),
         },
         "interfaces": {
@@ -248,16 +358,20 @@ def build_inventory() -> dict[str, Any]:
 
 
 def cmd_security_inventory(args: argparse.Namespace) -> int:
-    report = build_inventory()
-    output = str(getattr(args, "output", "") or "")
-    if output:
-        path = Path(output)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-    if getattr(args, "json", False) and not output:
+    diagnostics = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(diagnostics):
+            report = build_inventory()
+    except Exception as exc:
+        captured = diagnostics.getvalue()
+        if captured:
+            print(captured, file=sys.stderr, end="")
+        print(f"security inventory failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    captured = diagnostics.getvalue()
+    if captured:
+        print(captured, file=sys.stderr, end="")
+    if getattr(args, "json", False):
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
         invalid = sum(not row.get("valid", False) for row in report["skills"])
@@ -266,8 +380,6 @@ def cmd_security_inventory(args: argparse.Namespace) -> int:
         print(f"  Tools: {report['tools']['tool_count']}")
         print(f"  MCP servers: {len(report['mcp_servers'])}")
         print(f"  Environment keys: {report['secrets']['count']} (values redacted)")
-        if output:
-            print(f"  JSON report: {output}")
     return 0
 
 

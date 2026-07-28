@@ -11,6 +11,7 @@ Covers:
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -730,6 +731,60 @@ def test_group_topic_prompt_binding_without_legacy_profile_override():
 
     assert event.channel_prompt == "Act only as the trading research desk."
     assert event.source.profile is None
+
+
+def test_concurrent_group_topics_do_not_mix_prompts_and_nonforum_is_unchanged():
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(group_topics_config=[
+        {
+            "chat_id": -1001234567890,
+            "topics": [
+                {"name": "Research", "thread_id": 11, "prompt": "research-only"},
+                {"name": "Testing", "thread_id": 12, "prompt": "testing-only"},
+            ],
+        }
+    ])
+    research = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=11,
+        text="research",
+        is_topic_message=True,
+        is_forum=True,
+    )
+    testing = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=12,
+        text="testing",
+        is_topic_message=True,
+        is_forum=True,
+    )
+    nonforum = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=None,
+        text="ordinary group",
+        is_topic_message=False,
+        is_forum=False,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        events = list(
+            pool.map(
+                lambda message: adapter._build_message_event(message, MessageType.TEXT),
+                (research, testing),
+            )
+        )
+
+    assert events[0].channel_prompt == "research-only"
+    assert "testing-only" not in events[0].channel_prompt
+    assert events[1].channel_prompt == "testing-only"
+    assert "research-only" not in events[1].channel_prompt
+    ordinary = adapter._build_message_event(nonforum, MessageType.TEXT)
+    assert ordinary.channel_prompt is None
+    assert ordinary.source.chat_topic is None
 
 
 def test_group_topic_skill_binding_second_topic():

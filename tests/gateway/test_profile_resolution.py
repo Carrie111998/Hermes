@@ -1,5 +1,6 @@
 """Tests for GatewayRunner._resolve_profile_home_for_source — profile resolution logic."""
 
+import asyncio
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -491,3 +492,175 @@ class TestMultiplexGate:
         assert source.profile is None
         key = build_session_key(source, profile=source.profile)
         assert key.startswith("agent:main:"), key
+
+
+class TestTelegramTopicPrivacyAndIsolation:
+    CHAT_ID = "-1009876543210"
+    THREAD_RESEARCH = "700001"
+    THREAD_TESTING = "700002"
+    PARENT_CHAT_ID = "-1001122334455"
+    MASSA_CHAT_ID = "-1005566778899"
+    FOREIGN_CHAT_ID = "-1009988776655"
+
+    @staticmethod
+    def _runner():
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_routes=[
+                ProfileRoute(
+                    name="research",
+                    platform="telegram",
+                    profile="researcher",
+                    chat_id=TestTelegramTopicPrivacyAndIsolation.CHAT_ID,
+                    thread_id=TestTelegramTopicPrivacyAndIsolation.THREAD_RESEARCH,
+                ),
+                ProfileRoute(
+                    name="testing",
+                    platform="telegram",
+                    profile="tester",
+                    chat_id=TestTelegramTopicPrivacyAndIsolation.CHAT_ID,
+                    thread_id=TestTelegramTopicPrivacyAndIsolation.THREAD_TESTING,
+                ),
+            ],
+        )
+        return runner
+
+    @classmethod
+    def _source(cls, chat_id, thread_id):
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="group",
+            thread_id=thread_id,
+            parent_chat_id=cls.PARENT_CHAT_ID,
+        )
+
+    @classmethod
+    def _assert_raw_ids_absent(cls, caplog):
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        for raw in (
+            cls.CHAT_ID,
+            cls.THREAD_RESEARCH,
+            cls.THREAD_TESTING,
+            cls.PARENT_CHAT_ID,
+            cls.MASSA_CHAT_ID,
+            cls.FOREIGN_CHAT_ID,
+        ):
+            assert raw not in rendered
+
+    def test_valid_nonmatch_and_error_logs_never_expose_raw_telegram_ids(
+        self, caplog
+    ):
+        runner = self._runner()
+        with caplog.at_level(logging.DEBUG, logger="gateway.run"):
+            assert (
+                runner._profile_name_for_source(
+                    self._source(self.CHAT_ID, self.THREAD_RESEARCH)
+                )
+                == "researcher"
+            )
+            assert (
+                runner._profile_name_for_source(
+                    self._source(self.MASSA_CHAT_ID, self.THREAD_RESEARCH)
+                )
+                is None
+            )
+            assert (
+                runner._profile_name_for_source(
+                    self._source(self.FOREIGN_CHAT_ID, self.THREAD_TESTING)
+                )
+                is None
+            )
+            with patch(
+                "gateway.profile_routing.match_profile_route",
+                side_effect=RuntimeError(
+                    f"route failure {self.CHAT_ID} {self.THREAD_TESTING} "
+                    f"{self.PARENT_CHAT_ID}"
+                ),
+            ):
+                assert (
+                    runner._profile_name_for_source(
+                        self._source(self.CHAT_ID, self.THREAD_TESTING)
+                    )
+                    is None
+                )
+
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "Profile route matched" in messages
+        assert "No profile route matched" in messages
+        assert "Profile route matching failed" in messages
+        self._assert_raw_ids_absent(caplog)
+
+    def test_two_topics_have_distinct_profiles_and_session_keys(self):
+        runner = self._runner()
+        research = self._source(self.CHAT_ID, self.THREAD_RESEARCH)
+        testing = self._source(self.CHAT_ID, self.THREAD_TESTING)
+
+        research.profile = runner._profile_name_for_source(research)
+        testing.profile = runner._profile_name_for_source(testing)
+
+        research_key = build_session_key(research, profile=research.profile)
+        testing_key = build_session_key(testing, profile=testing.profile)
+        assert research.profile == "researcher"
+        assert testing.profile == "tester"
+        assert research_key != testing_key
+        assert research_key.startswith("agent:researcher:")
+        assert testing_key.startswith("agent:tester:")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_topics_keep_homes_and_secrets_isolated(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.secret_scope import get_secret
+        from hermes_constants import get_hermes_home
+
+        runner = self._runner()
+        homes = {
+            "researcher": tmp_path / "researcher",
+            "tester": tmp_path / "tester",
+        }
+        for profile, home in homes.items():
+            home.mkdir()
+            (home / ".env").write_text(
+                f"TOPIC_SENTINEL={profile}-secret\n",
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(
+            runner,
+            "_resolve_profile_home_for_source",
+            lambda source: homes[source.profile],
+        )
+        barrier = asyncio.Event()
+        entered = 0
+        seen = {}
+
+        async def inner(_message, _prompt, _history, source, *_args, **_kwargs):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                barrier.set()
+            await barrier.wait()
+            await asyncio.sleep(0)
+            seen[source.profile] = (
+                Path(get_hermes_home()),
+                get_secret("TOPIC_SENTINEL"),
+            )
+            return {"completed": True}
+
+        monkeypatch.setattr(runner, "_run_agent_inner", inner)
+        research = self._source(self.CHAT_ID, self.THREAD_RESEARCH)
+        testing = self._source(self.CHAT_ID, self.THREAD_TESTING)
+        research.profile = runner._profile_name_for_source(research)
+        testing.profile = runner._profile_name_for_source(testing)
+
+        await asyncio.gather(
+            runner._run_agent("one", "", [], research, "research-session"),
+            runner._run_agent("two", "", [], testing, "testing-session"),
+        )
+
+        assert seen == {
+            "researcher": (homes["researcher"], "researcher-secret"),
+            "tester": (homes["tester"], "tester-secret"),
+        }

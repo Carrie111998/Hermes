@@ -72,10 +72,5 @@ def build_security_parser(subparsers, *, cmd_security: Callable) -> None:
         action="store_true",
         help="Emit machine-readable JSON",
     )
-    inventory_parser.add_argument(
-        "--output",
-        default="",
-        help="Write the JSON inventory to this path",
-    )
     inventory_parser.set_defaults(func=cmd_security)
     security_parser.set_defaults(func=cmd_security)
