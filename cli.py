@@ -815,6 +815,36 @@ def resolve_idle_refresh_interval() -> float:
     return max(0.0, min(raw, 30.0))
 
 
+def spinner_loop_branch(command_running: bool, agent_running: bool, idle_refresh: float) -> str:
+    """Pure decision for the classic-CLI background ``spinner_loop``.
+
+    Maps the three loop inputs to a single action token the loop performs:
+
+    * ``"repaint_fast"`` — a child command is running; repaint on a fast
+      cadence so its progress is visible.
+    * ``"stable"`` — the agent itself is running (no child command). Do NOT
+      background-repaint (#70031): the bottom chrome is refreshed live by the
+      agent-event callbacks (``_on_thinking``, ``_on_tool_start/_complete``,
+      notices), each of which calls ``_invalidate()``. A periodic redraw here
+      would scroll the prior chrome copy into scrollback and stack repeated
+      frames mid-turn.
+    * ``"idle_tick"`` — idle and a positive idle cadence is configured; tick
+      the wall-clock status-bar read-outs.
+    * ``"idle_stable"`` — idle with no periodic cadence; just sleep.
+
+    Kept as a pure, DI-testable function (no ``self``/thread state) so the
+    #70031 invariant survives a real unit test without reimplementing the
+    branch inline.
+    """
+    if command_running:
+        return "repaint_fast"
+    if agent_running:
+        return "stable"
+    if idle_refresh > 0:
+        return "idle_tick"
+    return "idle_stable"
+
+
 # Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
 # This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
 try:
@@ -16166,10 +16196,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if not self._app:
                     time.sleep(0.1)
                     continue
-                if self._command_running:
+                action = spinner_loop_branch(
+                    self._command_running, self._agent_running, _idle_refresh
+                )
+                if action == "repaint_fast":
                     self._invalidate(min_interval=0.1)
                     time.sleep(0.1)
-                elif self._agent_running:
+                elif action == "stable":
                     # Agent is working but not waiting on a child command: do NOT
                     # background-repaint. The bottom chrome (spinner + status
                     # bar) is still refreshed live by the agent-event callbacks
@@ -16178,7 +16211,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # would scroll the prior chrome copy into scrollback and
                     # stack repeated frames — the #70031 artifact. Keep stable.
                     time.sleep(0.2)
-                elif _idle_refresh > 0:
+                elif action == "idle_tick":
                     # Idle: tick the wall-clock status-bar read-outs on the
                     # configured cadence. Input/agent events still invalidate
                     # explicitly when the UI actually changes.
