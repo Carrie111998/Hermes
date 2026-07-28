@@ -21496,7 +21496,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # is one line, key=value, parent_cmdline last (often long).
         if _shutdown_ctx is not None:
             try:
-                logger.warning(
+                _shutdown_context_log = logger.warning
+                if (
+                    _shutdown_ctx.get("signal") == "SIGTERM"
+                    and _shutdown_ctx.get("under_systemd")
+                    and not planned_takeover
+                    and not planned_stop
+                ):
+                    # Container managers and systemd normally stop services by
+                    # forwarding SIGTERM from PID 1. Keep the forensic breadcrumb,
+                    # but do not surface a routine orchestrator stop as a warning.
+                    _shutdown_context_log = logger.info
+                _shutdown_context_log(
                     "Shutdown context: %s", format_context_for_log(_shutdown_ctx)
                 )
             except Exception as _e:
