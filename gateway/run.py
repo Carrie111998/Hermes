@@ -22201,12 +22201,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             State.UNROUTABLE, State.DROPPED_OVERFLOW, State.STOPPING,
         }
 
-        def __init__(self, store: CompletionStore | None = None):
+        def __init__(self, store: "CompletionStore | None" = None):
             import threading as _threading
             self._lock = _threading.Lock()
             self._entries: dict[str, dict] = {}
             self._stopping = False
-            self._store = store or NullCompletionStore()
+            self._store = store  # None means in-memory only (no-op store)
             # Observability counters
             self.counters: dict[str, int] = {
                 "delivered": 0, "failed": 0, "superseded": 0,

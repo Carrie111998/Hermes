@@ -2,32 +2,12 @@
 
 Suggested location: ``tests/gateway/test_pending_registry_properties.py``.
 
-Why property tests and not more examples
-----------------------------------------
-Every existing test on this path is an *example* test: it proves the interleavings
-someone thought of. All five findings in the two review rounds on #72675 lived in
-interleavings nobody thought of — that is exactly how they were found, with ad-hoc
-fault probes. Stateful property testing generalises the method instead of adding more
-examples.
-
-Scope, deliberately narrow
---------------------------
-``hypothesis`` does **not** test asyncio concurrency, and pretending otherwise is
-worse than not using it. The registry's transitions are pure and synchronous, so they
-are the right target here. The async orchestration (flush, cancellation, shutdown) is
-covered separately by the interleaving grid built on the deterministic harness.
-
-BEFORE RUNNING
---------------
-* Check that ``hypothesis`` is already a test dependency of the repo. If it is not,
-  **stop and ask the maintainers** before adding it — a new dependency in a bugfix PR
-  is a predictable objection, and it is cheaper to ask than to argue.
-
 Reconciled against ``pr-73469`` (PendingCompletionRegistry in gateway/run.py).
 """
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 hypothesis = pytest.importorskip(
@@ -39,26 +19,32 @@ from hypothesis import HealthCheck, settings  # noqa: E402
 from hypothesis import strategies as st  # noqa: E402
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule  # noqa: E402
 
-from gateway.run import PendingCompletionRegistry  # type: ignore
+from gateway.run import GatewayRunner  # type: ignore
 
+PendingCompletionRegistry = GatewayRunner.PendingCompletionRegistry
 State = PendingCompletionRegistry.State
 MAX_ATTEMPTS = PendingCompletionRegistry.MAX_ATTEMPTS
 CAPACITY = PendingCompletionRegistry.BATCH_CAPACITY
-
 TERMINAL = PendingCompletionRegistry._TERMINAL
 
 identities = st.text(
     alphabet="abcdef0123456789", min_size=1, max_size=6
 ).map(lambda s: f"proc_{s}")
 
-# None and "" must NOT collapse into one routing key — that was a real defect
-# (`str(field or "")`), so the strategy exercises both explicitly.
-# Routing keys are tuples in the real API.
 routes = st.sampled_from([("route_a",), ("route_b",), (None,), ("",)])
 
 
 def _dummy_payload() -> dict:
     return {"synth_text": "test", "evt": {}}
+
+
+def _fresh() -> PendingCompletionRegistry:
+    return PendingCompletionRegistry()
+
+
+def run_sync(coro):
+    """Run coroutine in a fresh event loop (enqueue needs get_running_loop)."""
+    return asyncio.run(coro)
 
 
 class RegistryStateMachine(RuleBasedStateMachine):
@@ -71,31 +57,32 @@ class RegistryStateMachine(RuleBasedStateMachine):
         self.routes: dict[str, object] = {}
         self.delivered_count: dict[str, int] = {}
         self.stopping = False
-
-    # ------------------------------------------------------------------ rules
+        # Hypothesis stateful is sync, but enqueue() calls get_running_loop().
+        # Wrap enqueue in asyncio.run so the loop exists for Future creation.
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
 
     @rule(identity=identities, route=routes)
     def enqueue(self, identity: str, route: tuple) -> None:
-        future = self.registry.enqueue(identity, route, _dummy_payload())
+        future = asyncio.run(self._enqueue_async(identity, route))
         if future is not None:
             assert identity not in self.model or self.model[identity] in TERMINAL
             self.model[identity] = State.PENDING
             self.routes[identity] = route
 
+    async def _enqueue_async(self, identity: str, route: tuple):
+        return self.registry.enqueue(identity, route, _dummy_payload())
+
     @rule(batch=st.lists(identities, min_size=1, max_size=6), batch_id=st.just("b"))
     def claim_batch(self, batch: list[str], batch_id: str) -> None:
         fresh = [i for i in dict.fromkeys(batch) if self.model.get(i) is State.PENDING]
         claimed, skipped = self.registry.claim_batch(fresh, batch_id)
-
-        # Atomicity: all fresh siblings transition, or none.
-        # claim_batch returns (claimed_entries, skipped_ids).
         actual_claimed_ids = [c["identity"] for c in claimed]
         assert set(actual_claimed_ids) == set(fresh) or not actual_claimed_ids, (
             f"partial claim: asked {sorted(fresh)}, got {sorted(actual_claimed_ids)}"
         )
         for c in claimed:
-            ident = c["identity"]
-            self.model[ident] = State.CLAIMED
+            self.model[c["identity"]] = State.CLAIMED
 
     @rule(identity=identities)
     def deliver_ok(self, identity: str) -> None:
@@ -110,10 +97,7 @@ class RegistryStateMachine(RuleBasedStateMachine):
         if self.model.get(identity) is not State.CLAIMED:
             return
         backoff = self.registry.retry(identity)
-        if backoff is not None:
-            self.model[identity] = State.PENDING
-        else:
-            self.model[identity] = State.FAILED
+        self.model[identity] = State.PENDING if backoff is not None else State.FAILED
 
     @rule(identity=identities)
     def deliver_duplicate(self, identity: str) -> None:
@@ -140,14 +124,10 @@ class RegistryStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def registry_matches_model(self) -> None:
-        """Nothing vanishes. This is the invariant whose absence produced the
-        original `None`-consumes-a-completion defect."""
         snap = self.registry.snapshot()
         for ident, expected in self.model.items():
             actual = snap.get(ident)
-            assert actual is expected, (
-                f"{ident}: model={expected}, registry={actual}"
-            )
+            assert actual is expected, f"{ident}: model={expected}, registry={actual}"
 
     @invariant()
     def exactly_once_delivery(self) -> None:
@@ -180,7 +160,6 @@ class RegistryStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def distinct_routes_stay_distinct(self) -> None:
-        """`None` and `""` must not share a routing key."""
         for identity, route in self.routes.items():
             if identity in self.model and self.model[identity] not in TERMINAL:
                 entry = self.registry._entries.get(identity)
@@ -193,7 +172,7 @@ class RegistryStateMachine(RuleBasedStateMachine):
 RegistryStateMachine.TestCase.settings = settings(
     max_examples=200,
     stateful_step_count=40,
-    deadline=None,  # logical only; no wall-clock assertions here
+    deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )
 
@@ -201,55 +180,54 @@ TestRegistryStateMachine = RegistryStateMachine.TestCase
 
 
 # ---------------------------------------------------------------- unit checks
-# Prohibited transitions must raise rather than silently no-op. Property tests
-# above only exercise legal paths; these pin the illegal ones.
 
-def _fresh() -> PendingCompletionRegistry:
-    return PendingCompletionRegistry()
-
-
-def test_deliver_without_claim_is_rejected() -> None:
-    """Deliver on PENDING is a no-op (state stays PENDING)."""
-    reg = _fresh()
-    reg.enqueue("proc_a", ("r1",), _dummy_payload())
-    reg.deliver("proc_a")
-    # deliver only acts on CLAIMED; PENDING entry is unaffected
-    assert reg.snapshot()["proc_a"] is State.PENDING
+def test_deliver_without_claim_is_noop() -> None:
+    async def _test():
+        reg = _fresh()
+        reg.enqueue("proc_a", ("r1",), _dummy_payload())
+        reg.deliver("proc_a")
+        assert reg.snapshot()["proc_a"] is State.PENDING
+    run_sync(_test())
 
 
 def test_claim_of_already_claimed_by_other_batch_is_rejected() -> None:
-    reg = _fresh()
-    reg.enqueue("proc_a", ("r1",), _dummy_payload())
-    claimed, skipped = reg.claim_batch(["proc_a"], "b1")
-    assert len(claimed) == 1 and claimed[0]["identity"] == "proc_a"
-    # claimed by *this* flush vs claimed elsewhere are distinct states
-    claimed2, skipped2 = reg.claim_batch(["proc_a"], "b2")
-    assert len(claimed2) == 0
-    assert skipped2 == ["proc_a"]
+    async def _test():
+        reg = _fresh()
+        reg.enqueue("proc_a", ("r1",), _dummy_payload())
+        claimed, skipped = reg.claim_batch(["proc_a"], "b1")
+        assert len(claimed) == 1 and claimed[0]["identity"] == "proc_a"
+        claimed2, skipped2 = reg.claim_batch(["proc_a"], "b2")
+        assert len(claimed2) == 0
+        assert skipped2 == ["proc_a"]
+    run_sync(_test())
 
 
 def test_terminal_entry_cannot_be_reclaimed() -> None:
-    reg = _fresh()
-    reg.enqueue("proc_a", ("r1",), _dummy_payload())
-    reg.claim_batch(["proc_a"], "b1")
-    reg.deliver("proc_a")
-    claimed, skipped = reg.claim_batch(["proc_a"], "b2")
-    assert len(claimed) == 0
+    async def _test():
+        reg = _fresh()
+        reg.enqueue("proc_a", ("r1",), _dummy_payload())
+        reg.claim_batch(["proc_a"], "b1")
+        reg.deliver("proc_a")
+        claimed, skipped = reg.claim_batch(["proc_a"], "b2")
+        assert len(claimed) == 0
+    run_sync(_test())
 
 
 def test_none_and_empty_route_do_not_coalesce() -> None:
-    reg = _fresh()
-    reg.enqueue("proc_none", (None,), _dummy_payload())
-    reg.enqueue("proc_empty", ("",), _dummy_payload())
-    # They must have distinct route keys
-    e_none = reg._entries["proc_none"]
-    e_empty = reg._entries["proc_empty"]
-    assert e_none["route_key"] != e_empty["route_key"]
+    async def _test():
+        reg = _fresh()
+        reg.enqueue("proc_none", (None,), _dummy_payload())
+        reg.enqueue("proc_empty", ("",), _dummy_payload())
+        e_none = reg._entries["proc_none"]
+        e_empty = reg._entries["proc_empty"]
+        assert e_none["route_key"] != e_empty["route_key"]
+    run_sync(_test())
 
 
 def test_overflow_is_counted_not_silent() -> None:
-    reg = _fresh()
-    for i in range(CAPACITY + 5):
-        reg.enqueue(f"proc_{i:04d}", ("r1",), _dummy_payload())
-    # Entries beyond capacity are rejected, and counter reflects that
-    assert reg.counters["dropped_overflow"] == 5
+    async def _test():
+        reg = _fresh()
+        for i in range(CAPACITY + 5):
+            reg.enqueue(f"proc_{i:04d}", ("r1",), _dummy_payload())
+        assert reg.counters["dropped_overflow"] == 5
+    run_sync(_test())
