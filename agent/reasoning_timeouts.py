@@ -73,6 +73,11 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("deepseek-reasoner", 600),
     ("deepseek-v4-flash", 600),
     ("deepseek-v4-pro", 600),
+    # Moonshot AI Kimi K3 — reasoning model with extended thinking
+    # phase.  K3 uses chain-of-thought tokens before final content,
+    # hitting the same upstream idle timeout window as other reasoning
+    # models on hosted gateways.
+    ("k3", 600),
     # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
     # preview is the stable slug; ``qwen3`` covers the family of
     # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)
@@ -200,6 +205,8 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     >>> get_reasoning_stale_timeout_floor("deepseek/deepseek-v4-flash")
     600.0
     >>> get_reasoning_stale_timeout_floor("deepseek/deepseek-v4-pro")
+    600.0
+    >>> get_reasoning_stale_timeout_floor("moonshot/k3")
     600.0
     >>> get_reasoning_stale_timeout_floor("qwen/qwen3-235b-a22b-thinking")
     180.0
