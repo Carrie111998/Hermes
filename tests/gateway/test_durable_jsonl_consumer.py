@@ -157,7 +157,7 @@ def test_retained_xlsx_media_ref_delivers_as_document_and_images_are_unchanged(
     )
     retained = tmp_path / "retained"
     retained.mkdir()
-    workbook = retained / "sandbox_r_12ab34cd_deadbeef1234_weekly-report.xlsx"
+    workbook = retained / "sandbox_r_12ab34cd_deadbeef.xlsx"
     _xlsx(workbook)
     image = retained / "case-photo.png"
     image.write_bytes(_png_bytes())
@@ -208,7 +208,7 @@ def test_retained_xlsx_media_ref_delivers_as_document_and_images_are_unchanged(
         "replyTo": "DOC-MSG",
         "filePath": str(workbook),
         "mediaType": "document",
-        "fileName": "weekly-report.xlsx",
+        "fileName": workbook.name,
     }
 
     assert deliver(str(image), "IMAGE-MSG")["delivered"] == 1

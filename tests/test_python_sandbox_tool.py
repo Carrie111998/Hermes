@@ -352,9 +352,7 @@ def test_xlsx_file_listing_promotes_atomically_and_idempotently(tmp_path):
         f"/media/tgg/hermes/{promoted[0].name}"
     )
     assert "r_12ab34cd" in promoted[0].name
-    assert hashlib.sha256(workbook.read_bytes()).hexdigest()[:12] in promoted[0].name
-    assert promoted[0].name.endswith("_weekly-report.xlsx")
-    assert sandbox._CLIENT_ARTIFACT_NAME.fullmatch(promoted[0].name)
+    assert hashlib.sha256(workbook.read_bytes()).hexdigest() in promoted[0].name
 
     second, error = sandbox._harvest(
         work, "summary", "", "success", sandbox.DEFAULTS, **kwargs
@@ -368,6 +366,7 @@ def test_xlsx_file_listing_promotes_atomically_and_idempotently(tmp_path):
 @pytest.mark.parametrize(
     ("filename", "contents"),
     [
+        ("weekly report.xlsx", b"PK\x03\x04not-promoted"),
         ("weekly-report.xlsx", b"not-a-zip"),
         ("weekly-report.csv", b"PK\x03\x04not-an-xlsx"),
     ],
@@ -395,35 +394,6 @@ def test_file_listing_does_not_promote_invalid_workbooks(
 
     assert all("media_ref" not in item for item in payload["files"])
     assert not retained.exists()
-
-
-def test_promotion_sanitizes_and_caps_original_basename(tmp_path):
-    work = tmp_path / "work"
-    retained = tmp_path / "retained"
-    work.mkdir()
-    workbook = work / ("Weekly report (client) " + "x" * 160 + ".xlsx")
-    with zipfile.ZipFile(workbook, "w") as archive:
-        archive.writestr("[Content_Types].xml", "<Types/>")
-
-    payload, error = sandbox._harvest(
-        work,
-        "",
-        "",
-        "success",
-        sandbox.DEFAULTS,
-        run_id="r_12ab34cd",
-        media_retention={
-            "root": str(retained),
-            "media_ref_prefix": "/media/tgg/hermes",
-        },
-    )
-
-    assert error == ""
-    promoted_name = Path(payload["files"][0]["media_ref"]).name
-    assert sandbox._CLIENT_ARTIFACT_NAME.fullmatch(promoted_name)
-    assert len(promoted_name) <= 132
-    assert promoted_name.startswith("sandbox_r_12ab34cd_")
-    assert "_Weekly_report_client_" in promoted_name
 
 
 def test_sqlite_copy_larger_than_scratch_fails_clearly(tmp_path):

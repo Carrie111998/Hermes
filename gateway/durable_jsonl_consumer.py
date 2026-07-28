@@ -1441,19 +1441,8 @@ def _validated_captured_media_type(path: Path) -> tuple[str, str, str | None]:
     return (
         "document",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        _sandbox_workbook_display_name(path.name),
+        path.name,
     )
-
-
-_SANDBOX_WORKBOOK_RETAINED_NAME = re.compile(
-    r"^sandbox_r_[a-f0-9]{8}_[a-f0-9]{12}_(?P<original>.+\.xlsx)$"
-)
-
-
-def _sandbox_workbook_display_name(retained_name: str) -> str:
-    """Hide the retention prefix while preserving the sanitized export name."""
-    match = _SANDBOX_WORKBOOK_RETAINED_NAME.fullmatch(retained_name)
-    return match.group("original") if match else retained_name
 
 
 def _contained_existing_file(value: Any, roots: Sequence[Path]) -> Path:

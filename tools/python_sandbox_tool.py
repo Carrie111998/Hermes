@@ -554,21 +554,6 @@ _CLIENT_ARTIFACT_RUN_ID = re.compile(r"^r_[a-f0-9]{8}$")
 _ZIP_MAGIC = b"PK\x03\x04"
 
 
-def _retained_workbook_basename(
-    source_name: str, *, run_id: str, digest_prefix: str
-) -> str:
-    """Build a portal-safe retained name that preserves the export basename."""
-    stem = source_name[:-5] if source_name.lower().endswith(".xlsx") else source_name
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "workbook"
-    prefix = f"sandbox_{run_id}_{digest_prefix}_"
-    max_stem = 132 - len(prefix) - len(".xlsx")
-    stem = stem[:max_stem].rstrip("._-") or "workbook"
-    basename = f"{prefix}{stem}.xlsx"
-    if not _CLIENT_ARTIFACT_NAME.fullmatch(basename):
-        raise ValueError(f"retained workbook name violates portal contract: {basename}")
-    return basename
-
-
 def _promote_workbook(
     source: Path,
     *,
@@ -589,11 +574,7 @@ def _promote_workbook(
         return None
 
     hexdigest = digest.hexdigest()
-    basename = _retained_workbook_basename(
-        source.name,
-        run_id=run_id,
-        digest_prefix=hexdigest[:12],
-    )
+    basename = f"sandbox_{run_id}_{hexdigest}.xlsx"
     media_root.mkdir(parents=True, exist_ok=True, mode=0o750)
     target = media_root / basename
     if target.exists():
@@ -669,7 +650,7 @@ def _list_files(
             and _CLIENT_ARTIFACT_NAME.fullmatch(path.name)
         ):
             item["client_url"] = f"{client_url_base}/{run_id}/{path.name}"
-        if promotion_enabled and path.suffix.lower() == ".xlsx":
+        if promotion_enabled and _CLIENT_ARTIFACT_NAME.fullmatch(path.name):
             media_ref = _promote_workbook(
                 path,
                 run_id=run_id,
