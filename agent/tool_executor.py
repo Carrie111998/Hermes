@@ -407,11 +407,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             continue
 
-        # Reset nudge counters only for a structurally valid invocation.
-        if function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
+        # Nudge counters are reset only after a non-blocked, non-error
+        # result -- see the post-gather result-unpacking loop below. A
+        # structurally-valid call that later gets blocked by scope/plugin/
+        # guardrail checks (or errors) must not silently reset the nudge,
+        # or the agent never gets reminded to actually use memory/skills
+        # (issue #38863).
 
         # ── Tool Search unwrap ────────────────────────────────────────
         # When the model invokes the tool_call bridge, peel it open so
@@ -951,6 +952,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
+            # Reset nudge counters only on a non-blocked, non-error result.
+            # Moved here (post-execution) from the pre-execution loop above,
+            # which reset unconditionally for any structurally-valid call --
+            # including one about to be rejected by a scope/plugin/guardrail
+            # block, or one that raises during execution. That silently
+            # cleared the nudge without the agent ever having actually used
+            # memory/skill_manage, so it stopped reminding the agent to try
+            # again (issue #38863). Mirrors the sequential path's existing
+            # success-only gate.
+            if not blocked and not is_error:
+                if function_name == "memory":
+                    agent._turns_since_memory = 0
+                elif function_name == "skill_manage":
+                    agent._iters_since_skill = 0
+
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -1211,11 +1227,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # Tool blocked by plugin or guardrail policy — skip counters,
             # callbacks, checkpointing, activity mutation, and real execution.
             pass
-        # Reset nudge counters when the relevant tool is actually used
-        elif function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
@@ -1643,6 +1654,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        # Reset nudge counters only on a non-blocked, non-error result.
+        # Previously reset unconditionally once past the _execution_blocked
+        # gate above -- i.e. before the tool actually ran -- so a memory or
+        # skill_manage call that executed and then errored still silently
+        # cleared the nudge, same class of bug as the concurrent path had
+        # (issue #38863). Moved here, after the real outcome is known, to
+        # match that fix and keep both dispatch modes' success-only
+        # invariant consistent.
+        if not _execution_blocked and not _is_error_result:
+            if function_name == "memory":
+                agent._turns_since_memory = 0
+            elif function_name == "skill_manage":
+                agent._iters_since_skill = 0
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the

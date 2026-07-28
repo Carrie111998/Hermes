@@ -2669,6 +2669,140 @@ class TestRetryAfterCap:
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
+    # -- Nudge counter reset (issue #38863) --------------------------------
+    #
+    # execute_tool_calls_concurrent() used to reset _turns_since_memory /
+    # _iters_since_skill in the PRE-execution loop, for any structurally
+    # valid call -- before scope/plugin/guardrail blocking was even
+    # evaluated. A call that was then blocked, or that executed and
+    # returned an error, still silently cleared the nudge, so the agent
+    # never got reminded to actually use memory/skills again. The reset
+    # now happens post-result, gated on not blocked and not is_error.
+
+    def test_concurrent_blocked_memory_does_not_reset_counter(self, agent, monkeypatch):
+        agent._turns_since_memory = 5
+        tc = _mock_tool_call(name="memory", arguments='{"action":"add","target":"memory","content":"x"}', call_id="m1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: "Blocked",
+        )
+        with patch("tools.memory_tool.memory_tool", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
+
+        assert agent._turns_since_memory == 5
+
+    def test_concurrent_blocked_skill_manage_does_not_reset_counter(self, agent, monkeypatch):
+        agent._iters_since_skill = 3
+        tc = _mock_tool_call(name="skill_manage", arguments='{"action":"list"}', call_id="s1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: "Blocked",
+        )
+        with patch("tools.skill_manager_tool.skill_manage", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
+
+        assert agent._iters_since_skill == 3
+
+    def test_concurrent_successful_memory_resets_counter(self, agent, monkeypatch):
+        agent._turns_since_memory = 5
+        tc = _mock_tool_call(name="memory", arguments='{"action":"add","target":"memory","content":"x"}', call_id="m2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        with patch("tools.memory_tool.memory_tool", return_value='{"status": "saved"}'):
+            agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
+
+        assert agent._turns_since_memory == 0
+
+    def test_concurrent_successful_skill_manage_resets_counter(self, agent, monkeypatch):
+        agent._iters_since_skill = 3
+        tc = _mock_tool_call(name="skill_manage", arguments='{"action":"list"}', call_id="s2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        with patch("tools.skill_manager_tool.skill_manage", return_value='{"skills": []}'):
+            agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
+
+        assert agent._iters_since_skill == 0
+
+    def test_concurrent_error_memory_does_not_reset_counter(self, agent, monkeypatch):
+        """Regression (review of #38890): an executed-but-failed memory call
+        must not reset the counter either -- only a genuine success does."""
+        agent._turns_since_memory = 5
+        tc = _mock_tool_call(name="memory", arguments='{"action":"add","target":"memory","content":"x"}', call_id="m3")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        with patch("tools.memory_tool.memory_tool", return_value='{"error": "disk full"}'):
+            agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
+
+        assert agent._turns_since_memory == 5
+
+    def test_concurrent_error_skill_manage_does_not_reset_counter(self, agent, monkeypatch):
+        """Same error-result regression for skill_manage, as explicitly
+        requested in the review (both counters, not just memory)."""
+        agent._iters_since_skill = 3
+        tc = _mock_tool_call(name="skill_manage", arguments='{"action":"list"}', call_id="s3")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        with patch("tools.skill_manager_tool.skill_manage", return_value='{"error": "not found"}'):
+            agent._execute_tool_calls_concurrent(mock_msg, [], "task-1")
+
+        assert agent._iters_since_skill == 3
+
+    # -- Sequential path alignment (per review: "align and test the
+    # sequential path too") ------------------------------------------------
+
+    def test_sequential_error_memory_does_not_reset_counter(self, agent, monkeypatch):
+        agent._turns_since_memory = 5
+        tc = _mock_tool_call(name="memory", arguments='{"action":"add","target":"memory","content":"x"}', call_id="m4")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        with patch("tools.memory_tool.memory_tool", return_value='{"error": "disk full"}'):
+            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        assert agent._turns_since_memory == 5
+
+    def test_sequential_successful_memory_resets_counter(self, agent, monkeypatch):
+        agent._turns_since_memory = 5
+        tc = _mock_tool_call(name="memory", arguments='{"action":"add","target":"memory","content":"x"}', call_id="m5")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        with patch("tools.memory_tool.memory_tool", return_value='{"status": "saved"}'):
+            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        assert agent._turns_since_memory == 0
+
+    def test_sequential_blocked_memory_does_not_reset_counter(self, agent, monkeypatch):
+        agent._turns_since_memory = 5
+        tc = _mock_tool_call(name="memory", arguments='{"action":"add","target":"memory","content":"x"}', call_id="m6")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: "Blocked",
+        )
+        with patch("tools.memory_tool.memory_tool", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        assert agent._turns_since_memory == 5
+
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
