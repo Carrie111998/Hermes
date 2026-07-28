@@ -1810,10 +1810,8 @@ def _response_timeout_reason(output: str, *, prompt: str | None) -> str:
 
     if _known_claude_input_modal_visible(output):
         return "known_input_modal"
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace(
-        "\r", ""
-    )
-    if re.search(r"\[Pasted text #\d+(?: \+\d+ lines)?\]", cleaned):
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    if _pasted_input_visible(output):
         return "pasted_input_visible"
     if _claude_main_repl_ready(output):
         prompt_echoed = prompt is not None and (
@@ -1834,7 +1832,7 @@ def _response_timeout_reason(output: str, *, prompt: str | None) -> str:
 
 def _prompt_input_visible(output: str, *, prompt: str) -> bool:
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
-    if re.search(r"\[Pasted text #\d+(?: \+\d+ lines)?\]", cleaned):
+    if _pasted_input_visible(output):
         return True
     compact = _compact_terminal_text(cleaned)
     if "ctrl+gtoeditinnotepad" in compact.casefold():
@@ -1842,6 +1840,16 @@ def _prompt_input_visible(output: str, *, prompt: str) -> bool:
     if prompt in cleaned or prompt.replace("\n", "") in cleaned:
         return True
     return _compact_terminal_text(prompt) in compact
+
+
+def _pasted_input_visible(output: str) -> bool:
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    if re.search(r"\[Pasted text #\d+(?: \+\d+ lines)?\]", cleaned):
+        return True
+    compact = _compact_terminal_text(cleaned).casefold()
+    return (
+        re.search(r"\[pastedtext#\d+(?:\+\d+lines)?\]", compact) is not None
+    )
 
 
 def _prompt_input_timeout_reason(output: str, *, prompt: str) -> str:

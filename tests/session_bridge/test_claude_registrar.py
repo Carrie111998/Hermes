@@ -482,6 +482,26 @@ def test_winpty_accepts_current_claude_multiline_editor_hint() -> None:
     assert "ctrl+gtoeditinNotepad" in observed
 
 
+def test_winpty_accepts_cursor_positioned_pasted_text_token() -> None:
+    output = (
+        "\x1b[2m[Pasted\x1b[1Ctext\x1b[1C#1\x1b[1C+6\x1b[1Clines]\x1b[0m"
+        " paste again to expand"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([output])
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str | None:
+            return next(self.chunks)
+
+    observed = _WinPtyProcess(Process()).read_until_prompt_input(
+        1.0, prompt="a much longer multiline registration prompt"
+    )
+
+    assert "paste again to expand" in observed
+
+
 @pytest.mark.parametrize(
     ("process", "expected_writes"),
     [
