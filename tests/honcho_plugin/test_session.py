@@ -330,6 +330,40 @@ class TestPeerLookupHelpers:
         assert "fallback hit" in result
         peer_obj.search.assert_called_once()
 
+    def test_search_context_falls_back_to_peer_search_on_empty_result(self):
+        """An empty scoped search should still try the peer-level search."""
+        mgr, session = self._make_cached_manager()
+        honcho_client = MagicMock()
+        honcho_client.search.return_value = []
+        peer_obj = MagicMock()
+        peer_obj.search.return_value = [
+            SimpleNamespace(content="broader fallback hit", peer_id="robert", session_id="s1", id="m1"),
+        ]
+        mgr._get_or_create_peer = MagicMock(return_value=peer_obj)
+
+        with patch.object(HonchoSessionManager, "honcho", new_callable=lambda: property(lambda s: honcho_client)):
+            result = mgr.search_context(session.key, "anything")
+
+        assert "broader fallback hit" in result
+        honcho_client.search.assert_called_once()
+        peer_obj.search.assert_called_once()
+
+    def test_search_context_returns_empty_when_all_searches_are_empty(self):
+        """Return no context only when both search paths have no results."""
+        mgr, session = self._make_cached_manager()
+        honcho_client = MagicMock()
+        honcho_client.search.return_value = []
+        peer_obj = MagicMock()
+        peer_obj.search.return_value = []
+        mgr._get_or_create_peer = MagicMock(return_value=peer_obj)
+
+        with patch.object(HonchoSessionManager, "honcho", new_callable=lambda: property(lambda s: honcho_client)):
+            result = mgr.search_context(session.key, "anything")
+
+        assert result == ""
+        honcho_client.search.assert_called_once()
+        peer_obj.search.assert_called_once()
+
     def test_get_prefetch_context_fetches_user_and_ai_from_peer_api(self):
         mgr, session = self._make_cached_manager()
         user_peer = MagicMock()

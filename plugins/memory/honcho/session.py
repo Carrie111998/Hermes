@@ -1161,13 +1161,17 @@ class HonchoSessionManager:
             )
         except Exception as e:
             logger.debug("Honcho message search failed (peer_perspective=%s): %s", peer_id, e)
-            # Fall back to peer-authored search if the perspective filter is
-            # unsupported by the running Honcho version.
+            messages = None
+
+        # Fall back to peer-authored search when the perspective filter is
+        # unsupported or the scoped search finds no messages. The peer-level
+        # search can still return broader semantic matches in that case.
+        if not messages:
             try:
                 peer_obj = self._get_or_create_peer(peer_id)
                 messages = peer_obj.search(q, limit=limit)
-            except Exception as e2:
-                logger.debug("Honcho peer search fallback also failed: %s", e2)
+            except Exception as e:
+                logger.debug("Honcho peer search fallback failed: %s", e)
                 return ""
 
         if not messages:
