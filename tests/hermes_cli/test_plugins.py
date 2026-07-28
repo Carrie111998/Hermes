@@ -2244,6 +2244,35 @@ class TestPluginCommands:
         assert mgr._plugin_commands["cmd-b"]["plugin"] == "plugin-b"
 
 
+    @pytest.mark.asyncio
+    async def test_register_callback_handler_stores_and_matches_prefix(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="telegram-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        async def handler(callback_data, chat_id):
+            return (f"handled {callback_data} in {chat_id}", None)
+
+        ctx.register_callback_handler("page:", handler)
+
+        assert mgr._plugin_callback_handlers["page:"]["handler"] is handler
+        assert mgr._plugin_callback_handlers["page:"]["plugin"] == "telegram-plugin"
+        assert mgr.get_plugin_callback_handler("page:2") is handler
+        assert mgr.get_plugin_callback_handler("other:2") is None
+
+    def test_callback_handler_does_not_match_prefix_as_substring(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="telegram-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        async def handler(callback_data, chat_id):
+            return (f"handled {callback_data} in {chat_id}", None)
+
+        ctx.register_callback_handler("gt", handler)
+
+        assert mgr.get_plugin_callback_handler("some-gt-thing") is None
+
+
 class TestPluginCommandResultResolution:
     def test_returns_sync_values_unchanged(self):
         assert resolve_plugin_command_result("ok") == "ok"

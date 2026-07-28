@@ -1772,6 +1772,14 @@ from gateway.config import (
     PlatformConfig,
     load_gateway_config,
 )
+
+try:
+    from telegram import InlineKeyboardMarkup
+    if not isinstance(InlineKeyboardMarkup, type):
+        raise ImportError
+except (ImportError, AttributeError):
+    class InlineKeyboardMarkup:  # type: ignore[no-redef]
+        pass
 from gateway.session import (
     AsyncSessionStore,
     SessionStore,
@@ -10220,6 +10228,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
+
+                    if (
+                        isinstance(result, tuple)
+                        and len(result) == 2
+                        and isinstance(result[0], str)
+                        and (
+                            result[1] is None
+                            or isinstance(result[1], InlineKeyboardMarkup)
+                        )
+                    ):
+                        result_text, result_keyboard = result
+                        if result_keyboard is not None and source.platform == Platform.TELEGRAM:
+                            adapter = self._adapter_for_source(source)
+                            if adapter is not None:
+                                await adapter.send(
+                                    source.chat_id,
+                                    result_text,
+                                    reply_to=self._reply_anchor_for_event(event),
+                                    metadata=self._thread_metadata_for_source(
+                                        source,
+                                        self._reply_anchor_for_event(event),
+                                    ),
+                                    reply_markup=result_keyboard,
+                                )
+                                return None
+                        return result_text
+
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)

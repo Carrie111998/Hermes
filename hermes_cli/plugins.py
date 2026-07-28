@@ -44,7 +44,7 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
@@ -77,6 +77,22 @@ class PluginToolOverrideError(PermissionError):
 
 
 logger = logging.getLogger(__name__)
+
+try:
+    from telegram import InlineKeyboardMarkup
+    if not isinstance(InlineKeyboardMarkup, type):
+        raise ImportError
+except (ImportError, AttributeError):
+    # Telegram is an optional/lazy dependency.  The fallback keeps the public
+    # callback type available to plugin authors when Telegram is not installed;
+    # the Telegram adapter supplies the real class when it handles a callback.
+    class InlineKeyboardMarkup:  # type: ignore[no-redef]
+        pass
+
+
+CallbackHandler = Callable[
+    [str, int | str], Awaitable[tuple[str, InlineKeyboardMarkup | None]]
+]
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +595,36 @@ class PluginContext:
             "args_hint": (args_hint or "").strip(),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
+
+    def register_callback_handler(
+        self,
+        prefix: str,
+        handler: CallbackHandler,
+    ) -> None:
+        """Register a Telegram inline-keyboard callback handler.
+
+        The handler receives the complete callback data and the Telegram chat
+        id, and returns the replacement message text plus an optional inline
+        keyboard.  This registry is intentionally separate from slash
+        commands: it is consumed only by the Telegram adapter.
+        """
+        clean = str(prefix).strip()
+        if not clean:
+            logger.warning(
+                "Plugin '%s' tried to register a callback handler with an empty prefix.",
+                self.manifest.name,
+            )
+            return
+
+        self._manager._plugin_callback_handlers[clean] = {
+            "handler": handler,
+            "plugin": self.manifest.name,
+        }
+        logger.debug(
+            "Plugin %s registered Telegram callback handler: %s",
+            self.manifest.name,
+            clean,
+        )
 
     # -- tool dispatch -------------------------------------------------------
 
@@ -1257,6 +1303,7 @@ class PluginManager:
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
+        self._plugin_callback_handlers: Dict[str, dict] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
@@ -1297,6 +1344,7 @@ class PluginManager:
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
             self._plugin_commands.clear()
+            self._plugin_callback_handlers.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
@@ -1973,6 +2021,16 @@ class PluginManager:
         """
         return list(self._slack_action_handlers)
 
+    def get_plugin_callback_handler(
+        self,
+        callback_data: str,
+    ) -> Optional[CallbackHandler]:
+        """Return the first Telegram callback handler matching *callback_data*."""
+        for prefix, entry in self._plugin_callback_handlers.items():
+            if callback_data.startswith(prefix):
+                return entry["handler"]
+        return None
+
     # -----------------------------------------------------------------------
     # Introspection
     # -----------------------------------------------------------------------
@@ -2364,6 +2422,11 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def get_plugin_callback_handler(callback_data: str) -> Optional[CallbackHandler]:
+    """Return a plugin Telegram callback handler matching *callback_data*."""
+    return _ensure_plugins_discovered().get_plugin_callback_handler(callback_data)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
