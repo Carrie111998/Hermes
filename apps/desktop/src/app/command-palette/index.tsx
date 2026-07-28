@@ -6,25 +6,29 @@ import { useNavigate } from 'react-router-dom'
 
 import { HUD_HEADING, HUD_ITEM, HUD_POSITION, HUD_SURFACE, HUD_TEXT } from '@/app/floating-hud'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
-import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
+import { Command, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { KbdCombo } from '@/components/ui/kbd'
 import { getHermesConfigRecord, listAllProfileSessions } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import {
   Activity,
+  AppWindow,
   Archive,
   BarChart3,
+  Check,
   ChevronLeft,
   ChevronRight,
   Clock,
   Cpu,
   Download,
   Egg,
+  GitBranch,
   Globe,
   type IconComponent,
   Info,
   KeyRound,
+  Layers3,
   MessageCircle,
   Monitor,
   Moon,
@@ -35,17 +39,29 @@ import {
   RefreshCw,
   Settings,
   Settings2,
+  SlidersHorizontal,
+  Starmap,
   Sun,
   Terminal,
   Users,
   Wrench,
   Zap
 } from '@/lib/icons'
+import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
-import { $commandPaletteOpen, $commandPalettePage, closeCommandPalette, setCommandPaletteOpen } from '@/store/command-palette'
+import { $repoWorktrees } from '@/store/coding-status'
+import {
+  $commandPaletteOpen,
+  $commandPalettePage,
+  closeCommandPalette,
+  setCommandPaletteOpen
+} from '@/store/command-palette'
 import { $bindings } from '@/store/keybinds'
 import { openPetGenerate } from '@/store/pet-generate'
+import { requestStartWorkSession } from '@/store/projects'
 import { runGatewayRestart } from '@/store/system-actions'
+import { applyBackendUpdate } from '@/store/updates'
+import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
@@ -56,22 +72,27 @@ import {
   COMMAND_CENTER_ROUTE,
   CRON_ROUTE,
   MESSAGING_ROUTE,
+  navigateToWorkspacePage,
   NEW_CHAT_ROUTE,
   PROFILES_ROUTE,
   sessionRoute,
   SETTINGS_ROUTE,
-  SKILLS_ROUTE
+  SKILLS_ROUTE,
+  STARMAP_ROUTE
 } from '../routes'
 import { FIELD_LABELS, SECTIONS } from '../settings/constants'
 import { fieldCopyForSchemaKey } from '../settings/field-copy'
 import { prettyName } from '../settings/helpers'
 
+import { usePaletteContributions } from './contrib'
 import { MarketplaceThemePage } from './marketplace-theme-page'
 import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
 
 interface PaletteItem {
   /** Keybind action id — its live combo renders as a hotkey hint. */
   action?: string
+  /** Renders a trailing check: this row IS the current setting (theme, mode). */
+  active?: boolean
   icon: IconComponent
   id: string
   /** Keep the palette open after running (live-preview pickers like theme/mode). */
@@ -103,26 +124,93 @@ interface PalettePage {
 }
 
 interface SessionEntry {
+  git_branch?: null | string
   id: string
   preview?: string
   title: string
 }
 
-// cmdk defaults to fuzzy subsequence scoring, so "color" matches anything with
-// c…o…l…o…r scattered across it. Use case-insensitive multi-term substring
-// matching instead: every typed word must literally appear in the item's
-// value/keywords, which keeps results tight and predictable.
-const paletteFilter = (value: string, search: string, keywords?: string[]): number => {
-  const needle = search.trim().toLowerCase()
+// Ranking happens in React, not cmdk. We score, sort, and prune the groups
+// ourselves and hand cmdk an already-ordered list with `shouldFilter={false}`,
+// leaving it as pure keyboard/selection machinery. (cmdk's own group
+// re-sorting silently no-ops: its sort() queries groups by an internal id that
+// never matches the heading text it writes into `data-value`, so groups always
+// keep source order — which put a generic keyword match like "Capabilities" on
+// top and the auto-highlight on it while an exact "Tools" row sat below.)
+//
+// cmdk still auto-selects the first DOM item whenever the search changes, so
+// rendering best-match-first is what puts the highlight on the best match.
+//
+// AND semantics: every typed word must appear in the label or keywords. The
+// grade rewards matches on the visible label — exact > prefix > whole word >
+// word prefix > substring > scattered terms > keyword-only — so typing "tools"
+// selects the row that says Tools, not a row that hides it in keywords.
+const scoreItem = (item: PaletteItem, needle: string): number => {
+  const label = item.label.toLowerCase()
+  const keys = (item.keywords ?? []).join(' ').toLowerCase()
+  const terms = needle.split(/\s+/).filter(Boolean)
 
-  if (!needle) {
+  if (terms.some(term => !label.includes(term) && !keys.includes(term))) {
+    return 0
+  }
+
+  if (label === needle) {
     return 1
   }
 
-  const haystack = `${value} ${keywords?.join(' ') ?? ''}`.toLowerCase()
+  if (label.startsWith(needle)) {
+    return 0.9
+  }
 
-  return needle.split(/\s+/).every(term => haystack.includes(term)) ? 1 : 0
+  const words = label.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+
+  if (words.includes(needle)) {
+    return 0.85
+  }
+
+  if (words.some(word => word.startsWith(needle))) {
+    return 0.8
+  }
+
+  if (label.includes(needle)) {
+    return 0.7
+  }
+
+  if (terms.every(term => label.includes(term))) {
+    return 0.6
+  }
+
+  // Matched only via keywords — the weakest, generic-row signal.
+  return 0.4
 }
+
+// Order items within each group by score, order groups by their best item, and
+// drop everything that doesn't match. Ties keep their original order (stable
+// sort), so curated group/item ordering still breaks even scores.
+const rankGroups = (groups: PaletteGroup[], search: string): PaletteGroup[] => {
+  const needle = normalize(search)
+
+  if (!needle) {
+    return groups
+  }
+
+  return groups
+    .map(group => {
+      const scored = group.items
+        .map(item => ({ item, score: scoreItem(item, needle) }))
+        .filter(entry => entry.score > 0)
+        .sort((a, b) => b.score - a.score)
+
+      return { group: { ...group, items: scored.map(entry => entry.item) }, max: scored[0]?.score ?? 0 }
+    })
+    .filter(entry => entry.max > 0)
+    .sort((a, b) => b.max - a.max)
+    .map(entry => entry.group)
+}
+
+// cmdk selection values must be unique; labels alone can repeat (the same
+// theme lists under both Light and Dark). The id suffix disambiguates.
+const paletteValue = (item: PaletteItem): string => `${item.label}\u0001${item.id}`
 
 // Hermes session ids: <YYYYMMDD>_<HHMMSS>_<6 hex>. Used to offer a direct
 // "Go to session ‹id›" jump for ids that aren't in the recent-200 list.
@@ -131,6 +219,7 @@ const SESSION_ID_RE = /^\d{8}_\d{6}_[a-f0-9]{6}$/
 type SessionRow = Awaited<ReturnType<typeof listAllProfileSessions>>['sessions'][number]
 
 const toSessionEntry = (session: SessionRow): SessionEntry => ({
+  git_branch: session.git_branch ?? null,
   id: session.id,
   preview: session.preview ?? undefined,
   title: sessionTitle(session)
@@ -160,7 +249,7 @@ const NON_CONFIG_SETTINGS: ReadonlyArray<{
   },
   {
     icon: KeyRound,
-    keywords: ['providers', 'api key', 'keys', 'secrets', 'tokens'],
+    keywords: ['providers', 'api key', 'keys', 'secrets', 'tokens', 'egress', 'iron proxy', 'sandbox proxy'],
     labelKey: 'providerApiKeys',
     tab: 'providers&pview=keys'
   },
@@ -173,11 +262,10 @@ const NON_CONFIG_SETTINGS: ReadonlyArray<{
   },
   {
     icon: Settings2,
-    keywords: ['gateway', 'proxy', 'server', 'webhook', 'env'],
+    keywords: ['gateway', 'proxy', 'server', 'webhook', 'env', 'egress proxy', 'iron proxy'],
     labelKey: 'keysSettings',
     tab: 'keys&kview=settings'
   },
-  { icon: Wrench, keywords: ['servers', 'tools'], labelKey: 'mcp', tab: 'mcp' },
   { icon: Archive, keywords: ['history', 'archived'], labelKey: 'archivedChats', tab: 'sessions' },
   { icon: Info, keywords: ['version', 'about'], labelKey: 'about', tab: 'about' }
 ]
@@ -203,7 +291,8 @@ function themeSupportsMode(name: string, target: 'light' | 'dark'): boolean {
     return true
   }
 
-  const background = target === 'dark' ? (resolved.darkColors ?? resolved.colors).background : resolved.colors.background
+  const background =
+    target === 'dark' ? (resolved.darkColors ?? resolved.colors).background : resolved.colors.background
 
   return target === 'dark' ? luminance(background) <= 0.5 : luminance(background) > 0.5
 }
@@ -213,8 +302,9 @@ export function CommandPalette() {
   const open = useStore($commandPaletteOpen)
   const pendingPage = useStore($commandPalettePage)
   const bindings = useStore($bindings)
+  const worktrees = useStore($repoWorktrees)
   const navigate = useNavigate()
-  const { availableThemes, resolvedMode, setMode, setTheme, themeName } = useTheme()
+  const { availableThemes, mode, resolvedMode, setMode, setTheme, themeName } = useTheme()
   const [search, setSearch] = useState('')
   const [page, setPage] = useState<string | null>(null)
 
@@ -265,7 +355,7 @@ export function CommandPalette() {
     }
   }, [open, pendingPage])
 
-  const go = useCallback((path: string) => () => navigate(path), [navigate])
+  const go = useCallback((path: string) => () => navigateToWorkspacePage(navigate, path), [navigate])
 
   // Step up one nested page (or back to the root list), clearing the filter so
   // the parent page doesn't reopen mid-search.
@@ -287,9 +377,35 @@ export function CommandPalette() {
     [t.settings.fieldLabels]
   )
 
+  const contributedItems = usePaletteContributions()
+
   const baseGroups = useMemo<PaletteGroup[]>(() => {
     const settingsTab = (tab: string) => `${SETTINGS_ROUTE}?tab=${tab}`
     const cc = t.commandCenter
+
+    // The active repo's worktrees → "new conversation in <branch>". This is the
+    // ⌘K-typed "I want to work on <branch>" reflex: each entry seeds a fresh
+    // session anchored to that worktree's checkout (requestStartWorkSession),
+    // so git is the source of truth and edits land in the right tree.
+    const branchGroup: PaletteGroup[] =
+      worktrees.length > 0
+        ? [
+            {
+              heading: cc.branches,
+              items: worktrees.map(wt => {
+                const name = wt.branch?.trim() || wt.path.split('/').pop() || wt.path
+
+                return {
+                  icon: GitBranch,
+                  id: `worktree-${wt.path}`,
+                  keywords: ['branch', 'worktree', 'switch', name, wt.path],
+                  label: cc.startInBranch(name),
+                  run: () => requestStartWorkSession(wt.path)
+                }
+              })
+            }
+          ]
+        : []
 
     return [
       {
@@ -303,6 +419,18 @@ export function CommandPalette() {
             label: cc.nav.newChat.title,
             run: go(NEW_CHAT_ROUTE)
           },
+          ...(canOpenNewWindow()
+            ? [
+                {
+                  action: 'session.newWindow',
+                  icon: AppWindow,
+                  id: 'nav-new-window',
+                  keywords: ['window', 'instance', 'open', 'new'],
+                  label: t.keybinds.actions['session.newWindow'],
+                  run: () => void openNewWindow()
+                }
+              ]
+            : []),
           {
             action: 'view.showTerminal',
             icon: Terminal,
@@ -322,7 +450,7 @@ export function CommandPalette() {
             action: 'nav.skills',
             icon: Wrench,
             id: 'nav-skills',
-            keywords: ['tools', 'toolsets'],
+            keywords: ['skills', 'tools', 'toolsets', 'mcp', 'capabilities'],
             label: cc.nav.skills.title,
             run: go(SKILLS_ROUTE)
           },
@@ -349,9 +477,17 @@ export function CommandPalette() {
             run: go(CRON_ROUTE)
           },
           { action: 'nav.profiles', icon: Users, id: 'nav-profiles', label: t.profiles.title, run: go(PROFILES_ROUTE) },
-          { action: 'nav.agents', icon: Cpu, id: 'nav-agents', label: t.agents.title, run: go(AGENTS_ROUTE) }
+          { action: 'nav.agents', icon: Cpu, id: 'nav-agents', label: t.agents.title, run: go(AGENTS_ROUTE) },
+          {
+            icon: Starmap,
+            id: 'nav-starmap',
+            keywords: ['star map', 'memory', 'memories', 'skills', 'graph', 'learning', 'constellation'],
+            label: t.starmap.title,
+            run: go(STARMAP_ROUTE)
+          }
         ]
       },
+      ...branchGroup,
       {
         heading: cc.commandCenter,
         items: [
@@ -382,6 +518,13 @@ export function CommandPalette() {
             keywords: ['gateway', 'restart', 'messaging', 'reconnect', 'system'],
             label: cc.restartGateway,
             run: () => void runGatewayRestart()
+          },
+          {
+            icon: Download,
+            id: 'cc-update-hermes',
+            keywords: ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
+            label: cc.updateHermes,
+            run: () => void applyBackendUpdate()
           }
         ]
       },
@@ -439,9 +582,26 @@ export function CommandPalette() {
             run: go(settingsTab(entry.tab))
           }))
         ]
-      }
+      },
+      // Registry-contributed rows (core features + plugins) — one group,
+      // omitted while nothing contributes.
+      ...(contributedItems.length > 0
+        ? [
+            {
+              heading: cc.commands,
+              items: contributedItems.map(item => ({
+                action: item.action,
+                icon: item.icon ?? Zap,
+                id: item.key,
+                keywords: item.keywords,
+                label: item.label,
+                run: item.run
+              }))
+            }
+          ]
+        : [])
     ]
-  }, [go, settingsSectionLabel, t])
+  }, [contributedItems, go, settingsSectionLabel, t, worktrees])
 
   // The long, granular lists (settings fields, API keys, MCP servers, archived
   // chats) only surface once the user types — otherwise they'd bury the
@@ -471,13 +631,87 @@ export function CommandPalette() {
       })
     }
 
+    // Deep-link straight to a Capabilities sub-tab. The root "Go to" entry only
+    // lands on the top-level Skills view; typing "mcp"/"tools"/"skills" should
+    // jump to the exact tab (matches the "not just the top lvl" ask).
+    const capLabel = t.commandCenter.nav.skills.title
+
+    result.push({
+      heading: capLabel,
+      items: [
+        {
+          icon: Wrench,
+          id: 'cap-skills',
+          keywords: ['skills', 'capabilities'],
+          label: `${capLabel}: ${t.skills.tabSkills}`,
+          run: go(`${SKILLS_ROUTE}?tab=skills`)
+        },
+        {
+          icon: SlidersHorizontal,
+          id: 'cap-toolsets',
+          keywords: ['tools', 'toolsets', 'capabilities'],
+          label: `${capLabel}: ${t.skills.tabToolsets}`,
+          run: go(`${SKILLS_ROUTE}?tab=toolsets`)
+        },
+        {
+          icon: Layers3,
+          id: 'cap-mcp',
+          keywords: ['mcp', 'servers', 'tools', 'capabilities', 'model context protocol'],
+          label: `${capLabel}: ${t.skills.tabMcp}`,
+          run: go(`${SKILLS_ROUTE}?tab=mcp`)
+        }
+      ]
+    })
+
+    // Apply a theme directly from the root search (e.g. "nous" → Nous). Live
+    // preview via keepOpen, mirroring the nested theme picker. If the theme
+    // can't render the current light/dark mode, flip to the one it supports.
+    result.push({
+      heading: t.settings.appearance.themeTitle,
+      items: availableThemes.map(theme => ({
+        active: themeName === theme.name,
+        icon: Palette,
+        id: `search-theme-${theme.name}`,
+        keepOpen: true,
+        keywords: ['theme', 'appearance', 'color', 'skin', theme.name, theme.description],
+        label: theme.label,
+        run: () => {
+          setTheme(theme.name)
+
+          if (!themeSupportsMode(theme.name, resolvedMode)) {
+            setMode(resolvedMode === 'dark' ? 'light' : 'dark')
+          }
+        }
+      }))
+    })
+
+    // Switch light/dark/system directly (typing "dark" shouldn't require the
+    // nested color-mode page).
+    result.push({
+      heading: t.settings.appearance.colorMode,
+      items: THEME_MODES.map(entry => ({
+        active: mode === entry.mode,
+        icon: entry.icon,
+        id: `search-mode-${entry.mode}`,
+        keepOpen: true,
+        keywords: ['appearance', 'color mode', 'brightness', entry.mode, t.settings.modeOptions[entry.mode].label],
+        label: t.settings.modeOptions[entry.mode].label,
+        run: () => setMode(entry.mode)
+      }))
+    })
+
     if (sessions.length > 0) {
       result.push({
         heading: t.commandCenter.sections.sessions,
         items: sessions.map(session => ({
           icon: MessageCircle,
           id: `session-${session.id}`,
-          keywords: ['chat', 'session', ...(session.preview ? [session.preview] : [])],
+          keywords: [
+            'chat',
+            'session',
+            ...(session.preview ? [session.preview] : []),
+            ...(session.git_branch ? [session.git_branch] : [])
+          ],
           label: session.title,
           run: go(sessionRoute(session.id))
         }))
@@ -504,7 +738,7 @@ export function CommandPalette() {
           id: `mcp-${name}`,
           keywords: ['mcp', 'server', 'tool'],
           label: name,
-          run: go(`${SETTINGS_ROUTE}?tab=mcp&server=${encodeURIComponent(name)}`)
+          run: go(`${SKILLS_ROUTE}?tab=mcp&server=${encodeURIComponent(name)}`)
         }))
       })
     }
@@ -515,7 +749,13 @@ export function CommandPalette() {
         items: archivedSessions.map(session => ({
           icon: Archive,
           id: `archived-${session.id}`,
-          keywords: ['archived', 'chat', 'session', ...(session.preview ? [session.preview] : [])],
+          keywords: [
+            'archived',
+            'chat',
+            'session',
+            ...(session.preview ? [session.preview] : []),
+            ...(session.git_branch ? [session.git_branch] : [])
+          ],
           label: session.title,
           run: go(`${SETTINGS_ROUTE}?tab=sessions&session=${encodeURIComponent(session.id)}`)
         }))
@@ -523,7 +763,22 @@ export function CommandPalette() {
     }
 
     return result
-  }, [archivedSessions, configFieldLabel, go, mcpServers, search, sessions, settingsSectionLabel, t])
+  }, [
+    archivedSessions,
+    availableThemes,
+    configFieldLabel,
+    go,
+    mcpServers,
+    mode,
+    resolvedMode,
+    search,
+    sessions,
+    setMode,
+    setTheme,
+    settingsSectionLabel,
+    t,
+    themeName
+  ])
 
   const groups = useMemo(() => [...baseGroups, ...searchGroups], [baseGroups, searchGroups])
 
@@ -576,6 +831,7 @@ export function CommandPalette() {
           {
             heading: t.settings.appearance.colorMode,
             items: THEME_MODES.map(entry => ({
+              active: mode === entry.mode,
               icon: entry.icon,
               id: `mode-${entry.mode}`,
               keepOpen: true,
@@ -595,16 +851,17 @@ export function CommandPalette() {
       // Server-driven page: items come from the Marketplace, rendered by
       // <MarketplaceThemePage> (loader + live search + per-row install).
       'install-theme': {
-        title: t.commandCenter.installTheme.title,
+        title: t.commandCenter.installTheme.pageTitle,
         placeholder: t.commandCenter.installTheme.placeholder,
         groups: []
       }
     }),
-    [availableThemes, resolvedMode, setMode, setTheme, t, themeName]
+    [availableThemes, mode, resolvedMode, setMode, setTheme, t, themeName]
   )
 
   const activePage = page ? subPages[page] : null
-  const visibleGroups = activePage ? activePage.groups : groups
+  const unrankedGroups = activePage ? activePage.groups : groups
+  const visibleGroups = useMemo(() => rankGroups(unrankedGroups, search), [unrankedGroups, search])
   const placeholder = activePage ? activePage.placeholder : t.commandCenter.searchPlaceholder
 
   const handleSelect = (item: PaletteItem) => {
@@ -626,17 +883,17 @@ export function CommandPalette() {
     <DialogPrimitive.Root onOpenChange={setCommandPaletteOpen} open={open}>
       <DialogPrimitive.Portal>
         {/* Transparent overlay: keeps click-away + focus trap, but no dim/blur. */}
-        <DialogPrimitive.Overlay className="fixed inset-0 z-[200]" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-(--z-over-modal)" />
         <DialogPrimitive.Content
           aria-describedby={undefined}
           className={cn(
             HUD_POSITION,
             HUD_SURFACE,
-            'z-[210] w-[min(34rem,calc(100vw-2rem))] overflow-hidden duration-150 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:slide-in-from-top-2 data-[state=open]:zoom-in-95'
+            'z-(--z-over-modal-content) w-[min(34rem,calc(100vw-2rem))] overflow-hidden duration-150 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:slide-in-from-top-2 data-[state=open]:zoom-in-95'
           )}
         >
           <DialogPrimitive.Title className="sr-only">{t.commandCenter.paletteTitle}</DialogPrimitive.Title>
-          <Command className="bg-transparent" filter={paletteFilter} loop>
+          <Command className="bg-transparent" loop shouldFilter={false}>
             {activePage && (
               <button
                 className="flex w-full items-center gap-1.5 border-b border-border px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
@@ -674,12 +931,22 @@ export function CommandPalette() {
             <CommandList className="dt-portal-scrollbar max-h-[min(20rem,56vh)]">
               {/* Server-driven pages render their own list; the rest show groups. */}
               {page === 'pets' ? (
-                <PetPalettePage onGenerate={() => { closeCommandPalette(); openPetGenerate() }} search={search} />
+                <PetPalettePage
+                  onGenerate={() => {
+                    closeCommandPalette()
+                    openPetGenerate()
+                  }}
+                  search={search}
+                />
               ) : page === 'install-theme' ? (
                 <MarketplaceThemePage onPickTheme={setTheme} search={search} />
               ) : (
                 <>
-                  <CommandEmpty>{t.commandCenter.noResults}</CommandEmpty>
+                  {/* Filtering happens in rankGroups, so cmdk's own CommandEmpty
+                      (keyed to its internal filter count) would never fire. */}
+                  {visibleGroups.length === 0 && (
+                    <div className="py-6 text-center text-sm text-muted-foreground">{t.commandCenter.noResults}</div>
+                  )}
                   {visibleGroups.map((group, index) => (
                     <CommandGroup
                       className={HUD_HEADING}
@@ -696,7 +963,7 @@ export function CommandPalette() {
                             key={item.id}
                             keywords={item.keywords}
                             onSelect={() => handleSelect(item)}
-                            value={`${item.label} ${item.keywords?.join(' ') ?? ''} ${item.id}`}
+                            value={paletteValue(item)}
                           >
                             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
                             <span className="truncate">{item.label}</span>
@@ -704,6 +971,11 @@ export function CommandPalette() {
                             {item.to && (
                               <ChevronRight
                                 className={cn('size-3.5 shrink-0 text-muted-foreground/70', !combo && 'ml-auto')}
+                              />
+                            )}
+                            {item.active && (
+                              <Check
+                                className={cn('size-3.5 shrink-0 text-primary', !combo && !item.to && 'ml-auto')}
                               />
                             )}
                           </CommandItem>
