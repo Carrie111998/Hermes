@@ -1,9 +1,124 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import sqlite3
 from pathlib import Path
 
 from hermes_cli import agents_os
+
+
+def test_legacy_task_foreign_keys_are_repaired_without_data_loss(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    paths = agents_os.resolve_paths(None)
+    paths.root.mkdir(parents=True)
+    with sqlite3.connect(paths.db) as conn:
+        conn.executescript("""
+            CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+                workflow TEXT, priority INTEGER NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, notes TEXT NOT NULL, route TEXT, approval_required INTEGER NOT NULL);
+            INSERT INTO tasks VALUES ('task-legacy','Legacy','pending',NULL,3,'now','now','',NULL,0);
+            CREATE TABLE approvals (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+                risk TEXT NOT NULL, task_id TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+                resolved_at TEXT, FOREIGN KEY(task_id) REFERENCES "tasks_legacy_v1"(id));
+            CREATE TABLE artifacts (id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+                path TEXT NOT NULL, task_id TEXT, workflow TEXT, created_at TEXT NOT NULL, run_id TEXT,
+                FOREIGN KEY(task_id) REFERENCES "tasks_legacy_v1"(id));
+            CREATE TABLE events (id TEXT PRIMARY KEY, task_id TEXT, run_id TEXT, event_type TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES "tasks_legacy_v1"(id));
+            CREATE TABLE runs (id TEXT PRIMARY KEY, task_id TEXT, workflow TEXT NOT NULL, status TEXT NOT NULL,
+                input TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT,
+                FOREIGN KEY(task_id) REFERENCES "tasks_legacy_v1"(id));
+            CREATE TABLE reviews (id TEXT PRIMARY KEY, task_id TEXT, run_id TEXT, status TEXT NOT NULL,
+                kind TEXT NOT NULL, reviewer TEXT NOT NULL, notes TEXT NOT NULL, created_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES "tasks_legacy_v1"(id));
+            INSERT INTO approvals VALUES ('approval-legacy','Legacy','pending','normal','task-legacy','','now',NULL);
+            INSERT INTO artifacts VALUES ('artifact-legacy','test','Legacy','/tmp/legacy','task-legacy',NULL,'now',NULL);
+            INSERT INTO events VALUES ('event-legacy','task-legacy',NULL,'legacy','{}','now');
+            INSERT INTO runs VALUES ('run-legacy','task-legacy','test','created','','now',NULL);
+            INSERT INTO reviews VALUES ('review-legacy','task-legacy','run-legacy','pending','general','','','now');
+        """)
+
+    with agents_os.connect(paths) as conn:
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        for table in ("approvals", "events", "runs", "reviews"):
+            assert {row[2] for row in conn.execute(f"PRAGMA foreign_key_list({table})")} == {"tasks"}
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+        assert conn.execute("PRAGMA foreign_key_list(artifacts)").fetchall() == []
+        assert conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 1
+
+    result = agents_os.AgentsOSService(paths).automation_intake_payload({
+        "schema_version": "automation-intake.v0",
+        "source": "legacy-repair-test",
+        "event_id": "one",
+        "goal": "Verify repaired foreign keys accept a safe local intake",
+        "callback": {"type": "local_file"},
+    })
+    assert result["status"] == "created"
+
+
+def test_approval_cli_resolution_updates_linked_task(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    assert agents_os.main(["--vault-root", str(vault), "init", "--no-vault"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "run", "external-action-draft", "approval payload", "--task-id", "task-cli-approval"]) == 0
+    created = _json_out(capsys)
+
+    assert agents_os.main(["--vault-root", str(vault), "approval", "set", created["approval_id"], "approved", "--notes", "operator approved"]) == 0
+    capsys.readouterr()
+    with agents_os.connect(agents_os.resolve_paths(None)) as conn:
+        task = conn.execute("SELECT * FROM tasks WHERE id='task-cli-approval'").fetchone()
+        event = conn.execute("SELECT * FROM events WHERE task_id='task-cli-approval' AND event_type='approval_resolved'").fetchone()
+    assert task["status"] == "ready"
+    assert task["approval_required"] == 0
+    assert event is not None
+
+
+def test_dashboard_counts_all_tasks_beyond_preview_limit(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    assert agents_os.main(["--vault-root", str(vault), "init", "--no-vault"]) == 0
+    capsys.readouterr()
+    for index in range(25):
+        assert agents_os.main(["--vault-root", str(vault), "task", "add", f"Task {index}", "--id", f"task-{index}"]) == 0
+        capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "dashboard", "--json"]) == 0
+    dashboard = _json_out(capsys)
+    assert dashboard["queue_summary"]["open_tasks"] == 25
+    assert len(dashboard["tasks"]) == 20
+
+
+def test_automation_concurrent_dedup_and_external_gate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    assert agents_os.main(["--vault-root", str(vault), "init", "--no-vault"]) == 0
+    capsys.readouterr()
+    service = agents_os.AgentsOSService(agents_os.resolve_paths(None))
+    payload = {
+        "schema_version": "automation-intake.v0",
+        "source": "pytest-concurrency",
+        "event_id": "same-event",
+        "goal": "Create exactly one concurrent automation intake",
+        "callback": {"type": "local_file"},
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: service.automation_intake_payload(payload), range(6)))
+    assert sum(item["status"] == "created" for item in results) == 1
+    assert sum(item["status"] == "deduped" for item in results) == 5
+    external = service.automation_intake_payload({
+        **payload,
+        "source": "pytest-webhook",
+        "event_id": "external-event",
+        "goal": "Prepare a webhook callback approval draft",
+        "callback": {"type": "webhook", "approval_required": True},
+    })
+    assert external["status"] == "created"
+    assert external["approval_required"] is True
 
 
 def _json_out(capsys):
@@ -20,7 +135,7 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
 
     assert agents_os.main(["--vault-root", str(vault), "doctor", "--json"]) == 0
     doctor = _json_out(capsys)
-    assert doctor["checks"]["schema_version"] == "3"
+    assert doctor["checks"]["schema_version"] == "6"
     assert doctor["checks"]["orphan_records"] == 0
     assert doctor["checks"]["policy_home_isolated"] is True
 
@@ -65,10 +180,13 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
     assert route["execution_allowed"] is True
     assert route["assigned_agent"] == "local-agent"
 
-    assert agents_os.main(["--vault-root", str(vault), "execute", "task-proof", "--json"]) == 0
+    assert agents_os.main(["--vault-root", str(vault), "execute", "task-proof", "--json"]) == 2
     executed = _json_out(capsys)
-    assert executed["status"] == "succeeded"
-    assert Path(executed["log_path"]).exists()
+    assert executed == {"task_id": "task-proof", "status": "blocked", "reason": "runtime_required"}
+    assert agents_os.main(["--vault-root", str(vault), "task", "set", "task-proof", "in_progress"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "task", "set", "task-proof", "review"]) == 0
+    capsys.readouterr()
 
     assert agents_os.main(["--vault-root", str(vault), "review", "request", "task-proof", "--kind", "spec", "--json"]) == 0
     review = _json_out(capsys)
@@ -96,7 +214,7 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
         "completed_tasks": 1,
         "pending_approvals": 1,
         "failed_executions": 0,
-        "stale_drafts": 1,
+        "stale_drafts": 2,
         "action_required": 2,
     }
     assert dashboard["tasks"][0]["id"] == "task-blocked"
@@ -104,17 +222,16 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
     assert dashboard["reviews"][0]["status"] == "approved"
     assert dashboard["snapshots"][0]["label"] == "baseline"
     run_kinds = {(run["task_id"], run["status"]): run["kind"] for run in dashboard["runs"]}
-    assert run_kinds[("task-proof", "created")] == "draft_superseded"
-    assert run_kinds[("task-proof", "succeeded")] == "execution"
+    assert run_kinds[("task-proof", "created")] == "draft"
     assert run_kinds[("task-approval", "created")] == "draft"
     dashboard_text = Path(dashboard["dashboard_path"]).read_text(encoding="utf-8")
     assert "## Queue summary" in dashboard_text
     assert "action_required: 2" in dashboard_text
     assert "pending_approvals: 1" in dashboard_text
-    assert "stale_drafts: 1" in dashboard_text
-    assert "kind=draft_superseded" in dashboard_text
+    assert "stale_drafts: 2" in dashboard_text
     assert "kind=draft" in dashboard_text
-    assert "kind=execution" in dashboard_text
+    assert "kind=draft" in dashboard_text
+    assert "kind=draft" in dashboard_text
     assert "## Agent registry" in dashboard_text
     assert "## Review gateovi" in dashboard_text
     assert "## Snapshoti" in dashboard_text
@@ -127,12 +244,12 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
     service = agents_os.AgentsOSService(agents_os.resolve_paths(None))
     status = service.status_payload()
     assert status["status"] == "ok"
-    assert status["schema_version"] == "3"
+    assert status["schema_version"] == "6"
 
     assert agents_os.main(["--vault-root", str(vault), "service", "status", "--json"]) == 0
     service_cli = _json_out(capsys)
     assert service_cli["status"] == "ok"
-    assert service_cli["schema_version"] == "3"
+    assert service_cli["schema_version"] == "6"
 
     assert agents_os.main(["--vault-root", str(vault), "docs", "--json"]) == 0
     docs = _json_out(capsys)
@@ -140,7 +257,7 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
     assert set(docs["docs"].keys()) == {"runtime", "command_reference", "recovery_runbook", "safety_policy"}
     text = Path(docs["docs_path"]).read_text(encoding="utf-8")
     assert "Agents OS" in text
-    assert "schema_version: 3" in text
+    assert "schema_version: 6" in text
     for path in docs["docs"].values():
         assert Path(path).exists()
 
@@ -156,8 +273,12 @@ def test_agents_os_close_requires_evidence_or_approved_review(tmp_path, monkeypa
     capsys.readouterr()
     assert agents_os.main(["--vault-root", str(vault), "route", "task-close", "--json"]) == 0
     capsys.readouterr()
-    assert agents_os.main(["--vault-root", str(vault), "execute", "task-close", "--json"]) == 0
-    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "execute", "task-close", "--json"]) == 2
+    blocked = _json_out(capsys)
+    assert blocked["reason"] == "runtime_required"
+    with agents_os.connect(agents_os.resolve_paths(None)) as conn:
+        conn.execute("UPDATE tasks SET status='review',updated_at=? WHERE id='task-close'", (agents_os.utc_now(),))
+        conn.commit()
 
     assert agents_os.main(["--vault-root", str(vault), "close", "task-close", "--json"]) == 2
     rejected = _json_out(capsys)

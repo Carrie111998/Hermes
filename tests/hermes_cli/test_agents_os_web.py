@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 from pathlib import Path
@@ -8,12 +9,16 @@ from hermes_cli import agents_os, agents_os_web
 from hermes_cli.agents_os import AgentsOSService, connect, log_event, resolve_paths, utc_now
 from hermes_cli.agents_os_web import (
     agents_registry_payload,
+    automation_inbox_payload,
     approval_detail_payload,
     artifact_detail_payload,
     artifacts_payload,
     board_meeting_schema_payload,
     create_idea_action,
     draft_board_meeting_action,
+    draft_workflow_factory_action,
+    governance_action_payload,
+    governance_status_payload,
     jarvis_briefing_payload,
     jarvis_model_advisor_payload,
     jarvis_preview_payload,
@@ -33,7 +38,134 @@ from hermes_cli.agents_os_web import (
     task_detail_payload,
     tasks_payload,
     voice_status_payload,
+    workflow_factory_schema_payload,
 )
+
+
+def test_automation_bridge_create_dedup_reject_and_approval_gate(agents_home):
+    paths = resolve_paths(None)
+    service = AgentsOSService(paths)
+    payload = {
+        "schema_version": "automation-intake.v0",
+        "source": "pytest",
+        "event_id": "automation-safe-1",
+        "goal": "Create a safe local Automation Bridge proof artifact",
+        "approval_policy": "safe_local_only",
+        "callback": {"type": "local_file"},
+    }
+
+    created = service.automation_intake_payload(payload)
+    assert created["status"] == "created"
+    assert created["exit_code"] == 0
+    assert created["approval_required"] is False
+    assert Path(created["artifact_path"]).exists()
+
+    deduped = service.automation_intake_payload(payload)
+    assert deduped["status"] == "deduped"
+    assert deduped["deduped"] is True
+    assert deduped["task_id"] == created["task_id"]
+
+    rejected = service.automation_intake_payload({"schema_version": "wrong"})
+    assert rejected["status"] == "rejected"
+    assert rejected["exit_code"] == 2
+    assert rejected["errors"]
+
+    gated = service.automation_intake_payload(
+        {**payload, "event_id": "automation-gated-1", "approval_policy": "approval_required"}
+    )
+    assert gated["status"] == "created"
+    assert gated["approval_required"] is True
+    with connect(paths) as conn:
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (gated["task_id"],)).fetchone()
+        approvals = conn.execute("SELECT * FROM approvals WHERE task_id=?", (gated["task_id"],)).fetchall()
+    assert task["status"] == "needs_approval"
+    assert len(approvals) == 1
+    assert approvals[0]["status"] == "pending"
+
+    inbox = automation_inbox_payload(paths)
+    assert inbox["count"] == 2
+    assert inbox["external_callbacks_executed"] is False
+    assert inbox["contract"]["dedup_key"] == "source:event_id"
+
+
+def test_automation_intake_http_route_maps_rejection_to_400_and_created_to_200(agents_home, monkeypatch):
+    service = AgentsOSService(resolve_paths(None))
+    captured = {}
+
+    monkeypatch.setattr(agents_os_web, "_read_json_body", lambda handler: {"schema_version": "wrong"})
+
+    def fake_send_json(handler, payload, status=200):
+        captured["payload"] = payload
+        captured["status"] = status
+
+    monkeypatch.setattr(agents_os_web, "_send_json", fake_send_json)
+    handler = object.__new__(agents_os_web.MissionControlHandler)
+    handler.path = "/api/automation/intake"
+    handler.service = service
+
+    handler.do_POST()
+
+    assert captured["status"] == 400
+    assert captured["payload"]["status"] == "rejected"
+
+    monkeypatch.setattr(
+        agents_os_web,
+        "_read_json_body",
+        lambda handler: {
+            "schema_version": "automation-intake.v0",
+            "source": "pytest-http",
+            "event_id": "automation-http-1",
+            "goal": "Create a safe local HTTP route proof artifact",
+            "callback": {"type": "local_file"},
+        },
+    )
+    captured.clear()
+
+    handler.do_POST()
+
+    assert captured["status"] == 200
+    assert captured["payload"]["status"] == "created"
+
+
+def test_automation_inbox_ui_wires_submit_and_refresh_controls(agents_home):
+    html = mission_control_html(AgentsOSService(resolve_paths(None)))
+
+    for marker in (
+        'data-tab="automation"',
+        'id="automation"',
+        'id="automationPayload"',
+        'id="submitAutomationPayload"',
+        'id="refreshAutomationInbox"',
+        'id="automationResult"',
+        'id="automationPayloadView"',
+        'id="automationList"',
+        "$('#submitAutomationPayload').addEventListener('click', submitAutomationPayload);",
+        "$('#refreshAutomationInbox').addEventListener('click', refreshAutomationInbox);",
+    ):
+        assert marker in html
+
+
+def test_safety_endpoint_alias_returns_dashboard_safety_payload(agents_home, monkeypatch):
+    service = AgentsOSService(resolve_paths(None))
+    captured = {}
+
+    def fake_send_json(handler, payload, status=200):
+        captured["payload"] = payload
+        captured["status"] = status
+
+    monkeypatch.setattr(agents_os_web, "_send_json", fake_send_json)
+    handler = object.__new__(agents_os_web.MissionControlHandler)
+    handler.path = "/api/safety"
+    handler.service = service
+
+    handler.do_GET()
+
+    assert captured["status"] == 200
+    assert captured["payload"]["gateway_restart"] is False
+    assert captured["payload"]["network_side_effects"] is False
+    assert "credential_scan" in captured["payload"]
+    assert captured["payload"]["credential_scan"]["status"] == "not_run_from_web"
+    assert captured["payload"]["doctor"]["checks"]["schema_current"] is True
 
 
 @pytest.fixture()
@@ -44,6 +176,26 @@ def agents_home(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTS_OS_VAULT_ROOT", str(tmp_path / "vault"))
     agents_os.main(["init", "--no-vault"])
     return home
+
+
+def test_web_module_json_launcher_is_fast_path_without_main_cli_imports(agents_home, capsys):
+    code = agents_os_web.main(["--host", "127.0.0.1", "--port", "18791", "--json"])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ready"
+    assert payload["url"] == "http://127.0.0.1:18791"
+    assert payload["local_only"] is True
+    assert payload["gateway_restart"] is False
+
+
+def test_web_cmd_json_launcher_keeps_legacy_argparse_contract(agents_home, capsys):
+    args = argparse.Namespace(host="127.0.0.1", port=18791, open=False, json=True)
+    code = agents_os_web.web_cmd(args)
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["url"] == "http://127.0.0.1:18791"
 
 
 def test_root_html_contains_operator_tabs_and_bootstrap_payload(agents_home):
@@ -60,7 +212,7 @@ def test_root_html_contains_operator_tabs_and_bootstrap_payload(agents_home):
         "Operator Loop",
         "Media Studio",
         "Manage / Status",
-        "Voice / Jarvis",
+        "Doni",
     ]:
         assert label in html
     assert "/api/idea-factory/draft" in html
@@ -75,7 +227,7 @@ def test_root_html_contains_operator_tabs_and_bootstrap_payload(agents_home):
     assert "showApprovalDetail(approvals.items[0].id)" in html
     assert "vault/reference graph, not runtime memory merge" in html
     assert "Local-only operator cockpit" in html
-    assert "Doni" not in html
+    assert "Hermes / Doni" in html
 
 
 def test_idea_factory_schema_and_draft_payloads_are_local_only(agents_home):
@@ -88,6 +240,50 @@ def test_idea_factory_schema_and_draft_payloads_are_local_only(agents_home):
     assert draft["approval_required"] is True
     assert draft["risk_class"] == "public_gated"
     assert draft["execution_created"] is False
+
+
+def test_workflow_factory_schema_is_local_only_draft_only(agents_home):
+    schema = workflow_factory_schema_payload(resolve_paths(None))
+
+    assert schema["local_only"] is True
+    assert schema["execution_created"] is False
+    assert schema["external_calls"] is False
+    assert schema["mutation_scope"] == "local_artifact_only"
+    assert "input_text" in schema["fields"]
+    assert "gateway_restart" in schema["approval_gates"]
+
+
+def test_workflow_factory_draft_classifies_agent_runtime_and_writes_artifact(agents_home):
+    service = AgentsOSService(resolve_paths(None))
+    result = draft_workflow_factory_action(
+        service,
+        {"input_text": "Agent OS: dodaj read-only proof panel bez gateway restarta"},
+    )
+
+    assert result["status"] == "drafted"
+    assert result["local_only"] is True
+    assert result["execution_created"] is False
+    assert result["task_created"] is False
+    assert result["external_calls"] is False
+    assert result["capability_bucket"] == "agent_runtime"
+    assert result["approval_required"] is True
+    assert "gateway_restart" in result["approval_gates"]
+    artifact_path = Path(result["artifact_path"])
+    assert artifact_path.exists()
+    assert "Workflow Factory Draft" in artifact_path.read_text(encoding="utf-8")
+    with connect(resolve_paths(None)) as conn:
+        artifact = conn.execute("SELECT * FROM artifacts WHERE id=?", (result["artifact_id"],)).fetchone()
+    assert artifact["kind"] == "workflow_factory"
+
+
+def test_workflow_factory_draft_video_stays_safe_local(agents_home):
+    service = AgentsOSService(resolve_paths(None))
+    result = draft_workflow_factory_action(service, {"source_url": "https://youtu.be/q13OqknCh-c"})
+
+    assert result["input_type"] == "video"
+    assert result["capability_bucket"] == "source_ingest"
+    assert result["approval_required"] is False
+    assert result["execution_created"] is False
 
 
 def test_board_meeting_schema_is_local_only_and_approval_gated(agents_home):
@@ -174,14 +370,13 @@ def test_agent_registry_payload_includes_boundaries(agents_home):
 
     assert {"local-agent", "coding-delegate", "separate-profile", "external-reference-runtime"}.issubset(ids)
     local_agent = next(agent for agent in payload["agents"] if agent["id"] == "local-agent")
-    assert local_agent["memory_boundary"] == "profile-local Hermes home only"
+    assert "shared registry" in local_agent["memory_boundary"]
     assert "gateway restart" in " ".join(local_agent["approval_gates"])
     dumped = json.dumps(payload, ensure_ascii=False)
-    assert "Doni" not in dumped
     assert "Goran" not in dumped
     assert "Marija" not in dumped
     assert "ERO" not in dumped
-    assert "OpenClaw" not in dumped
+    assert {"codex", "claude", "openclaw"}.issubset(ids)
     assert "/home/goran" not in dumped
     assert "/mnt/d" not in dumped
 
@@ -240,7 +435,9 @@ def test_artifacts_media_operator_manage_voice_payloads_are_redacted_and_read_on
     assert jarvis["always_on_microphone"] is False
     assert jarvis["wake_word_enabled"] is False
     assert jarvis["computer_control"] == "approval_gated_unexecuted"
-    assert {command["name"] for command in jarvis["commands"]} == {"wake", "show", "build", "act"}
+    command_names = {command["name"] for command in jarvis["commands"]}
+    assert {"wake", "show", "build", "act"}.issubset(command_names)
+    assert {"rundown", "show tasks", "open Google", "SEO keyword ideas", "build website"}.issubset(command_names)
     assert jarvis["briefing"]["artifact_count"] >= 1
     assert "cross_agent_memory_merge" in jarvis["approval_gates"]
     assert operator["judge_status"] in {"pending", "ready"}
@@ -320,9 +517,9 @@ def test_detail_visibility_payloads_are_read_only_and_bounded(agents_home):
     assert task["approvals"][0]["payload_preview"] == "[redacted-sensitive-preview]"
     assert task["runs"][0]["input_preview"] == "[redacted-sensitive-preview]"
     assert task["events"][0]["payload_preview"] == "[redacted-sensitive-preview]"
-    assert approval["resolution_enabled"] is False
+    assert approval["resolution_enabled"] is True
     assert approval["approval"]["payload_preview"] == "[redacted-sensitive-preview]"
-    assert "approve" in approval["blocked_actions"]
+    assert "execute_without_resolution" in approval["blocked_actions"]
     assert approval["risk_taxonomy"]["deterministic"] is True
     assert run["read_only"] is True
     assert run["run"]["input_preview"] == "[redacted-sensitive-preview]"
@@ -568,16 +765,183 @@ def test_jarvis_reply_can_prepare_hume_octave_request_draft_without_api_call(age
     assert payload["hume_octave_request"]["format"]["type"] == "mp3"
 
 
-def test_root_html_contains_jarvis_oracle_briefing_panel(agents_home):
+def test_root_html_contains_doni_companion_panel(agents_home):
     service = AgentsOSService(resolve_paths(None))
     html = mission_control_html(service)
 
-    assert "Jarvis / Oracle Briefing" in html
+    assert "Doni / Osobni asistent" in html
+    assert "Voice / Jarvis" not in html
+    assert "Jarvis / Oracle Briefing" not in html
+    assert "Napiši poruku Doniju" in html
     assert "Record command" in html
     assert "Command Preview" in html
-    assert "/api/jarvis/briefing" in html
-    assert "/api/jarvis/transcribe" in html
-    assert "/api/jarvis/preview" in html
-    assert "/api/jarvis/reply" in html
+    assert "/api/doni/briefing" in html
+    assert "/api/doni/transcribe" in html
+    assert "/api/doni/preview" in html
+    assert "/api/doni/reply" in html
     assert "Voice Reply" in html
     assert "wake/show/build/act" in html
+
+
+def test_doni_facade_keeps_legacy_jarvis_routes_compatible(agents_home, monkeypatch):
+    service = AgentsOSService(resolve_paths(None))
+    captured = {}
+
+    def fake_send_json(handler, payload, status=200):
+        captured["payload"] = payload
+        captured["status"] = status
+
+    monkeypatch.setattr(agents_os_web, "_send_json", fake_send_json)
+    handler = object.__new__(agents_os_web.MissionControlHandler)
+    handler.service = service
+
+    handler.path = "/api/doni/briefing"
+    handler.do_GET()
+    doni = captured["payload"]
+    assert captured["status"] == 200
+
+    handler.path = "/api/jarvis/briefing"
+    handler.do_GET()
+    legacy = captured["payload"]
+    assert captured["status"] == 200
+    assert doni == legacy
+
+    monkeypatch.setattr(
+        agents_os_web,
+        "_read_json_body",
+        lambda _handler: {"transcript_text": "Prikaži lokalni status"},
+    )
+    handler.path = "/api/doni/preview"
+    handler.do_POST()
+    assert captured["status"] == 200
+    assert captured["payload"]["execution_created"] is False
+
+
+def test_doni_companion_proxy_locks_identity_context_and_turn_contract(agents_home, monkeypatch):
+    service = AgentsOSService(resolve_paths(None))
+    captured = {}
+    calls = []
+
+    def fake_send_json(handler, payload, status=200):
+        captured["payload"] = payload
+        captured["status"] = status
+
+    def fake_companion_request(path, *, method="GET", data=None, timeout_seconds=45.0):
+        calls.append({"path": path, "method": method, "data": data, "timeout": timeout_seconds})
+        base = {
+            "schema_version": "1.0",
+            "assistant_identity": "doni",
+            "memory_authority": "canonical-doni-runtime",
+            "runtime_boot_id": "runtime-test",
+        }
+        if path == "/v1/companion/sessions":
+            return {**base, "session_id": "voice_test"}
+        return {
+            **base,
+            "session_id": "voice_test",
+            "turn_id": data["turn_id"],
+            "run_id": "run-test",
+            "status": "started",
+        }
+
+    monkeypatch.setattr(agents_os_web, "_send_json", fake_send_json)
+    monkeypatch.setattr(agents_os_web, "doni_companion_json_request", fake_companion_request)
+    monkeypatch.setattr(agents_os_web, "_read_json_body", lambda _handler: {})
+    handler = object.__new__(agents_os_web.MissionControlHandler)
+    handler.service = service
+
+    handler.path = "/api/doni/sessions"
+    handler.do_POST()
+    assert captured["status"] == 201
+    assert captured["payload"]["assistant_identity"] == "doni"
+    assert calls[-1]["data"] == {
+        "schema_version": "1.0",
+        "client": "doni-live-companion",
+        "profile_id": "doni",
+        "user_id": "goran",
+        "locale": "hr-HR",
+        "context_policy": "goran_voice_v1",
+    }
+
+    monkeypatch.setattr(agents_os_web, "_read_json_body", lambda _handler: {"text": "Koji je sljedeći korak?"})
+    handler.path = "/api/doni/sessions/voice_test/turns"
+    handler.do_POST()
+    assert captured["status"] == 202
+    turn = calls[-1]["data"]
+    assert calls[-1]["path"] == "/v1/companion/sessions/voice_test/turns"
+    assert turn["idempotency_key"] == turn["turn_id"]
+    assert turn["locale"] == "hr-HR"
+    assert turn["input"] == {"type": "text", "text": "Koji je sljedeći korak?"}
+    assert turn["response"]["style"] == "voice_concise"
+
+
+def test_primary_doni_chat_uses_companion_session_not_action_command(agents_home):
+    html = mission_control_html(AgentsOSService(resolve_paths(None)))
+    send_block = html.split("async function sendJarvisMessage()", 1)[1].split(
+        "async function createJarvisCommand()", 1
+    )[0]
+
+    assert "/api/doni/sessions" in send_block
+    assert "/api/doni/commands" not in send_block
+    assert "assistant_identity" in html
+    assert "canonical-doni-runtime" in html
+
+
+def test_governance_system_map_buttons_are_active_safe_local_controls(agents_home):
+    paths = resolve_paths(None)
+    service = AgentsOSService(paths)
+    html = mission_control_html(service)
+
+    assert "Governance / System Map" in html
+    assert "/api/governance/action" in html
+    assert "Preview governance artifact" in html
+    assert "Draft approval:" in html
+    assert "Create local E2E proof task" in html
+    assert "read-only showroom" not in html.lower()
+    assert "loadAllPromise" in html
+    assert "scheduleRefresh" in html
+    assert "setInterval(() => loadAll" not in html
+
+    gov = governance_status_payload(paths)
+    assert gov["local_only"] is True
+    assert gov["execution_created"] is False
+    assert len(gov["artifacts"]) >= 1
+
+    preview = governance_action_payload(paths, {"action": "artifact_preview", "artifact_id": gov["artifacts"][0]["id"]})
+    assert preview["local_only"] is True
+    assert preview["execution_created"] is False
+    assert preview["status"] in {"preview_ready", "not_found"}
+
+
+def test_governance_gated_button_creates_pending_approval_not_execution(agents_home):
+    paths = resolve_paths(None)
+
+    result = governance_action_payload(paths, {"action": "gated_approval_draft", "label": "deploy / public publish"})
+
+    assert result["status"] == "approval_drafted"
+    assert result["local_only"] is True
+    assert result["execution_created"] is False
+    assert result["external_calls"] is False
+    assert result["approval_id"].startswith("approval-gov-")
+    assert result["task_id"].startswith("task-gov-")
+    assert Path(result["artifact_path"]).exists()
+
+    approval = approval_detail_payload(paths, result["approval_id"])
+    assert approval["status"] == "ok"
+    assert approval["approval"]["status"] == "pending"
+    assert approval["resolution_enabled"] is True
+
+
+def test_governance_local_e2e_button_creates_safe_local_task(agents_home):
+    paths = resolve_paths(None)
+
+    result = governance_action_payload(paths, {"action": "create_local_e2e_task", "label": "Create local E2E proof task"})
+
+    assert result["status"] == "local_task_created"
+    assert result["local_only"] is True
+    assert result["execution_created"] is False
+    assert result["approval_id"] is None
+    task = task_detail_payload(paths, result["task_id"])
+    assert task["status"] == "ok"
+    assert task["task"]["approval_required"] is False
+    assert task["task"]["status"] == "pending"

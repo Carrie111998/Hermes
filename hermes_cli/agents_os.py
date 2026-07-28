@@ -55,8 +55,10 @@ SAFE_WORKFLOWS = {
     },
 }
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "6"
 _SERVICE_COMMAND_STDOUT_LOCK = threading.RLock()
+_DB_INIT_LOCK = threading.RLock()
+_INITIALIZED_DBS: set[str] = set()
 TASK_STATUSES = (
     "new",
     "pending",
@@ -103,6 +105,23 @@ AGENTS_OS_TABLES = {
     "routing_rules",
     "reviews",
     "state_snapshots",
+    "automation_intakes",
+    "runtime_executions",
+    "jarvis_commands",
+    "jarvis_command_events",
+    "jarvis_feedback_candidates",
+    "memory_objects",
+    "memory_provenance",
+    "memory_candidates",
+    "board_meetings",
+    "board_proposals",
+    "board_challenges",
+    "board_recommendations",
+    "board_decisions",
+    "board_memory_candidates",
+    "board_shared_memory",
+    "company_projects",
+    "company_ideas",
 }
 WORKFLOW_TEXT_COLUMNS = {
     "route",
@@ -266,7 +285,22 @@ CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, created_at);
+CREATE TABLE IF NOT EXISTS automation_intakes (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    artifact_path TEXT NOT NULL,
+    approval_required INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(source, event_id)
+);
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_automation_source_event ON automation_intakes(source, event_id);
 """
 
 def _quote_sql_identifier(identifier: str, *, allowed: set[str] | None = None) -> str:
@@ -314,6 +348,10 @@ def _rebuild_legacy_tasks_table_if_needed(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()
     if not row or "needs_approval" in (row[0] or ""):
         return
+    # Prevent modern SQLite from rewriting child-table foreign keys to the
+    # temporary table name.  Migrations run with foreign_keys disabled and
+    # validate the repaired schema before normal connections enable them.
+    conn.execute("PRAGMA legacy_alter_table=ON")
     conn.execute("ALTER TABLE tasks RENAME TO tasks_legacy_v1")
     conn.execute("""
         CREATE TABLE tasks (
@@ -334,11 +372,79 @@ def _rebuild_legacy_tasks_table_if_needed(conn: sqlite3.Connection) -> None:
         SELECT id,title,status,workflow,priority,created_at,updated_at,notes FROM tasks_legacy_v1
     """)
     conn.execute("DROP TABLE tasks_legacy_v1")
+    conn.execute("PRAGMA legacy_alter_table=OFF")
+
+
+_TASK_FK_REPAIR_DDL = {
+    "approvals": """CREATE TABLE approvals (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','cancelled')),
+        risk TEXT NOT NULL DEFAULT 'normal', task_id TEXT,
+        payload TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, resolved_at TEXT,
+        FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+    "artifacts": """CREATE TABLE artifacts (
+        id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL, path TEXT NOT NULL,
+        task_id TEXT, workflow TEXT, created_at TEXT NOT NULL, run_id TEXT)""",
+    "events": """CREATE TABLE events (
+        id TEXT PRIMARY KEY, task_id TEXT, run_id TEXT, event_type TEXT NOT NULL,
+        payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+        FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+    "runs": """CREATE TABLE runs (
+        id TEXT PRIMARY KEY, task_id TEXT, workflow TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'created' CHECK(status IN ('created','queued','running','succeeded','failed','blocked','needs_review')),
+        input TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, completed_at TEXT,
+        FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+    "reviews": """CREATE TABLE reviews (
+        id TEXT PRIMARY KEY, task_id TEXT, run_id TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','changes_requested','rejected','cancelled')),
+        kind TEXT NOT NULL DEFAULT 'general', reviewer TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+        FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+}
+
+
+def _repair_legacy_task_foreign_keys(conn: sqlite3.Connection) -> None:
+    """Repair SQLite child tables rewritten to a dropped migration table.
+
+    Older Agents OS builds renamed ``tasks`` while modern SQLite automatically
+    rewrote dependent foreign keys to ``tasks_legacy_v1``.  Rebuild only the
+    affected tables, copying every shared column and preserving every row.
+    """
+    affected = []
+    for table in _TASK_FK_REPAIR_DDL:
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if row and "tasks_legacy_v1" in (row[0] or ""):
+            affected.append(table)
+    if not affected:
+        return
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        for table in affected:
+            legacy = f"{table}_legacy_fk_v4"
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (legacy,)).fetchone():
+                raise sqlite3.IntegrityError(f"refusing to overwrite migration recovery table: {legacy}")
+            conn.execute(f'ALTER TABLE "{table}" RENAME TO "{legacy}"')
+            conn.execute(_TASK_FK_REPAIR_DDL[table])
+            old_columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{legacy}")').fetchall()}
+            new_columns = [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            shared = [column for column in new_columns if column in old_columns]
+            quoted = ",".join(f'"{column}"' for column in shared)
+            conn.execute(f'INSERT INTO "{table}" ({quoted}) SELECT {quoted} FROM "{legacy}"')
+            conn.execute(f'DROP TABLE "{legacy}"')
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+        CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, created_at);
+    """)
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _rebuild_legacy_tasks_table_if_needed(conn)
+    _repair_legacy_task_foreign_keys(conn)
     task_cols = _table_columns(conn, "tasks")
     if "route" not in task_cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN route TEXT")
@@ -371,6 +477,16 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'general'")
     if "reviewer" not in review_cols:
         conn.execute("ALTER TABLE reviews ADD COLUMN reviewer TEXT NOT NULL DEFAULT ''")
+    # v6 services own their append-only tables, but the core migration makes
+    # them available consistently to CLI, web and importable service callers.
+    from hermes_cli.agents_os_commands import ensure_schema as ensure_command_schema
+    from hermes_cli.agents_os_executive_board import ensure_executive_board_schema
+    from hermes_cli.agents_os_memory import ensure_memory_schema
+    from hermes_cli.agents_os_orchestrator import ensure_execution_schema
+    ensure_command_schema(conn)
+    ensure_executive_board_schema(conn)
+    ensure_memory_schema(conn)
+    ensure_execution_schema(conn)
     conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)", ("created_at", utc_now()))
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("schema_version", SCHEMA_VERSION))
     _seed_workflows_and_rules(conn)
@@ -380,10 +496,34 @@ def connect(paths: AgentsOSPaths) -> sqlite3.Connection:
     paths.root.mkdir(parents=True, exist_ok=True)
     paths.artifacts.mkdir(parents=True, exist_ok=True)
     paths.outbox.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(paths.db)
+    db_key = str(paths.db.resolve())
+    if not paths.db.exists():
+        _INITIALIZED_DBS.discard(db_key)
+    conn = sqlite3.connect(paths.db, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    _migrate_schema(conn)
-    conn.commit()
+    conn.execute("PRAGMA busy_timeout=30000")
+    if db_key not in _INITIALIZED_DBS:
+        with _DB_INIT_LOCK:
+            if db_key not in _INITIALIZED_DBS:
+                conn.execute("PRAGMA foreign_keys=OFF")
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.OperationalError:
+                    # Another process may already hold a short-lived startup lock.
+                    # busy_timeout still protects this connection and the next
+                    # process startup will retry WAL activation.
+                    pass
+                _migrate_schema(conn)
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys=ON")
+                broken_schema = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%tasks_legacy_v1%'"
+                ).fetchall()
+                if broken_schema:
+                    names = ", ".join(row[0] for row in broken_schema)
+                    raise sqlite3.IntegrityError(f"legacy task foreign keys remain after migration: {names}")
+                _INITIALIZED_DBS.add(db_key)
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -582,6 +722,9 @@ def approval_request(args: argparse.Namespace) -> int:
     paths = resolve_paths(args)
     approval_id = args.id or f"approval-{uuid.uuid4().hex[:8]}"
     with connect(paths) as conn:
+        if args.task_id and conn.execute("SELECT 1 FROM tasks WHERE id=?", (args.task_id,)).fetchone() is None:
+            print(json.dumps({"status": "error", "reason": "task_not_found", "task_id": args.task_id}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
         conn.execute(
             "INSERT INTO approvals(id,title,status,risk,task_id,payload,created_at) VALUES(?,?,?,?,?,?,?)",
             (approval_id, args.title, "pending", args.risk, args.task_id, args.payload or "", utc_now()),
@@ -611,16 +754,47 @@ def approval_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def approval_set(args: argparse.Namespace) -> int:
-    paths = resolve_paths(args)
+def resolve_approval_service(paths: AgentsOSPaths, approval_id: str, status: str, notes: str = "", *, source: str = "agents_os") -> dict[str, Any]:
+    if status not in {"approved", "rejected", "cancelled"}:
+        return {"status": "error", "reason": "invalid_approval_status", "approval_id": approval_id}
     with connect(paths) as conn:
-        cur = conn.execute(
-            "UPDATE approvals SET status=?, resolved_at=? WHERE id=?",
-            (args.status, utc_now(), args.id),
-        )
+        approval = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        if approval is None:
+            return {"status": "error", "reason": "approval_not_found", "approval_id": approval_id}
+        now = utc_now()
+        conn.execute("UPDATE approvals SET status=?, resolved_at=? WHERE id=?", (status, now, approval_id))
+        task_id = approval["task_id"]
+        if task_id:
+            task_exists = conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is not None
+            if task_exists and status == "approved":
+                pending = conn.execute(
+                    "SELECT COUNT(*) FROM approvals WHERE task_id=? AND status='pending' AND id != ?",
+                    (task_id, approval_id),
+                ).fetchone()[0]
+                if pending == 0:
+                    conn.execute(
+                        "UPDATE tasks SET approval_required=0, status=CASE WHEN status='needs_approval' THEN 'ready' ELSE status END, updated_at=? WHERE id=?",
+                        (now, task_id),
+                    )
+            elif task_exists and status in {"rejected", "cancelled"}:
+                conn.execute(
+                    "UPDATE tasks SET approval_required=0, status='blocked', updated_at=? WHERE id=?",
+                    (now, task_id),
+                )
+            log_event(
+                conn,
+                "approval_resolved",
+                task_id=task_id if task_exists else None,
+                payload={"approval_id": approval_id, "status": status, "notes": notes, "source": source, "orphan_task_id": None if task_exists else task_id},
+            )
         conn.commit()
-    if cur.rowcount == 0:
-        print(f"Approval ne postoji: {args.id}", file=sys.stderr)
+    return {"approval_id": approval_id, "status": status, "task_id": task_id, "notes": notes}
+
+
+def approval_set(args: argparse.Namespace) -> int:
+    result = resolve_approval_service(resolve_paths(args), args.id, args.status, getattr(args, "notes", "") or "", source="cli")
+    if result.get("status") == "error":
+        print(f"Approval ne postoji ili status nije valjan: {args.id}", file=sys.stderr)
         return 2
     print(f"{args.id} -> {args.status}")
     return 0
@@ -740,6 +914,215 @@ def workflow_run(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def automation_validate_payload(data: Any) -> tuple[bool, list[str]]:
+    """Validate Automation Bridge v0 intake without network or third-party deps."""
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return False, ["payload must be a JSON object"]
+    if data.get("schema_version") != "automation-intake.v0":
+        errors.append("schema_version must be automation-intake.v0")
+    source = data.get("source")
+    event_id = data.get("event_id")
+    goal = data.get("goal")
+    if not isinstance(source, str) or not source.strip():
+        errors.append("source must be a non-empty string")
+    if not isinstance(event_id, str) or not event_id.strip():
+        errors.append("event_id must be a non-empty string")
+    if not isinstance(goal, str) or len(goal.strip()) < 12:
+        errors.append("goal must be a string with at least 12 characters")
+    if not isinstance(data.get("context", {}), dict):
+        errors.append("context must be an object")
+    allowed_tools = data.get("allowed_tools", [])
+    if not isinstance(allowed_tools, list) or any(not isinstance(item, str) for item in allowed_tools):
+        errors.append("allowed_tools must be a list of strings")
+    allowed_policies = {"safe_local_only", "approval_required", "draft_only"}
+    approval_policy = data.get("approval_policy", "safe_local_only")
+    if approval_policy not in allowed_policies:
+        errors.append("approval_policy must be one of: " + ", ".join(sorted(allowed_policies)))
+    callback = data.get("callback", {"type": "none"})
+    if not isinstance(callback, dict):
+        errors.append("callback must be an object")
+        callback = {}
+    callback_type = callback.get("type", "none")
+    allowed_callback_types = {"none", "local_file", "webhook", "telegram", "email", "slack"}
+    if callback_type not in allowed_callback_types:
+        errors.append("callback.type must be one of: " + ", ".join(sorted(allowed_callback_types)))
+    if callback_type in {"webhook", "telegram", "email", "slack"} and not callback.get("approval_required"):
+        errors.append("external callback types telegram/webhook/email/slack require callback.approval_required=true")
+    priority = data.get("priority", 2)
+    if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 9:
+        errors.append("priority must be an integer between 0 and 9")
+    risk_markers = ["deploy", "publish", "send email", "webhook", "credential", "token", "delete", "payment", "trade"]
+    goal_text = str(goal or "").lower()
+    external_callback = callback_type in {"webhook", "telegram", "email", "slack"}
+    if approval_policy == "safe_local_only" and not external_callback and any(marker in goal_text for marker in risk_markers):
+        errors.append("safe_local_only payload contains risky goal marker; use approval_required or draft_only")
+    return not errors, errors
+
+
+def _automation_workflow_for_source(source: str, goal: str) -> str:
+    text = f"{source} {goal}".lower()
+    if "youtube" in text or "screenshot" in text or "link" in text or "telegram" in text:
+        return "youtube-intake"
+    if "seo" in text or "monitor" in text or "qa" in text:
+        return "qa-report"
+    if "code" in text or "implement" in text or "runtime" in text:
+        return "code-task"
+    return "research-brief"
+
+
+def _automation_result_payload(*, intake_id: str, task_id: str, run_id: str, artifact_id: str, artifact_path: str, status: str, deduped: bool, approval_required: bool, errors: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "schema_version": "automation-result.v0",
+        "status": status,
+        "deduped": deduped,
+        "intake_id": intake_id,
+        "task_id": task_id,
+        "run_id": run_id,
+        "artifact_id": artifact_id,
+        "artifact_path": artifact_path,
+        "approval_required": approval_required,
+        "errors": errors or [],
+    }
+
+
+def automation_intake_service(paths: AgentsOSPaths, data: Any) -> tuple[int, dict[str, Any]]:
+    ok, errors = automation_validate_payload(data)
+    if not ok:
+        return 2, _automation_result_payload(
+            intake_id="", task_id="", run_id="", artifact_id="", artifact_path="",
+            status="rejected", deduped=False, approval_required=True, errors=errors,
+        )
+    source = str(data["source"]).strip()
+    event_id = str(data["event_id"]).strip()
+    goal = str(data["goal"]).strip()
+    approval_policy = str(data.get("approval_policy") or "safe_local_only")
+    callback_type = str((data.get("callback") or {}).get("type") or "none")
+    external_callback = callback_type in {"webhook", "telegram", "email", "slack"}
+    approval_required = approval_policy == "approval_required" or external_callback
+    draft_only = approval_policy == "draft_only"
+    workflow = _automation_workflow_for_source(source, goal)
+    now = utc_now()
+    with connect(paths) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute("SELECT * FROM automation_intakes WHERE source=? AND event_id=?", (source, event_id)).fetchone()
+        if existing is not None:
+            return 0, _automation_result_payload(
+                intake_id=existing["id"], task_id=existing["task_id"], run_id=existing["run_id"], artifact_id=existing["artifact_id"],
+                artifact_path=existing["artifact_path"], status="deduped", deduped=True, approval_required=bool(existing["approval_required"]),
+            )
+        intake_id = f"automation-{uuid.uuid4().hex[:8]}"
+        task_id = f"task-auto-{uuid.uuid4().hex[:8]}"
+        run_id = f"run-auto-{uuid.uuid4().hex[:8]}"
+        artifact_id = f"artifact-auto-{uuid.uuid4().hex[:8]}"
+        status = "needs_approval" if approval_required else ("review" if draft_only else "pending")
+        route = "approval_gate" if approval_required else ("local:draft-only" if draft_only else "local:automation")
+        title = f"Automation intake: {source}:{event_id}"
+        target = paths.artifacts / "automation" / f"{now.split('T', 1)[0]}-{slugify(source + '-' + event_id)}-{intake_id}.md"
+        body = textwrap.dedent(f"""
+        ## Goal
+        {goal}
+
+        ## Source
+        - source: `{source}`
+        - event_id: `{event_id}`
+        - approval_policy: `{approval_policy}`
+        - callback_type: `{(data.get('callback') or {}).get('type', 'none') if isinstance(data.get('callback', {}), dict) else 'invalid'}`
+
+        ## Allowed tools
+        {json.dumps(data.get('allowed_tools', []), ensure_ascii=False, indent=2)}
+
+        ## Context
+        ```json
+        {json.dumps(data.get('context', {}), ensure_ascii=False, indent=2)}
+        ```
+
+        ## Execution boundary
+        - local_only: true
+        - external_callback_executed: false
+        - approval_required: {approval_required}
+        - next_step: route inside Agent OS / Mission Control Automation Inbox
+        """).strip()
+        write_markdown(
+            target,
+            title,
+            body,
+            {"id": artifact_id, "type": "automation_intake", "workflow": workflow, "task_id": task_id, "run_id": run_id, "created_at": now},
+        )
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,workflow,priority,created_at,updated_at,notes,route,approval_required) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (task_id, title, status, workflow, data.get("priority", 2), now, now, goal, route, 1 if approval_required else 0),
+        )
+        conn.execute(
+            "INSERT INTO runs(id,task_id,workflow,status,input,created_at) VALUES(?,?,?,?,?,?)",
+            (run_id, task_id, workflow, "created", json.dumps(data, ensure_ascii=False), now),
+        )
+        conn.execute(
+            "INSERT INTO artifacts(id,kind,title,path,task_id,workflow,created_at,run_id) VALUES(?,?,?,?,?,?,?,?)",
+            (artifact_id, "automation_intake", title, str(target), task_id, workflow, now, run_id),
+        )
+        conn.execute(
+            "INSERT INTO automation_intakes(id,source,event_id,task_id,run_id,artifact_id,artifact_path,approval_required,payload,result,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (intake_id, source, event_id, task_id, run_id, artifact_id, str(target), 1 if approval_required else 0, json.dumps(data, ensure_ascii=False), "", now),
+        )
+        log_event(conn, "automation_intake_created", task_id=task_id, run_id=run_id, payload={"intake_id": intake_id, "source": source, "event_id": event_id, "artifact_id": artifact_id})
+        if approval_required:
+            approval_id = f"approval-{uuid.uuid4().hex[:8]}"
+            conn.execute(
+                "INSERT INTO approvals(id,title,status,risk,task_id,payload,created_at) VALUES(?,?,?,?,?,?,?)",
+                (approval_id, f"Automation approval required: {source}:{event_id}", "pending", "external-action", task_id, json.dumps(data, ensure_ascii=False), now),
+            )
+            log_event(conn, "approval_requested", task_id=task_id, run_id=run_id, payload={"approval_id": approval_id, "risk": "external-action", "intake_id": intake_id})
+        result = _automation_result_payload(
+            intake_id=intake_id, task_id=task_id, run_id=run_id, artifact_id=artifact_id,
+            artifact_path=str(target), status="created", deduped=False, approval_required=approval_required,
+        )
+        conn.execute("UPDATE automation_intakes SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), intake_id))
+        conn.commit()
+    return 0, result
+
+
+def automation_intake_cmd(args: argparse.Namespace) -> int:
+    paths = resolve_paths(args)
+    try:
+        data = json.loads(Path(args.path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        payload = _automation_result_payload(
+            intake_id="", task_id="", run_id="", artifact_id="", artifact_path="",
+            status="rejected", deduped=False, approval_required=True, errors=[f"cannot read payload: {exc}"],
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else "\n".join(payload["errors"]), file=sys.stderr if not args.json else sys.stdout)
+        return 2
+    code, payload = automation_intake_service(paths, data)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(payload["artifact_path"] if code == 0 else "\n".join(payload.get("errors") or []))
+    return code
+
+
+def automation_list_cmd(args: argparse.Namespace) -> int:
+    paths = resolve_paths(args)
+    with connect(paths) as conn:
+        rows = [row_to_dict(r) for r in conn.execute("SELECT * FROM automation_intakes ORDER BY created_at DESC LIMIT ?", (args.limit,)).fetchall()]
+    for row in rows:
+        try:
+            row["payload"] = json.loads(row.get("payload") or "{}")
+        except json.JSONDecodeError:
+            pass
+        try:
+            row["result"] = json.loads(row.get("result") or "{}")
+        except json.JSONDecodeError:
+            pass
+    if args.json:
+        print(json.dumps({"local_only": True, "count": len(rows), "items": rows}, ensure_ascii=False, indent=2))
+    else:
+        for row in rows:
+            print(f"{row['id']} {row['source']}:{row['event_id']} task={row['task_id']} approval_required={bool(row['approval_required'])}")
+    return 0
+
+
 def _pick_agent(conn: sqlite3.Connection, task: sqlite3.Row) -> str | None:
     needed: set[str] = set()
     if task["workflow"]:
@@ -832,6 +1215,8 @@ def next_task(args: argparse.Namespace) -> int:
 def dashboard(args: argparse.Namespace) -> int:
     paths = resolve_paths(args)
     with connect(paths) as conn:
+        task_status_counts = dict(conn.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status").fetchall())
+        pending_approval_count = conn.execute("SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
         tasks = [row_to_dict(r) for r in conn.execute("""
             SELECT * FROM tasks
             ORDER BY CASE status
@@ -849,13 +1234,13 @@ def dashboard(args: argparse.Namespace) -> int:
             LIMIT 20
         """).fetchall()]
         approvals = [row_to_dict(r) for r in conn.execute("SELECT * FROM approvals WHERE status='pending' ORDER BY created_at ASC LIMIT 20").fetchall()]
-        runs = [row_to_dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 10").fetchall()]
+        all_runs = [row_to_dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()]
         execution_task_ids = {
             run.get("task_id")
-            for run in runs
+            for run in all_runs
             if run.get("task_id") and (run.get("completed_at") or run.get("status") in {"succeeded", "failed", "blocked", "needs_review"})
         }
-        for run in runs:
+        for run in all_runs:
             is_execution = run.get("completed_at") or run.get("status") in {"succeeded", "failed", "blocked", "needs_review"}
             if is_execution:
                 run["kind"] = "execution"
@@ -863,14 +1248,15 @@ def dashboard(args: argparse.Namespace) -> int:
                 run["kind"] = "draft_superseded"
             else:
                 run["kind"] = "draft"
+        runs = all_runs[:10]
         queue_summary = {
-            "open_tasks": sum(1 for task in tasks if task["status"] in {"new", "pending", "routed", "ready", "in_progress", "needs_approval"}),
-            "blocked_tasks": sum(1 for task in tasks if task["status"] == "blocked"),
-            "review_tasks": sum(1 for task in tasks if task["status"] == "review"),
-            "completed_tasks": sum(1 for task in tasks if task["status"] == "completed"),
-            "pending_approvals": len(approvals),
-            "failed_executions": sum(1 for run in runs if run.get("kind") == "execution" and run.get("status") == "failed"),
-            "stale_drafts": sum(1 for run in runs if run.get("kind") == "draft"),
+            "open_tasks": sum(task_status_counts.get(status, 0) for status in {"new", "pending", "routed", "ready", "in_progress", "needs_approval"}),
+            "blocked_tasks": task_status_counts.get("blocked", 0),
+            "review_tasks": task_status_counts.get("review", 0),
+            "completed_tasks": task_status_counts.get("completed", 0),
+            "pending_approvals": pending_approval_count,
+            "failed_executions": sum(1 for run in all_runs if run.get("kind") == "execution" and run.get("status") == "failed"),
+            "stale_drafts": sum(1 for run in all_runs if run.get("kind") == "draft"),
         }
         queue_summary["action_required"] = queue_summary["blocked_tasks"] + queue_summary["review_tasks"] + queue_summary["pending_approvals"] + queue_summary["failed_executions"]
         events = [row_to_dict(r) for r in conn.execute("SELECT * FROM events ORDER BY created_at DESC LIMIT 10").fetchall()]
@@ -983,8 +1369,16 @@ def doctor(args: argparse.Namespace) -> int:
         orphan_artifacts = conn.execute("SELECT COUNT(*) FROM artifacts WHERE task_id IS NOT NULL AND task_id != '' AND task_id NOT IN (SELECT id FROM tasks)").fetchone()[0]
         orphan_events = conn.execute("SELECT COUNT(*) FROM events WHERE task_id IS NOT NULL AND task_id != '' AND task_id NOT IN (SELECT id FROM tasks)").fetchone()[0]
         orphan_runs = conn.execute("SELECT COUNT(*) FROM runs WHERE task_id IS NOT NULL AND task_id != '' AND task_id NOT IN (SELECT id FROM tasks)").fetchone()[0]
-    required_tables = ["meta", "tasks", "approvals", "artifacts", "events", "runs", "agents", "workflows", "routing_rules", "reviews", "state_snapshots"]
-    orphan_records = orphan_artifacts + orphan_events + orphan_runs
+        orphan_approvals = conn.execute("SELECT COUNT(*) FROM approvals WHERE task_id IS NOT NULL AND task_id != '' AND task_id NOT IN (SELECT id FROM tasks)").fetchone()[0]
+        orphan_reviews = conn.execute("SELECT COUNT(*) FROM reviews WHERE task_id IS NOT NULL AND task_id != '' AND task_id NOT IN (SELECT id FROM tasks)").fetchone()[0]
+        orphan_intakes = conn.execute("""
+            SELECT COUNT(*) FROM automation_intakes
+            WHERE task_id NOT IN (SELECT id FROM tasks)
+               OR run_id NOT IN (SELECT id FROM runs)
+               OR artifact_id NOT IN (SELECT id FROM artifacts)
+        """).fetchone()[0]
+    required_tables = ["meta", "tasks", "approvals", "artifacts", "events", "runs", "agents", "workflows", "routing_rules", "reviews", "state_snapshots", "automation_intakes"]
+    orphan_records = orphan_artifacts + orphan_events + orphan_runs + orphan_approvals + orphan_reviews + orphan_intakes
     root_text = str(paths.root).lower()
     policy_home_isolated = str(paths.root).startswith(str(paths.home)) and not any(marker in root_text for marker in ("separate-profile", "external-runtime", "shared-runtime"))
     checks = {
@@ -998,6 +1392,14 @@ def doctor(args: argparse.Namespace) -> int:
         "vault_root_exists": paths.vault_root.exists(),
         "pending_approvals": pending_approvals,
         "orphan_records": orphan_records,
+        "orphan_details": {
+            "artifacts": orphan_artifacts,
+            "events": orphan_events,
+            "runs": orphan_runs,
+            "approvals": orphan_approvals,
+            "reviews": orphan_reviews,
+            "automation_intakes": orphan_intakes,
+        },
         "policy_home_isolated": policy_home_isolated,
         "network_side_effects": False,
         "runtime_config_changed": False,
@@ -1014,7 +1416,7 @@ def doctor(args: argparse.Namespace) -> int:
 
 
 def _snapshot_payload(conn: sqlite3.Connection) -> dict[str, Any]:
-    tables = ["meta", "tasks", "approvals", "artifacts", "events", "runs", "agents", "workflows", "routing_rules", "reviews"]
+    tables = ["meta", "tasks", "approvals", "artifacts", "events", "runs", "agents", "workflows", "routing_rules", "reviews", "automation_intakes"]
     payload: dict[str, Any] = {}
     for table in tables:
         quoted_table = _quote_sql_identifier(table, allowed=AGENTS_OS_TABLES)
@@ -1246,24 +1648,52 @@ def execute_task(args: argparse.Namespace) -> int:
             conn.commit()
             print(json.dumps({"task_id": task_id, "status": "blocked", "reason": "approval_required"}, ensure_ascii=False, indent=2))
             return 2
-        run_id = f"run-{uuid.uuid4().hex[:8]}"
-        now = utc_now()
         if args.dry_run:
-            log_event(conn, "execution_dry_run", task_id=task_id, run_id=run_id, payload={"status": "dry_run"})
+            from hermes_cli.agents_os_orchestrator import ExecutionCoordinator, resolve_allowed_cwds
+            allowed = resolve_allowed_cwds(paths)
+            probes = ExecutionCoordinator(paths, allowed_cwds=allowed).capabilities()
+            log_event(conn, "execution_dry_run", task_id=task_id, payload={"status": "dry_run", "runtimes": probes})
             conn.commit()
-            print(json.dumps({"task_id": task_id, "run_id": run_id, "status": "dry_run"}, ensure_ascii=False, indent=2))
+            print(json.dumps({"task_id": task_id, "status": "dry_run", "runtimes": probes, "allowed_cwds": [str(item) for item in allowed]}, ensure_ascii=False, indent=2))
             return 0
-        log_path = paths.artifacts / "runs" / f"{now.split('T',1)[0]}-{run_id}.md"
-        body = f"## Execution log\n\n- task_id: {task_id}\n- workflow: {task['workflow'] or ''}\n- dry_run: {bool(args.dry_run)}\n- status: succeeded\n"
-        write_markdown(log_path, f"Run {run_id}", body, {"run_id": run_id, "task_id": task_id, "status": "succeeded", "created_at": now})
-        conn.execute("INSERT INTO runs(id,task_id,workflow,status,input,created_at,completed_at) VALUES(?,?,?,?,?,?,?)", (run_id, task_id, task["workflow"] or "manual", "succeeded", task["notes"] or "", now, utc_now()))
-        artifact_id = f"artifact-{uuid.uuid4().hex[:8]}"
-        conn.execute("INSERT INTO artifacts(id,kind,title,path,task_id,workflow,created_at,run_id) VALUES(?,?,?,?,?,?,?,?)", (artifact_id, "run-log", f"Run log {run_id}", str(log_path), task_id, task["workflow"], now, run_id))
-        conn.execute("UPDATE tasks SET status='review', updated_at=? WHERE id=?", (utc_now(), task_id))
-        log_event(conn, "executed", task_id=task_id, run_id=run_id, payload={"status": "succeeded", "log_path": str(log_path)})
+    runtime = getattr(args, "runtime", None)
+    if not runtime:
+        print(json.dumps({"task_id": task_id, "status": "blocked", "reason": "runtime_required"}, ensure_ascii=False, indent=2))
+        return 2
+    from hermes_cli.agents_os_commands import confirm_command, create_command
+    from hermes_cli.agents_os_orchestrator import ExecutionCoordinator, execution_projection, resolve_allowed_cwds
+    allowed = resolve_allowed_cwds(paths)
+    requested_cwd = Path(getattr(args, "cwd", None) or allowed[0]).expanduser().resolve(strict=True)
+    if requested_cwd not in allowed:
+        print(json.dumps({"task_id": task_id, "status": "blocked", "reason": "cwd_not_allowlisted", "allowed_cwds": [str(item) for item in allowed]}, ensure_ascii=False, indent=2))
+        return 2
+    with connect(paths) as conn:
+        command = create_command(
+            conn, transcript=task["notes"] or task["title"],
+            idempotency_key=f"cli:{task_id}:{uuid.uuid4().hex}", risk_class="safe_local",
+            metadata={"task_id": task_id, "workflow": task["workflow"] or "manual", "profile_id": "doni", "source": "agents_os_cli"},
+        )
+        command = confirm_command(conn, command["id"], expected_version=command["version"])
         conn.commit()
-    print(json.dumps({"task_id": task_id, "run_id": run_id, "status": "succeeded", "log_path": str(log_path)}, ensure_ascii=False, indent=2))
-    return 0
+    coordinator = ExecutionCoordinator(paths, allowed_cwds=allowed)
+    try:
+        queued = coordinator.queue(
+            command_id=command["id"], runtime=runtime, cwd=requested_cwd,
+            approved_model_call=bool(getattr(args, "approve_model_call", False)),
+            timeout_seconds=float(getattr(args, "timeout", 300.0)),
+        )
+    except Exception as exc:
+        print(json.dumps({"task_id": task_id, "status": "blocked", "reason": exc.__class__.__name__, "message": str(exc)}, ensure_ascii=False, indent=2))
+        return 2
+    import time
+    deadline = time.monotonic() + float(getattr(args, "timeout", 300.0)) + 10.0
+    current = queued
+    while current and current.get("status") in {"queued", "running", "cancelling"} and time.monotonic() < deadline:
+        time.sleep(0.05)
+        with connect(paths) as conn:
+            current = execution_projection(conn, queued["run_id"])
+    print(json.dumps({"task_id": task_id, "command_id": command["id"], "execution": current}, ensure_ascii=False, indent=2))
+    return 0 if current and current.get("status") == "succeeded" else 1
 
 
 def execute_next(args: argparse.Namespace) -> int:
@@ -1281,6 +1711,9 @@ def review_request(args: argparse.Namespace) -> int:
     paths = resolve_paths(args)
     rid = args.id or f"review-{uuid.uuid4().hex[:8]}"
     with connect(paths) as conn:
+        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (args.task_id,)).fetchone() is None:
+            print(json.dumps({"status": "error", "reason": "task_not_found", "task_id": args.task_id}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
         conn.execute("INSERT INTO reviews(id,task_id,run_id,status,kind,reviewer,notes,created_at) VALUES(?,?,?,?,?,?,?,?)", (rid, args.task_id, args.run_id, "pending", args.kind, args.reviewer or "", args.notes or "", utc_now()))
         log_event(conn, "review_requested", task_id=args.task_id, run_id=args.run_id, payload={"review_id": rid, "kind": args.kind})
         conn.commit()
@@ -1434,6 +1867,11 @@ class AgentsOSService:
     def maintenance_payload(self) -> dict[str, Any]:
         return self._json_from_command(maintenance)
 
+    def automation_intake_payload(self, data: dict[str, Any]) -> dict[str, Any]:
+        code, payload = automation_intake_service(self.paths, data)
+        payload["exit_code"] = code
+        return payload
+
 
 def service_status(args: argparse.Namespace) -> int:
     payload = AgentsOSService(resolve_paths(args)).status_payload()
@@ -1502,6 +1940,10 @@ def docs_cmd(args: argparse.Namespace) -> int:
         - `doctor_payload()`
         - `dashboard_payload()`
         - `maintenance_payload()`
+        - `automation_intake_payload(data)`
+
+        Mission Control fast local entrypoint:
+        - `python -m hermes_cli.agents_os_web --host 127.0.0.1 --port 18791`
         """
     ).strip() + "\n"
     command_text = textwrap.dedent(
@@ -1517,8 +1959,10 @@ def docs_cmd(args: argparse.Namespace) -> int:
         python -m hermes_cli.agents_os service status --json
         python -m hermes_cli.agents_os dashboard --json
         python -m hermes_cli.agents_os maintenance --json
+        python -m hermes_cli.agents_os automation list --json
         python -m hermes_cli.agents_os mirror validate --json
         python -m hermes_cli.agents_os docs --json
+        python -m hermes_cli.agents_os_web --json
         ```
 
         Closeout path:
@@ -1546,7 +1990,8 @@ def docs_cmd(args: argparse.Namespace) -> int:
         Hard boundaries:
         - no deploy
         - no gateway restart
-        - no web UI, TUI, daemon, or server process without explicit approval
+        - Mission Control may bind only to 127.0.0.1/localhost
+        - no externally reachable daemon or server process
         - no credentials, API keys, auth stores, tokens, `.env`, or secrets in reports/dashboard
         - no writes to other Hermes profiles or external agent runtimes
         - no legacy or unrelated Hermes home as active runtime authority
@@ -1567,6 +2012,16 @@ def docs_cmd(args: argparse.Namespace) -> int:
     result = {"status": "ok", "docs_path": str(docs_path), "docs": docs, "schema_version": payload["schema_version"]}
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else str(docs_path))
     return 0
+
+
+def tui_cmd_lazy(args: argparse.Namespace) -> int:
+    """Import curses-backed TUI only when the TUI command is selected."""
+    try:
+        from hermes_cli.agents_os_tui import tui_cmd
+    except (ImportError, ModuleNotFoundError) as exc:
+        print(f"Agents OS TUI is unavailable in this Python environment: {exc}", file=sys.stderr)
+        return 2
+    return tui_cmd(args)
 
 
 def _populate_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -1618,8 +2073,7 @@ def _populate_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     p.add_argument("--script", help="Run deterministic key script and print final frame (test/automation helper)")
     p.add_argument("--width", type=int, default=100, help=argparse.SUPPRESS)
     p.add_argument("--height", type=int, default=30, help=argparse.SUPPRESS)
-    from hermes_cli.agents_os_tui import tui_cmd
-    p.set_defaults(func=tui_cmd)
+    p.set_defaults(func=tui_cmd_lazy)
 
     p = sub.add_parser("web", help="Open local-only Agents OS Mission Control dashboard")
     p.add_argument("--host", default="127.0.0.1", help="Local bind host; only 127.0.0.1 or localhost are allowed")
@@ -1699,11 +2153,19 @@ def _populate_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     p = sub.add_parser("execute", help="Execute a safe local task")
     p.add_argument("id")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--runtime", choices=["hermes", "codex", "claude", "openclaw"])
+    p.add_argument("--cwd", help="Exact working directory from AGENTS_OS_RUNTIME_CWDS")
+    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--approve-model-call", action="store_true", help="Explicitly approve this potentially paid model call")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=execute_task)
 
     p = sub.add_parser("execute-next", help="Execute next safe local task")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--runtime", choices=["hermes", "codex", "claude", "openclaw"])
+    p.add_argument("--cwd", help="Exact working directory from AGENTS_OS_RUNTIME_CWDS")
+    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--approve-model-call", action="store_true", help="Explicitly approve this potentially paid model call")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=execute_next)
 
@@ -1765,6 +2227,17 @@ def _populate_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=idea_draft_cmd)
 
+    automation = sub.add_parser("automation", help="Automation Bridge v0 intake and inbox")
+    automation_sub = automation.add_subparsers(dest="automation_command")
+    p = automation_sub.add_parser("intake", help="Validate and ingest Automation Bridge v0 payload")
+    p.add_argument("path")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=automation_intake_cmd)
+    p = automation_sub.add_parser("list", help="List Automation Bridge v0 intakes")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=automation_list_cmd)
+
     p = sub.add_parser("docs", help="Generate local Agents OS runtime docs")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=docs_cmd)
@@ -1785,6 +2258,7 @@ def _populate_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     p = approval_sub.add_parser("set", help="Resolve approval")
     p.add_argument("id")
     p.add_argument("status", choices=["approved", "rejected", "cancelled"])
+    p.add_argument("--notes", default="")
     p.set_defaults(func=approval_set)
 
     artifact = sub.add_parser("artifact", help="Manage artifacts")

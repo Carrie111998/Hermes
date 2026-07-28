@@ -165,25 +165,13 @@ class MissionControlCore:
         return {"task_id": task_id, "status": "completed", "evidence": evidence}
 
     def resolve_approval(self, approval_id: str, status: str, notes: str = "") -> dict[str, Any]:
-        if status not in {"approved", "rejected", "cancelled"}:
-            return {"approval_id": approval_id, "status": "error", "reason": "invalid_approval_status"}
-        with agents_os.connect(self.paths) as conn:
-            approval = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
-            if approval is None:
-                return {"approval_id": approval_id, "status": "error", "reason": "approval_not_found"}
-            now = agents_os.utc_now()
-            conn.execute("UPDATE approvals SET status=?, resolved_at=? WHERE id=?", (status, now, approval_id))
-            task_id = approval["task_id"]
-            if task_id:
-                if status == "approved":
-                    pending = conn.execute("SELECT COUNT(*) FROM approvals WHERE task_id=? AND status='pending' AND id != ?", (task_id, approval_id)).fetchone()[0]
-                    if pending == 0:
-                        conn.execute("UPDATE tasks SET approval_required=0, status=CASE WHEN status='needs_approval' THEN 'ready' ELSE status END, updated_at=? WHERE id=?", (now, task_id))
-                elif status == "rejected":
-                    conn.execute("UPDATE tasks SET status='blocked', updated_at=? WHERE id=?", (now, task_id))
-                agents_os.log_event(conn, "approval_resolved", task_id=task_id, payload={"approval_id": approval_id, "status": status, "notes": notes, "source": "mission_control_tui"})
-            conn.commit()
-        return {"approval_id": approval_id, "status": status, "task_id": task_id, "notes": notes}
+        return agents_os.resolve_approval_service(
+            self.paths,
+            approval_id,
+            status,
+            notes,
+            source="mission_control_tui",
+        )
 
 
 def _format_item(view: str, item: dict[str, Any]) -> str:
