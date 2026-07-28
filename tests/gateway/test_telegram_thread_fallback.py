@@ -1303,7 +1303,7 @@ async def test_send_raises_on_other_bad_request():
     )
 
     assert result.success is False
-    assert "Chat not found" in result.error
+    assert result.error == "FakeBadRequest"
 
 
 @pytest.mark.asyncio
@@ -1377,7 +1377,7 @@ async def test_send_does_not_retry_timeout():
     )
 
     assert result.success is False
-    assert "Timed out" in result.error
+    assert result.error == "FakeTimedOut"
     # CRITICAL: only 1 attempt — no retry for TimedOut
     assert attempt[0] == 1
 

@@ -1,6 +1,7 @@
 """Tests for GatewayRunner._resolve_profile_home_for_source — profile resolution logic."""
 
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -548,6 +549,7 @@ class TestTelegramTopicPrivacyAndIsolation:
             cls.FOREIGN_CHAT_ID,
         ):
             assert raw not in rendered
+            assert hashlib.sha256(raw.encode()).hexdigest()[:12] not in rendered
 
     def test_valid_nonmatch_and_error_logs_never_expose_raw_telegram_ids(
         self, caplog
@@ -587,9 +589,9 @@ class TestTelegramTopicPrivacyAndIsolation:
                 )
 
         messages = "\n".join(record.getMessage() for record in caplog.records)
-        assert "Profile route matched" in messages
-        assert "No profile route matched" in messages
-        assert "Profile route matching failed" in messages
+        assert "Telegram profile route matched" in messages
+        assert "Telegram profile route did not match" in messages
+        assert "Telegram route resolution failed" in messages
         self._assert_raw_ids_absent(caplog)
 
     def test_two_topics_have_distinct_profiles_and_session_keys(self):

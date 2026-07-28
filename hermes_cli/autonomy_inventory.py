@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import io
 import json
 import os
 import re
 import sys
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +18,6 @@ import yaml
 from agent.skill_utils import is_excluded_skill_path, parse_frontmatter
 from hermes_cli.config import read_raw_config
 from hermes_constants import (
-    get_config_path,
     get_env_path,
     get_hermes_home,
     get_skills_dir,
@@ -37,7 +35,8 @@ _ENV_ASSIGNMENT = re.compile(
     r"(\s*=\s*)([^\s,;]+)"
 )
 _CLI_SECRET = re.compile(
-    r"(?i)(--(?:api[-_]?key|token|secret|password)(?:\s+|=))([^\s,;]+)"
+    r"(?i)(--(?:api[-_]?key|key|token|secret|passw(?:or)?d|credentials?|auth"
+    r"|authorization)(?:\s+|=))([^\s,;]+)"
 )
 _URL_USERINFO = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _URL_SECRET_QUERY = re.compile(
@@ -54,6 +53,11 @@ _TEXT_SECRET_FIELD = re.compile(
     )
     """
 )
+_WINDOWS_ABSOLUTE_PATH = re.compile(
+    r"(?i)\b[A-Z]:\\(?:Users\\[^\\\s]+|Documents and Settings\\[^\\\s]+)"
+    r"(?:\\[^\s,;\"']*)?"
+)
+_UNIX_HOME_PATH = re.compile(r"(?<![A-Za-z0-9_])/(?:home|Users)/[^/\s]+(?:/[^\s,;\"']*)?")
 _RECOMMENDED_SECTIONS = (
     "objective",
     "preconditions",
@@ -61,6 +65,22 @@ _RECOMMENDED_SECTIONS = (
     "error handling",
     "success criteria",
     "tests",
+)
+_SENSITIVE_OPTIONS = frozenset(
+    {
+        "--token",
+        "--api-key",
+        "--apikey",
+        "--key",
+        "--secret",
+        "--password",
+        "--passwd",
+        "--credential",
+        "--credentials",
+        "--auth",
+        "--authorization",
+        "-p",
+    }
 )
 
 
@@ -75,6 +95,8 @@ def _redact_string(value: str, known_values: frozenset[str]) -> str:
     result = _ENV_ASSIGNMENT.sub(r"\1\2<redacted>", result)
     result = _CLI_SECRET.sub(r"\1<redacted>", result)
     result = _TEXT_SECRET_FIELD.sub(r"\1<redacted>", result)
+    result = _WINDOWS_ABSOLUTE_PATH.sub("<redacted-path>", result)
+    result = _UNIX_HOME_PATH.sub("<redacted-path>", result)
     return result
 
 
@@ -88,7 +110,25 @@ def _redact(value: Any, known_values: frozenset[str] = frozenset()) -> Any:
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_redact(item, known_values) for item in value]
+        items = list(value)
+        redacted: list[Any] = []
+        redact_next = False
+        for item in items:
+            if redact_next:
+                redacted.append("<redacted>")
+                redact_next = False
+                continue
+            if isinstance(item, str):
+                option, separator, _option_value = item.partition("=")
+                if option.casefold() in _SENSITIVE_OPTIONS:
+                    if separator:
+                        redacted.append(f"{option}=<redacted>")
+                    else:
+                        redacted.append(item)
+                        redact_next = True
+                    continue
+            redacted.append(_redact(item, known_values))
+        return tuple(redacted) if isinstance(value, tuple) else redacted
     if isinstance(value, str):
         return _redact_string(value, known_values)
     return value
@@ -175,7 +215,11 @@ def inventory_skills(skills_dir: Path | None = None) -> list[dict[str, Any]]:
             content = skill_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             rows.append(
-                {"path": str(skill_path), "valid": False, "issues": [str(exc)]}
+                {
+                    "path": f"skills/{skill_path.parent.name}/SKILL.md",
+                    "valid": False,
+                    "issues": [type(exc).__name__],
+                }
             )
             continue
         yaml_valid, yaml_issue = _frontmatter_is_yaml(content)
@@ -195,7 +239,7 @@ def inventory_skills(skills_dir: Path | None = None) -> list[dict[str, Any]]:
         rows.append(
             {
                 "name": str(frontmatter.get("name") or skill_path.parent.name),
-                "path": str(skill_path),
+                "path": f"skills/{skill_path.parent.name}/SKILL.md",
                 "yaml_valid": yaml_valid,
                 "valid": yaml_valid
                 and bool(frontmatter.get("name"))
@@ -211,60 +255,67 @@ def inventory_skills(skills_dir: Path | None = None) -> list[dict[str, Any]]:
 
 def inventory_tools() -> dict[str, Any]:
     import tools.registry as registry_module
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     registry = registry_module.registry
-    with registry._lock, registry_module._check_fn_cache_lock:
-        registry_state = {
-            "_tools": dict(registry._tools),
-            "_plugin_override_policy": dict(registry._plugin_override_policy),
-            "_toolset_checks": dict(registry._toolset_checks),
-            "_toolset_aliases": dict(registry._toolset_aliases),
-            "_generation": registry._generation,
+    tools_dir = Path(registry_module.__file__).resolve().parent
+    declared_modules = sorted(
+        path.stem
+        for path in tools_dir.glob("*.py")
+        if path.name not in {"__init__.py", "registry.py", "mcp_tool.py"}
+        and registry_module._module_registers_tools(path)
+    )
+    declared_toolsets: dict[str, set[str]] = {}
+    for module_name in declared_modules:
+        module_path = tools_dir / f"{module_name}.py"
+        tree = ast.parse(
+            module_path.read_text(encoding="utf-8"),
+            filename=f"tools/{module_name}.py",
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if not (
+                isinstance(function, ast.Attribute)
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "registry"
+                and function.attr == "register"
+            ):
+                continue
+            keywords = {item.arg: item.value for item in node.keywords if item.arg}
+            name_node = keywords.get("name")
+            toolset_node = keywords.get("toolset")
+            if not (
+                isinstance(name_node, ast.Constant)
+                and isinstance(name_node.value, str)
+                and isinstance(toolset_node, ast.Constant)
+                and isinstance(toolset_node.value, str)
+            ):
+                continue
+            declared_toolsets.setdefault(toolset_node.value, set()).add(name_node.value)
+
+    toolset_names = set(declared_toolsets) | set(registry.get_registered_toolset_names())
+    toolsets = {
+        name: {
+            "available": None,
+            "availability_checked": False,
+            "tools": sorted(
+                declared_toolsets.get(name, set())
+                | set(registry.get_tool_names_for_toolset(name))
+            ),
         }
-        cache_state = dict(registry_module._check_fn_cache)
-        last_good_state = dict(registry_module._check_fn_last_good)
-    modules_before = set(sys.modules)
-    environ_before = dict(os.environ)
-    dont_write_bytecode = sys.dont_write_bytecode
-    with tempfile.TemporaryDirectory(prefix="hermes-inventory-") as isolated_home:
-        home_token = set_hermes_home_override(isolated_home)
-        try:
-            sys.dont_write_bytecode = True
-            imported = registry_module.discover_builtin_tools()
-            toolsets = {
-                name: {
-                    "available": None,
-                    "availability_checked": False,
-                    "tools": registry.get_tool_names_for_toolset(name),
-                }
-                for name in registry.get_registered_toolset_names()
-            }
-            return {
-                "imported_modules": imported,
-                "tool_count": len(registry.get_all_tool_names()),
-                "toolsets": toolsets,
-                "aliases": registry.get_registered_toolset_aliases(),
-            }
-        finally:
-            reset_hermes_home_override(home_token)
-            sys.dont_write_bytecode = dont_write_bytecode
-            os.environ.clear()
-            os.environ.update(environ_before)
-            with registry._lock, registry_module._check_fn_cache_lock:
-                for name, value in registry_state.items():
-                    current = getattr(registry, name)
-                    if isinstance(current, dict):
-                        current.clear()
-                        current.update(value)
-                    else:
-                        setattr(registry, name, value)
-                registry_module._check_fn_cache.clear()
-                registry_module._check_fn_cache.update(cache_state)
-                registry_module._check_fn_last_good.clear()
-                registry_module._check_fn_last_good.update(last_good_state)
-            for name in set(sys.modules) - modules_before:
-                sys.modules.pop(name, None)
+        for name in sorted(toolset_names)
+    }
+    declared_tool_count = len(
+        {tool for tools in declared_toolsets.values() for tool in tools}
+    )
+    return {
+        "declared_modules": declared_modules,
+        "loaded_tool_count": len(registry.get_all_tool_names()),
+        "tool_count": max(declared_tool_count, len(registry.get_all_tool_names())),
+        "toolsets": toolsets,
+        "aliases": registry.get_registered_toolset_aliases(),
+    }
 
 
 def inventory_mcp(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -325,14 +376,13 @@ def build_inventory() -> dict[str, Any]:
     known_values = _known_env_values(env_path)
     agent_config = config.get("agent") if isinstance(config.get("agent"), dict) else {}
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "hermes_home": str(home),
-        "config_path": str(get_config_path()),
+        "hermes_home": "hermes_home",
+        "config_path": "config.yaml",
         "skills": inventory_skills(),
         "tools": inventory_tools(),
         "mcp_servers": inventory_mcp(config),
         "secrets": {
-            "env_file": str(get_env_path()),
+            "env_file": ".env",
             "env_keys": env_keys,
             "count": len(env_keys),
             "values_redacted": True,

@@ -2179,7 +2179,6 @@ from gateway.config import (
     load_gateway_config,
 )
 from gateway.session import (
-    _hash_chat_id,
     AsyncSessionStore,
     SessionEntry,
     SessionStore,
@@ -13080,10 +13079,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _telegram_log = _platform_name == "telegram"
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
+            _platform_name,
+            "<redacted>" if _telegram_log else source.user_name or source.user_id or "unknown",
+            "<redacted>" if _telegram_log else source.chat_id or "unknown",
+            "<redacted>" if _telegram_log and _msg_preview else _msg_preview,
+            "<redacted>" if _telegram_log and _reply_id else _reply_id,
+            "<redacted>" if _telegram_log and _reply_txt else _reply_txt,
         )
 
         # Get or create session
@@ -13093,8 +13097,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
         if recovered is not None:
             logger.info(
-                "telegram topic recovery: chat=%s user=%s %r -> %s",
-                source.chat_id, source.user_id, source.thread_id, recovered,
+                "Telegram topic recovery resolved thread context",
             )
             source = dataclasses.replace(source, thread_id=recovered)
             try:
@@ -14296,8 +14299,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
             logger.info(
-                "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
-                _platform_name, source.chat_id or "unknown",
+                "response ready: platform=%s time=%.1fs api_calls=%d response=%d chars",
+                _platform_name,
                 _response_time, _api_calls, _resp_len,
             )
 
@@ -20343,9 +20346,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         from gateway.profile_routing import match_profile_route
 
-        def _route_id(value: Optional[str]) -> str:
-            return _hash_chat_id(str(value)) if value is not None else "none"
-
         try:
             matched = match_profile_route(
                 routes,
@@ -20357,32 +20357,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception as exc:
             logger.warning(
-                "Profile route matching failed for platform=%s chat=%s thread=%s "
-                "parent=%s error_type=%s; falling back to default",
+                "Telegram route resolution failed platform=%s error_type=%s; "
+                "falling back to default",
                 source.platform.value,
-                _route_id(source.chat_id),
-                _route_id(getattr(source, "thread_id", None)),
-                _route_id(getattr(source, "parent_chat_id", None)),
                 type(exc).__name__,
             )
             return None
         if matched:
             logger.debug(
-                "Profile route matched: platform=%s chat=%s thread=%s parent=%s "
-                "profile=%s",
+                "Telegram profile route matched platform=%s profile=%s",
                 source.platform.value,
-                _route_id(source.chat_id),
-                _route_id(getattr(source, "thread_id", None)),
-                _route_id(getattr(source, "parent_chat_id", None)),
                 matched.profile,
             )
             return matched.profile
         logger.debug(
-            "No profile route matched: platform=%s chat=%s thread=%s parent=%s",
+            "Telegram profile route did not match platform=%s thread_present=%s",
             source.platform.value,
-            _route_id(source.chat_id),
-            _route_id(getattr(source, "thread_id", None)),
-            _route_id(getattr(source, "parent_chat_id", None)),
+            bool(getattr(source, "thread_id", None)),
         )
         return None
 

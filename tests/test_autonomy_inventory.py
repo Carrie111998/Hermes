@@ -1,9 +1,11 @@
 import json
 import argparse
+import builtins
 import hashlib
 import os
 import socket
 import tempfile
+import sys
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 import requests
+import subprocess
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli import autonomy_inventory
@@ -48,7 +51,7 @@ description: Test hypotheses.
     assert rows == [
         {
             "name": "research",
-            "path": str(skill_dir / "SKILL.md"),
+            "path": "skills/research/SKILL.md",
             "yaml_valid": True,
             "valid": True,
             "recommended_sections_present": [
@@ -165,6 +168,34 @@ def test_string_redaction_covers_unstructured_secret_shapes():
     assert "example.test/run" in dumped
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (["--token", "SECRET"], ["--token", "<redacted>"]),
+        (
+            ["command", "--api-key", "SECRET", "--verbose"],
+            ["command", "--api-key", "<redacted>", "--verbose"],
+        ),
+        (("--password", "SECRET"), ("--password", "<redacted>")),
+        (["--token=SECRET"], ["--token=<redacted>"]),
+        (["--TOKEN", "SECRET"], ["--TOKEN", "<redacted>"]),
+        (
+            {"nested": [["--secret", "SECRET"]]},
+            {"nested": [["--secret", "<redacted>"]]},
+        ),
+        (["sh", "-c", "tool --token SECRET"], ["sh", "-c", "tool --token <redacted>"]),
+        (
+            ["cmd.exe", "/c", "set API_TOKEN=SECRET && tool"],
+            ["cmd.exe", "/c", "set API_TOKEN=<redacted> && tool"],
+        ),
+    ],
+)
+def test_segmented_and_nested_argv_redaction(value, expected):
+    result = _redact(value)
+    assert result == expected
+    assert "SECRET" not in json.dumps(result)
+
+
 def _security_parser():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -219,6 +250,38 @@ def test_inventory_cli_exit_codes_and_json_stdout(monkeypatch, capsys):
     assert "sentinel-must-not-leak" not in captured.err
 
 
+def test_real_inventory_cli_codes_json_and_no_home_writes(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    before = _tree_snapshot(home)
+    commands = [
+        (["security", "inventory"], 0),
+        (["security", "inventory", "--json"], 0),
+        (["security", "inventory", "--help"], 0),
+        (["security", "inventory", "--output", str(home / "forbidden.json")], 2),
+    ]
+
+    completed = []
+    for args, expected_code in commands:
+        result = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", *args],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        assert result.returncode == expected_code
+        completed.append(result)
+
+    assert json.loads(completed[1].stdout)
+    assert not (home / "forbidden.json").exists()
+    assert _tree_snapshot(home) == before
+
+
 def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
     snapshot = {}
     for path in sorted(root.rglob("*")):
@@ -229,6 +292,30 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
                 hashlib.sha256(payload).hexdigest(),
             )
     return snapshot
+
+
+def test_inventory_tools_exception_does_not_mutate_process_state(monkeypatch):
+    import tools.registry as registry_module
+
+    registry = registry_module.registry
+    environ_before = dict(os.environ)
+    modules_before = dict(sys.modules)
+    registry_before = registry._snapshot_state()
+    cache_before = dict(registry_module._check_fn_cache)
+    last_good_before = dict(registry_module._check_fn_last_good)
+
+    def fail_mid_inventory(_path):
+        raise RuntimeError("forced inventory failure")
+
+    monkeypatch.setattr(registry_module, "_module_registers_tools", fail_mid_inventory)
+    with pytest.raises(RuntimeError, match="forced inventory failure"):
+        autonomy_inventory.inventory_tools()
+
+    assert dict(os.environ) == environ_before
+    assert dict(sys.modules) == modules_before
+    assert registry._snapshot_state() == registry_before
+    assert registry_module._check_fn_cache == cache_before
+    assert registry_module._check_fn_last_good == last_good_before
 
 
 def test_real_inventory_is_offline_read_only_and_restores_registry(tmp_path, monkeypatch):
@@ -245,6 +332,8 @@ def test_real_inventory_is_offline_read_only_and_restores_registry(tmp_path, mon
             f"""
 command_allowlist:
   - "runner --token {sentinel}"
+  - 'inspect C:\\Users\\SENSITIVE_USER\\AppData\\Local\\hermes'
+  - "inspect /home/sensitive-user/.hermes"
 cron:
   script: "Authorization: Bearer {sentinel}"
 """,
@@ -274,6 +363,7 @@ cron:
             for path in Path(tempfile.gettempdir()).glob("hermes-inventory-*")
         }
         attempts = []
+        writes = []
 
         def deny_network(*_args, **_kwargs):
             attempts.append("attempt")
@@ -287,10 +377,38 @@ cron:
         monkeypatch.setattr(requests.sessions.Session, "request", deny_network)
         monkeypatch.setattr(urllib.request, "urlopen", deny_network)
 
+        def deny_write(*args, **kwargs):
+            writes.append((args, kwargs))
+            raise AssertionError("filesystem write attempted")
+
+        real_open = builtins.open
+
+        def guarded_open(file, mode="r", *args, **kwargs):
+            if any(flag in mode for flag in ("w", "a", "x", "+")):
+                return deny_write(file, mode, *args, **kwargs)
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(tempfile, "TemporaryDirectory", deny_write)
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", deny_write)
+        monkeypatch.setattr(tempfile, "mkstemp", deny_write)
+        monkeypatch.setattr(os, "mkdir", deny_write)
+        monkeypatch.setattr(os, "makedirs", deny_write)
+        monkeypatch.setattr(Path, "mkdir", deny_write)
+        monkeypatch.setattr(Path, "write_text", deny_write)
+        monkeypatch.setattr(Path, "write_bytes", deny_write)
+        monkeypatch.setattr(builtins, "open", guarded_open)
+
         report = build_inventory()
+        second = build_inventory()
 
         assert attempts == []
+        assert writes == []
+        assert report == second
         assert sentinel not in json.dumps(report)
+        dumped = json.dumps(report)
+        assert str(tmp_path) not in dumped
+        assert r"C:\Users\SENSITIVE_USER\AppData\Local\hermes" not in dumped
+        assert "/home/sensitive-user/.hermes" not in dumped
         assert _tree_snapshot(tmp_path) == files_before
         assert _tree_snapshot(
             Path(autonomy_inventory.__file__).resolve().parents[1] / "tools"

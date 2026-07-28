@@ -9,6 +9,7 @@ Covers:
 - _build_message_event: DM topic resolution in message events
 """
 
+import hashlib
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -536,6 +537,51 @@ def test_cache_dm_topic_from_message_no_overwrite():
     adapter._cache_dm_topic_from_message("111", "999", "General")
 
     assert adapter._dm_topics["111:General"] == 100  # unchanged
+
+
+def _assert_no_telegram_identifier(text: str, identifiers) -> None:
+    for identifier in identifiers:
+        raw = str(identifier)
+        assert raw not in text
+        assert hashlib.sha256(raw.encode()).hexdigest()[:12] not in text
+
+
+@pytest.mark.asyncio
+async def test_telegram_topic_reaction_and_exception_logs_are_non_identifying(
+    caplog, capsys
+):
+    chat_id = "-100314159265358"
+    thread_id = "271828182845"
+    user_id = "161803398874"
+    sentinels = (chat_id, thread_id, user_id)
+    adapter = _make_adapter()
+    adapter._bot = AsyncMock()
+    adapter._bot.create_forum_topic.side_effect = RuntimeError(
+        f"telegram failure chat={chat_id} thread={thread_id} user={user_id}"
+    )
+
+    with caplog.at_level("DEBUG"):
+        assert await adapter._create_dm_topic(chat_id=int(chat_id), name="General") is None
+        adapter._cache_dm_topic_from_message(chat_id, thread_id, "General")
+        adapter._bot.set_message_reaction.side_effect = RuntimeError(
+            f"reaction failure {chat_id} {thread_id} {user_id}"
+        )
+        assert await adapter._set_reaction(chat_id, thread_id, "👀") is False
+        adapter._bot.get_chat.side_effect = RuntimeError(
+            f"lookup failure {chat_id} {thread_id} {user_id}"
+        )
+        info = await adapter.get_chat_info(chat_id)
+
+    captured = capsys.readouterr()
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    _assert_no_telegram_identifier(rendered + captured.out + captured.err, sentinels)
+    assert info == {"name": "Unknown", "type": "dm", "error": "RuntimeError"}
+
+
+def test_identifier_log_assertion_detects_regression():
+    sentinel = "-100141421356237"
+    with pytest.raises(AssertionError):
+        _assert_no_telegram_identifier(f"chat_id={sentinel}", (sentinel,))
 
 
 # ── _build_message_event: auto_skill binding ──

@@ -60,7 +60,7 @@ async def test_connect_failure_redacts_token_from_fatal_status(monkeypatch):
     assert result is False
     assert adapter._fatal_error_message is not None
     assert _SECRET_TOKEN not in adapter._fatal_error_message
-    assert "***" in adapter._fatal_error_message
+    assert adapter._fatal_error_message.endswith("RuntimeError")
 
 
 @pytest.mark.asyncio
@@ -149,7 +149,7 @@ async def test_send_update_prompt_failure_redacts_token_in_result_and_log(caplog
 
     assert result.success is False
     assert _SECRET_TOKEN not in (result.error or "")
-    assert "***" in (result.error or "")
+    assert result.error == "RuntimeError"
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert _SECRET_TOKEN not in logged
 
@@ -187,4 +187,4 @@ async def test_delete_message_failure_redacts_token_in_log(caplog):
     assert ok is False
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert _SECRET_TOKEN not in logged
-    assert "***" in logged
+    assert "error_type=RuntimeError" in logged
