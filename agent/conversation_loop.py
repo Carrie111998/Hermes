@@ -1084,6 +1084,79 @@ def _notify_context_engine_turn_complete(
         )
 
 
+# ── OpenCode-style <invoke name="X"> tool call recovery ──────────
+_INVOKE_BLOCK_RE = re.compile(
+    r'<\s*(invoke|rivoke)\s+name\s*=\s*"([^"]*)"\s*>(.*?)</\s*\1\s*>',
+    re.DOTALL | re.IGNORECASE,
+)
+_INVOKE_OPEN_RE = re.compile(
+    r'<\s*(invoke|rivoke)\s+name\s*=\s*"([^"]*)"\s*>',
+    re.DOTALL | re.IGNORECASE,
+)
+_PARAMETER_RE = re.compile(
+    r'<\s*parameter\s+(?:name|rname)\s*=\s*"([^"]*)"\s*>(.*?)</\s*parameter\s*>',
+    re.DOTALL,
+)
+
+
+def _extract_invoke_tool_calls(text: str) -> tuple[list[tuple[str, str]], str]:
+    if not text or not isinstance(text, str):
+        return [], text or ""
+    results: list[tuple[str, str]] = []
+    strip_spans: list[tuple[int, int]] = []
+    for m in _INVOKE_BLOCK_RE.finditer(text):
+        tool_name = m.group(2).strip()
+        body = m.group(3)
+        if not tool_name:
+            continue
+        args: dict[str, str] = {}
+        for pm in _PARAMETER_RE.finditer(body):
+            key = pm.group(1).strip()
+            value = pm.group(2).strip()
+            if key:
+                args[key] = value
+        results.append((tool_name, json.dumps(args)))
+        strip_spans.append((m.start(), m.end()))
+    if not results:
+        for m in _INVOKE_OPEN_RE.finditer(text):
+            if any(s <= m.start() < e for s, e in strip_spans):
+                continue
+            tool_name = m.group(2).strip()
+            if not tool_name:
+                continue
+            body = text[m.end():]
+            args = {}
+            for pm in _PARAMETER_RE.finditer(body):
+                key = pm.group(1).strip()
+                value = pm.group(2).strip()
+                if key:
+                    args[key] = value
+            results.append((tool_name, json.dumps(args)))
+            last_param_end = 0
+            for pm in _PARAMETER_RE.finditer(body):
+                last_param_end = max(last_param_end, pm.end())
+            strip_end = text.find("\n", m.end() + last_param_end)
+            if strip_end == -1:
+                strip_end = len(text)
+            else:
+                strip_end += 1
+            strip_spans.append((m.start(), strip_end))
+    if strip_spans:
+        strip_spans.sort()
+        cleaned_parts: list[str] = []
+        cursor = 0
+        for start, end in strip_spans:
+            if cursor < start:
+                cleaned_parts.append(text[cursor:start])
+            cursor = end
+        if cursor < len(text):
+            cleaned_parts.append(text[cursor:])
+        cleaned_text = "".join(cleaned_parts).strip()
+    else:
+        cleaned_text = text.strip()
+    return results, cleaned_text
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -5657,7 +5730,25 @@ def run_conversation(
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
-            
+
+            # Recovery: model may emit OpenCode-style <invoke name="X"> XML
+            # in text content instead of structured tool_calls. Parse them out.
+            if not assistant_message.tool_calls and assistant_message.content:
+                _invoke_calls, _cleaned = _extract_invoke_tool_calls(assistant_message.content)
+                if _invoke_calls:
+                    from agent.transports.types import ToolCall
+                    assistant_message.tool_calls = [
+                        ToolCall(id=f"invoke_{i}", name=name, arguments=args)
+                        for i, (name, args) in enumerate(_invoke_calls)
+                    ]
+                    assistant_message.content = _cleaned or None
+                    assistant_message.finish_reason = "tool_calls"
+                    if not agent.quiet_mode:
+                        agent._vprint(
+                            f"{agent.log_prefix}🔧 Recovered {len(_invoke_calls)} tool call(s)"
+                            f" from <invoke> XML in text content"
+                        )
+
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
