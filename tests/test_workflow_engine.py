@@ -1087,11 +1087,11 @@ def test_build_task_body_appends_context_footer_after_substitution(engine):
     body = engine._build_task_body(
         wf.nodes["a"], wf, states, layers, context={"x": "X_VAL"},
     )
-    # The body should contain the resolved value AND the JSON footer
+    # The body should contain the resolved value but NOT the Context footer
+    # or Run ID — those are meta noise that agents don't need in card bodies.
     assert "Task with X_VAL" in body
-    assert 'Context: {"x": "X_VAL"}' in body
-    # The footer should be after the resolved task text, not before
-    assert body.index("X_VAL") < body.index('Context: ')
+    assert 'Context:' not in body
+    assert 'Run ID:' not in body
 
 
 def test_build_task_body_no_context_no_footer(engine):
@@ -1162,8 +1162,8 @@ def test_build_task_body_full_council_substitution(engine, council_pipeline):
     # No unresolved literals left
     assert "{context.question}" not in body
     assert "{phase1.all}" not in body
-    # Footer is present
-    assert "Context:" in body
+    # Context footer is removed — agents don't need meta noise in card bodies
+    assert "Context:" not in body
 
 
 def test_build_task_body_phase2a_vs_phase2b(engine, council_pipeline):
@@ -1303,8 +1303,8 @@ def test_create_kanban_card_resolves_templates_when_workflow_provided(
     # Literal braces are gone
     assert "{phase1.all}" not in body
     assert "{context.q}" not in body
-    # Context footer was appended
-    assert 'Context: {"q": "Q_VAL"}' in body
+    # Context footer removed — meta noise not in card bodies
+    assert 'Context:' not in body
 
 
 def test_create_kanban_card_legacy_path_unchanged(

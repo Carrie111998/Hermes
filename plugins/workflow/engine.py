@@ -1242,20 +1242,7 @@ class WorkflowEngine:
             }
             print(f"   📋 WFE:DIAG {json.dumps(diag, default=str)}", file=sys.stderr)
 
-        if context:
-            # Preserve the pre-B2 footer. It contains braces (JSON
-            # dict literal) that would otherwise be eaten by the
-            # template resolver if we appended it first.
-            body = resolved_task + f"\n\nContext: {json.dumps(context)}"
-        else:
-            body = resolved_task
-        # Append run ID so agents can identify which workflow run
-        # this card belongs to — critical when multiple runs of the
-        # same workflow are in progress simultaneously.
-        run_id = lookup.get("run_id", "")
-        if run_id:
-            body += f"\n\nRun ID: {run_id}"
-        return body
+        return resolved_task
 
     # ── State persistence ──────────────────────────────────────
 
@@ -2594,12 +2581,10 @@ class WorkflowEngine:
                             if upstream_state.kanban_card_id:
                                 try:
                                     with kanban_db.connect_closing(board=self.kanban_board) as conn:
-                                        existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
-                                        feedback = f"\n\n--- Review Failed ({nid}) ---\n{body}"
-                                        new_body = existing_body + feedback
+                                        kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Failed ({nid}):\n{body}")
                                         conn.execute(
-                                            "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL WHERE id = ?",
-                                            (new_body, upstream_state.kanban_card_id)
+                                            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+                                            (upstream_state.kanban_card_id,)
                                         )
                                         conn.commit()
                                     upstream_state.status = "ready"
@@ -3348,12 +3333,10 @@ class WorkflowEngine:
                             if upstream_state.kanban_card_id:
                                 try:
                                     with kanban_db.connect_closing(board=self.kanban_board) as conn:
-                                        existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
-                                        enrichment = f"\n\n--- Review Passed ({nid}) ---\n{reviewer_body}"
-                                        new_body = existing_body + enrichment
+                                        kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
                                         conn.execute(
-                                            "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
-                                            (new_body, upstream_state.kanban_card_id)
+                                            "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                            (upstream_state.kanban_card_id,)
                                         )
                                         conn.commit()
                                     upstream_state.status = "ready"
@@ -3450,12 +3433,10 @@ class WorkflowEngine:
                                         if upstream_state.kanban_card_id:
                                             try:
                                                 with kanban_db.connect_closing(board=self.kanban_board) as conn:
-                                                    existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
-                                                    feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
-                                                    new_body = existing_body + feedback
+                                                    kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Feedback ({nid}):\n{body}")
                                                     conn.execute(
-                                                        "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
-                                                        (new_body, upstream_state.kanban_card_id)
+                                                        "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                                        (upstream_state.kanban_card_id,)
                                                     )
                                                     conn.commit()
                                                 upstream_state.status = "ready"
@@ -3513,12 +3494,10 @@ class WorkflowEngine:
                                     if upstream_state.kanban_card_id:
                                         try:
                                             with kanban_db.connect_closing(board=self.kanban_board) as conn:
-                                                existing_body = kanban_db.get_task(conn, upstream_state.kanban_card_id).body or ""
-                                                feedback = f"\n\n--- Review Feedback ({nid}) ---\n{body}"
-                                                new_body = existing_body + feedback
+                                                kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Feedback ({nid}):\n{body}")
                                                 conn.execute(
-                                                    "UPDATE tasks SET body = ?, status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
-                                                    (new_body, upstream_state.kanban_card_id)
+                                                    "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                                    (upstream_state.kanban_card_id,)
                                                 )
                                                 conn.commit()
                                             upstream_state.status = "ready"
