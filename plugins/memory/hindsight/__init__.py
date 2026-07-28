@@ -982,6 +982,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     new_lines.append(f"{k}={v}")
             env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
+        # Step 5: Optional starter template. Only for cloud / local_external —
+        # the API is reachable now; local_embedded's daemon isn't up during setup.
+        if mode in ("cloud", "local_external"):
+            self._offer_starter_template(mode, provider_config, env_writes)
+
         if mode == "local_embedded":
             materialized_config = dict(provider_config)
             config_path = Path(hermes_home) / "hindsight" / "config.json"
@@ -1008,6 +1013,24 @@ class HindsightMemoryProvider(MemoryProvider):
         if env_writes:
             print("  API keys saved to .env")
         print("\n  Start a new session to activate.\n")
+
+    def _offer_starter_template(self, mode: str, provider_config: dict, env_writes: dict) -> None:
+        """Offer to seed the bank with a Hermes starter template (best-effort)."""
+        from hermes_cli.memory_setup import _CANCELLED, _curses_select
+
+        from . import templates as _hs_templates
+
+        default_url = _DEFAULT_LOCAL_URL if mode == "local_external" else _DEFAULT_API_URL
+        api_url = provider_config.get("api_url") or default_url
+        bank_id = provider_config.get("bank_id", "hermes")
+        api_key = env_writes.get("HINDSIGHT_API_KEY") or os.environ.get("HINDSIGHT_API_KEY", "") or None
+        _hs_templates.run_template_step(
+            api_url=api_url,
+            bank_id=bank_id,
+            api_key=api_key,
+            select=_curses_select,
+            cancelled=_CANCELLED,
+        )
 
     def get_config_schema(self):
         return [
