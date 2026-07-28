@@ -151,6 +151,22 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
 }
 
+/**
+ * Returns true when the terminal viewport is at (or past) the bottom of the
+ * scrollback buffer.  We compare viewportY against baseY — xterm.js defines
+ * baseY as "the first line of the bottom page when fully scrolled down", so
+ * viewportY >= baseY means the user has not scrolled up at all (or has
+ * scrolled back to the bottom).
+ *
+ * Used by the PTY onmessage handler to implement auto-scroll-if-at-bottom:
+ * new data appears at the bottom only when the user is already there; if
+ * they scrolled up to read history the viewport stays put.
+ */
+function isTerminalAtBottom(term: Terminal): boolean {
+  const buf = term.buffer.active;
+  return buf.viewportY >= buf.baseY;
+}
+
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -983,10 +999,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
 
     ws.onmessage = (ev) => {
+      // Fix #53641 (viewport drift during normal conversation): xterm.js does
+      // not auto-scroll when the user has scrolled up even a single line.
+      // Capture the at-bottom state *before* writing so the new content hasn't
+      // shifted the buffer yet, then scroll inside a rAF so xterm has finished
+      // rendering.  When the user is reading history (scrolled up) we leave the
+      // viewport alone.
+      const atBottom = isTerminalAtBottom(term);
       if (typeof ev.data === "string") {
         term.write(ev.data);
       } else {
         term.write(new Uint8Array(ev.data as ArrayBuffer));
+      }
+      if (atBottom) {
+        requestAnimationFrame(() => {
+          try { term.scrollToBottom(); } catch { /* disposed */ }
+        });
       }
     };
 
