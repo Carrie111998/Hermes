@@ -1395,6 +1395,7 @@ class ProductionBackend:
                 "native_task_not_indexed",
                 "codex_thread_conflict",
                 "native_create_ambiguous",
+                "marker_conflict",
             }
             or confirmation != "PRESERVE_EXACT_BOUND_TASK"
         ):
@@ -3378,6 +3379,7 @@ def build_parser() -> argparse.ArgumentParser:
             "native_task_not_indexed",
             "codex_thread_conflict",
             "native_create_ambiguous",
+            "marker_conflict",
         ),
         required=True,
     )
@@ -4548,6 +4550,7 @@ def _public_sidebar_bound_retry_result(raw: Mapping[str, Any]) -> dict[str, Any]
             "native_task_not_indexed",
             "codex_thread_conflict",
             "native_create_ambiguous",
+            "marker_conflict",
         }
         or not isinstance(job_id, str)
         or re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None

@@ -7518,6 +7518,7 @@ class SessionBridgeStore:
                 "native_task_not_indexed",
                 "codex_thread_conflict",
                 "native_create_ambiguous",
+                "marker_conflict",
             }
             or authority != "PRESERVE_EXACT_BOUND_TASK"
         ):

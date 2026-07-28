@@ -1265,6 +1265,61 @@ def test_sidebar_retry_bound_accepts_exact_project_drift_conflict(
     }
 
 
+def test_sidebar_retry_bound_accepts_exact_idempotent_marker_replay(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "c" * 64
+    source_session_id = "claude:2775e933-7684-486f-a681-e50647dbf17c"
+    thread_id = "019fa687-7ee0-79d1-92d9-17294ea810ab"
+    backend = FakeBackend(
+        sidebar_bound_retry_payload={
+            "status": "requeued",
+            "job_id": job_id,
+            "codex_thread_id": thread_id,
+            "error_code": "marker_conflict",
+            "state": "sidebar_retry",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-retry-bound",
+                "--job-id",
+                job_id,
+                "--source-session-id",
+                source_session_id,
+                "--codex-thread-id",
+                thread_id,
+                "--expected-error-code",
+                "marker_conflict",
+                "--confirm",
+                "PRESERVE_EXACT_BOUND_TASK",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    assert backend.calls == [
+        (
+            "sidebar_retry_bound",
+            job_id,
+            source_session_id,
+            thread_id,
+            "marker_conflict",
+            "PRESERVE_EXACT_BOUND_TASK",
+        ),
+        ("close",),
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "requeued",
+        "job_id": job_id,
+        "codex_thread_id": thread_id,
+        "state": "sidebar_retry",
+    }
+
+
 @pytest.mark.parametrize(
     "argv",
     (
@@ -1301,7 +1356,7 @@ def test_sidebar_retry_bound_accepts_exact_project_drift_conflict(
             "--codex-thread-id",
             "019f-bound-thread",
             "--expected-error-code",
-            "marker_conflict",
+            "source_identity_mismatch",
             "--confirm",
             "PRESERVE_EXACT_BOUND_TASK",
         ],
@@ -1887,6 +1942,39 @@ def test_production_sidebar_retry_bound_accepts_exact_ambiguous_create(
             "job_id": failed["id"],
             "codex_thread_id": thread_id,
             "error_code": "native_create_ambiguous",
+            "state": SidebarJobState.RETRY.value,
+        }
+        assert store.get_sidebar_create_reservation(source_session_id) == reservation
+    finally:
+        backend.close()
+
+
+def test_production_sidebar_retry_bound_accepts_exact_idempotent_marker_replay(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation = _production_bound_retry_backend(tmp_path)
+    source_session_id = failed["source_session_id"]
+    thread_id = failed["codex_thread_id"]
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("marker_conflict", failed["id"]),
+        )
+    )
+    try:
+        result = backend.sidebar_retry_bound(
+            job_id=failed["id"],
+            source_session_id=source_session_id,
+            codex_thread_id=thread_id,
+            expected_error_code="marker_conflict",
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+        )
+
+        assert result == {
+            "status": "requeued",
+            "job_id": failed["id"],
+            "codex_thread_id": thread_id,
+            "error_code": "marker_conflict",
             "state": SidebarJobState.RETRY.value,
         }
         assert store.get_sidebar_create_reservation(source_session_id) == reservation
