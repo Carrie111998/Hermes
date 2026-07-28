@@ -178,7 +178,16 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             _select_active_environment,
         )
 
-        cfg = _get_env_config()
+        # The registry cache key needs env_type, so the config read has to come
+        # first — but it must not pre-empt the live-environment lookup. A
+        # registered backend is authoritative on its own, and letting a config
+        # failure fall through to the outer handler would report "local" while
+        # a container env is active, silently routing container paths to the
+        # host (the misrouting this module exists to prevent).
+        try:
+            cfg = _get_env_config()
+        except Exception:
+            cfg = {}
         try:
             container_key = _resolve_environment_cache_key(
                 task_id,
