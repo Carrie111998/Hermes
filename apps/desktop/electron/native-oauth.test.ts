@@ -20,6 +20,7 @@ import {
   nativeRefreshUrl,
   nativeTokenUrl,
   parseLoopbackCallback,
+  parseStoredTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   statusSupportsNativeFlow,
@@ -171,6 +172,48 @@ test('parseTokenResponse throws on a missing access token', () => {
 
 test('parseTokenResponse tolerates an absent refresh token / expiry', () => {
   const t = parseTokenResponse({ access_token: 'AT' })
+
+  assert.equal(t.refreshToken, '')
+  assert.equal(t.expiresAt, 0)
+})
+
+// --- stored-token rehydration (#73271) ---
+
+test('parseStoredTokenSet rehydrates a persisted camelCase NativeTokenSet', () => {
+  const original = {
+    accessToken: 'AT-stored',
+    refreshToken: 'RT-stored',
+    expiresAt: 1893456000,
+    provider: 'nous',
+    userId: 'u-9'
+  }
+
+  // Round-trip through the on-disk encoding: _persistNativeTokens writes
+  // JSON.stringify(tokens); _loadNativeTokens decrypts and JSON.parses it.
+  const t = parseStoredTokenSet(JSON.parse(JSON.stringify(original)))
+
+  assert.deepEqual(t, original)
+})
+
+test('parseTokenResponse cannot read a persisted set (the reload bug #73271)', () => {
+  // Guards against regressing to the wrong parser on the reload path: a
+  // persisted camelCase set has no snake_case access_token, so the raw-response
+  // parser throws — which is exactly why the stored path must use
+  // parseStoredTokenSet instead.
+  const persisted = JSON.parse(
+    JSON.stringify({ accessToken: 'AT', refreshToken: 'RT', expiresAt: 1, provider: 'nous', userId: 'u' })
+  )
+
+  assert.throws(() => parseTokenResponse(persisted), /missing access_token/i)
+  assert.equal(parseStoredTokenSet(persisted).accessToken, 'AT')
+})
+
+test('parseStoredTokenSet throws on a missing access token', () => {
+  assert.throws(() => parseStoredTokenSet({ refreshToken: 'RT' }), /missing accessToken/i)
+})
+
+test('parseStoredTokenSet tolerates an absent refresh token / expiry', () => {
+  const t = parseStoredTokenSet({ accessToken: 'AT' })
 
   assert.equal(t.refreshToken, '')
   assert.equal(t.expiresAt, 0)

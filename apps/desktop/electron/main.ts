@@ -135,6 +135,7 @@ import {
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
+  parseStoredTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   tokenNeedsRefresh
@@ -6098,7 +6099,11 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
       return null
     }
 
-    const tokens = parseTokenResponse(JSON.parse(plaintext))
+    // Reload uses the stored-set parser (camelCase), NOT parseTokenResponse
+    // (snake_case, for raw gateway responses) — the persisted blob is a
+    // JSON.stringify'd NativeTokenSet, so the raw parser would reject it and
+    // strand a signed-in user on the sign-in screen after restart (#73271).
+    const tokens = parseStoredTokenSet(JSON.parse(plaintext))
     _nativeTokens.set(baseUrl, tokens)
 
     return tokens

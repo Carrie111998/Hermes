@@ -194,6 +194,37 @@ export function parseTokenResponse(body: any): NativeTokenSet {
 }
 
 /**
+ * Parse a *persisted* NativeTokenSet back into a validated NativeTokenSet.
+ * This is the reload counterpart of `parseTokenResponse`: the on-disk blob is
+ * `JSON.stringify(NativeTokenSet)` (camelCase — `accessToken`, `refreshToken`,
+ * `expiresAt`, …), whereas `parseTokenResponse` reads the raw gateway
+ * `/auth/native/token` response (snake_case — `access_token`, …). The two
+ * payloads use different field names, so a stored set must NOT be run through
+ * the raw-response parser — that path reads `access_token`, finds it absent on
+ * every persisted set, and throws `missing access_token`, stranding a
+ * signed-in user on the sign-in screen after a restart. Throws on a
+ * missing/empty access token so a corrupt store fails loudly rather than
+ * rehydrating junk.
+ */
+export function parseStoredTokenSet(body: any): NativeTokenSet {
+  const accessToken = String(body?.accessToken || '')
+
+  if (!accessToken) {
+    throw new Error('Stored native token set missing accessToken')
+  }
+
+  const expiresAt = Number(body?.expiresAt)
+
+  return {
+    accessToken,
+    refreshToken: String(body?.refreshToken || ''),
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    provider: String(body?.provider || ''),
+    userId: String(body?.userId || '')
+  }
+}
+
+/**
  * True when a stored token set is at/near expiry and should be refreshed
  * before use. `skewSeconds` refreshes slightly early to avoid a race where
  * the token expires in flight (mirrors the server's 60s cookie floor).
