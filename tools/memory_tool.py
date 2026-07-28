@@ -1091,7 +1091,7 @@ def _check_policy_claim_gate(action: str, target: str, content: Optional[str],
     except Exception as e:
         logger.warning(
             "Policy-claim gate: cannot import write_approval, "
-            "failing open (%s)", e,
+            "failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
         )
         return None
 
@@ -1112,7 +1112,7 @@ def _check_policy_claim_gate(action: str, target: str, content: Optional[str],
         )
     except Exception as e:
         logger.warning(
-            "Policy-claim gate: stage_write failed, failing open (%s)", e,
+            "Policy-claim gate: stage_write failed, failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
         )
         return None
 
@@ -1165,7 +1165,7 @@ def _check_policy_claim_batch(
     except Exception as e:
         logger.warning(
             "Policy-claim batch gate: cannot import write_approval, "
-            "failing open (%s)", e,
+            "failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
         )
         return None
 
@@ -1185,7 +1185,7 @@ def _check_policy_claim_batch(
         )
     except Exception as e:
         logger.warning(
-            "Policy-claim batch gate: stage_write failed, failing open (%s)", e,
+            "Policy-claim batch gate: stage_write failed, failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
         )
         return None
 
