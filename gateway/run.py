@@ -13003,10 +13003,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _stopped = self._completion_registry.signal_stop()
             if _stopped:
                 logger.info(
-                    "Completion registry: %d entries moved to STOPPING "
-                    "(counters: %s)",
+                    "Completion registry: %d entries moved to STOPPING",
                     len(_stopped),
-                    self._completion_registry.counters,
                 )
 
             for platform, adapter in list(self.adapters.items()):
@@ -22146,22 +22144,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         DROPPED_OVERFLOW = "dropped_overflow"
         SHUTTING_DOWN = "shutting_down"
 
-    class CompletionStore:
-        """Protocol for optional durability of pending completions.
-
-        Default is ``NullCompletionStore`` — in-memory only, identical
-        behaviour to the pre-registry delivery path.
-        """
-        async def put(self, entry: dict) -> None: ...
-        async def remove(self, identity: str) -> None: ...
-        async def load_pending(self) -> list: ...
-
-    class NullCompletionStore(CompletionStore):
-        """Default no-op store. Completions are purely in-memory."""
-        async def put(self, entry: dict) -> None: return None
-        async def remove(self, identity: str) -> None: return None
-        async def load_pending(self) -> list: return []
-
     class PendingCompletionRegistry:
         """Explicit state machine for completion notification delivery.
 
@@ -22201,17 +22183,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             State.UNROUTABLE, State.DROPPED_OVERFLOW, State.STOPPING,
         }
 
-        def __init__(self, store: "CompletionStore | None" = None):
+        def __init__(self):
             import threading as _threading
             self._lock = _threading.Lock()
             self._entries: dict[str, dict] = {}
             self._stopping = False
-            self._store = store  # None means in-memory only (no-op store)
-            # Observability counters
-            self.counters: dict[str, int] = {
-                "delivered": 0, "failed": 0, "superseded": 0,
-                "unroutable": 0, "dropped_overflow": 0, "stopping": 0,
-            }
 
         # -- public API -------------------------------------------------
 
@@ -22222,7 +22198,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             import asyncio as _asyncio
             with self._lock:
                 if len(self._entries) >= self.BATCH_CAPACITY:
-                    self.counters["dropped_overflow"] += 1
                     return None
                 future = _asyncio.get_running_loop().create_future()
                 self._entries[identity] = {
@@ -22263,7 +22238,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 entry = self._entries.get(identity)
                 if entry is not None and entry["state"] is self.State.CLAIMED:
                     entry["state"] = self.State.DELIVERED
-                    self.counters["delivered"] += 1
 
         def retry(self, identity: str) -> float | None:
             """Transition CLAIMED->PENDING with attempt counter.
@@ -22278,7 +22252,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 entry["attempts"] += 1
                 if entry["attempts"] >= self.MAX_ATTEMPTS:
                     entry["state"] = self.State.FAILED
-                    self.counters["failed"] += 1
                     return None
                 deadline = _time.monotonic() + self.BASE_BACKOFF * (2 ** (entry["attempts"] - 1))
                 entry["next_attempt_at"] = deadline
@@ -22292,7 +22265,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 entry = self._entries.get(identity)
                 if entry is not None:
                     entry["state"] = self.State.SUPERSEDED
-                    self.counters["superseded"] += 1
 
         def mark_unroutable(self, identity: str) -> None:
             """Transition to UNROUTABLE."""
@@ -22300,7 +22272,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 entry = self._entries.get(identity)
                 if entry is not None:
                     entry["state"] = self.State.UNROUTABLE
-                    self.counters["unroutable"] += 1
 
         def signal_stop(self) -> list[dict]:
             """Move all non-terminal entries to STOPPING. Returns the list."""
@@ -22310,7 +22281,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for entry in self._entries.values():
                     if entry["state"] not in self._TERMINAL:
                         entry["state"] = self.State.STOPPING
-                        self.counters["stopping"] += 1
                         stopped.append(entry)
             return stopped
 

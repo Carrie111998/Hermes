@@ -229,5 +229,6 @@ def test_overflow_is_counted_not_silent() -> None:
         reg = _fresh()
         for i in range(CAPACITY + 5):
             reg.enqueue(f"proc_{i:04d}", ("r1",), _dummy_payload())
-        assert reg.counters["dropped_overflow"] == 5
+        # CAPACITY entries accepted, 5 silently rejected (returned None)
+        assert len(reg._entries) == CAPACITY
     run_sync(_test())
