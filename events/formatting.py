@@ -580,33 +580,64 @@ def code_drift_body(p: dict) -> str:
     """
     p = p or {}
     repo = p.get("repo", "~/.hermes/agent-src")
+    # Watched repos disagree on the trunk branch name (agent-src `main`,
+    # ~/.hermes `master`), so never hardcode it here — an operator told to
+    # "ff-only main" in a repo that has no `main` gets a fatal command.
+    # `main` is the pre-2026-07-28 payload alias, kept for stored events.
+    trunk = p.get("trunk", p.get("main", "?"))
+    trunk_name = p.get("trunk_name") or "main"
+    label = f"{p.get('repo_name')} checkout" if p.get("repo_name") else "Deployed checkout"
+
     if p.get("status") == "resolved":
-        return f"Deployed checkout back in sync with main @ {p.get('main', '?')}"
+        if p.get("inert"):
+            # Gated repo left the alerting state without merging: don't
+            # claim a sync that did not happen.
+            return (f"{label} drift no longer touches executed code "
+                    f"(still not merged with {trunk_name}).")
+        return f"{label} back in sync with {trunk_name} @ {trunk}"
 
     state = p.get("state", "?")
     lines = []
+    if state == "misconfigured":
+        # The fail-silent case made loud (2026-07-28): the repo is present
+        # but its configured trunk ref does not resolve, so drift CANNOT be
+        # evaluated. Reported as a broken watcher, not as a clean repo.
+        detail = p.get("detail") or "trunk ref does not resolve"
+        lines.append(
+            f"CODE DRIFT MONITOR IS BLIND on {repo}: {detail}. "
+            "Drift is NOT being evaluated for this repo — treat it as "
+            "unmonitored until fixed."
+        )
+        lines.append(
+            f"Fix: point the watched-repo entry at the real trunk ref "
+            f"(git -C {repo} branch --list), then restart the gateway."
+        )
+        return "\n".join(lines)
     if state == "behind":
         lines.append(
-            f"Deployed checkout LAGS main by {p.get('behind_count', '?')} "
+            f"{label} LAGS {trunk_name} by {p.get('behind_count', '?')} "
             "commit(s) — landed fixes are NOT running."
         )
         for subj in (p.get("missed_subjects") or [])[:5]:
             lines.append(f"  missed: {subj}")
     elif state == "ahead":
         lines.append(
-            f"Deployed checkout is AHEAD of main by {p.get('ahead_count', '?')} "
+            f"{label} is AHEAD of {trunk_name} by {p.get('ahead_count', '?')} "
             "commit(s) — the working tree carries unlanded state."
         )
     else:
         lines.append(
-            f"Deployed checkout has DIVERGED from main "
-            f"(HEAD {p.get('head', '?')} vs main {p.get('main', '?')})."
+            f"{label} has DIVERGED from {trunk_name} "
+            f"(HEAD {p.get('head', '?')} vs {trunk_name} {trunk})."
         )
+    for f in (p.get("executed_files") or [])[:5]:
+        lines.append(f"  executed: {f}")
     if p.get("dirty"):
         lines.append("Working tree is DIRTY (uncommitted changes).")
     if state == "behind":
         lines.append(
-            f"Fix: git -C {repo} merge --ff-only main, then restart the gateway."
+            f"Fix: git -C {repo} merge --ff-only {trunk_name}, "
+            "then restart the gateway."
         )
     return "\n".join(lines)
 

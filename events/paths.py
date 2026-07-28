@@ -7,13 +7,25 @@ but notification state is CROSS-PROFILE (all agents contribute, one user
 consumes), so it must live at the canonical ~/.hermes root.
 """
 
+import re
 from pathlib import Path
+from typing import Optional
 
 from hermes_constants import get_default_hermes_root
 
 
 def _root() -> Path:
     return get_default_hermes_root()
+
+
+def hermes_repo_root() -> Path:
+    """The ~/.hermes parent repo root — itself a git checkout whose WORKING
+    TREE is production (cron script slots and Scheduled Tasks resolve
+    absolute paths under it). Canonical root, never profile-scoped: the
+    repo is ~/.hermes, not ~/.hermes/profiles/<name>.  Added 2026-07-28 for
+    the CODE_DRIFT watched-repo list.
+    """
+    return _root()
 
 
 def events_dir() -> Path:
@@ -106,15 +118,22 @@ def failure_cluster_state_path() -> Path:
     return events_dir() / "failure_cluster_state.json"
 
 
-def code_drift_state_path() -> Path:
-    """CodeDriftMonitor episode persistence (2026-07-21).
+def code_drift_state_path(repo_name: Optional[str] = None) -> Path:
+    """CodeDriftMonitor episode persistence, one file per watched repo.
 
     Holds {"alerting", "last_emit_wall", "last_shape"} so the falling-edge
     "resolved" event survives the common remediation path (FF the checkout,
     then restart the gateway). Wall-clock timestamps — same lesson as the
     notifier batch-age persistence. Cross-profile, so canonical root.
+
+    agent-src keeps the original un-suffixed filename so the in-flight
+    episode state of the only pre-2026-07-28 watched repo survives the
+    multi-repo cutover; every other repo gets a slugged sibling.
     """
-    return notifications_home() / "code_drift_state.json"
+    if repo_name is None or repo_name == "agent-src":
+        return notifications_home() / "code_drift_state.json"
+    slug = re.sub(r"[^a-z0-9._-]+", "-", repo_name.lower()).strip("-.") or "repo"
+    return notifications_home() / f"code_drift_state.{slug}.json"
 
 
 def cron_trigger_log_path() -> Path:

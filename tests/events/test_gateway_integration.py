@@ -396,18 +396,33 @@ class TestResourceMonitorWiring:
 class TestCodeDriftMonitorWiring:
     """CodeDriftMonitor (2026-07-21 stale-checkout remediation) must be
     constructed at startup and probed by the poll loop. Asserted statically
-    for the same reasons as TestResourceMonitorWiring above."""
+    for the same reasons as TestResourceMonitorWiring above.
+
+    2026-07-28: one monitor PER watched repo — a single instance could only
+    ever watch agent-src, leaving the ~/.hermes parent repo (whose working
+    tree cron and Scheduled Tasks execute) structurally unwatched.
+    """
 
     def test_getter_returns_module_global(self):
-        assert gi.get_code_drift_monitor() is gi._code_drift_monitor
+        assert gi.get_code_drift_monitors() is gi._code_drift_monitors
 
-    def test_startup_constructs_code_drift_monitor(self):
+    def test_startup_constructs_one_monitor_per_watched_repo(self):
         src = inspect.getsource(gi.startup)
-        assert "_code_drift_monitor = CodeDriftMonitor(_bus)" in src
+        assert "CodeDriftMonitor(_bus, repo=r) for r in watched_repos()" in src
 
-    def test_poll_loop_probes_code_drift(self):
+    def test_poll_loop_probes_every_monitor(self):
         src = inspect.getsource(gi._subscriber_poll_loop)
-        assert "_code_drift_monitor.check()" in src
+        assert "for _drift_monitor in _code_drift_monitors:" in src
+        assert "_drift_monitor.check()" in src
+
+    def test_hermes_parent_repo_is_actually_wired(self):
+        """The gap the 2026-07-28 incident exposed: it is not enough that the
+        list is parameterised — ~/.hermes must be IN it, on its own trunk."""
+        from events.producers.code_drift_monitor import watched_repos
+
+        by_name = {r.name: r for r in watched_repos()}
+        assert "hermes" in by_name
+        assert by_name["hermes"].trunk_ref == "refs/heads/master"
 
 
 class TestDedicatedApplierThread:

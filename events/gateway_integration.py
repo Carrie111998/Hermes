@@ -23,7 +23,7 @@ from events.paths import (
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
 from events.producers.resource_monitor import ResourcePressureMonitor
-from events.producers.code_drift_monitor import CodeDriftMonitor
+from events.producers.code_drift_monitor import CodeDriftMonitor, watched_repos
 from events.producers.partial_backlog_monitor import PartialBacklogMonitor
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
@@ -92,7 +92,7 @@ _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
 _health_monitor: Optional[GatewayHealthMonitor] = None
 _resource_monitor: Optional[ResourcePressureMonitor] = None
-_code_drift_monitor: Optional[CodeDriftMonitor] = None
+_code_drift_monitors: List[CodeDriftMonitor] = []
 _partial_backlog_monitor: Optional[PartialBacklogMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
 _subscriber_thread: Optional[threading.Thread] = None
@@ -118,7 +118,7 @@ _gateway_started_at_monotonic: Optional[float] = None
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _resource_monitor, _code_drift_monitor, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
+    global _bus, _registry, _health_monitor, _resource_monitor, _code_drift_monitors, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
 
     if _bus is not None:
         shutdown()
@@ -130,7 +130,10 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry = SubscriberRegistry()
     _health_monitor = GatewayHealthMonitor(_bus)
     _resource_monitor = ResourcePressureMonitor(_bus)
-    _code_drift_monitor = CodeDriftMonitor(_bus)
+    # One monitor per repo whose WORKING TREE is deployed code, each with
+    # its own trunk ref and its own episode-state file (2026-07-28: added
+    # ~/.hermes on `master` alongside agent-src on `main`).
+    _code_drift_monitors = [CodeDriftMonitor(_bus, repo=r) for r in watched_repos()]
     # Always-on tracker partial/ backlog alert (independent of the re-drive flag).
     # Construction is side-effect-free (stores the path; counts only on check()).
     _partial_backlog_monitor = PartialBacklogMonitor(
@@ -342,9 +345,18 @@ def get_resource_monitor() -> Optional[ResourcePressureMonitor]:
     return _resource_monitor
 
 
+def get_code_drift_monitors() -> List[CodeDriftMonitor]:
+    """All code-drift monitors (one per watched repo, checkout-vs-trunk)."""
+    return _code_drift_monitors
+
+
 def get_code_drift_monitor() -> Optional[CodeDriftMonitor]:
-    """Get the code-drift monitor (checkout-vs-main probe)."""
-    return _code_drift_monitor
+    """The agent-src code-drift monitor, or None before startup().
+
+    Back-compat accessor from when agent-src was the only watched repo;
+    prefer get_code_drift_monitors().
+    """
+    return _code_drift_monitors[0] if _code_drift_monitors else None
 
 
 def get_partial_backlog_monitor() -> Optional[PartialBacklogMonitor]:
@@ -767,15 +779,17 @@ def _subscriber_poll_loop() -> None:
                     logger.exception("Resource pressure check failed")
                 last_resource_check = now
 
-            # Code-drift probe — the deployed detached checkout vs the landed
-            # main ref (2026-07-20/21 stale-restart incident). The monitor
+            # Code-drift probe — each deployed checkout vs its own trunk ref
+            # (2026-07-20/21 agent-src stale-restart incident; 2026-07-28
+            # ~/.hermes 62-commit stale-checkout incident). Every monitor
             # self-gates to one read-only git sample per 15 min, so the
             # per-tick call is a clock comparison.
-            if _code_drift_monitor:
+            for _drift_monitor in _code_drift_monitors:
                 try:
-                    _code_drift_monitor.check()
+                    _drift_monitor.check()
                 except Exception:
-                    logger.exception("Code drift check failed")
+                    logger.exception("Code drift check failed (%s)",
+                                     _drift_monitor.repo_name)
 
             # Tracker partial-backlog check every 60s — counts
             # mailbox/tracker/partial/ and emits TRACKER_PARTIAL_BACKLOG on the

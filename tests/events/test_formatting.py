@@ -550,6 +550,33 @@ class TestCodeDriftBody:
         assert "back in sync" in body
         assert "bbbbbbbbb" in body
 
+    def test_master_trunk_remediation_names_master_not_main(self):
+        """~/.hermes has no `main` branch: telling the operator to run
+        `merge --ff-only main` there hands them a fatal command."""
+        from events.formatting import code_drift_body
+        body = code_drift_body(self._payload(
+            repo="C:/Users/diego/.hermes", repo_name="hermes",
+            trunk="bbbbbbbbb", trunk_name="master",
+        ))
+        assert "LAGS master by 3 commit(s)" in body
+        assert "merge --ff-only master" in body
+        assert "ff-only main" not in body
+
+    def test_misconfigured_body_reads_as_a_blind_watcher(self):
+        """state='misconfigured' is the loud replacement for the old silent
+        None. It must NOT read like a healthy or merely-drifting repo."""
+        from events.formatting import code_drift_body
+        body = code_drift_body({
+            "status": "drifting", "state": "misconfigured",
+            "repo": "C:/Users/diego/.hermes", "repo_name": "hermes",
+            "detail": "configured trunk ref refs/heads/main does not exist",
+            "head": "", "trunk": "",
+        })
+        assert "BLIND" in body
+        assert "refs/heads/main does not exist" in body
+        assert "UNMONITORED" in body or "unmonitored" in body
+        assert "in sync" not in body
+
     def test_resolved_header_dot_is_green(self):
         """A CODE_DRIFT resolution reads as green, mirroring the
         GATEWAY_HEALTH 'up' override — recovery, not an alert."""

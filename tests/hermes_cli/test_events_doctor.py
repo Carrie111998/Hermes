@@ -200,15 +200,74 @@ class TestCodeDrift:
         assert issues == 0
         assert "skip" in out.lower()
 
-    def test_missing_main_ref_skips_without_issue(self, tmp_path, capsys):
+    def test_missing_configured_trunk_ref_is_loud_not_a_silent_pass(
+        self, tmp_path, capsys
+    ):
+        """THE 2026-07-28 DEFECT, inverted.
+
+        A repo that is PRESENT but whose configured trunk ref does not exist
+        must FAIL, not skip. Until 2026-07-28 this returned 0 with a "skip"
+        note, which is why pointing the checker at ~/.hermes (trunk
+        `master`, no `main` branch) would have reported a clean bill of
+        health forever instead of erroring.
+        """
         repo = _make_repo(tmp_path)
         _commit(repo, "a")
-        _git(repo, "branch", "-m", "main", "trunk")
+        _git(repo, "branch", "-m", "main", "master")   # no `main` ref left
 
-        issues = check_code_drift(repo_path=repo)
+        issues = check_code_drift(repo_path=repo, trunk_ref="refs/heads/main")
+        out = capsys.readouterr().out
+
+        assert issues == 1, "unresolvable configured trunk must count as an issue"
+        assert "[FAIL]" in out
+        assert "refs/heads/main" in out
+        assert "UNMONITORED" in out
+        assert "skip" not in out.lower()
+
+    def test_master_trunk_repo_is_evaluated_not_skipped(self, tmp_path, capsys):
+        """The ~/.hermes shape: trunk is `master`, and drift is real.
+
+        Guards the other half of the fix — parameterising the ref must
+        actually WORK, not merely stop erroring.
+        """
+        repo = _make_repo(tmp_path)
+        _git(repo, "branch", "-m", "main", "master")
+        sha_a = _commit(repo, "first")
+        _commit(repo, "landed on master, never deployed")
+        _git(repo, "checkout", "--detach", sha_a)
+
+        issues = check_code_drift(repo_path=repo, trunk_ref="refs/heads/master")
+        out = capsys.readouterr().out
+
+        assert issues == 1
+        assert "LAGS master" in out
+        assert "landed on master, never deployed" in out
+        # Remediation must name the repo's OWN trunk: "ff-only main" is a
+        # fatal command in a repo that has no main.
+        assert "merge --ff-only master" in out
+        assert "ff-only main" not in out
+
+    def test_master_trunk_repo_in_sync_is_ok(self, tmp_path, capsys):
+        repo = _make_repo(tmp_path)
+        _git(repo, "branch", "-m", "main", "master")
+        _commit(repo, "a")
+        _git(repo, "checkout", "--detach")
+
+        issues = check_code_drift(repo_path=repo, trunk_ref="refs/heads/master")
         out = capsys.readouterr().out
         assert issues == 0
-        assert "skip" in out.lower()
+        assert "[OK]" in out and "in sync" in out
+
+    def test_watched_repos_pair_every_path_with_its_own_trunk(self):
+        """The config surface itself: ~/.hermes must be watched, and must
+        NOT inherit agent-src's `main` (it has no such branch)."""
+        from events.producers.code_drift_monitor import watched_repos
+
+        by_name = {r.name: r for r in watched_repos()}
+        assert "hermes" in by_name, "~/.hermes parent repo must be watched"
+        assert by_name["hermes"].trunk_ref == "refs/heads/master"
+        assert by_name["agent-src"].trunk_ref == "refs/heads/main"
+        assert by_name["hermes"].path != by_name["agent-src"].path
 
     def test_check_never_mutates_repo(self, tmp_path):
         repo = _make_repo(tmp_path)

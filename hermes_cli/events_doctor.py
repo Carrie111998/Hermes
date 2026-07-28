@@ -16,6 +16,7 @@ from events.paths import (
     audit_log_path, events_db_path, quiet_hours_path,
     telegram_topics_path, telegram_verbosity_path,
 )
+from events.producers.code_drift_monitor import watched_repos
 
 # telegram-mirror retired 2026-04-28 (scribe_daily topic cutover made it
 # duplicate every mailbox_message); checking it produced a permanent false
@@ -33,13 +34,24 @@ def _check(name: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-# The gateway's editable install imports the WORKING TREE of this checkout,
-# which is deliberately kept on a detached HEAD so worktree agents can land
-# commits onto the `main` ref via `git branch -f`.  A commit landed on main
-# therefore does NOT run until the detached checkout is fast-forwarded and
-# the gateway restarted — on 2026-07-20/21 three restart cycles ran stale
-# code while every session believed the fix was live because "main tip
-# moved".  This check makes that drift loud.
+# Two checkouts on this box ARE production and can silently run stale code:
+#
+#   ~/.hermes/agent-src (trunk `main`)   — the gateway's editable install
+#     imports its WORKING TREE, which is kept on a detached HEAD so worktree
+#     agents can land commits onto `main` via `git branch -f`.  A commit
+#     landed on main does NOT run until the checkout is fast-forwarded and
+#     the gateway restarted — on 2026-07-20/21 three restart cycles ran
+#     stale code because every session believed "main tip moved" meant live.
+#
+#   ~/.hermes (trunk `master`)           — cron script slots and Windows
+#     Scheduled Tasks resolve ABSOLUTE paths under ~/.hermes/scripts/,
+#     ~/.hermes/profiles/*/scripts/ and ~/.hermes/ops/, so only the working
+#     tree runs.  On 2026-07-28, 62 commits sat undeployed for three days
+#     behind a clean `git status`.
+#
+# Trunk ref names differ per repo and ~/.hermes has NO `main` branch, so the
+# trunk is configured alongside the path — see the loud-vs-skip note in
+# check_code_drift().
 _AGENT_SRC_DEFAULT = Path.home() / ".hermes" / "agent-src"
 
 
@@ -59,70 +71,101 @@ def _git(repo: Path, *args: str) -> Tuple[int, str]:
         return 127, str(e)
 
 
-def check_code_drift(repo_path: Optional[Path] = None) -> int:
-    """Compare the deployed checkout's HEAD against the landed `main` ref.
+def check_code_drift(
+    repo_path: Optional[Path] = None,
+    trunk_ref: str = "refs/heads/main",
+    *,
+    label: str = "",
+) -> int:
+    """Compare a deployed checkout's HEAD against its configured trunk ref.
 
-    Read-only — never mutates the repo.  Returns the number of issues found
-    (0 or 1).  A missing repo/ref degrades to a skip note, not a failure,
-    so the doctor stays usable on boxes without the shared checkout.
+    Read-only -- never mutates the repo.  Returns the number of issues found
+    (0 or 1).
+
+    Deliberately NOT gated by WatchedRepo.executed_dirs, unlike the
+    event-bus producer.  The producer narrows ALERTS so a phone does not
+    buzz for inert docs churn; this is a diagnostic the operator ran on
+    purpose, so it reports every divergence and lets them judge.
+
+    Skip vs FAIL, the 2026-07-28 lesson: an ABSENT repo (no .git) degrades
+    to a skip note so the doctor stays usable on boxes without the shared
+    checkout.  A repo that is PRESENT but whose configured trunk ref does
+    not resolve is a FAILURE, not a skip -- that combination means drift
+    cannot be evaluated at all, and reporting it quietly is how a watcher
+    ends up certifying an unwatched repo as clean.  ~/.hermes has no `main`
+    branch, so under the old hardcoded ref this was the guaranteed outcome.
     """
     repo = repo_path or _agent_src_root()
+    trunk_name = trunk_ref.rsplit("/", 1)[-1]
+    tag = f"code drift [{label}]" if label else "code drift"
     # .git is a directory in a normal checkout and a file in a worktree.
     if not (repo / ".git").exists():
-        print(f"[--] code drift -- skipped ({repo} is not a git checkout)")
+        print(f"[--] {tag} -- skipped ({repo} is not a git checkout)")
         return 0
 
     rc_head, head = _git(repo, "rev-parse", "--verify", "HEAD")
-    rc_main, main = _git(repo, "rev-parse", "--verify", "refs/heads/main")
-    if rc_head != 0 or rc_main != 0:
-        which = "HEAD" if rc_head != 0 else "main ref"
-        print(f"[--] code drift -- skipped (cannot resolve {which} in {repo})")
-        return 0
-    head, main = head.strip(), main.strip()
+    rc_trunk, trunk = _git(repo, "rev-parse", "--verify", trunk_ref)
+    if rc_trunk != 0:
+        print(f"[FAIL] {tag}: configured trunk ref {trunk_ref} does not exist "
+              f"in {repo} -- drift CANNOT be evaluated, so this repo is "
+              "effectively UNMONITORED (not clean)")
+        print(f"  remediation: check the real trunk name (git -C {repo} "
+              "branch --list) and fix the watched-repo entry's trunk_ref")
+        return 1
+    if rc_head != 0:
+        print(f"[FAIL] {tag}: cannot resolve HEAD in {repo} -- drift CANNOT "
+              "be evaluated, so this repo is effectively UNMONITORED")
+        return 1
+    head, trunk = head.strip(), trunk.strip()
 
     dirty = bool(_git(repo, "status", "--porcelain")[1].strip())
     if dirty:
-        print(f"[NOTE] code drift: working tree at {repo} is DIRTY "
+        print(f"[NOTE] {tag}: working tree at {repo} is DIRTY "
               "(uncommitted changes -- inspect manually, never auto-fixed)")
 
-    if head == main:
-        _check("code drift (HEAD vs main)", True, f"in sync @ {head[:9]}")
+    if head == trunk:
+        _check(f"{tag} (HEAD vs {trunk_name})", True, f"in sync @ {head[:9]}")
         return 0
 
-    head_behind = _git(repo, "merge-base", "--is-ancestor", "HEAD", "refs/heads/main")[0] == 0
-    head_ahead = _git(repo, "merge-base", "--is-ancestor", "refs/heads/main", "HEAD")[0] == 0
+    head_behind = _git(repo, "merge-base", "--is-ancestor", "HEAD", trunk_ref)[0] == 0
+    head_ahead = _git(repo, "merge-base", "--is-ancestor", trunk_ref, "HEAD")[0] == 0
 
     if head_behind:
-        count = _git(repo, "rev-list", "--count", "HEAD..refs/heads/main")[1].strip()
+        count = _git(repo, "rev-list", "--count", f"HEAD..{trunk_ref}")[1].strip()
         subjects = _git(repo, "log", "--format=  missed: %h %s", "-5",
-                        "HEAD..refs/heads/main")[1].rstrip()
-        print(f"[WARN] code drift: working tree LAGS main by {count} commit(s) "
-              "-- landed fixes are NOT running")
+                        f"HEAD..{trunk_ref}")[1].rstrip()
+        print(f"[WARN] {tag}: working tree LAGS {trunk_name} by {count} "
+              "commit(s) -- landed fixes are NOT running")
         if subjects:
             print(subjects)
-        print("  remediation: FF the detached checkout: "
-              f"git -C {repo} merge --ff-only main "
-              "(safe -- checkout is detached; check for a clean tree first), "
-              "then restart the gateway")
+        print("  remediation: FF the checkout: "
+              f"git -C {repo} merge --ff-only {trunk_name} "
+              "(check for a clean tree first), then restart the gateway")
         return 1
 
     if head_ahead:
-        count = _git(repo, "rev-list", "--count", "refs/heads/main..HEAD")[1].strip()
-        print(f"[WARN] code drift: HEAD is AHEAD of main by {count} commit(s) "
-              "(working tree carries unlanded state -- land it on main or "
-              "move the checkout back to the main tip)")
+        count = _git(repo, "rev-list", "--count", f"{trunk_ref}..HEAD")[1].strip()
+        print(f"[WARN] {tag}: HEAD is AHEAD of {trunk_name} by {count} "
+              f"commit(s) (working tree carries unlanded state -- land it on "
+              f"{trunk_name} or move the checkout back to the {trunk_name} tip)")
         return 1
 
-    print("[WARN] code drift: HEAD has DIVERGED from main "
-          f"(HEAD {head[:9]} vs main {main[:9]}, neither is an ancestor "
-          "of the other -- reconcile manually)")
+    print(f"[WARN] {tag}: HEAD has DIVERGED from {trunk_name} "
+          f"(HEAD {head[:9]} vs {trunk_name} {trunk[:9]}, neither is an "
+          "ancestor of the other -- reconcile manually)")
     return 1
 
 
 def run_doctor(check_telegram_api: bool = True) -> int:
     issues = 0
 
-    issues += check_code_drift()
+    # Every repo whose WORKING TREE is deployed code, each with its own
+    # trunk ref (agent-src `main`, ~/.hermes `master`). Shared source of
+    # truth with the CODE_DRIFT producer so the two layers cannot disagree
+    # about what is watched.
+    for watched in watched_repos():
+        issues += check_code_drift(watched.path, watched.trunk_ref,
+                                   label=watched.name)
 
     db = events_db_path()
     if not _check("events db exists", db.exists(), str(db)):
