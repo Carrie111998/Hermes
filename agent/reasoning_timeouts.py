@@ -204,6 +204,13 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     and only when no explicit user-configured per-model
     ``stale_timeout_seconds`` exists.
 
+    Model allowlist alone is incomplete: the stale detectors measure
+    **silence** (no SSE / no non-stream response), not model identity.
+    Elevated ``reasoning_effort`` causes the same silent mid-think gap
+    on any provider that buffers thinking. Prefer
+    :func:`get_effective_reasoning_stale_timeout_floor` when the agent's
+    reasoning config is available.
+
     >>> get_reasoning_stale_timeout_floor("nvidia/nemotron-3-ultra-550b-a55b")
     600.0
     >>> get_reasoning_stale_timeout_floor("openai/o3-mini")
@@ -240,3 +247,90 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     if "/" in name:
         name = name.rsplit("/", 1)[1]
     return _match_any(name)
+
+
+# Effort tiers that routinely produce multi-minute silent thinking
+# phases (no content token / no SSE) across providers.  Independent of
+# the model allowlist — a gpt-family or Grok call with xhigh has the
+# same failure mode as o1 even when the slug is not in the table.
+_REASONING_EFFORT_STALE_TIMEOUT_FLOORS: dict[str, float] = {
+    "high": 600.0,
+    "xhigh": 900.0,
+    "max": 900.0,
+    "ultra": 900.0,
+}
+
+
+def _normalize_effort_level(effort_or_config: object) -> Optional[str]:
+    """Extract a bare effort level string from config dict / raw string."""
+    if effort_or_config is None or effort_or_config is False:
+        return None
+    if isinstance(effort_or_config, dict):
+        if effort_or_config.get("enabled") is False:
+            return None
+        raw = effort_or_config.get("effort")
+    else:
+        raw = effort_or_config
+    if raw is None or raw is False:
+        return None
+    level = str(raw).strip().lower()
+    if not level or level in {"none", "false", "disabled"}:
+        return None
+    return level
+
+
+def get_reasoning_effort_stale_timeout_floor(
+    effort_or_config: object,
+) -> Optional[float]:
+    """Return a silence-timeout floor from ``reasoning_effort`` alone.
+
+    Model-independent.  Watchdogs measure time-since-last-byte / last-SSE,
+    not which SKU is thinking.  Elevated effort (high / xhigh / max / ultra)
+    is the common cause of multi-minute silent mid-think gaps on any
+    provider that buffers reasoning before the next stream event.
+
+    Returns ``None`` for medium/low/minimal/disabled/unknown so default
+    chat models keep their existing short stale budgets.
+
+    >>> get_reasoning_effort_stale_timeout_floor("xhigh")
+    900.0
+    >>> get_reasoning_effort_stale_timeout_floor({"enabled": True, "effort": "high"})
+    600.0
+    >>> get_reasoning_effort_stale_timeout_floor("medium") is None
+    True
+    >>> get_reasoning_effort_stale_timeout_floor({"enabled": False}) is None
+    True
+    """
+    level = _normalize_effort_level(effort_or_config)
+    if level is None:
+        return None
+    return _REASONING_EFFORT_STALE_TIMEOUT_FLOORS.get(level)
+
+
+def get_effective_reasoning_stale_timeout_floor(
+    model: object = None,
+    effort_or_config: object = None,
+) -> Optional[float]:
+    """Combine model-allowlist floor and effort floor (max of both).
+
+    Prefer this at every stale-detector call site when the agent's
+    ``reasoning_config`` is available.  Either input alone may raise the
+    floor; both absent → ``None`` (caller keeps the generic default).
+
+    >>> get_effective_reasoning_stale_timeout_floor("gpt-4o", "xhigh")
+    900.0
+    >>> get_effective_reasoning_stale_timeout_floor("openai/o3-mini", "medium")
+    300.0
+    >>> get_effective_reasoning_stale_timeout_floor("gpt-4o", "medium") is None
+    True
+    """
+    floors: list[float] = []
+    model_floor = get_reasoning_stale_timeout_floor(model)
+    if model_floor is not None:
+        floors.append(float(model_floor))
+    effort_floor = get_reasoning_effort_stale_timeout_floor(effort_or_config)
+    if effort_floor is not None:
+        floors.append(float(effort_floor))
+    if not floors:
+        return None
+    return max(floors)

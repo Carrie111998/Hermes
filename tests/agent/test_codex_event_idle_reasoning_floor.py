@@ -26,8 +26,8 @@ import pytest
         ("x-ai/grok-4.5", 120.0, 600.0),
         ("grok-build-0.1", 60.0, 600.0),
         ("nvidia/nemotron-3-ultra-550b-a55b", 120.0, 600.0),
-        ("gpt-4o", 120.0, 120.0),  # non-reasoning: unchanged
-        ("x-ai/grok-4", 120.0, 120.0),  # bare grok-4 still not on floor
+        ("gpt-4o", 120.0, 120.0),  # non-reasoning, no elevated effort: unchanged
+        ("x-ai/grok-4", 120.0, 120.0),  # bare grok-4 still not on model floor
     ],
 )
 def test_implicit_default_raises_for_reasoning_models(model, default, expected):
@@ -40,6 +40,33 @@ def test_implicit_default_raises_for_reasoning_models(model, default, expected):
     )
     assert enabled is True
     assert timeout == expected
+
+
+def test_elevated_reasoning_effort_raises_even_for_non_allowlisted_model():
+    """Silence floor is effort-driven, not SKU-driven.
+
+    gpt-4o is intentionally off the model allowlist, but xhigh still
+    produces multi-minute silent thinking on many providers — the Codex
+    event-idle watchdog must not kill at 120s.
+    """
+    from agent.chat_completion_helpers import resolve_codex_event_idle_timeout
+
+    timeout, enabled = resolve_codex_event_idle_timeout(
+        default_seconds=120.0,
+        env_raw=None,
+        model="gpt-4o",
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    )
+    assert enabled is True
+    assert timeout == 900.0
+
+    timeout_high, _ = resolve_codex_event_idle_timeout(
+        default_seconds=120.0,
+        env_raw=None,
+        model="some-unknown-chat-model",
+        reasoning_config="high",
+    )
+    assert timeout_high == 600.0
 
 
 def test_explicit_env_wins_over_reasoning_floor():

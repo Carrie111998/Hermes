@@ -164,6 +164,7 @@ def resolve_codex_event_idle_timeout(
     default_seconds: float,
     env_raw: object = None,
     model: object = None,
+    reasoning_config: object = None,
 ) -> tuple[float, bool]:
     """Resolve Codex Responses post-first-byte event-idle budget.
 
@@ -171,11 +172,14 @@ def resolve_codex_event_idle_timeout(
 
     * Explicit ``HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS`` (including ``0``
       to disable) always wins.
-    * On the implicit default path, known reasoning models raise the
-      timeout to :func:`get_reasoning_stale_timeout_floor` so xAI Grok and
-      peers are not killed mid-think after an opening SSE frame.
+    * On the implicit default path, raise via
+      :func:`get_effective_reasoning_stale_timeout_floor` (model allowlist
+      **or** elevated ``reasoning_effort``). Watchdogs measure silence —
+      not SKU — so xhigh on any model needs the same patience as o1.
     """
-    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+    from agent.reasoning_timeouts import (
+        get_effective_reasoning_stale_timeout_floor,
+    )
 
     explicit = env_raw is not None and str(env_raw).strip() != ""
     if explicit:
@@ -191,7 +195,9 @@ def resolve_codex_event_idle_timeout(
         return timeout, False
 
     if not explicit:
-        floor = get_reasoning_stale_timeout_floor(model)
+        floor = get_effective_reasoning_stale_timeout_floor(
+            model, reasoning_config
+        )
         if floor is not None:
             timeout = max(timeout, float(floor))
     return timeout, True
@@ -358,17 +364,34 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
         _timeout = max(_base, 240.0)
     else:
         _timeout = _base
-    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+    from agent.reasoning_timeouts import (
+        get_effective_reasoning_stale_timeout_floor,
+    )
     # Resolve the model id from BOTH the OpenAI/Anthropic key (``model``) and
     # the Bedrock key (``modelId``). OpenAI/Anthropic wins first via the ``or``
     # chain, so those paths are unchanged. Bedrock carries the model as a
     # dotted, region-prefixed inference-profile id (e.g.
     # ``us.anthropic.claude-opus-4-6-v1:0``) that the floor's start-of-slug
     # regex cannot match directly — normalize it to a canonical slug first.
+    # Effort floor is model-independent (high/xhigh silent thinking).
     _model_id = api_kwargs.get("model") or api_kwargs.get("modelId") or ""
-    _reasoning_floor = get_reasoning_stale_timeout_floor(_model_id)
+    _effort = getattr(agent, "reasoning_config", None)
+    _reasoning_floor = get_effective_reasoning_stale_timeout_floor(
+        _model_id, _effort
+    )
     if _reasoning_floor is None and api_kwargs.get("modelId"):
         _reasoning_floor = _bedrock_reasoning_stale_floor(api_kwargs["modelId"])
+        # Still apply effort floor if only Bedrock model floor was missing.
+        if _reasoning_floor is None:
+            _reasoning_floor = get_effective_reasoning_stale_timeout_floor(
+                None, _effort
+            )
+        elif _effort is not None:
+            _effort_only = get_effective_reasoning_stale_timeout_floor(
+                None, _effort
+            )
+            if _effort_only is not None:
+                _reasoning_floor = max(_reasoning_floor, _effort_only)
     if _reasoning_floor is not None:
         _timeout = max(_timeout, _reasoning_floor)
     return _timeout
@@ -873,6 +896,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         default_seconds=_codex_idle_timeout_default,
         env_raw=_codex_idle_env_raw,
         model=api_kwargs.get("model") or getattr(agent, "model", None),
+        reasoning_config=getattr(agent, "reasoning_config", None),
     )
     _codex_idle_enabled = bool(_codex_watchdog_enabled and _codex_idle_enabled_flag)
     if (
@@ -4061,15 +4085,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
         else:
             _stream_stale_timeout = _stream_stale_timeout_base
-        # Reasoning-model floor: known reasoning models (Nemotron 3 Ultra,
-        # OpenAI o1/o3, Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ,
-        # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
-        # model threshold during their thinking phase.  The cloud gateway
-        # upstream kills the socket first, surfacing as BrokenPipeError.
-        # Raises the floor only — never overrides explicit user config
-        # (handled by get_provider_stale_timeout above).
-        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
-        _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
+        # Reasoning silence floor: known reasoning SKUs *or* elevated
+        # reasoning_effort (high/xhigh/…) — detectors measure silence, not
+        # model identity. Raises only; explicit user config already won via
+        # get_provider_stale_timeout above.
+        from agent.reasoning_timeouts import (
+            get_effective_reasoning_stale_timeout_floor,
+        )
+        _reasoning_floor = get_effective_reasoning_stale_timeout_floor(
+            api_kwargs.get("model") or getattr(agent, "model", None),
+            getattr(agent, "reasoning_config", None),
+        )
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
