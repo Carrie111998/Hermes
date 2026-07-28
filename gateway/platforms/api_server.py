@@ -40,6 +40,7 @@ Requires:
 """
 
 import asyncio
+import threading
 import errno
 import hashlib
 import hmac
@@ -5416,25 +5417,6 @@ class APIServerAdapter(BasePlatformAdapter):
         trips NAS's HTTP timeout. The store CAS claim inside fire_due guards
         against double-fire on a NAS/scheduler retry.
         """
-        from hermes_cli.config import cfg_get, load_config
-        from plugins.cron_providers.chronos.verify import get_fire_verifier
-
-        auth = request.headers.get("Authorization", "")
-        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-
-        cfg = load_config()
-        claims = get_fire_verifier()(
-            token=token,
-            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
-        )
-        if claims is None:
-            logger.warning(
-                "cron fire: rejected invalid token: %s",
-                self._request_audit_log_suffix(request),
-            )
-            return web.json_response({"error": "invalid fire token"}, status=401)
         draining = self._draining_response()
         if draining is not None:
             return draining
@@ -5448,15 +5430,134 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job_id:
                 return web.json_response({"error": "missing job_id"}, status=400)
 
-            from cron.scheduler_provider import resolve_cron_scheduler
-            provider = resolve_cron_scheduler()
+            from hermes_constants import get_hermes_home
+            from cron.jobs import load_jobs
+            from hermes_cli.profiles import profiles_to_serve
+
+            runner = getattr(self, "gateway_runner", None)
+            multiplex = bool(
+                getattr(getattr(runner, "config", None), "multiplex_profiles", False)
+            )
+            if multiplex:
+                from gateway.run import _profile_runtime_scope
+
+                exact_scope = _profile_runtime_scope
+            else:
+                exact_scope = lambda _home: nullcontext()
+            homes = (
+                list(profiles_to_serve(multiplex=True))
+                if multiplex
+                else [("active", get_hermes_home())]
+            )
+            owners = []
+            for profile_name, candidate_home in homes:
+                home = Path(candidate_home).expanduser().resolve()
+                try:
+                    with exact_scope(home):
+                        if any(job.get("id") == job_id for job in load_jobs()):
+                            owners.append((profile_name, home))
+                except Exception:
+                    logger.exception(
+                        "cron fire: failed to inspect job owner for %s", home
+                    )
+                    return web.json_response(
+                        {"error": "job ownership unavailable"}, status=503
+                    )
+            if len(owners) != 1:
+                logger.warning(
+                    "cron fire: rejected %s job id %r",
+                    "unknown" if not owners else "ambiguous",
+                    job_id,
+                )
+                return web.json_response({"error": "job not found"}, status=404)
+
+            _owner_profile, owner_home = owners[0]
+            with exact_scope(owner_home):
+                from hermes_cli.config import cfg_get, load_config
+                from plugins.cron_providers.chronos.verify import get_fire_verifier
+
+                auth = request.headers.get("Authorization", "")
+                token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+                cfg = load_config()
+                claims = get_fire_verifier()(
+                    token=token,
+                    expected_audience=cfg_get(
+                        cfg, "cron", "chronos", "expected_audience", default=""
+                    ),
+                    jwks_or_key=cfg_get(
+                        cfg, "cron", "chronos", "nas_jwks_url", default=""
+                    ) or None,
+                    issuer=cfg_get(
+                        cfg, "cron", "chronos", "portal_url", default=""
+                    ) or None,
+                )
+            if claims is None:
+                logger.warning(
+                    "cron fire: rejected invalid token: %s",
+                    self._request_audit_log_suffix(request),
+                )
+                return web.json_response({"error": "invalid fire token"}, status=401)
+
+            from cron.scheduler_runtime import borrow_scheduler_provider
 
             loop = asyncio.get_running_loop()
+            admission_ready = loop.create_future()
+            completed = loop.create_future()
+
+            def _fire_in_worker():
+                try:
+                    with borrow_scheduler_provider(hermes_home=owner_home) as provider:
+                        loop.call_soon_threadsafe(
+                            lambda admitted=provider is not None: (
+                                None
+                                if admission_ready.done()
+                                else admission_ready.set_result(admitted)
+                            )
+                        )
+                        if provider is None:
+                            result = None
+                        else:
+                            result = provider.fire_due(
+                                job_id, adapters=None, loop=loop
+                            )
+                    loop.call_soon_threadsafe(
+                        lambda value=result: (
+                            None if completed.done() else completed.set_result(value)
+                        )
+                    )
+                except BaseException as exc:
+                    if not admission_ready.done():
+                        loop.call_soon_threadsafe(
+                            lambda: (
+                                None
+                                if admission_ready.done()
+                                else admission_ready.set_result(False)
+                            )
+                        )
+                    loop.call_soon_threadsafe(
+                        lambda error=exc: (
+                            None if completed.done() else completed.set_exception(error)
+                        )
+                    )
+
+            async def _fire_reserved():
+                try:
+                    await asyncio.shield(completed)
+                except asyncio.CancelledError:
+                    # The accepted worker owns provider admission and pending
+                    # API tracking until fire_due really returns. Caller/task
+                    # cancellation must not release either ledger early.
+                    await asyncio.shield(completed)
+
             # Fire in the background (202 immediately). fire_due claims via the
             # store CAS, so a retry while this is in flight is de-duped.
-            task = asyncio.create_task(
-                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+            task = asyncio.create_task(_fire_reserved())
+            worker = threading.Thread(
+                target=_fire_in_worker,
+                daemon=True,
+                name=f"cron-fire-{job_id}",
             )
+            worker.start()
             reservation["detached"] = True
             task.add_done_callback(
                 lambda _task: _release_pending_api_work(self, reservation)
@@ -5467,6 +5568,13 @@ class APIServerAdapter(BasePlatformAdapter):
             except (TypeError, AttributeError):
                 pass
 
+            # Do not acknowledge until the actual worker thread owns admission.
+            # Waiting only for this hand-off is bounded by executor scheduling;
+            # the long fire itself remains background work in both ledgers.
+            if not await asyncio.shield(admission_ready):
+                return web.json_response(
+                    {"error": "scheduler ownership unavailable"}, status=503
+                )
             return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 
 

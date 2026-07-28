@@ -15,7 +15,7 @@ def temp_home(tmp_path, monkeypatch):
     yield tmp_path
 
 
-def test_notify_helper_calls_provider_on_jobs_changed(monkeypatch):
+def test_notify_helper_calls_provider_on_jobs_changed(temp_home):
     """cron.scheduler._notify_provider_jobs_changed resolves the provider and
     calls on_jobs_changed exactly once."""
     import cron.scheduler_provider as sp
@@ -34,9 +34,15 @@ def test_notify_helper_calls_provider_on_jobs_changed(monkeypatch):
         def on_jobs_changed(self):
             calls.append(1)
 
-    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: Spy())
-    sched._notify_provider_jobs_changed()
-    assert calls == [1]
+    from cron.scheduler_runtime import _ProviderAdmission, _set_active_provider
+
+    admission = _ProviderAdmission(Spy())
+    _set_active_provider(temp_home, admission)
+    try:
+        sched._notify_provider_jobs_changed()
+        assert calls == [1]
+    finally:
+        _set_active_provider(temp_home, None)
 
 
 def test_notify_helper_swallows_provider_errors(monkeypatch):

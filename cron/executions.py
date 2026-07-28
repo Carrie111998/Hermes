@@ -19,7 +19,8 @@ from typing import Any, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_DEFAULT_EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+EXECUTIONS_FILE = _DEFAULT_EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
@@ -27,8 +28,13 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    path = (
+        get_hermes_home().resolve() / "cron" / "executions.db"
+        if EXECUTIONS_FILE == _DEFAULT_EXECUTIONS_FILE
+        else EXECUTIONS_FILE
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

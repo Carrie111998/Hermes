@@ -63,36 +63,61 @@ def _active_cron_provider_name() -> str:
         return "builtin"
 
 
-def _warn_if_gateway_not_running() -> None:
-    """Warn that scheduled jobs won't fire unless the gateway is running.
-
-    The cron ticker only runs inside the gateway (``_start_cron_ticker`` in
-    gateway/run.py); there is no standalone cron daemon. Without a running
-    gateway, ``next_run_at`` passes but jobs never fire and ``last_run_at``
-    stays null — the most common cron support report (#51038). Surfacing this
-    at create/list time, when the user is right there, prevents it.
-
-    An external provider (e.g. Chronos) fires jobs via a NAS-mediated webhook,
-    NOT the in-process ticker, so a momentarily-absent gateway process does not
-    mean jobs won't fire — the warning would be a false alarm. Stay quiet for
-    any non-builtin provider; the gateway-process heuristic only speaks to the
-    built-in ticker's trigger.
-    """
+def _scheduler_health():
+    """Strict exact-home policy plus kernel-authoritative live owner metadata."""
     try:
-        if _active_cron_provider_name() != "builtin":
-            return
+        from cron.scheduler_lease import read_scheduler_owner_status
+        from cron.scheduler_runtime import read_scheduler_ownership_policy_strict
+        from hermes_constants import get_hermes_home
 
-        from hermes_cli.gateway import find_gateway_pids
-
-        if find_gateway_pids():
-            return
+        home = get_hermes_home().expanduser().resolve()
+        policy = read_scheduler_ownership_policy_strict(hermes_home=home)
+        owner = read_scheduler_owner_status(home)
+        if owner is not None and (
+            owner.get("owner") not in {"gateway", "desktop"}
+            or not isinstance(owner.get("provider"), str)
+        ):
+            owner = None
+        return policy, owner
     except Exception:
-        # If we can't determine gateway state, stay quiet rather than nag.
+        return None, None
+
+
+def _scheduler_owner_matches_policy(policy, owner) -> bool:
+    """Return whether a live lease matches the configured provider and owner policy."""
+    if owner is None or owner.get("provider") != policy.configured_provider:
+        return False
+    owner_name = owner.get("owner")
+    if policy.mode == "gateway":
+        return owner_name == "gateway"
+    if policy.mode == "desktop":
+        return owner_name == "desktop"
+    if policy.configured_provider == "builtin":
+        return owner_name in {"gateway", "desktop"}
+    return owner_name == "gateway"
+
+
+def _warn_if_gateway_not_running() -> None:
+    """Warn when no exact-home runtime owns the configured scheduler.
+
+    The live kernel lease, rather than a process-name/PID heuristic, covers
+    Gateway- and Desktop-owned built-in schedulers as well as external
+    providers. A configured provider without a matching live lease fails
+    closed because jobs are not currently armed or ticked.
+    """
+    policy, owner = _scheduler_health()
+    if policy is None:
+        print(color("  ⚠  Cron policy is invalid — automatic firing is disabled.", Colors.YELLOW))
+        return
+    if _scheduler_owner_matches_policy(policy, owner):
         return
 
-    print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
-    print(color("     Start it with: hermes gateway install", Colors.DIM))
-    print(color("                    sudo hermes gateway install --system  # Linux servers", Colors.DIM))
+    if policy.mode == "gateway":
+        print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
+    else:
+        print(color("  ⚠  No live cron owner — jobs won't fire automatically.", Colors.YELLOW))
+    print(color("     Start an eligible Gateway or Desktop runtime.", Colors.DIM))
+    print(color("     Gateway setup: hermes gateway install", Colors.DIM))
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
 
@@ -221,7 +246,31 @@ def cron_status():
 
     print()
 
-    provider = _active_cron_provider_name()
+    policy, owner = _scheduler_health()
+    if policy is None:
+        print(color("✗ Cron scheduler policy is invalid — automatic firing is disabled", Colors.RED))
+        print()
+        _print_active_jobs_summary(list_jobs(include_disabled=False))
+        print()
+        return
+    provider = policy.configured_provider
+    if not _scheduler_owner_matches_policy(policy, owner):
+        if policy.mode == "gateway" and provider == "builtin":
+            reason = "Gateway is not running — cron jobs will NOT fire automatically"
+        else:
+            reason = (
+                f"No live cron owner for configured provider {provider!r} — "
+                "jobs will NOT fire automatically"
+            )
+        print(color(
+            f"✗ {reason}",
+            Colors.RED,
+        ))
+        print()
+        _print_active_jobs_summary(list_jobs(include_disabled=False))
+        print()
+        return
+    owner_name = owner.get("owner", "unknown")
     if provider != "builtin":
         # An external provider (e.g. Chronos) does NOT run the in-process 60s
         # ticker — it arms one external one-shot per job and is fired by a
@@ -231,7 +280,7 @@ def cron_status():
         # healthy Chronos instance. Report the provider instead and skip the
         # ticker-liveness heuristics entirely.
         print(color(
-            f"✓ Cron provider: {provider} — jobs fire via the managed scheduler, "
+            f"✓ Cron owner: {owner_name}; provider: {provider} — jobs fire via the managed scheduler, "
             "not the in-process ticker.",
             Colors.GREEN,
         ))
@@ -245,8 +294,8 @@ def cron_status():
         print()
         return
 
-    pids = find_gateway_pids()
-    if pids:
+    pids = find_gateway_pids() if owner_name == "gateway" else []
+    if owner_name in {"gateway", "desktop"}:
         # The gateway PROCESS is alive — but the cron ticker THREAD inside it
         # can die silently, or stay alive while every tick fails. Check both
         # the liveness heartbeat and the last-successful-tick marker so we
@@ -300,8 +349,13 @@ def cron_status():
                     ))
             print("  Check the gateway log for 'Cron tick error'.")
         else:
-            print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
-            print(f"  PID: {', '.join(map(str, pids))}")
+            if owner_name == "gateway":
+                message = "✓ Gateway is running and owns cron — jobs will fire automatically"
+            else:
+                message = "✓ Desktop owns cron — jobs will fire automatically"
+            print(color(message, Colors.GREEN))
+            if pids:
+                print(f"  PID: {', '.join(map(str, pids))}")
             if hb_age is not None:
                 print(f"  Ticker heartbeat: {int(hb_age)}s ago")
     else:

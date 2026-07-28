@@ -30,6 +30,7 @@ from __future__ import annotations
 import importlib
 import importlib.machinery
 import importlib.util
+import hashlib
 import logging
 import sys
 from pathlib import Path
@@ -223,7 +224,16 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["CronScheduler"]:  #
     # Use a separate namespace for user-installed plugins so they don't
     # collide with bundled providers in sys.modules.
     _is_bundled = _CRON_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _CRON_PLUGINS_DIR
-    module_name = f"plugins.cron_providers.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
+    if _is_bundled:
+        module_name = f"plugins.cron_providers.{name}"
+    else:
+        # The same provider name may have different implementations in
+        # multiplex profile homes. Cache by canonical provider path so one
+        # profile can never receive another profile's module.
+        path_key = hashlib.sha256(
+            str(provider_dir.resolve()).encode("utf-8")
+        ).hexdigest()[:16]
+        module_name = f"{_USER_NAMESPACE}.{path_key}.{name}"
     init_file = provider_dir / "__init__.py"
 
     if not init_file.exists():
@@ -259,6 +269,9 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["CronScheduler"]:  #
         # same way, or relative imports inside the plugin cannot resolve.
         if not _is_bundled:
             _register_synthetic_package(_USER_NAMESPACE, [])
+            _register_synthetic_package(
+                module_name.rsplit(".", 1)[0], [str(provider_dir.parent)]
+            )
 
         # Now load the provider module
         spec = importlib.util.spec_from_file_location(
