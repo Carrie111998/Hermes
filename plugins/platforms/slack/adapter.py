@@ -2331,6 +2331,55 @@ class SlackAdapter(BasePlatformAdapter):
         """Scope Slack's workspace-local event/message ids for deduplication."""
         return f"{team_id}:{event_id}" if team_id else str(event_id)
 
+    def _slack_event_dedup_id(
+        self, event: dict, payload: Optional[dict] = None
+    ) -> str:
+        """Return the deduplication id claimed for *event*, or "" if none."""
+        event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
+        if not event_ts:
+            return ""
+        return self._workspace_event_id(self._event_team_id(event, payload), event_ts)
+
+    @staticmethod
+    def _slack_event_coords(event: dict) -> str:
+        """Describe an inbound event for logs — metadata only, never text."""
+        return "type={} subtype={} channel={} ts={} thread_ts={} user={}".format(
+            event.get("type") or "message",
+            event.get("subtype") or "-",
+            event.get("channel") or "-",
+            event.get("ts") or "-",
+            event.get("thread_ts") or "-",
+            event.get("user") or "-",
+        )
+
+    def _release_slack_event_claim(
+        self, event: dict, payload: Optional[dict] = None
+    ) -> None:
+        """Hand an undelivered event's dedup slot back for a retry.
+
+        Best-effort by construction: this only ever runs on a path that is
+        already failing, so it must not raise a second exception over the
+        first one.
+        """
+        try:
+            self._dedup.discard(self._slack_event_dedup_id(event, payload))
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("[Slack] Could not release dedup claim", exc_info=True)
+
+    def _log_slack_discard(self, event: dict, reason: str) -> None:
+        """Account for an inbound event the ingress deliberately drops.
+
+        Every filter in ``_route_slack_message`` funnels through here so a
+        Slack event can never leave the gateway without a trace: an operator
+        holding a Slack ts can always find out whether we received it and why
+        it produced no reply.
+        """
+        logger.info(
+            "[Slack] Discarded inbound event (%s): %s",
+            reason,
+            self._slack_event_coords(event),
+        )
+
     @staticmethod
     def _workspace_message_marker(team_id: str, message_id: str) -> Any:
         """Return an in-memory routing marker without changing legacy no-team tests."""
@@ -5225,7 +5274,40 @@ class SlackAdapter(BasePlatformAdapter):
     async def _handle_slack_message(
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
-        """Handle an incoming Slack message event."""
+        """Deliver an inbound Slack event, accounting for every outcome.
+
+        This is the sole ingress for Slack traffic, so it owns the guarantee
+        that an event either reaches the gateway or says why it did not.
+        Routing does a lot of best-effort enrichment (user/channel name
+        lookups, thread backfill, file downloads) against the Slack Web API;
+        each of those helpers degrades on its own today, but nothing bounded
+        the ingress as a whole. An unexpected failure anywhere in that chain
+        therefore destroyed a valid @mention with no record of the ts, and —
+        because the deduplication claim was taken up front — permanently
+        suppressed the sibling ``app_mention`` Slack fires for the same
+        message and every Socket Mode redelivery of it.
+
+        Releasing the claim on failure mirrors the Discord adapter, which
+        already calls ``_dedup.discard`` when a handoff is cancelled or
+        raises.
+        """
+        try:
+            await self._route_slack_message(event, payload)
+        except asyncio.CancelledError:
+            self._release_slack_event_claim(event, payload)
+            raise
+        except Exception:
+            self._release_slack_event_claim(event, payload)
+            logger.error(
+                "[Slack] Inbound event lost before dispatch: %s",
+                self._slack_event_coords(event),
+                exc_info=True,
+            )
+
+    async def _route_slack_message(
+        self, event: dict, payload: Optional[dict] = None
+    ) -> None:
+        """Filter, enrich, and route an incoming Slack message event."""
         # DEBUG entry log — fires BEFORE any filtering so users debugging
         # bot-to-bot interop, allow_bots config, or SLACK_ALLOWED_USERS
         # drops can confirm whether the event actually arrived from Slack
@@ -5251,6 +5333,7 @@ class SlackAdapter(BasePlatformAdapter):
         if event.get("subtype") == "message_changed":
             updated_message = event.get("message")
             if not isinstance(updated_message, dict):
+                self._log_slack_discard(event, "edit carries no message body")
                 return
 
             original_message_ts = str(updated_message.get("ts") or "")
@@ -5258,6 +5341,7 @@ class SlackAdapter(BasePlatformAdapter):
                 original_message_ts
                 and original_message_ts in self._processed_message_ts
             ):
+                self._log_slack_discard(event, "edit of an already-handled message")
                 return
             edited = updated_message.get("edited")
             edited_ts = ""
@@ -5286,11 +5370,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Scope the dedup id by workspace: Slack event ts values are only
         # unique within one workspace, so two teams' events with the same ts
         # must not suppress each other.
-        event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
-        dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(
-            self._workspace_event_id(dedup_team_id, event_ts)
-        ):
+        dedup_id = self._slack_event_dedup_id(event, payload)
+        if dedup_id and self._dedup.is_duplicate(dedup_id):
+            self._log_slack_discard(event, "duplicate of an already-claimed event")
             return
 
         channel_id = event.get("channel", "")
@@ -5323,26 +5405,27 @@ class SlackAdapter(BasePlatformAdapter):
         if sender_is_bot:
             allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
+                self._log_slack_discard(event, "bot-authored sender, allow_bots=none")
                 return
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
                 if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
-                    logger.debug(
-                        "[Slack] Dropping bot message under allow_bots=mentions: "
-                        "no <@%s> mention in flat text or blocks",
-                        self._bot_user_id,
+                    self._log_slack_discard(
+                        event, "bot-authored sender without a mention, allow_bots=mentions"
                     )
                     return
             # "all" falls through to process the message
             # Always ignore our own messages to prevent echo loops
             if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+                self._log_slack_discard(event, "our own message")
                 return
 
         # Ignore message deletions. Edits are normalized above so an @mention
         # added by edit can still wake the bot once.
         subtype = event.get("subtype")
         if subtype == "message_deleted":
+            self._log_slack_discard(event, "message deleted")
             return
 
         original_text = event.get("text", "")
@@ -5633,17 +5716,19 @@ class SlackAdapter(BasePlatformAdapter):
             if sender_is_bot_user:
                 allow_bots = self._slack_allow_bots()
                 if allow_bots == "none":
+                    self._log_slack_discard(event, "resolved bot user, allow_bots=none")
                     return
                 if allow_bots == "mentions" and not is_mentioned:
+                    self._log_slack_discard(
+                        event, "resolved bot user without a mention, allow_bots=mentions"
+                    )
                     return
 
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
-                logger.debug(
-                    "[Slack] Ignoring message in non-allowed channel: %s", channel_id
-                )
+                self._log_slack_discard(event, "channel not in allowed_channels")
                 return
 
             # A message that opens by @mentioning another user is directed at
@@ -5657,10 +5742,7 @@ class SlackAdapter(BasePlatformAdapter):
                 and not self._slack_message_mentions_self(routing_text, self_uids)
                 and self._slack_message_addressed_to_other_user(routing_text, self_uids)
             ):
-                logger.debug(
-                    "[Slack] Ignoring message addressed to another user in channel %s",
-                    channel_id,
-                )
+                self._log_slack_discard(event, "addressed to another user")
                 return
 
             if force_process:
@@ -5683,25 +5765,21 @@ class SlackAdapter(BasePlatformAdapter):
                     and is_thread_reply
                     and not is_mentioned
                 ):
-                    logger.debug(
-                        "[Slack] Ignoring thread reply without mention "
-                        "(thread_require_mention=true): channel=%s thread_ts=%s",
-                        channel_id,
-                        event_thread_ts,
+                    self._log_slack_discard(
+                        event, "thread reply without mention, thread_require_mention=true"
                     )
                     return
             elif self._slack_strict_mention() and not is_mentioned:
-                return  # Strict mode: ignore until @-mentioned again
+                # Strict mode: ignore until @-mentioned again.
+                self._log_slack_discard(event, "no mention, strict_mention=true")
+                return
             elif (
                 self._slack_thread_require_mention()
                 and is_thread_reply
                 and not is_mentioned
             ):
-                logger.debug(
-                    "[Slack] Ignoring thread reply without mention "
-                    "(thread_require_mention=true): channel=%s thread_ts=%s",
-                    channel_id,
-                    event_thread_ts,
+                self._log_slack_discard(
+                    event, "thread reply without mention, thread_require_mention=true"
                 )
                 return
             elif not is_mentioned:
@@ -5713,6 +5791,7 @@ class SlackAdapter(BasePlatformAdapter):
                     is_thread_reply=is_thread_reply,
                     chat_type="dm" if is_dm else "group",
                 ):
+                    self._log_slack_discard(event, "no mention and nothing to wake on")
                     return
 
         if is_mentioned:
