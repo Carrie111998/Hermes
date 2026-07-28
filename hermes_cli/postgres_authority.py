@@ -578,6 +578,14 @@ def claim_task(
     expires_dt = _ts(expires_at)
     resolved_tenant = str(tenant_id or DEFAULT_TENANT_ID)
 
+    # Quota enforcement: reject if free-tier tenant is over their hard limit.
+    try:
+        allowed, _, _ = check_quota(conn, tenant_id=resolved_tenant, meter_type="task_claim")
+        if not allowed:
+            return None
+    except Exception:
+        pass  # Fail-open: billing tables may not exist in older schemas
+
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -613,6 +621,17 @@ def claim_task(
         )
 
         conn.commit()
+
+        # Record billable usage (best-effort, non-blocking)
+        try:
+            record_usage(
+                conn, tenant_id=resolved_tenant, organization_id=organization_id,
+                meter_type="task_claim",
+                reference_id=f"claim:{task_id}:{organization_id}:{generation}",
+            )
+        except Exception:
+            pass
+
         return generation
 
 
@@ -1103,6 +1122,26 @@ def consume_permit(
             return False
 
         conn.commit()
+
+        # Record billable usage (best-effort)
+        try:
+            cur2 = conn.cursor()
+            cur2.execute(
+                "SELECT tenant_id FROM task_permits WHERE permit_id = %s",
+                (permit_id,),
+            )
+            prow = cur2.fetchone()
+            cur2.close()
+            if prow:
+                record_usage(
+                    conn, tenant_id=str(prow["tenant_id"]),
+                    organization_id=organization_id,
+                    meter_type="permit_consume",
+                    reference_id=f"permit:{permit_id}",
+                )
+        except Exception:
+            pass
+
         return True
 
 
@@ -1209,7 +1248,21 @@ def record_effect(
         )
         row = cur.fetchone()
         conn.commit()
-        return row is not None
+        is_new = row is not None
+
+    # Record billable usage for new effects only (best-effort)
+    if is_new:
+        try:
+            record_usage(
+                conn, tenant_id=resolved_tenant,
+                organization_id=organization_id,
+                meter_type="effect_record",
+                reference_id=f"effect:{effect_key}",
+            )
+        except Exception:
+            pass
+
+    return is_new
 
 
 def get_effect(
