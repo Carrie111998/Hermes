@@ -636,9 +636,9 @@ async def test_continuation_reconcile_cursor_reaches_second_page(
     first = await coordinator.reconcile_once()
     second = await coordinator.reconcile_once()
 
-    assert first.examined == 1000
-    assert second.examined == 1
-    assert store.after_calls == [None, "bridge:0999"]
+    assert first.examined == 5
+    assert second.examined == 5
+    assert store.after_calls == [None, "bridge:0004"]
 
 
 @pytest.mark.asyncio

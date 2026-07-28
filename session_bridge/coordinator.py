@@ -877,6 +877,7 @@ _CLAUDE_FINGERPRINT_KEY = "session-bridge:scan:claude:fingerprints"
 _CLAUDE_STAGED_KEY = "session-bridge:scan:claude:staged-fingerprints"
 _CODEX_SEEN_KEY = "session-bridge:scan:codex:seen"
 _CONTINUATION_RECONCILE_CURSOR_KEY = "session-bridge:reconcile:continuation-cursor"
+_CONTINUATION_RECONCILE_BATCH_SIZE = 5
 _EXTERNAL_PROVIDERS = (Provider.CLAUDE, Provider.CODEX)
 _PENDING_KEYS = {
     Provider.CLAUDE: "session-bridge:scan:claude:pending",
@@ -2561,7 +2562,7 @@ class SessionBridgeCoordinator:
             _call,
             self._store,
             "list_continuation_snapshots",
-            limit=1000,
+            limit=_CONTINUATION_RECONCILE_BATCH_SIZE,
             after_bridge_id=after_bridge_id,
         )
         if not snapshots and after_bridge_id is not None:
@@ -2569,7 +2570,7 @@ class SessionBridgeCoordinator:
                 _call,
                 self._store,
                 "list_continuation_snapshots",
-                limit=1000,
+                limit=_CONTINUATION_RECONCILE_BATCH_SIZE,
                 after_bridge_id=None,
             )
         examined = 0
@@ -2612,7 +2613,8 @@ class SessionBridgeCoordinator:
                 self._record_error_code("continuation_reconcile_failed")
         next_cursor = (
             snapshots[-1].get("bridge_id")
-            if len(snapshots) >= 1000 and isinstance(snapshots[-1], Mapping)
+            if len(snapshots) >= _CONTINUATION_RECONCILE_BATCH_SIZE
+            and isinstance(snapshots[-1], Mapping)
             else None
         )
         await self._save_continuation_reconcile_cursor(next_cursor)
