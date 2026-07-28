@@ -1,6 +1,14 @@
-## Community Memory Providers
+---
+sidebar_position: 5
+title: "Community Memory Providers"
+description: "External memory provider plugins maintained by the community — Memex Zero RAG"
+---
+
+# Community Memory Providers
 
 Beyond the 8 built-in providers, the following **standalone memory provider plugins** are available as community-maintained packages. They integrate with Hermes via the same `MemoryProvider` ABC and plugin discovery system — install them into `~/.hermes/plugins/`, and Hermes picks them up automatically.
+
+## Available Community Providers
 
 ### Memex Zero RAG
 
