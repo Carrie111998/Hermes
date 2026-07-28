@@ -418,7 +418,10 @@ class _FixedCloudFactsReader:
         finally:
             bearer = ""
             connection.close()
-        return _decode_json(response_body), len(response_body)
+        decoded = _decode_json(response_body)
+        if parsed.path.endswith("/getEffectiveFirewalls"):
+            decoded = _normalized_effective_firewalls(decoded)
+        return decoded, len(response_body)
 
     def _collect_once(self) -> Mapping[str, Any]:
         result: dict[str, Any] = {}
@@ -1277,13 +1280,14 @@ def _public_owner_gate_rule(rule: Mapping[str, Any], *, owner_sa: str) -> bool:
     source_tags = rule.get("sourceTags", [])
     if not isinstance(source_sas, list) or not isinstance(source_tags, list):
         _error("owner_gate_cloud_observation_firewall_invalid")
-    if (
-        source_sas == [foundation.PRODUCTION_SOURCE_SERVICE_ACCOUNT]
-        and not source_tags
-        and not rule.get("sourceRanges", [])
-    ):
-        return False
-    ranges = rule.get("sourceRanges", ["0.0.0.0/0"])
+    ranges = rule.get("sourceRanges")
+    if ranges is None:
+        # GCE omits sourceRanges for source-tag and source-service-account
+        # rules.  Only a rule with no source selector at all receives the
+        # implicit public IPv4 range.
+        if source_sas or source_tags:
+            return False
+        ranges = ["0.0.0.0/0"]
     if not isinstance(ranges, list) or any(
         not isinstance(item, str) for item in ranges
     ):
@@ -1293,6 +1297,35 @@ def _public_owner_gate_rule(rule: Mapping[str, Any], *, owner_sa: str) -> bool:
     except ValueError:
         _error("owner_gate_cloud_observation_firewall_invalid")
     return any(not network.is_private for network in networks)
+
+
+def _normalized_effective_firewalls(
+    value: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Normalize the unordered effective-firewall API collection.
+
+    Compute Engine requires an exact networkInterface selector for this
+    endpoint and does not promise rule ordering between identical reads.
+    Firewall names are project-unique, so sorting by that immutable identity
+    removes projection-only drift without changing any rule content.
+    """
+
+    rules = value.get("firewalls")
+    if (
+        not isinstance(rules, list)
+        or len(rules) > MAX_ITEMS
+        or any(not isinstance(rule, Mapping) for rule in rules)
+    ):
+        _error("owner_gate_cloud_observation_firewall_invalid")
+    names = [str(rule.get("name") or "") for rule in rules]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        _error("owner_gate_cloud_observation_firewall_invalid")
+    normalized = dict(value)
+    normalized["firewalls"] = sorted(
+        (dict(rule) for rule in rules),
+        key=lambda rule: str(rule["name"]),
+    )
+    return normalized
 
 
 def _exact_selectors(
@@ -1936,6 +1969,7 @@ def _build_unsigned(
             _url(
                 f"{compute}/projects/{project}/zones/{foundation.ZONE}/instances/"
                 f"{foundation.VM_NAME}/getEffectiveFirewalls"
+                f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
             ),
         ),
         expected_private_identity=foundation_identities.private_web_firewall,

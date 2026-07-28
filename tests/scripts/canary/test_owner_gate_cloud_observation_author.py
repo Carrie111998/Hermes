@@ -1224,6 +1224,7 @@ def _raw(
         author._url(
             f"{compute}/projects/{project}/zones/{zone}/instances/"
             f"{foundation.VM_NAME}/getEffectiveFirewalls"
+            f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
         ),
         {"firewalls": [iap, private_web]},
     )
@@ -1568,6 +1569,45 @@ def test_public_owner_gate_firewall_is_rejected() -> None:
     _reject(mutate, match="firewall_invalid")
 
 
+def test_source_tag_limited_effective_firewall_is_not_public() -> None:
+    plan, ancestry, _cloud_key = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    connector_rule = {
+        "name": "vpc-connector-source-tag",
+        "direction": "INGRESS",
+        "disabled": False,
+        "sourceTags": ["vpc-connector"],
+        "allowed": [{"IPProtocol": "tcp"}],
+    }
+    inventory_key = next(
+        key for key in raw if key.endswith("/global/firewalls")
+    )
+    effective_key = next(
+        key
+        for key in raw
+        if "/getEffectiveFirewalls?networkInterface=" in key
+    )
+    cast(dict[str, Any], raw[inventory_key])["items"].append(
+        copy.deepcopy(connector_rule)
+    )
+    cast(dict[str, Any], raw[effective_key])["firewalls"].append(
+        connector_rule
+    )
+
+    observation = author._unsigned_from_raw(
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        raw=raw,
+        collected_at_unix=NOW,
+        package_sha256="3" * 64,
+        foundation_identities=_identities(plan, ancestry),
+        verified_probe=_verified_probe("inert"),
+    )
+
+    assert observation["firewalls"]["public_owner_gate_rules"] == []
+
+
 def test_target_numeric_id_drift_is_rejected() -> None:
     def mutate(raw, _plan) -> None:
         key = next(
@@ -1640,7 +1680,14 @@ def test_owner_boot_device_is_not_conflated_with_disk_resource_name() -> None:
 def test_mixed_firewall_source_selectors_are_rejected(effective: bool) -> None:
     def mutate(raw, _plan) -> None:
         if effective:
-            key = next(key for key in raw if key.endswith("/getEffectiveFirewalls"))
+            key = next(
+                key
+                for key in raw
+                if key.endswith(
+                    "/getEffectiveFirewalls"
+                    f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
+                )
+            )
             rule = next(
                 item
                 for item in raw[key]["firewalls"]
@@ -1856,11 +1903,13 @@ class _FakeCloudHttp:
         corrupt_key: str | None = None,
         corrupt_kind: str | None = None,
         unstable_key: str | None = None,
+        reorder_key: str | None = None,
     ) -> None:
         self.raw = raw
         self.corrupt_key = corrupt_key
         self.corrupt_kind = corrupt_kind
         self.unstable_key = unstable_key
+        self.reorder_key = reorder_key
         self.calls: list[tuple[str, str, bytes | None, dict[str, str]]] = []
         self.counts: dict[str, int] = {}
 
@@ -1885,6 +1934,9 @@ class _FakeCloudHttp:
                 value = parent.raw[key]
                 if key == parent.unstable_key and parent.counts[key] >= 2:
                     value = {**cast(Mapping[str, Any], value), "unstable": True}
+                if key == parent.reorder_key and parent.counts[key] >= 2:
+                    value = copy.deepcopy(value)
+                    cast(dict[str, Any], value)["firewalls"].reverse()
                 body = foundation.canonical_json_bytes(value)
                 if key != parent.corrupt_key:
                     return _FakeResponse(body)
@@ -1970,6 +2022,23 @@ def test_fixed_http_reader_rejects_second_snapshot_drift() -> None:
             match="facts_unstable",
         ):
             reader.collect()
+    finally:
+        direct_iam_author.wipe_access_token(token)
+
+
+def test_fixed_http_reader_normalizes_effective_firewall_order() -> None:
+    plan, ancestry, _ = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    effective_key = next(
+        key
+        for key in raw
+        if "/getEffectiveFirewalls?networkInterface=" in key
+    )
+    fake = _FakeCloudHttp(raw, reorder_key=effective_key)
+    reader, token = _http_reader(plan, ancestry, raw, fake)
+    try:
+        assert reader.collect() == raw
+        assert fake.counts[effective_key] == 2
     finally:
         direct_iam_author.wipe_access_token(token)
 

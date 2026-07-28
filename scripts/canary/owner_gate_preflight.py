@@ -361,7 +361,11 @@ def read_only_cloud_requests(
         f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.PRODUCTION_SOURCE_VM}",
         f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.VM_NAME}",
         f"{compute}/projects/{project}/zones/{zone}/disks/{foundation.VM_NAME}",
-        f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.VM_NAME}/getEffectiveFirewalls",
+        (
+            f"{compute}/projects/{project}/zones/{zone}/instances/"
+            f"{foundation.VM_NAME}/getEffectiveFirewalls"
+            f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
+        ),
         f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.TARGET_INSTANCE}",
         f"{compute}/projects/{project}/zones/{zone}/disks/{foundation.TARGET_DISK}",
         f"{compute}/projects/{project}/aggregated/subnetworks",
