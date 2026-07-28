@@ -107,7 +107,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -2929,7 +2929,9 @@ class MCPServerTask:
             # Deprecated API (mcp < 1.24.0): manages httpx client internally.
             _http_kwargs: dict = {
                 "headers": headers,
-                "timeout": float(connect_timeout),
+                # Legacy MCP SDKs access ``.seconds`` on these values.
+                "timeout": timedelta(seconds=float(connect_timeout)),
+                "sse_read_timeout": timedelta(seconds=300),
                 "verify": ssl_verify,
             }
             if _oauth_auth is not None:
