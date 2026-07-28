@@ -3561,6 +3561,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     "usage": usage,
                     "runtime": effective_runtime,
                 }))
+                # Optional post-turn hook: fire a user-configured command as a
+                # detached, non-blocking subprocess once a turn has completed and
+                # its transcript is persisted. Set HERMES_POST_TURN_HOOK to the
+                # command (e.g. a deterministic vault-ingest script). A hook
+                # failure must never affect the turn.
+                _hook = os.environ.get("HERMES_POST_TURN_HOOK", "").strip()
+                if _hook:
+                    try:
+                        import shlex, subprocess
+                        subprocess.Popen(
+                            shlex.split(_hook),
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                            env={**os.environ,
+                                 "HERMES_TURN_SESSION_ID": str(effective_session_id or "")},
+                        )
+                    except Exception:
+                        logger.debug("[api_server] post-turn hook failed", exc_info=True)
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
