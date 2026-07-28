@@ -100,6 +100,8 @@ models-dev-upstream/
 .gemini/
 .zed/
 .mcp.json
+.qoder/
+.agents/
 opencode.json
 config/mcporter.json
 
@@ -132,3 +134,7 @@ scripts/out/
 # stores the published notes. They are not a build artifact and must never be
 # committed to the repo root. See the hermes-release skill.
 RELEASE_v*.md
+
+# Workspace-local tmp for sandboxed tooling (playwright mkdtemp fallback used by
+# apps/desktop/scripts/cdp-drive.mjs when the system TMPDIR is denied).
+.tmp/
