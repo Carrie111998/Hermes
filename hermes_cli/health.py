@@ -84,11 +84,25 @@ def _read_raw_config(config_path: Path) -> tuple[dict[str, Any] | None, HealthRo
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except Exception as exc:
+        # ``str(MarkedYAMLError)`` includes the offending source line. Never
+        # echo it: malformed config may contain credentials and health output
+        # is commonly persisted by monitoring systems.
+        problem = getattr(exc, "problem", None)
+        mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+        diagnostic = type(exc).__name__
+        if isinstance(problem, str) and problem:
+            diagnostic += f": {problem.replace(chr(10), ' ')[:160]}"
+        location = ""
+        if mark is not None:
+            line = getattr(mark, "line", None)
+            column = getattr(mark, "column", None)
+            if isinstance(line, int) and isinstance(column, int):
+                location = f" at line {line + 1}, column {column + 1}"
         return None, HealthRow(
             "profile_config",
             "profile/config",
             "critical",
-            f"config.yaml is not valid YAML for profile {get_active_profile_name()}: {exc}",
+            f"config.yaml invalid{location} ({diagnostic}); profile={get_active_profile_name()}",
             "run: hermes config check",
         )
     if raw is None:

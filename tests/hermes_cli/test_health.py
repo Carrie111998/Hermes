@@ -186,7 +186,24 @@ def test_collect_health_critical_exit_two_for_bad_config(tmp_path, monkeypatch):
 
     assert result["status"] == "critical"
     assert result["exit_code"] == 2
-    assert any(row["id"] == "profile_config" and row["status"] == "critical" for row in result["checks"])
+    config_row = next(row for row in result["checks"] if row["id"] == "profile_config")
+    assert config_row["status"] == "critical"
+    assert "line 2, column 1" in config_row["detail"]
+
+
+def test_bad_config_diagnostic_does_not_disclose_source_line(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "profile"
+    home.mkdir()
+    sentinel = "SUPER_SECRET_CREDENTIAL_123"
+    (home / "config.yaml").write_text(f"api_key: [{sentinel}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    for json_output in (True, False):
+        code = health_mod.run_health(SimpleNamespace(json=json_output, quiet=False))
+        output = capsys.readouterr().out
+        assert code == 2
+        assert sentinel not in output
+        assert "line 2, column 1" in output
 
 
 def test_collect_health_critical_exit_two_for_non_mapping_config(tmp_path, monkeypatch):
@@ -419,6 +436,65 @@ import hermes_cli.main
     assert "PyYAML" in payload["checks"][0]["detail"]
     assert recovery_marker.read_bytes() == original_marker
     assert not repair_marker.exists()
+
+
+def test_broken_dependency_health_resolves_explicit_and_sticky_profiles(tmp_path):
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "yaml.py").write_text(
+        "raise ImportError('deliberately broken yaml')\n", encoding="utf-8"
+    )
+    user_home = tmp_path / "user"
+    hermes_root = user_home / ".hermes"
+    (hermes_root / "profiles" / "coder").mkdir(parents=True)
+    (hermes_root / "active_profile").write_text("coder\n", encoding="utf-8")
+    script = """
+import sys
+sys.argv = ["hermes", *sys.argv[1:]]
+import hermes_cli.main
+"""
+    base_env = {
+        **os.environ,
+        "HOME": str(user_home),
+        "PYTHONPATH": f"{shadow}{os.pathsep}{os.getcwd()}",
+    }
+    base_env.pop("HERMES_HOME", None)
+    base_env.pop("HERMES_PROFILE", None)
+
+    for args in (
+        ["--profile", "coder", "health", "--json"],
+        ["-p", "coder", "health", "--json"],
+        ["--profile=coder", "health", "--json"],
+        ["health", "--json"],
+    ):
+        proc = subprocess.run(
+            [sys.executable, "-c", script, *args],
+            cwd=os.getcwd(),
+            env=base_env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert proc.returncode == 2, proc.stderr
+        payload = json.loads(proc.stdout)
+        assert payload["profile"] == "coder"
+        assert payload["hermes_home"] == str(hermes_root / "profiles" / "coder")
+
+    custom_root = tmp_path / "custom-hermes-root"
+    (custom_root / "profiles" / "coder").mkdir(parents=True)
+    custom_env = {**base_env, "HERMES_HOME": str(custom_root)}
+    proc = subprocess.run(
+        [sys.executable, "-c", script, "--profile", "coder", "health", "--json"],
+        cwd=os.getcwd(),
+        env=custom_env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert proc.returncode == 2, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["profile"] == "coder"
+    assert payload["hermes_home"] == str(custom_root / "profiles" / "coder")
 
 
 def test_health_subparser_registered():
