@@ -137,12 +137,14 @@ def _get_mcp_stderr_log() -> Any:
             # Line-buffered so server output lands on disk promptly; errors=
             # "replace" tolerates garbled binary output from misbehaving
             # servers.
-            fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+            fh = open(log_path, "a", encoding="utf-8",
+                      errors="replace", buffering=1)
             # Sanity-check: confirm a real fd is available before we commit.
             fh.fileno()
             _mcp_stderr_log_fh = fh
         except Exception as exc:  # pragma: no cover — best-effort fallback
-            logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)
+            logger.debug(
+                "Failed to open MCP stderr log, using devnull: %s", exc)
             try:
                 _mcp_stderr_log_fh = open(os.devnull, "w", encoding="utf-8")
             except Exception:
@@ -170,6 +172,7 @@ def _write_stderr_log_header(server_name: str) -> None:
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
 # ---------------------------------------------------------------------------
+
 
 _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
@@ -199,13 +202,15 @@ try:
     try:
         from mcp.types import LATEST_PROTOCOL_VERSION
     except ImportError:
-        logger.debug("mcp.types.LATEST_PROTOCOL_VERSION not available -- using fallback protocol version")
+        logger.debug(
+            "mcp.types.LATEST_PROTOCOL_VERSION not available -- using fallback protocol version")
     # SSE transport client (for MCP servers using SSE transport instead of Streamable HTTP)
     try:
         from mcp.client.sse import sse_client
     except ImportError:
         sse_client = None
-        logger.debug("mcp.client.sse.sse_client not available -- SSE transport disabled")
+        logger.debug(
+            "mcp.client.sse.sse_client not available -- SSE transport disabled")
     # Sampling types -- separated so older SDK versions don't break MCP support
     try:
         from mcp.types import (
@@ -230,7 +235,8 @@ try:
         )
         _MCP_NOTIFICATION_TYPES = True
     except ImportError:
-        logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
+        logger.debug(
+            "MCP notification types not available -- dynamic tool discovery disabled")
 except ImportError:
     logger.debug("mcp package not installed -- MCP tool support disabled")
 
@@ -251,7 +257,8 @@ def _check_message_handler_support() -> bool:
 
 _MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
 if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
-    logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
+    logger.debug(
+        "MCP SDK does not support message_handler -- dynamic tool discovery disabled")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -260,7 +267,7 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
-_MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
+_MAX_INITIAL_CONNECT_RETRIES = 3  # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
 
 # Environment variables that are safe to pass to stdio subprocesses
@@ -452,12 +459,14 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
         elif resolved_command in {"npx", "npm", "node"}:
             hermes_home = os.path.expanduser(
                 os.getenv(
-                    "HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes")
+                    "HERMES_HOME", os.path.join(
+                        os.path.expanduser("~"), ".hermes")
                 )
             )
             candidates = [
                 os.path.join(hermes_home, "node", "bin", resolved_command),
-                os.path.join(os.path.expanduser("~"), ".local", "bin", resolved_command),
+                os.path.join(os.path.expanduser("~"), ".local",
+                             "bin", resolved_command),
                 # /usr/local/bin is the canonical install location for Node on
                 # Linux from-source builds, the upstream node:bookworm-slim
                 # image (which the Hermes Docker image copies node + npm +
@@ -517,7 +526,8 @@ def _cache_mcp_image_block(block) -> str:
     try:
         raw_bytes = base64.b64decode(data)
     except (TypeError, ValueError) as exc:
-        logger.warning("MCP image block decode failed (%s): %s", normalized_mime, exc)
+        logger.warning("MCP image block decode failed (%s): %s",
+                       normalized_mime, exc)
         return ""
 
     try:
@@ -531,7 +541,8 @@ def _cache_mcp_image_block(block) -> str:
         # gateway.platforms.base not importable in this process (e.g. cron
         # without gateway deps). Fall back to silently dropping — callers
         # get any text blocks that did parse.
-        logger.debug("MCP image caching skipped — gateway.platforms.base unavailable")
+        logger.debug(
+            "MCP image caching skipped — gateway.platforms.base unavailable")
         return ""
     except Exception as exc:
         logger.warning("MCP image block cache failed: %s", exc)
@@ -708,7 +719,8 @@ def _format_connect_error(exc: BaseException) -> str:
         if isinstance(current, FileNotFoundError):
             if getattr(current, "filename", None):
                 return str(current.filename)
-            match = re.search(r"No such file or directory: '([^']+)'", str(current))
+            match = re.search(
+                r"No such file or directory: '([^']+)'", str(current))
             if match:
                 return match.group(1)
         for attr in ("__cause__", "__context__"):
@@ -786,20 +798,23 @@ class SamplingHandler:
     it doesn't block the event loop.
     """
 
-    _STOP_REASON_MAP = {"stop": "endTurn", "length": "maxTokens", "tool_calls": "toolUse"}
+    _STOP_REASON_MAP = {"stop": "endTurn",
+                        "length": "maxTokens", "tool_calls": "toolUse"}
 
     def __init__(self, server_name: str, config: dict):
         self.server_name = server_name
         self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
         self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
-        self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 4096), 4096, int)
+        self.max_tokens_cap = _safe_numeric(
+            config.get("max_tokens_cap", 4096), 4096, int)
         self.max_tool_rounds = _safe_numeric(
             config.get("max_tool_rounds", 5), 5, int, minimum=0,
         )
         self.model_override = config.get("model")
         self.allowed_models = config.get("allowed_models", [])
 
-        _log_levels = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING}
+        _log_levels = {"debug": logging.DEBUG,
+                       "info": logging.INFO, "warning": logging.WARNING}
         self.audit_level = _log_levels.get(
             str(config.get("log_level", "info")).lower(), logging.INFO,
         )
@@ -807,7 +822,8 @@ class SamplingHandler:
         # Per-instance state
         self._rate_timestamps: List[float] = []
         self._tool_loop_count = 0
-        self.metrics = {"requests": 0, "errors": 0, "tokens_used": 0, "tool_use_count": 0}
+        self.metrics = {"requests": 0, "errors": 0,
+                        "tokens_used": 0, "tool_use_count": 0}
 
     # -- Rate limiting -------------------------------------------------------
 
@@ -815,7 +831,8 @@ class SamplingHandler:
         """Sliding-window rate limiter.  Returns True if request is allowed."""
         now = time.time()
         window = now - 60
-        self._rate_timestamps[:] = [t for t in self._rate_timestamps if t > window]
+        self._rate_timestamps[:] = [
+            t for t in self._rate_timestamps if t > window]
         if len(self._rate_timestamps) >= self.max_rpm:
             return False
         self._rate_timestamps.append(now)
@@ -840,7 +857,8 @@ class SamplingHandler:
         """Extract text from a ToolResultContent block."""
         if not hasattr(block, "content") or block.content is None:
             return ""
-        items = block.content if isinstance(block.content, list) else [block.content]
+        items = block.content if isinstance(
+            block.content, list) else [block.content]
         return "\n".join(item.text for item in items if hasattr(item, "text"))
 
     def _convert_messages(self, params) -> List[dict]:
@@ -859,8 +877,10 @@ class SamplingHandler:
 
             # Separate blocks by kind
             tool_results = [b for b in blocks if hasattr(b, "toolUseId")]
-            tool_uses = [b for b in blocks if hasattr(b, "name") and hasattr(b, "input") and not hasattr(b, "toolUseId")]
-            content_blocks = [b for b in blocks if not hasattr(b, "toolUseId") and not (hasattr(b, "name") and hasattr(b, "input"))]
+            tool_uses = [b for b in blocks if hasattr(b, "name") and hasattr(
+                b, "input") and not hasattr(b, "toolUseId")]
+            content_blocks = [b for b in blocks if not hasattr(
+                b, "toolUseId") and not (hasattr(b, "name") and hasattr(b, "input"))]
 
             # Emit tool result messages (role: tool)
             for tr in tool_results:
@@ -884,14 +904,16 @@ class SamplingHandler:
                     })
                 msg_dict: dict = {"role": msg.role, "tool_calls": tc_list}
                 # Include any accompanying text
-                text_parts = [b.text for b in content_blocks if hasattr(b, "text")]
+                text_parts = [
+                    b.text for b in content_blocks if hasattr(b, "text")]
                 if text_parts:
                     msg_dict["content"] = "\n".join(text_parts)
                 messages.append(msg_dict)
             elif content_blocks:
                 # Pure text/image content
                 if len(content_blocks) == 1 and hasattr(content_blocks[0], "text"):
-                    messages.append({"role": msg.role, "content": content_blocks[0].text})
+                    messages.append(
+                        {"role": msg.role, "content": content_blocks[0].text})
                 else:
                     parts = []
                     for block in content_blocks:
@@ -956,7 +978,8 @@ class SamplingHandler:
                     )
                     parsed = {"_raw": args}
             else:
-                parsed = args if isinstance(args, dict) else {"_raw": str(args)}
+                parsed = args if isinstance(args, dict) else {
+                    "_raw": str(args)}
 
             content_blocks.append(ToolUseContent(
                 type="tool_use",
@@ -994,9 +1017,11 @@ class SamplingHandler:
 
         return CreateMessageResult(
             role="assistant",
-            content=TextContent(type="text", text=_sanitize_error(response_text)),
+            content=TextContent(
+                type="text", text=_sanitize_error(response_text)),
             model=response.model,
-            stopReason=self._STOP_REASON_MAP.get(choice.finish_reason, "endTurn"),
+            stopReason=self._STOP_REASON_MAP.get(
+                choice.finish_reason, "endTurn"),
         )
 
     # -- Session kwargs helper -----------------------------------------------
@@ -1054,7 +1079,8 @@ class SamplingHandler:
         # Convert messages
         messages = self._convert_messages(params)
         if hasattr(params, "systemPrompt") and params.systemPrompt:
-            messages.insert(0, {"role": "system", "content": params.systemPrompt})
+            messages.insert(
+                0, {"role": "system", "content": params.systemPrompt})
 
         # Build LLM call kwargs
         max_tokens = min(params.maxTokens, self.max_tokens_cap)
@@ -1125,7 +1151,8 @@ class SamplingHandler:
         # Track metrics
         choice = response.choices[0]
         self.metrics["requests"] += 1
-        total_tokens = getattr(getattr(response, "usage", None), "total_tokens", 0)
+        total_tokens = getattr(
+            getattr(response, "usage", None), "total_tokens", 0)
         if isinstance(total_tokens, int):
             self.metrics["tokens_used"] += total_tokens
 
@@ -1217,7 +1244,8 @@ class MCPServerTask:
         any server that was working before this gate).
         """
         init_result = self.initialize_result
-        caps = getattr(init_result, "capabilities", None) if init_result is not None else None
+        caps = getattr(init_result, "capabilities",
+                       None) if init_result is not None else None
         if caps is None:
             return True
         return getattr(caps, "tools", None) is not None
@@ -1231,7 +1259,8 @@ class MCPServerTask:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("MCP server '%s': dynamic tool refresh failed", self.name)
+            logger.exception(
+                "MCP server '%s': dynamic tool refresh failed", self.name)
 
     def _schedule_tools_refresh(self) -> asyncio.Task:
         """Schedule a background tool refresh and keep it strongly referenced."""
@@ -1250,7 +1279,8 @@ class MCPServerTask:
         async def _handler(message):
             try:
                 if isinstance(message, Exception):
-                    logger.debug("MCP message handler (%s): exception: %s", self.name, message)
+                    logger.debug(
+                        "MCP message handler (%s): exception: %s", self.name, message)
                     return
                 if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
                     match message.root:
@@ -1274,13 +1304,16 @@ class MCPServerTask:
                             # refresh without awaiting the full server RPC.
                             await asyncio.sleep(0)
                         case PromptListChangedNotification():
-                            logger.debug("MCP server '%s': prompts/list_changed (ignored)", self.name)
+                            logger.debug(
+                                "MCP server '%s': prompts/list_changed (ignored)", self.name)
                         case ResourceListChangedNotification():
-                            logger.debug("MCP server '%s': resources/list_changed (ignored)", self.name)
+                            logger.debug(
+                                "MCP server '%s': resources/list_changed (ignored)", self.name)
                         case _:
                             pass
             except Exception:
-                logger.exception("Error in MCP message handler for '%s'", self.name)
+                logger.exception(
+                    "Error in MCP message handler for '%s'", self.name)
         return _handler
 
     async def _refresh_tools(self):
@@ -1306,7 +1339,8 @@ class MCPServerTask:
             # 1. Fetch current tool list from server
             async with self._rpc_lock:
                 tools_result = await self.session.list_tools()
-            new_mcp_tools = tools_result.tools if hasattr(tools_result, "tools") else []
+            new_mcp_tools = tools_result.tools if hasattr(
+                tools_result, "tools") else []
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
             # all names: live agent turns may already have tool-call IDs
@@ -1501,7 +1535,7 @@ class MCPServerTask:
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
-                    self.initialize_result = await session.initialize()
+                    self.initialize_result = await _initialize_declaring_ui(session)
                     self.session = session
                     await self._discover_tools()
                     self._ready.set()
@@ -1583,7 +1617,8 @@ class MCPServerTask:
         try:
             import httpx as _httpx
         except ImportError:
-            return  # No httpx → skip probe; SDK import would have failed first.
+            # No httpx → skip probe; SDK import would have failed first.
+            return
 
         client_kwargs: dict = {
             "verify": ssl_verify,
@@ -1609,7 +1644,8 @@ class MCPServerTask:
         if not (200 <= resp.status_code < 300):
             return
 
-        ct_base = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+        ct_base = resp.headers.get(
+            "content-type", "").split(";")[0].strip().lower()
         if not ct_base:
             return  # No content type advertised — don't second-guess the SDK.
         if ct_base in self._MCP_CONTENT_TYPES:
@@ -1641,7 +1677,8 @@ class MCPServerTask:
         # case-insensitive so conventional casing is preserved.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
-        connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+        connect_timeout = config.get(
+            "connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
 
@@ -1659,7 +1696,8 @@ class MCPServerTask:
                     self.name, url, config.get("oauth"),
                 )
             except Exception as exc:
-                logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+                logger.warning(
+                    "MCP OAuth setup failed for '%s': %s", self.name, exc)
                 raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
@@ -1716,7 +1754,8 @@ class MCPServerTask:
                     if timeout is not None:
                         kwargs["timeout"] = timeout
                     else:
-                        kwargs["timeout"] = _httpx_mod.Timeout(30.0, read=300.0)
+                        kwargs["timeout"] = _httpx_mod.Timeout(
+                            30.0, read=300.0)
                     if headers is not None:
                         kwargs["headers"] = headers
                     if auth is not None:
@@ -1730,7 +1769,7 @@ class MCPServerTask:
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
-                    self.initialize_result = await session.initialize()
+                    self.initialize_result = await _initialize_declaring_ui(session)
                     self.session = session
                     await self._discover_tools()
                     self._ready.set()
@@ -1756,8 +1795,10 @@ class MCPServerTask:
                     if (target.scheme, target.host, target.port) != (
                         _original_url.scheme, _original_url.host, _original_url.port,
                     ):
-                        response.next_request.headers.pop("authorization", None)
-                        response.next_request.headers.pop("Authorization", None)
+                        response.next_request.headers.pop(
+                            "authorization", None)
+                        response.next_request.headers.pop(
+                            "Authorization", None)
 
             client_kwargs: dict = {
                 "follow_redirects": True,
@@ -1779,7 +1820,7 @@ class MCPServerTask:
                     read_stream, write_stream, _get_session_id,
                 ):
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                        self.initialize_result = await session.initialize()
+                        self.initialize_result = await _initialize_declaring_ui(session)
                         self.session = session
                         await self._discover_tools()
                         self._ready.set()
@@ -1802,7 +1843,7 @@ class MCPServerTask:
                 read_stream, write_stream, _get_session_id,
             ):
                 async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                    self.initialize_result = await session.initialize()
+                    self.initialize_result = await _initialize_declaring_ui(session)
                     self.session = session
                     await self._discover_tools()
                     self._ready.set()
@@ -1840,6 +1881,9 @@ class MCPServerTask:
             if hasattr(tools_result, "tools")
             else []
         )
+        # MCP Apps: capture referenced-form UI descriptors (tool-def
+        # ``_meta.ui.resourceUri``) so the call path can resolve + render cards.
+        _capture_ui_tool_resources(self.name, self._tools)
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -2126,6 +2170,7 @@ def _reset_server_error(server_name: str) -> None:
 # ---------------------------------------------------------------------------
 # Auth-failure detection helpers (Task 6 of MCP OAuth consolidation)
 # ---------------------------------------------------------------------------
+
 
 # Cached tuple of auth-related exception types. Lazy so this module
 # imports cleanly when the MCP SDK OAuth module is missing.
@@ -2723,6 +2768,355 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 
 
 # ---------------------------------------------------------------------------
+# MCP Apps UI side-channel
+#
+# MCP Apps servers (the io.modelcontextprotocol/ui extension) attach an
+# interactive HTML card to a tool call in one of two forms:
+#
+#   * inline form -- the tool RESULT carries ``_meta.ui.resource`` (full HTML
+#     inline) + ``_meta.ui.csp``. Self-contained; read by ``_extract_mcp_ui``.
+#     (utp: login / checkout / address.)
+#   * referenced form -- the tool DEFINITION (from ``tools/list``) carries
+#     ``_meta.ui.resourceUri`` (a ``ui://`` URI) + ``_meta.ui.csp``; the actual
+#     HTML lives in an MCP resource the host fetches via ``resources/read``.
+#     (utp: catalog_search / catalog_product / cart_list.)
+#
+# Servers gate emission of the referenced-form tool-def ``_meta`` on the client
+# declaring the ``io.modelcontextprotocol/ui`` capability at ``initialize`` time
+# (utp's ``supportsMCPApps`` check strips every tool ``_meta`` otherwise). So we
+# declare that extension in ``_initialize_declaring_ui`` below.
+#
+# Either way the HTML is large (100-300 KB) and must NOT enter the model context
+# or the prompt cache, so we never fold it into the string the handler returns
+# to the agent. Instead we stash it here keyed by the active ``tool_call_id``
+# and let the gateway attach it to the ``tool.complete`` event delivered to
+# UI-capable hosts (the desktop app), which render it in a sandboxed iframe.
+# Non-UI results and non-UI hosts are unaffected -- the model still gets the
+# normal short text/structuredContent.
+# ---------------------------------------------------------------------------
+
+_MCP_UI_EXTENSION = "io.modelcontextprotocol/ui"
+_MCP_UI_MIME = "text/html;profile=mcp-app"
+
+_mcp_ui_registry: "dict[str, dict]" = {}
+_mcp_ui_registry_lock = threading.Lock()
+_MCP_UI_REGISTRY_MAX = 64
+
+# Per-server map of tool name -> referenced-form UI descriptor
+# ({"resourceUri": str, "csp": dict|None}), captured from tool-definition
+# ``_meta.ui`` during discovery. Populated by ``_capture_ui_tool_resources``.
+_mcp_ui_tool_resources: "dict[str, dict[str, dict]]" = {}
+# Cache of resolved referenced-form card HTML, keyed by (server, resourceUri).
+# The HTML is static per server, so we fetch each ``ui://`` resource at most
+# once instead of re-reading 100-300 KB on every tool call.
+_mcp_ui_resource_html_cache: "dict[tuple, str]" = {}
+_mcp_ui_resources_lock = threading.Lock()
+
+
+async def _initialize_declaring_ui(session):
+    """Initialize an MCP session declaring the MCP Apps UI extension.
+
+    Mirrors the stock ``ClientSession.initialize()`` but adds the
+    ``io.modelcontextprotocol/ui`` extension to the client capabilities so
+    MCP Apps servers emit referenced-form tool-definition ``_meta.ui`` (which
+    they strip when the client doesn't advertise UI support). Declaring this
+    is generic MCP Apps host behavior -- servers that don't understand the
+    extension ignore it.
+
+    Falls back to the stock ``session.initialize()`` if anything about the
+    custom path fails (SDK-version drift on the mirrored internals), so
+    non-MCP-Apps servers are never regressed.
+    """
+    try:
+        from mcp import types as _types
+        import mcp.client.session as _session_mod
+
+        # Mirror the SDK's capability detection: declare a capability only when
+        # a non-default callback was wired up (same rule ``initialize`` uses).
+        sampling = (
+            _types.SamplingCapability()
+            if session._sampling_callback is not _session_mod._default_sampling_callback
+            else None
+        )
+        elicitation = (
+            _types.ElicitationCapability()
+            if session._elicitation_callback is not _session_mod._default_elicitation_callback
+            else None
+        )
+        roots = (
+            _types.RootsCapability(listChanged=True)
+            if session._list_roots_callback is not _session_mod._default_list_roots_callback
+            else None
+        )
+
+        caps = _types.ClientCapabilities(
+            sampling=sampling,
+            elicitation=elicitation,
+            experimental=None,
+            roots=roots,
+        )
+        # ClientCapabilities is ``extra='allow'``; attach the UI extension as an
+        # additional field so it serializes under ``capabilities.extensions``.
+        caps.extensions = {_MCP_UI_EXTENSION: {"mimeTypes": [_MCP_UI_MIME]}}
+
+        result = await session.send_request(
+            _types.ClientRequest(
+                _types.InitializeRequest(
+                    method="initialize",
+                    params=_types.InitializeRequestParams(
+                        protocolVersion=_types.LATEST_PROTOCOL_VERSION,
+                        capabilities=caps,
+                        clientInfo=session._client_info,
+                    ),
+                )
+            ),
+            _types.InitializeResult,
+        )
+
+        if result.protocolVersion not in _session_mod.SUPPORTED_PROTOCOL_VERSIONS:
+            raise RuntimeError(
+                f"Unsupported protocol version from the server: {result.protocolVersion}"
+            )
+
+        await session.send_notification(
+            _types.ClientNotification(
+                _types.InitializedNotification(
+                    method="notifications/initialized")
+            )
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001 -- any failure falls back to stock init
+        logger.debug(
+            "UI-declaring initialize failed (%s); falling back to stock initialize",
+            exc,
+        )
+        return await session.initialize()
+
+
+def _capture_ui_tool_resources(server_name: str, tools) -> None:
+    """Record referenced-form UI descriptors from tool-definition ``_meta.ui``.
+
+    A tool whose definition carries ``_meta.ui.resourceUri`` renders a card
+    fetched from that ``ui://`` resource. We stash {resourceUri, csp} per tool
+    so the call path can resolve + stash the card after the tool runs.
+    """
+    mapping: "dict[str, dict]" = {}
+    for tool in (tools or []):
+        meta = getattr(tool, "meta", None)
+        if not isinstance(meta, dict):
+            continue
+        ui = meta.get("ui")
+        if not isinstance(ui, dict):
+            continue
+        resource_uri = ui.get("resourceUri")
+        if not isinstance(resource_uri, str) or not resource_uri:
+            continue
+        mapping[getattr(tool, "name", "")] = {
+            "resourceUri": resource_uri,
+            "csp": ui.get("csp") if isinstance(ui.get("csp"), dict) else None,
+        }
+    with _mcp_ui_resources_lock:
+        if mapping:
+            _mcp_ui_tool_resources[server_name] = mapping
+        else:
+            _mcp_ui_tool_resources.pop(server_name, None)
+            # Drop any cached HTML for a server that no longer exposes UI tools.
+            for key in [k for k in _mcp_ui_resource_html_cache if k[0] == server_name]:
+                _mcp_ui_resource_html_cache.pop(key, None)
+
+
+def _stash_mcp_ui_payload(tool_call_id: str, payload: dict) -> None:
+    if not tool_call_id or not payload:
+        return
+    with _mcp_ui_registry_lock:
+        _mcp_ui_registry[tool_call_id] = payload
+        # A card may never be claimed (e.g. a non-desktop host), so evict the
+        # oldest entries instead of leaking the big HTML blobs indefinitely.
+        while len(_mcp_ui_registry) > _MCP_UI_REGISTRY_MAX:
+            _mcp_ui_registry.pop(next(iter(_mcp_ui_registry)), None)
+
+
+def pop_mcp_ui_payload(tool_call_id: str) -> "dict | None":
+    """Claim (and remove) the MCP Apps UI payload stashed for a tool call.
+
+    Called by the gateway from its ``tool.complete`` path. Returns ``None`` when
+    the tool produced no UI card.
+    """
+    if not tool_call_id:
+        return None
+    with _mcp_ui_registry_lock:
+        return _mcp_ui_registry.pop(tool_call_id, None)
+
+
+def _extract_mcp_ui(result, server_name: str) -> "dict | None":
+    """Pull an MCP Apps UI card out of a CallToolResult's ``_meta.ui``.
+
+    Shape (confirmed against the utp MCP Apps server)::
+
+        _meta.ui.resource = {"uri": "ui://...",
+                             "mimeType": "text/html;profile=mcp-app",
+                             "text": "<html>..."}
+        _meta.ui.csp      = {"scriptSrc": ..., "connectDomains": [...],
+                             "resourceDomains": [...], "allowUnsafeEval": bool}
+
+    Returns ``None`` when the result carries no UI card.
+    """
+    meta = getattr(result, "meta", None)
+    if not isinstance(meta, dict):
+        return None
+    ui = meta.get("ui")
+    if not isinstance(ui, dict):
+        return None
+    resource = ui.get("resource")
+    if not isinstance(resource, dict):
+        return None
+    uri = resource.get("uri")
+    html = resource.get("text")
+    if not uri or not html:
+        return None
+    return {
+        "server": server_name,
+        "uri": uri,
+        "mimeType": resource.get("mimeType"),
+        "html": html,
+        "csp": ui.get("csp"),
+    }
+
+
+async def _resolve_referenced_mcp_ui(server, server_name: str, tool_name: str) -> "dict | None":
+    """Resolve a referenced-form UI card for a tool call.
+
+    When ``tool_name``'s definition advertised ``_meta.ui.resourceUri`` (captured
+    at discovery), fetch that ``ui://`` resource's HTML (cached per server+uri,
+    since it is static) and build the same payload shape the inline form yields.
+    Returns ``None`` when the tool has no referenced-form card.
+
+    Must run on the MCP loop with ``server._rpc_lock`` held by the caller.
+    """
+    with _mcp_ui_resources_lock:
+        descriptor = (_mcp_ui_tool_resources.get(
+            server_name) or {}).get(tool_name)
+    if not descriptor:
+        return None
+    resource_uri = descriptor["resourceUri"]
+    cache_key = (server_name, resource_uri)
+    with _mcp_ui_resources_lock:
+        html = _mcp_ui_resource_html_cache.get(cache_key)
+    if html is None:
+        try:
+            res = await server.session.read_resource(resource_uri)
+        except Exception as exc:  # noqa: BLE001 -- missing resource just means no card
+            logger.debug(
+                "MCP '%s': resources/read for referenced UI %s failed: %s",
+                server_name, resource_uri, exc,
+            )
+            return None
+        html = ""
+        mime = None
+        for block in (getattr(res, "contents", None) or []):
+            text = getattr(block, "text", None)
+            if text:
+                html = text
+                mime = getattr(block, "mimeType", None)
+                break
+        if not html:
+            return None
+        with _mcp_ui_resources_lock:
+            _mcp_ui_resource_html_cache[cache_key] = html
+        descriptor = {**descriptor, "mimeType": mime}
+    return {
+        "server": server_name,
+        "uri": resource_uri,
+        "mimeType": descriptor.get("mimeType") or _MCP_UI_MIME,
+        "html": html,
+        "csp": descriptor.get("csp"),
+    }
+
+
+def _serialize_call_tool_result(result) -> dict:
+    """Serialize a CallToolResult into the plain dict an MCP Apps iframe expects.
+
+    The bridged UI reads ``.content`` / ``.structuredContent`` / ``.isError``
+    (and may inspect ``_meta``), so mirror the wire shape rather than Hermes'
+    model-facing summary.
+    """
+    out: dict = {"isError": bool(getattr(result, "isError", False))}
+    content = []
+    for block in (getattr(result, "content", None) or []):
+        try:
+            content.append(block.model_dump(exclude_none=True, by_alias=True))
+        except Exception:
+            if hasattr(block, "text"):
+                content.append({"type": "text", "text": block.text})
+    out["content"] = content
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        out["structuredContent"] = structured
+    meta = getattr(result, "meta", None)
+    if meta:
+        out["_meta"] = meta
+    return out
+
+
+def call_mcp_app_request(
+    server_name: str,
+    method: str,
+    params: "dict | None" = None,
+    timeout: float = 60.0,
+) -> dict:
+    """Proxy an MCP Apps iframe JSON-RPC request to a connected server session.
+
+    The desktop renderer relays the sandboxed card's ``{jsonrpc, id, method,
+    params}`` frames here (via the gateway ``mcp.app.request`` method). We run
+    the request against the already-initialized session on the MCP loop and
+    return a JSON-serializable dict. On failure a ``{"error": {...}}`` dict is
+    returned so the caller can build a JSON-RPC error for the iframe.
+    """
+    params = params or {}
+    with _lock:
+        server = _servers.get(server_name)
+    if not server or not server.session:
+        return {"error": {"code": -32000,
+                          "message": f"MCP server '{server_name}' is not connected"}}
+
+    async def _do():
+        session = server.session
+        if method == "tools/call":
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            async with server._rpc_lock:
+                result = await session.call_tool(name, arguments=arguments)
+            return _serialize_call_tool_result(result)
+        if method == "resources/read":
+            uri = params.get("uri")
+            async with server._rpc_lock:
+                res = await session.read_resource(uri)
+            contents = []
+            for c in (getattr(res, "contents", None) or []):
+                try:
+                    contents.append(c.model_dump(
+                        exclude_none=True, by_alias=True))
+                except Exception:
+                    pass
+            return {"contents": contents}
+        if method in ("initialize", "notifications/initialized", "ping"):
+            # The card runs a mini MCP handshake through the bridge, but the
+            # real session is already initialized -- acknowledge as a no-op.
+            return {}
+        return {"error": {"code": -32601,
+                          "message": f"unsupported bridged method: {method}"}}
+
+    try:
+        return _run_on_mcp_loop(_do, timeout=timeout)
+    except InterruptedError:
+        return {"error": {"code": -32000, "message": "interrupted"}}
+    except Exception as exc:
+        return {"error": {"code": -32000,
+                          "message": _sanitize_error(
+                              f"{type(exc).__name__}: {_exc_str(exc)}")}}
+
+
+# ---------------------------------------------------------------------------
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
 
@@ -2734,6 +3128,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Correlate any MCP Apps UI card this call produces with the
+        # tool_call_id the gateway later reports in ``tool.complete`` (read
+        # from the observability contextvar bound by handle_function_call).
+        try:
+            from tools.approval import get_current_tool_call_id
+            _ui_tool_call_id = get_current_tool_call_id()
+        except Exception:
+            _ui_tool_call_id = ""
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -2809,6 +3211,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # is machine-oriented (JSON metadata).  For an AI agent, content
             # is the primary payload; structuredContent supplements it.
             structured = getattr(result, "structuredContent", None)
+
+            # MCP Apps: if the tool call has an interactive UI card, stash it
+            # out-of-band (keyed by tool_call_id) for the gateway to deliver to
+            # UI-capable hosts. Two forms: inline (result ``_meta.ui.resource``)
+            # and referenced (tool-def ``_meta.ui.resourceUri`` -> resources/read).
+            # The big HTML never enters the model-facing result below, preserving
+            # context + prompt cache.
+            ui_payload = _extract_mcp_ui(result, server_name)
+            if not ui_payload and not getattr(result, "isError", False):
+                async with server._rpc_lock:
+                    ui_payload = await _resolve_referenced_mcp_ui(
+                        server, server_name, tool_name
+                    )
+            if ui_payload:
+                _stash_mcp_ui_payload(_ui_tool_call_id, ui_payload)
+
             if structured is not None:
                 if text_result:
                     return json.dumps({
@@ -3215,7 +3633,8 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
             if "properties" not in repaired or not isinstance(
                 repaired.get("properties"), dict
             ):
-                repaired["properties"] = {} if "properties" not in repaired else repaired["properties"]
+                repaired["properties"] = {
+                } if "properties" not in repaired else repaired["properties"]
                 if not isinstance(repaired.get("properties"), dict):
                     repaired["properties"] = {}
 
@@ -3223,7 +3642,8 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
             required = repaired.get("required")
             if isinstance(required, list):
                 props = repaired.get("properties") or {}
-                valid = [r for r in required if isinstance(r, str) and r in props]
+                valid = [r for r in required if isinstance(
+                    r, str) and r in props]
                 if len(valid) != len(required):
                     if valid:
                         repaired["required"] = valid
@@ -3358,7 +3778,8 @@ def _normalize_name_filter(value: Any, label: str) -> set[str]:
         return {value}
     if isinstance(value, (list, tuple, set)):
         return {str(item) for item in value}
-    logger.warning("MCP config %s must be a string or list of strings; ignoring %r", label, value)
+    logger.warning(
+        "MCP config %s must be a string or list of strings; ignoring %r", label, value)
     return set()
 
 
@@ -3374,7 +3795,8 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
             return True
         if lowered in {"false", "0", "no", "off"}:
             return False
-    logger.warning("MCP config expected a boolean-ish value, got %r; using default=%s", value, default)
+    logger.warning(
+        "MCP config expected a boolean-ish value, got %r; using default=%s", value, default)
     return default
 
 
@@ -3419,7 +3841,8 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
     """Select utility schemas based on config and server capabilities."""
     tools_filter = config.get("tools") or {}
-    resources_enabled = _parse_boolish(tools_filter.get("resources"), default=True)
+    resources_enabled = _parse_boolish(
+        tools_filter.get("resources"), default=True)
     prompts_enabled = _parse_boolish(tools_filter.get("prompts"), default=True)
 
     # ``initialize_result.capabilities`` is the source of truth: its sub-objects
@@ -3436,10 +3859,12 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
     for entry in _build_utility_schemas(server_name):
         handler_key = entry["handler_key"]
         if handler_key in {"list_resources", "read_resource"} and not resources_enabled:
-            logger.debug("MCP server '%s': skipping utility '%s' (resources disabled)", server_name, handler_key)
+            logger.debug(
+                "MCP server '%s': skipping utility '%s' (resources disabled)", server_name, handler_key)
             continue
         if handler_key in {"list_prompts", "get_prompt"} and not prompts_enabled:
-            logger.debug("MCP server '%s': skipping utility '%s' (prompts disabled)", server_name, handler_key)
+            logger.debug(
+                "MCP server '%s': skipping utility '%s' (prompts disabled)", server_name, handler_key)
             continue
 
         # Preferred gate: check the server's advertised capabilities. Skip
@@ -3510,8 +3935,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     #   include takes precedence over exclude
     #   Neither set → register all tools (backward-compatible default)
     tools_filter = config.get("tools") or {}
-    include_set = _normalize_name_filter(tools_filter.get("include"), f"mcp_servers.{name}.tools.include")
-    exclude_set = _normalize_name_filter(tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude")
+    include_set = _normalize_name_filter(tools_filter.get(
+        "include"), f"mcp_servers.{name}.tools.include")
+    exclude_set = _normalize_name_filter(tools_filter.get(
+        "exclude"), f"mcp_servers.{name}.tools.exclude")
 
     def _should_register(tool_name: str) -> bool:
         if include_set:
@@ -3522,7 +3949,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
-            logger.debug("MCP server '%s': skipping tool '%s' (filtered by config)", name, mcp_tool.name)
+            logger.debug(
+                "MCP server '%s': skipping tool '%s' (filtered by config)", name, mcp_tool.name)
             continue
 
         # Scan tool description for prompt injection patterns
@@ -3545,7 +3973,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             name=tool_name_prefixed,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, mcp_tool.name, server.tool_timeout),
+            handler=_make_tool_handler(
+                name, mcp_tool.name, server.tool_timeout),
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
@@ -3640,7 +4069,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         List of all currently registered MCP tool names.
     """
     if not _MCP_AVAILABLE:
-        logger.debug("MCP SDK not available -- skipping explicit MCP registration")
+        logger.debug(
+            "MCP SDK not available -- skipping explicit MCP registration")
         return []
 
     if not servers:
@@ -3661,9 +4091,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
-                _parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
+                _parallel_safe_servers.add(
+                    sanitize_mcp_name_component(srv_name))
             else:
-                _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
+                _parallel_safe_servers.discard(
+                    sanitize_mcp_name_component(srv_name))
 
     if not new_servers:
         return _existing_tool_names()
@@ -3766,7 +4198,8 @@ def discover_mcp_tools() -> List[str]:
         return tool_names
 
     with _lock:
-        connected_server_names = [name for name in new_server_names if name in _servers]
+        connected_server_names = [
+            name for name in new_server_names if name in _servers]
         new_tool_count = sum(
             len(getattr(_servers[name], "_registered_tool_names", []))
             for name in connected_server_names
@@ -3915,13 +4348,15 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
         coros = []
         for name, cfg in enabled.items():
             ct = cfg.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-            coros.append(asyncio.wait_for(_connect_server(name, cfg), timeout=ct))
+            coros.append(asyncio.wait_for(
+                _connect_server(name, cfg), timeout=ct))
 
         outcomes = await asyncio.gather(*coros, return_exceptions=True)
 
         for name, outcome in zip(names, outcomes):
             if isinstance(outcome, Exception):
-                logger.debug("Probe: failed to connect to '%s': %s", name, outcome)
+                logger.debug(
+                    "Probe: failed to connect to '%s': %s", name, outcome)
                 continue
             probed_servers.append(outcome)
             tools = []
@@ -4027,7 +4462,8 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
             _stdio_pids.clear()
         # Snapshot pgids for the pids we're about to kill, then drop the
         # entries so a future spawn can't collide with stale state.
-        pgids: Dict[int, int] = {pid: _stdio_pgids[pid] for pid in pids if pid in _stdio_pgids}
+        pgids: Dict[int, int] = {pid: _stdio_pgids[pid]
+                                 for pid in pids if pid in _stdio_pgids}
         for pid in pgids:
             _stdio_pgids.pop(pid, None)
 
@@ -4059,7 +4495,8 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
     # Phase 1: SIGTERM (graceful)
     for pid, server_name in pids.items():
         _send_signal(pid, _signal.SIGTERM, server_name)
-        logger.debug("Sent SIGTERM to orphaned MCP process %d (%s)", pid, server_name)
+        logger.debug(
+            "Sent SIGTERM to orphaned MCP process %d (%s)", pid, server_name)
 
     # Phase 2: Wait for graceful exit
     time.sleep(2)
