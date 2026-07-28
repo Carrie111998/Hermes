@@ -1545,6 +1545,85 @@ class TestCapabilityGrants:
         ) is False
 
 
+# ---------------------------------------------------------------------------
+# 11. Capability enforcement tests
+# ---------------------------------------------------------------------------
+
+
+class TestCapabilityEnforcement:
+    """enforce_capability: opt-in gating with fail-open on no grants."""
+
+    def test_no_grants_passes_open(self, pg):
+        """When no grants exist for the tenant, enforcement is a no-op."""
+        from hermes_cli.postgres_authority import enforce_capability, DEFAULT_TENANT_ID
+
+        enforce_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-ungated",
+            resource="task", action="claim", scope="*",
+        )
+
+    def test_with_grants_denies_missing_capability(self, pg):
+        """Once any grant exists, unlisted principals are denied."""
+        from hermes_cli.postgres_authority import (
+            grant_capability, enforce_capability, DEFAULT_TENANT_ID,
+        )
+        import pytest
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-privileged",
+            resource="task", action="claim", scope="*",
+        )
+
+        with pytest.raises(PermissionError, match="lacks capability"):
+            enforce_capability(
+                pg, tenant_id=DEFAULT_TENANT_ID,
+                principal_type="worker", principal_id="w-unprivileged",
+                resource="task", action="claim", scope="*",
+            )
+
+    def test_with_grants_allows_granted_principal(self, pg):
+        from hermes_cli.postgres_authority import (
+            grant_capability, enforce_capability, DEFAULT_TENANT_ID,
+        )
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-allowed",
+            resource="task", action="claim", scope="workspace=prod",
+        )
+
+        enforce_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-allowed",
+            resource="task", action="claim", scope="workspace=prod",
+        )
+
+    def test_enforcement_tenant_isolation(self, pg):
+        """Grants in tenant A do not gate enforcement in tenant B."""
+        from hermes_cli.postgres_authority import (
+            grant_capability, enforce_capability, create_tenant, DEFAULT_TENANT_ID,
+        )
+        from uuid import UUID
+
+        tenant_b = UUID("eb0eb0eb-eb0e-eb0e-eb0e-eb0eb0eb0eb0")
+        create_tenant(pg, tenant_id=tenant_b, slug="enforce-test")
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-a",
+            resource="task", action="claim", scope="*",
+        )
+
+        # Tenant B has no grants → passes open
+        enforce_capability(
+            pg, tenant_id=tenant_b,
+            principal_type="worker", principal_id="w-a",
+            resource="task", action="claim", scope="*",
+        )
+
+
 # Note: Authority-store capability contract tests (postgres backend recognition,
 # SQLite multi-host rejection, unknown backend fail-closed) live in:
 #   tests/hermes_cli/test_authority_store.py

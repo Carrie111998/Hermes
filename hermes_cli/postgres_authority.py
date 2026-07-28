@@ -1521,6 +1521,57 @@ def list_capabilities(
 
 
 # ---------------------------------------------------------------------------
+# Capability enforcement
+# ---------------------------------------------------------------------------
+
+
+def enforce_capability(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+    principal_type: str,
+    principal_id: str,
+    resource: str,
+    action: str,
+    scope: str = "*",
+) -> None:
+    """Enforce that a principal holds a required capability. Raises on denial.
+
+    Fails open when no grants exist for the tenant (opt-in enforcement).
+    Once any grant exists for the tenant, all principals must hold explicit
+    grants for gated operations.
+
+    Raises:
+        PermissionError: Principal lacks the required capability.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM capability_grants WHERE tenant_id = %s "
+            "AND revoked_at IS NULL LIMIT 1)",
+            (str(tenant_id),),
+        )
+        row = cur.fetchone()
+        has_any_grants = row["exists"] if row else False
+
+    if not has_any_grants:
+        return
+
+    if not check_capability(
+        conn,
+        tenant_id=tenant_id,
+        principal_type=principal_type,
+        principal_id=principal_id,
+        resource=resource,
+        action=action,
+        scope=scope,
+    ):
+        raise PermissionError(
+            f"{principal_type}:{principal_id} lacks capability "
+            f"{resource}:{action}:{scope} in tenant {tenant_id}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Environment / backend detection
 # ---------------------------------------------------------------------------
 
@@ -1581,6 +1632,7 @@ __all__ = [
     "revoke_capability",
     "check_capability",
     "list_capabilities",
+    "enforce_capability",
     "get_authority_backend",
     "get_authority_connection",
     "DEFAULT_TENANT_ID",
