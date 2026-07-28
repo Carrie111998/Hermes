@@ -5342,14 +5342,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     _backend = "local"
                 if str(_backend).lower() == "local":
-                    logger.warning(
+                    _log_network_local_backend = logger.info if self._api_key else logger.warning
+                    _auth_note = (
+                        "This endpoint requires API-key authentication, but agent work "
+                        if self._api_key
+                        else "This endpoint has no API key configured and agent work "
+                    )
+                    _log_network_local_backend(
                         "[%s] API server is network-accessible (%s) AND the "
-                        "terminal backend is 'local' (unsandboxed). Agent work "
+                        "terminal backend is 'local' (unsandboxed). %s"
                         "dispatched through this endpoint runs as the host user "
                         "with full terminal/file access. Strongly consider a "
                         "sandboxed backend (terminal.backend: docker) and "
                         "firewalling this port to trusted networks only.",
-                        self.name, self._host,
+                        self.name, self._host, _auth_note,
                     )
 
             self._runner = web.AppRunner(self._app)
