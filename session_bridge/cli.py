@@ -109,11 +109,13 @@ from .store import (
     SIDEBAR_PRECREATE_RESOLUTION_CODE,
     SIDEBAR_RETRYABLE_ERRORS,
     SIDEBAR_TERMINAL_RESOLUTION_CODE,
+    SIDEBAR_UNBOUND_RESOLUTION_CODE,
     SessionBridgeStore,
     SidebarSource,
     redact_codex_thread_id,
     sidebar_precreate_terminal_evidence_digest,
     sidebar_terminal_evidence_digest,
+    sidebar_unbound_terminal_evidence_digest,
 )
 
 
@@ -622,6 +624,12 @@ class _Backend(Protocol):
         expected_error_code: str,
     ) -> Mapping[str, Any]: ...
     def sidebar_acknowledge_precreate_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]: ...
+    def sidebar_acknowledge_unbound_unrecoverable(
         self,
         *,
         job_id: str,
@@ -1383,7 +1391,11 @@ class ProductionBackend:
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", codex_thread_id)
             is None
             or expected_error_code
-            not in {"native_task_not_indexed", "codex_thread_conflict"}
+            not in {
+                "native_task_not_indexed",
+                "codex_thread_conflict",
+                "native_create_ambiguous",
+            }
             or confirmation != "PRESERVE_EXACT_BOUND_TASK"
         ):
             raise RolloutGateBlocked("sidebar_bound_retry_snapshot_mismatch")
@@ -1705,6 +1717,158 @@ class ProductionBackend:
             ),
             "error_code": "native_create_ambiguous",
             "resolution_code": SIDEBAR_PRECREATE_RESOLUTION_CODE,
+        }
+
+    def sidebar_acknowledge_unbound_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]:
+        """Prove one post-dispatch no-ID create has no native task, then audit it."""
+
+        if (
+            re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
+            or expected_error_code != "native_create_ambiguous"
+        ):
+            raise RolloutGateBlocked("sidebar_unbound_snapshot_mismatch")
+        try:
+            marker_secret = resolve_marker_key()
+            if type(marker_secret) is not bytes or not marker_secret:
+                raise ValueError("marker key is unavailable")
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
+            raise ConfigurationFailure("sidebar_unbound_probe_unavailable") from None
+
+        store = self._require_store()
+        try:
+            job = store.get_sidebar_job_by_id(job_id)
+            if job is None:
+                raise ValueError("missing sidebar job")
+            source_session_id = job.get("source_session_id")
+            if not isinstance(source_session_id, str):
+                raise ValueError("missing sidebar source identity")
+            expected_idempotency_key = sidebar_idempotency_key(source_session_id)
+            expected_bridge_id = sidebar_bridge_id(source_session_id)
+            expected_job_id = (
+                "sidebar-job:"
+                + hashlib.sha256(expected_idempotency_key.encode("utf-8")).hexdigest()
+            )
+            attempts = job.get("attempts")
+            next_attempt_at = job.get("next_attempt_at")
+            updated_at = job.get("updated_at")
+            if (
+                job.get("id") != job_id
+                or job_id != expected_job_id
+                or job.get("idempotency_key") != expected_idempotency_key
+                or job.get("bridge_id") != expected_bridge_id
+                or job.get("codex_thread_id") is not None
+                or job.get("state") != SidebarJobState.FAILED.value
+                or job.get("error_code") != expected_error_code
+                or type(attempts) is not int
+                or attempts <= 0
+                or not _is_finite_number(next_attempt_at)
+                or not _is_finite_number(updated_at)
+                or not _is_finite_number(job.get("eligible_at"))
+                or not _is_finite_number(job.get("created_at"))
+                or job.get("lease_digest") is not None
+                or job.get("lease_expires_at") is not None
+                or job.get("completion_digest") is not None
+                or job.get("visible_at") is not None
+            ):
+                raise ValueError("sidebar unbound snapshot mismatch")
+
+            candidate = store.get_sidebar_candidate_for_delivery(source_session_id)
+            if (
+                not isinstance(candidate, SidebarCandidate)
+                or candidate.source_session_id != source_session_id
+                or candidate.bridge_id != expected_bridge_id
+                or candidate.eligible_at != float(job["eligible_at"])
+            ):
+                raise ValueError("sidebar unbound candidate mismatch")
+            expected_marker = BridgeMarkerPayload(
+                bridge_id=expected_bridge_id,
+                source_session_id=source_session_id,
+                target_provider=Provider.CODEX,
+                policy_generation=1,
+            )
+            marker = encode_bridge_marker(expected_marker, marker_secret)
+            expected_recovery_key = sidebar_create_recovery_key(
+                marker,
+                marker_secret,
+            )
+            reservation = store.get_sidebar_create_reservation(source_session_id)
+            if (
+                reservation is None
+                or set(reservation)
+                != {
+                    "version",
+                    "job_id",
+                    "source_session_id",
+                    "bridge_id",
+                    "recovery_key",
+                    "reserved_at",
+                }
+                or reservation.get("version") != 1
+                or reservation.get("job_id") != job_id
+                or reservation.get("source_session_id") != source_session_id
+                or reservation.get("bridge_id") != expected_bridge_id
+                or reservation.get("recovery_key") != expected_recovery_key
+                or not _is_finite_number(reservation.get("reserved_at"))
+            ):
+                raise ValueError("sidebar unbound reservation mismatch")
+        except (KeyError, TypeError, ValueError):
+            raise RolloutGateBlocked("sidebar_unbound_snapshot_mismatch") from None
+
+        verifier = self._require_sidebar_terminal_verifier(
+            marker_secret=marker_secret,
+        )
+        try:
+            marker_match = verifier.find_by_marker_including_archived(expected_marker)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ProviderDegraded("sidebar_unbound_probe_failed") from None
+        if marker_match is not None:
+            raise RolloutGateBlocked("native_thread_materialized")
+        try:
+            recovery_match = verifier.find_by_recovery_key(
+                reservation["recovery_key"],
+                expected_cwd=candidate.cwd,
+                deadline=time.monotonic() + 240.0,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ProviderDegraded("sidebar_unbound_probe_failed") from None
+        if recovery_match is not None:
+            raise RolloutGateBlocked("native_thread_materialized")
+
+        evidence_digest = sidebar_unbound_terminal_evidence_digest(
+            job=job,
+            reservation=reservation,
+            candidate=candidate,
+        )
+        try:
+            result = store.acknowledge_sidebar_unbound_resolution(
+                job_id=job_id,
+                expected_error_code=expected_error_code,
+                expected_attempts=job["attempts"],
+                expected_next_attempt_at=job["next_attempt_at"],
+                expected_updated_at=job["updated_at"],
+                evidence_digest=evidence_digest,
+                marker_secret=marker_secret,
+                now=time.time(),
+            )
+        except (TypeError, ValueError):
+            raise RolloutGateBlocked("sidebar_unbound_snapshot_mismatch") from None
+        return {
+            "status": (
+                "acknowledged"
+                if result.get("created") is True
+                else "already_acknowledged"
+            ),
+            "error_code": "native_create_ambiguous",
+            "resolution_code": SIDEBAR_UNBOUND_RESOLUTION_CODE,
         }
 
     def claude_visibility_status(self) -> Mapping[str, Any]:
@@ -3210,7 +3374,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sidebar_retry_bound.add_argument(
         "--expected-error-code",
-        choices=("native_task_not_indexed", "codex_thread_conflict"),
+        choices=(
+            "native_task_not_indexed",
+            "codex_thread_conflict",
+            "native_create_ambiguous",
+        ),
         required=True,
     )
     sidebar_retry_bound.add_argument(
@@ -3257,6 +3425,24 @@ def build_parser() -> argparse.ArgumentParser:
     sidebar_precreate_terminal.add_argument(
         "--confirm",
         choices=("precutover-create-unrecoverable",),
+        required=True,
+    )
+
+    sidebar_unbound_terminal = commands.add_parser(
+        "sidebar-acknowledge-unbound-unrecoverable",
+        help="acknowledge one audited post-dispatch create with no native task",
+    )
+    sidebar_unbound_terminal.add_argument(
+        "--job-id", type=_sidebar_terminal_job_id, required=True
+    )
+    sidebar_unbound_terminal.add_argument(
+        "--expected-error-code",
+        choices=("native_create_ambiguous",),
+        required=True,
+    )
+    sidebar_unbound_terminal.add_argument(
+        "--confirm",
+        choices=("unbound-create-unrecoverable",),
         required=True,
     )
 
@@ -3498,6 +3684,15 @@ def main(
         if args.command == "sidebar-acknowledge-precreate-unrecoverable":
             payload = _public_sidebar_terminal_resolution_result(
                 backend.sidebar_acknowledge_precreate_unrecoverable(
+                    job_id=args.job_id,
+                    expected_error_code=args.expected_error_code,
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "sidebar-acknowledge-unbound-unrecoverable":
+            payload = _public_sidebar_terminal_resolution_result(
+                backend.sidebar_acknowledge_unbound_unrecoverable(
                     job_id=args.job_id,
                     expected_error_code=args.expected_error_code,
                 )
@@ -4098,6 +4293,7 @@ def _public_sidebar_status(
     known_resolution_codes = {
         SIDEBAR_TERMINAL_RESOLUTION_CODE,
         SIDEBAR_PRECREATE_RESOLUTION_CODE,
+        SIDEBAR_UNBOUND_RESOLUTION_CODE,
     }
     if any(code not in known_resolution_codes for code in resolution_codes_source):
         raise ConfigurationFailure("invalid_sidebar_status")
@@ -4110,13 +4306,17 @@ def _public_sidebar_status(
     precreate_code_count = _status_count(
         resolution_codes_source.get(SIDEBAR_PRECREATE_RESOLUTION_CODE, 0)
     )
+    unbound_code_count = _status_count(
+        resolution_codes_source.get(SIDEBAR_UNBOUND_RESOLUTION_CODE, 0)
+    )
     if (
         blocking_failed_count + terminally_resolved_failed_count
         != state_counts[SidebarJobState.FAILED.value]
         or terminal_total != terminal_effective + terminal_ineffective
         or terminal_effective != terminally_resolved_failed_count
         or terminal_ineffective != ineffective_terminal_resolution_count
-        or terminal_code_count + precreate_code_count != terminal_effective
+        or terminal_code_count + precreate_code_count + unbound_code_count
+        != terminal_effective
     ):
         raise ConfigurationFailure("invalid_sidebar_status")
     raw_execution_blockers = raw.get("execution_blockers")
@@ -4262,6 +4462,7 @@ def _public_sidebar_status(
             "by_resolution_code": {
                 SIDEBAR_TERMINAL_RESOLUTION_CODE: terminal_code_count,
                 SIDEBAR_PRECREATE_RESOLUTION_CODE: precreate_code_count,
+                SIDEBAR_UNBOUND_RESOLUTION_CODE: unbound_code_count,
             },
         },
         "execution_blockers": execution_blockers,
@@ -4343,7 +4544,11 @@ def _public_sidebar_bound_retry_result(raw: Mapping[str, Any]) -> dict[str, Any]
         status != "requeued"
         or state != SidebarJobState.RETRY.value
         or raw.get("error_code")
-        not in {"native_task_not_indexed", "codex_thread_conflict"}
+        not in {
+            "native_task_not_indexed",
+            "codex_thread_conflict",
+            "native_create_ambiguous",
+        }
         or not isinstance(job_id, str)
         or re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
         or not isinstance(thread_id, str)
@@ -4370,6 +4575,7 @@ def _public_sidebar_terminal_resolution_result(
     if resolution_code not in {
         SIDEBAR_TERMINAL_RESOLUTION_CODE,
         SIDEBAR_PRECREATE_RESOLUTION_CODE,
+        SIDEBAR_UNBOUND_RESOLUTION_CODE,
     }:
         raise ProviderDegraded("invalid_sidebar_terminal_resolution_result")
     return {

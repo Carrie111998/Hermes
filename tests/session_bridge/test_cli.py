@@ -70,6 +70,7 @@ from session_bridge.sidebar import (
     SidebarCandidate,
     build_registration_prompt,
     sidebar_bridge_id,
+    sidebar_create_recovery_key,
 )
 from session_bridge.sidebar_executor import (
     CodexAppServerSidebarDelivery,
@@ -144,6 +145,13 @@ class FakeBackend:
             "status": "acknowledged",
             "error_code": "native_create_ambiguous",
             "resolution_code": "precutover_create_unrecoverable",
+        }
+    )
+    sidebar_unbound_terminal_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_create_unrecoverable",
         }
     )
     sidebar_bound_retry_payload: dict[str, Any] = field(
@@ -334,6 +342,19 @@ class FakeBackend:
             expected_error_code,
         ))
         return dict(self.sidebar_precreate_terminal_payload)
+
+    def sidebar_acknowledge_unbound_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_acknowledge_unbound_unrecoverable",
+            job_id,
+            expected_error_code,
+        ))
+        return dict(self.sidebar_unbound_terminal_payload)
 
     def sidebar_retry_bound(
         self,
@@ -1536,6 +1557,54 @@ def test_sidebar_precreate_acknowledgement_parser_rejects_incomplete_authority(
         main(argv)
 
 
+def test_sidebar_unbound_acknowledgement_requires_exact_operator_authority_and_sanitizes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "c" * 64
+    backend = FakeBackend(
+        sidebar_unbound_terminal_payload={
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_create_unrecoverable",
+            "job_id": job_id,
+            "recovery_key": "hermes-session-bridge-create-v1:private",
+            "evidence_digest": "e" * 64,
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-acknowledge-unbound-unrecoverable",
+                "--job-id",
+                job_id,
+                "--expected-error-code",
+                "native_create_ambiguous",
+                "--confirm",
+                "unbound-create-unrecoverable",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert backend.calls == [
+        (
+            "sidebar_acknowledge_unbound_unrecoverable",
+            job_id,
+            "native_create_ambiguous",
+        ),
+        ("close",),
+    ]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "status": "acknowledged",
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "native_create_unrecoverable",
+    }
+    for private in (job_id, "hermes-session-bridge-create-v1", "e" * 64, "private"):
+        assert private not in rendered
+
+
 class _TerminalProbeClient:
     def __init__(self, *, scenario: str, thread_id: str) -> None:
         self.scenario = scenario
@@ -1792,6 +1861,39 @@ def test_production_sidebar_retry_bound_accepts_exact_project_drift_conflict(
         backend.close()
 
 
+def test_production_sidebar_retry_bound_accepts_exact_ambiguous_create(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation = _production_bound_retry_backend(tmp_path)
+    source_session_id = failed["source_session_id"]
+    thread_id = failed["codex_thread_id"]
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("native_create_ambiguous", failed["id"]),
+        )
+    )
+    try:
+        result = backend.sidebar_retry_bound(
+            job_id=failed["id"],
+            source_session_id=source_session_id,
+            codex_thread_id=thread_id,
+            expected_error_code="native_create_ambiguous",
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+        )
+
+        assert result == {
+            "status": "requeued",
+            "job_id": failed["id"],
+            "codex_thread_id": thread_id,
+            "error_code": "native_create_ambiguous",
+            "state": SidebarJobState.RETRY.value,
+        }
+        assert store.get_sidebar_create_reservation(source_session_id) == reservation
+    finally:
+        backend.close()
+
+
 def test_production_terminal_acknowledgement_derives_exact_evidence_and_replays(
     tmp_path: Path,
 ) -> None:
@@ -2023,6 +2125,126 @@ def _production_precreate_resolution_backend(
     backend._store = store
     backend._catalog = UnifiedCatalog(db, store)
     return backend, store, failed, reservation, cutover, candidate
+
+
+def _production_unbound_resolution_backend(
+    tmp_path: Path,
+    *,
+    marker_secret: bytes,
+) -> tuple[
+    ProductionBackend,
+    SessionBridgeStore,
+    dict[str, Any],
+    dict[str, Any],
+    SidebarCandidate,
+]:
+    db = SessionDB(tmp_path / "unbound-terminal.db")
+    tokens = iter(("unbound-terminal-token-1", "unbound-terminal-token-2"))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    source_session_id = "hermes:unbound-terminal"
+    db.ensure_session(source_session_id, source="cli")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Hermes] unbound terminal evidence",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=candidate.bridge_id,
+            source_session_id=candidate.source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_secret,
+    )
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=sidebar_create_recovery_key(marker, marker_secret),
+        now=105.0,
+    )
+    retry = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="bridge_temporarily_unavailable",
+        now=110.0,
+    )
+    lease = store.claim_sidebar_jobs(now=retry["next_attempt_at"], limit=1)[0]
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=retry["next_attempt_at"] + 1.0,
+    )
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    return backend, store, failed, reservation, candidate
+
+
+def test_production_unbound_acknowledgement_probes_exact_identities_and_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"unbound-cli-marker-secret"
+    backend, store, failed, reservation, candidate = (
+        _production_unbound_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    before_job = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        first = backend.sidebar_acknowledge_unbound_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+        )
+        replay = backend.sidebar_acknowledge_unbound_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+        )
+
+        assert first == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_create_unrecoverable",
+        }
+        assert replay == {**first, "status": "already_acknowledged"}
+        assert len(verifier.all_marker_calls) == 2
+        assert [
+            (recovery_key, cwd)
+            for recovery_key, cwd, _deadline in verifier.recovery_calls
+        ] == [(reservation["recovery_key"], candidate.cwd)] * 2
+        assert verifier.create_calls == []
+        assert (
+            store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
+        )
+        [audit] = store.db._conn.execute(
+            "SELECT * FROM session_sidebar_unbound_resolutions"
+        ).fetchall()
+        assert audit["resolution_code"] == "native_create_unrecoverable"
+        assert len(audit["evidence_digest"]) == 64
+    finally:
+        backend.close()
 
 
 def test_production_precreate_acknowledgement_probes_exact_identities_and_replays(
@@ -2871,6 +3093,7 @@ def test_sidebar_status_preserves_raw_failures_but_waives_exact_terminal_resolut
         "by_resolution_code": {
             "native_thread_unrecoverable": 1,
             "precutover_create_unrecoverable": 0,
+            "native_create_unrecoverable": 0,
         },
     }
     assert status["execution_blockers"] == []
@@ -2910,6 +3133,45 @@ def test_sidebar_status_accepts_and_preserves_precreate_terminal_resolution(
     assert status["terminal_resolutions"]["by_resolution_code"] == {
         "native_thread_unrecoverable": 0,
         "precutover_create_unrecoverable": 1,
+        "native_create_unrecoverable": 0,
+    }
+
+def test_sidebar_status_accepts_and_preserves_unbound_terminal_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 1,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 1,
+            "effective": 1,
+            "ineffective": 0,
+            "by_resolution_code": {
+                "native_thread_unrecoverable": 0,
+                "precutover_create_unrecoverable": 0,
+                "native_create_unrecoverable": 1,
+            },
+        },
+        "execution_blockers": [],
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is True
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 0,
+        "precutover_create_unrecoverable": 0,
+        "native_create_unrecoverable": 1,
     }
 
 

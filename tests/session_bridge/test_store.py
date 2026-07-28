@@ -59,6 +59,7 @@ from session_bridge.store import (
     SessionBridgeStore,
     sidebar_precreate_terminal_evidence_digest,
     sidebar_terminal_evidence_digest,
+    sidebar_unbound_terminal_evidence_digest,
 )
 from session_bridge.worktree import WorktreeSnapshot, capture_worktree_snapshot
 
@@ -459,6 +460,7 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "trg_session_sidebar_terminal_resolutions_no_update",
         "trg_session_sidebar_terminal_resolutions_no_delete",
         "trg_session_sidebar_terminal_resolutions_no_precreate_overlap",
+        "trg_session_sidebar_terminal_resolutions_no_unbound_overlap",
     }
     assert _rows(
         db,
@@ -499,6 +501,46 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "trg_session_sidebar_precreate_resolutions_no_replacement",
         "trg_session_sidebar_precreate_resolutions_no_update",
         "trg_session_sidebar_precreate_resolutions_no_delete",
+        "trg_session_sidebar_precreate_resolutions_no_unbound_overlap",
+    }
+    assert _rows(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("session_sidebar_unbound_resolutions",),
+    ) == [{"name": "session_sidebar_unbound_resolutions"}]
+    assert [
+        row["name"]
+        for row in _rows(
+            db, 'PRAGMA table_info("session_sidebar_unbound_resolutions")'
+        )
+    ] == [
+        "job_id",
+        "idempotency_key",
+        "source_session_id",
+        "bridge_id",
+        "failure_state",
+        "failure_code",
+        "failure_attempts",
+        "failure_next_attempt_at",
+        "failure_updated_at",
+        "reservation_reserved_at",
+        "resolution_code",
+        "evidence_kind",
+        "evidence_version",
+        "evidence_digest",
+        "resolved_at",
+    ]
+    assert {
+        row["name"]
+        for row in _rows(
+            db,
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'session_sidebar_unbound_resolutions'",
+        )
+    } == {
+        "trg_session_sidebar_unbound_resolutions_no_replacement",
+        "trg_session_sidebar_unbound_resolutions_no_update",
+        "trg_session_sidebar_unbound_resolutions_no_delete",
     }
 
 
@@ -539,6 +581,7 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
     try:
         connection.execute("DROP TABLE session_sidebar_terminal_resolutions")
         connection.execute("DROP TABLE session_sidebar_precreate_resolutions")
+        connection.execute("DROP TABLE session_sidebar_unbound_resolutions")
         connection.commit()
     finally:
         connection.close()
@@ -574,6 +617,7 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
                 "trg_session_sidebar_terminal_resolutions_no_update",
                 "trg_session_sidebar_terminal_resolutions_no_delete",
                 "trg_session_sidebar_terminal_resolutions_no_precreate_overlap",
+                "trg_session_sidebar_terminal_resolutions_no_unbound_overlap",
             }
             assert _rows(
                 reopened,
@@ -591,6 +635,24 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
                 "trg_session_sidebar_precreate_resolutions_no_replacement",
                 "trg_session_sidebar_precreate_resolutions_no_update",
                 "trg_session_sidebar_precreate_resolutions_no_delete",
+                "trg_session_sidebar_precreate_resolutions_no_unbound_overlap",
+            }
+            assert _rows(
+                reopened,
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("session_sidebar_unbound_resolutions",),
+            ) == [{"name": "session_sidebar_unbound_resolutions"}]
+            assert {
+                row["name"]
+                for row in _rows(
+                    reopened,
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND tbl_name = 'session_sidebar_unbound_resolutions'",
+                )
+            } == {
+                "trg_session_sidebar_unbound_resolutions_no_replacement",
+                "trg_session_sidebar_unbound_resolutions_no_update",
+                "trg_session_sidebar_unbound_resolutions_no_delete",
             }
         finally:
             reopened.close()
@@ -8709,6 +8771,107 @@ def test_precreate_cutover_resolution_is_append_only_and_unblocks_without_native
         )
 
 
+def test_unbound_create_resolution_is_append_only_after_exact_absence(db) -> None:
+    marker_secret = b"unbound-create-terminal-secret"
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "unbound-terminal-token-1",
+            "unbound-terminal-token-2",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="unbound-terminal")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=candidate.bridge_id,
+            source_session_id=candidate.source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_secret,
+    )
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=sidebar_create_recovery_key(marker, marker_secret),
+        now=105.0,
+    )
+    retry = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="bridge_temporarily_unavailable",
+        now=110.0,
+    )
+    lease = store.claim_sidebar_jobs(now=retry["next_attempt_at"], limit=1)[0]
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=retry["next_attempt_at"] + 1.0,
+    )
+    assert failed["state"] == SidebarJobState.FAILED.value
+    assert failed["attempts"] > 0
+    assert failed["codex_thread_id"] is None
+    evidence = sidebar_unbound_terminal_evidence_digest(
+        job=failed,
+        reservation=reservation,
+        candidate=candidate,
+    )
+
+    first = store.acknowledge_sidebar_unbound_resolution(
+        job_id=failed["id"],
+        expected_error_code="native_create_ambiguous",
+        expected_attempts=failed["attempts"],
+        expected_next_attempt_at=failed["next_attempt_at"],
+        expected_updated_at=failed["updated_at"],
+        evidence_digest=evidence,
+        marker_secret=marker_secret,
+        now=failed["updated_at"] + 1.0,
+    )
+    replay = store.acknowledge_sidebar_unbound_resolution(
+        job_id=failed["id"],
+        expected_error_code="native_create_ambiguous",
+        expected_attempts=failed["attempts"],
+        expected_next_attempt_at=failed["next_attempt_at"],
+        expected_updated_at=failed["updated_at"],
+        evidence_digest=evidence,
+        marker_secret=marker_secret,
+        now=failed["updated_at"] + 2.0,
+    )
+
+    assert first == {
+        "job_id": failed["id"],
+        "state": SidebarJobState.FAILED.value,
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "native_create_unrecoverable",
+        "created": True,
+    }
+    assert replay == {**first, "created": False}
+    [audit] = _rows(db, "SELECT * FROM session_sidebar_unbound_resolutions")
+    assert audit["failure_attempts"] == failed["attempts"]
+    assert audit["reservation_reserved_at"] == reservation["reserved_at"]
+    assert audit["evidence_digest"] == evidence
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM session_sidebar_unbound_resolutions WHERE job_id = ?",
+                (failed["id"],),
+            )
+        )
+    status = store.sidebar_delivery_status(now=failed["updated_at"] + 3.0)
+    assert status["blocking_failed_count"] == 0
+    assert status["terminally_resolved_failed_count"] == 1
+    assert status["terminal_resolutions"]["by_resolution_code"][
+        "native_create_unrecoverable"
+    ] == 1
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="native_create_ambiguous",
+            now=failed["updated_at"] + 4.0,
+        )
+
+
 def test_sidebar_terminal_resolution_is_append_only_and_unblocks_unrelated_work(
     db,
 ) -> None:
@@ -10302,6 +10465,40 @@ def test_bound_sidebar_operator_retry_accepts_exact_project_drift_conflict(db) -
     claimed = store.claim_sidebar_jobs(now=140.0, limit=1)[0]
     assert claimed["codex_thread_id"] == thread_id
     assert claimed["lease_token"] == "bound-conflict-recovered"
+
+
+def test_bound_sidebar_operator_retry_accepts_exact_ambiguous_create(db) -> None:
+    thread_id = "019f-bound-ambiguous-create"
+    store, candidate, failed, reservation = _failed_bound_not_indexed_sidebar(
+        db,
+        native_id="bound-ambiguous-create",
+        thread_id=thread_id,
+    )
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("native_create_ambiguous", failed["id"]),
+        )
+    )
+
+    retried = store.retry_failed_bound_sidebar_job(
+        job_id=failed["id"],
+        source_session_id=candidate.source_session_id,
+        codex_thread_id=thread_id,
+        expected_error_code="native_create_ambiguous",
+        confirmation="PRESERVE_EXACT_BOUND_TASK",
+        now=1_000.0,
+    )
+
+    assert retried["state"] == SidebarJobState.RETRY.value
+    assert retried["attempts"] == 0
+    assert retried["error_code"] is None
+    assert retried["codex_thread_id"] == thread_id
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) == (
+        reservation
+    )
+    claimed = store.claim_sidebar_jobs(now=1_000.0, limit=1)[0]
+    assert claimed["codex_thread_id"] == thread_id
 
 
 @pytest.mark.parametrize(
