@@ -7902,7 +7902,14 @@ def _update_via_zip(args):
         if _is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
-        _install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+        try:
+            _install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+        except subprocess.CalledProcessError:
+            if _is_termux_env(uv_env):
+                print("  ⚠ uv pip install failed on Termux — falling back to pip...")
+                _install_python_dependencies_with_optional_fallback(pip_cmd, env=uv_env)
+            else:
+                raise
     else:
         # Use sys.executable to explicitly call the venv's pip module,
         # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
@@ -12418,9 +12425,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if _is_termux_env(uv_env) and _is_android_python():
                 print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
                 _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
-            _install_python_dependencies_with_optional_fallback(
-                [uv_bin, "pip"], env=uv_env, group=install_group
-            )
+            try:
+                _install_python_dependencies_with_optional_fallback(
+                    [uv_bin, "pip"], env=uv_env, group=install_group
+                )
+            except subprocess.CalledProcessError:
+                if _is_termux_env(uv_env):
+                    print("  ⚠ uv pip install failed on Termux — falling back to pip...")
+                    _install_python_dependencies_with_optional_fallback(
+                        pip_cmd, env=uv_env, group=install_group
+                    )
+                else:
+                    raise
         else:
             # Use sys.executable to explicitly call the venv's pip module,
             # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
