@@ -461,7 +461,7 @@ class ToolCallGuardrailController:
             cap = caps.max_web_searches
             if cap and self._turn_web_search_count >= cap:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action="halt",
                     code="loop_web_search_cap",
                     message=(
                         f"Blocked web_search: this turn has already made {cap} "
@@ -473,7 +473,7 @@ class ToolCallGuardrailController:
                     count=self._turn_web_search_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
+                # Do not set _halt_decision: block != hard halt (fork policy).
                 return decision
             self._turn_web_search_count += 1
             return None
@@ -485,7 +485,7 @@ class ToolCallGuardrailController:
             spawn_count = _subagent_spawn_count(args)
             if self._turn_subagent_count >= cap:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action="halt",
                     code="loop_subagent_cap",
                     message=(
                         f"Blocked delegate_task: this turn has already spawned "
@@ -497,7 +497,7 @@ class ToolCallGuardrailController:
                     count=self._turn_subagent_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
+                # Do not set _halt_decision: block != hard halt (fork policy).
                 return decision
             self._turn_subagent_count += spawn_count
             return None
