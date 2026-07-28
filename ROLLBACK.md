@@ -1,9 +1,22 @@
 # Rollback procedure
 
+## Placeholders
+
+Paths below are deployment-specific and are written as placeholders. Substitute
+your own, or export them — `scripts/rehearse_rollback.py` reads the same three
+names from the environment and discovers sane defaults when they are unset.
+
+| Placeholder | Meaning | Default the script uses |
+|---|---|---|
+| `<HERMES_ROOT>` | the hermes install root | `~/AppData/Local/hermes` (env `HERMES_ROOT`) |
+| `<PROFILE>` | the profile name | the only profile present (env `HERMES_PROFILE`) |
+| `<BACKUP_ROOT>` | where safety points live | `~/backups` (env `HERMES_BACKUP` names one directly) |
+| `<HOME>`, `<USER>`, `<WORKTREES>` | your home dir, username, worktree parent | — |
+
 Every command below was exercised by `scripts/rehearse_rollback.py`, which
 restores each artifact into a scratch tree and verifies it. Last rehearsal:
 **20/20 checks passed** against safety point
-`C:/Users/Waxilliam/backups/hermes-audit-safety-20260727T070301Z`.
+`<BACKUP_ROOT>/hermes-audit-safety-20260727T070301Z`.
 
 Re-verify before relying on it:
 
@@ -16,7 +29,7 @@ restoring a database underneath a live writer is how you get the corruption you
 were rolling back to avoid.
 
 ```bash
-schtasks //End //TN "Hermes_Gateway_aletheon"
+schtasks //End //TN "Hermes_Gateway_<PROFILE>"
 ```
 
 `hermes gateway stop` reports success while leaving PID alive (Session 0,
@@ -24,7 +37,7 @@ schtasks //End //TN "Hermes_Gateway_aletheon"
 trusting the message:
 
 ```bash
-python -c "import json,datetime;h=json.load(open(r'C:/Users/Waxilliam/AppData/Local/hermes/profiles/aletheon/state/gateway.heartbeat'));print((datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(h['updated_at'])).total_seconds())"
+python -c "import json,datetime;h=json.load(open(r'<HERMES_ROOT>/profiles/<PROFILE>/state/gateway.heartbeat'));print((datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(h['updated_at'])).total_seconds())"
 ```
 
 Over ~90 s and climbing means it is really down (the beat interval is ~30 s).
@@ -37,8 +50,8 @@ Backups are **online-backup-API snapshots**, not file copies, so they are
 transactionally consistent and restore by plain copy.
 
 ```bash
-BK="C:/Users/Waxilliam/backups/hermes-audit-safety-20260727T070301Z/databases"
-P="C:/Users/Waxilliam/AppData/Local/hermes/profiles/aletheon"
+BK="<BACKUP_ROOT>/hermes-audit-safety-20260727T070301Z/databases"
+P="<HERMES_ROOT>/profiles/<PROFILE>"
 
 cp "$P/state.db" "$P/state.db.pre-rollback"      # keep what you are replacing
 cp "$BK/state.db" "$P/state.db"
@@ -59,7 +72,7 @@ replaced and SQLite will otherwise try to replay them over the restored one.
 Both bundles are complete packs — verified and cloned during rehearsal.
 
 ```bash
-BK="C:/Users/Waxilliam/backups/hermes-audit-safety-20260727T070301Z"
+BK="<BACKUP_ROOT>/hermes-audit-safety-20260727T070301Z"
 git bundle verify "$BK/inner-repo.bundle"
 
 # inspect without touching the live repo
@@ -74,11 +87,11 @@ Bundle HEADs at snapshot time: inner `8364110ab`, outer `1614b6e`.
 ## 3. Configuration
 
 ```bash
-BK="C:/Users/Waxilliam/backups/hermes-audit-safety-20260727T070301Z"
-tar -xzf "$BK/outer-uncommitted.tar.gz" -C /tmp profiles/aletheon/config.yaml
-python -c "import yaml;print(len(yaml.safe_load(open('/tmp/profiles/aletheon/config.yaml',encoding='utf-8'))))"
+BK="<BACKUP_ROOT>/hermes-audit-safety-20260727T070301Z"
+tar -xzf "$BK/outer-uncommitted.tar.gz" -C /tmp profiles/<PROFILE>/config.yaml
+python -c "import yaml;print(len(yaml.safe_load(open('/tmp/profiles/<PROFILE>/config.yaml',encoding='utf-8'))))"
 # then copy into place, and:
-hermes -p aletheon doctor
+hermes -p <PROFILE> doctor
 ```
 
 The archive's config carries `delegation.max_concurrent_children: 5` and no
@@ -98,7 +111,7 @@ databases are already in WAL. The guard refuses it unless you accept the risk
 explicitly:
 
 ```bash
-HERMES_ALLOW_VULNERABLE_SQLITE=1 hermes-agent/venv/Scripts/hermes.exe -p aletheon doctor
+HERMES_ALLOW_VULNERABLE_SQLITE=1 hermes-agent/venv/Scripts/hermes.exe -p <PROFILE> doctor
 ```
 
 `HERMES_SUPPRESS_SQLITE_WARNING` will **not** do this — it silences a message

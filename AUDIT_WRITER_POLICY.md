@@ -31,7 +31,7 @@ its intent — the operator still reviews before anything lands on a branch.
 
 ## Entangled work preserved, not staged
 
-`profiles/aletheon/plugins/worker-alert-gate/` carries pre-existing WIP
+`profiles/<PROFILE>/plugins/worker-alert-gate/` carries pre-existing WIP
 (+392/−17 in `alert_core.py`, +239 in its tests) interleaved with ~65 lines of
 this session's lock fix. It is **not** committed by this session. Recoverable
 snapshot:
@@ -46,4 +46,4 @@ backups/hermes-audit-safety-20260727T070301Z/entangled-wip/
 
 Final integration is the operator's: they merge both sessions' work. This
 session's commits are reachable from the detached HEAD of its worktree; the SHA
-is recorded in `profiles/aletheon/AUDIT_STATUS.md` at session end.
+is recorded in `profiles/<PROFILE>/AUDIT_STATUS.md` at session end.

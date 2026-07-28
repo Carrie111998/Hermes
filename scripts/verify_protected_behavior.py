@@ -40,23 +40,41 @@ def _find_profile() -> Path:
     a `profiles/` directory; matching on plugins/ alone silently turned every
     profile scenario into a no-op SKIP.
     """
-    candidates = []
-    env_home = os.environ.get("HERMES_HOME")
-    if env_home:
-        home = Path(env_home)
-        candidates += [home, home / "profiles" / "aletheon"]
-    candidates += [
-        REPO.parent / "profiles" / "aletheon",
-        Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "aletheon",
-        Path.home() / ".hermes" / "profiles" / "aletheon",
-    ]
-    for candidate in candidates:
+    def _is_profile(path: Path) -> bool:
         try:
-            if candidate.parent.name == "profiles" and (candidate / "plugins").is_dir():
-                return candidate
+            return path.parent.name == "profiles" and (path / "plugins").is_dir()
+        except OSError:
+            return False
+
+    # In profile mode HERMES_HOME already IS the profile directory.
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home and _is_profile(Path(env_home)):
+        return Path(env_home)
+
+    # The profile NAME is deployment-specific and is never hardcoded here.
+    wanted = os.environ.get("HERMES_PROFILE")
+    roots = []
+    if env_home:
+        roots.append(Path(env_home) / "profiles")
+    roots += [
+        REPO.parent / "profiles",
+        Path.home() / "AppData" / "Local" / "hermes" / "profiles",
+        Path.home() / ".hermes" / "profiles",
+    ]
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            names = [wanted] if wanted else sorted(
+                entry.name for entry in root.iterdir() if entry.is_dir()
+            )
+            for name in names:
+                candidate = root / name
+                if _is_profile(candidate):
+                    return candidate
         except OSError:
             continue
-    return REPO.parent / "profiles" / "aletheon"
+    return REPO.parent / "profiles"
 
 
 PROFILE = _find_profile()

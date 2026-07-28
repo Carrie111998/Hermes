@@ -31,11 +31,54 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-DEFAULT_BACKUP = Path(
-    r"C:/Users/Waxilliam/backups/hermes-audit-safety-20260727T070301Z"
+# Deployment-specific locations are resolved from the environment, never
+# hardcoded: this script is committed to a public repository and the paths it
+# needs differ per install.
+#   HERMES_ROOT    the hermes install root      (default: ~/AppData/Local/hermes)
+#   HERMES_PROFILE the profile name             (default: the only profile present)
+#   HERMES_BACKUP  the safety point to rehearse (default: newest under ~/backups)
+HERMES_ROOT = Path(
+    os.environ.get("HERMES_ROOT") or Path.home() / "AppData" / "Local" / "hermes"
 )
-PROFILE = Path(r"C:/Users/Waxilliam/AppData/Local/hermes/profiles/aletheon")
-HERMES_AGENT = Path(r"C:/Users/Waxilliam/AppData/Local/hermes/hermes-agent")
+HERMES_AGENT = HERMES_ROOT / "hermes-agent"
+
+
+def _discover_profile_name() -> str:
+    wanted = os.environ.get("HERMES_PROFILE")
+    if wanted:
+        return wanted
+    root = HERMES_ROOT / "profiles"
+    try:
+        names = sorted(
+            entry.name for entry in root.iterdir()
+            if entry.is_dir() and (entry / "plugins").is_dir()
+        )
+    except OSError:
+        names = []
+    return names[0] if names else "default"
+
+
+PROFILE_NAME = _discover_profile_name()
+PROFILE = HERMES_ROOT / "profiles" / PROFILE_NAME
+
+
+def _default_backup() -> Path:
+    env = os.environ.get("HERMES_BACKUP")
+    if env:
+        return Path(env)
+    root = Path.home() / "backups"
+    try:
+        points = sorted(
+            (p for p in root.iterdir()
+             if p.is_dir() and p.name.startswith("hermes-audit-safety-")),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        points = []
+    return points[-1] if points else root / "hermes-audit-safety"
+
+
+DEFAULT_BACKUP = _default_backup()
 
 # backup filename -> live path, for the row-count comparison.
 DB_LIVE_MAP = {
@@ -175,7 +218,7 @@ def rehearse_config(backup: Path, scratch: Path) -> None:
     if not archive.exists():
         record("config archive present", False, "outer-uncommitted.tar.gz missing")
         return
-    member = "profiles/aletheon/config.yaml"
+    member = f"profiles/{PROFILE_NAME}/config.yaml"
     dest = scratch / "config"
     dest.mkdir(parents=True, exist_ok=True)
     try:

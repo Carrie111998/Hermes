@@ -43,17 +43,38 @@ class Scenario:
 
 
 def _profile() -> Optional[Path]:
+    def _is_profile(path: Path) -> bool:
+        try:
+            return path.parent.name == "profiles" and (path / "plugins").is_dir()
+        except OSError:
+            return False
+
+    # In profile mode HERMES_HOME already IS the profile directory. The profile
+    # NAME is deployment-specific and is never hardcoded here.
     env = os.environ.get("HERMES_HOME")
-    candidates = []
+    if env and _is_profile(Path(env)):
+        return Path(env)
+    wanted = os.environ.get("HERMES_PROFILE")
+    roots = []
     if env:
-        candidates += [Path(env), Path(env) / "profiles" / "aletheon"]
-    candidates += [
-        REPO.parent / "profiles" / "aletheon",
-        Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "aletheon",
+        roots.append(Path(env) / "profiles")
+    roots += [
+        REPO.parent / "profiles",
+        Path.home() / "AppData" / "Local" / "hermes" / "profiles",
     ]
-    for c in candidates:
-        if c.parent.name == "profiles" and (c / "plugins").is_dir():
-            return c
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            names = [wanted] if wanted else sorted(
+                entry.name for entry in root.iterdir() if entry.is_dir()
+            )
+            for name in names:
+                candidate = root / name
+                if _is_profile(candidate):
+                    return candidate
+        except OSError:
+            continue
     return None
 
 

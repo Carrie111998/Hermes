@@ -38,38 +38,57 @@ def _find_profile() -> Path | None:
     green while protecting nothing, which is the exact failure class this file
     exists to catch.
     """
-    candidates = []
-    env_home = os.environ.get("HERMES_HOME")
-    if env_home:
-        home = Path(env_home)
-        # HERMES_HOME may be the profile dir (profile mode) or the hermes root.
-        candidates += [home, home / "profiles" / "aletheon"]
-    candidates += [
-        REPO.parent / "profiles" / "aletheon",
-        Path.home() / "AppData" / "Local" / "hermes" / "profiles" / "aletheon",
-        Path.home() / ".hermes" / "profiles" / "aletheon",
-    ]
-    for candidate in candidates:
+    def _is_profile(path: Path) -> bool:
+        # A `plugins/` dir alone is NOT enough: the hermes ROOT has one too, and
+        # matching it made every profile-scoped test below skip while the suite
+        # still reported green. A profile is defined structurally by living
+        # directly under a `profiles/` directory.
         try:
-            # A `plugins/` dir alone is NOT enough: the hermes ROOT has one too,
-            # and matching it made every profile-scoped test below skip while
-            # the suite still reported green. A profile is defined structurally
-            # by living directly under a `profiles/` directory.
-            if candidate.parent.name == "profiles" and (candidate / "plugins").is_dir():
-                return candidate
+            return path.parent.name == "profiles" and (path / "plugins").is_dir()
+        except OSError:
+            return False
+
+    # In profile mode HERMES_HOME already IS the profile directory.
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home and _is_profile(Path(env_home)):
+        return Path(env_home)
+
+    # The profile NAME is deployment-specific and is never hardcoded here.
+    # HERMES_PROFILE names one explicitly; otherwise take whichever profile the
+    # install actually has.
+    wanted = os.environ.get("HERMES_PROFILE")
+    roots = []
+    if env_home:
+        roots.append(Path(env_home) / "profiles")
+    roots += [
+        REPO.parent / "profiles",
+        Path.home() / "AppData" / "Local" / "hermes" / "profiles",
+        Path.home() / ".hermes" / "profiles",
+    ]
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            names = [wanted] if wanted else sorted(
+                entry.name for entry in root.iterdir() if entry.is_dir()
+            )
+            for name in names:
+                candidate = root / name
+                if _is_profile(candidate):
+                    return candidate
         except OSError:
             continue
     return None
 
 
-PROFILE = _find_profile() or (REPO.parent / "profiles" / "aletheon")
+PROFILE = _find_profile() or (REPO.parent / "profiles")
 
 
 def test_the_profile_under_test_was_actually_located():
     """Guard the guard: if this fails, every profile-scoped test below is
     skipping and proving nothing."""
     assert PROFILE.exists() and (PROFILE / "plugins").is_dir(), (
-        f"could not locate the aletheon profile (tried env HERMES_HOME, "
+        f"could not locate a hermes profile (tried env HERMES_HOME/HERMES_PROFILE, "
         f"{REPO.parent}, and the standard install paths) — profile-scoped "
         f"contract tests would silently skip"
     )

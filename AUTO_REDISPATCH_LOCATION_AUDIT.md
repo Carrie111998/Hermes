@@ -2,8 +2,8 @@
 
 **Scope:** Read-only forensic location audit of worker-task automatic failure-handling / retry / re-dispatch.  
 **Date:** 2026-07-23  
-**Profile under study:** `aletheon` (live gateway: `pythonw -m hermes_cli.main --profile aletheon gateway run`)  
-**Store:** `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\workers\bridge.db`  
+**Profile under study:** `<PROFILE>` (live gateway: `pythonw -m hermes_cli.main --profile <PROFILE> gateway run`)  
+**Store:** `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\workers\bridge.db`  
 **Constraint honored:** no code, config, service, or database modifications.
 
 ---
@@ -23,7 +23,7 @@ What remains live today:
 | Orchestrator `verification.auto_repair` (same-task follow-up) | **Present and active** in plugin package |
 | Thin `created` → start dispatcher | **Present and active** in running gateway |
 | Gateway terminal-alert + rich auto-dispatch + ultra mixin | **Source deleted; not importable; not wired** |
-| `worker-alert-gate` triage / ack / dispatch-block | **Present** under aletheon plugins |
+| `worker-alert-gate` triage / ack / dispatch-block | **Present** under <PROFILE> plugins |
 | Automatic *create* of successor task on failure | **Does not exist as code** (by design; agent must create) |
 
 **Conclusion for `task-0b6b1e99a188`:** it exhausted same-task auto-repair, terminal-failed on independent verification (`cmd.exe` not found), and no successor was auto-created because **no component creates successors**. The push-wake path that would have prompted the agent immediately is **dead**. The alert gate eventually surfaced the failure when the agent was already running; an operator/agent then ACKed and later created `task-0041c22521d2` manually.
@@ -36,24 +36,24 @@ What remains live today:
 
 | Path | Role |
 |------|------|
-| `C:\Users\Waxilliam\AppData\Local\hermes\hermes-agent\gateway\worker_task_dispatcher.py` | Thin gateway mixin: polls and starts tasks in `created` via `dispatch_pending`. Wired into `GatewayRunner` (import ~1929; MRO ~3064; watcher spawn ~8122–8127). mtime **2026-07-22 15:57**. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\hermes-agent\gateway\run.py` | Only worker-bridge background loop remaining: `_worker_task_dispatcher_watcher`. **No** references to `worker_bridge_watchers` / `WorkerBridgeWatch` / `worker_bridge_ultra`. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\dispatch.py` | `dispatch_pending()` + detached runner spawn. Used by the thin dispatcher. mtime **2026-07-22 15:56**. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\orchestrator.py` | **Same-task** verification auto-repair (`_auto_repair_budget`, `verification.auto_repair` event, `continue_task`). Config: `worker_bridge.verification_auto_repair` (aletheon config = `1`). |
-| `C:\Users\Waxilliam\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\workflows.py` | Task-type defaults for `metadata.auto_repair`. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\cli.py` / `runner.py` | Pass `verification_auto_repair` into bridge construction. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\plugins\worker-alert-gate\` | `alert_core.py`, `plugin.py`, tests. Syncs `bridge.db` → `workers/alert_queue.json`; injects pending alerts on `pre_llm_call`; **blocks** new dispatch until failure ACKs; does **not** enqueue successors. Explicitly documents that an earlier **auto-re-dispatch cron** was rejected for lacking judgment. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\scripts\worker_task_alerts.py` | Cron/daemon human-facing Discord text alerts (stdout). Independent cursor: `cron/worker_task_alerts_state.json` (**stale** at `last_event_id=26501`). |
-| `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\skills\devops\worker-alert-system\SKILL.md` | Operator doc for the **intended** full pipeline; still points at `gateway/worker_bridge_watchers.py` as the push daemon. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\docs\worker-task-alerts.md` | Design for cron-side `worker_task_alerts.py` (notify, not auto-create). |
-| `C:\Users\Waxilliam\AppData\Local\hermes\hermes-agent\tests\gateway\test_worker_task_dispatcher.py` | Tests for thin dispatcher only. |
+| `C:\Users\<USER>\AppData\Local\hermes\hermes-agent\gateway\worker_task_dispatcher.py` | Thin gateway mixin: polls and starts tasks in `created` via `dispatch_pending`. Wired into `GatewayRunner` (import ~1929; MRO ~3064; watcher spawn ~8122–8127). mtime **2026-07-22 15:57**. |
+| `C:\Users\<USER>\AppData\Local\hermes\hermes-agent\gateway\run.py` | Only worker-bridge background loop remaining: `_worker_task_dispatcher_watcher`. **No** references to `worker_bridge_watchers` / `WorkerBridgeWatch` / `worker_bridge_ultra`. |
+| `C:\Users\<USER>\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\dispatch.py` | `dispatch_pending()` + detached runner spawn. Used by the thin dispatcher. mtime **2026-07-22 15:56**. |
+| `C:\Users\<USER>\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\orchestrator.py` | **Same-task** verification auto-repair (`_auto_repair_budget`, `verification.auto_repair` event, `continue_task`). Config: `worker_bridge.verification_auto_repair` (<PROFILE> config = `1`). |
+| `C:\Users\<USER>\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\workflows.py` | Task-type defaults for `metadata.auto_repair`. |
+| `C:\Users\<USER>\AppData\Local\hermes\plugins\worker-bridge\hermes_worker_bridge\cli.py` / `runner.py` | Pass `verification_auto_repair` into bridge construction. |
+| `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\plugins\worker-alert-gate\` | `alert_core.py`, `plugin.py`, tests. Syncs `bridge.db` → `workers/alert_queue.json`; injects pending alerts on `pre_llm_call`; **blocks** new dispatch until failure ACKs; does **not** enqueue successors. Explicitly documents that an earlier **auto-re-dispatch cron** was rejected for lacking judgment. |
+| `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\scripts\worker_task_alerts.py` | Cron/daemon human-facing Discord text alerts (stdout). Independent cursor: `cron/worker_task_alerts_state.json` (**stale** at `last_event_id=26501`). |
+| `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\skills\devops\worker-alert-system\SKILL.md` | Operator doc for the **intended** full pipeline; still points at `gateway/worker_bridge_watchers.py` as the push daemon. |
+| `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\docs\worker-task-alerts.md` | Design for cron-side `worker_task_alerts.py` (notify, not auto-create). |
+| `C:\Users\<USER>\AppData\Local\hermes\hermes-agent\tests\gateway\test_worker_task_dispatcher.py` | Tests for thin dispatcher only. |
 
 ### 1.2 Intended gateway alert / auto-dispatch / ultra — source **missing**, bytecode **orphaned**
 
 | Path | Evidence |
 |------|----------|
-| `C:\Users\Waxilliam\AppData\Local\hermes\hermes-agent\gateway\worker_bridge_watchers.py` | **MISSING.** `import gateway.worker_bridge_watchers` → `ModuleNotFoundError`. |
-| `C:\Users\Waxilliam\AppData\Local\hermes\hermes-agent\gateway\worker_bridge_ultra.py` | **MISSING.** Same import failure. |
+| `C:\Users\<USER>\AppData\Local\hermes\hermes-agent\gateway\worker_bridge_watchers.py` | **MISSING.** `import gateway.worker_bridge_watchers` → `ModuleNotFoundError`. |
+| `C:\Users\<USER>\AppData\Local\hermes\hermes-agent\gateway\worker_bridge_ultra.py` | **MISSING.** Same import failure. |
 | `...\gateway\__pycache__\worker_bridge_watchers.cpython-311.pyc` | Present (68 582 B, mtime **2026-07-14 17:03**). Filename still points at deleted `.py`. |
 | `...\gateway\__pycache__\worker_bridge_watchers.cpython-314.pyc` | Present (68 621 B, mtime **2026-07-13 17:41**). |
 | `...\gateway\__pycache__\worker_bridge_ultra.cpython-311.pyc` | Present (48 121 B, mtime **2026-07-14 17:03**). |
@@ -73,10 +73,10 @@ Bytecode-recovered API surface of `worker_bridge_watchers` (still the best in-pl
 
 | Path |
 |------|
-| `C:\Users\Waxilliam\AppData\Local\hermes\CODE_REVIEW_worker_bridge_watchers.md` |
-| `C:\Users\Waxilliam\AppData\Local\hermes\worker_bridge_watchers_code_review.md` |
-| `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\evals\watchers_review.md` |
-| `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\evals\bridge-issues-handoff.md` |
+| `C:\Users\<USER>\AppData\Local\hermes\CODE_REVIEW_worker_bridge_watchers.md` |
+| `C:\Users\<USER>\AppData\Local\hermes\worker_bridge_watchers_code_review.md` |
+| `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\evals\watchers_review.md` |
+| `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\evals\bridge-issues-handoff.md` |
 
 ### 1.4 Git evidence (active tree)
 
@@ -85,7 +85,7 @@ Bytecode-recovered API surface of `worker_bridge_watchers` (still the best in-pl
 
 ### 1.5 Runtime config still enabling the *old* path
 
-`C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\config.yaml` still has (duplicated key block):
+`C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\config.yaml` still has (duplicated key block):
 
 ```yaml
 worker_bridge:
@@ -102,7 +102,7 @@ Config is **orphaned**: nothing in the running gateway process loads `gateway_al
 
 Cursor left behind by the old daemon:
 
-`C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\workers\gateway_alerts_cursor.json`
+`C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\workers\gateway_alerts_cursor.json`
 
 ```json
 {
@@ -119,18 +119,18 @@ Live `events` table max `event_id` ≈ **198966**. Cursor is frozen far behind; 
 
 ## 2. Exact Windows.old path(s)
 
-Root present: `C:\Windows.old\Users\Waxilliam\AppData\Local\hermes\`
+Root present: `C:\Windows.old\Users\<USER>\AppData\Local\hermes\`
 
 | Finding | Path / result |
 |---------|----------------|
 | Full `hermes-agent\gateway\` tree | **Absent** (`Test-Path ...\Windows.old\...\hermes-agent\gateway` → **False**). Windows.old hermes-agent is a partial tree (has `hermes_cli`, `agent`, `apps`, …) without gateway sources. |
 | `worker_bridge_watchers.py` / `worker_bridge_ultra.py` | **Not found** under Windows.old hermes (recursive search). |
-| Worker-bridge plugin packages (orchestrator-era copies in worktrees) | `C:\Windows.old\Users\Waxilliam\AppData\Local\hermes\.claude\worktrees\confident-hawking-11b1d5\plugins\worker-bridge\` |
-| | `C:\Windows.old\Users\Waxilliam\AppData\Local\hermes\.claude\worktrees\dazzling-vaughan-ca6c0d\plugins\worker-bridge\` |
-| | `C:\Windows.old\Users\Waxilliam\AppData\Local\hermes\.claude\worktrees\pensive-shannon-96f4bf\plugins\worker-bridge\` |
-| | `C:\Windows.old\Users\Waxilliam\AppData\Local\hermes\plugins\worker-bridge\` |
-| Aletheon worker-alert-gate in a worktree | Under `...\dazzling-vaughan-ca6c0d\profiles\aletheon\plugins\worker-alert*` (path truncated by explorer; package family present). |
-| Active install archive of stray bridge | `C:\Users\Waxilliam\AppData\Local\hermes\_archive\stray-hermes_worker_bridge-2026-07-13\` (partial; not the gateway watchers). |
+| Worker-bridge plugin packages (orchestrator-era copies in worktrees) | `C:\Windows.old\Users\<USER>\AppData\Local\hermes\.claude\worktrees\confident-hawking-11b1d5\plugins\worker-bridge\` |
+| | `C:\Windows.old\Users\<USER>\AppData\Local\hermes\.claude\worktrees\dazzling-vaughan-ca6c0d\plugins\worker-bridge\` |
+| | `C:\Windows.old\Users\<USER>\AppData\Local\hermes\.claude\worktrees\pensive-shannon-96f4bf\plugins\worker-bridge\` |
+| | `C:\Windows.old\Users\<USER>\AppData\Local\hermes\plugins\worker-bridge\` |
+| <PROFILE> worker-alert-gate in a worktree | Under `...\dazzling-vaughan-ca6c0d\profiles\<PROFILE>\plugins\worker-alert*` (path truncated by explorer; package family present). |
+| Active install archive of stray bridge | `C:\Users\<USER>\AppData\Local\hermes\_archive\stray-hermes_worker_bridge-2026-07-13\` (partial; not the gateway watchers). |
 
 **Windows.old does not hold a recoverable copy of `worker_bridge_watchers.py` / `worker_bridge_ultra.py`.** Best archaeological copies of the deleted gateway modules on this machine are the **current** `__pycache__\*.pyc` files listed in §1.2.
 
@@ -140,10 +140,10 @@ Root present: `C:\Windows.old\Users\Waxilliam\AppData\Local\hermes\`
 
 ### Process evidence (read-only)
 
-- Live: `pythonw.exe -m hermes_cli.main --profile aletheon gateway run` (PID observed during audit).
+- Live: `pythonw.exe -m hermes_cli.main --profile <PROFILE> gateway run` (PID observed during audit).
 - Also: detached runners `hermes_worker_bridge.runner` for in-flight tasks (e.g. this audit task).
 
-### Log evidence (`profiles\aletheon\logs\gateway.log`)
+### Log evidence (`profiles\<PROFILE>\logs\gateway.log`)
 
 | Pattern | Last seen |
 |---------|-----------|
@@ -242,7 +242,7 @@ Ordered by leverage:
 2. **Re-wire** `GatewayRunner` to inherit `GatewayWorkerBridgeWatchersMixin` (and ultra as designed) and re-spawn `_worker_bridge_notifier_watcher` at startup — mirror the old skill docs / pre-rebuild layout.
 3. **Reconcile** with the post-rebuild thin `worker_task_dispatcher` (avoid double-dispatch of `created` tasks: either fold thin logic back into watchers or gate one of them).
 4. **Re-baseline** `workers/gateway_alerts_cursor.json` (delete or set to current max event id) so restore does not skip ~130k events silently or replay a flood without intent.
-5. **Restart** aletheon gateway so imports load the restored modules.
+5. **Restart** <PROFILE> gateway so imports load the restored modules.
 6. Confirm log line: `worker-bridge alerts: watching <bridge.db> every 15s (statuses=...)`.
 
 Optional parallel: advance/reset `cron/worker_task_alerts_state.json` if Discord cron text alerts are still desired.
@@ -255,7 +255,7 @@ Optional parallel: advance/reset `cron/worker_task_alerts_state.json` if Discord
 
 | Item | Location |
 |------|----------|
-| Live bridge DB | `C:\Users\Waxilliam\AppData\Local\hermes\profiles\aletheon\workers\bridge.db` |
+| Live bridge DB | `C:\Users\<USER>\AppData\Local\hermes\profiles\<PROFILE>\workers\bridge.db` |
 | Failed task artifacts | `...\workers\artifacts\task-0b6b1e99a188\` |
 | Alert queue (acked fixed) | `...\workers\alert_queue.json` entry `task-0b6b1e99a188` |
 | Alert audit | `...\logs\worker-alert-gate.jsonl` |
@@ -263,14 +263,14 @@ Optional parallel: advance/reset `cron/worker_task_alerts_state.json` if Discord
 | Frozen gateway alert cursor | `...\workers\gateway_alerts_cursor.json` |
 | Orphaned watchers/ultra pyc | `hermes-agent\gateway\__pycache__\worker_bridge_{watchers,ultra}.cpython-3{11,14}.pyc` |
 | Thin dispatcher commit | `6cd47d16e` “post-rebuild protection” |
-| Design skill (intended architecture) | `profiles\aletheon\skills\devops\worker-alert-system\SKILL.md` |
+| Design skill (intended architecture) | `profiles\<PROFILE>\skills\devops\worker-alert-system\SKILL.md` |
 
 ---
 
 ## Answers to the five required items (compact)
 
-1. **Current source paths if present:** live logic in `gateway/worker_task_dispatcher.py`, `plugins/worker-bridge/.../orchestrator.py` (+ `dispatch.py`), `profiles/aletheon/plugins/worker-alert-gate/`. Full alert/re-dispatch daemon sources **missing**; only pyc leftovers under `gateway/__pycache__/`.
-2. **Windows.old paths if present:** worker-bridge plugin trees under `C:\Windows.old\Users\Waxilliam\AppData\Local\hermes\` (plugins + `.claude` worktrees). **No** `worker_bridge_watchers.py` / `worker_bridge_ultra.py`; **no** `hermes-agent\gateway` tree.
+1. **Current source paths if present:** live logic in `gateway/worker_task_dispatcher.py`, `plugins/worker-bridge/.../orchestrator.py` (+ `dispatch.py`), `profiles/<PROFILE>/plugins/worker-alert-gate/`. Full alert/re-dispatch daemon sources **missing**; only pyc leftovers under `gateway/__pycache__/`.
+2. **Windows.old paths if present:** worker-bridge plugin trees under `C:\Windows.old\Users\<USER>\AppData\Local\hermes\` (plugins + `.claude` worktrees). **No** `worker_bridge_watchers.py` / `worker_bridge_ultra.py`; **no** `hermes-agent\gateway` tree.
 3. **Running gateway has full behavior?** **No.** Only thin `created` auto-start. Alert injection / rich auto-dispatch / ultra mixin not loaded.
 4. **Why no auto successor for `task-0b6b1e99a188`?** Repair budget spent; verification still failed; **no code creates successors**; push watcher dead; gate only forced triage ~77m later; agent later created `task-0041c22521d2` by hand.
 5. **Smallest recovery:** for the objective — use/finish `task-0041c22521d2` or create a new task with a PATH-safe verify command; for the platform — restore watchers+ultra from pyc/backup, rewire `run.py`, re-baseline cursor, restart gateway.
