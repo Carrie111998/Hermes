@@ -243,12 +243,24 @@ class TestCreateJobSnapshot:
         assert job["model_snapshot"] is None
 
 
-def _run_with_current_provider_and_model(job, current_provider, current_model, tmp_path):
+def _run_with_current_provider_and_model(
+    job,
+    current_provider,
+    current_model,
+    tmp_path,
+    *,
+    inference_source=None,
+    capture=None,
+):
     """Drive run_job with resolved provider pinned and config.yaml model.default
     set to ``current_model`` (the unpinned-model fire-time source)."""
-    (tmp_path / "config.yaml").write_text(
-        f"model:\n  default: {current_model}\n"
-    )
+    config_text = f"model:\n  default: {current_model}\n"
+    if inference_source is not None:
+        config_text += (
+            "cron:\n"
+            f"  inference_source: {inference_source}\n"
+        )
+    (tmp_path / "config.yaml").write_text(config_text)
     fake_db = MagicMock()
     with patch("cron.scheduler._hermes_home", tmp_path), \
          patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
@@ -258,7 +270,11 @@ def _run_with_current_provider_and_model(job, current_provider, current_model, t
          patch("hermes_state.SessionDB", return_value=fake_db), \
          patch(
              "hermes_cli.runtime_provider.resolve_runtime_provider",
-             return_value={
+             side_effect=lambda **kwargs: (
+                 capture.update({"runtime_kwargs": kwargs})
+                 if capture is not None
+                 else None
+             ) or {
                  "api_key": "test-key",
                  "base_url": "https://example.invalid/v1",
                  "provider": current_provider,
@@ -271,6 +287,8 @@ def _run_with_current_provider_and_model(job, current_provider, current_model, t
         mock_agent_cls.return_value = mock_agent
         success, output, final_response, error = run_job(job)
         agent_constructed = mock_agent_cls.called
+        if capture is not None and mock_agent_cls.called:
+            capture["agent_model"] = mock_agent_cls.call_args.kwargs["model"]
     return success, output, final_response, error, agent_constructed
 
 
@@ -334,6 +352,51 @@ class TestModelDriftGuard:
             )
         assert agent_constructed is True
         assert success is True
+
+    def test_global_source_ignores_job_pins_and_snapshot_drift(self, tmp_path):
+        """The explicit central source wins over every stored job override."""
+        job = _base_job(
+            provider_snapshot="openrouter",
+            model_snapshot="old-model",
+            provider="per-job-provider",
+            model="per-job-model",
+            base_url="https://per-job.invalid/v1",
+        )
+        captured = {}
+        success, output, final_response, error, agent_constructed = \
+            _run_with_current_provider_and_model(
+                job,
+                "openai-codex",
+                "centrally-managed-model",
+                tmp_path,
+                inference_source="global",
+                capture=captured,
+            )
+        assert agent_constructed is True
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert captured["runtime_kwargs"]["requested"] is None
+        assert "explicit_base_url" not in captured["runtime_kwargs"]
+        assert captured["agent_model"] == "centrally-managed-model"
+
+    def test_unknown_source_still_fails_closed(self, tmp_path):
+        """Typos retain the safe job-or-global behavior."""
+        job = _base_job(
+            provider_snapshot="openrouter",
+            model_snapshot="old-model",
+        )
+        success, output, final_response, error, agent_constructed = \
+            _run_with_current_provider_and_model(
+                job,
+                "openai-codex",
+                "centrally-managed-model",
+                tmp_path,
+                inference_source="typo",
+            )
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None
 
 
 class TestRuntimeResolutionTargetModel:
