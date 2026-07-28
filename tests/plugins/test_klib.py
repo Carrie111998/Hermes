@@ -91,12 +91,75 @@ class TestKlibCommands:
         assert requests[0].url.path == "/query"
         assert requests[0].url.params["q"] == "cache invalidation"
         assert requests[0].url.params["mode"] == "lexical"
-        assert requests[0].url.params["limit"] == "5"
+        assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
         assert "docs/1.md" in result
         assert "docs/5.md" in result
         assert "docs/6.md" not in result
         assert "top 5 of 7" in result
         assert len(result) <= 2800
+
+    def test_query_deduplicates_same_file_and_counts_distinct_files(
+        self, monkeypatch
+    ):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"path": "docs/shared.md", "snippet": "first hit"},
+                        {"path": "docs/shared.md", "snippet": "duplicate hit"},
+                        {"path": "docs/1.md", "snippet": "snippet 1"},
+                        {"path": "docs/2.md", "snippet": "snippet 2"},
+                        {"path": "docs/3.md", "snippet": "snippet 3"},
+                        {"path": "docs/4.md", "snippet": "snippet 4"},
+                        {"path": "docs/5.md", "snippet": "snippet 5"},
+                    ]
+                },
+            )
+
+        _install_transport(monkeypatch, mod, handler)
+        result = _run(mod._handle_klib("duplicate files"))
+
+        assert result.count("docs/shared.md") == 1
+        assert "first hit" in result
+        assert "duplicate hit" not in result
+        assert "docs/4.md" in result
+        assert "docs/5.md" not in result
+        assert "Showing top 5 of 6 distinct files." in result
+
+    def test_query_overfetches_past_file_dominated_server_limit(
+        self, monkeypatch
+    ):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        requests = []
+        corpus = [
+            {"path": "docs/dominant.md", "snippet": f"dominant hit {index}"}
+            for index in range(20)
+        ] + [
+            {"path": f"docs/other-{file_index}.md", "snippet": "other hit"}
+            for file_index in range(1, 4)
+            for _ in range(2)
+        ]
+
+        def handler(request):
+            requests.append(request)
+            limit = int(request.url.params["limit"])
+            return httpx.Response(200, json={"results": corpus[:limit]})
+
+        _install_transport(monkeypatch, mod, handler)
+        result = _run(mod._handle_klib("shared topic"))
+
+        assert len(requests) == 1
+        assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
+        assert "docs/dominant.md" in result
+        assert "docs/other-1.md" in result
+        assert "docs/other-2.md" in result
+        assert "docs/other-3.md" in result
+        assert "Showing top 4 of 4 distinct files." not in result
 
     def test_successful_query_with_zero_results_is_friendly(self, monkeypatch):
         mod = _load_plugin_init()
@@ -227,3 +290,120 @@ class TestKlibCommands:
         _run(mod._handle_klib("authenticated query"))
 
         assert headers == ["Bearer test-key"]
+
+    def test_read_success_returns_path_and_full_text(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "path": "docs/manual.md",
+                    "raw": "# Manual\n\nFull text from klib.",
+                    "status": 200,
+                },
+            )
+
+        _install_transport(monkeypatch, mod, handler)
+        result = _run(mod._handle_klib("read docs/manual.md"))
+
+        assert len(requests) == 1
+        assert requests[0].url.path == "/read"
+        assert requests[0].url.params["path"] == "docs/manual.md"
+        assert "docs/manual.md" in result
+        assert "# Manual\n\nFull text from klib." in result
+        assert len(result) <= 2800
+
+    def test_read_404_is_a_friendly_not_found_message(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(404, text="not found"),
+        )
+
+        result = _run(mod._handle_klib("read docs/missing.md"))
+
+        assert "not found" in result.lower()
+        assert "HTTP status 404" not in result
+
+    def test_read_timeout_is_friendly(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+
+        def handler(request):
+            raise httpx.TimeoutException("simulated timeout", request=request)
+
+        _install_transport(monkeypatch, mod, handler)
+        result = _run(mod._handle_klib("read docs/slow.md"))
+
+        assert "timed out" in result
+
+    def test_read_connection_failure_is_friendly(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+
+        def handler(request):
+            raise httpx.ConnectError("simulated connection failure", request=request)
+
+        _install_transport(monkeypatch, mod, handler)
+        result = _run(mod._handle_klib("read docs/unreachable.md"))
+
+        assert "could not reach" in result
+
+    def test_read_non_2xx_response_is_friendly(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(500, text="server failure"),
+        )
+
+        result = _run(mod._handle_klib("read docs/server-error.md"))
+
+        assert "HTTP status 500" in result
+
+    def test_read_invalid_json_is_friendly(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(200, text="not json"),
+        )
+
+        result = _run(mod._handle_klib("read docs/broken.md"))
+
+        assert "invalid JSON" in result
+
+    def test_read_invalid_response_format_is_friendly(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(200, json={"path": "docs/broken.md"}),
+        )
+
+        result = _run(mod._handle_klib("read docs/broken.md"))
+
+        assert "invalid response format" in result
+
+    @pytest.mark.parametrize("raw_args", ["read", "read "])
+    def test_read_without_path_returns_usage_without_http_call(
+        self, monkeypatch, raw_args
+    ):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        calls = []
+        _install_transport(monkeypatch, mod, lambda request: calls.append(request))
+
+        result = _run(mod._handle_klib(raw_args))
+
+        assert "Usage: /klib read <path>" in result
+        assert calls == []

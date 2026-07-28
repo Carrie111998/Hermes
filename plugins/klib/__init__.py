@@ -1,8 +1,9 @@
-"""Klib search plugin for Telegram and other Hermes gateway sessions.
+"""Klib search/read plugin for Telegram and other Hermes gateway sessions.
 
 The ``/klib <query>`` command calls klib's ``GET /query`` endpoint using
 lexical search by default.  When ``klib.key_file`` is configured, the file's
 trimmed contents are sent as an ``Authorization: Bearer <key>`` request header.
+The ``/klib read <path>`` command calls klib's ``GET /read`` endpoint.
 
 The command is intentionally fail-closed and never raises to its caller:
 missing or disabled configuration, authentication-file failures, HTTP errors,
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 10.0
 _RESULT_LIMIT = 5
+# Klib lexical search returns hits file-by-file and early-returns when the
+# limit is reached, so one file with many matching lines can fill the entire
+# raw budget before the server even examines a second file. Overfetching gives
+# client-side dedup real material from additional files to work with.
+_FETCH_LIMIT = 25
 _MAX_REPLY_LENGTH = 2800
 _SNIPPET_LENGTH = 150
 
@@ -46,6 +52,13 @@ def _truncate(value: str, length: int) -> str:
     return value[: max(0, length - 1)].rstrip() + "…"
 
 
+def _truncate_reply(value: str, length: int) -> str:
+    """Truncate a reply without collapsing whitespace in full-text content."""
+    if len(value) <= length:
+        return value
+    return value[: max(0, length - 1)].rstrip() + "…"
+
+
 def _value_from_item(item: dict[str, Any], keys: tuple[str, ...]) -> str:
     for key in keys:
         value = item.get(key)
@@ -56,13 +69,29 @@ def _value_from_item(item: dict[str, Any], keys: tuple[str, ...]) -> str:
 
 def _format_results(query: str, results: list[Any]) -> str:
     """Format at most five results while keeping the Telegram reply bounded."""
-    total = len(results)
+    distinct_results: list[Any] = []
+    seen_identities: set[str] = set()
+    # First-hit-wins is deliberate: the tested response shape has no reliable
+    # score field, so retaining the original klib result order is deterministic.
+    for item in results:
+        identity = ""
+        if isinstance(item, dict):
+            identity = _value_from_item(item, ("path", "file", "title"))
+        if identity and identity in seen_identities:
+            continue
+        if identity:
+            seen_identities.add(identity)
+        distinct_results.append(item)
+
+    # Report distinct files, not raw line hits, so "top N of M" is not
+    # misleading when several hits came from the same file.
+    total = len(distinct_results)
     if total == 0:
         return f"klib: no results found for {_truncate(query, 500)!r}."
 
     lines = [f"klib results for {_truncate(query, 300)!r}:"]
     shown = min(total, _RESULT_LIMIT)
-    for index, item in enumerate(results[:_RESULT_LIMIT], start=1):
+    for index, item in enumerate(distinct_results[:_RESULT_LIMIT], start=1):
         if isinstance(item, dict):
             label = _value_from_item(item, ("path", "file", "title"))
             snippet = _value_from_item(item, ("snippet", "text", "content"))
@@ -80,7 +109,7 @@ def _format_results(query: str, results: list[Any]) -> str:
         lines.append(line)
 
     if total > shown:
-        lines.append(f"Showing top {shown} of {total} results.")
+        lines.append(f"Showing top {shown} of {total} distinct files.")
 
     reply = "\n".join(lines)
     if len(reply) <= _MAX_REPLY_LENGTH:
@@ -117,7 +146,7 @@ async def _query_klib(
                 params={
                     "q": query,
                     "mode": "lexical",
-                    "limit": _RESULT_LIMIT,
+                    "limit": _FETCH_LIMIT,
                 },
                 headers=headers,
             )
@@ -139,6 +168,61 @@ async def _query_klib(
     return _format_results(query, payload["results"])
 
 
+async def _read_klib(
+    path: str,
+    cfg: dict[str, Any],
+) -> str:
+    """Read a klib page and convert every expected failure to text."""
+    base_url = cfg.get("base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return (
+            "klib: not configured or disabled. An admin must set "
+            "klib.enabled: true and klib.base_url in config.yaml first."
+        )
+    base_url = base_url.strip()
+
+    headers: dict[str, str] = {}
+    key_file = cfg.get("key_file")
+    if key_file:
+        try:
+            api_key = Path(str(key_file)).read_text(encoding="utf-8").strip()
+            headers["Authorization"] = f"Bearer {api_key}"
+        except Exception:
+            return "klib: could not read the configured API key file."
+
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            response = await client.get(
+                f"{base_url.rstrip('/')}/read",
+                params={"path": path},
+                headers=headers,
+            )
+    except httpx.TimeoutException:
+        return "klib: read request timed out."
+    except httpx.RequestError:
+        return "klib: could not reach the klib service."
+
+    if response.status_code == 404:
+        return f"klib: page not found for {_truncate(path, 500)!r}."
+    if not 200 <= response.status_code < 300:
+        return f"klib: service returned HTTP status {response.status_code}."
+
+    try:
+        payload = response.json()
+    except Exception:
+        return "klib: received an invalid JSON response."
+
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("path"), str)
+        or not isinstance(payload.get("raw"), str)
+    ):
+        return "klib: received an invalid response format."
+
+    reply = f"klib: {payload['path'].strip()}\n{payload['raw']}"
+    return _truncate_reply(reply, _MAX_REPLY_LENGTH)
+
+
 async def _handle_klib(raw_args: str) -> str:
     """Handle ``/klib`` and never propagate an exception to the gateway."""
     try:
@@ -146,8 +230,17 @@ async def _handle_klib(raw_args: str) -> str:
         if not query:
             return (
                 "Usage: /klib <query>\n"
-                "Search the klib knowledge library using lexical search."
+                "Usage: /klib read <path>\n"
+                "Search the klib knowledge library or read a full page."
             )
+
+        # This is a case-sensitive literal "read " prefix.  A search for a
+        # phrase such as "read the manual" is therefore treated as a read;
+        # that ambiguity is an accepted tradeoff for simple slash dispatch.
+        if query == "read" or query.startswith("read "):
+            path = query[5:].strip() if query.startswith("read ") else ""
+            if not path:
+                return "Usage: /klib read <path>\nRead the full text of a klib page."
 
         cfg = _load_klib_config()
         if not cfg.get("enabled") or not cfg.get("base_url"):
@@ -155,6 +248,8 @@ async def _handle_klib(raw_args: str) -> str:
                 "klib: not configured or disabled. An admin must set "
                 "klib.enabled: true and klib.base_url in config.yaml first."
             )
+        if query.startswith("read "):
+            return await _read_klib(path, cfg)
         return await _query_klib(query, cfg)
     except Exception:
         logger.exception("klib: unexpected command failure")
@@ -165,6 +260,6 @@ def register(ctx) -> None:
     ctx.register_command(
         "klib",
         handler=_handle_klib,
-        description="Search the klib knowledge library.",
-        args_hint="<query>",
+        description="Search the klib knowledge library or read a full page.",
+        args_hint="<query> | read <path>",
     )
