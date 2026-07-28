@@ -1588,6 +1588,7 @@ def restore_primary_runtime(agent) -> bool:
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
+        agent._active_fallback_entry = None
         agent._fallback_index = 0
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
@@ -2423,6 +2424,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── Reset fallback state ──
     agent._fallback_activated = False
+    agent._active_fallback_entry = None
     agent._fallback_index = 0
 
     # When the user deliberately swaps primary providers (e.g. openrouter
