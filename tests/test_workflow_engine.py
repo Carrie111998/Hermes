@@ -751,7 +751,7 @@ def test_lookup_context_only_no_states_done(engine):
     layers = []
     lookup = engine._build_template_lookup(wf, states, layers,
                                            context={"q": "Q"})
-    assert lookup == {"context": {"q": "Q"}}
+    assert lookup == {"context": {"q": "Q"}, "nodes": {}}
 
 
 def test_lookup_phase_default_derived_from_layer(engine, council_pipeline):

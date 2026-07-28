@@ -937,7 +937,10 @@ class WorkflowEngine:
     # plus hyphens (so node ids like "position-edison" match as a field
     # under the "phase1" namespace). Bare form is a single token.
     _TEMPLATE_RE = re.compile(
-        r"\{(?P<ns>[A-Za-z_][A-Za-z0-9_]*)\.(?P<field>[A-Za-z0-9_\-]+)\}"
+        r"\{(?P<ns>[A-Za-z_][A-Za-z0-9_]*)"
+        r"\.(?P<field>[A-Za-z0-9_\-]+)"
+        r"(?:\.(?P<subfield>[A-Za-z0-9_\-]+))?"
+        r"\}"
         r"|\{(?P<bare>[A-Za-z_][A-Za-z0-9_\-]*)\}"
     )
 
@@ -993,6 +996,14 @@ class WorkflowEngine:
                 date_part = ts_part.split("-")[0]            # "20260610"
                 lookup["date"] = date_part
                 lookup["context"]["date"] = date_part
+                # Short run ID: just the time portion (HHMMSS) for
+                # disambiguation in card names and task prompts.
+                # e.g. run_id = "implementation-20260728-123456"
+                #      run_short_id = "123456"
+                time_part = ts_part.split("-")[1] if "-" in ts_part else ""
+                if time_part:
+                    lookup["run_short_id"] = time_part
+                    lookup["context"]["run_short_id"] = time_part
 
         # Pre-compute the phase label for each node. Authors can set
         # `phase:` explicitly in YAML; otherwise we default to the
@@ -1052,6 +1063,20 @@ class WorkflowEngine:
             # the docstring above calls out the convention.
             lookup[nid] = st.result
 
+        # ── Node metadata namespace ──
+        # Expose {nodes.<node-id>.name} — the node's ID with the short
+        # run ID appended, so YAML authors can reference a node's
+        # disambiguated name without manually appending {run_short_id}.
+        # e.g. {nodes.coder-implement.name} → "coder-implement (123456)"
+        run_short_id = lookup.get("run_short_id", "")
+        nodes_ns: dict[str, dict] = {}
+        for nid in workflow.nodes:
+            if run_short_id:
+                nodes_ns[nid] = {"name": f"{nid} ({run_short_id})"}
+            else:
+                nodes_ns[nid] = {"name": nid}
+        lookup["nodes"] = nodes_ns
+
         for phase_label, members in by_phase.items():
             # Stable concatenation order: follow the topological layer
             # order, not the dict iteration order. Within a single
@@ -1110,9 +1135,15 @@ class WorkflowEngine:
         def _replace(match: re.Match) -> str:
             if match.group("ns") is not None:
                 ns, field = match.group("ns"), match.group("field")
+                subfield = match.group("subfield")
                 ns_val = lookup.get(ns)
                 if isinstance(ns_val, dict) and field in ns_val:
-                    return str(ns_val[field])
+                    val = ns_val[field]
+                    if subfield is not None:
+                        if isinstance(val, dict) and subfield in val:
+                            return str(val[subfield])
+                    else:
+                        return str(val)
                 # ── Resolution failure diagnostics ──
                 ns_type = type(ns_val).__name__ if ns_val is not None else "MISSING"
                 ns_keys = sorted(ns_val.keys())[:20] if isinstance(ns_val, dict) else "N/A"
@@ -1181,9 +1212,13 @@ class WorkflowEngine:
         # Count how many template variables survived unresolved
         unresolved = self._TEMPLATE_RE.findall(resolved_task)
         unresolved_formatted = []
-        for ns, field, bare in unresolved:
+        for parts in unresolved:
+            ns, field, subfield, bare = parts[0], parts[1], parts[2], parts[3]
             if ns:
-                unresolved_formatted.append(f"{{{ns}.{field}}}")
+                ref = f"{{{ns}.{field}}}"
+                if subfield:
+                    ref = f"{{{ns}.{field}.{subfield}}}"
+                unresolved_formatted.append(ref)
             else:
                 unresolved_formatted.append(f"{{{bare}}}")
         if unresolved_formatted:
