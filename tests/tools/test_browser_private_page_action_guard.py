@@ -147,6 +147,28 @@ def test_browser_back_returns_url_when_landed_page_is_public(monkeypatch):
     assert out == {"success": True, "url": "https://example.com/"}
 
 
+def test_browser_back_closes_tab_when_url_is_unchanged(monkeypatch):
+    calls = []
+
+    def run_command(task_id, command, args):
+        calls.append((task_id, command, args))
+        if command == "tab":
+            return {"success": True, "data": {"url": "https://previous-tab.example/"}}
+        return {"success": True, "data": {"url": "https://only-history-entry.example/"}}
+
+    monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda task_id: False)
+    monkeypatch.setattr(browser_tool, "_run_browser_command", run_command)
+
+    out = json.loads(browser_tool.browser_back(task_id="task-1"))
+
+    assert calls == [
+        ("task-1", "get", ["url"]),
+        ("task-1", "back", []),
+        ("task-1", "tab", ["close"]),
+    ]
+    assert out == {"success": True, "url": "https://previous-tab.example/"}
+
+
 def test_browser_back_guard_inactive_does_not_probe(monkeypatch):
     """When the SSRF guard is inactive (local backend), back navigation must
     proceed without even probing the landed page URL."""
