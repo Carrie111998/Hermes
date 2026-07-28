@@ -54,6 +54,10 @@ MAX_CLOUD_RECEIPT_BYTES = 256 * 1024
 MAX_OBSERVATION_FRAME_BYTES = 1024 * 1024
 MAX_ACTIVATION_STAGING_RESPONSE_BYTES = 64 * 1024
 MAX_SEALER_BYTES = 128 * 1024 * 1024
+_FIREWALL_RULES_PATH = "/etc/muncho-owner-gate/metadata-firewall.rules"
+_FIREWALL_READINESS_RECEIPT_PATH = (
+    "/run/muncho-owner-gate/metadata-firewall-ready.json"
+)
 MAX_STREAM_BYTES = (
     len(outer.TREE_STREAM_MAGIC)
     + 8
@@ -2526,6 +2530,39 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
         )
         return self._validate_host_runtime_receipt(value, binding=binding)
 
+    def _open_host_observation_window(self) -> int:
+        """Refresh volatile firewall proof before fixing the observation time."""
+
+        release = f"/opt/muncho-owner-gate/releases/{self._release_sha}"
+        self._execute_empty(
+            _FixedOperation(
+                "firewall_readiness_refresh",
+                (
+                    f"{release}/venv/bin/python",
+                    "-I",
+                    "-B",
+                    (
+                        f"{release}/scripts/canary/"
+                        "owner_gate_firewall_readiness.py"
+                    ),
+                    "receipt",
+                    "--rules",
+                    _FIREWALL_RULES_PATH,
+                    "--receipt",
+                    _FIREWALL_READINESS_RECEIPT_PATH,
+                ),
+                b"",
+                0,
+                60.0,
+            )
+        )
+        collected_at_unix = int(time.time())
+        if collected_at_unix <= 0:
+            raise launcher.OwnerLauncherError(
+                "owner_gate_host_observation_time_invalid"
+            )
+        return collected_at_unix
+
     def _provision_signer(
         self,
         *,
@@ -2778,11 +2815,7 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             package_sha256=binding.package_sha256,
             expected_key_id=str(plan.spec.host_collector_public_key_id),
         )
-        collected_at_unix = int(time.time())
-        if collected_at_unix <= 0:
-            raise launcher.OwnerLauncherError(
-                "owner_gate_host_observation_time_invalid"
-            )
+        collected_at_unix = self._open_host_observation_window()
         host_request = self._host_request(
             schema="muncho-owner-gate-host-observation-request.v1",
             phase=phase,

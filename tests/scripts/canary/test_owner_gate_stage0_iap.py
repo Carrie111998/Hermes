@@ -1209,6 +1209,85 @@ def test_composite_public_surface_has_only_two_fixed_streams_and_no_journal() ->
     assert "journal" not in inspect.getsource(method)
 
 
+def test_host_observation_window_refreshes_exact_release_firewall_receipt_before_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    exchange = transport._stage0_exchange
+    events: list[str] = []
+
+    def ordered_exchange(argv, environment, input_source, **kwargs):
+        events.append("refresh")
+        return exchange(argv, environment, input_source, **kwargs)
+
+    def observed_time() -> float:
+        events.append("time")
+        return 1_800_000_123.0
+
+    transport._stage0_exchange = ordered_exchange
+    monkeypatch.setattr(transport_module.time, "time", observed_time)
+
+    collected_at_unix = transport._open_host_observation_window()
+
+    assert collected_at_unix == 1_800_000_123
+    assert events == ["refresh", "time"]
+    assert _remote_commands(calls) == [[
+        f"/opt/muncho-owner-gate/releases/{REVISION}/venv/bin/python",
+        "-I",
+        "-B",
+        (
+            f"/opt/muncho-owner-gate/releases/{REVISION}/scripts/canary/"
+            "owner_gate_firewall_readiness.py"
+        ),
+        "receipt",
+        "--rules",
+        "/etc/muncho-owner-gate/metadata-firewall.rules",
+        "--receipt",
+        "/run/muncho-owner-gate/metadata-firewall-ready.json",
+    ]]
+    assert calls[0][1] == b""
+    assert all(
+        item not in _remote_commands(calls)[0]
+        for item in ("/usr/bin/systemctl", "/opt/muncho-owner-gate/current")
+    )
+
+
+def test_host_observation_window_fails_closed_before_reading_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    time_read = False
+
+    def failing_exchange(*_args, **_kwargs):
+        return transport_module._ProcessResult(1, b"", b"failed\n")
+
+    def observed_time() -> float:
+        nonlocal time_read
+        time_read = True
+        return 1_800_000_123.0
+
+    transport._stage0_exchange = failing_exchange
+    monkeypatch.setattr(transport_module.time, "time", observed_time)
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_stage0_iap_firewall_readiness_refresh_failed",
+    ):
+        transport._open_host_observation_window()
+
+    assert time_read is False
+
+
 def test_owner_gate_observation_composite_and_target_signer_surfaces_are_exact() -> (
     None
 ):
