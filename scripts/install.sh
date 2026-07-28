@@ -251,41 +251,47 @@ uv_is_cert_error() {
         -e "CERT_HAS_EXPIRED"
 }
 
-# Run a uv command with automatic retry using system certificates on TLS failure.
+# Run a uv command with automatic retry using UV_SYSTEM_CERTS=1 on TLS failure.
+# The first attempt streams stdout+stderr live to the user (the happy path —
+# `uv sync` can take 1-5 minutes and must show progress, not swallow it).
+# On failure, the command is re-run once silently to capture output for
+# cert-error inspection, and retried with UV_SYSTEM_CERTS=1. Only the
+# captured-then-retried output is echoed on the final attempt path; on the
+# success path the user already saw everything live.
 # Usage: uv_with_system_certs_retry <uv command and args...>
-# Example: uv_with_system_certs_retry sync --extra all --locked
 uv_with_system_certs_retry() {
-    local output
-    local exit_code
-
-    # First attempt: normal uv invocation
-    output="$("$UV_CMD" "$@" 2>&1)"
-    exit_code=$?
-    if [ $exit_code -eq 0 ]; then
-        echo "$output"
+    # Happy path: stream live.  uv's own progress UI (resolver bars, download
+    # meters) writes to stderr; capturing it makes `uv sync` look frozen.
+    if "$UV_CMD" "$@"; then
         return 0
     fi
+    local _first_exit=$?
+
+    # Re-run silently to capture stderr+stdout for cert-error inspection.
+    local _output
+    _output="$("$UV_CMD" "$@" 2>&1)" || true
+    local _exit=$?
 
     # Check for TLS certificate error
-    if uv_is_cert_error "$output"; then
-        log_warn "This looks like a TLS certificate-trust failure, not a generic network problem."
-        log_info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a"
-        log_info "  certificate the OS trusts but uv's bundled trust store does not."
-        log_info "  Retrying with UV_SYSTEM_CERTS=1 (uses OS certificate store)..."
-        
-        output="$(UV_SYSTEM_CERTS=1 "$UV_CMD" "$@" 2>&1)"
-        exit_code=$?
-        if [ $exit_code -eq 0 ]; then
-            log_success "Retry with UV_SYSTEM_CERTS=1 succeeded."
-            log_info "For future runs, you can set UV_SYSTEM_CERTS=1 before invoking uv."
-            echo "$output"
+    if uv_is_cert_error "$_output"; then
+        log_warn "This looks like a TLS certificate-trust failure, not a generic network problem." >&2
+        log_info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a" >&2
+        log_info "  certificate the OS trusts but uv's bundled trust store does not." >&2
+        log_info "  Retrying with UV_SYSTEM_CERTS=1 (uses OS certificate store)..." >&2
+
+        if UV_SYSTEM_CERTS=1 "$UV_CMD" "$@"; then
+            log_success "Retry with UV_SYSTEM_CERTS=1 succeeded." >&2
+            log_info "For future runs, you can set UV_SYSTEM_CERTS=1 before invoking uv." >&2
             return 0
         fi
-        log_error "Retry with UV_SYSTEM_CERTS=1 also failed. The issue may be unrelated to certificates."
+        local _retry_exit=$?
+        log_error "Retry with UV_SYSTEM_CERTS=1 also failed. The issue may be unrelated to certificates." >&2
+        return $_retry_exit
     fi
 
-    echo "$output"
-    return $exit_code
+    # Not a cert error — surface the original failure to the user.
+    echo "$_output" >&2
+    return $_first_exit
 }
 
 # npm rewrites tracked package-lock.json files non-deterministically during
@@ -630,10 +636,12 @@ install_uv() {
     fi
     # UV_UNMANAGED_INSTALL tells the astral installer to place the binary
     # directly into $HERMES_HOME/bin instead of ~/.local/bin.
-    # The astral installer downloads uv over HTTPS. On corporate networks
-    # with TLS inspection, this can fail. Retry with UV_SYSTEM_CERTS=1.
-    local _install_script="UV_UNMANAGED_INSTALL=\"$HERMES_HOME/bin\" sh \"$_uv_installer\""
-    if eval "$_install_script" >>"$_uv_install_log" 2>&1; then
+    # The astral installer is a shell script that downloads uv over HTTPS.
+    # On corporate networks with TLS inspection, the download (performed by
+    # curl inside the installer shell script, not by uv itself) can fail.
+    # UV_SYSTEM_CERTS=1 won't help here (curl uses the OS store already),
+    # so we don't retry — surface the error clearly instead.
+    if UV_UNMANAGED_INSTALL="$HERMES_HOME/bin" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
         rm -f "$_uv_installer"
         if [ -x "$_managed_uv" ]; then
             UV_CMD="$_managed_uv"
@@ -648,31 +656,6 @@ install_uv() {
         UV_VERSION=$($UV_CMD --version 2>/dev/null)
         log_success "Managed uv installed ($UV_VERSION)"
     else
-        # Check if the failure was a TLS cert error and retry
-        if uv_is_cert_error "$(cat "$_uv_install_log")"; then
-            log_warn "This looks like a TLS certificate-trust failure, not a generic network problem."
-            log_info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a"
-            log_info "  certificate the OS trusts but uv's bundled trust store does not."
-            log_info "  Retrying with UV_SYSTEM_CERTS=1..."
-            
-            if UV_SYSTEM_CERTS=1 eval "$_install_script" >>"$_uv_install_log" 2>&1; then
-                rm -f "$_uv_installer"
-                if [ -x "$_managed_uv" ]; then
-                    UV_CMD="$_managed_uv"
-                    rm -f "$_uv_install_log"
-                    UV_VERSION=$($UV_CMD --version 2>/dev/null)
-                    log_success "Retry with UV_SYSTEM_CERTS=1 succeeded. Managed uv installed ($UV_VERSION)"
-                    return 0
-                else
-                    log_error "uv installer reported success but binary not found at $_managed_uv"
-                    log_info "Installer output:"
-                    sed 's/^/    /' "$_uv_install_log" >&2
-                    rm -f "$_uv_install_log" "$_uv_installer"
-                    exit 1
-                fi
-            fi
-        fi
-        
         log_error "Failed to install uv"
         log_info "Installer output:"
         sed 's/^/    /' "$_uv_install_log" >&2

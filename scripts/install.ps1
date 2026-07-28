@@ -309,95 +309,93 @@ function Show-NpmCertHint {
     return $true
 }
 
-# Inspect uv output for a TLS-trust failure and, if found, print actionable
-# remediation. uv surfaces corporate MITM proxies and missing root CAs as
-# "invalid peer certificate: UnknownIssuer" / "certificate verify failed" /
-# "CERTIFICATE_VERIFY_FAILED" / "UNABLE_TO_GET_ISSUER_CERT" -- most commonly
-# while downloading Python builds or PyPI packages. The reporter usually
-# misreads this as a generic network failure, so detect it here and route
-# every uv stage through the auto-retry with --system-certs hint.
-# Returns $true when a cert error was detected, $false otherwise.
-function Show-UvCertHint {
+# Inspect uv output for a TLS-trust failure.  Returns $true when a cert error
+# is detected (so the caller can retry with UV_SYSTEM_CERTS=1), $false otherwise.
+# Unlike Show-NpmCertHint (which prints remediation), this only *detects* --
+# the retry messaging is handled by Invoke-UvWithSystemCertsRetry so the user
+# sees one clear sequence: detection -> retry -> success/failure.
+function Test-UvCertError {
     param([string]$UvOutput)
     if (-not $UvOutput) { return $false }
-    $isCertError = $UvOutput -match "invalid peer certificate" `
+    return ($UvOutput -match "invalid peer certificate" `
         -or $UvOutput -match "UnknownIssuer" `
         -or $UvOutput -match "certificate verify failed" `
         -or $UvOutput -match "CERTIFICATE_VERIFY_FAILED" `
         -or $UvOutput -match "UNABLE_TO_GET_ISSUER_CERT" `
         -or $UvOutput -match "SELF_SIGNED_CERT_IN_CHAIN" `
-        -or $UvOutput -match "CERT_HAS_EXPIRED"
-    if (-not $isCertError) { return $false }
-    Write-Warn "This looks like a TLS certificate-trust failure, not a generic network problem."
-    Write-Info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a"
-    Write-Info "  certificate the OS trusts but uv's bundled trust store does not."
-    Write-Info "  The installer will automatically retry with --system-certs (uses Windows Cert Store)."
-    return $true
+        -or $UvOutput -match "CERT_HAS_EXPIRED")
 }
 
-# Invoke a uv command with automatic retry using --system-certs on TLS failure.
-# uv uses its own bundled CA bundle by default. On corporate networks with TLS
+# Invoke a uv command with automatic retry using UV_SYSTEM_CERTS=1 on TLS failure.
+# uv uses its own bundled CA bundle by default.  On corporate networks with TLS
 # inspection, the corporate root CA is in the Windows Certificate Store but not
-# in uv's bundle. This wrapper:
-#   1. Runs the uv command as-is
-#   2. If it fails with a TLS cert error, retries once with --system-certs
-#   3. If the retry succeeds, prints a hint for future runs
-#   4. Returns the exit code of the final attempt
+# in uv's bundle.  This wrapper:
+#   1. Runs the uv command once, capturing stdout+stderr into a temp file so the
+#      user still sees live progress (Tee-Object), and we have the output for
+#      cert-error inspection.  Exit code is read from $LASTEXITCODE.
+#   2. If it failed AND the output contains a TLS cert error, retries once with
+#      UV_SYSTEM_CERTS=1 (instructs uv to use the OS trust store instead of its
+#      bundled CA bundle).  TLS verification is still fully enforced by Windows.
+#   3. Prints a success/failure hint after the retry.
+#   4. Returns the exit code of the final attempt.  $LASTEXITCODE is also set.
 # Usage: Invoke-UvWithSystemCertsRetry { & $UvCmd sync --extra all --locked }
 function Invoke-UvWithSystemCertsRetry {
     param([scriptblock]$Script)
-    # First attempt: normal uv invocation
+
+    # Single invocation that both streams to the user AND captures output for
+    # cert-error inspection.  Tee-Object mirrors to the console; the temp file
+    # holds the full text so we can grep for cert signatures on failure without
+    # re-running the command (side-effectful uv sync / pip install must not run
+    # more than once on the happy path, and at most twice total on retry).
+    $_retryLog = [System.IO.Path]::GetTempFileName()
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $Script
+        & $Script 2>&1 | Tee-Object -FilePath $_retryLog | Out-Host
     } catch {
-        # Ignore; we check exit code below
+        # Native stderr lines can throw under EAP=Stop; we catch and fall
+        # through to the exit-code check.  The temp file still has output.
     }
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $prevEAP
-    
-    if ($exitCode -eq 0) { return 0 }
-    
-    # Capture stderr output to check for TLS errors
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $output = & $Script 2>&1
-    } catch {
-        $output = $_ | Out-String
+
+    if ($exitCode -eq 0) {
+        Remove-Item $_retryLog -Force -ErrorAction SilentlyContinue
+        return 0
     }
-    $exitCode = $LASTEXITCODE
-    $ErrorActionPreference = $prevEAP
-    
-    # Check for TLS certificate error
-    if (Show-UvCertHint $output) {
-        Write-Info "Retrying with --system-certs (uses Windows Certificate Store)..."
+
+    # Read the captured output to check for TLS cert errors
+    $output = Get-Content $_retryLog -Raw -ErrorAction SilentlyContinue
+    Remove-Item $_retryLog -Force -ErrorAction SilentlyContinue
+
+    if (Test-UvCertError $output) {
+        Write-Warn "This looks like a TLS certificate-trust failure, not a generic network problem."
+        Write-Info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a"
+        Write-Info "  certificate the OS trusts but uv's bundled trust store does not."
+        Write-Info "  Retrying with UV_SYSTEM_CERTS=1 (uses Windows Certificate Store)..."
+
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            # Inject --system-certs after the subcommand (uv sync --system-certs, uv pip install --system-certs, etc.)
-            # We need to reconstruct the command with --system-certs flag
-            # Since we have a scriptblock, we'll use the UV_SYSTEM_CERTS env var approach which is cleaner
             $env:UV_SYSTEM_CERTS = "1"
-            & $Script
+            & $Script 2>&1 | Out-Host
             $retryExitCode = $LASTEXITCODE
-            Remove-Item Env:UV_SYSTEM_CERTS -ErrorAction SilentlyContinue
         } catch {
             $retryExitCode = $LASTEXITCODE
+        } finally {
             Remove-Item Env:UV_SYSTEM_CERTS -ErrorAction SilentlyContinue
+            $ErrorActionPreference = $prevEAP
         }
-        $ErrorActionPreference = $prevEAP
-        
+
         if ($retryExitCode -eq 0) {
-            Write-Success "Retry with --system-certs succeeded."
-            Write-Info "For future runs, you can set \$env:UV_SYSTEM_CERTS = \"1\" before invoking uv."
+            Write-Success "Retry with UV_SYSTEM_CERTS=1 succeeded."
+            Write-Info "For future runs, you can set `$env:UV_SYSTEM_CERTS = `"1`" before invoking uv."
             return 0
         }
-        Write-Err "Retry with --system-certs also failed. The issue may be unrelated to certificates."
+        Write-Err "Retry with UV_SYSTEM_CERTS=1 also failed. The issue may be unrelated to certificates."
         return $retryExitCode
     }
-    
+
     return $exitCode
 }
 
@@ -534,76 +532,74 @@ function Get-PowerShellHostExe {
     return "powershell"
 }
 
-# Install-Uv installs the uv binary into $HermesHome\bin.  It uses the
-# official astral.sh installer script, which downloads the uv binary
-# over HTTPS.  On corporate networks with TLS inspection, the download
-# can fail with certificate errors.  We wrap the download with our
-# retry logic (using UV_SYSTEM_CERTS for the installer's own uv download).
 function Install-Uv {
-        # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
-        # no PATH probing, no conda guards, no multi-location resolution chains.
-        # The runtime update path (hermes_cli/managed_uv.py) looks in the same
-        # place, so install.ps1 and `hermes update` stay in sync.
-        $managedUv = Join-Path $HermesHome "bin\uv.exe"
+    # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
+    # no PATH probing, no conda guards, no multi-location resolution chains.
+    # The runtime update path (hermes_cli/managed_uv.py) looks in the same
+    # place, so install.ps1 and `hermes update` stay in sync.
+    #
+    # NOTE: The astral.sh installer shell script is downloaded via `irm`
+    # (Invoke-RestMethod), which uses the Windows SChannel TLS provider -- it
+    # already trusts the Windows Certificate Store by default, so unlike the
+    # `uv` invocations elsewhere in this installer there is no bundled-CA
+    # gap to bridge with UV_SYSTEM_CERTS.  If irm fails on a corporate
+    # network, the corporate CA itself isn't in the Windows store; surfacing
+    # the error here is the correct behaviour.
+    $managedUv = Join-Path $HermesHome "bin\uv.exe"
+
+    if (Test-Path $managedUv) {
+        $script:UvCmd = $managedUv
+        $version = & $managedUv --version
+        Write-Success "Managed uv found ($version)"
+        return $true
+    }
+
+    Write-Info "Installing managed uv into $HermesHome\bin ..."
+    New-Item -ItemType Directory -Path (Join-Path $HermesHome "bin") -Force | Out-Null
+
+    # UV_INSTALL_DIR tells the astral installer to place the binary
+    # directly into $HermesHome\bin instead of ~/.local/bin.
+    $prevEAP = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $env:UV_INSTALL_DIR = Join-Path $HermesHome "bin"
+        # Spawn via the resolved host exe (see Get-PowerShellHostExe) rather
+        # than a bare `powershell`, which isn't guaranteed to be on PATH under
+        # PowerShell 7 / pwsh-only setups.
+        $psHostExe = Get-PowerShellHostExe
+        $installScript = "irm https://astral.sh/uv/install.ps1 | iex"
+        $output = & $psHostExe -ExecutionPolicy ByPass -c $installScript 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+
+        if ($exitCode -ne 0) {
+            Write-Err "uv installer exited with code $exitCode"
+            # Surface the installer's own error so the user can diagnose
+            # (e.g. corporate CA missing from the Windows Cert Store).
+            if ($output) {
+                Write-Host $output -ForegroundColor DarkGray
+            }
+            Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+            return $false
+        }
 
         if (Test-Path $managedUv) {
             $script:UvCmd = $managedUv
             $version = & $managedUv --version
-            Write-Success "Managed uv found ($version)"
+            Write-Success "Managed uv installed ($version)"
             return $true
         }
 
-        Write-Info "Installing managed uv into $HermesHome\bin ..."
-        New-Item -ItemType Directory -Path (Join-Path $HermesHome "bin") -Force | Out-Null
-
-        # UV_INSTALL_DIR tells the astral installer to place the binary
-        # directly into $HermesHome\bin instead of ~/.local/bin.
-        $prevEAP = $ErrorActionPreference
-        try {
-            $ErrorActionPreference = "Continue"
-            $env:UV_INSTALL_DIR = Join-Path $HermesHome "bin"
-            # Spawn via the resolved host exe (see Get-PowerShellHostExe) rather
-            # than a bare `powershell`, which isn't guaranteed to be on PATH under
-            # PowerShell 7 / pwsh-only setups.
-            $psHostExe = Get-PowerShellHostExe
-            # The astral installer downloads uv over HTTPS. On corporate networks
-            # with TLS inspection, this can fail. Retry with UV_SYSTEM_CERTS=1
-            # so the installer uses the Windows Certificate Store.
-            $installScript = "irm https://astral.sh/uv/install.ps1 | iex"
-            $output = & $psHostExe -ExecutionPolicy ByPass -c $installScript 2>&1
-            $exitCode = $LASTEXITCODE
-            if ($exitCode -ne 0 -and (Show-UvCertHint $output)) {
-                Write-Info "Retrying uv install with UV_SYSTEM_CERTS=1..."
-                $env:UV_SYSTEM_CERTS = "1"
-                $output = & $psHostExe -ExecutionPolicy ByPass -c $installScript 2>&1
-                $exitCode = $LASTEXITCODE
-                Remove-Item Env:UV_SYSTEM_CERTS -ErrorAction SilentlyContinue
-            }
-            $ErrorActionPreference = $prevEAP
-
-            if ($exitCode -ne 0) {
-                Write-Err "uv installer exited with code $exitCode"
-                Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
-                return $false
-            }
-
-            if (Test-Path $managedUv) {
-                $script:UvCmd = $managedUv
-                $version = & $managedUv --version
-                Write-Success "Managed uv installed ($version)"
-                return $true
-            }
-
-            Write-Err "uv installed but not found at $managedUv"
-            Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
-            return $false
-        } catch {
-            if ($prevEAP) { $ErrorActionPreference = $prevEAP }
-            Write-Err "Failed to install uv: $_"
-            Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
-            return $false
-        }
+        Write-Err "uv installed but not found at $managedUv"
+        Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+        return $false
+    } catch {
+        if ($prevEAP) { $ErrorActionPreference = $prevEAP }
+        Write-Err "Failed to install uv: $_"
+        Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+        return $false
     }
+}
 
 # Refresh $env:Path from the User + Machine registry hives.  Stage drivers
 # invoke each stage in a fresh powershell process, but those processes
@@ -739,9 +735,9 @@ function Test-Python {
         # semantics or stderr noise.  This fix was previously landed as
         # commit ec1714e71 and then lost in a release squash; reapplied here.
         $ErrorActionPreference = "Continue"
-        $uvExitCode = Invoke-UvWithSystemCertsRetry { & $UvCmd python install $PythonVersion 2>&1 }
+        $uvExitCode = Invoke-UvWithSystemCertsRetry { & $UvCmd python install $PythonVersion }
         $ErrorActionPreference = $prevEAP
-        
+
         # Check if Python is now available (more reliable than exit code
         # since uv may return non-zero due to "already installed" etc.)
         $pythonPath = Invoke-UvWithSystemCertsRetry { & $UvCmd python find $PythonVersion }
@@ -749,12 +745,6 @@ function Test-Python {
             $ver = & $pythonPath --version 2>$null
             Write-Success "Python installed: $ver"
             return $true
-        }
-        
-        # uv ran but Python still not findable -- show what happened
-        if ($uvExitCode -ne 0) {
-            Write-Warn "uv python install output:"
-            Write-Host $uvOutput -ForegroundColor DarkGray
         }
     } catch {
         # Restore EAP in case the try block threw before the assignment
