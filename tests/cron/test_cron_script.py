@@ -276,6 +276,68 @@ class TestRunJobScript:
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
 
+    def test_systemd_exec_context_wraps_script_with_user_service(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("ok")\n')
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "linux")
+        monkeypatch.setattr(sched_mod.shutil, "which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = _run_job_script(
+            "probe.py",
+            job_id="13c1f9279025",
+            exec_context={
+                "mode": "systemd-run-user-service",
+                "unit_prefix": "hermes-cron-heavy-native",
+                "properties": {"TasksMax": "4096", "Slice": "hermes-cron-heavy-native.slice"},
+            },
+        )
+
+        assert success is True
+        assert output == "ok"
+        argv = captured["argv"]
+        assert argv[:6] == [
+            "/usr/bin/systemd-run",
+            "--user",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--quiet",
+        ]
+        assert any(arg.startswith("--unit=hermes-cron-heavy-native-13c1f9279025-") for arg in argv)
+        assert "--property=Slice=hermes-cron-heavy-native.slice" in argv
+        assert "--property=TasksMax=4096" in argv
+        assert argv[-2:] == [sys.executable, str(script.resolve())]
+        assert captured["kwargs"]["cwd"] == str(script.parent)
+
+    def test_systemd_exec_context_rejects_unsupported_property(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("should not run")\n')
+
+        success, output = _run_job_script(
+            "probe.py",
+            exec_context={
+                "mode": "systemd-run-user-service",
+                "properties": {"Environment": "SECRET=x"},
+            },
+        )
+
+        assert success is False
+        assert "unsupported cron exec_context systemd property" in output
+
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
 
