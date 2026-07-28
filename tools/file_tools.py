@@ -57,29 +57,36 @@ def _expand_tilde(path: str) -> str:
 # ---------------------------------------------------------------------------
 _DEFAULT_MAX_READ_CHARS = 100_000
 _max_read_chars_cached: int | None = None
+_max_read_chars_by_config: dict[str, int] = {}
+_max_read_chars_lock = threading.Lock()
 
 
 def _get_max_read_chars() -> int:
     """Return the configured max characters per file read.
 
-    Reads ``file_read_max_chars`` from config.yaml on first call, caches
-    the result for the lifetime of the process.  Falls back to the
-    built-in default if the config is missing or invalid.
+    Cache values by active profile config path. ``_max_read_chars_cached`` is
+    retained only as an explicit compatibility override for tests/embedders.
     """
-    global _max_read_chars_cached
     if _max_read_chars_cached is not None:
         return _max_read_chars_cached
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_config_path, load_config
+        config_key = str(get_config_path().resolve())
+        with _max_read_chars_lock:
+            cached = _max_read_chars_by_config.get(config_key)
+        if cached is not None:
+            return cached
         cfg = load_config()
         val = cfg.get("file_read_max_chars")
         if isinstance(val, (int, float)) and val > 0:
-            _max_read_chars_cached = int(val)
-            return _max_read_chars_cached
+            result = int(val)
+        else:
+            result = _DEFAULT_MAX_READ_CHARS
     except Exception:
-        pass
-    _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
-    return _max_read_chars_cached
+        return _DEFAULT_MAX_READ_CHARS
+    with _max_read_chars_lock:
+        _max_read_chars_by_config[config_key] = result
+    return result
 
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
@@ -424,20 +431,21 @@ _hermes_config_resolved_loaded = False
 
 
 def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
-    global _hermes_config_resolved, _hermes_config_resolved_loaded
+    """Return the active profile's resolved Hermes config path.
+
+    The legacy globals are honored only when explicitly loaded by a test or
+    embedder. Normal runtime resolution remains profile-local.
+    """
     if _hermes_config_resolved_loaded:
         return _hermes_config_resolved
-    _hermes_config_resolved_loaded = True
     try:
         from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
+        return str(get_config_path().resolve())
     except Exception:
         try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+            return str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
         except Exception:
-            _hermes_config_resolved = None
-    return _hermes_config_resolved
+            return None
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:

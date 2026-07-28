@@ -1915,14 +1915,27 @@ class PluginManager:
 # ---------------------------------------------------------------------------
 
 _plugin_manager: Optional[PluginManager] = None
+_plugin_managers: Dict[str, PluginManager] = {}
+_plugin_managers_lock = threading.Lock()
 
 
 def get_plugin_manager() -> PluginManager:
-    """Return (and lazily create) the global PluginManager singleton."""
-    global _plugin_manager
-    if _plugin_manager is None:
-        _plugin_manager = PluginManager()
-    return _plugin_manager
+    """Return the manager isolated to the active profile home.
+
+    ``_plugin_manager`` remains an explicit compatibility override for tests
+    and embedders. Normal runtime managers are cached by resolved
+    ``HERMES_HOME`` so one multiplexed process cannot leak discovered plugins
+    or hooks between profiles.
+    """
+    if _plugin_manager is not None:
+        return _plugin_manager
+    profile_key = str(get_hermes_home().resolve())
+    with _plugin_managers_lock:
+        manager = _plugin_managers.get(profile_key)
+        if manager is None:
+            manager = PluginManager()
+            _plugin_managers[profile_key] = manager
+        return manager
 
 
 def discover_plugins(force: bool = False) -> None:
