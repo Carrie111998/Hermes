@@ -141,11 +141,6 @@ def test_versioned_policy_documents_validate_strictly():
 
 def test_packaging_metadata_covers_all_research_protocol_data_channels():
     pyproject = (PLUGIN_ROOT.parents[1] / "pyproject.toml").read_text(encoding="utf-8")
-    manifest = (PLUGIN_ROOT.parents[1] / "MANIFEST.in").read_text(encoding="utf-8")
 
     for suffix in ("*.json", "*.yaml", "*.sql", "*.md"):
         assert f'"research_protocol/**/*{suffix[1:]}"' in pyproject
-    assert (
-        "recursive-include plugins/research_protocol *.json *.yaml *.sql *.md"
-        in manifest
-    )

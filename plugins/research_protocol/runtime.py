@@ -235,9 +235,7 @@ class LazyAsyncpgPool:
                 elif owner_loop.is_running():
                     coroutine = close_on_owner(state)
                     try:
-                        future = asyncio.run_coroutine_threadsafe(
-                            coroutine, owner_loop
-                        )
+                        future = asyncio.run_coroutine_threadsafe(coroutine, owner_loop)
                     except RuntimeError:
                         coroutine.close()
                         terminate_state(state)

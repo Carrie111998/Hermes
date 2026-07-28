@@ -151,9 +151,11 @@ def test_approval_service_propagates_cli_callback_to_native_consent_thread(
     callback_observations = []
 
     def approve_once(_message, _description, **kwargs):
-        callback_observations.append(
-            (threading.get_ident(), terminal_tool._get_approval_callback(), kwargs)
-        )
+        callback_observations.append((
+            threading.get_ident(),
+            terminal_tool._get_approval_callback(),
+            kwargs,
+        ))
         return "once"
 
     monkeypatch.setattr(

@@ -139,18 +139,13 @@ def test_research_protocol_extra_is_consistent_with_uv_lock():
     } in root_package["metadata"]["requires-dist"]
 
 
-def test_migrations_are_declared_for_wheel_and_sdist():
+def test_migrations_are_declared_in_package_data():
     pyproject = tomllib.loads(
         (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
     plugin_data = pyproject["tool"]["setuptools"]["package-data"]["plugins"]
-    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
 
     assert "research_protocol/**/*.sql" in plugin_data
-    assert (
-        "recursive-include plugins/research_protocol *.json *.yaml *.sql *.md"
-        in manifest
-    )
 
 
 def test_asyncpg_is_isolated_in_research_protocol_extra():

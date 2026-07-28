@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 from uuid import uuid4
 import zipfile
@@ -102,27 +103,54 @@ def test_secret_scanner_detects_synthetic_payloads_without_scanning_other_subtre
 
 
 def test_wheel_and_sdist_ship_every_versioned_protocol_data_file(tmp_path):
-    uv = shutil.which("uv")
-    assert uv is not None, "uv is required by the Hermes development workflow"
     canaries = _secret_canaries()
-    env = os.environ.copy()
-    env.update(
-        {
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    for filename in ("setup.py", "pyproject.toml", "README.md", "LICENSE"):
+        shutil.copy2(REPO_ROOT / filename, source_root / filename)
+    isolated_plugins = source_root / "plugins"
+    isolated_plugins.mkdir()
+    shutil.copy2(PLUGIN_ROOT.parent / "__init__.py", isolated_plugins / "__init__.py")
+    shutil.copytree(
+        PLUGIN_ROOT,
+        isolated_plugins / "research_protocol",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    output_dir = tmp_path / "dist"
+    output_dir.mkdir()
+
+    for kind in ("sdist", "wheel"):
+        env = os.environ.copy()
+        env["HERMES_NIX_BUILD"] = "1"
+        env.update({
             "RESEARCH_PROTOCOL_TOKEN": canaries[0].decode(),
             "RESEARCH_PROTOCOL_DSN": canaries[1].decode(),
-        }
-    )
-    subprocess.run(
-        [uv, "build", "--offline", "--out-dir", str(tmp_path)],
-        cwd=REPO_ROOT,
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+        })
+        scratch = tmp_path / f"{kind}-scratch"
+        scratch.mkdir()
+        extra_cfg = tmp_path / f"{kind}-dist-extra.cfg"
+        extra_cfg.write_text(
+            f"[build]\nbuild_base = {scratch / 'build'}\n\n"
+            f"[egg_info]\negg_base = {scratch}\n",
+            encoding="utf-8",
+        )
+        env["DIST_EXTRA_CONFIG"] = str(extra_cfg)
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"from setuptools.build_meta import build_{kind}; "
+                f"build_{kind}({str(output_dir)!r})",
+            ],
+            cwd=source_root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
-    wheel = next(tmp_path.glob("*.whl"))
-    sdist = next(tmp_path.glob("*.tar.gz"))
+    wheel = next(output_dir.glob("*.whl"))
+    sdist = next(output_dir.glob("*.tar.gz"))
     required = _required_data_paths()
     wheel_entries = _wheel_entries(wheel)
     sdist_entries = _sdist_entries(sdist)
