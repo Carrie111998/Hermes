@@ -21,8 +21,8 @@ Hermes calls this **no-agent mode**. It's the cron system minus the LLM.
                                           ▼
                                  ┌──────────────────┐
                                  │ delivery router  │
-										       │ (telegram/disc…) │
-										       └──────────────────┘
+                                 │ (telegram/disc…) │
+                                 └──────────────────┘
 ```
 <!-- ascii-guard-ignore-end -->
 
