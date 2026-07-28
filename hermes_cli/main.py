@@ -469,6 +469,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.import_agent import build_import_agent_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -15639,6 +15640,12 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def cmd_import_agent(args):
+    from hermes_cli.agent_import import import_agent_command
+
+    import_agent_command(args)
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -17898,6 +17905,11 @@ def main():
     # claw command  (parser built in hermes_cli/subcommands/claw.py)
     # =========================================================================
     build_claw_parser(subparsers, cmd_claw=cmd_claw)
+
+    # =========================================================================
+    # import-agent command  (parser built in hermes_cli/subcommands/import_agent.py)
+    # =========================================================================
+    build_import_agent_parser(subparsers, cmd_import_agent=cmd_import_agent)
 
     # =========================================================================
     # version command  (parser built in hermes_cli/subcommands/version.py)
