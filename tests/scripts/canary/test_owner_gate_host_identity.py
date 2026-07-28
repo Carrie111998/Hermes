@@ -221,7 +221,7 @@ def _responses(**overrides: Any) -> Mapping[str, Any]:
                 "interface": "SCSI",
                 "index": 0,
                 "source": host.EXPECTED_BOOT_DISK_SELF_LINK,
-                "deviceName": foundation.TARGET_BOOT_DEVICE,
+                "deviceName": foundation.OWNER_GATE_BOOT_DEVICE,
                 "diskSizeGb": str(foundation.BOOT_DISK_SIZE_GB),
             }],
         },

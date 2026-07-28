@@ -949,7 +949,7 @@ def _owner_instance_projection(
         != str(expected_identity.get("boot_disk_numeric_id"))
         or str(boot_disk.get("sizeGb"))
         != str(expected_identity.get("boot_disk_size_gb"))
-        or attachment.get("deviceName") != expected_identity.get("boot_disk_name")
+        or attachment.get("deviceName") != foundation.OWNER_GATE_BOOT_DEVICE
         or attachment.get("boot") is not expected_identity.get("boot_disk_boot")
         or attachment.get("autoDelete")
         is not expected_identity.get("boot_disk_auto_delete")

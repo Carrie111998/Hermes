@@ -990,7 +990,7 @@ def _raw(
                 "source": (
                     f"{compute_resource}/zones/{zone}/disks/{foundation.VM_NAME}"
                 ),
-                "deviceName": foundation.VM_NAME,
+                "deviceName": foundation.OWNER_GATE_BOOT_DEVICE,
                 "boot": True,
                 "autoDelete": True,
                 "mode": "READ_WRITE",
@@ -1622,6 +1622,16 @@ def test_owner_boot_disk_attachment_drift_is_rejected() -> None:
             key for key in raw if key.endswith(f"/instances/{foundation.VM_NAME}")
         )
         raw[key]["disks"][0]["autoDelete"] = False
+
+    _reject(mutate, match="instance_invalid")
+
+
+def test_owner_boot_device_is_not_conflated_with_disk_resource_name() -> None:
+    def mutate(raw, _plan) -> None:
+        key = next(
+            key for key in raw if key.endswith(f"/instances/{foundation.VM_NAME}")
+        )
+        raw[key]["disks"][0]["deviceName"] = foundation.VM_NAME
 
     _reject(mutate, match="instance_invalid")
 
