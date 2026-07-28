@@ -187,10 +187,10 @@ deliberate:
    imports framework primitives from `@spectrum-ts/core`, managed iMessage from
    `spectrum-ts/providers/imessage`, and local macOS iMessage from
    `@spectrum-ts/imessage-local`.
-4. Run the sidecar tests. They verify the installed provider exports as well as
-   the executable local/cloud selection behavior. Then re-run mixed
-   text/attachment inbound coverage and verify every part remains ordered with
-   `flattenGroups` enabled.
+4. Run `npm test` in `sidecar/`. The tests verify installed provider exports,
+   executable local/cloud selection, and native mixed-message ordering through
+   both real Spectrum provider pipelines. `npm run smoke:spectrum` runs only
+   that compatibility check.
 5. Run `pytest tests/plugins/platforms/photon/`.
 6. Verify end-to-end: `hermes photon status`, a DM and a group roundtrip,
    and an agent reply into a group right after a gateway restart (exercises
