@@ -12,6 +12,7 @@ def _make_adapter(
     require_mention=None,
     free_response_chats=None,
     free_response_topics=None,
+    shared_chat_guard=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -33,6 +34,8 @@ def _make_adapter(
         extra["free_response_chats"] = free_response_chats
     if free_response_topics is not None:
         extra["free_response_topics"] = free_response_topics
+    if shared_chat_guard is not None:
+        extra["shared_chat_guard"] = shared_chat_guard
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -432,6 +435,110 @@ class _FakeSessionStore:
 
     def append_to_transcript(self, session_id, message, skip_db=False):
         self.messages.append((session_id, message, skip_db))
+
+
+def _shared_chat_guard(chats=("-5312735398",), enabled=True, **overrides):
+    cfg = {"enabled": enabled, "chats": list(chats)}
+    cfg.update(overrides)
+    return cfg
+
+
+def test_shared_chat_guard_silences_and_observes_ordinary_logistics_chatter():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            free_response_chats=["-5312735398"],
+            shared_chat_guard=_shared_chat_guard(),
+            group_allowed_chats=["-5312735398"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+
+        for update_id, text in enumerate(
+            (
+                "Kann aber auch einfach mit dem Bus zu dir kommen",
+                "Ich kann vorher zu dir und wir essen was kleines zusammen? Muss Emil heute um 17 Uhr zum Minigolf bringen zu Mari.",
+            ),
+            start=5001,
+        ):
+            await adapter._handle_text_message(
+                SimpleNamespace(
+                    update_id=update_id,
+                    message=_group_message(text, chat_id=-5312735398),
+                    effective_message=None,
+                ),
+                SimpleNamespace(),
+            )
+
+        adapter._message_handler.assert_not_awaited()
+        assert len(store.messages) == 2
+        assert [entry[1]["content"].split("\n", 1)[1] for entry in store.messages] == [
+            "Kann aber auch einfach mit dem Bus zu dir kommen",
+            "Ich kann vorher zu dir und wir essen was kleines zusammen? Muss Emil heute um 17 Uhr zum Minigolf bringen zu Mari.",
+        ]
+        assert all(entry[1]["observed"] is True for entry in store.messages)
+        assert all(source.chat_id == "-5312735398" for source in store.sources)
+        assert all(source.user_id is None for source in store.sources)
+
+    asyncio.run(_run())
+
+
+def test_shared_chat_guard_dispatches_direct_address_even_in_guarded_chat():
+    text = "NORA kannst du schauen ob das zeitlich reicht?"
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(),
+        mention_patterns=[r"^\s*NORA\b"],
+    )
+
+    assert adapter._should_process_message(_group_message(text, chat_id=-5312735398)) is True
+
+
+def test_shared_chat_guard_direct_command_reply_and_mention_still_dispatch():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(),
+    )
+    mentioned = "hi @hermes_bot"
+
+    assert adapter._should_process_message(_group_message("/status", chat_id=-5312735398), is_command=True) is True
+    assert adapter._should_process_message(_group_message("replying", chat_id=-5312735398, reply_to_bot=True)) is True
+    assert adapter._should_process_message(
+        _group_message(mentioned, chat_id=-5312735398, entities=[_mention_entity(mentioned)])
+    ) is True
+
+
+def test_shared_chat_guard_classifier_allows_tasks_and_risks_but_not_time_chatter():
+    from plugins.platforms.telegram.adapter import classify_telegram_shared_chat_relevance
+
+    assert classify_telegram_shared_chat_relevance("bitte für mich buchen").allow is True
+    assert classify_telegram_shared_chat_relevance("Storno/No-show/Gebühr/zu spät/Kalender").allow is True
+    assert classify_telegram_shared_chat_relevance(
+        "Ich kann vorher zu dir und wir essen was kleines zusammen? Muss Emil heute um 17 Uhr zum Minigolf bringen zu Mari."
+    ).allow is False
+
+
+def test_shared_chat_guard_leaves_other_free_response_chats_unchanged():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398", "-100"],
+        shared_chat_guard=_shared_chat_guard(),
+    )
+
+    assert adapter._should_process_message(_group_message("ordinary chatter", chat_id=-100)) is True
+
+
+def test_shared_chat_guard_disabled_keeps_free_response_chat_open():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(enabled=False),
+    )
+
+    assert adapter._should_process_message(_group_message("ordinary chatter", chat_id=-5312735398)) is True
 
 
 def test_group_messages_can_require_direct_trigger_via_config():

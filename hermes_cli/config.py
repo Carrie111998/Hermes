@@ -2752,6 +2752,12 @@ DEFAULT_CONFIG = {
     "telegram": {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
+        "shared_chat_guard": {         # Opt-in relevance gate for shared human group chats
+            "enabled": False,
+            "chats": [],              # Chat IDs where unaddressed free-response turns are relevance-gated
+            "allow_keywords": [],     # Optional override; defaults cover orga/calendar/research tasks
+            "risk_keywords": [],      # Optional override; defaults cover timing/fee/deadline risks
+        },
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
         "extra": {
             "rich_messages": False,     # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set True to opt in. Default stays legacy MarkdownV2 because rich messages can be hard to copy as plain text in Telegram clients.

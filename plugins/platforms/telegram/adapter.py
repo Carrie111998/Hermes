@@ -25,6 +25,90 @@ from typing import Dict, List, Optional, Set, Any
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_SHARED_CHAT_ALLOW_KEYWORDS = (
+    "buch", "prüf", "pruef", "such", "recherch", "kalender",
+    "route", "weg", "fahrt", "kurs", "einkauf", "termin",
+    "zusammenfass", "erinner", "reservier", "plan", "organisier",
+)
+_DEFAULT_SHARED_CHAT_RISK_KEYWORDS = (
+    "storno", "no-show", "noshow", "gebühr", "gebuehr", "deadline",
+    "frist", "zu spät", "zu spaet", "verspät", "verspaet", "konflikt",
+    "überschneid", "ueberschneid", "passt zeitlich", "zeitlich reicht",
+    "reicht zeitlich", "schaffen wir das", "location", "adresse",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class TelegramSharedChatRelevance:
+    """Pure relevance decision for opt-in Telegram shared-chat gating."""
+
+    allow: bool
+    reason: str
+
+
+def _shared_chat_guard_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
+
+
+def _shared_chat_guard_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def classify_telegram_shared_chat_relevance(
+    text: str,
+    guard_config: Optional[dict] = None,
+) -> TelegramSharedChatRelevance:
+    """Classify whether a shared-chat free-response message merits dispatch.
+
+    Direct bot addressing is handled by the Telegram routing layer before this
+    helper runs.  This function is intentionally conservative: without an
+    explicit task, factual lookup, orga/calendar cue, or risk cue, shared-chat
+    side conversation stays silent by default.
+    """
+
+    body = (text or "").strip()
+    if not body:
+        return TelegramSharedChatRelevance(False, "empty")
+
+    cfg = guard_config if isinstance(guard_config, dict) else {}
+    lowered = body.lower()
+
+    allow_keywords = _shared_chat_guard_list(cfg.get("allow_keywords")) or list(
+        _DEFAULT_SHARED_CHAT_ALLOW_KEYWORDS
+    )
+    risk_keywords = _shared_chat_guard_list(cfg.get("risk_keywords")) or list(
+        _DEFAULT_SHARED_CHAT_RISK_KEYWORDS
+    )
+
+    for keyword in risk_keywords:
+        if keyword.lower() in lowered:
+            return TelegramSharedChatRelevance(True, f"risk:{keyword}")
+
+    for keyword in allow_keywords:
+        if keyword.lower() in lowered:
+            return TelegramSharedChatRelevance(True, f"task:{keyword}")
+
+    # Decision-help questions are only enough when they carry an orga/factual
+    # shape.  This catches "Sollen wir den Kurs buchen?" without replying to
+    # general emotional/social questions between the humans.
+    if "?" in body and re.search(
+        r"\b(sollen wir|kannst du|können wir|koennen wir|geht das|passt das|reicht das)\b",
+        lowered,
+    ):
+        if re.search(r"\b(zeit|uhr|morgen|heute|kurs|termin|bus|bahn|route|adresse|buchen)\b", lowered):
+            return TelegramSharedChatRelevance(True, "orga-question")
+
+    return TelegramSharedChatRelevance(False, "default_silent")
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -7641,6 +7725,28 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_shared_chat_guard_config(self) -> dict:
+        raw = self.config.extra.get("shared_chat_guard")
+        return raw if isinstance(raw, dict) else {}
+
+    def _telegram_shared_chat_guard_chats(self) -> set[str]:
+        cfg = self._telegram_shared_chat_guard_config()
+        return set(_shared_chat_guard_list(cfg.get("chats") or cfg.get("groups")))
+
+    def _telegram_shared_chat_guard_enabled_for(self, message) -> bool:
+        cfg = self._telegram_shared_chat_guard_config()
+        if not _shared_chat_guard_bool(cfg.get("enabled"), False):
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        return bool(chat_id and chat_id in self._telegram_shared_chat_guard_chats())
+
+    def _telegram_shared_chat_guard_allows(self, message) -> TelegramSharedChatRelevance:
+        text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        return classify_telegram_shared_chat_relevance(
+            text,
+            self._telegram_shared_chat_guard_config(),
+        )
+
     def _telegram_free_response_topics(self) -> set[str]:
         """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.
 
@@ -8172,11 +8278,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if not allowed or chat_id_str not in allowed:
             return False
 
-        # Only observe messages skipped by the require_mention gate.  If the
-        # message would be processed normally, let the dispatcher handle it;
-        # if require_mention is disabled, every group message is a request.
+        # Only observe messages skipped by the trigger/relevance gate.  A
+        # shared-chat guard can narrow a free-response chat back to observation
+        # for side conversation, preserving context without dispatching NORA.
         if chat_id_str in self._telegram_free_response_chats():
-            return False
+            if not self._telegram_shared_chat_guard_enabled_for(message):
+                return False
+            if self._telegram_shared_chat_guard_allows(message).allow:
+                return False
         if self._telegram_is_free_response_topic(message):
             return False
         if not self._telegram_require_mention():
@@ -8555,6 +8664,27 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
+        if self._telegram_shared_chat_guard_enabled_for(message):
+            if is_command or self._is_reply_to_bot(message):
+                return True
+            if not self._telegram_guest_mode() and self._message_mentions_bot(message):
+                return True
+            if self._message_matches_mention_patterns(message):
+                return True
+            relevance = self._telegram_shared_chat_guard_allows(message)
+            if relevance.allow:
+                logger.debug(
+                    "[Telegram] shared_chat_guard allowed chat=%s reason=%s",
+                    chat_id_str,
+                    relevance.reason,
+                )
+                return True
+            logger.debug(
+                "[Telegram] shared_chat_guard silenced chat=%s reason=%s",
+                chat_id_str,
+                relevance.reason,
+            )
+            return False
         if chat_id_str in self._telegram_free_response_chats():
             return True
         if self._telegram_is_free_response_topic(message):
