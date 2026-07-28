@@ -58,6 +58,8 @@ _OPEN_DIRECTORY_FLAGS = (
 _OPEN_FILE_FLAGS = (
     os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
+_REQUIRED_DIR_FD_FUNCTIONS = (os.open, os.mkdir, os.stat, os.unlink, os.link)
+_REQUIRED_FOLLOW_SYMLINKS_FUNCTIONS = (os.stat, os.link)
 
 # This is deliberately closed: adding a type requires adding its validated model
 # and its fixed directory in the same reviewed change.
@@ -89,14 +91,77 @@ def canonical_json_bytes(value: Any) -> bytes:
         raise ValueError(f"value is not canonical JSON: {exc}") from exc
 
 
-def _reject_symlink_components(path: Path) -> None:
-    """Reject symlinks in an already-created path, including its root."""
+def _secure_storage_capabilities_available() -> bool:
+    """Return whether the runtime can enforce the no-symlink storage contract."""
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and all(function in supports_dir_fd for function in _REQUIRED_DIR_FD_FUNCTIONS)
+        and all(
+            function in supports_follow_symlinks
+            for function in _REQUIRED_FOLLOW_SYMLINKS_FUNCTIONS
+        )
+    )
+
+
+def _open_directory_path(path: Path, *, create: bool) -> int:
+    """Open a directory path without following any symlink component."""
     absolute = Path(os.path.abspath(path))
-    current = Path(absolute.anchor)
-    for component in absolute.parts[1:]:
-        current /= component
-        if os.path.lexists(current) and current.is_symlink():
-            raise ArtifactSecurityError("symlink path component is not allowed")
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(absolute.anchor, _OPEN_DIRECTORY_FLAGS)
+        for component in absolute.parts[1:]:
+            created = False
+            if create:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise ArtifactSecurityError(
+                        "artifact root could not be created safely"
+                    ) from exc
+
+            try:
+                child_fd = os.open(
+                    component,
+                    _OPEN_DIRECTORY_FLAGS,
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                raise ArtifactSecurityError(
+                    "artifact path component is not a safe directory"
+                ) from exc
+
+            try:
+                entry_stat = os.stat(
+                    component,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                descriptor_stat = os.fstat(child_fd)
+                if not stat.S_ISDIR(entry_stat.st_mode) or not _same_inode(
+                    entry_stat, descriptor_stat
+                ):
+                    raise ArtifactSecurityError(
+                        "artifact path component changed during operation"
+                    )
+                if created:
+                    os.fsync(directory_fd)
+            except Exception:
+                os.close(child_fd)
+                raise
+
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except Exception:
+        _safe_close(directory_fd)
+        raise
 
 
 def _validate_identifier(value: str, label: str) -> str:
@@ -139,21 +204,16 @@ class ArtifactStore:
     def __init__(self, root: str | os.PathLike[str]):
         if root is None:
             raise ArtifactSecurityError("artifact root is required")
-        if os.name != "posix":
+        if not _secure_storage_capabilities_available():
             raise ArtifactSecurityError(
-                "secure artifact storage requires POSIX dir_fd support"
+                "secure artifact storage requires POSIX O_NOFOLLOW and dir_fd support"
             )
-        raw_root = Path(root)
-        if raw_root.exists() and raw_root.is_symlink():
-            raise ArtifactSecurityError("artifact root must not be a symlink")
-        raw_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _reject_symlink_components(raw_root)
-        if not raw_root.is_dir():
-            raise ArtifactSecurityError("artifact root must be a directory")
-        self.root = Path(os.path.abspath(raw_root))
-
-        root_fd = self._open_root()
-        os.close(root_fd)
+        self.root = Path(os.path.abspath(Path(root)))
+        root_fd = _open_directory_path(self.root, create=True)
+        try:
+            self._assert_root_attached(root_fd)
+        finally:
+            os.close(root_fd)
 
     @staticmethod
     def _artifact_definition(
@@ -181,12 +241,7 @@ class ArtifactStore:
         return encoded, validated
 
     def _open_root(self) -> int:
-        try:
-            root_fd = os.open(self.root, _OPEN_DIRECTORY_FLAGS)
-        except OSError as exc:
-            raise ArtifactSecurityError(
-                "artifact root is not a safe directory"
-            ) from exc
+        root_fd = _open_directory_path(self.root, create=False)
         try:
             self._assert_root_attached(root_fd)
         except Exception:

@@ -184,6 +184,49 @@ def test_store_rejects_symlinked_directory_and_target(tmp_path):
         store.persist("plan", "plan-001", plan_payload())
 
 
+def test_store_rejects_new_root_below_symlinked_parent_without_creating_it(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    root = linked_parent / "artifacts"
+
+    with pytest.raises(ArtifactSecurityError):
+        ArtifactStore(root)
+
+    assert not os.path.lexists(real_parent / "artifacts")
+
+
+def test_store_fails_closed_without_o_nofollow_before_creating_root(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "artifacts"
+    monkeypatch.delattr("plugins.research_protocol.storage.artifacts.os.O_NOFOLLOW")
+
+    with pytest.raises(ArtifactSecurityError, match="O_NOFOLLOW"):
+        ArtifactStore(root)
+
+    assert not os.path.lexists(root)
+
+
+def test_store_fails_closed_without_required_dir_fd_support(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "artifacts"
+    supported = set(os.supports_dir_fd) - {os.open}
+    monkeypatch.setattr(
+        "plugins.research_protocol.storage.artifacts.os.supports_dir_fd",
+        supported,
+    )
+
+    with pytest.raises(ArtifactSecurityError, match="dir_fd"):
+        ArtifactStore(root)
+
+    assert not os.path.lexists(root)
+
+
 def test_store_never_overwrites_existing_target(tmp_path):
     store = ArtifactStore(tmp_path)
     receipt = store.persist("plan", "plan-001", plan_payload())
