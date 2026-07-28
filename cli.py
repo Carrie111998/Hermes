@@ -782,6 +782,11 @@ def load_cli_config() -> Dict[str, Any]:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(
                 sessions_config["search_slow_ms"]
             )
+        if "index_exclude_sources" in sessions_config:
+            from hermes_cli.config import join_index_exclude_sources
+            os.environ["HERMES_FTS_EXCLUDE_SOURCES"] = join_index_exclude_sources(
+                sessions_config["index_exclude_sources"]
+            )
 
     return defaults
 

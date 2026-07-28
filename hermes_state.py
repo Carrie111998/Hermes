@@ -40,7 +40,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -1426,6 +1426,28 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
 # predicate into a tautology (id > -1 OR id <= -1), i.e. normal operation.
 # The two state_meta PK probes per write are negligible next to the FTS
 # insert itself.
+# ── Per-source FTS exclusion (config.yaml sessions.index_exclude_sources) ──
+#
+# state_meta key holding the excluded session sources, stored comma-delimited
+# AND comma-wrapped (",webhook,cron,") so a trigger can test membership with a
+# single ``instr`` and never match a prefix ("cron" must not match "cronish").
+# The key is ABSENT when nothing is excluded, which makes the added trigger
+# predicates tautologies — byte-identical behavior to before this existed.
+# Living in state_meta rather than baked into the trigger DDL is what lets the
+# setting change without schema surgery, and keeps every process (gateway,
+# cron, CLI) agreeing on one value.
+FTS_EXCLUDE_SOURCES_KEY = "fts_exclude_sources"
+
+# Membership test shared by the index triggers. Correlates on the row's own
+# session_id, so it costs one PK probe on ``sessions`` plus one on
+# ``state_meta`` — negligible next to the FTS insert it guards.
+_FTS_SOURCE_NOT_EXCLUDED_SQL = (
+    "NOT EXISTS (SELECT 1 FROM state_meta sm JOIN sessions s "
+    "ON s.id = {alias}.session_id "
+    f"WHERE sm.key = '{FTS_EXCLUDE_SOURCES_KEY}' "
+    "AND instr(sm.value, ',' || s.source || ',') > 0)"
+)
+
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
@@ -1442,7 +1464,8 @@ WHEN (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
                           WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    WHERE __SRC_OK_NEW__;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
@@ -1452,7 +1475,8 @@ WHEN (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
                           WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    WHERE EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = old.id);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
@@ -1465,9 +1489,11 @@ WHEN (old.content IS NOT new.content
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    WHERE EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = old.id);
     INSERT INTO messages_fts(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    WHERE __SRC_OK_NEW__;
 END;
 """
 
@@ -1508,7 +1534,8 @@ WHEN new.role <> 'tool'
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    WHERE __SRC_OK_NEW__;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages
@@ -1519,7 +1546,8 @@ WHEN old.role <> 'tool'
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    WHERE EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = old.id);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages
@@ -1534,10 +1562,11 @@ WHEN (old.content IS NOT new.content
 BEGIN
     INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
     SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
-    WHERE old.role <> 'tool';
+    WHERE old.role <> 'tool'
+      AND EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = old.id);
     INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
     SELECT new.id, new.content, new.tool_name, new.tool_calls
-    WHERE new.role <> 'tool';
+    WHERE new.role <> 'tool' AND __SRC_OK_NEW__;
 END;
 """
 
@@ -1600,7 +1629,8 @@ WHEN new.role <> 'tool'
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    WHERE __SRC_OK_NEW__;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_delete AFTER DELETE ON messages
@@ -1611,7 +1641,8 @@ WHEN old.role <> 'tool'
                             WHERE key = 'fts_cjk_rebuild_progress'), -1))
 BEGIN
     INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    WHERE EXISTS (SELECT 1 FROM messages_fts_cjk_docsize d WHERE d.id = old.id);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_cjk_update AFTER UPDATE ON messages
@@ -1626,10 +1657,11 @@ WHEN (old.content IS NOT new.content
 BEGIN
     INSERT INTO messages_fts_cjk(messages_fts_cjk, rowid, content, tool_name, tool_calls)
     SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
-    WHERE old.role <> 'tool';
+    WHERE old.role <> 'tool'
+      AND EXISTS (SELECT 1 FROM messages_fts_cjk_docsize d WHERE d.id = old.id);
     INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls)
     SELECT new.id, new.content, new.tool_name, new.tool_calls
-    WHERE new.role <> 'tool';
+    WHERE new.role <> 'tool' AND __SRC_OK_NEW__;
 END;
 """
 
@@ -1659,6 +1691,73 @@ def _cjk_fts_config_enabled() -> bool:
     return os.getenv("HERMES_CJK_FTS", "1").strip().lower() not in (
         "0", "false", "off", "no",
     )
+
+
+# ── Per-source FTS exclusion helpers (see FTS_EXCLUDE_SOURCES_KEY above) ──
+
+def fts_exclude_sources_from_env() -> List[str]:
+    """Excluded session sources from the ``sessions.index_exclude_sources``
+    env bridge (HERMES_FTS_EXCLUDE_SOURCES, comma-separated).
+
+    Returns a de-duplicated, order-preserving list; empty when unset.
+    """
+    raw = os.getenv("HERMES_FTS_EXCLUDE_SOURCES", "") or ""
+    out: List[str] = []
+    for part in raw.split(","):
+        src = part.strip()
+        if src and src not in out:
+            out.append(src)
+    return out
+
+
+def encode_fts_exclude_sources(sources: Iterable[str]) -> Optional[str]:
+    """Encode sources into the comma-wrapped state_meta value.
+
+    Returns None when the collection is empty, which callers translate into
+    DELETING the key (absent ⇒ index everything).
+    """
+    cleaned = []
+    for src in sources or ():
+        s = str(src).strip()
+        if s and "," not in s and s not in cleaned:
+            cleaned.append(s)
+    if not cleaned:
+        return None
+    return "," + ",".join(cleaned) + ","
+
+
+def decode_fts_exclude_sources(value: Optional[str]) -> List[str]:
+    """Inverse of :func:`encode_fts_exclude_sources`."""
+    if not value:
+        return []
+    return [p for p in value.split(",") if p]
+
+
+# Placeholder the FTS trigger DDL uses where the "this row's source is not
+# excluded" test belongs. Expanded by :func:`expand_fts_ddl` at CREATE time —
+# the DDL strings themselves stay readable and every trigger gets the exact
+# same predicate.
+_FTS_SRC_OK_NEW_TOKEN = "__SRC_OK_NEW__"
+
+
+def expand_fts_ddl(ddl: str) -> str:
+    """Substitute the source-exclusion predicate into FTS trigger DDL."""
+    return ddl.replace(
+        _FTS_SRC_OK_NEW_TOKEN,
+        _FTS_SOURCE_NOT_EXCLUDED_SQL.format(alias="new"),
+    )
+
+
+# Same predicate for backfill/sweep statements, which select FROM messages
+# under the alias ``m`` rather than acting on a trigger's NEW row. Keeping one
+# source of truth here is what stops a backfill from re-adding rows the
+# triggers deliberately skip.
+FTS_SOURCE_NOT_EXCLUDED_FOR_BACKFILL = _FTS_SOURCE_NOT_EXCLUDED_SQL.format(
+    alias="m"
+)
+
+
+
 
 
 def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
@@ -2352,7 +2451,7 @@ class SessionDB:
                 # `optimize-storage` run rebuilds from scratch.
                 self._fts_cjk_available = False
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            cursor.executescript(expand_fts_ddl(FTS_CJK_TRIGGER_SQL))
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
@@ -2386,6 +2485,234 @@ class SessionDB:
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
     @staticmethod
+    def _drop_fts_triggers_missing_source_guard(cursor: sqlite3.Cursor) -> int:
+        """Drop FTS triggers whose stored body predates the source guard.
+
+        ``CREATE TRIGGER IF NOT EXISTS`` silently keeps an existing trigger,
+        so a DB created before ``sessions.index_exclude_sources`` existed
+        would keep indexing every source forever. Detect the old bodies by
+        the absence of the guard's marker key and drop them; the caller's
+        ensure step recreates them from current DDL. Triggers hold no index
+        data, so this loses nothing.
+
+        Returns the number of triggers dropped.
+        """
+        names = tuple(_FTS_TRIGGERS) + _FTS_CJK_TRIGGERS
+        placeholders = ",".join("?" for _ in names)
+        dropped = 0
+        try:
+            rows = cursor.execute(
+                f"SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                f"AND name IN ({placeholders})",
+                names,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return 0
+        for row in rows:
+            name = row[0]
+            sql = row[1] or ""
+            # Delete-side triggers gained a docsize existence check in the
+            # same change; insert/update sides gained the source guard. Both
+            # markers are absent from every pre-change body.
+            if FTS_EXCLUDE_SOURCES_KEY in sql or "_docsize d WHERE d.id" in sql:
+                continue
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+                dropped += 1
+            except sqlite3.OperationalError:
+                pass
+        if dropped:
+            logger.info(
+                "Recreating %d FTS trigger(s) to honor "
+                "sessions.index_exclude_sources.", dropped,
+            )
+        return dropped
+
+    def _sync_fts_exclude_sources(self, cursor: sqlite3.Cursor) -> List[str]:
+        """Make the state_meta marker match ``sessions.index_exclude_sources``.
+
+        config.yaml is authoritative (same discipline as ``cjk_fts`` and
+        ``search_slow_ms``): whatever the env bridge carries wins over a stale
+        marker left by an earlier configuration. Called during schema init,
+        before the trigger DDL, so a process never writes a single message
+        under the previous setting.
+
+        Returns the effective excluded-source list.
+        """
+        desired = fts_exclude_sources_from_env()
+        encoded = encode_fts_exclude_sources(desired)
+        try:
+            row = cursor.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (FTS_EXCLUDE_SOURCES_KEY,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return desired
+        current = row[0] if row is not None else None
+        if current == encoded:
+            return desired
+        try:
+            if encoded is None:
+                cursor.execute(
+                    "DELETE FROM state_meta WHERE key = ?",
+                    (FTS_EXCLUDE_SOURCES_KEY,),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (FTS_EXCLUDE_SOURCES_KEY, encoded),
+                )
+        except sqlite3.OperationalError as exc:
+            logger.debug("Could not sync FTS exclude-sources marker: %s", exc)
+            return decode_fts_exclude_sources(current)
+        logger.info(
+            "Search index now excludes session sources: %s",
+            ", ".join(desired) if desired else "(none)",
+        )
+        return desired
+
+    def fts_excluded_sources(self) -> List[str]:
+        """Session sources currently kept OUT of the search indexes."""
+        return decode_fts_exclude_sources(
+            self.get_meta(FTS_EXCLUDE_SOURCES_KEY)
+        )
+
+    def prune_fts_for_excluded_sources(
+        self,
+        *,
+        chunk_rows: int = 2000,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Delete already-indexed rows belonging to now-excluded sources.
+
+        Changing ``sessions.index_exclude_sources`` only affects future
+        writes — rows indexed under the old setting stay in the index and keep
+        occupying disk. This removes them in bounded chunks so a live gateway
+        is never blocked for long, using the same external-content 'delete'
+        op the triggers use (the canonical way to un-index a row).
+
+        Rows are only touched when they are actually IN the index (docsize
+        anti-join), so re-running is a no-op and a partial run resumes
+        naturally. Message rows themselves are never modified — this is
+        index-only, the transcripts stay readable and exportable.
+
+        The freed pages are returned to the filesystem by a subsequent
+        VACUUM (``hermes sessions optimize``); this call only frees them
+        inside the file.
+
+        Returns {"ok", "sources", "removed": {<table>: <rows>}}.
+        """
+        excluded = self.fts_excluded_sources()
+        if not self._fts_enabled or self.read_only or not excluded:
+            return {
+                "ok": False,
+                "reason": (
+                    "read_only" if self.read_only
+                    else "fts5_unavailable" if not self._fts_enabled
+                    else "no_excluded_sources"
+                ),
+                "sources": excluded,
+                "removed": {},
+            }
+
+        tables = ["messages_fts"]
+        if self._fts_table_exists("messages_fts_trigram"):
+            tables.append("messages_fts_trigram")
+        if self._fts_cjk_available and self._fts_table_exists("messages_fts_cjk"):
+            tables.append("messages_fts_cjk")
+
+        placeholders = ",".join("?" for _ in excluded)
+        removed: Dict[str, int] = {}
+        for table in tables:
+            total = 0
+            while True:
+                def _do(conn, table=table):
+                    rows = conn.execute(
+                        f"SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                        f"FROM messages m JOIN sessions s ON s.id = m.session_id "
+                        f"JOIN {table}_docsize d ON d.id = m.id "
+                        f"WHERE s.source IN ({placeholders}) "
+                        f"LIMIT {int(chunk_rows)}",
+                        excluded,
+                    ).fetchall()
+                    for r in rows:
+                        conn.execute(
+                            f"INSERT INTO {table}"
+                            f"({table}, rowid, content, tool_name, tool_calls) "
+                            f"VALUES ('delete', ?, ?, ?, ?)",
+                            (r[0], r[1], r[2], r[3]),
+                        )
+                    return len(rows)
+
+                try:
+                    n = int(self._execute_write(_do))
+                except sqlite3.DatabaseError as exc:
+                    logger.warning(
+                        "Index prune failed on %s: %s", table, exc
+                    )
+                    break
+                total += n
+                if progress_cb is not None:
+                    try:
+                        progress_cb({"table": table, "removed": total})
+                    except Exception:
+                        pass
+                if n < chunk_rows:
+                    break
+            removed[table] = total
+            logger.info("Un-indexed %d row(s) from %s.", total, table)
+
+        try:
+            self.optimize_fts()
+        except Exception as exc:
+            logger.debug("FTS optimize after index prune failed: %s", exc)
+
+        return {"ok": True, "sources": excluded, "removed": removed}
+
+    @staticmethod
+    def _unindex_excluded_sources(
+        cursor: sqlite3.Cursor,
+        tables: Iterable[str],
+    ) -> None:
+        """Remove excluded-source rows from freshly rebuilt FTS indexes.
+
+        FTS5's external-content ``'rebuild'`` repopulates from the whole
+        content source and has no way to filter, so a rebuild re-adds exactly
+        the rows ``sessions.index_exclude_sources`` says to leave out. Undo it
+        in the same pass, otherwise every corruption recovery or trigger
+        repair would silently re-inflate the index.
+
+        No-op when nothing is excluded. Runs on the caller's cursor (already
+        inside the schema-init transaction) — the row set is bounded by what
+        the rebuild just wrote, and a rebuild is the expensive part.
+        """
+        row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (FTS_EXCLUDE_SOURCES_KEY,),
+        ).fetchone()
+        excluded = decode_fts_exclude_sources(row[0] if row else None)
+        if not excluded:
+            return
+        placeholders = ",".join("?" for _ in excluded)
+        for table in tables:
+            try:
+                cursor.execute(
+                    f"INSERT INTO {table}"
+                    f"({table}, rowid, content, tool_name, tool_calls) "
+                    f"SELECT 'delete', m.id, m.content, m.tool_name, m.tool_calls "
+                    f"FROM messages m JOIN sessions s ON s.id = m.session_id "
+                    f"JOIN {table}_docsize d ON d.id = m.id "
+                    f"WHERE s.source IN ({placeholders})",
+                    excluded,
+                )
+            except sqlite3.OperationalError as exc:
+                logger.debug(
+                    "Could not un-index excluded sources from %s: %s",
+                    table, exc,
+                )
+
+    @staticmethod
     def _rebuild_fts_indexes(
         cursor: sqlite3.Cursor,
         *,
@@ -2396,10 +2723,15 @@ class SessionDB:
         # content source (messages for the standard index, the tool-row-
         # excluding messages_fts_trigram_src view for the trigram index).
         cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        rebuilt = ["messages_fts"]
         if include_trigram:
             cursor.execute(
                 "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('rebuild')"
             )
+            rebuilt.append("messages_fts_trigram")
+        # 'rebuild' cannot filter, so it re-adds the excluded sources the
+        # triggers skip — strip them back out before returning.
+        SessionDB._unindex_excluded_sources(cursor, rebuilt)
         # 'rebuild' indexes EVERY row, so any deferred-backfill markers are
         # now satisfied — clear them, otherwise the background worker would
         # re-insert rows the rebuild already covered (duplicate entries).
@@ -2472,7 +2804,7 @@ class SessionDB:
             # Run even when the virtual table exists so any dropped or missing
             # triggers are recreated after a previous no-FTS5 runtime disabled
             # them to keep message writes working.
-            cursor.executescript(ddl)
+            cursor.executescript(expand_fts_ddl(ddl))
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
@@ -2764,6 +3096,7 @@ class SessionDB:
                     "SELECT m.id, m.content, m.tool_name, m.tool_calls "
                     "FROM messages m "
                     "WHERE m.id > ? AND m.id <= ? "
+                    f"AND {FTS_SOURCE_NOT_EXCLUDED_FOR_BACKFILL} "
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
@@ -2772,6 +3105,7 @@ class SessionDB:
                     "SELECT m.id, m.content, m.tool_name, m.tool_calls "
                     "FROM messages m "
                     "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                    f"AND {FTS_SOURCE_NOT_EXCLUDED_FOR_BACKFILL} "
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
@@ -2866,16 +3200,19 @@ class SessionDB:
             upper = min(progress + chunk, high_water)
             conn.execute(
                 "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
-                "SELECT id, content, tool_name, tool_calls FROM messages "
-                "WHERE id > ? AND id <= ?",
+                "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                "FROM messages m WHERE m.id > ? AND m.id <= ? "
+                f"AND {FTS_SOURCE_NOT_EXCLUDED_FOR_BACKFILL}",
                 (progress, upper),
             )
             if include_trigram:
                 conn.execute(
                     "INSERT INTO messages_fts_trigram"
                     "(rowid, content, tool_name, tool_calls) "
-                    "SELECT id, content, tool_name, tool_calls FROM messages "
-                    "WHERE id > ? AND id <= ? AND role <> 'tool'",
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                    "FROM messages m WHERE m.id > ? AND m.id <= ? "
+                    "AND m.role <> 'tool' "
+                    f"AND {FTS_SOURCE_NOT_EXCLUDED_FOR_BACKFILL}",
                     (progress, upper),
                 )
             # Publish progress in the same transaction as the rows it
@@ -2941,8 +3278,10 @@ class SessionDB:
             upper = min(progress + chunk, high_water)
             conn.execute(
                 "INSERT INTO messages_fts_cjk(rowid, content, tool_name, tool_calls) "
-                "SELECT id, content, tool_name, tool_calls FROM messages "
-                "WHERE id > ? AND id <= ? AND role <> 'tool'",
+                "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                "FROM messages m WHERE m.id > ? AND m.id <= ? "
+                "AND m.role <> 'tool' "
+                f"AND {FTS_SOURCE_NOT_EXCLUDED_FOR_BACKFILL}",
                 (progress, upper),
             )
             conn.execute(
@@ -2979,6 +3318,7 @@ class SessionDB:
                     "SELECT m.id, m.content, m.tool_name, m.tool_calls "
                     "FROM messages m "
                     "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                    f"AND {FTS_SOURCE_NOT_EXCLUDED_FOR_BACKFILL} "
                     "AND NOT EXISTS (SELECT 1 FROM messages_fts_cjk_docsize d WHERE d.id = m.id)",
                     (lo, hi),
                 )
@@ -3747,6 +4087,10 @@ class SessionDB:
             pass  # Index already exists
 
         if fts5_available:
+            # Config-authoritative: reconcile the excluded-source marker from
+            # sessions.index_exclude_sources BEFORE the trigger DDL runs, so
+            # the very first write of this process already honors it.
+            self._sync_fts_exclude_sources(cursor)
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
@@ -3776,6 +4120,13 @@ class SessionDB:
                             cursor, include_trigram=trigram_enabled
                         )
             else:
+                # The trigger BODIES gained the source-exclusion predicate
+                # (sessions.index_exclude_sources). CREATE TRIGGER IF NOT
+                # EXISTS will not replace an older body, so drop the FTS
+                # triggers whose SQL predates it and let the ensure calls
+                # below recreate them. Triggers carry no index data, so this
+                # is pure schema surgery — nothing to rebuild.
+                self._drop_fts_triggers_missing_source_guard(cursor)
                 triggers_need_repair = (
                     self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
                 )
@@ -11056,6 +11407,9 @@ class SessionDB:
                     self._conn.execute(
                         f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
                     )
+                    # 'rebuild' repopulates from the full content source and
+                    # cannot filter, so re-apply sessions.index_exclude_sources.
+                    self._unindex_excluded_sources(self._conn, (tbl,))
                     self._conn.commit()
                     rebuilt += 1
                 except sqlite3.OperationalError as exc:
