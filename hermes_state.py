@@ -2514,6 +2514,46 @@ class SessionDB:
         )
         return True
 
+    @staticmethod
+    def _try_checkpoint_flock(db_path: Path):
+        """Attempt to acquire a cross-process exclusive flock for checkpointing.
+
+        Returns an open file handle on success (caller must close), or ``None``
+        when another process is already checkpointing (non-blocking).
+
+        Cross-process WAL checkpoint contention is the documented trigger for
+        ``malformed database schema`` on multi-process deployments (issue #73411):
+        two independent ``SessionDB`` instances (e.g. ``hermes serve`` + ``gateway
+        run``) each running ``PRAGMA wal_checkpoint(PASSIVE)`` on the same
+        ``state.db`` can corrupt the main DB file and FTS5 shadow tables.
+
+        The flock is best-effort — if unavailable, the caller should skip the
+        checkpoint and retry on the next periodic cadence.
+        """
+        try:
+            import fcntl
+        except ImportError:
+            # Windows: no flock — skip the guard and checkpoint directly.
+            # Windows uses a different locking model (file-share mode) that
+            # does not exhibit the same concurrent-checkpoint corruption.
+            return None  # No lock → let the caller proceed without gating.
+
+        lock_path = db_path.with_suffix(db_path.suffix + ".checkpoint.lock")
+        try:
+            fh = open(lock_path, "a", encoding="utf-8")
+        except OSError:
+            return None  # Cannot open lock file → skip checkpoint.
+
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            # Another process is already checkpointing — skip to avoid
+            # concurrent WAL checkpoint contention (issue #73411).
+            fh.close()
+            return None
+
+        return fh
+
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint.  Never raises.
 
@@ -2530,17 +2570,30 @@ class SessionDB:
         Previous TRUNCATE strategy caused B-tree corruption on large
         databases (65K+ pages) due to the exclusive-lock I/O pressure
         from checkpointing thousands of frames at once (issue #45383).
+
+        A cross-process ``flock`` gate prevents concurrent checkpoint
+        operations from separate ``SessionDB`` instances (e.g. ``hermes
+        serve`` + ``gateway run``) which can corrupt the main DB file
+        and FTS5 shadow tables (issue #73411).
         """
         try:
-            with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
-                if result and result[1] > 0:
-                    logger.debug(
-                        "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
-                    )
+            checkpoint_fh = self._try_checkpoint_flock(self.db_path)
+            if checkpoint_fh is None:
+                # Another process is checkpointing or flock unavailable —
+                # skip this cycle; will retry on the next write cadence.
+                return
+            try:
+                with self._lock:
+                    result = self._conn.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    ).fetchone()
+                    if result and result[1] > 0:
+                        logger.debug(
+                            "WAL checkpoint: %d/%d pages checkpointed",
+                            result[2], result[1],
+                        )
+            finally:
+                checkpoint_fh.close()
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 

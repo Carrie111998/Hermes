@@ -1,11 +1,15 @@
-"""Tests for SessionDB WAL checkpoint strategy (issue #45383).
+"""Tests for SessionDB WAL checkpoint strategy (issue #45383) and cross-process
+checkpoint contention guard (issue #73411).
 
-Verifies that periodic checkpoints use PASSIVE mode (safe for large DBs)
-while close() and pre-VACUUM paths still use TRUNCATE.
+Verifies that periodic checkpoints use PASSIVE mode (safe for large DBs),
+that a cross-process flock gate prevents concurrent checkpoint operations
+from separate SessionDB instances, and that close() / pre-VACUUM paths still
+use TRUNCATE.
 """
 
 import sqlite3
 import logging
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,9 +64,13 @@ class TestTryWalCheckpointPassive:
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
         db._conn = mock_conn
-
-        with caplog.at_level(logging.WARNING):
-            db._try_wal_checkpoint()
+        # Bypass the flock gate so we exercise the actual PRAGMA failure path.
+        fh = db._try_checkpoint_flock(db.db_path)
+        assert fh is not None, "flock gate must succeed in single-process test"
+        fh.close()
+        with patch.object(db, "_try_checkpoint_flock", return_value=fh):
+            with caplog.at_level(logging.WARNING):
+                db._try_wal_checkpoint()
 
         assert any("WAL checkpoint (PASSIVE) failed" in r.message for r in caplog.records), (
             f"Expected warning log about PASSIVE checkpoint failure, got: {caplog.text}"
@@ -71,6 +79,19 @@ class TestTryWalCheckpointPassive:
     def test_checkpoint_returns_result_on_success(self, db):
         """Successful PASSIVE checkpoint does not raise."""
         db._try_wal_checkpoint()
+
+    def test_checkpoint_skipped_when_flock_unavailable(self, db, caplog):
+        """When another process holds the checkpoint flock, checkpoint is skipped
+        silently (no warning) and no PRAGMA is issued."""
+        mock_conn = MagicMock()
+        db._conn = mock_conn
+        # Simulate another process holding the lock.
+        with patch.object(db, "_try_checkpoint_flock", return_value=None):
+            with caplog.at_level(logging.WARNING):
+                db._try_wal_checkpoint()
+            # No PRAGMA call, no warning.
+            mock_conn.execute.assert_not_called()
+            assert not any("WAL checkpoint" in r.message for r in caplog.records)
 
 
 class TestCloseUsesTruncate:
@@ -136,3 +157,64 @@ class TestCheckpointFrequency:
         assert call_count[0] == 1, (
             f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
         )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX-only")
+class TestCrossProcessCheckpointFlock:
+    """Real cross-process flock gate for WAL checkpoints (issue #73411)."""
+
+    def test_checkpoint_flock_allows_single_process(self, tmp_path):
+        """A lone process can acquire the checkpoint flock."""
+        db_path = tmp_path / "test.db"
+        fh = SessionDB._try_checkpoint_flock(db_path)
+        assert fh is not None
+        fh.close()
+
+    def test_checkpoint_flock_blocks_second_holder(self, tmp_path):
+        """When one fd holds the checkpoint flock, a second open() gets None."""
+        fcntl = pytest.importorskip("fcntl")
+        db_path = tmp_path / "test.db"
+        # Hold the lock on a raw fd (simulates another process).
+        lock_path = db_path.with_suffix(db_path.suffix + ".checkpoint.lock")
+        blocker_fh = open(lock_path, "a", encoding="utf-8")
+        fcntl.flock(blocker_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            # Same-process second fd contends because flock is per-open-fd.
+            result = SessionDB._try_checkpoint_flock(db_path)
+            assert result is None, (
+                "Expected None when checkpoint flock is already held"
+            )
+        finally:
+            fcntl.flock(blocker_fh.fileno(), fcntl.LOCK_UN)
+            blocker_fh.close()
+
+    def test_checkpoint_flock_released_after_close(self, tmp_path):
+        """Releasing the flock allows the next holder to acquire it."""
+        db_path = tmp_path / "test.db"
+        fh1 = SessionDB._try_checkpoint_flock(db_path)
+        assert fh1 is not None
+        fh1.close()
+        fh2 = SessionDB._try_checkpoint_flock(db_path)
+        assert fh2 is not None, (
+            "Flock should be acquirable after the first holder closes"
+        )
+        fh2.close()
+
+    def test_checkpoint_flock_releases_lock_on_close(self, tmp_path):
+        """Closing the flock fd releases the exclusive lock."""
+        fcntl = pytest.importorskip("fcntl")
+        db_path = tmp_path / "test.db"
+        fh = SessionDB._try_checkpoint_flock(db_path)
+        assert fh is not None
+        fh.close()
+        # After close, another fd should be able to acquire immediately.
+        fh2 = open(
+            db_path.with_suffix(db_path.suffix + ".checkpoint.lock"),
+            "a",
+            encoding="utf-8",
+        )
+        try:
+            fcntl.flock(fh2.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            fcntl.flock(fh2.fileno(), fcntl.LOCK_UN)
+            fh2.close()
