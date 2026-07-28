@@ -6069,6 +6069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_notification_batch_tasks: dict = {}
         self._completion_notification_batch_lock = threading.Lock()
         self._completion_notification_batch_window = 0.1
+        self._batch_window_sleep = asyncio.sleep
         self._completion_route_keys: dict[str, tuple] = {}
         self._completion_entry_data: dict[str, tuple] = {}
 
@@ -22695,7 +22696,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         claimed: list[dict] = []
 
         try:
-            await asyncio.sleep(self._completion_notification_batch_window)
+            await self._batch_window_sleep(self._completion_notification_batch_window)
 
             if self._completion_notification_batch_tasks.get(key) is current_task:
                 self._completion_notification_batch_tasks.pop(key, None)
