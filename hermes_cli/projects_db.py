@@ -413,6 +413,32 @@ def get_project(
     return _attach_folders(conn, _project_from_row(row))
 
 
+def get_active_project_for_board(
+    conn: sqlite3.Connection, board_slug: str
+) -> Optional[Project]:
+    """Return the sole active project bound to ``board_slug``, if any.
+
+    A board may have no project binding for backwards compatibility, but two
+    active bindings are ambiguous and must never be resolved by creation
+    order.
+    """
+    normalized_board = normalize_slug(board_slug)
+    if normalized_board is None:
+        return None
+    rows = conn.execute(
+        "SELECT * FROM projects WHERE archived = 0 AND board_slug = ? "
+        "ORDER BY created_at ASC, id ASC",
+        (normalized_board,),
+    ).fetchall()
+    if len(rows) > 1:
+        raise ValueError(
+            f"ambiguous active project binding for board {normalized_board!r}"
+        )
+    if not rows:
+        return None
+    return _attach_folders(conn, _project_from_row(rows[0]))
+
+
 def update_project(
     conn: sqlite3.Connection,
     project_id: str,

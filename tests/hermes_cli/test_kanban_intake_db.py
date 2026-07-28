@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_intake as intake
+from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
@@ -793,6 +794,204 @@ def test_handoff_v2_materializes_executable_card_with_canonical_worktree(
         assert task.workspace_path is None
     finally:
         connection.close()
+
+
+def test_project_bound_standalone_card_materializes_with_canonical_project_worktree(
+    tmp_path, monkeypatch
+):
+    board = "strict-project-bound-card"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+    repo = tmp_path / "project-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Qualification Project",
+            primary_path=str(repo),
+            board_slug=board,
+        )
+        project = pdb.get_project(project_conn, project_id)
+
+    # Qualification runs under the product-owner profile, while the board's
+    # first-class Project binding belongs to the default control-plane profile.
+    profile_home = tmp_path / ".hermes" / "profiles" / "productowner"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_card(connection, board)
+        task = kb.get_task(connection, task_id)
+
+    assert task is not None
+    assert project is not None
+    assert task.project_id == project.id
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo / ".worktrees" / task_id)
+    assert task.branch_name == f"{project.slug}/{task_id}-qualified-card"
+
+
+def test_project_bound_epic_story_materializes_with_canonical_project_worktree(
+    tmp_path, monkeypatch
+):
+    board = "strict-project-bound-epic"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+    repo = tmp_path / "project-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Qualification Epic Project",
+            primary_path=str(repo),
+            board_slug=board,
+        )
+        project = pdb.get_project(project_conn, project_id)
+
+    with kb.connect(board=board) as connection:
+        request_id = kb.create_qualification_intake(
+            connection,
+            raw_request="qualified epic with a story",
+            source="hermes",
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["work"]["item_kind"] = "epic"
+        contract["work"]["title"] = "Qualified Epic"
+        contract["routing"] = {
+            "entry_phase": None,
+            "assignee": None,
+            "epic_id": None,
+            "dependencies": [],
+        }
+        contract["handover"]["next_phase"] = None
+        contract["handover"]["next_role"] = None
+        contract["stories"] = [
+            {
+                "title": "Qualified Story",
+                "outcome": "safe story execution",
+                "scope": [],
+                "out_of_scope": [],
+                "done_when": [],
+                "depends_on": [],
+            }
+        ]
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        epic_id = intake.materialize_contract(
+            connection,
+            board=board,
+            signed_contract=signed,
+            secret=b"test-only-secret",
+        )
+        epic = kb.get_task(connection, epic_id)
+        story_id = connection.execute(
+            "SELECT task_id FROM epic_memberships WHERE epic_id = ?",
+            (epic_id,),
+        ).fetchone()["task_id"]
+        story = kb.get_task(connection, story_id)
+
+    assert epic is not None
+    assert project is not None
+    assert epic.project_id is None
+    assert story is not None
+    assert story.project_id == project.id
+    assert story.workspace_kind == "worktree"
+    assert story.workspace_path == str(repo / ".worktrees" / story_id)
+    assert story.branch_name == f"{project.slug}/{story_id}-qualified-story"
+
+
+def test_projectless_strict_materialization_remains_unlinked(tmp_path, monkeypatch):
+    board = "strict-projectless-compat"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_card(connection, board)
+        task = kb.get_task(connection, task_id)
+
+    assert task is not None
+    assert task.project_id is None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path is None
+    assert task.branch_name is None
+
+
+def test_bound_project_without_primary_path_rejects_materialization(
+    tmp_path, monkeypatch
+):
+    board = "strict-project-without-path"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+    with pdb.connect_closing() as project_conn:
+        pdb.create_project(
+            project_conn,
+            name="Unworkable Qualification Project",
+            board_slug=board,
+        )
+
+    with kb.connect(board=board) as connection:
+        request_id = kb.create_qualification_intake(
+            connection,
+            raw_request="project has no checkout",
+            source="hermes",
+            attachments=[
+                {"name": "backlog-artifact"},
+                {"name": "architecture-artifact"},
+            ],
+        )
+        with pytest.raises(intake.WorkContractError, match="primary path"):
+            intake.materialize_contract(
+                connection,
+                board=board,
+                signed_contract=_signed_contract(request_id),
+                secret=b"test-only-secret",
+            )
+
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "pending"
+        assert kb.list_qualification_decisions(connection, request_id) == []
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_ambiguous_project_binding_rejects_materialization_and_rolls_back(
+    tmp_path, monkeypatch
+):
+    board = "strict-ambiguous-project-binding"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+    repo = tmp_path / "project-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        pdb.create_project(
+            project_conn,
+            name="First Qualification Project",
+            primary_path=str(repo),
+            board_slug=board,
+        )
+        pdb.create_project(
+            project_conn,
+            name="Second Qualification Project",
+            primary_path=str(repo),
+            board_slug=board,
+        )
+
+    with kb.connect(board=board) as connection:
+        request_id = kb.create_qualification_intake(
+            connection,
+            raw_request="ambiguous project binding",
+            source="hermes",
+            attachments=[
+                {"name": "backlog-artifact"},
+                {"name": "architecture-artifact"},
+            ],
+        )
+        with pytest.raises(ValueError, match="ambiguous.*project"):
+            intake.materialize_contract(
+                connection,
+                board=board,
+                signed_contract=_signed_contract(request_id),
+                secret=b"test-only-secret",
+            )
+
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "pending"
+        assert kb.list_qualification_decisions(connection, request_id) == []
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_materialized_worker_and_show_receive_the_signed_work_contract(

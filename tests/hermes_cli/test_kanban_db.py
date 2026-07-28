@@ -829,6 +829,13 @@ def _route_task_to_resolver(
         current_step_key=step,
         board=board,
     )
+    return _route_existing_task_to_resolver(conn, tid, board, step=step)
+
+
+def _route_existing_task_to_resolver(
+    conn, task_id: str, board: str, *, step: str = "development"
+) -> tuple[str, int]:
+    tid = task_id
     first = kb.claim_task(conn, tid)
     assert first is not None and first.current_run_id is not None
     assert kb.block_task(
@@ -1271,6 +1278,96 @@ def test_resolver_repair_derives_project_worktree_and_branch(kanban_home, tmp_pa
     assert task.workspace_kind == "worktree"
     assert task.workspace_path == str(repo / ".worktrees" / tid)
     assert task.branch_name.startswith("resolver-project/")
+
+
+def test_resolver_project_adoption_preserves_existing_canonical_worktree(
+    kanban_home, tmp_path, monkeypatch
+):
+    board = "resolver-project-adoption"
+    shared_board_home = tmp_path / "shared-board-root"
+    shared_board_home.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(shared_board_home))
+    repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
+    resolver_home = kanban_home / "profiles" / "resolver"
+    resolver_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(resolver_home))
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Legacy project adoption",
+            assignee="developer",
+            workspace_kind="worktree",
+            board=board,
+        )
+        existing_workspace = repo / ".worktrees" / tid
+        existing_workspace.mkdir(parents=True)
+        kb.set_workspace_path(conn, tid, existing_workspace)
+        kb.set_branch_name(conn, tid, f"wt/{tid}")
+        _tid, run_id = _route_existing_task_to_resolver(conn, tid, board)
+
+        assert kb.resolve_product_preflight(
+            conn,
+            tid,
+            board=board,
+            request=_resolver_request(
+                _resolver_expected(conn, tid, run_id),
+                decision="repair",
+                repair={"workflow": {"project_id": project_id}},
+            ),
+            resolver_profile="resolver",
+            resolver_model=None,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.project_id == project_id
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(existing_workspace)
+    assert task.branch_name == f"wt/{tid}"
+
+
+def test_resolver_project_adoption_rewrites_unsafe_workspace_path(
+    kanban_home, tmp_path, monkeypatch
+):
+    from hermes_cli import projects_db as pdb
+
+    board = "resolver-project-unsafe-adoption"
+    repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Unsafe project adoption",
+            assignee="developer",
+            workspace_kind="worktree",
+            board=board,
+        )
+        monkeypatch.chdir(repo)
+        unsafe_workspace = Path(".worktrees") / tid
+        kb.set_workspace_path(conn, tid, unsafe_workspace)
+        kb.set_branch_name(conn, tid, f"wt/{tid}")
+        _tid, run_id = _route_existing_task_to_resolver(conn, tid, board)
+
+        assert kb.resolve_product_preflight(
+            conn,
+            tid,
+            board=board,
+            request=_resolver_request(
+                _resolver_expected(conn, tid, run_id),
+                decision="repair",
+                repair={"workflow": {"project_id": project_id}},
+            ),
+            resolver_profile="resolver",
+            resolver_model=None,
+        )
+        task = kb.get_task(conn, tid)
+    with pdb.connect_closing() as project_conn:
+        project = pdb.get_project(project_conn, project_id)
+
+    assert task is not None
+    assert project is not None
+    assert task.project_id == project_id
+    assert task.workspace_path == str(repo / ".worktrees" / tid)
+    assert task.branch_name == f"{project.slug}/{tid}-unsafe-project-adoption"
 
 
 def test_resolver_repair_rejects_phase_assignee_mismatch(kanban_home):
