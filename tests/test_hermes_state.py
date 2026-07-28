@@ -7185,7 +7185,7 @@ def test_gateway_routing_replace_preserves_rows_newer_than_snapshot(db):
 
     db._execute_write(seed_rows)
 
-    db.replace_gateway_routing_entries_preserving_newer(
+    db.replace_gateway_routing_entries(
         {
             "old-key": '{"session_id":"replacement"}',
             "same-key": '{"session_id":"stale-snapshot"}',

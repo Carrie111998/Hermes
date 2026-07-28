@@ -3410,33 +3410,24 @@ class SessionDB:
         self._execute_write(_do)
 
     def replace_gateway_routing_entries(
-        self, entries: Dict[str, str], *, scope: str = ""
-    ) -> None:
-        """Atomically replace the routing index for *scope* with *entries*.
-
-        Mirrors the sessions.json full-rewrite semantics: keys absent from
-        *entries* are removed (pruned/reset sessions disappear from the
-        index).  Runs as a single write transaction.  Other scopes are
-        untouched.
-        """
-        self.replace_gateway_routing_entries_preserving_newer(
-            entries, scope=scope, snapshot_at=None
-        )
-
-    def replace_gateway_routing_entries_preserving_newer(
         self,
         entries: Dict[str, str],
         *,
         scope: str = "",
         snapshot_at: Optional[float] = None,
     ) -> None:
-        """Replace routing rows while preserving concurrent newer handoffs.
+        """Atomically replace routing rows while preserving newer handoffs.
+
+        Mirrors the sessions.json full-rewrite semantics: keys absent from
+        *entries* are removed (pruned/reset sessions disappear from the
+        index).  Runs as a single write transaction.  Other scopes are
+        untouched.
 
         ``SessionStore`` whole-index saves are based on an in-memory snapshot.
         Out-of-band handoffs can commit newer durable routes between that
-        snapshot and this write.  Keep any existing row whose ``updated_at`` is
+        snapshot and this write. Keep any existing row whose ``updated_at`` is
         newer than the snapshot timestamp, so a stale whole-index writer cannot
-        delete or rewind routes it did not observe.  When ``snapshot_at`` is
+        delete or rewind routes it did not observe. When ``snapshot_at`` is
         ``None`` this is an ordinary full replacement for compatibility.
         """
         now = time.time()

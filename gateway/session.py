@@ -1312,11 +1312,7 @@ class SessionStore:
             db_saved = False
             _db = getattr(self, "_db", None)
             if _db:
-                replacer = getattr(
-                    _db, "replace_gateway_routing_entries_preserving_newer", None
-                )
-                if not callable(replacer):
-                    replacer = getattr(_db, "replace_gateway_routing_entries", None)
+                replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
                     try:
                         entries_json = {k: json.dumps(v) for k, v in data.items()}
