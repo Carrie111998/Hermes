@@ -163,11 +163,20 @@ def create_clawops_task(
     idempotency_key: str = "",
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    executor_backend: str = "hermes",
+    executor_profile: Optional[str] = None,
 ) -> ClawOpsTask:
     """Create a Hermes-owned ClawOps task in the existing kanban queue."""
     clean_objective = (objective or "").strip()
     if not clean_objective:
         raise ValueError("objective is required")
+    clean_executor_backend = str(executor_backend or "").strip().lower()
+    if clean_executor_backend != "hermes":
+        raise ValueError(
+            "create_clawops_task only admits Hermes-owned work; external "
+            "backends must use their dedicated start adapter so the task and "
+            "executable run are created atomically."
+        )
 
     enriched_source = infer_clawops_metadata(clean_objective, source=source)
     normalized_contract = (
@@ -303,6 +312,9 @@ def create_clawops_task(
             initial_status=initial_status,
             session_id=(session_id or "").strip() or None,
             idempotency_key=idempotency_key.strip() or None,
+            executor_backend=clean_executor_backend,
+            executor_profile=executor_profile,
+            project_namespace=str(enriched_source.get("project") or "").strip() or None,
         )
         row = kb.get_task(conn, task_id)
         status = str(row.status if row else "ready")

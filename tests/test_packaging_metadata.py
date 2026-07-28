@@ -78,6 +78,28 @@ def test_every_on_disk_subpackage_is_covered_by_packages_find():
     )
 
 
+def test_proactive_runtime_is_included_in_wheel_packages():
+    """Gateway imports proactive workers after source-checkout bootstrap.
+
+    Editable installs can therefore hide a missing wheel package. Production
+    wheels must carry the same proactive runtime used by ClawOps and the
+    execution-backend poller.
+    """
+    include = _packages_find_include()
+    selected = set(find_packages(where=str(REPO_ROOT), include=include))
+
+    assert "proactive" in selected
+
+
+def test_execution_backend_registry_is_included_in_wheel_package_data():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "execution-backends.yaml" in data["tool"]["setuptools"]["package-data"][
+        "proactive"
+    ]
+    assert (REPO_ROOT / "proactive" / "execution-backends.yaml").is_file()
+
+
 def test_packaging_declared_as_core_dependency():
     """Regression for #40503.
 
@@ -264,4 +286,3 @@ def test_locale_catalogs_ship_in_both_wheel_and_sdist():
     # Every on-disk catalog has the .yaml extension the globs above match.
     on_disk = list((REPO_ROOT / "locales").glob("*.yaml"))
     assert on_disk, "expected locales/*.yaml catalogs on disk"
-

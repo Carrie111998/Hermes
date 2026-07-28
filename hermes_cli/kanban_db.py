@@ -135,6 +135,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_EXECUTOR_BACKENDS = {"hermes", "codex", "openclaw"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -944,6 +945,43 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+def _load_json_object(value: object) -> Optional[dict]:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _legacy_routing_decision(executor_backend: object) -> dict[str, Any]:
+    backend = str(executor_backend or "hermes").strip().lower() or "hermes"
+    return {
+        "version": 1,
+        "mode": "legacy_explicit",
+        "selected_backend": backend,
+        "selection_reason": "task creator explicitly selected the backend",
+        "candidates": [
+            {
+                "backend": backend,
+                "eligible": True,
+                "reasons": ["explicit_task_backend"],
+            }
+        ],
+        "fallback_order": [],
+    }
+
+
+def _canonical_json(value: Mapping[str, Any]) -> str:
+    return json.dumps(
+        dict(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1023,6 +1061,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Execution backend selected by ClawOps. ``hermes`` preserves all legacy
+    # dispatcher behavior; external backends bind their own run/session ids to
+    # the corresponding task_runs attempt.
+    executor_backend: str = "hermes"
+    executor_profile: Optional[str] = None
+    project_namespace: Optional[str] = None
+    routing_decision: Optional[dict] = None
     # Ephemeral bearer credential for this exact claimed run. The dispatcher
     # stores only its SHA-256 digest in task_runs.metadata and passes the raw
     # value to the child process. It is never persisted on the task row.
@@ -1111,6 +1156,22 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            executor_backend=(
+                row["executor_backend"]
+                if "executor_backend" in keys and row["executor_backend"]
+                else "hermes"
+            ),
+            executor_profile=(
+                row["executor_profile"] if "executor_profile" in keys else None
+            ),
+            project_namespace=(
+                row["project_namespace"] if "project_namespace" in keys else None
+            ),
+            routing_decision=(
+                _load_json_object(row["routing_decision"])
+                if "routing_decision" in keys and row["routing_decision"]
+                else None
+            ),
         )
 
 
@@ -1141,6 +1202,21 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    executor_backend: str = "hermes"
+    backend_run_id: Optional[str] = None
+    backend_agent_id: Optional[str] = None
+    protocol_version: Optional[str] = None
+    result_digest: Optional[str] = None
+    workspace_ref: Optional[str] = None
+    routing_decision: Optional[dict] = None
+    backend_status: Optional[str] = None
+    backend_updated_at: Optional[int] = None
+    backend_poll_count: int = 0
+    backend_next_poll_at: Optional[int] = None
+    backend_poll_owner: Optional[str] = None
+    backend_poll_lease_until: Optional[int] = None
+    backend_last_polled_at: Optional[int] = None
+    backend_last_error: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1165,6 +1241,69 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            executor_backend=(
+                row["executor_backend"]
+                if "executor_backend" in row.keys() and row["executor_backend"]
+                else "hermes"
+            ),
+            backend_run_id=(
+                row["backend_run_id"] if "backend_run_id" in row.keys() else None
+            ),
+            backend_agent_id=(
+                row["backend_agent_id"] if "backend_agent_id" in row.keys() else None
+            ),
+            protocol_version=(
+                row["protocol_version"] if "protocol_version" in row.keys() else None
+            ),
+            result_digest=(
+                row["result_digest"] if "result_digest" in row.keys() else None
+            ),
+            workspace_ref=(
+                row["workspace_ref"] if "workspace_ref" in row.keys() else None
+            ),
+            routing_decision=(
+                _load_json_object(row["routing_decision"])
+                if "routing_decision" in row.keys() and row["routing_decision"]
+                else None
+            ),
+            backend_status=(
+                row["backend_status"] if "backend_status" in row.keys() else None
+            ),
+            backend_updated_at=(
+                row["backend_updated_at"]
+                if "backend_updated_at" in row.keys()
+                else None
+            ),
+            backend_poll_count=(
+                int(row["backend_poll_count"] or 0)
+                if "backend_poll_count" in row.keys()
+                else 0
+            ),
+            backend_next_poll_at=(
+                row["backend_next_poll_at"]
+                if "backend_next_poll_at" in row.keys()
+                else None
+            ),
+            backend_poll_owner=(
+                row["backend_poll_owner"]
+                if "backend_poll_owner" in row.keys()
+                else None
+            ),
+            backend_poll_lease_until=(
+                row["backend_poll_lease_until"]
+                if "backend_poll_lease_until" in row.keys()
+                else None
+            ),
+            backend_last_polled_at=(
+                row["backend_last_polled_at"]
+                if "backend_last_polled_at" in row.keys()
+                else None
+            ),
+            backend_last_error=(
+                row["backend_last_error"]
+                if "backend_last_error" in row.keys()
+                else None
+            ),
         )
 
 
@@ -1288,7 +1427,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    executor_backend     TEXT NOT NULL DEFAULT 'hermes',
+    executor_profile     TEXT,
+    project_namespace    TEXT,
+    routing_decision     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1340,7 +1483,33 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    executor_backend    TEXT NOT NULL DEFAULT 'hermes',
+    backend_run_id      TEXT,
+    backend_agent_id    TEXT,
+    protocol_version    TEXT,
+    result_digest       TEXT,
+    workspace_ref       TEXT,
+    routing_decision    TEXT,
+    backend_status      TEXT,
+    backend_updated_at  INTEGER,
+    backend_poll_count  INTEGER NOT NULL DEFAULT 0,
+    backend_next_poll_at INTEGER,
+    backend_poll_owner TEXT,
+    backend_poll_lease_until INTEGER,
+    backend_last_polled_at INTEGER,
+    backend_last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS execution_backend_circuits (
+    backend_id           TEXT PRIMARY KEY,
+    state                TEXT NOT NULL DEFAULT 'closed',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    failure_epoch_generation INTEGER,
+    opened_until         INTEGER,
+    last_error           TEXT,
+    updated_at           INTEGER NOT NULL,
+    generation           INTEGER NOT NULL DEFAULT 0
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2081,15 +2250,17 @@ def init_db(
 
 def _migrate_external_effect_keys(conn: sqlite3.Connection) -> None:
     """Rebuild the external-effect ledger with a per-object effect key."""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    # Optional-column migrations may already have opened SQLite's implicit
+    # transaction before this one-shot rebuild runs. ``write_txn`` acquires
+    # BEGIN IMMEDIATE for a clean connection and a SAVEPOINT when nested, so
+    # both direct tests and real legacy-board upgrades remain atomic.
+    with write_txn(conn):
         # Inspect only after acquiring the writer lock. A second process may
         # have completed this rebuild while this connection was waiting.
         info = conn.execute(
             "PRAGMA table_info(task_external_effects)"
         ).fetchall()
         if not info:
-            conn.execute("COMMIT")
             return
         pk_columns = [
             row["name"]
@@ -2102,7 +2273,6 @@ def _migrate_external_effect_keys(conn: sqlite3.Connection) -> None:
             "effect_key" in {row["name"] for row in info}
             and pk_columns == ["task_id", "platform", "effect_key"]
         ):
-            conn.execute("COMMIT")
             return
         conn.execute(
             "ALTER TABLE task_external_effects "
@@ -2140,13 +2310,6 @@ def _migrate_external_effect_keys(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_external_effects_state "
             "ON task_external_effects(task_id, state)"
         )
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            pass
-        raise
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -2286,6 +2449,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "executor_backend" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "executor_backend",
+            "executor_backend TEXT NOT NULL DEFAULT 'hermes'",
+        )
+    if "executor_profile" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "executor_profile", "executor_profile TEXT"
+        )
+    if "project_namespace" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "project_namespace", "project_namespace TEXT"
+        )
+    if "routing_decision" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "routing_decision", "routing_decision TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2300,6 +2483,119 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    current_task_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if {"executor_backend", "status"}.issubset(current_task_cols):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_executor_backend "
+            "ON tasks(executor_backend, status)"
+        )
+
+    runs_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone()
+    if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        for column, definition in (
+            (
+                "executor_backend",
+                "executor_backend TEXT NOT NULL DEFAULT 'hermes'",
+            ),
+            ("backend_run_id", "backend_run_id TEXT"),
+            ("backend_agent_id", "backend_agent_id TEXT"),
+            ("protocol_version", "protocol_version TEXT"),
+            ("result_digest", "result_digest TEXT"),
+            ("workspace_ref", "workspace_ref TEXT"),
+            ("routing_decision", "routing_decision TEXT"),
+            ("backend_status", "backend_status TEXT"),
+            ("backend_updated_at", "backend_updated_at INTEGER"),
+            (
+                "backend_poll_count",
+                "backend_poll_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("backend_next_poll_at", "backend_next_poll_at INTEGER"),
+            ("backend_poll_owner", "backend_poll_owner TEXT"),
+            ("backend_poll_lease_until", "backend_poll_lease_until INTEGER"),
+            ("backend_last_polled_at", "backend_last_polled_at INTEGER"),
+            ("backend_last_error", "backend_last_error TEXT"),
+        ):
+            if column not in run_cols:
+                _add_column_if_missing(conn, "task_runs", column, definition)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_backend_run "
+            "ON task_runs(executor_backend, backend_run_id) "
+            "WHERE backend_run_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_runs_backend_poll "
+            "ON task_runs(backend_status, backend_next_poll_at) "
+            "WHERE ended_at IS NULL"
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_backend_circuits (
+            backend_id           TEXT PRIMARY KEY,
+            state                TEXT NOT NULL DEFAULT 'closed',
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            failure_epoch_generation INTEGER,
+            opened_until         INTEGER,
+            last_error           TEXT,
+            updated_at           INTEGER NOT NULL,
+            generation           INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    circuit_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(execution_backend_circuits)")
+    }
+    if "generation" not in circuit_cols:
+        _add_column_if_missing(
+            conn,
+            "execution_backend_circuits",
+            "generation",
+            "generation INTEGER NOT NULL DEFAULT 0",
+        )
+    if "failure_epoch_generation" not in circuit_cols:
+        _add_column_if_missing(
+            conn,
+            "execution_backend_circuits",
+            "failure_epoch_generation",
+            "failure_epoch_generation INTEGER",
+        )
+
+    # Every task and historical attempt must be explainable after migration,
+    # including records created before the backend router existed.
+    unrouted_tasks = conn.execute(
+        "SELECT id, executor_backend FROM tasks "
+        "WHERE routing_decision IS NULL OR routing_decision = ''"
+    ).fetchall()
+    for row in unrouted_tasks:
+        conn.execute(
+            "UPDATE tasks SET routing_decision = ? WHERE id = ?",
+            (
+                _canonical_json(
+                    _legacy_routing_decision(row["executor_backend"])
+                ),
+                row["id"],
+            ),
+        )
+    if runs_exist:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET routing_decision = (
+                   SELECT tasks.routing_decision
+                     FROM tasks
+                    WHERE tasks.id = task_runs.task_id
+               )
+             WHERE routing_decision IS NULL OR routing_decision = ''
+            """
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2426,7 +2722,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if runs_exist:
         with write_txn(conn):
             inflight = conn.execute(
-                "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                "SELECT id, assignee, executor_backend, routing_decision, "
+                "       claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
                 "WHERE status = 'running' AND current_run_id IS NULL"
@@ -2436,14 +2733,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 cur = conn.execute(
                     """
                     INSERT INTO task_runs (
-                        task_id, profile, status,
+                        task_id, profile, executor_backend, routing_decision, status,
                         claim_lock, claim_expires, worker_pid,
                         max_runtime_seconds, last_heartbeat_at,
                         started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        row["id"], row["assignee"], row["claim_lock"],
+                        row["id"], row["assignee"],
+                        row["executor_backend"] or "hermes",
+                        row["routing_decision"],
+                        row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
                         started,
@@ -2703,6 +3003,19 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    if conn.in_transaction:
+        savepoint = f"kanban_nested_{secrets.token_hex(8)}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield conn
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return
+
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -2795,6 +3108,10 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    executor_backend: str = "hermes",
+    executor_profile: Optional[str] = None,
+    project_namespace: Optional[str] = None,
+    routing_decision: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2831,6 +3148,29 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    executor_backend = str(executor_backend or "hermes").strip().lower()
+    if executor_backend not in VALID_EXECUTOR_BACKENDS:
+        raise ValueError(
+            "executor_backend must be one of "
+            f"{sorted(VALID_EXECUTOR_BACKENDS)}, got {executor_backend!r}"
+        )
+    executor_profile = str(executor_profile or "").strip() or None
+    project_namespace = str(project_namespace or "").strip() or None
+    routing_decision_json: Optional[str] = None
+    if routing_decision is not None:
+        if not isinstance(routing_decision, Mapping):
+            raise ValueError("routing_decision must be a mapping")
+        selected_backend = str(
+            routing_decision.get("selected_backend") or ""
+        ).strip()
+        if selected_backend and selected_backend != executor_backend:
+            raise ValueError(
+                "routing_decision.selected_backend must match executor_backend"
+            )
+        routing_decision_json = _canonical_json(routing_decision)
+    else:
+        routing_decision = _legacy_routing_decision(executor_backend)
+        routing_decision_json = _canonical_json(routing_decision)
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -3023,8 +3363,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        executor_backend, executor_profile, project_namespace,
+                        routing_decision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3047,6 +3389,10 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        executor_backend,
+                        executor_profile,
+                        project_namespace,
+                        routing_decision_json,
                     ),
                 )
                 for pid in parents:
@@ -3092,6 +3438,10 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "executor_backend": executor_backend,
+                        "executor_profile": executor_profile,
+                        "project_namespace": project_namespace,
+                        "routing_decision": dict(routing_decision),
                     },
                 )
             return task_id
@@ -4371,7 +4721,8 @@ def _end_run(
     now = int(time.time())
     row = conn.execute(
         """
-        SELECT tasks.current_run_id, task_runs.metadata
+        SELECT tasks.current_run_id, task_runs.metadata,
+               task_runs.executor_backend
           FROM tasks
           LEFT JOIN task_runs ON task_runs.id = tasks.current_run_id
          WHERE tasks.id = ?
@@ -4392,7 +4743,16 @@ def _end_run(
     # immutable spawn audit across the terminal transition, then layer it on
     # top so worker-supplied metadata cannot rewrite startup evidence.
     spawn_audit = prior_metadata.get("worker_spawn")
-    merged_metadata = dict(metadata) if metadata else {}
+    merged_metadata = (
+        {
+            **(
+                prior_metadata
+                if str(row["executor_backend"] or "hermes") != "hermes"
+                else {}
+            ),
+            **(dict(metadata) if metadata else {}),
+        }
+    )
     if isinstance(spawn_audit, dict):
         merged_metadata["worker_spawn"] = spawn_audit
     conn.execute(
@@ -4462,7 +4822,8 @@ def _synthesize_ended_run(
     """
     now = int(time.time())
     trow = conn.execute(
-        "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
+        "SELECT assignee, current_step_key, executor_backend, routing_decision "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     profile = trow["assignee"] if trow else None
@@ -4470,14 +4831,16 @@ def _synthesize_ended_run(
     cur = conn.execute(
         """
         INSERT INTO task_runs (
-            task_id, profile, step_key,
+            task_id, profile, step_key, executor_backend, routing_decision,
             status, outcome,
             summary, error, metadata,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key,
+            trow["executor_backend"] if trow else "hermes",
+            trow["routing_decision"] if trow else None,
             outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
@@ -4851,7 +5214,8 @@ def claim_task(
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, executor_backend, "
+            "       routing_decision "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4859,15 +5223,17 @@ def claim_task(
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
-                task_id, profile, step_key, status,
+                task_id, profile, step_key, executor_backend, routing_decision, status,
                 claim_lock, claim_expires, max_runtime_seconds,
                 started_at, metadata
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
                 trow["assignee"] if trow else None,
                 trow["current_step_key"] if trow else None,
+                trow["executor_backend"] if trow else "hermes",
+                trow["routing_decision"] if trow else None,
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
@@ -4937,7 +5303,8 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, executor_backend, "
+            "       routing_decision "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4945,15 +5312,17 @@ def claim_review_task(
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
-                task_id, profile, step_key, status,
+                task_id, profile, step_key, executor_backend, routing_decision, status,
                 claim_lock, claim_expires, max_runtime_seconds,
                 started_at, metadata
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
                 trow["assignee"] if trow else None,
                 trow["current_step_key"] if trow else None,
+                trow["executor_backend"] if trow else "hermes",
+                trow["routing_decision"] if trow else None,
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
@@ -5007,6 +5376,77 @@ def heartbeat_claim(
                 )
             return True
         return False
+
+
+def renew_external_backend_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    ttl_seconds: Optional[int] = None,
+) -> bool:
+    """Renew the exact active external run's claim and liveness heartbeat."""
+    expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT t.claim_lock, t.executor_backend
+              FROM tasks t
+              JOIN task_runs r ON r.id = t.current_run_id
+             WHERE t.id = ?
+               AND t.status = 'running'
+               AND t.current_run_id = ?
+               AND r.id = ?
+               AND r.ended_at IS NULL
+            """,
+            (task_id, int(expected_run_id), int(expected_run_id)),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["executor_backend"] or "hermes") == "hermes"
+            or not str(row["claim_lock"] or "").strip()
+        ):
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET claim_expires = ?,
+                   last_heartbeat_at = ?
+             WHERE id = ?
+               AND status = 'running'
+               AND current_run_id = ?
+               AND claim_lock = ?
+            """,
+            (
+                expires,
+                now,
+                task_id,
+                int(expected_run_id),
+                row["claim_lock"],
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET claim_expires = ?,
+                   last_heartbeat_at = ?
+             WHERE id = ?
+               AND task_id = ?
+               AND ended_at IS NULL
+            """,
+            (expires, now, int(expected_run_id), task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "backend_heartbeat",
+            {"claim_expires": expires},
+            run_id=int(expected_run_id),
+        )
+        return True
 
 
 def release_stale_claims(
@@ -8711,7 +9151,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND executor_backend = 'hermes'"
     ).fetchall()
     if not rows:
         return False
@@ -8737,7 +9177,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND executor_backend = 'hermes'"
     ).fetchall()
     if not rows:
         return False
@@ -8906,6 +9346,7 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        "AND executor_backend = 'hermes' "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -8940,6 +9381,7 @@ def _dispatch_once_locked(
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
+            "AND executor_backend = 'hermes' "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
@@ -9158,6 +9600,7 @@ def _dispatch_once_locked(
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
+        "AND executor_backend = 'hermes' "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
@@ -12656,6 +13099,936 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
         "SELECT * FROM task_runs WHERE id = ?", (int(run_id),),
     ).fetchone()
     return Run.from_row(row) if row else None
+
+
+def merge_active_run_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Merge durable correlation metadata into one exact active attempt."""
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT metadata
+              FROM task_runs
+             WHERE id = ? AND task_id = ? AND ended_at IS NULL
+            """,
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if not row:
+            return False
+        current = _load_json_object(row["metadata"]) or {}
+        current.update(dict(metadata))
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (_canonical_json(current), int(expected_run_id)),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "run_metadata_merged",
+            {"keys": sorted(str(key) for key in metadata)},
+            run_id=int(expected_run_id),
+        )
+        return True
+
+
+def bind_backend_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    backend_run_id: str,
+    backend_agent_id: str,
+    protocol_version: str,
+    workspace_ref: Optional[str] = None,
+    result_digest: Optional[str] = None,
+) -> bool:
+    """Bind one external executor run to the exact active Kanban attempt.
+
+    The current-run compare-and-set prevents a late OpenClaw response from
+    attaching itself to a newer retry. Repeating the same binding is
+    idempotent; changing an already-bound backend run fails closed.
+    """
+    clean_backend_run_id = str(backend_run_id or "").strip()
+    clean_backend_agent_id = str(backend_agent_id or "").strip()
+    clean_protocol_version = str(protocol_version or "").strip()
+    clean_workspace_ref = str(workspace_ref or "").strip() or None
+    clean_result_digest = str(result_digest or "").strip() or None
+    if not clean_backend_run_id or not clean_backend_agent_id:
+        raise ValueError("backend_run_id and backend_agent_id are required")
+    if clean_protocol_version not in {"1.0", "2.0"}:
+        raise ValueError("protocol_version must be '1.0' or '2.0'")
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT t.current_run_id, t.executor_backend,
+                   r.backend_run_id, r.backend_agent_id,
+                   r.protocol_version, r.workspace_ref, r.result_digest
+              FROM tasks t
+              JOIN task_runs r ON r.id = t.current_run_id
+             WHERE t.id = ? AND r.id = ? AND r.ended_at IS NULL
+            """,
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if not row or row["executor_backend"] == "hermes":
+            return False
+        if row["backend_run_id"]:
+            return (
+                row["backend_run_id"] == clean_backend_run_id
+                and row["backend_agent_id"] == clean_backend_agent_id
+                and row["protocol_version"] == clean_protocol_version
+                and row["workspace_ref"] == clean_workspace_ref
+                and row["result_digest"] == clean_result_digest
+            )
+        try:
+            cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET backend_run_id = ?,
+                       backend_agent_id = ?,
+                       protocol_version = ?,
+                       workspace_ref = ?,
+                       result_digest = ?
+                 WHERE id = ?
+                   AND task_id = ?
+                   AND ended_at IS NULL
+                   AND backend_run_id IS NULL
+                """,
+                (
+                    clean_backend_run_id,
+                    clean_backend_agent_id,
+                    clean_protocol_version,
+                    clean_workspace_ref,
+                    clean_result_digest,
+                    int(expected_run_id),
+                    task_id,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "backend_run_bound",
+            {
+                "executor_backend": row["executor_backend"],
+                "backend_run_id": clean_backend_run_id,
+                "backend_agent_id": clean_backend_agent_id,
+                "protocol_version": clean_protocol_version,
+                "workspace_ref": clean_workspace_ref,
+            },
+            run_id=int(expected_run_id),
+        )
+        return True
+
+
+_BACKEND_STATUS_ORDER = {
+    "queued": 0,
+    "running": 1,
+    "succeeded": 2,
+    "failed": 2,
+    "blocked": 2,
+}
+_TERMINAL_BACKEND_STATUSES = {"succeeded", "failed", "blocked"}
+
+
+def record_backend_lifecycle(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    status: str,
+    backend_run_id: Optional[str] = None,
+    backend_agent_id: Optional[str] = None,
+    protocol_version: Optional[str] = None,
+    workspace_ref: Optional[str] = None,
+    result_digest: Optional[str] = None,
+    next_poll_seconds: Optional[int] = None,
+    poll_owner: Optional[str] = None,
+    poll_error: Optional[str] = None,
+    terminal_observation: Optional[Mapping[str, Any]] = None,
+    terminal_handler_pending: bool = False,
+) -> bool:
+    """Persist one monotonic external-backend lifecycle observation.
+
+    The exact active Kanban run is a compare-and-set boundary. Late responses
+    cannot attach to a retry, terminal states cannot be rewritten, and backend
+    identity cannot change after the first observation.
+    """
+    clean_status = str(status or "").strip().lower()
+    if clean_status not in _BACKEND_STATUS_ORDER:
+        raise ValueError(f"unsupported backend status: {status!r}")
+    clean_run_id = str(backend_run_id or "").strip() or None
+    clean_agent_id = str(backend_agent_id or "").strip() or None
+    clean_protocol = str(protocol_version or "").strip() or None
+    clean_poll_owner = str(poll_owner or "").strip() or None
+    if clean_protocol is not None and clean_protocol not in {"1.0", "2.0"}:
+        raise ValueError("protocol_version must be '1.0' or '2.0'")
+    if next_poll_seconds is not None and int(next_poll_seconds) < 0:
+        raise ValueError("next_poll_seconds cannot be negative")
+    clean_terminal_observation: Optional[dict[str, Any]] = None
+    if terminal_observation is not None:
+        if clean_status not in _TERMINAL_BACKEND_STATUSES:
+            raise ValueError(
+                "terminal_observation requires a terminal backend status"
+            )
+        clean_terminal_observation = json.loads(
+            _canonical_json(dict(terminal_observation))
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT t.current_run_id, t.executor_backend,
+                   r.backend_status, r.backend_run_id, r.backend_agent_id,
+                   r.protocol_version, r.workspace_ref, r.result_digest,
+                   r.backend_poll_count, r.backend_poll_owner,
+                   r.backend_poll_lease_until, r.metadata
+              FROM tasks t
+              JOIN task_runs r ON r.id = t.current_run_id
+             WHERE t.id = ? AND r.id = ? AND r.ended_at IS NULL
+            """,
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if not row or row["executor_backend"] == "hermes":
+            return False
+        active_poll_owner = str(row["backend_poll_owner"] or "").strip() or None
+        active_poll_lease_until = int(row["backend_poll_lease_until"] or 0)
+        if (
+            active_poll_owner
+            and active_poll_lease_until > now
+            and clean_poll_owner != active_poll_owner
+        ):
+            return False
+        if clean_poll_owner and (
+            active_poll_owner != clean_poll_owner
+            or active_poll_lease_until <= now
+        ):
+            return False
+        previous = row["backend_status"]
+        if previous in _TERMINAL_BACKEND_STATUSES and previous != clean_status:
+            return False
+        clean_result_digest = str(result_digest or "").strip() or None
+        if (
+            previous in _TERMINAL_BACKEND_STATUSES
+            and row["result_digest"]
+            and clean_result_digest
+            and row["result_digest"] != clean_result_digest
+        ):
+            return False
+        if (
+            previous in _BACKEND_STATUS_ORDER
+            and _BACKEND_STATUS_ORDER[clean_status] < _BACKEND_STATUS_ORDER[previous]
+        ):
+            return False
+        for stored, incoming in (
+            (row["backend_run_id"], clean_run_id),
+            (row["backend_agent_id"], clean_agent_id),
+            (row["protocol_version"], clean_protocol),
+            (row["workspace_ref"], str(workspace_ref or "").strip() or None),
+        ):
+            if stored and incoming and stored != incoming:
+                return False
+        poll_count = int(row["backend_poll_count"] or 0)
+        if previous is not None:
+            poll_count += 1
+        handler_pending = (
+            clean_status in _TERMINAL_BACKEND_STATUSES
+            and (
+                clean_poll_owner is not None
+                or terminal_handler_pending
+            )
+        )
+        next_poll_at = (
+            int(row["backend_poll_lease_until"] or now)
+            if handler_pending
+            else (
+                now + int(next_poll_seconds)
+                if clean_status in {"queued", "running"}
+                and next_poll_seconds is not None
+                else None
+            )
+        )
+        retained_poll_owner = clean_poll_owner if handler_pending else None
+        retained_poll_lease_until = (
+            row["backend_poll_lease_until"] if handler_pending else None
+        )
+        updated_metadata: Optional[str] = None
+        if clean_terminal_observation is not None:
+            existing_metadata = _load_json_object(row["metadata"]) or {}
+            prior_observation = existing_metadata.get(
+                "backend_terminal_observation"
+            )
+            if (
+                prior_observation is not None
+                and prior_observation != clean_terminal_observation
+            ):
+                return False
+            existing_metadata["backend_terminal_observation"] = (
+                clean_terminal_observation
+            )
+            updated_metadata = _canonical_json(existing_metadata)
+        try:
+            cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET backend_status = ?,
+                       backend_updated_at = ?,
+                       backend_poll_count = ?,
+                       backend_next_poll_at = ?,
+                       backend_run_id = COALESCE(backend_run_id, ?),
+                       backend_agent_id = COALESCE(backend_agent_id, ?),
+                       protocol_version = COALESCE(protocol_version, ?),
+                       workspace_ref = COALESCE(workspace_ref, ?),
+                       result_digest = COALESCE(?, result_digest),
+                       backend_poll_owner = ?,
+                       backend_poll_lease_until = ?,
+                       backend_last_polled_at = ?,
+                       backend_last_error = ?,
+                       metadata = COALESCE(?, metadata)
+                 WHERE id = ? AND task_id = ? AND ended_at IS NULL
+                """,
+                (
+                    clean_status,
+                    now,
+                    poll_count,
+                    next_poll_at,
+                    clean_run_id,
+                    clean_agent_id,
+                    clean_protocol,
+                    str(workspace_ref or "").strip() or None,
+                    clean_result_digest,
+                    retained_poll_owner,
+                    retained_poll_lease_until,
+                    now,
+                    str(poll_error or "").strip() or None,
+                    updated_metadata,
+                    int(expected_run_id),
+                    task_id,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "backend_lifecycle",
+            {
+                "executor_backend": row["executor_backend"],
+                "previous_status": previous,
+                "status": clean_status,
+                "backend_run_id": clean_run_id or row["backend_run_id"],
+                "backend_agent_id": clean_agent_id or row["backend_agent_id"],
+                "poll_count": poll_count,
+                "next_poll_at": next_poll_at,
+            },
+            run_id=int(expected_run_id),
+        )
+        return True
+
+
+def claim_due_backend_polls(
+    conn: sqlite3.Connection,
+    *,
+    owner: str,
+    executor_backends: Optional[Iterable[str]] = None,
+    executor_profiles: Optional[Iterable[str]] = None,
+    exclude_run_ids: Optional[Iterable[int]] = None,
+    limit: int = 20,
+    lease_seconds: int = 30,
+    now: Optional[int] = None,
+) -> list[Run]:
+    """Atomically lease due asynchronous backend runs for polling."""
+    clean_owner = str(owner or "").strip()
+    if not clean_owner:
+        raise ValueError("poll owner is required")
+    if int(limit) <= 0 or int(lease_seconds) <= 0:
+        raise ValueError("poll limit and lease_seconds must be positive")
+    current = int(now if now is not None else time.time())
+    backend_filter_requested = executor_backends is not None
+    clean_backends = tuple(
+        dict.fromkeys(
+            str(backend or "").strip().lower()
+            for backend in (executor_backends or ())
+            if str(backend or "").strip()
+        )
+    )
+    unsupported = sorted(set(clean_backends) - VALID_EXECUTOR_BACKENDS)
+    if unsupported:
+        raise ValueError(
+            "unsupported executor backend filter: " + ", ".join(unsupported)
+        )
+    if clean_backends:
+        backend_filter = (
+            "AND t.executor_backend IN ("
+            + ",".join("?" for _ in clean_backends)
+            + ")"
+        )
+    elif backend_filter_requested:
+        backend_filter = "AND 0"
+    else:
+        backend_filter = "AND t.executor_backend != 'hermes'"
+    profile_filter_requested = executor_profiles is not None
+    clean_profiles = tuple(
+        dict.fromkeys(
+            str(profile or "").strip()
+            for profile in (executor_profiles or ())
+            if str(profile or "").strip()
+        )
+    )
+    if clean_profiles:
+        profile_filter = (
+            "AND t.executor_profile IN ("
+            + ",".join("?" for _ in clean_profiles)
+            + ")"
+        )
+    elif profile_filter_requested:
+        profile_filter = "AND 0"
+    else:
+        profile_filter = ""
+    clean_excluded_ids = tuple(
+        dict.fromkeys(
+            int(run_id)
+            for run_id in (exclude_run_ids or ())
+            if int(run_id) > 0
+        )
+    )
+    exclude_filter = (
+        "AND r.id NOT IN ("
+        + ",".join("?" for _ in clean_excluded_ids)
+        + ")"
+        if clean_excluded_ids
+        else ""
+    )
+    claimed_ids: list[int] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            f"""
+            SELECT r.id
+              FROM task_runs r
+              JOIN tasks t ON t.id = r.task_id
+             WHERE r.ended_at IS NULL
+               AND t.current_run_id = r.id
+               {backend_filter}
+               {profile_filter}
+               {exclude_filter}
+               AND r.backend_status IN (
+                    'queued', 'running', 'succeeded', 'failed', 'blocked'
+               )
+               AND r.backend_next_poll_at IS NOT NULL
+               AND r.backend_next_poll_at <= ?
+               AND (
+                    r.backend_poll_owner IS NULL
+                    OR r.backend_poll_lease_until IS NULL
+                    OR r.backend_poll_lease_until <= ?
+               )
+             ORDER BY r.backend_next_poll_at ASC, r.id ASC
+             LIMIT ?
+            """,
+            (
+                *clean_backends,
+                *clean_profiles,
+                *clean_excluded_ids,
+                current,
+                current,
+                int(limit),
+            ),
+        ).fetchall()
+        for row in rows:
+            run_id = int(row["id"])
+            cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET backend_poll_owner = ?,
+                       backend_poll_lease_until = ?
+                 WHERE id = ?
+                   AND ended_at IS NULL
+                   AND backend_status IN (
+                        'queued', 'running', 'succeeded', 'failed', 'blocked'
+                   )
+                   AND backend_next_poll_at <= ?
+                   AND (
+                        backend_poll_owner IS NULL
+                        OR backend_poll_lease_until IS NULL
+                        OR backend_poll_lease_until <= ?
+                   )
+                """,
+                (
+                    clean_owner,
+                    current + int(lease_seconds),
+                    run_id,
+                    current,
+                    current,
+                ),
+            )
+            if cur.rowcount == 1:
+                claimed_ids.append(run_id)
+    return [
+        run
+        for run_id in claimed_ids
+        if (run := get_run(conn, run_id)) is not None
+    ]
+
+
+def release_backend_poll_claim(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    owner: str,
+    retry_seconds: int,
+    error: Optional[str] = None,
+    increment_poll_count: bool = True,
+    now: Optional[int] = None,
+) -> bool:
+    """Release one poll lease and schedule a bounded retry."""
+    clean_owner = str(owner or "").strip()
+    if not clean_owner:
+        raise ValueError("poll owner is required")
+    if int(retry_seconds) < 0:
+        raise ValueError("retry_seconds cannot be negative")
+    current = int(now if now is not None else time.time())
+    retry_at = current + int(retry_seconds)
+    with write_txn(conn):
+        run = conn.execute(
+            """
+            SELECT task_id, executor_backend, backend_status,
+                   backend_poll_count
+              FROM task_runs
+             WHERE id = ?
+            """,
+            (int(run_id),),
+        ).fetchone()
+        if run is None:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE task_runs
+               SET backend_poll_owner = NULL,
+                   backend_poll_lease_until = NULL,
+                   backend_next_poll_at = ?,
+                   backend_last_polled_at = ?,
+                   backend_poll_count = backend_poll_count + ?,
+                   backend_last_error = ?
+             WHERE id = ?
+               AND ended_at IS NULL
+               AND backend_poll_owner = ?
+               AND backend_status IN (
+                    'queued', 'running', 'succeeded', 'failed', 'blocked'
+               )
+            """,
+            (
+                retry_at,
+                current,
+                1 if increment_poll_count else 0,
+                str(error or "").strip() or None,
+                int(run_id),
+                clean_owner,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            str(run["task_id"]),
+            "backend_poll_retry",
+            {
+                "executor_backend": run["executor_backend"],
+                "backend_status": run["backend_status"],
+                "poll_count": (
+                    int(run["backend_poll_count"] or 0)
+                    + (1 if increment_poll_count else 0)
+                ),
+                "retry_at": retry_at,
+                "error": str(error or "").strip() or None,
+            },
+            run_id=int(run_id),
+        )
+        return True
+
+
+def renew_backend_poll_claim(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    owner: str,
+    lease_seconds: int,
+    now: Optional[int] = None,
+) -> bool:
+    """Extend a still-valid poll lease owned by the exact worker."""
+    clean_owner = str(owner or "").strip()
+    if not clean_owner:
+        raise ValueError("poll owner is required")
+    if int(lease_seconds) <= 0:
+        raise ValueError("lease_seconds must be positive")
+    current = int(now if now is not None else time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE task_runs
+               SET backend_poll_lease_until = ?
+             WHERE id = ?
+               AND ended_at IS NULL
+               AND backend_poll_owner = ?
+               AND backend_poll_lease_until > ?
+            """,
+            (
+                current + int(lease_seconds),
+                int(run_id),
+                clean_owner,
+                current,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def record_backend_shadow_report(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    report: Mapping[str, Any],
+) -> bool:
+    """Persist one side-effect-free Shadow Mode comparison on its exact run."""
+    clean_report = dict(report)
+    if not clean_report:
+        raise ValueError("shadow report is required")
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT routing_decision
+              FROM task_runs
+             WHERE id = ? AND task_id = ?
+            """,
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if not row:
+            return False
+        routing_decision = _load_json_object(row["routing_decision"]) or {}
+        routing_decision["shadow_report"] = clean_report
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET routing_decision = ?
+             WHERE id = ? AND task_id = ?
+            """,
+            (
+                _canonical_json(routing_decision),
+                int(expected_run_id),
+                task_id,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "backend_shadow_report",
+            {
+                "selected_backend": clean_report.get("selected_backend"),
+                "semantic_class": clean_report.get("semantic_class"),
+                "summary": clean_report.get("summary"),
+            },
+            run_id=int(expected_run_id),
+        )
+        return True
+
+
+def backend_runtime_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return operator-visible circuits and active async backend poll state."""
+    current = int(now if now is not None else time.time())
+    rows = conn.execute(
+        """
+        SELECT r.*, t.title, t.status AS task_status
+         FROM task_runs r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.ended_at IS NULL
+           AND r.backend_status IN (
+                'queued', 'running', 'succeeded', 'failed', 'blocked'
+           )
+         ORDER BY COALESCE(r.backend_next_poll_at, 9223372036854775807), r.id
+        """
+    ).fetchall()
+    active_runs: list[dict[str, Any]] = []
+    for row in rows:
+        routing_decision = _load_json_object(row["routing_decision"]) or {}
+        selected_backend = routing_decision.get("selected_backend")
+        selected_cost_tier = None
+        for candidate in routing_decision.get("candidates") or []:
+            if (
+                isinstance(candidate, Mapping)
+                and candidate.get("backend") == selected_backend
+            ):
+                selected_cost_tier = candidate.get("cost_tier")
+                break
+        shadow_report = routing_decision.get("shadow_report")
+        observed_cost_units = None
+        if isinstance(shadow_report, Mapping):
+            observations = shadow_report.get("observations")
+            if isinstance(observations, list):
+                observed_cost_units = sum(
+                    float(observation["cost_units"])
+                    for observation in observations
+                    if (
+                        isinstance(observation, Mapping)
+                        and isinstance(observation.get("cost_units"), (int, float))
+                    )
+                )
+        active_runs.append(
+            {
+                "task_id": row["task_id"],
+                "title": row["title"],
+                "run_id": int(row["id"]),
+                "executor_backend": row["executor_backend"],
+                "backend_run_id": row["backend_run_id"],
+                "backend_status": row["backend_status"],
+                "poll_count": int(row["backend_poll_count"] or 0),
+                "next_poll_at": row["backend_next_poll_at"],
+                "poll_age_seconds": (
+                    max(0, current - int(row["backend_updated_at"]))
+                    if row["backend_updated_at"] is not None
+                    else None
+                ),
+                "poll_owner": row["backend_poll_owner"],
+                "poll_lease_until": row["backend_poll_lease_until"],
+                "last_error": row["backend_last_error"],
+                "selected_cost_tier": selected_cost_tier,
+                "observed_cost_units": observed_cost_units,
+                "routing_decision": routing_decision,
+            }
+        )
+    return {
+        "captured_at": current,
+        "circuits": backend_circuit_states(conn, now=current),
+        "active_runs": active_runs,
+    }
+
+
+def backend_circuit_states(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> dict[str, str]:
+    """Return effective circuit states, including cooldown half-open state."""
+    current = int(now if now is not None else time.time())
+    rows = conn.execute(
+        "SELECT backend_id, state, opened_until FROM execution_backend_circuits"
+    ).fetchall()
+    result: dict[str, str] = {}
+    for row in rows:
+        state = str(row["state"] or "closed")
+        if state == "open" and int(row["opened_until"] or 0) <= current:
+            state = "half_open"
+        result[str(row["backend_id"])] = state
+    return result
+
+
+def backend_circuit_snapshot(
+    conn: sqlite3.Connection,
+    backend_id: str,
+) -> dict[str, Any]:
+    """Return the persisted circuit generation used for optimistic writes."""
+    clean_backend = str(backend_id or "").strip().lower()
+    if clean_backend not in VALID_EXECUTOR_BACKENDS:
+        raise ValueError(f"unsupported backend_id={backend_id!r}")
+    row = conn.execute(
+        """
+        SELECT backend_id, state, consecutive_failures, opened_until,
+               last_error, updated_at, generation
+          FROM execution_backend_circuits
+         WHERE backend_id = ?
+        """,
+        (clean_backend,),
+    ).fetchone()
+    if row is None:
+        return {
+            "backend_id": clean_backend,
+            "exists": False,
+            "generation": 0,
+        }
+    return {
+        "backend_id": clean_backend,
+        "exists": True,
+        "state": str(row["state"]),
+        "consecutive_failures": int(row["consecutive_failures"] or 0),
+        "opened_until": row["opened_until"],
+        "last_error": row["last_error"],
+        "updated_at": int(row["updated_at"]),
+        "generation": int(row["generation"] or 0),
+    }
+
+
+def claim_backend_circuit_probe(
+    conn: sqlite3.Connection,
+    backend_id: str,
+    *,
+    lease_seconds: int = 60,
+    now: Optional[int] = None,
+) -> bool:
+    """Atomically reserve the single probe allowed after circuit cooldown."""
+    clean_backend = str(backend_id or "").strip().lower()
+    if clean_backend not in VALID_EXECUTOR_BACKENDS:
+        raise ValueError(f"unsupported backend_id={backend_id!r}")
+    if int(lease_seconds) <= 0:
+        raise ValueError("probe lease_seconds must be positive")
+    current = int(now if now is not None else time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT state, opened_until
+              FROM execution_backend_circuits
+             WHERE backend_id = ?
+            """,
+            (clean_backend,),
+        ).fetchone()
+        if row is None or str(row["state"] or "closed") == "closed":
+            return True
+        state = str(row["state"] or "closed")
+        lease_until = int(row["opened_until"] or 0)
+        if state not in {"open", "half_open"} or lease_until > current:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE execution_backend_circuits
+               SET state = 'half_open',
+                   opened_until = ?,
+                   updated_at = ?,
+                   generation = generation + 1
+             WHERE backend_id = ?
+               AND state = ?
+               AND COALESCE(opened_until, 0) = ?
+            """,
+            (
+                current + int(lease_seconds),
+                current,
+                clean_backend,
+                state,
+                lease_until,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def record_backend_circuit_outcome(
+    conn: sqlite3.Connection,
+    backend_id: str,
+    *,
+    succeeded: bool,
+    error: Optional[str] = None,
+    failure_threshold: int = 3,
+    cooldown_seconds: int = 300,
+    now: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+) -> dict[str, Any]:
+    """Update one backend circuit without changing task retry policy."""
+    clean_backend = str(backend_id or "").strip().lower()
+    if clean_backend not in VALID_EXECUTOR_BACKENDS:
+        raise ValueError(f"unsupported backend_id={backend_id!r}")
+    if failure_threshold <= 0 or cooldown_seconds <= 0:
+        raise ValueError("circuit thresholds must be positive")
+    current = int(now if now is not None else time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT state, consecutive_failures, failure_epoch_generation, "
+            "opened_until, generation "
+            "FROM execution_backend_circuits "
+            "WHERE backend_id = ?",
+            (clean_backend,),
+        ).fetchone()
+        current_generation = int(
+            (row or {"generation": 0})["generation"] or 0
+        )
+        if (
+            expected_generation is not None
+            and int(expected_generation) != current_generation
+        ):
+            current_failures = int(
+                (row or {"consecutive_failures": 0})[
+                    "consecutive_failures"
+                ]
+                or 0
+            )
+            failure_epoch_generation = (
+                None
+                if row is None
+                else row["failure_epoch_generation"]
+            )
+            if (
+                succeeded
+                or current_failures == 0
+                or failure_epoch_generation is None
+                or int(failure_epoch_generation)
+                != int(expected_generation)
+            ):
+                return {
+                    "backend_id": clean_backend,
+                    "state": str((row or {"state": "closed"})["state"]),
+                    "consecutive_failures": current_failures,
+                    "opened_until": (
+                        None if row is None else row["opened_until"]
+                    ),
+                    "applied": False,
+                }
+        failures = 0 if succeeded else int((row or {"consecutive_failures": 0})["consecutive_failures"]) + 1
+        failure_epoch_generation = (
+            None
+            if succeeded
+            else (
+                int(expected_generation)
+                if expected_generation is not None
+                else current_generation
+            )
+        )
+        state = "closed"
+        opened_until: Optional[int] = None
+        if not succeeded and failures >= failure_threshold:
+            state = "open"
+            opened_until = current + cooldown_seconds
+        conn.execute(
+            """
+            INSERT INTO execution_backend_circuits (
+                backend_id, state, consecutive_failures,
+                failure_epoch_generation, opened_until, last_error,
+                updated_at, generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(backend_id) DO UPDATE SET
+                state = excluded.state,
+                consecutive_failures = excluded.consecutive_failures,
+                failure_epoch_generation = excluded.failure_epoch_generation,
+                opened_until = excluded.opened_until,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at,
+                generation = excluded.generation
+            """,
+            (
+                clean_backend,
+                state,
+                failures,
+                failure_epoch_generation,
+                opened_until,
+                None if succeeded else str(error or "") or None,
+                current,
+                current_generation + 1,
+            ),
+        )
+    result = {
+        "backend_id": clean_backend,
+        "state": state,
+        "consecutive_failures": failures,
+        "opened_until": opened_until,
+    }
+    if expected_generation is not None:
+        result["applied"] = True
+    return result
 
 
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:

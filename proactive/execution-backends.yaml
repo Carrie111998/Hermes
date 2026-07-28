@@ -1,0 +1,72 @@
+version: 1
+updated_at: "2026-07-27"
+shadow_mode: true
+
+policy:
+  risk_order: [low, medium, high, critical]
+  circuit_breaker:
+    failure_threshold: 3
+    cooldown_seconds: 300
+  poll:
+    initial_delay_seconds: 2
+    max_delay_seconds: 30
+  selection_order: [openclaw, codex, hermes]
+
+backends:
+  hermes:
+    enabled: true
+    semantic_classes: [analysis, content, local_code]
+    capabilities:
+      - analysis
+      - content
+      - local_files
+      - research
+      - shell
+    risk_level_limit: medium
+    credential_policy: shared_runtime
+    workspace_policies: [shared, dedicated]
+    session_policies: [managed]
+    supports_async: false
+    max_runtime_seconds: 1800
+    cost_tier: medium
+    fallback: []
+
+  codex:
+    # Admission stays disabled until a durable Codex start/poll worker is
+    # registered with the gateway. Keeping capabilities documented allows
+    # shadow comparison without routing live tasks into an unowned queue.
+    enabled: false
+    semantic_classes: [analysis, local_code]
+    capabilities:
+      - analysis
+      - code
+      - local_files
+      - research
+      - shell
+      - tests
+    risk_level_limit: medium
+    credential_policy: task_scoped
+    workspace_policies: [dedicated]
+    session_policies: [managed, ephemeral]
+    supports_async: true
+    max_runtime_seconds: 3600
+    cost_tier: high
+    fallback: [hermes]
+
+  openclaw:
+    enabled: true
+    semantic_classes: [browser_readonly, isolated_long_running]
+    capabilities:
+      - browser_read
+      - isolated_credentials
+      - isolated_session
+      - isolated_workspace
+      - long_running
+    risk_level_limit: low
+    credential_policy: agent_scoped
+    workspace_policies: [dedicated]
+    session_policies: [ephemeral, persistent]
+    supports_async: true
+    max_runtime_seconds: 1200
+    cost_tier: medium
+    fallback: [codex, hermes]

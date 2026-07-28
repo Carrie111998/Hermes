@@ -23,7 +23,49 @@
     "audit_log": { "type": "array" },
     "errors": { "type": "array" },
     "requires_human_review": { "type": "boolean" },
-    "recommended_next_action": { "type": "string" }
-  }
+    "recommended_next_action": { "type": "string" },
+    "protocol_version": { "type": "string", "enum": ["1.0", "2.0"] },
+    "delegation_id": { "type": "string", "minLength": 1 },
+    "attempt_id": { "type": "string", "minLength": 1 },
+    "contract_fingerprint": { "type": "string", "minLength": 1 },
+    "identity_correlated": { "type": "boolean" },
+    "protocol_correlated": { "type": "boolean" },
+    "backend_run_id": { "type": "string", "minLength": 1 },
+    "backend_agent_id": { "type": "string", "minLength": 1 },
+    "backend_session_key": { "type": "string", "minLength": 1 },
+    "result_digest": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "protocol_version": { "const": "2.0" } },
+        "required": ["protocol_version"]
+      },
+      "then": {
+        "required": [
+          "delegation_id",
+          "attempt_id",
+          "contract_fingerprint",
+          "identity_correlated",
+          "protocol_correlated"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "protocol_version": { "const": "2.0" },
+          "status": { "const": "succeeded" }
+        },
+        "required": ["protocol_version", "status"]
+      },
+      "then": {
+        "required": [
+          "backend_run_id",
+          "backend_agent_id",
+          "backend_session_key"
+        ]
+      }
+    }
+  ]
 }
-

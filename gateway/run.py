@@ -6624,6 +6624,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
+        # External backend polling owns separate leases and must remain active
+        # even when Hermes dispatch is hosted by an external daemon.
+        asyncio.create_task(self._kanban_backend_poller_watcher())
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
