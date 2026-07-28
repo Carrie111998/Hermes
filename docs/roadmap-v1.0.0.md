@@ -1,8 +1,8 @@
 # Charterforge Roadmap to v1.0.0
 
-**Current Version:** v0.22.0 (2026-07-28)  
-**Release Type:** Production HA-capable authority database  
-**Gap:** Multi-tenant isolation and billing engine
+**Current Version:** v0.23.0 (2026-07-28)  
+**Release Type:** Multi-tenant isolation with governed worker runtime  
+**Gap:** Billing engine, marketplace, and production hardening
 
 ---
 
@@ -13,8 +13,8 @@
 | **0.20.0** | Crash Recovery | Proven supervised worker lifecycle | ✅ Released |
 | **0.21.0** | Payment Rails | ≥3 payment rail plugins working | ✅ Released |
 | **0.22.0** | Postgres Authority Store | HA-capable authority database | ✅ Released |
-| **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | ✅ Complete |
-| **0.24.0** | Billing Engine | Usage metering + invoicing | 🔲 |
+| **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | ✅ Released |
+| **0.24.0** | Billing Engine | Usage metering + invoicing | 🟡 Next |
 | **0.25.0** | Agent Marketplace | Tool/skill discovery + installation | 🔲 |
 | **0.26.0** | External Integrations | Email, calendar, CRM, project tools | 🔲 |
 | **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | 🔲 |
@@ -24,7 +24,7 @@
 
 ---
 
-## v0.23.0 — Multi-Tenant Isolation (Next)
+## v0.23.0 — Multi-Tenant Isolation (Released)
 
 **Goal:** Secure tenant boundaries preventing cross-organization data leakage.
 
@@ -61,6 +61,32 @@
 - [x] AuthorityBridge for runtime-to-Postgres integration
 - [x] Wire AuthorityBridge into objective_service tick cycle
 - [x] Production worker runtime test with Postgres backend (3 scenarios: full lifecycle, race exclusivity, crash recovery)
+
+---
+
+## v0.24.0 — Billing Engine (Next)
+
+**Goal:** Usage metering, invoicing, and payment collection for multi-tenant SaaS.
+
+**Status:** 🔲 Not started
+
+### Scope
+
+- Usage metering: track task executions, permit consumption, effect recordings per tenant
+- Meter aggregation: rollup hourly/daily usage into billable units
+- Plan/tier management: free, starter, pro, enterprise with quota limits
+- Invoice generation: periodic billing cycles with line items
+- Payment integration: Stripe subscription + usage-based billing
+- Quota enforcement: hard/soft limits on task claims per billing period
+- Tenant billing dashboard: current usage, invoices, payment methods
+- Webhook handlers: Stripe payment events → authority store state
+
+### Prerequisites (from v0.23.0)
+
+- [x] Tenant registry with quota fields
+- [x] Organization-scoped task claims (metering anchor point)
+- [x] RBAC capability model (billing:manage capability)
+- [x] AuthorityBridge lifecycle tracking (countable events)
 
 ---
 
