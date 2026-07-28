@@ -7470,6 +7470,40 @@ def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
         return None
 
 
+def _get_pid_ppid(pid: int) -> int | None:
+    """Return the parent PID of *pid*, or *None* if it cannot be determined.
+
+    Linux: reads /proc/<pid>/status for the PPid: line.
+    macOS/other: falls back to ps -o ppid=.
+    On Windows returns None because supervisors there use job objects
+    rather than parent-child process trees.
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    # Fallback for macOS / edge cases where /proc is unavailable.
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "ppid="],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if result.returncode == 0:
+            ppid_str = (result.stdout or "").strip()
+            if ppid_str:
+                return int(ppid_str)
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     """Best-effort respawn of manually-started dashboards after ``hermes update``.
 
@@ -7579,11 +7613,13 @@ def _kill_stale_dashboard_processes(
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
     pid_cmdline: dict[int, list[str]] = {}
+    pid_ppid: dict[int, int | None] = {}
     if restart_managed and sys.platform != "win32":
         for pid in pids:
             cg_path = _get_pid_cgroup_path(pid)
             pid_cgroup[pid] = cg_path
             pid_service[pid] = _get_systemd_service_for_pid(pid)
+            pid_ppid[pid] = _get_pid_ppid(pid)
             if not pid_service[pid]:
                 # Manually-started process: preserve its exact argv so we
                 # can respawn it after the update (#40449, #68934).
@@ -7681,7 +7717,20 @@ def _kill_stale_dashboard_processes(
                     failed_restarts.append((svc_name, "systemctl restart returned non-zero"))
                     unrecovered.append(pid)
             elif pid in pid_cmdline:
-                respawn_cmds.append(pid_cmdline[pid])
+                # Opção 3 (#73379): check if the killed process had a parent
+                # other than init (PPID != 1).  If so, it was supervised by
+                # tmux, supervisord, runit, or another non-systemd supervisor.
+                # Killing the child was correct (the code changed on disk),
+                # but respawning it detached (start_new_session=True) would
+                # orphan it from its supervisor.  Instead, just let the
+                # supervisor see the child die and restart it naturally.
+                ppid = pid_ppid.get(pid)
+                if ppid is not None and ppid != 1:
+                    # Supervised by a non-systemd supervisor — skip manual
+                    # respawn; the supervisor will restart the process.
+                    pass
+                else:
+                    respawn_cmds.append(pid_cmdline[pid])
             else:
                 unrecovered.append(pid)
 
