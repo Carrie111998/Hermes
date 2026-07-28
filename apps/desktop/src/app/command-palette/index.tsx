@@ -13,6 +13,7 @@ import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import {
   Activity,
+  AppWindow,
   Archive,
   BarChart3,
   ChevronLeft,
@@ -59,6 +60,7 @@ import { openPetGenerate } from '@/store/pet-generate'
 import { requestStartWorkSession } from '@/store/projects'
 import { runGatewayRestart } from '@/store/system-actions'
 import { applyBackendUpdate } from '@/store/updates'
+import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
@@ -69,6 +71,7 @@ import {
   COMMAND_CENTER_ROUTE,
   CRON_ROUTE,
   MESSAGING_ROUTE,
+  navigateToWorkspacePage,
   NEW_CHAT_ROUTE,
   PROFILES_ROUTE,
   sessionRoute,
@@ -243,7 +246,7 @@ const NON_CONFIG_SETTINGS: ReadonlyArray<{
   },
   {
     icon: KeyRound,
-    keywords: ['providers', 'api key', 'keys', 'secrets', 'tokens'],
+    keywords: ['providers', 'api key', 'keys', 'secrets', 'tokens', 'egress', 'iron proxy', 'sandbox proxy'],
     labelKey: 'providerApiKeys',
     tab: 'providers&pview=keys'
   },
@@ -256,7 +259,7 @@ const NON_CONFIG_SETTINGS: ReadonlyArray<{
   },
   {
     icon: Settings2,
-    keywords: ['gateway', 'proxy', 'server', 'webhook', 'env'],
+    keywords: ['gateway', 'proxy', 'server', 'webhook', 'env', 'egress proxy', 'iron proxy'],
     labelKey: 'keysSettings',
     tab: 'keys&kview=settings'
   },
@@ -349,7 +352,7 @@ export function CommandPalette() {
     }
   }, [open, pendingPage])
 
-  const go = useCallback((path: string) => () => navigate(path), [navigate])
+  const go = useCallback((path: string) => () => navigateToWorkspacePage(navigate, path), [navigate])
 
   // Step up one nested page (or back to the root list), clearing the filter so
   // the parent page doesn't reopen mid-search.
@@ -413,6 +416,18 @@ export function CommandPalette() {
             label: cc.nav.newChat.title,
             run: go(NEW_CHAT_ROUTE)
           },
+          ...(canOpenNewWindow()
+            ? [
+                {
+                  action: 'session.newWindow',
+                  icon: AppWindow,
+                  id: 'nav-new-window',
+                  keywords: ['window', 'instance', 'open', 'new'],
+                  label: t.keybinds.actions['session.newWindow'],
+                  run: () => void openNewWindow()
+                }
+              ]
+            : []),
           {
             action: 'view.showTerminal',
             icon: Terminal,
@@ -860,13 +875,13 @@ export function CommandPalette() {
     <DialogPrimitive.Root onOpenChange={setCommandPaletteOpen} open={open}>
       <DialogPrimitive.Portal>
         {/* Transparent overlay: keeps click-away + focus trap, but no dim/blur. */}
-        <DialogPrimitive.Overlay className="fixed inset-0 z-[200]" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-(--z-over-modal)" />
         <DialogPrimitive.Content
           aria-describedby={undefined}
           className={cn(
             HUD_POSITION,
             HUD_SURFACE,
-            'z-[210] w-[min(34rem,calc(100vw-2rem))] overflow-hidden duration-150 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:slide-in-from-top-2 data-[state=open]:zoom-in-95'
+            'z-(--z-over-modal-content) w-[min(34rem,calc(100vw-2rem))] overflow-hidden duration-150 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:slide-in-from-top-2 data-[state=open]:zoom-in-95'
           )}
         >
           <DialogPrimitive.Title className="sr-only">{t.commandCenter.paletteTitle}</DialogPrimitive.Title>
