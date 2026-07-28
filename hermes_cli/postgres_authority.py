@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -368,6 +368,73 @@ _MIGRATIONS: list[tuple[int, str]] = [
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (tenant_id, billing_period)
         );
+        """,
+    ),
+    # v7 → v8: agent marketplace tables (RFC-0.25.0).
+    (
+        7,
+        """
+        CREATE TABLE IF NOT EXISTS marketplace_listings (
+            listing_id      TEXT        PRIMARY KEY,
+            name            TEXT        NOT NULL,
+            description     TEXT        NOT NULL DEFAULT '',
+            category        TEXT        NOT NULL DEFAULT 'general',
+            author          TEXT        NOT NULL DEFAULT '',
+            version         TEXT        NOT NULL,
+            package_type    TEXT        NOT NULL
+                CHECK (package_type IN ('builtin', 'pip', 'git', 'bundle')),
+            package_ref     TEXT        NOT NULL DEFAULT '',
+            entry_point     TEXT        NOT NULL DEFAULT '',
+            capabilities_required TEXT[] NOT NULL DEFAULT '{}',
+            dependencies    JSONB       NOT NULL DEFAULT '[]',
+            metadata        JSONB       NOT NULL DEFAULT '{}',
+            published_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            active          BOOLEAN     NOT NULL DEFAULT true
+        );
+
+        CREATE TABLE IF NOT EXISTS marketplace_installations (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            listing_id      TEXT        NOT NULL
+                REFERENCES marketplace_listings(listing_id),
+            version         TEXT        NOT NULL,
+            installed_by    TEXT        NOT NULL DEFAULT '',
+            installed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            enabled         BOOLEAN     NOT NULL DEFAULT true,
+            config          JSONB       NOT NULL DEFAULT '{}',
+
+            CONSTRAINT uq_installation_tenant_listing
+                UNIQUE (tenant_id, listing_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_installations_tenant
+            ON marketplace_installations(tenant_id);
+        CREATE INDEX IF NOT EXISTS idx_installations_listing
+            ON marketplace_installations(listing_id);
+
+        CREATE TABLE IF NOT EXISTS marketplace_reviews (
+            id              BIGSERIAL   PRIMARY KEY,
+            listing_id      TEXT        NOT NULL
+                REFERENCES marketplace_listings(listing_id),
+            tenant_id       UUID        NOT NULL,
+            rating          INTEGER     NOT NULL CHECK (rating BETWEEN 1 AND 5),
+            review_text     TEXT        NOT NULL DEFAULT '',
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT uq_review_tenant_listing
+                UNIQUE (tenant_id, listing_id)
+        );
+
+        -- Seed built-in tool listings
+        INSERT INTO marketplace_listings
+            (listing_id, name, description, category, author, version, package_type, entry_point)
+        VALUES
+            ('hermes.web-search', 'Web Search', 'Search the web via configured provider', 'search', 'hermes', '1.0.0', 'builtin', 'hermes_cli.tools.web_search'),
+            ('hermes.code-exec', 'Code Execution', 'Sandboxed code execution environment', 'development', 'hermes', '1.0.0', 'builtin', 'hermes_cli.tools.code_exec'),
+            ('hermes.file-ops', 'File Operations', 'File system read/write/search operations', 'filesystem', 'hermes', '1.0.0', 'builtin', 'hermes_cli.tools.file_ops'),
+            ('hermes.calendar', 'Calendar', 'Calendar integration (Google, Outlook)', 'productivity', 'hermes', '1.0.0', 'builtin', 'hermes_cli.tools.calendar'),
+            ('hermes.email', 'Email', 'Email send/receive integration', 'communication', 'hermes', '1.0.0', 'builtin', 'hermes_cli.tools.email')
+        ON CONFLICT (listing_id) DO NOTHING;
         """,
     ),
 ]
@@ -2101,6 +2168,326 @@ def list_invoices(conn: "psycopg.Connection", *, tenant_id: UUID | str) -> list[
 
 
 # ---------------------------------------------------------------------------
+# Marketplace: Listings
+# ---------------------------------------------------------------------------
+
+
+def publish_listing(
+    conn: "psycopg.Connection",
+    *,
+    listing_id: str,
+    name: str,
+    description: str = "",
+    category: str = "general",
+    author: str = "",
+    version: str,
+    package_type: str,
+    package_ref: str = "",
+    entry_point: str = "",
+    capabilities_required: list[str] | None = None,
+    dependencies: list[dict] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict:
+    """Publish a tool/skill listing to the marketplace."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO marketplace_listings
+                (listing_id, name, description, category, author, version,
+                 package_type, package_ref, entry_point,
+                 capabilities_required, dependencies, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (listing_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
+                category = EXCLUDED.category,
+                version = EXCLUDED.version,
+                package_ref = EXCLUDED.package_ref,
+                entry_point = EXCLUDED.entry_point,
+                capabilities_required = EXCLUDED.capabilities_required,
+                dependencies = EXCLUDED.dependencies,
+                metadata = EXCLUDED.metadata
+            RETURNING *
+            """,
+            (
+                listing_id, name, description, category, author, version,
+                package_type, package_ref, entry_point,
+                capabilities_required or [],
+                json.dumps(dependencies or []),
+                json.dumps(metadata or {}),
+            ),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def get_listing(conn: "psycopg.Connection", *, listing_id: str) -> Optional[dict]:
+    """Get a marketplace listing by ID."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM marketplace_listings WHERE listing_id = %s",
+            (listing_id,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def search_listings(
+    conn: "psycopg.Connection",
+    *,
+    query: str = "",
+    category: str = "",
+    limit: int = 50,
+) -> list[dict]:
+    """Search marketplace listings by name/description or category."""
+    conditions = ["active = true"]
+    params: list[Any] = []
+
+    if query:
+        conditions.append(
+            "(name ILIKE %s OR description ILIKE %s)"
+        )
+        params.extend([f"%{query}%", f"%{query}%"])
+
+    if category:
+        conditions.append("category = %s")
+        params.append(category)
+
+    where = " AND ".join(conditions)
+    params.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM marketplace_listings WHERE {where} "
+            f"ORDER BY published_at DESC LIMIT %s",
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def update_listing_version(
+    conn: "psycopg.Connection",
+    *,
+    listing_id: str,
+    version: str,
+    package_ref: str = "",
+) -> bool:
+    """Update a listing's version (and optionally package_ref)."""
+    with conn.cursor() as cur:
+        if package_ref:
+            cur.execute(
+                "UPDATE marketplace_listings SET version = %s, package_ref = %s "
+                "WHERE listing_id = %s",
+                (version, package_ref, listing_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE marketplace_listings SET version = %s WHERE listing_id = %s",
+                (version, listing_id),
+            )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+# ---------------------------------------------------------------------------
+# Marketplace: Installations
+# ---------------------------------------------------------------------------
+
+
+def install_tool(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    listing_id: str,
+    version: str,
+    installed_by: str = "",
+    config: dict | None = None,
+) -> dict:
+    """Install a tool for a tenant. Upserts (re-install upgrades version)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO marketplace_installations
+                (tenant_id, listing_id, version, installed_by, config)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, listing_id) DO UPDATE SET
+                version = EXCLUDED.version,
+                installed_by = EXCLUDED.installed_by,
+                config = EXCLUDED.config,
+                enabled = true,
+                installed_at = NOW()
+            RETURNING *
+            """,
+            (str(tenant_id), listing_id, version, installed_by,
+             json.dumps(config or {})),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def uninstall_tool(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    listing_id: str,
+) -> bool:
+    """Remove a tool installation for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM marketplace_installations "
+            "WHERE tenant_id = %s AND listing_id = %s",
+            (str(tenant_id), listing_id),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def get_installed_tools(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+) -> list[dict]:
+    """List all installed tools for a tenant (with listing metadata)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT i.*, l.name, l.description, l.category, l.package_type,
+                   l.entry_point
+            FROM marketplace_installations i
+            JOIN marketplace_listings l ON l.listing_id = i.listing_id
+            WHERE i.tenant_id = %s AND i.enabled = true
+            ORDER BY i.installed_at DESC
+            """,
+            (str(tenant_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def enable_tool(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    listing_id: str,
+) -> bool:
+    """Enable a disabled tool installation."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE marketplace_installations SET enabled = true "
+            "WHERE tenant_id = %s AND listing_id = %s AND enabled = false",
+            (str(tenant_id), listing_id),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def disable_tool(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    listing_id: str,
+) -> bool:
+    """Disable a tool installation without uninstalling."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE marketplace_installations SET enabled = false "
+            "WHERE tenant_id = %s AND listing_id = %s AND enabled = true",
+            (str(tenant_id), listing_id),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def get_tool_config(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    listing_id: str,
+) -> Optional[dict]:
+    """Get the configuration for an installed tool."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT config FROM marketplace_installations "
+            "WHERE tenant_id = %s AND listing_id = %s",
+            (str(tenant_id), listing_id),
+        )
+        row = cur.fetchone()
+    return row["config"] if row else None
+
+
+def update_tool_config(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    listing_id: str,
+    config: dict,
+) -> bool:
+    """Update configuration for an installed tool."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE marketplace_installations SET config = %s "
+            "WHERE tenant_id = %s AND listing_id = %s",
+            (json.dumps(config), str(tenant_id), listing_id),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+# ---------------------------------------------------------------------------
+# Marketplace: Reviews
+# ---------------------------------------------------------------------------
+
+
+def submit_review(
+    conn: "psycopg.Connection",
+    *,
+    listing_id: str,
+    tenant_id: UUID | str,
+    rating: int,
+    review_text: str = "",
+) -> dict:
+    """Submit or update a review for a listing (one review per tenant per listing)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO marketplace_reviews
+                (listing_id, tenant_id, rating, review_text)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (tenant_id, listing_id) DO UPDATE SET
+                rating = EXCLUDED.rating,
+                review_text = EXCLUDED.review_text
+            RETURNING *
+            """,
+            (listing_id, str(tenant_id), rating, review_text),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def get_reviews(
+    conn: "psycopg.Connection",
+    *,
+    listing_id: str,
+    limit: int = 20,
+) -> list[dict]:
+    """Get reviews for a listing, most recent first."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM marketplace_reviews WHERE listing_id = %s "
+            "ORDER BY created_at DESC LIMIT %s",
+            (listing_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 
@@ -2176,6 +2563,19 @@ __all__ = [
     "mark_invoice_paid",
     "get_invoice",
     "list_invoices",
+    "publish_listing",
+    "get_listing",
+    "search_listings",
+    "update_listing_version",
+    "install_tool",
+    "uninstall_tool",
+    "get_installed_tools",
+    "enable_tool",
+    "disable_tool",
+    "get_tool_config",
+    "update_tool_config",
+    "submit_review",
+    "get_reviews",
     "get_authority_backend",
     "get_authority_connection",
     "DEFAULT_TENANT_ID",
