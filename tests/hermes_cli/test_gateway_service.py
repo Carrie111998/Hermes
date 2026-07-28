@@ -238,6 +238,14 @@ class TestSystemdServiceRefresh:
             return True
 
         monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
+        # ``run_gateway()`` routes every exit path through
+        # ``_exit_after_graceful_shutdown`` which hard-kills the process with
+        # ``os._exit`` (by design, see #53107). Stub it or the test runner
+        # itself dies mid-suite. Same pattern as test_gateway.py's
+        # ``_install_fake_gateway_run``.
+        monkeypatch.setattr(
+            "gateway.run._exit_after_graceful_shutdown", lambda code: None
+        )
 
         gateway_cli.run_gateway()
 
