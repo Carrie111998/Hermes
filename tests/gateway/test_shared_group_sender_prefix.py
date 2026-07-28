@@ -103,6 +103,50 @@ async def test_preprocess_includes_slack_author_mention_for_shared_thread():
 
 
 @pytest.mark.asyncio
+async def test_preprocess_marks_verified_slack_bot_mention_as_directed():
+    """Slack strips the bot's raw ``<@UID>`` before the agent turn.
+
+    Preserve the adapter's verified mention decision in the prepared user
+    message so group-chat response policy cannot mistake an explicitly
+    addressed request for ambient channel chatter.
+    """
+    runner = _make_runner(
+        GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+    )
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_name="team-channel",
+        chat_type="group",
+        user_id="U123",
+        user_name="Alice",
+        thread_id="171.000",
+    )
+    event = MessageEvent(
+        text="please investigate the scheduler timeout",
+        source=source,
+        metadata={"slack_bot_mentioned": True},
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == (
+        "[Alice | Slack user <@U123>] "
+        "[Slack routing — verified: the current message explicitly mentioned "
+        "this assistant and is directed at you.]\n"
+        "please investigate the scheduler timeout"
+    )
+
+
+@pytest.mark.asyncio
 async def test_preprocess_slack_shared_thread_without_user_id_keeps_name_only():
     """No user_id on the source → fall back to the plain name prefix."""
     runner = _make_runner(

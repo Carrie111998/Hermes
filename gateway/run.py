@@ -12631,6 +12631,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
+        if (
+            _is_shared_multi_user
+            and source.platform == Platform.SLACK
+            and event.metadata.get("slack_bot_mentioned") is True
+        ):
+            # The Slack adapter strips its own raw ``<@UID>`` before creating
+            # MessageEvent.text so commands and natural-language requests stay
+            # clean. Without carrying the verified mention decision forward,
+            # however, group-chat response policy can mistake the explicitly
+            # addressed request for ambient chatter and emit NO_REPLY even
+            # though Slack already routed and acknowledged it.
+            message_text = (
+                "[Slack routing — verified: the current message explicitly "
+                "mentioned this assistant and is directed at you.]\n"
+                f"{message_text}"
+            )
         if _is_shared_multi_user and source.user_name:
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their

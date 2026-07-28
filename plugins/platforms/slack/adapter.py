@@ -6292,6 +6292,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                # ``text`` no longer contains the bot's raw ``<@UID>`` at this
+                # point. Preserve the adapter's verified routing decision so
+                # the shared-channel agent turn still knows the current request
+                # was explicitly directed at it.
+                "slack_bot_mentioned": is_mentioned,
             },
         )
 

@@ -142,6 +142,7 @@ def test_thread_require_mention_allows_mentioned_thread_reply_without_sticky_thr
 
     assert len(handled) == 1
     assert handled[0].text == "update this"
+    assert handled[0].metadata["slack_bot_mentioned"] is True
     assert "100.000" not in adapter._mentioned_threads
 
     run(
