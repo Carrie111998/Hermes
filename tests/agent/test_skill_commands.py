@@ -113,6 +113,19 @@ class TestScanSkillCommands:
         assert "/enabled-skill" in result
         assert "/disabled-skill" not in result
 
+    def test_excludes_on_demand_skill_from_offer_surface(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "on-demand-skill",
+                frontmatter_extra="activation: on-demand\n",
+            )
+            _make_skill(tmp_path, "automatic-skill")
+            result = scan_skill_commands()
+
+        assert "/automatic-skill" in result
+        assert "/on-demand-skill" not in result
+
     def test_finds_skills_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"
@@ -515,6 +528,22 @@ class TestBuildPreloadedSkillsPrompt:
         assert "first-skill" in prompt
         assert "second-skill" in prompt
         assert "preloaded" in prompt.lower()
+
+    def test_explicitly_preloads_on_demand_skill(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "on-demand-skill",
+                frontmatter_extra="activation: on-demand\n",
+                body="ON DEMAND CONTENT",
+            )
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["on-demand-skill"]
+            )
+
+        assert missing == []
+        assert loaded == ["on-demand-skill"]
+        assert "ON DEMAND CONTENT" in prompt
 
     def test_reports_missing_named_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

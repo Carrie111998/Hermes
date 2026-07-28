@@ -399,8 +399,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # Skip skills incompatible with the current OS platform
                     if not skill_matches_platform(frontmatter):
                         continue
-                    # Skip skills not relevant to the current runtime env
-                    # (kanban/docker/s6). Offer-time only; explicit load bypasses.
+                    # Skip on-demand skills and skills not relevant to the
+                    # current runtime env. Offer-time only; explicit loads
+                    # bypass this gate.
                     if not skill_matches_environment(frontmatter):
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)

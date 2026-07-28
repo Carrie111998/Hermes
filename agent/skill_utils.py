@@ -286,6 +286,10 @@ def _detect_environment(env: str) -> bool:
 def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     """Return True when the skill is relevant to the current runtime environment.
 
+    ``activation: on-demand`` is an offer-time gate: the skill stays out of
+    automatic indexes and autocomplete, but explicit ``skill_view`` and
+    ``--skills`` loads still bypass this function and remain available.
+
     Skills may declare an ``environments`` list in their YAML frontmatter::
 
         environments: [kanban]        # only relevant when kanban is active
@@ -305,6 +309,10 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     A skill matches when ANY of its declared environments is currently active
     (OR semantics, mirroring ``platforms``). Unknown env tags fail open.
     """
+    activation = str(frontmatter.get("activation") or "").strip().lower()
+    if activation == "on-demand":
+        return False
+
     environments = frontmatter.get("environments")
     if not environments:
         return True

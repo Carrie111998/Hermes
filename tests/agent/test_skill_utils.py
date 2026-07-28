@@ -13,9 +13,16 @@ from agent.skill_utils import (
     iter_skill_index_files,
     parse_frontmatter,
     resolve_skill_config_values,
+    skill_matches_environment,
     skill_matches_platform,
     skill_matches_platform_list,
 )
+
+
+def test_on_demand_activation_is_hidden_only_from_offer_surfaces():
+    assert skill_matches_environment({"activation": "on-demand"}) is False
+    assert skill_matches_environment({"activation": "automatic"}) is True
+    assert skill_matches_environment({}) is True
 
 
 def test_metadata_as_dict_with_hermes():
