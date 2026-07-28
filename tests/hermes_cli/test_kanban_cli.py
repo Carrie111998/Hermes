@@ -226,13 +226,33 @@ def test_show_omits_verify_line_without_config(kanban_home):
     assert "verify:" not in show
 
 
-def test_cli_complete_bypasses_gate_with_stderr_notice(kanban_home):
-    """Manual CLI completion is the loud human override — it bypasses the
-    gate but says so on stderr."""
+def test_cli_complete_refuses_gated_task_without_skip_verify(kanban_home):
+    """The CLI is reachable from any worker's terminal tool, so an
+    unflagged complete on a gated card must refuse, naming the override."""
     out = kc.run_slash("create gated --verify-cmd 'exit 1'")
     tid = _created_task_id(out)
-    done = kc.run_slash(f"complete {tid}")
+    res = kc.run_slash(f"complete {tid}")
+    assert "Completed" not in res
+    assert "--skip-verify" in res
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "done"
+
+
+def test_cli_complete_skip_verify_bypasses_and_records_audit(kanban_home):
+    """The human override is one deliberate flag away — and leaves a
+    durable trail (event + comment), not just an ephemeral stderr line."""
+    out = kc.run_slash("create gated --verify-cmd 'exit 1'")
+    tid = _created_task_id(out)
+    done = kc.run_slash(f"complete {tid} --skip-verify")
     assert "Completed" in done
     assert "bypasses" in done
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "done"
+        events = [e for e in kb.list_events(conn, tid)
+                  if e.kind == "verify_bypassed"]
+        assert len(events) == 1
+        assert events[0].payload["mode"] == "cmd"
+        assert events[0].payload["flag"] == "--skip-verify"
+        comments = [c for c in kb.list_comments(conn, tid)
+                    if c.author == "verify-gate"]
+        assert comments and "bypass" in comments[0].body

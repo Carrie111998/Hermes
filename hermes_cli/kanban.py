@@ -622,6 +622,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--skip-verify", action="store_true",
+                            help="Human override for a verified-completion gate "
+                                 "(--verify-cmd / --verify auto tasks): complete "
+                                 "without running the verification. Refused "
+                                 "without this flag; the bypass is recorded on "
+                                 "the task (event + comment).")
 
     p_edit = sub.add_parser(
         "edit",
@@ -2214,12 +2220,29 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # bypass the auxiliary judge that the tool-call path enforces.
             task = kb.get_task(conn, tid)
             # Verified completion (#70806): manual CLI completion is the
-            # documented human override for the gate — allowed, but loud.
-            # stderr keeps --json stdout strictly machine-parseable.
+            # documented human override for the gate — but it must be one
+            # deliberate keystroke away, not the default. The CLI is
+            # reachable from any worker's terminal tool (the exact bypass
+            # the goal-judge comment below exists for), so an unflagged
+            # complete on a gated card is refused, and a --skip-verify
+            # override leaves a durable audit trail on the task instead
+            # of just an ephemeral stderr line.
             if task and task.verify_mode:
+                if not getattr(args, "skip_verify", False):
+                    print(
+                        f"kanban: {tid} has a verified-completion gate "
+                        f"({task.verify_mode}); completing it from the CLI "
+                        f"would bypass the gate. Let the worker complete "
+                        f"it, or re-run with --skip-verify to record a "
+                        f"human override.",
+                        file=sys.stderr,
+                    )
+                    failed.append(tid)
+                    continue
                 print(
                     f"note: {tid} has a verified-completion gate "
-                    f"({task.verify_mode}); manual completion bypasses it.",
+                    f"({task.verify_mode}); --skip-verify bypasses it "
+                    f"(recorded on the task).",
                     file=sys.stderr,
                 )
             if task and task.goal_mode:
@@ -2271,6 +2294,34 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
+                if task and task.verify_mode:
+                    # Auditable human override (#70806): persist the bypass
+                    # as an event + comment so the board records that this
+                    # 'done' was NOT verified. Command redacted — events
+                    # and comments are broadcast surfaces.
+                    from agent.redact import redact_sensitive_text
+                    shown_cmd = (
+                        redact_sensitive_text(task.verify_cmd, force=True)
+                        if task.verify_cmd else None
+                    )
+                    with kb.write_txn(conn):
+                        kb._append_event(
+                            conn, tid, "verify_bypassed",
+                            {
+                                "mode": task.verify_mode,
+                                "command": shown_cmd,
+                                "actor": "cli",
+                                "flag": "--skip-verify",
+                            },
+                        )
+                    kb.add_comment(
+                        conn, tid, "verify-gate",
+                        (
+                            f"Human override: completed from the CLI with "
+                            f"--skip-verify, bypassing the "
+                            f"{task.verify_mode} verification gate."
+                        ),
+                    )
     return 0 if not failed else 1
 
 
