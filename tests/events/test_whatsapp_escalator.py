@@ -476,19 +476,42 @@ class TestFlushQueueChunking:
         self, bus, quiet_config, queue_path
     ):
         """_queue_message caps the queue at _MAX_QUEUE_SIZE (drop-oldest) so a
-        multi-day WhatsApp outage can't grow quiet_queue.json unbounded."""
+        multi-day WhatsApp outage can't grow quiet_queue.json unbounded.
+
+        The queue is SEEDED to just under the cap in one write rather than
+        driven there by cap+25 _queue_message calls: every call re-reads and
+        re-rewrites the whole growing file, so filling it that way costs ~20MB
+        of small synchronous IO and blew the 30s per-test timeout on its own
+        (killing the tests/events run at ~98%). Seeding and then stepping
+        _queue_message ACROSS the boundary exercises the same overflow path in
+        four file round-trips."""
         escalator = WhatsAppEscalator(
             bus, quiet_config_path=quiet_config, queue_path=queue_path,
         )
         cap = escalator._MAX_QUEUE_SIZE
-        for i in range(cap + 25):
+
+        # Seed one short of the cap: msg_0 .. msg_{cap-2}.
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue_path.write_text(json.dumps([
+            {"message": f"msg_{i}", "queued_at": "2026-07-27T03:00:00"}
+            for i in range(cap - 1)
+        ]), encoding="utf-8")
+
+        # The next message lands exactly ON the cap — nothing dropped yet.
+        escalator._queue_message(f"msg_{cap - 1}")
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert len(queue) == cap, f"expected cap {cap}, got {len(queue)}"
+        assert queue[0]["message"] == "msg_0", "at the cap nothing is dropped"
+
+        # Three more overflow it, one at a time.
+        for i in range(cap, cap + 3):
             escalator._queue_message(f"msg_{i}")
 
         queue = json.loads(queue_path.read_text(encoding="utf-8"))
         assert len(queue) == cap, f"expected cap {cap}, got {len(queue)}"
-        # Oldest 25 dropped; newest preserved.
-        assert queue[0]["message"] == "msg_25"
-        assert queue[-1]["message"] == f"msg_{cap + 24}"
+        # Oldest 3 dropped; newest preserved.
+        assert queue[0]["message"] == "msg_3"
+        assert queue[-1]["message"] == f"msg_{cap + 2}"
 
     def test_small_queue_still_drains_in_single_chunk(
         self, bus, quiet_config, queue_path
