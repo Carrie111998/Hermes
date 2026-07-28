@@ -34,7 +34,8 @@
     "qrcode": "^1.5.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "react-router-dom": "^7.17.0",
+    "react-router": "^7.18.1",
+    "react-router-dom": "^7.18.1",
     "tailwind-merge": "^3.5.0",
     "tailwindcss": "^4.2.1",
     "unicode-animations": "^1.0.3"
@@ -46,7 +47,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
-    "eslint": "^9.39.4",
+    "eslint": "^10.8.0",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.4.0",
@@ -55,5 +56,9 @@
     "typescript-eslint": "^8.56.1",
     "vite": "^8.0.16",
     "vitest": "^4.1.5"
+  },
+  "overrides": {
+    "brace-expansion": "^5.0.8",
+    "minimatch": "^10.0.3"
   }
 }

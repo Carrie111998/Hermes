@@ -328,3 +328,142 @@ class TestRealCatalog:
                 assert pkg, f"{advisory.id}: empty package name"
                 assert isinstance(versions, frozenset), \
                     f"{advisory.id}: versions must be frozenset"
+
+
+# ---------------------------------------------------------------------------
+# npm advisory catalog + ack mechanism
+# ---------------------------------------------------------------------------
+
+
+class TestNpmAdvisories:
+    """Tests for the npm GHSA catalog and ack persistence.
+
+    Mirrors ``TestAck`` above for the npm side — same config-store
+    monkeypatching pattern, same idempotency expectations, but exercises
+    the NpmAdvisory + ack_npm_advisory + filter_unacked_npm surface.
+    """
+
+    def test_catalog_well_formed(self):
+        """Every npm advisory must be self-consistent."""
+        seen_ids: set[str] = set()
+        for npm_adv in adv.NPM_ADVISORIES:
+            assert npm_adv.id.startswith("GHSA-"), \
+                f"{npm_adv.id}: must start with GHSA-"
+            assert npm_adv.id not in seen_ids, \
+                f"duplicate npm advisory id {npm_adv.id}"
+            seen_ids.add(npm_adv.id)
+            assert npm_adv.title, f"{npm_adv.id}: empty title"
+            assert npm_adv.summary, f"{npm_adv.id}: empty summary"
+            assert npm_adv.url.startswith("http"), \
+                f"{npm_adv.id}: bad url {npm_adv.url!r}"
+            assert npm_adv.package, f"{npm_adv.id}: empty package name"
+            assert npm_adv.severity in ("low", "high", "critical"), \
+                f"{npm_adv.id}: bad severity {npm_adv.severity!r}"
+
+    def test_get_acked_npm_ids_empty_when_no_config(self, monkeypatch):
+        """load_config raises → returns empty set, doesn't crash."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert adv.get_acked_npm_ids() == set()
+
+    def test_filter_unacked_npm_strips_dismissed(self, monkeypatch):
+        """An acked GHSA should not appear in filter_unacked_npm output."""
+        monkeypatch.setattr(adv, "get_acked_npm_ids", lambda: {"GHSA-qwww-vcr4-c8h2"})
+        out = adv.filter_unacked_npm(["GHSA-qwww-vcr4-c8h2", "GHSA-other"])
+        assert out == ["GHSA-other"]
+
+    def test_ack_npm_advisory_persists_id(self, isolated_home, monkeypatch):
+        """Successful ack writes to security.acked_npm_advisories."""
+        store: dict = {"security": {}}
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: store
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.save_config",
+            lambda cfg: store.update(cfg) or None,
+        )
+        assert adv.ack_npm_advisory("GHSA-qwww-vcr4-c8h2") is True
+        assert "GHSA-qwww-vcr4-c8h2" in store["security"]["acked_npm_advisories"]
+        # Idempotent.
+        adv.ack_npm_advisory("GHSA-qwww-vcr4-c8h2")
+        assert (
+            store["security"]["acked_npm_advisories"]
+            .count("GHSA-qwww-vcr4-c8h2")
+            == 1
+        )
+
+    def test_ack_npm_advisory_rejects_unknown_id(self, monkeypatch):
+        """Unknown GHSA IDs are not silently persisted."""
+        # No config stub needed — validation happens before persistence.
+        assert adv.ack_npm_advisory("GHSA-does-not-exist") is False
+
+    def test_ack_npm_advisory_rejects_blank(self):
+        assert adv.ack_npm_advisory("") is False
+        assert adv.ack_npm_advisory("   ") is False
+
+    def test_ack_does_not_pollute_python_catalog(self, isolated_home, monkeypatch):
+        """npm acks go to a separate list from Python acks."""
+        store: dict = {"security": {}}
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: store
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.save_config",
+            lambda cfg: store.update(cfg) or None,
+        )
+        adv.ack_npm_advisory("GHSA-qwww-vcr4-c8h2")
+        # The npm GHSA must not appear in the Python acks list.
+        assert store["security"].get("acked_advisories", []) == []
+        assert "GHSA-qwww-vcr4-c8h2" in store["security"]["acked_npm_advisories"]
+
+    def test_unack_npm_advisory_removes_id(self, isolated_home, monkeypatch):
+        """Successful unack removes the GHSA from the persisted list."""
+        store: dict = {"security": {"acked_npm_advisories": ["GHSA-qwww-vcr4-c8h2"]}}
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: store
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.save_config",
+            lambda cfg: store.update(cfg) or None,
+        )
+        assert adv.unack_npm_advisory("GHSA-qwww-vcr4-c8h2") is True
+        assert "GHSA-qwww-vcr4-c8h2" not in store["security"]["acked_npm_advisories"]
+
+    def test_unack_npm_advisory_idempotent(self, isolated_home, monkeypatch):
+        """Unacking a never-acked ID is a no-op (still returns True)."""
+        store: dict = {"security": {"acked_npm_advisories": []}}
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: store
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.save_config",
+            lambda cfg: store.update(cfg) or None,
+        )
+        assert adv.unack_npm_advisory("GHSA-never-acked") is True
+        assert store["security"]["acked_npm_advisories"] == []
+
+    def test_unack_npm_advisory_rejects_blank(self):
+        assert adv.unack_npm_advisory("") is False
+        assert adv.unack_npm_advisory("   ") is False
+
+    def test_unack_preserves_other_acked_ids(self, isolated_home, monkeypatch):
+        """Removing one GHSA must not affect sibling acks in the list."""
+        store: dict = {"security": {"acked_npm_advisories": [
+            "GHSA-qwww-vcr4-c8h2",
+            "GHSA-other",
+            "GHSA-third",
+        ]}}
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: store
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.save_config",
+            lambda cfg: store.update(cfg) or None,
+        )
+        adv.unack_npm_advisory("GHSA-qwww-vcr4-c8h2")
+        assert store["security"]["acked_npm_advisories"] == [
+            "GHSA-other",
+            "GHSA-third",
+        ]
