@@ -43,47 +43,7 @@ from dataclasses import dataclass, field
 logger = logging.getLogger("plugins.workflow.engine")
 from typing import Optional
 
-
-def _hermes_binary() -> str:
-    """Resolve the ``hermes`` CLI binary from the venv.
-
-    The engine spawns ``hermes kanban create/show`` subprocesses to
-    interact with the fleet-wide kanban board.  When called from inside a
-    Hermes agent process (e.g. via MCP tools), ``hermes`` is not on PATH
-    — it only lives in the venv's ``bin/`` directory alongside
-    ``sys.executable``.
-
-    Resolution order:
-      1. ``sys.executable``'s parent — works when invoked via the venv's
-         own python (agent-in-process invocation).
-      2. ``sys.prefix/bin/hermes`` — works when invoked via ``python3 -m``
-         with a different ``sys.executable`` (CLI invocation outside the
-         venv); ``sys.prefix`` always points to the venv root.
-      3. Bare ``"hermes"`` — last resort for dev environments with PATH.
-
-    Returns the absolute path to the ``hermes`` binary, which is always
-    the correct target for ``subprocess.run`` regardless of how the
-    engine is invoked (CLI or in-process).
-    """
-    candidate = Path(sys.executable).parent / "hermes"
-    if candidate.is_file():
-        return str(candidate)
-    # ``sys.prefix`` is set to the venv root by the activated
-    # environment, regardless of which python binary executed this
-    # module.  This catches ``python3 -m plugins.workflow.engine``
-    # invocations where ``sys.executable`` is the system python.
-    venv_candidate = Path(sys.prefix) / "bin" / "hermes"
-    if venv_candidate.is_file():
-        return str(venv_candidate)
-    # Look for the project's .venv next to the module.  This catches
-    # cases where neither sys.executable nor sys.prefix points to
-    # the project venv (e.g. session agent invoking the engine via
-    # ``python3 -m`` with system python outside any activation).
-    project_venv = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "hermes"
-    if project_venv.is_file():
-        return str(project_venv)
-    # Fallback: bare name works when PATH is set (CLI invocations)
-    return "hermes"
+from plugins.workflow.utils import hermes_binary
 from datetime import datetime, timezone
 
 # ── Data structures ──────────────────────────────────────────────
@@ -2388,29 +2348,47 @@ class WorkflowEngine:
                                         rev_state.completed_at = None
                                         rev_state.result = None
                                         print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
-                            # Now wait for the dispatcher to claim the reviewer
-                            # before returning, so the next layer's _monitor_layer
-                            # finds it as "running".
-                            for rev_entry in workflow.nodes[implement_nid].reviews:
-                                rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                                if rev_id and rev_id in states:
-                                    rev_state = states[rev_id]
-                                    if rev_state.kanban_card_id:
-                                        for _ in range(10):  # Wait up to ~30s
-                                            time.sleep(3)
-                                            try:
-                                                card = self.get_card_status(rev_state.kanban_card_id)
-                                                card_status = card.get("status", "").lower()
-                                                if card_status == "running":
-                                                    rev_state.status = "running"
-                                                    print(f"   🔄 {rev_id} claimed by dispatcher — monitoring layer")
-                                                    return True
-                                            except Exception:
-                                                pass
+                            # Don't wait for the dispatcher — the next
+                            # _monitor_layer call will detect the
+                            # "ready" → "running" transition naturally.
                             return True
                 except Exception:
                     pass
         # While loop exited without break — reviewers done or timeout
+        return False
+
+    def _has_active_review(self, workflow: "Workflow", states: dict,
+                            layer: list[str] = None,
+                            require_ready_implement: bool = False) -> bool:
+        """Check if any node has an active (running/blocked/ready) reviewer.
+
+        When ``layer`` is provided, only checks nodes in that layer.
+        When ``require_ready_implement`` is True, only returns True when
+        the implement node is in "ready" status (post-enrichment state).
+        """
+        for nid, state in states.items():
+            if layer and nid not in layer:
+                continue
+            node = workflow.nodes.get(nid)
+            if not node or not node.reviews:
+                continue
+            if require_ready_implement and state.status != "ready":
+                continue
+            for rev_entry in node.reviews:
+                rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                if not rev_id or rev_id not in states:
+                    continue
+                rev_state = states[rev_id]
+                if rev_state.status in ("running", "blocked", "ready"):
+                    return True
+                if rev_state.kanban_card_id:
+                    try:
+                        card = self.get_card_status(rev_state.kanban_card_id)
+                        card_status = card.get("status", "").lower()
+                        if card_status in ("running", "blocked", "ready"):
+                            return True
+                    except Exception:
+                        pass
         return False
 
     # ── Execution ──────────────────────────────────────────────
@@ -2882,30 +2860,7 @@ class WorkflowEngine:
                 # After _monitor_layer returns, check if any node in the
                 # workflow has an active review. If so, enter the review
                 # waiting loop directly.
-                any_active_review = False
-                for nid, state in states.items():
-                    node = workflow.nodes.get(nid)
-                    if node and node.reviews:
-                        if state.status == "ready":
-                            for rev_entry in node.reviews:
-                                rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                                if rev_id and rev_id in states:
-                                    rev_state = states[rev_id]
-                                    if rev_state.status in ("running", "blocked"):
-                                        any_active_review = True
-                                        break
-                                    if rev_state.kanban_card_id:
-                                        try:
-                                            card = self.get_card_status(rev_state.kanban_card_id)
-                                            card_status = card.get("status", "").lower()
-                                            if card_status in ("running", "blocked", "ready"):
-                                                any_active_review = True
-                                                break
-                                        except Exception:
-                                            pass
-                        if any_active_review:
-                            break
-                if any_active_review:
+                if self._has_active_review(workflow, states, require_ready_implement=True):
                     implement_nid = None
                     for nid, state in states.items():
                         node = workflow.nodes.get(nid)
@@ -2920,7 +2875,6 @@ class WorkflowEngine:
                     continue
             else:
                 revision_result = None
-                    # naturally instead of continuing.
 
             # ── Review loop detection ──
             # After _monitor_layer returns, check if this layer has
@@ -2928,30 +2882,7 @@ class WorkflowEngine:
             # enter the waiting loop instead of advancing to the next
             # layer. The waiting loop polls the implement card for its
             # next "pending review" block.
-            has_active_review = False
-            for nid in layer:
-                node = workflow.nodes.get(nid)
-                if node and node.reviews:
-                    for rev_entry in node.reviews:
-                        rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                        if rev_id and rev_id in states:
-                            rev_state = states[rev_id]
-                            if rev_state.status in ("running", "blocked", "ready"):
-                                has_active_review = True
-                                break
-                            if rev_state.kanban_card_id:
-                                try:
-                                    card = self.get_card_status(rev_state.kanban_card_id)
-                                    card_status = card.get("status", "").lower()
-                                    if card_status in ("running", "blocked", "ready"):
-                                        has_active_review = True
-                                        break
-                                except Exception:
-                                    pass
-                    if has_active_review:
-                        break
-
-            if has_active_review:
+            if self._has_active_review(workflow, states, layer=layer):
                 # Check if reviewer is actually blocked (waiting for
                 # implement to re-block) vs just unblocked (dispatcher
                 # will claim it). Only enter the waiting loop when the
@@ -3127,35 +3058,12 @@ class WorkflowEngine:
                 # BUT: if any node in this layer has reviews and the
                 # reviewer is still in-flight (running or blocked),
                 # stay in this layer — the review loop is still active.
-                has_active_review = False
-                for nid in layer:
-                    node = workflow.nodes.get(nid)
-                    if node and node.reviews:
-                        for rev_entry in node.reviews:
-                            rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
-                            if rev_id and rev_id in states:
-                                rev_state = states[rev_id]
-                                # Check in-memory state first, then fall back
-                                # to actual kanban card status for accuracy.
-                                if rev_state.status in ("running", "blocked"):
-                                    has_active_review = True
-                                    break
-                                # Fallback: check actual kanban card status
-                                if rev_state.kanban_card_id:
-                                    try:
-                                        card = self.get_card_status(rev_state.kanban_card_id)
-                                        card_status = card.get("status", "").lower()
-                                        if card_status in ("running", "blocked", "ready"):
-                                            has_active_review = True
-                                            break
-                                    except Exception:
-                                        pass
-                        if has_active_review:
-                            break
-                if has_active_review:
+                if self._has_active_review(workflow, states, layer=layer):
                     print(f"   🔍 has_active_review=True — layer={layer}")
                     print(f"   🔄 Review loop active — waiting for {layer[0]} to re-block pending review")
                     if self._review_waiting_loop(workflow, states, layer[0]):
+                        layer_idx += 1
+                    else:
                         layer_idx += 1
                 else:
                     layer_idx += 1

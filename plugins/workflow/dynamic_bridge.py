@@ -51,32 +51,11 @@ VALID_SCOPES = frozenset({"project", "global", "durable"})
 KANBAN_BOARD = "dynamic-workflows"
 
 # ── Hermes binary resolution ──────────────────────────────────────
-# Self-contained — mirrors the logic in engine.py's _hermes_binary()
+# Self-contained — mirrors the logic in engine.py's hermes_binary()
 # but does NOT import engine.py (bridge is independent).
 
 
-def _hermes_binary() -> str:
-    """Resolve the ``hermes`` CLI binary from the venv.
-
-    Resolution order:
-      1. ``sys.executable``'s parent — works via the venv's own python.
-      2. ``sys.prefix/bin/hermes`` — works when invoked via ``python3 -m``
-         with a different ``sys.executable``.
-      3. Project-level ``.venv/bin/hermes`` — fallback for dev setups.
-      4. Bare ``"hermes"`` — last resort for PATH.
-    """
-    candidate = Path(sys.executable).parent / "hermes"
-    if candidate.is_file():
-        return str(candidate)
-    venv_candidate = Path(sys.prefix) / "bin" / "hermes"
-    if venv_candidate.is_file():
-        return str(venv_candidate)
-    project_venv = (
-        Path(__file__).resolve().parent.parent.parent / ".venv" / "bin" / "hermes"
-    )
-    if project_venv.is_file():
-        return str(project_venv)
-    return "hermes"
+from plugins.workflow.utils import hermes_binary
 
 
 # ── Kanban helpers ────────────────────────────────────────────────
@@ -102,7 +81,7 @@ def _kanban_create_card(node: dict, workflow_id: str, context: str = "", board: 
     kanban_board = board if board else KANBAN_BOARD
     _default_assignee = get_config().get("default_assignee", "")
     cmd = [
-        _hermes_binary(), "kanban", "create",
+        hermes_binary(), "kanban", "create",
         title,
         "--tenant", kanban_board,
         "--body", body,
@@ -143,7 +122,7 @@ def _kanban_create_card(node: dict, workflow_id: str, context: str = "", board: 
 
 def _kanban_complete_card(card_id: str, summary: str = "") -> bool:
     """Mark a kanban card as complete.  Returns True on success."""
-    cmd = [_hermes_binary(), "kanban", "complete", card_id]
+    cmd = [hermes_binary(), "kanban", "complete", card_id]
     if summary:
         cmd.extend(["--result", summary[:500]])
     try:
@@ -247,7 +226,7 @@ def _get_kanban_card_status(card_id: str) -> str:
     """Look up a kanban card's current status. Returns 'unknown' if card not found."""
     try:
         result = subprocess.run(
-            [_hermes_binary(), "kanban", "show", card_id, "--json"],
+            [hermes_binary(), "kanban", "show", card_id, "--json"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
