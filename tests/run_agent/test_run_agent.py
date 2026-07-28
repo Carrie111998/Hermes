@@ -6856,6 +6856,76 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "rate limited" in result["error"]
 
+    def test_network_or_ttfb_outage_keeps_turn_active_until_provider_recovers(
+        self, agent
+    ):
+        """A provider no-byte timeout must not terminate the user turn."""
+        from agent import conversation_loop as _conv_loop
+        from agent.network_outage_retry import NetworkOutageRetryPolicy
+
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+        agent._network_outage_retry_policy = NetworkOutageRetryPolicy(
+            enabled=True,
+            interval_seconds=300,
+            max_wait_seconds=0,
+        )
+        agent.client.chat.completions.create.side_effect = [
+            TimeoutError(
+                "Codex stream produced no bytes within 120s "
+                "(TTFB threshold: 120s)"
+            ),
+            _mock_response(content="recovered"),
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_recover_primary_transport", return_value=False),
+            patch.object(_conv_loop, "wait_for_outage_retry", return_value=True) as wait,
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("continue the task")
+
+        assert result.get("completed") is True
+        assert result.get("final_response") == "recovered"
+        assert agent.client.chat.completions.create.call_count == 2
+        wait.assert_called_once_with(agent, 300, cycle=1)
+
+    def test_network_outage_mode_respects_operator_interrupt(self, agent):
+        """Unlimited outage retry remains immediately interruptible."""
+        from agent import conversation_loop as _conv_loop
+        from agent.network_outage_retry import NetworkOutageRetryPolicy
+
+        class APIConnectionError(Exception):
+            pass
+
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+        agent._network_outage_retry_policy = NetworkOutageRetryPolicy(
+            enabled=True,
+            interval_seconds=300,
+            max_wait_seconds=0,
+        )
+        agent.client.chat.completions.create.side_effect = APIConnectionError(
+            "Connection error."
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_recover_primary_transport", return_value=False),
+            patch.object(_conv_loop, "wait_for_outage_retry", return_value=False),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("continue the task")
+
+        assert result.get("completed") is False
+        assert result.get("interrupted") is True
+        assert "interrupted" in result.get("final_response", "").lower()
+
     def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
 

@@ -129,6 +129,39 @@ class TestFlushAfterCompression:
             assert len(rows) == 2
             assert [row["content"] for row in rows] == ["summary", "continuing..."]
 
+    def test_reloaded_durable_snapshot_is_intrinsically_persisted(self):
+        """A fresh DB snapshot must not be appended again if its baseline is lost.
+
+        Compression may replace the in-memory list with a newly loaded durable
+        snapshot before an auxiliary summary call fails. In that shape object
+        identity no longer matches ``conversation_history``; without an
+        intrinsic marker, the crash-resilience flush appends every durable row
+        again and doubles the session.
+        """
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            first_agent = self._make_agent(db)
+            first_agent._ensure_db_session()
+            original = [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+            ]
+            first_agent._flush_messages_to_session_db(original, [])
+
+            reloaded = db.get_messages_as_conversation("original-session")
+            assert all(msg.get("_db_persisted") is True for msg in reloaded)
+
+            resumed_agent = self._make_agent(db)
+            resumed_agent._flush_messages_to_session_db(reloaded, None)
+
+            rows = db.get_messages("original-session")
+            assert [row["content"] for row in rows] == [
+                "old question",
+                "old answer",
+            ]
+
     def test_in_place_compression_rebaseline_prevents_duplicate_compacted_rows(self):
         """In-place compaction already persisted the compacted transcript.
 

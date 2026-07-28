@@ -82,6 +82,12 @@ from agent.retry_utils import (
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
 )
+from agent.network_outage_retry import (
+    NetworkOutageRetryPolicy,
+    is_provider_network_outage,
+    outage_retry_wait_seconds,
+    wait_for_outage_retry,
+)
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1978,6 +1984,13 @@ def run_conversation(
         api_start_time = time.time()
         retry_count = 0
         max_retries = agent._api_max_retries
+        _network_outage_policy = getattr(
+            agent,
+            "_network_outage_retry_policy",
+            NetworkOutageRetryPolicy(),
+        )
+        _network_outage_started_at = None
+        _network_outage_cycle = 0
         _retry = TurnRetryState()
 
         finish_reason = "stop"
@@ -5092,6 +5105,82 @@ def run_conversation(
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
+
+                    # Slow outage/stall mode: the bounded quick retries, one client
+                    # rebuild, and configured fallback chain have all failed.
+                    # For a genuine status-less provider transport failure or
+                    # an explicitly classified no-byte/no-event provider stall,
+                    # keep this turn active and retry at a fixed cadence rather
+                    # than returning a terminal error.  This is opt-in because
+                    # unattended deployments may prefer a finite task budget.
+                    if (
+                        _network_outage_policy.enabled
+                        and is_provider_network_outage(api_error, classified)
+                    ):
+                        _outage_now = time.monotonic()
+                        if _network_outage_started_at is None:
+                            _network_outage_started_at = _outage_now
+                        _outage_elapsed = max(
+                            0.0, _outage_now - _network_outage_started_at
+                        )
+                        _outage_wait = outage_retry_wait_seconds(
+                            _network_outage_policy,
+                            elapsed_seconds=_outage_elapsed,
+                        )
+                        if _outage_wait is not None:
+                            _network_outage_cycle += 1
+                            _wait_display = int(round(_outage_wait))
+                            agent._emit_status(
+                                "🌐 Provider network/response outage detected — task remains "
+                                f"active; retrying in {_wait_display}s "
+                                f"(outage cycle {_network_outage_cycle})."
+                            )
+                            logger.warning(
+                                "%sProvider transport/response outage; keeping turn active "
+                                "and retrying in %.1fs (cycle=%s elapsed=%.1fs "
+                                "provider=%s model=%s)",
+                                agent.log_prefix,
+                                _outage_wait,
+                                _network_outage_cycle,
+                                _outage_elapsed,
+                                _provider,
+                                _model,
+                            )
+                            agent._touch_activity(
+                                f"provider network outage retry scheduled "
+                                f"(cycle {_network_outage_cycle})"
+                            )
+                            if not wait_for_outage_retry(
+                                agent,
+                                _outage_wait,
+                                cycle=_network_outage_cycle,
+                            ):
+                                _interrupt_text = (
+                                    "Operation interrupted during provider network "
+                                    "outage retry wait."
+                                )
+                                close_interrupted_tool_sequence(
+                                    messages, _interrupt_text
+                                )
+                                agent._persist_session(
+                                    messages, conversation_history
+                                )
+                                agent.clear_interrupt()
+                                return {
+                                    "final_response": _interrupt_text,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "interrupted": True,
+                                }
+                            # Start a fresh quick-retry/rebuild cycle.  The
+                            # original user message and tool sequence remain in
+                            # this same active turn.
+                            retry_count = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.has_retried_429 = False
+                            continue
+
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)

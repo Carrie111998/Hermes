@@ -4616,6 +4616,162 @@ class BasePlatformAdapter(ABC):
             return self
         return live_adapter
 
+    def _delivery_outage_retry_policy(self) -> dict[str, float | bool]:
+        """Return the opt-in long-retry policy for safe delivery outages."""
+        extra = getattr(self.config, "extra", None)
+        raw = extra.get("network_outage_retry", {}) if isinstance(extra, dict) else {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        enabled_raw = raw.get("enabled", False)
+        if isinstance(enabled_raw, str):
+            enabled = enabled_raw.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            enabled = bool(enabled_raw)
+
+        def _number(key: str, default: float) -> float:
+            try:
+                return float(raw.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        sleep_raw = raw.get("sleep_seconds", raw.get("interval_seconds", 300.0))
+        try:
+            sleep_seconds = max(0.0, float(sleep_raw))
+        except (TypeError, ValueError):
+            sleep_seconds = 300.0
+
+        return {
+            "enabled": enabled,
+            "active_window_seconds": max(
+                1.0, _number("active_window_seconds", 180.0)
+            ),
+            "sleep_seconds": sleep_seconds,
+            "max_wait_seconds": max(0.0, _number("max_wait_seconds", 0.0)),
+        }
+
+    def _is_safe_delivery_outage(self, result: "SendResult") -> bool:
+        """Return True only when retrying cannot duplicate an accepted send."""
+        error = (result.error or "").lower()
+        if not result.retryable or self._is_timeout_error(error):
+            return False
+        if result.retry_after is not None:
+            return False
+        if (result.error_kind or "").lower() in {
+            "auth",
+            "bad_request",
+            "blocked",
+            "forbidden",
+            "not_found",
+            "permission",
+            "rate_limited",
+        }:
+            return False
+
+        # These failures happen before a platform can acknowledge/accept the
+        # outbound send. Deliberately exclude read/write timeouts and generic
+        # remote-protocol disconnects: the platform may already have received
+        # those requests, so replaying them could duplicate user-visible text.
+        return any(
+            marker in error
+            for marker in (
+                "send_path_degraded",
+                "connectionerror",
+                "connecterror",
+                "proxyerror",
+                "connection refused",
+                "network is unreachable",
+                "no route to host",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "nodename nor servname provided",
+            )
+        )
+
+    async def _retry_safe_delivery_outage(
+        self,
+        *,
+        result: "SendResult",
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Any,
+        base_delay: float,
+        started_at: float,
+        policy: dict[str, float | bool],
+    ) -> "SendResult":
+        """Keep a final/status delivery alive through a safe network outage."""
+        active_window = float(policy["active_window_seconds"])
+        sleep_seconds = float(policy["sleep_seconds"])
+        max_wait = float(policy["max_wait_seconds"])
+        window_started_at = started_at
+        attempt_in_window = 0
+        cycle = 1
+
+        while self._is_safe_delivery_outage(result):
+            now = time.monotonic()
+            elapsed = max(0.0, now - started_at)
+            if max_wait > 0 and elapsed >= max_wait:
+                logger.error(
+                    "[%s] Delivery outage retry budget exhausted after %.1fs: %s",
+                    self.name,
+                    elapsed,
+                    result.error or "unknown error",
+                )
+                return result
+
+            remaining_window = (window_started_at + active_window) - now
+            if remaining_window <= 0:
+                wait = sleep_seconds
+                if max_wait > 0:
+                    wait = min(wait, max(0.0, max_wait - elapsed))
+                    if wait <= 0:
+                        return result
+                logger.warning(
+                    "[%s] Delivery network outage persists; task response remains "
+                    "pending, sleeping %.1fs before retry cycle %d",
+                    self.name,
+                    wait,
+                    cycle + 1,
+                )
+                await asyncio.sleep(wait)
+                window_started_at = time.monotonic()
+                attempt_in_window = 0
+                cycle += 1
+                continue
+
+            delay = max(0.0, base_delay) * (2 ** min(attempt_in_window, 5))
+            delay += random.uniform(0, 1)
+            delay = min(delay, max(0.0, remaining_window))
+            if max_wait > 0:
+                delay = min(delay, max(0.0, max_wait - elapsed))
+            logger.warning(
+                "[%s] Delivery network outage detected — response remains pending; "
+                "retrying in %.1fs (cycle=%d attempt=%d)",
+                self.name,
+                delay,
+                cycle,
+                attempt_in_window + 1,
+            )
+            await asyncio.sleep(delay)
+            result = await self.send(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            attempt_in_window += 1
+            if result.success:
+                logger.info(
+                    "[%s] Delivery succeeded after network outage (cycle=%d attempt=%d)",
+                    self.name,
+                    cycle,
+                    attempt_in_window,
+                )
+                return result
+
+        return result
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -4634,6 +4790,7 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        delivery_started_at = time.monotonic()
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -4683,7 +4840,32 @@ class BasePlatformAdapter(ABC):
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
-                # All retries exhausted (loop completed without break) — notify user
+                # All bounded retries were exhausted. For failures proven safe
+                # to replay (pre-send connectivity/path failures only), keep the
+                # response pending across active-window/cooldown cycles instead
+                # of dropping it. Ambiguous timeouts never enter this tier.
+                outage_policy = self._delivery_outage_retry_policy()
+                if outage_policy["enabled"] and self._is_safe_delivery_outage(result):
+                    result = await self._retry_safe_delivery_outage(
+                        result=result,
+                        chat_id=chat_id,
+                        content=content,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                        base_delay=base_delay,
+                        started_at=delivery_started_at,
+                        policy=outage_policy,
+                    )
+                    if result.success:
+                        return result
+                    error_str = result.error or ""
+                    if self._is_safe_delivery_outage(result):
+                        # Finite max_wait_seconds exhausted. Do not attempt a
+                        # different payload: the path itself is still down.
+                        return result
+
+                # Policy disabled or error not safe for long retry — preserve
+                # the existing bounded failure-notice behavior.
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
                 notice = (
                     "\u26a0\ufe0f Message delivery failed after multiple attempts. "

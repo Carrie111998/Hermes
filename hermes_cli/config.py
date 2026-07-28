@@ -983,6 +983,16 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Optional slow retry tier for genuine status-less provider transport
+        # outages and explicit no-byte/no-event provider watchdog timeouts,
+        # after normal quick retries/client rebuild/fallback paths are exhausted.
+        # Disabled by default for backwards compatibility.
+        # max_wait_seconds=0 means retry until success or operator interrupt.
+        "network_outage_retry": {
+            "enabled": False,
+            "interval_seconds": 300,
+            "max_wait_seconds": 0,
+        },
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
