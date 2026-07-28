@@ -171,6 +171,23 @@ def priority_dot(priority: Priority) -> str:
     return PRIORITY_EMOJI.get(priority, "")
 
 
+# Event types that ARE a recovery — no payload inspection needed. Their
+# priority exists to make the *transition* land (a gateway coming back is
+# worth a message), not to say "something is wrong".
+_ALWAYS_RECOVERY_TYPES = frozenset({
+    EventType.GATEWAY_STARTED,
+    EventType.WATCHDOG_RECOVERED,
+})
+
+# Event types that are a recovery only for certain payloads:
+#   type -> (payload field, value that means "recovered")
+_RECOVERY_WHEN = {
+    EventType.GATEWAY_HEALTH: ("status", "up"),
+    EventType.CODE_DRIFT: ("status", "resolved"),
+    EventType.WATCHDOG_PROBE_TRANSITION: ("after", "healthy"),
+}
+
+
 def header_dot(event: Event) -> str:
     """Header status dot, overriding the priority color where an event
     semantically reads as a recovery rather than a problem.
@@ -180,12 +197,21 @@ def header_dot(event: Event) -> str:
     operator scanning the feed asked (2026-07-18) for the recovery/'up' line to
     read as green — visually distinct from an outage — without touching the
     event's priority (routing/escalation stay as-is). Only the dot changes.
+
+    Generalized 2026-07-27 after Diego reported the same mismatch on the rest
+    of the recovery family: "messages saying that components are up with an
+    amber indication (should be green)". GATEWAY_STARTED and
+    WATCHDOG_RECOVERED wore a yellow dot beside their own green icon;
+    WATCHDOG_PROBE_TRANSITION → healthy wore the amber HIGH dot. Same scoping
+    as the original: PRESENTATIONAL ONLY, priority/routing/escalation
+    untouched.
     """
-    if event.event_type == EventType.GATEWAY_HEALTH:
-        if (event.payload or {}).get("status") == "up":
-            return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
-    if event.event_type == EventType.CODE_DRIFT:
-        if (event.payload or {}).get("status") == "resolved":
+    if event.event_type in _ALWAYS_RECOVERY_TYPES:
+        return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
+    when = _RECOVERY_WHEN.get(event.event_type)
+    if when is not None:
+        field, recovered_value = when
+        if (event.payload or {}).get(field) == recovered_value:
             return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
     return priority_dot(event.priority)
 

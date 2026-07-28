@@ -23,6 +23,7 @@ from events.routing_policy import (
     WA_URGENT,
     _POLICY,
     classify,
+    cron_output_is_actionable,
     cron_output_is_alert,
     resolve_topic_thread,
 )
@@ -278,6 +279,102 @@ def test_cron_benign_output_stays_trace():
 
 def test_cron_lowercase_red_word_not_matched():
     assert not cron_output_is_alert("colored the widget red for fun")
+
+
+# ------------------------------------------------- cron actionable sniff
+
+class TestCronActionableOutput:
+    """A cron run that asks Diego a question is ACT, not telemetry (2026-07-27).
+
+    Diego, reading the Telegram feed: a "CRON_COMPLETED message that require
+    action ('Reply ALL or...') that should be routed somewhere else". Only
+    cron_output_is_alert() existed, and it scans the HEAD 400 chars — but a
+    prompt is the LAST thing a job prints, so the head window structurally
+    cannot see it. These pin a TAIL-scanning actionable sniffer that outranks
+    the alert sniffer.
+
+    v3 contract: ACT ALWAYS escalates to WhatsApp (_derive_wa). Diego
+    explicitly accepted that tradeoff, which is why the marker set stays
+    tight — a false positive costs a phone page.
+    """
+
+    def _route(self, summary):
+        return classify(make_event(EventType.CRON_COMPLETED,
+                                   {"output_summary": summary}))
+
+    def test_reply_all_prompt_routes_to_action_required(self):
+        route = self._route(
+            "digest built, 12 threads scanned\nReply ALL or pick a thread number.")
+        assert route.attention is Attention.ACT
+        assert route.topic_key == ACTION_REQUIRED
+
+    def test_actionable_prompt_at_the_tail_is_seen(self):
+        """The whole point: the alert scanner's 400-char head window would
+        miss a prompt printed after a long run log."""
+        summary = ("processed row\n" * 200) + "Awaiting your approval to proceed."
+        assert len(summary) > 400
+        assert cron_output_is_actionable(summary)
+        assert self._route(summary).topic_key == ACTION_REQUIRED
+
+    def test_actionable_beats_alert_when_output_has_both(self):
+        """A run that errored AND asked a question is ACT/action_required —
+        the question is the part that needs a human."""
+        summary = "NIGHTLY GATE: RED - pytest rc=2\nReply ALL to retry or STOP."
+        assert cron_output_is_alert(summary)
+        route = self._route(summary)
+        assert route.attention is Attention.ACT
+        assert route.topic_key == ACTION_REQUIRED
+
+    def test_actionable_escalates_to_whatsapp(self):
+        route = self._route("done.\nACTION REQUIRED: confirm the cutover.")
+        assert route.wa_tier in (WA_URGENT, WA_IMMEDIATE)
+
+    def test_actionable_is_never_batched(self):
+        assert self._route("done.\nPlease reply with a choice.").batch is False
+
+    def test_actionable_priority_floors_at_high(self):
+        route = self._route("done.\nReply YES to continue.")
+        assert route.priority.level >= Priority.HIGH.level
+
+    def test_alert_without_a_prompt_still_routes_to_alerts(self):
+        """The alert path is unchanged when nothing asks a question."""
+        route = self._route("NIGHTLY GATE: RED - pytest rc=2 after 75s")
+        assert route.attention is Attention.WARN
+        assert route.topic_key == ALERTS
+
+    def test_benign_output_stays_trace(self):
+        route = self._route("synced 42 rows, errors=0, all green")
+        assert route.attention is Attention.TRACE
+        assert route.topic_key == OPS_TRACE
+
+    @pytest.mark.parametrize("summary", [
+        "Reply ALL or choose one.",
+        "Reply YES to continue.",
+        "Respond with a thread number.",
+        "ACTION REQUIRED: approve the release.",
+        "Awaiting your decision.",
+        "Needs your approval before the cutover.",
+        "Please confirm the destination.",
+        "Proceed with the merge? (y/n)",
+        "Overwrite the file? [Y/n]",
+    ])
+    def test_recognized_prompts(self, summary):
+        assert cron_output_is_actionable(summary), summary
+
+    @pytest.mark.parametrize("summary", [
+        "",
+        "synced 42 rows, errors=0",
+        "no reply needed, run complete",
+        "the customer needs a new laptop",
+        "sent 3 replies to the queue",
+        "NIGHTLY GATE: RED - pytest rc=2 after 75s",
+    ])
+    def test_non_prompts_are_not_actionable(self, summary):
+        """Prose that merely contains 'reply'/'needs' must not page a phone."""
+        assert not cron_output_is_actionable(summary), summary
+
+    def test_none_output_is_not_actionable(self):
+        assert not cron_output_is_actionable(None)
 
 
 # ----------------------------------------------------------- misc routing

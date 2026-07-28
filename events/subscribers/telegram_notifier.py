@@ -296,14 +296,15 @@ class TelegramNotifier(BaseSubscriber):
         route = classify(event, known_topic_keys=self.topics.keys())
 
         # P4: cron lifecycle noise never becomes a message. A no-op
-        # completion ([SILENT]/empty/"no work") is bus-only; the WARN
-        # upgrade from the content sniffer in routing_policy bypasses this
-        # (a real error inside a [SILENT]-prefixed run must deliver).
+        # completion ([SILENT]/empty/"no work") is bus-only; a WARN or ACT
+        # upgrade from the content sniffers in routing_policy bypasses this
+        # (a real error — or a question asked — inside a [SILENT]-prefixed
+        # run must deliver).
         if event.event_type in _CRON_BUS_ONLY:
             return
         if event.event_type == EventType.CRON_COMPLETED:
             output = (event.payload or {}).get("output_summary", "")
-            if (route.attention is not Attention.WARN
+            if (route.attention not in (Attention.WARN, Attention.ACT)
                     and is_noop_cron_output(output)):
                 return
             # Novelty gate (applies to sniffer-upgraded WARN repeats too):

@@ -236,6 +236,34 @@ _CRON_ALERT_RE = re.compile(
 )
 _CRON_ALERT_SCAN_CHARS = 400
 
+# cron_completed output that ASKS DIEGO SOMETHING — "Reply ALL or...", a y/n
+# prompt, an explicit ACTION REQUIRED banner. Reported 2026-07-27: these were
+# landing in the ops firehose as telemetry, so a run that stopped to ask a
+# question just sat there unanswered.
+#
+# Scanned over the TAIL, not the head: a prompt is the LAST thing a job
+# prints, so _CRON_ALERT_SCAN_CHARS' head window structurally cannot see it.
+#
+# Deliberately TIGHT. An ACT route ALWAYS escalates to WhatsApp (_derive_wa),
+# a tradeoff Diego accepted explicitly — so a false positive costs a phone
+# page. Bare "reply"/"needs" in prose must not match; each alternative
+# requires the verb AND its object ("Reply ALL", "Needs your approval").
+_CRON_ACTION_RE = re.compile(
+    r"(?:\bACTION REQUIRED\b"
+    r"|\b(?:R|r)eply (?:ALL|YES|NO|STOP|with|to)\b"
+    r"|\bREPLY (?:ALL|YES|NO|STOP|WITH|TO)\b"
+    r"|\b(?:R|r)espond (?:with|to)\b"
+    r"|\b(?:A|a)waiting (?:your )?(?:reply|response|input|approval|decision)\b"
+    r"|\bAWAITING (?:YOUR )?(?:REPLY|RESPONSE|INPUT|APPROVAL|DECISION)\b"
+    r"|\b(?:N|n)eeds? (?:your )?(?:input|decision|approval|sign-?off)\b"
+    r"|\bNEEDS? (?:YOUR )?(?:INPUT|DECISION|APPROVAL|SIGN-?OFF)\b"
+    r"|\b(?:P|p)lease (?:reply|respond|confirm|approve|choose|pick)\b"
+    r"|[\[(] ?[yY] ?/ ?[nN] ?[\])]"
+    r"|[\[(] ?[yY]es ?/ ?[nN]o ?[\])]"
+    r")"
+)
+_CRON_ACTION_SCAN_CHARS = 800
+
 
 _NON_ACTIONABLE_STATES = frozenset({"healthy", "skipped"})
 
@@ -288,6 +316,14 @@ def cron_output_is_alert(output_summary: str) -> bool:
     outrank type)."""
     text = str(output_summary or "")[:_CRON_ALERT_SCAN_CHARS]
     return bool(_CRON_ALERT_RE.search(text))
+
+
+def cron_output_is_actionable(output_summary: str) -> bool:
+    """True iff a cron run's output text asks the operator for something
+    (P9: content can outrank type). Scans the TAIL — a prompt is the last
+    thing a job prints — unlike cron_output_is_alert()'s head window."""
+    text = str(output_summary or "")[-_CRON_ACTION_SCAN_CHARS:]
+    return bool(_CRON_ACTION_RE.search(text))
 
 
 def classify(
@@ -350,7 +386,13 @@ def classify(
             topic_key = SECURITY
 
     elif et == EventType.CRON_COMPLETED:
-        if cron_output_is_alert(payload.get("output_summary", "")):
+        # Actionable is checked FIRST: a run that both errored AND asked a
+        # question needs a human, not an alert-thread post-mortem. ACT's
+        # class floor (>= HIGH) and mandatory WhatsApp escalation follow.
+        if cron_output_is_actionable(payload.get("output_summary", "")):
+            attention = Attention.ACT
+            topic_key = ACTION_REQUIRED
+        elif cron_output_is_alert(payload.get("output_summary", "")):
             attention = Attention.WARN
             topic_key = ALERTS
             # A RED/FAILED finding must read as an incident (amber dot),

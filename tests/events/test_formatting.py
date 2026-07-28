@@ -2,7 +2,7 @@
 from events.formatting import (
     PRIORITY_EMOJI, EVENT_TYPE_EMOJI, MAILBOX_INNER_EMOJI,
     SEPARATOR,
-    priority_dot, event_icon,
+    priority_dot, header_dot, event_icon,
     format_header, format_event_message, format_whatsapp_message,
     format_whatsapp_header,
 )
@@ -83,6 +83,73 @@ def test_format_whatsapp_header_gateway_health_up_is_green():
     e = _make_event(EventType.GATEWAY_HEALTH, source="system",
                     payload={"platform": "whatsapp", "status": "up", "detail": ""})
     assert format_whatsapp_header(e) == "🟢 🛰️ GATEWAY HEALTH — system · 05:02 UTC"
+
+
+class TestRecoveryHeaderDots:
+    """Recovery lines wear a green dot (2026-07-27).
+
+    Diego, reading the Telegram feed: "messages saying that components are up
+    with an amber indication (should be green)". header_dot() only greened
+    GATEWAY_HEALTH 'up' and CODE_DRIFT 'resolved'; every other recovery fell
+    through to priority_dot(). GATEWAY_STARTED and WATCHDOG_RECOVERED are
+    recoveries by definition (their icon is already green), and a
+    WATCHDOG_PROBE_TRANSITION to 'healthy' is one conditionally. The dot
+    contradicted the icon beside it.
+
+    PRESENTATIONAL ONLY — priority, routing and escalation are untouched, the
+    same scoping as the 2026-07-18 GATEWAY_HEALTH change.
+    """
+
+    def test_gateway_started_is_green(self):
+        e = _make_event(EventType.GATEWAY_STARTED, source="gateway",
+                        payload={"pid": 62724, "boot_reason": "manual"})
+        assert header_dot(e) == PRIORITY_EMOJI[Priority.LOW]
+
+    def test_watchdog_recovered_is_green(self):
+        e = _make_event(EventType.WATCHDOG_RECOVERED, source="watchdog",
+                        payload={"component": "mempalace"})
+        assert header_dot(e) == PRIORITY_EMOJI[Priority.LOW]
+
+    def test_always_recovery_types_stay_green_at_any_priority(self):
+        """These two are recoveries by definition — a producer that stamps a
+        louder priority must not repaint the dot amber."""
+        for et in (EventType.GATEWAY_STARTED, EventType.WATCHDOG_RECOVERED):
+            e = _make_event(et, priority=Priority.CRITICAL, source="watchdog")
+            assert header_dot(e) == PRIORITY_EMOJI[Priority.LOW], et
+
+    def test_probe_transition_to_healthy_is_green(self):
+        e = _make_event(EventType.WATCHDOG_PROBE_TRANSITION, source="watchdog",
+                        payload={"probe": "gbrain-http", "before": "degraded",
+                                 "after": "healthy"})
+        assert header_dot(e) == PRIORITY_EMOJI[Priority.LOW]
+
+    def test_probe_transition_to_degraded_keeps_its_priority_dot(self):
+        """The conditional half only fires on the recovery side."""
+        e = _make_event(EventType.WATCHDOG_PROBE_TRANSITION, source="watchdog",
+                        payload={"probe": "gbrain-http", "before": "healthy",
+                                 "after": "degraded"})
+        assert header_dot(e) == PRIORITY_EMOJI[Priority.HIGH]
+
+    def test_probe_transition_without_payload_keeps_its_priority_dot(self):
+        e = _make_event(EventType.WATCHDOG_PROBE_TRANSITION, source="watchdog")
+        assert header_dot(e) == PRIORITY_EMOJI[Priority.HIGH]
+
+    def test_unrelated_event_still_uses_its_priority_dot(self):
+        """The restructure must not green anything outside the two tables."""
+        e = _make_event(EventType.AGENT_ERROR, source="mailbox:sentinel")
+        assert header_dot(e) == priority_dot(e.priority)
+
+    def test_recovery_dot_does_not_change_event_priority(self):
+        """Presentational only: rendering a header must leave the event's
+        own priority (and therefore routing/escalation) alone."""
+        e = _make_event(EventType.WATCHDOG_RECOVERED, source="watchdog")
+        before = e.priority
+        format_header(e)
+        assert e.priority is before
+
+    def test_whatsapp_header_greens_recoveries_too(self):
+        e = _make_event(EventType.GATEWAY_STARTED, source="gateway")
+        assert format_whatsapp_header(e).startswith(PRIORITY_EMOJI[Priority.LOW])
 
 
 def test_format_header_for_interview_signal_is_critical():
