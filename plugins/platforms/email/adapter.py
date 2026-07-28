@@ -31,6 +31,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email.utils import formatdate
 from email import encoders
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -481,8 +482,11 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
 
-        # Map chat_id (sender email) -> last subject + message-id for threading
-        self._thread_context: Dict[str, Dict[str, str]] = {}
+        # Map chat_id (sender email) -> message_id -> thread context
+        # Multiple threads per sender are tracked by their Message-ID
+        # so concurrent conversations don't overwrite each other (#PR).
+        self._thread_context: Dict[str, Dict[str, Dict[str, str]]] = {}
+        self._max_threads_per_sender: int = 20
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -505,6 +509,64 @@ class EmailAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             # Fallback: just clear old entries if sort fails
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    # ── Thread context helpers ────────────────────────────────────────────
+
+    def _get_thread_context(
+        self,
+        to_addr: str,
+        reply_to_msg_id: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Look up thread context for an outgoing reply.
+
+        Returns the thread context (subject + message_id) that best matches
+        the outgoing reply.  Priority:
+
+        1. If *reply_to_msg_id* is given and there is a thread keyed by that
+           exact Message-ID, return that thread's context.
+        2. Otherwise return the most recent thread context for this sender.
+        3. As a last resort return an empty dict (the caller will produce an
+           unthreaded reply).
+
+        Also trims stale entries for *to_addr* when they exceed
+        ``_max_threads_per_sender`` to prevent unbounded memory growth.
+        """
+        sender_threads = self._thread_context.get(to_addr, {})
+        if not sender_threads:
+            return {}
+
+        # Exact match by the reply target's Message-ID
+        if reply_to_msg_id and reply_to_msg_id in sender_threads:
+            return sender_threads[reply_to_msg_id]
+
+        # Check if reply_to_msg_id matches the *original* message in any thread
+        # (i.e. the reply_to_msg_id is the first message in the chain, and the
+        # thread context was stored under a later message_id in that same chain).
+        if reply_to_msg_id:
+            for ctx in sender_threads.values():
+                if ctx.get("reply_target") == reply_to_msg_id:
+                    return ctx
+
+        # Fall back to the most recent thread for this sender
+        last_key = next(reversed(sender_threads))
+        return sender_threads[last_key]
+
+    def _store_thread_context(self, sender_addr: str, subject: str, message_id: str) -> None:
+        """Record thread context for an incoming email.
+
+        Stores context keyed by the email's Message-ID so that replies can be
+        correctly threaded even when multiple conversations from the same sender
+        overlap.
+        """
+        sender_threads = self._thread_context.setdefault(sender_addr, OrderedDict())
+        sender_threads[message_id] = {
+            "subject": subject,
+            "message_id": message_id,
+        }
+        # Trim oldest entries when this sender exceeds the cap
+        while len(sender_threads) > self._max_threads_per_sender:
+            oldest_key = next(iter(sender_threads))
+            del sender_threads[oldest_key]
 
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
@@ -864,10 +926,7 @@ class EmailAdapter(BasePlatformAdapter):
                 msg_type = MessageType.DOCUMENT
 
         # Store thread context for reply threading
-        self._thread_context[sender_addr] = {
-            "subject": subject,
-            "message_id": msg_data["message_id"],
-        }
+        self._store_thread_context(sender_addr, subject, msg_data["message_id"])
 
         source = self.build_source(
             chat_id=sender_addr,
@@ -929,8 +988,10 @@ class EmailAdapter(BasePlatformAdapter):
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
+        # Thread context for reply — use the reply-to message ID when available
+        # to correctly thread across multiple concurrent conversations from the
+        # same sender.
+        ctx = self._get_thread_context(to_addr, reply_to_msg_id)
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
@@ -987,6 +1048,7 @@ class EmailAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        reply_to: Optional[str] = None,
     ) -> None:
         """Send a batch of images as a single email with multiple MIME attachments.
 
@@ -1028,6 +1090,7 @@ class EmailAdapter(BasePlatformAdapter):
                 chat_id,
                 body,
                 local_paths,
+                reply_to,
             )
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
@@ -1038,19 +1101,23 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
+        reply_to_msg_id: Optional[str] = None,
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
+        # Thread context for reply — use the reply-to message ID when available
+        # to correctly thread across multiple concurrent conversations from the
+        # same sender.
+        ctx = self._get_thread_context(to_addr, reply_to_msg_id)
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
         msg["Subject"] = subject
 
-        original_msg_id = ctx.get("message_id")
+        original_msg_id = reply_to_msg_id or ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
             msg["References"] = original_msg_id
@@ -1106,6 +1173,7 @@ class EmailAdapter(BasePlatformAdapter):
                 caption or "",
                 file_path,
                 file_name,
+                reply_to,
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1118,19 +1186,23 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_path: str,
         file_name: Optional[str] = None,
+        reply_to_msg_id: Optional[str] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
+        # Thread context for reply — use the reply-to message ID when available
+        # to correctly thread across multiple concurrent conversations from the
+        # same sender.
+        ctx = self._get_thread_context(to_addr, reply_to_msg_id)
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
         msg["Subject"] = subject
 
-        original_msg_id = ctx.get("message_id")
+        original_msg_id = reply_to_msg_id or ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
             msg["References"] = original_msg_id
@@ -1166,7 +1238,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the email chat."""
-        ctx = self._thread_context.get(chat_id, {})
+        ctx = self._get_thread_context(chat_id)
         return {
             "name": chat_id,
             "type": "dm",
