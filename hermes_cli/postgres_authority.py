@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -262,6 +262,40 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ''
         )
         ON CONFLICT (id) DO NOTHING;
+        """,
+    ),
+    # v5 → v6: capability grants for RBAC enforcement.
+    # Capabilities follow the grammar: resource:action:scope=value
+    # Grants are never amplifiable — a worker cannot gain more permission
+    # than its credential provides.
+    (
+        5,
+        """
+        CREATE TABLE IF NOT EXISTS capability_grants (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            workspace_id    UUID,
+            -- The principal receiving the grant (worker_id, actor_id, role slug)
+            principal_type  TEXT        NOT NULL,
+            principal_id    TEXT        NOT NULL,
+            -- Capability triple: resource:action:scope
+            resource        TEXT        NOT NULL,
+            action          TEXT        NOT NULL,
+            scope           TEXT        NOT NULL DEFAULT '*',
+            -- Grant metadata
+            granted_by      TEXT        NOT NULL DEFAULT '',
+            granted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at      TIMESTAMPTZ,
+            revoked_at      TIMESTAMPTZ,
+
+            CONSTRAINT uq_capability_grant
+                UNIQUE (tenant_id, principal_type, principal_id, resource, action, scope)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_capability_grants_principal
+            ON capability_grants(tenant_id, principal_type, principal_id);
+        CREATE INDEX IF NOT EXISTS idx_capability_grants_resource
+            ON capability_grants(tenant_id, resource, action);
         """,
     ),
 ]
@@ -1349,6 +1383,144 @@ def deactivate_workspace(
 
 
 # ---------------------------------------------------------------------------
+# Capability grants (RBAC)
+# ---------------------------------------------------------------------------
+
+
+def grant_capability(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+    principal_type: str,
+    principal_id: str,
+    resource: str,
+    action: str,
+    scope: str = "*",
+    workspace_id: Optional[UUID] = None,
+    granted_by: str = "",
+    ttl_seconds: Optional[int] = None,
+) -> bool:
+    """Grant a capability to a principal. Idempotent (ON CONFLICT DO NOTHING)."""
+    expires_dt = _ts(time.time() + ttl_seconds) if ttl_seconds else None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO capability_grants
+                (tenant_id, workspace_id, principal_type, principal_id,
+                 resource, action, scope, granted_by, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, principal_type, principal_id, resource, action, scope)
+            DO NOTHING
+            RETURNING id
+            """,
+            (
+                str(tenant_id),
+                str(workspace_id) if workspace_id else None,
+                principal_type,
+                principal_id,
+                resource,
+                action,
+                scope,
+                granted_by,
+                expires_dt,
+            ),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+
+
+def revoke_capability(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+    principal_type: str,
+    principal_id: str,
+    resource: str,
+    action: str,
+    scope: str = "*",
+) -> bool:
+    """Revoke a capability grant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE capability_grants
+            SET revoked_at = NOW()
+            WHERE tenant_id      = %s
+              AND principal_type  = %s
+              AND principal_id   = %s
+              AND resource       = %s
+              AND action         = %s
+              AND scope          = %s
+              AND revoked_at     IS NULL
+            RETURNING id
+            """,
+            (str(tenant_id), principal_type, principal_id, resource, action, scope),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row is not None
+
+
+def check_capability(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+    principal_type: str,
+    principal_id: str,
+    resource: str,
+    action: str,
+    scope: str = "*",
+) -> bool:
+    """Check if a principal holds an active (non-revoked, non-expired) capability.
+
+    Matches exact scope or wildcard ('*') grants.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM capability_grants
+            WHERE tenant_id      = %s
+              AND principal_type  = %s
+              AND principal_id   = %s
+              AND resource       = %s
+              AND action         = %s
+              AND (scope = %s OR scope = '*')
+              AND revoked_at     IS NULL
+              AND (expires_at IS NULL OR expires_at > NOW())
+            LIMIT 1
+            """,
+            (str(tenant_id), principal_type, principal_id, resource, action, scope),
+        )
+        return cur.fetchone() is not None
+
+
+def list_capabilities(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID,
+    principal_type: str,
+    principal_id: str,
+) -> list[dict[str, Any]]:
+    """List all active capabilities for a principal."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM capability_grants
+            WHERE tenant_id      = %s
+              AND principal_type  = %s
+              AND principal_id   = %s
+              AND revoked_at     IS NULL
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY resource, action
+            """,
+            (str(tenant_id), principal_type, principal_id),
+        )
+        return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
 # Environment / backend detection
 # ---------------------------------------------------------------------------
 
@@ -1405,6 +1577,10 @@ __all__ = [
     "get_workspace",
     "list_workspaces",
     "deactivate_workspace",
+    "grant_capability",
+    "revoke_capability",
+    "check_capability",
+    "list_capabilities",
     "get_authority_backend",
     "get_authority_connection",
     "DEFAULT_TENANT_ID",

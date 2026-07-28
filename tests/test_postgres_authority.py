@@ -1395,6 +1395,156 @@ class TestWorkspaceManagement:
         assert "default" in slugs
 
 
+# ---------------------------------------------------------------------------
+# 10. Capability grants (RBAC) tests
+# ---------------------------------------------------------------------------
+
+
+class TestCapabilityGrants:
+    """RBAC capability enforcement."""
+
+    def test_grant_and_check_capability(self, pg):
+        from hermes_cli.postgres_authority import (
+            grant_capability, check_capability, DEFAULT_TENANT_ID,
+        )
+
+        ok = grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-001",
+            resource="task", action="claim", scope="workspace=default",
+        )
+        assert ok is True
+
+        has = check_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-001",
+            resource="task", action="claim", scope="workspace=default",
+        )
+        assert has is True
+
+    def test_wildcard_scope_matches_any(self, pg):
+        from hermes_cli.postgres_authority import (
+            grant_capability, check_capability, DEFAULT_TENANT_ID,
+        )
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-admin",
+            resource="task", action="complete", scope="*",
+        )
+
+        has = check_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-admin",
+            resource="task", action="complete",
+            scope="workspace=engineering",
+        )
+        assert has is True
+
+    def test_revoked_capability_not_found(self, pg):
+        from hermes_cli.postgres_authority import (
+            grant_capability, revoke_capability, check_capability, DEFAULT_TENANT_ID,
+        )
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-revoke-test",
+            resource="payment", action="write", scope="*",
+        )
+        revoke_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-revoke-test",
+            resource="payment", action="write", scope="*",
+        )
+
+        has = check_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-revoke-test",
+            resource="payment", action="write", scope="*",
+        )
+        assert has is False
+
+    def test_expired_capability_not_found(self, pg):
+        from hermes_cli.postgres_authority import (
+            grant_capability, check_capability, DEFAULT_TENANT_ID,
+        )
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-expired",
+            resource="audit", action="read", scope="*",
+            ttl_seconds=-10,  # already expired
+        )
+
+        has = check_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-expired",
+            resource="audit", action="read", scope="*",
+        )
+        assert has is False
+
+    def test_capability_non_amplifiable_cross_tenant(self, pg):
+        """A capability in tenant A must not be visible in tenant B."""
+        from hermes_cli.postgres_authority import (
+            grant_capability, check_capability, create_tenant, DEFAULT_TENANT_ID,
+        )
+        from uuid import UUID
+
+        tenant_b = UUID("ca0ca0ca-ca0c-ca0c-ca0c-ca0ca0ca0ca0")
+        create_tenant(pg, tenant_id=tenant_b, slug="rbac-test-tenant")
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-cross",
+            resource="task", action="claim", scope="*",
+        )
+
+        has = check_capability(
+            pg, tenant_id=tenant_b,
+            principal_type="worker", principal_id="w-cross",
+            resource="task", action="claim", scope="*",
+        )
+        assert has is False, "capability must not leak across tenants"
+
+    def test_list_capabilities(self, pg):
+        from hermes_cli.postgres_authority import (
+            grant_capability, list_capabilities, DEFAULT_TENANT_ID,
+        )
+
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="role", principal_id="ceo",
+            resource="objective", action="verify", scope="*",
+        )
+        grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="role", principal_id="ceo",
+            resource="payment", action="approve", scope="*",
+        )
+
+        caps = list_capabilities(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="role", principal_id="ceo",
+        )
+        resources = [c["resource"] for c in caps]
+        assert "objective" in resources
+        assert "payment" in resources
+
+    def test_grant_idempotent(self, pg):
+        from hermes_cli.postgres_authority import grant_capability, DEFAULT_TENANT_ID
+
+        assert grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-idem",
+            resource="task", action="claim", scope="*",
+        ) is True
+        assert grant_capability(
+            pg, tenant_id=DEFAULT_TENANT_ID,
+            principal_type="worker", principal_id="w-idem",
+            resource="task", action="claim", scope="*",
+        ) is False
+
+
 # Note: Authority-store capability contract tests (postgres backend recognition,
 # SQLite multi-host rejection, unknown backend fail-closed) live in:
 #   tests/hermes_cli/test_authority_store.py

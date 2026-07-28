@@ -45,13 +45,15 @@
 - [x] v2→v3 + v3→v4 migrations (idempotent, fail-closed)
 - [x] Cross-tenant attack vector tests (100% pass, 4 vectors)
 - [x] Claim exclusivity invariant preserved (UNIQUE task_id, org_id only)
+- [x] Runtime tenant context propagation (ContextVar + env fallback)
+- [x] Objective worker binds tenant at registration
+- [x] Workspace model (v4→v5 migration, tenant-scoped CRUD)
+- [x] RBAC capability grants (v5→v6 migration, grant/revoke/check/list)
 
 ### Remaining
 
 - [ ] Gateway tenant_id extraction from authenticated credential
-- [ ] Agent runtime tenant_id injection into all DB calls
-- [ ] Workspace model (workspace_id scoping)
-- [ ] RBAC capability grammar enforcement
+- [ ] RBAC enforcement wiring into authority store operations
 - [ ] Documentation: migration guide, capability model
 
 ---
