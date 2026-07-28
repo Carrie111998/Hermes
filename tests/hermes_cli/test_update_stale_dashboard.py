@@ -14,6 +14,7 @@ History:
 from __future__ import annotations
 
 import importlib
+import io
 import os
 import sys
 from unittest.mock import patch, MagicMock
@@ -232,6 +233,93 @@ class TestFindStaleDashboardPids:
             )
             pids = _find_stale_dashboard_pids(exclude_pids={12345})
         assert pids == []
+
+
+    def test_supervisor_wrapper_while_true_skipped(self):
+        """A shell loop wrapper containing 'hermes dashboard' should not be
+        matched — killing it would destroy the supervisor itself (#73379).
+        """
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="\n".join([
+                    _ps_line(
+                        10000,
+                        'bash -lc "while true; do hermes dashboard '
+                        "--host 127.0.0.1 --port 9119 --no-open "
+                        '--skip-build; sleep 3; done"',
+                    ),
+                    _ps_line(
+                        20000,
+                        "python3 /path/to/venv/bin/hermes dashboard "
+                        "--host 127.0.0.1 --port 9119 --no-open",
+                    ),
+                ])
+                + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+        # The wrapper (PID 10000) should be skipped; only the actual
+        # dashboard process (PID 20000) should be returned.
+        assert 10000 not in pids
+        assert 20000 in pids
+
+    def test_supervisor_wrapper_while_colon_skipped(self):
+        """'while :' is a POSIX idiom for infinite loops."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=_ps_line(
+                    10001,
+                    "sh -c 'while :; do hermes dashboard --port 9119; sleep 1; done'",
+                )
+                + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+        assert pids == []
+
+    def test_supervisor_wrapper_until_skipped(self):
+        """'until' loop wrappers should also be skipped."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=_ps_line(
+                    10002,
+                    "bash -c 'until false; do hermes serve --port 8300; sleep 2; done'",
+                )
+                + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+        assert pids == []
+
+    def test_supervisor_wrapper_semicolon_do_skipped(self):
+        "'; do ' in the command indicates a loop body."
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=_ps_line(
+                    10003,
+                    "bash -lc 'for i in 1 2 3; do hermes dashboard --port 9119; done'",
+                )
+                + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+        assert pids == []
+
+    def test_direct_hermes_dashboard_still_matched(self):
+        """Direct ``hermes dashboard`` without loop constructs must still match."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=_ps_line(12345, "hermes dashboard --port 9119 --no-open")
+                + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+        assert pids == [12345]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX kill semantics")
@@ -792,6 +880,43 @@ class TestManualBackendRespawn:
         assert failed == [["hermes", "serve"]]
         out = capsys.readouterr().out
         assert "✗ failed to restart" in out
+
+    def test_supervised_non_systemd_pid_not_respawned(self, capsys):
+        """Processes with PPID != 1 are supervised by something other than
+        systemd (tmux, supervisord, etc.).  They should be killed but NOT
+        respawned — the supervisor will handle the restart (#73379).
+        """
+        live = self._live()
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                raise ProcessLookupError
+
+        proc_status = io.BytesIO(b"Name:\thermes\ntest\nPPid:\t42\nState:\tS\n")
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if isinstance(path, str) and path.startswith("/proc/"):
+                return io.TextIOWrapper(proc_status, encoding="utf-8")
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(live, "_restart_managed_dashboard_service", return_value=False), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=[5555]), \
+             patch.object(live, "_get_pid_cgroup_path", return_value=None), \
+             patch.object(live, "_get_systemd_service_for_pid", return_value=None), \
+             patch.object(live, "_dashboard_cmdline_for_pid") as capture, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch("os.kill", side_effect=fake_kill), \
+             patch("builtins.open", side_effect=fake_open), \
+             patch("time.sleep"):
+            _kill_stale_dashboard_processes(restart_managed=True)
+
+        # PPID 42 ≠ 1 → supervised → cmdline capture and respawn both skipped.
+        capture.assert_not_called()
+        respawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Restart anything not auto-restarted" in out
 
 
 class TestCmdlineCapture:
