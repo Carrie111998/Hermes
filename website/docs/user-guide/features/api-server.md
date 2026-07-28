@@ -250,6 +250,12 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
+    "run_approval_compare_and_set": {
+      "version": 1,
+      "required": true,
+      "request_id_field": "expected_approval_id",
+      "event_id_field": "approval_id"
+    },
     "run_stop": true
   }
 }
@@ -371,9 +377,21 @@ Poll the current run state. This is useful for dashboards that need status witho
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
 
+While a run is waiting for one or more human decisions, status includes
+`pending_approvals`. Each item contains the immutable `approval_id`,
+`created_at`, `expires_at`, and allowed `choices`. For compatibility,
+`pending_approval` contains the same item when exactly one request is pending;
+it is `null` when none or multiple are pending. Both fields are cleared when
+the run completes, fails, is cancelled, stops, or the request expires.
+
 ### GET /v1/runs/\{run_id\}/events
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
+
+An `approval.request` event includes the same immutable `approval_id`,
+`created_at`, `expires_at`, and `choices` fields exposed by run status. Clients
+must retain that `approval_id` and return it as `expected_approval_id`; a
+decision must never be inferred from only the run ID.
 
 When the agent delegates work to background subagents, the stream also carries
 `subagent.start` and `subagent.complete` lifecycle events, so clients can
@@ -401,7 +419,55 @@ running.
 
 ### POST /v1/runs/\{run_id\}/approval
 
-Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
+Resolve exactly one pending approval for a run that is waiting on a human
+decision. This endpoint uses compare-and-set: `expected_approval_id` is
+mandatory and must match the immutable ID from `approval.request` or
+`pending_approvals`.
+
+```json
+{
+  "choice": "once",
+  "expected_approval_id": "approval_abc123"
+}
+```
+
+The first matching decision returns:
+
+```json
+{
+  "object": "hermes.run.approval_response",
+  "run_id": "run_abc123",
+  "approval_id": "approval_abc123",
+  "choice": "once",
+  "resolved": 1,
+  "idempotent": false
+}
+```
+
+Repeating the same ID and choice is safe and returns HTTP 200 with
+`"resolved": 0` and `"idempotent": true`, including after the run reaches a
+terminal state while its retained status is available. Reusing the ID with a
+different choice fails closed.
+
+Errors use the normal OpenAI-style error envelope:
+
+- HTTP 400 `invalid_approval_choice` — unsupported `choice`.
+- HTTP 400 `approval_resolve_all_not_supported` — exact decisions cannot use
+  `all` or `resolve_all`.
+- HTTP 409 `approval_id_required` — `expected_approval_id` was omitted.
+- HTTP 409 `approval_id_mismatch` — the ID does not name a current request.
+- HTTP 409 `approval_expired` — the matching request passed its deadline.
+- HTTP 409 `approval_decision_conflict` — that ID was already finalized with a
+  different decision, including a concurrent stop/interrupt denial.
+- HTTP 409 `approval_not_pending` or `approval_not_active` — the run has no
+  resolvable approval state.
+
+The mandatory contract is discoverable at
+`features.run_approval_compare_and_set` in `/v1/capabilities`. Version `1`
+advertises `required: true`, `event_id_field: "approval_id"`, and
+`request_id_field: "expected_approval_id"`. Clients that do not discover this
+capability must not display an actionable approval control, because legacy
+run-ID-only decisions are unsafe.
 
 ## Jobs API (background scheduled work)
 

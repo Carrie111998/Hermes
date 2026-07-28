@@ -2817,6 +2817,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "run_approval_compare_and_set": {
+                    "version": 1,
+                    "required": True,
+                    "request_id_field": "expected_approval_id",
+                    "event_id_field": "approval_id",
+                },
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
@@ -5925,6 +5931,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        if status in {"completed", "failed", "cancelled"}:
+            fields["pending_approval"] = None
+            fields["pending_approvals"] = []
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -5935,6 +5944,48 @@ class APIServerAdapter(BasePlatformAdapter):
         current.update(fields)
         self._run_statuses[run_id] = current
         return current
+
+    def _refresh_run_approval_status(
+        self,
+        run_id: str,
+        approval_session_key: str,
+        *,
+        last_event: Optional[str] = None,
+    ) -> None:
+        """Rebuild public pending-approval state from the locked core queue."""
+        from tools.approval import list_gateway_approvals
+
+        current = self._run_statuses.get(run_id)
+        if current is None:
+            return
+        pending = []
+        for approval in list_gateway_approvals(approval_session_key):
+            pending.append({
+                "approval_id": approval["approval_id"],
+                "created_at": approval["created_at"],
+                "expires_at": approval["expires_at"],
+                "choices": _approval_event_choices(
+                    smart_denied=bool(approval.get("smart_denied")),
+                    allow_permanent=approval.get("allow_permanent") is not False,
+                ),
+            })
+        current_status = current.get("status", "running")
+        if current_status in {"completed", "failed", "cancelled"}:
+            pending = []
+            next_status = current_status
+        elif pending:
+            next_status = "waiting_for_approval"
+        elif current_status == "waiting_for_approval":
+            next_status = "running"
+        else:
+            next_status = current_status
+        fields = {
+            "pending_approvals": pending,
+            "pending_approval": pending[0] if len(pending) == 1 else None,
+        }
+        if last_event is not None:
+            fields["last_event"] = last_event
+        self._set_run_status(run_id, next_status, **fields)
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -6215,19 +6266,34 @@ class APIServerAdapter(BasePlatformAdapter):
                             allow_permanent=event.get("allow_permanent") is not False,
                         ),
                     })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                        pending_approval={
-                            "approval_id": event.get("approval_id"),
-                            "created_at": event.get("created_at"),
-                            "expires_at": event.get("expires_at"),
-                            "choices": event["choices"],
-                        },
-                    )
+                    def _publish_request() -> None:
+                        self._refresh_run_approval_status(
+                            run_id,
+                            approval_session_key,
+                            last_event="approval.request",
+                        )
+                        q.put_nowait(event)
+
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        loop.call_soon_threadsafe(_publish_request)
+                    except Exception:
+                        pass
+
+                def _approval_finalized(approval_data: Dict[str, Any]) -> None:
+                    def _update() -> None:
+                        choice = approval_data.get("_resolution_choice")
+                        approval_id = approval_data.get("approval_id")
+                        if choice is not None and approval_id:
+                            self._run_approval_decisions.setdefault(run_id, {})[
+                                approval_id
+                            ] = choice
+                        self._refresh_run_approval_status(
+                            run_id,
+                            approval_session_key,
+                        )
+
+                    try:
+                        loop.call_soon_threadsafe(_update)
                     except Exception:
                         pass
 
@@ -6262,7 +6328,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
                             )
-                            register_gateway_notify(approval_session_key, _approval_notify)
+                            register_gateway_notify(
+                                approval_session_key,
+                                _approval_notify,
+                                finalized_cb=_approval_finalized,
+                            )
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
@@ -6598,12 +6668,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         resolution_status = resolution["status"]
         if resolution_status not in {"resolved", "already_resolved"}:
+            self._refresh_run_approval_status(run_id, approval_session_key)
             error_codes = {
                 "approval_id_required": "approval_id_required",
                 "decision_conflict": "approval_decision_conflict",
                 "expired": "approval_expired",
                 "mismatch": "approval_id_mismatch",
                 "not_pending": "approval_not_pending",
+                "already_finalized": "approval_already_finalized",
             }
             return web.json_response(
                 _openai_error(
@@ -6619,11 +6691,10 @@ class APIServerAdapter(BasePlatformAdapter):
             expected_approval_id
         ] = choice
         if not idempotent:
-            self._set_run_status(
+            self._refresh_run_approval_status(
                 run_id,
-                "running",
+                approval_session_key,
                 last_event="approval.responded",
-                pending_approval=None,
             )
         q = self._run_streams.get(run_id)
         if q is not None and not idempotent:
@@ -6663,6 +6734,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
+
+        approval_session_key = self._run_approval_sessions.get(run_id)
+        if approval_session_key:
+            try:
+                from tools.approval import resolve_gateway_approval
+
+                resolve_gateway_approval(
+                    approval_session_key,
+                    "deny",
+                    resolve_all=True,
+                )
+                self._refresh_run_approval_status(run_id, approval_session_key)
+            except Exception:
+                pass
 
         if agent is not None:
             try:

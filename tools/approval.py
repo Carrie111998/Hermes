@@ -2155,7 +2155,10 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "approval_id", "deadline")
+    __slots__ = (
+        "event", "data", "result", "reason", "approval_id", "deadline",
+        "finalized_cb",
+    )
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2167,6 +2170,7 @@ class _ApprovalEntry:
         self.data["created_at"] = created_at
         self.data["expires_at"] = created_at + timeout
         self.deadline = time.monotonic() + timeout
+        self.finalized_cb = None
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
@@ -2176,11 +2180,12 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_finalize_cbs: dict[str, object] = {}
 _resolved_gateway_approvals: dict[tuple[str, str], dict] = {}
 _RESOLVED_GATEWAY_APPROVALS_MAX = 1024
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(session_key: str, cb, finalized_cb=None) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
@@ -2190,6 +2195,59 @@ def register_gateway_notify(session_key: str, cb) -> None:
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+        if finalized_cb is not None:
+            _gateway_finalize_cbs[session_key] = finalized_cb
+        else:
+            _gateway_finalize_cbs.pop(session_key, None)
+
+
+def _remember_gateway_resolution_locked(
+    session_key: str,
+    entry: _ApprovalEntry,
+    choice: Optional[str],
+    status: str,
+) -> None:
+    _resolved_gateway_approvals[(session_key, entry.approval_id)] = {
+        "choice": choice,
+        "status": status,
+        "resolved_at": time.time(),
+    }
+    while len(_resolved_gateway_approvals) > _RESOLVED_GATEWAY_APPROVALS_MAX:
+        _resolved_gateway_approvals.pop(next(iter(_resolved_gateway_approvals)))
+
+
+def _finalize_gateway_entry_locked(
+    session_key: str,
+    entry: _ApprovalEntry,
+    choice: Optional[str],
+    *,
+    reason: Optional[str] = None,
+    status: str = "resolved",
+) -> bool:
+    """Finalize and dequeue one entry while the caller holds ``_lock``."""
+    queue = _gateway_queues.get(session_key)
+    if not queue or entry not in queue or entry.event.is_set():
+        return False
+    queue.remove(entry)
+    if not queue:
+        _gateway_queues.pop(session_key, None)
+    entry.result = choice
+    if reason:
+        entry.reason = reason
+    _remember_gateway_resolution_locked(session_key, entry, choice, status)
+    entry.event.set()
+    return True
+
+
+def _notify_gateway_entry_finalized(entry: _ApprovalEntry) -> None:
+    if entry.finalized_cb is None:
+        return
+    try:
+        payload = dict(entry.data)
+        payload["_resolution_choice"] = entry.result
+        entry.finalized_cb(payload)
+    except Exception as exc:
+        logger.debug("Gateway approval finalize callback failed: %s", exc)
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -2200,9 +2258,14 @@ def unregister_gateway_notify(session_key: str) -> None:
     """
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
-    for entry in entries:
-        entry.event.set()
+        _gateway_finalize_cbs.pop(session_key, None)
+        entries = list(_gateway_queues.get(session_key, []))
+        finalized = [
+            entry for entry in entries
+            if _finalize_gateway_entry_locked(session_key, entry, "deny")
+        ]
+    for entry in finalized:
+        _notify_gateway_entry_finalized(entry)
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2221,24 +2284,24 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    finalized = []
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
         if resolve_all:
             targets = list(queue)
-            queue.clear()
         else:
-            targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
-
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
-    return len(targets)
+            targets = [queue[0]]
+        finalized = [
+            entry for entry in targets
+            if _finalize_gateway_entry_locked(
+                session_key, entry, choice, reason=reason
+            )
+        ]
+    for entry in finalized:
+        _notify_gateway_entry_finalized(entry)
+    return len(finalized)
 
 
 def resolve_gateway_approval_cas(
@@ -2264,6 +2327,12 @@ def resolve_gateway_approval_cas(
     with _lock:
         previous = _resolved_gateway_approvals.get(key)
         if previous is not None:
+            if previous.get("status") == "expired":
+                return {
+                    "status": "expired",
+                    "resolved": 0,
+                    "approval_id": expected_approval_id,
+                }
             if previous["choice"] == choice:
                 return {
                     "status": "already_resolved",
@@ -2299,23 +2368,29 @@ def resolve_gateway_approval_cas(
                 "approval_id": expected_approval_id,
             }
 
-        queue.remove(target)
-        if not queue:
-            _gateway_queues.pop(session_key, None)
-
+        if target.event.is_set():
+            return {
+                "status": "already_finalized",
+                "resolved": 0,
+                "approval_id": expected_approval_id,
+            }
         if time.monotonic() >= target.deadline:
             expired = True
+            finalized = _finalize_gateway_entry_locked(
+                session_key, target, None, status="expired"
+            )
         else:
-            target.result = choice
-            if reason:
-                target.reason = reason
-            _resolved_gateway_approvals[key] = {
-                "choice": choice,
-                "resolved_at": time.time(),
-            }
-            while len(_resolved_gateway_approvals) > _RESOLVED_GATEWAY_APPROVALS_MAX:
-                _resolved_gateway_approvals.pop(next(iter(_resolved_gateway_approvals)))
-        target.event.set()
+            finalized = _finalize_gateway_entry_locked(
+                session_key, target, choice, reason=reason
+            )
+
+    if not finalized:
+        return {
+            "status": "already_finalized",
+            "resolved": 0,
+            "approval_id": expected_approval_id,
+        }
+    _notify_gateway_entry_finalized(target)
 
     if expired:
         return {
@@ -2336,6 +2411,16 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def list_gateway_approvals(session_key: str) -> list[dict]:
+    """Return snapshots of the session's currently pending approvals."""
+    with _lock:
+        return [
+            dict(entry.data)
+            for entry in _gateway_queues.get(session_key, [])
+            if not entry.event.is_set()
+        ]
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -3340,6 +3425,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     entry = _ApprovalEntry(approval_data)
     with _lock:
+        entry.finalized_cb = _gateway_finalize_cbs.get(session_key)
         _gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry() -> None:
@@ -3398,15 +3484,25 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 "returning deny for session %s",
                 session_key,
             )
-            entry.result = "deny"
-            entry.event.set()
-            resolved = True
+            with _lock:
+                finalized = _finalize_gateway_entry_locked(
+                    session_key, entry, "deny"
+                )
+            if finalized:
+                _notify_gateway_entry_finalized(entry)
+            resolved = finalized or entry.event.is_set()
             break
         if entry.event.is_set():
             resolved = True
             break
         _remaining = _deadline - time.monotonic()
         if _remaining <= 0:
+            with _lock:
+                finalized = _finalize_gateway_entry_locked(
+                    session_key, entry, None, status="expired"
+                )
+            if finalized:
+                _notify_gateway_entry_finalized(entry)
             break
         if entry.event.wait(timeout=min(1.0, _remaining)):
             resolved = True

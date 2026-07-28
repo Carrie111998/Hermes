@@ -739,6 +739,101 @@ class TestRunApprovalCompareAndSet:
         with approval_mod._lock:
             approval_mod._gateway_queues.pop(run_id, None)
 
+    @pytest.mark.asyncio
+    async def test_multiple_pending_approvals_remain_visible_until_each_resolves(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        run_id = "run_multiple_pending"
+        approval_a = approval_mod._ApprovalEntry({"command": "danger-a"})
+        approval_b = approval_mod._ApprovalEntry({"command": "danger-b"})
+        self._bind_pending(adapter, run_id, approval_a, approval_b)
+        adapter._refresh_run_approval_status(run_id, run_id)
+
+        status = adapter._run_statuses[run_id]
+        assert [
+            pending["approval_id"] for pending in status["pending_approvals"]
+        ] == [approval_a.approval_id, approval_b.approval_id]
+        assert status["pending_approval"] is None
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "once",
+                    "expected_approval_id": approval_a.approval_id,
+                },
+            )
+            assert first.status == 200
+            status = adapter._run_statuses[run_id]
+            assert status["status"] == "waiting_for_approval"
+            assert status["pending_approvals"] == [status["pending_approval"]]
+            assert status["pending_approval"]["approval_id"] == approval_b.approval_id
+
+            second = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "deny",
+                    "expected_approval_id": approval_b.approval_id,
+                },
+            )
+
+        assert second.status == 200
+        status = adapter._run_statuses[run_id]
+        assert status["status"] == "running"
+        assert status["pending_approvals"] == []
+        assert status["pending_approval"] is None
+
+    @pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+    def test_terminal_status_clears_stale_pending_approvals(
+        self, adapter, terminal_status
+    ):
+        run_id = "run_terminal_cleanup"
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+            "pending_approval": {"approval_id": "approval_stale"},
+            "pending_approvals": [{"approval_id": "approval_stale"}],
+        }
+
+        adapter._set_run_status(
+            run_id,
+            terminal_status,
+            last_event=f"run.{terminal_status}",
+        )
+
+        status = adapter._run_statuses[run_id]
+        assert status["pending_approval"] is None
+        assert status["pending_approvals"] == []
+
+    @pytest.mark.asyncio
+    async def test_stop_finalizes_pending_as_deny_before_stale_cas(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_stop_approval_race"
+        pending = approval_mod._ApprovalEntry({"command": "danger"})
+        self._bind_pending(adapter, run_id, pending)
+        adapter._active_run_agents[run_id] = MagicMock()
+
+        async with TestClient(TestServer(app)) as cli:
+            stop = await cli.post(f"/v1/runs/{run_id}/stop")
+            stale = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "once",
+                    "expected_approval_id": pending.approval_id,
+                },
+            )
+            stale_body = await stale.json()
+
+        assert stop.status == 200
+        assert stale.status == 409
+        assert stale_body["error"]["code"] == "approval_decision_conflict"
+        assert pending.result == "deny"
+        assert pending.event.is_set()
+        status = adapter._run_statuses[run_id]
+        assert status["pending_approval"] is None
+        assert status["pending_approvals"] == []
+
     def test_concurrent_matching_decisions_resolve_once(self):
         run_id = "run_concurrent_cas"
         pending = approval_mod._ApprovalEntry({"command": "danger"})
@@ -772,6 +867,64 @@ class TestRunApprovalCompareAndSet:
         assert pending.result == "once"
         assert pending.event.is_set()
 
+    def test_interrupt_finalization_wins_atomic_race_with_cas(self, monkeypatch):
+        session_key = "run_interrupt_cas"
+        approval_requested = threading.Event()
+        interrupt_finalized = threading.Event()
+        release_finalize_callback = threading.Event()
+        approval_id = {}
+        decision = {}
+
+        monkeypatch.setattr(approval_mod, "is_interrupted", lambda: True)
+        original_notify = approval_mod._notify_gateway_entry_finalized
+
+        def _pause_after_atomic_finalize(entry):
+            interrupt_finalized.set()
+            assert release_finalize_callback.wait(timeout=3)
+            original_notify(entry)
+
+        monkeypatch.setattr(
+            approval_mod,
+            "_notify_gateway_entry_finalized",
+            _pause_after_atomic_finalize,
+        )
+
+        def _notify(data):
+            approval_id["value"] = data["approval_id"]
+            approval_requested.set()
+
+        def _wait():
+            decision.update(
+                approval_mod._await_gateway_decision(
+                    session_key,
+                    _notify,
+                    {
+                        "command": "danger",
+                        "description": "danger",
+                        "pattern_key": "danger",
+                        "pattern_keys": ["danger"],
+                    },
+                )
+            )
+
+        waiter = threading.Thread(target=_wait)
+        waiter.start()
+        assert approval_requested.wait(timeout=3)
+        assert interrupt_finalized.wait(timeout=3)
+
+        stale = approval_mod.resolve_gateway_approval_cas(
+            session_key,
+            "once",
+            approval_id["value"],
+        )
+        release_finalize_callback.set()
+        waiter.join(timeout=3)
+
+        assert stale["status"] == "decision_conflict"
+        assert stale["previous_choice"] == "deny"
+        assert decision["resolved"] is True
+        assert decision["choice"] == "deny"
+
     @pytest.mark.asyncio
     async def test_expired_match_fails_closed(self, adapter):
         app = _create_runs_app(adapter)
@@ -794,6 +947,9 @@ class TestRunApprovalCompareAndSet:
         assert body["error"]["code"] == "approval_expired"
         assert expired.result is None
         assert expired.event.is_set()
+        status = adapter._run_statuses[run_id]
+        assert status["pending_approval"] is None
+        assert status["pending_approvals"] == []
 
 
 # ---------------------------------------------------------------------------
