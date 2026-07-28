@@ -810,6 +810,7 @@ class CodexSourceAdapter:
         *,
         archived: bool,
         after: float,
+        known_native_ids: frozenset[str] = frozenset(),
     ) -> list[CodexThreadSummary]:
         """Return recent state-DB summaries without paging full task payloads."""
 
@@ -822,6 +823,7 @@ class CodexSourceAdapter:
             source_kinds=None,
             state_db_only=True,
             stop_after=cutoff,
+            known_native_ids=known_native_ids,
         )
         summaries = [
             summary for summary in summaries if summary.last_active >= cutoff
@@ -1193,6 +1195,7 @@ class CodexSourceAdapter:
         source_kinds: tuple[str, ...] | None,
         state_db_only: bool = False,
         stop_after: float | None = None,
+        known_native_ids: frozenset[str] = frozenset(),
     ) -> list[CodexThreadSummary]:
         cursor: Any = None
         seen_cursors: set[str] = set()
@@ -1223,6 +1226,7 @@ class CodexSourceAdapter:
             if not isinstance(entries, list):
                 raise ValueError("Codex thread/list entries must be a list")
             raw_entry_count += len(entries)
+            page_native_ids: set[str] = set()
             for entry in entries:
                 if not isinstance(entry, dict):
                     raise ValueError(
@@ -1238,6 +1242,7 @@ class CodexSourceAdapter:
                         "Codex thread/list inventory entry is invalid"
                     ) from None
                 prior = normalized.get(summary.native_id)
+                page_native_ids.add(summary.native_id)
                 if prior is None:
                     normalized[summary.native_id] = summary
                 elif prior != summary:
@@ -1246,6 +1251,12 @@ class CodexSourceAdapter:
                     )
 
             next_cursor = _first(response, "nextCursor", "next_cursor")
+            if (
+                known_native_ids
+                and page_native_ids
+                and page_native_ids <= known_native_ids
+            ):
+                break
             if stop_after is not None and any(
                 summary.last_active < stop_after for summary in normalized.values()
             ):

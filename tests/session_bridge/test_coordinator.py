@@ -2094,7 +2094,7 @@ async def test_codex_continuous_scan_uses_recent_bounded_inventory() -> None:
                 summaries_by_native_id={summary.native_id: summary},
                 operations=operations,
             )
-            self.recent_calls: list[tuple[bool, float]] = []
+            self.recent_calls: list[tuple[bool, float, frozenset[str]]] = []
 
         def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
             del archived
@@ -2105,8 +2105,9 @@ async def test_codex_continuous_scan_uses_recent_bounded_inventory() -> None:
             *,
             archived: bool,
             after: float,
+            known_native_ids: frozenset[str],
         ) -> list[CodexThreadSummary]:
-            self.recent_calls.append((archived, after))
+            self.recent_calls.append((archived, after, known_native_ids))
             return [] if archived else [summary]
 
     adapter = RecentCodexAdapter()
@@ -2117,12 +2118,19 @@ async def test_codex_continuous_scan_uses_recent_bounded_inventory() -> None:
         adapters={Provider.CODEX: adapter},
     )
     coordinator._continuous_watermark = 250.0
+    store.states[_CODEX_SEEN_KEY] = {
+        "version": 1,
+        "native_ids": ["codex-known"],
+    }
 
     result = await coordinator.scan_once(Provider.CODEX)
 
     assert result.failed == 0
     assert result.indexed == 1
-    assert adapter.recent_calls == [(False, 250.0), (True, 250.0)]
+    assert adapter.recent_calls == [
+        (False, 250.0, frozenset({"codex-known"})),
+        (True, 250.0, frozenset({"codex-known"})),
+    ]
     assert adapter.projected_native_ids == ["codex-recent"]
 
 

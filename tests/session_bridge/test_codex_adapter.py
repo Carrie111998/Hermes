@@ -142,6 +142,34 @@ class TestInventory:
             assert params["sortDirection"] == "desc"
             assert timeout == 30.0
 
+    def test_recent_inventory_stops_on_a_full_page_of_known_tasks(self) -> None:
+        client = FakeInitializingClient({
+            "thread/list": [
+                {
+                    "data": [
+                        {
+                            "id": "known",
+                            "createdAt": 290,
+                            "updatedAt": 300,
+                        }
+                    ],
+                    "nextCursor": "must-not-be-read",
+                }
+            ]
+        })
+
+        summaries = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+        ).list_recent_inventory(
+            archived=False,
+            after=0,
+            known_native_ids=frozenset({"known"}),
+        )
+
+        assert [summary.native_id for summary in summaries] == ["known"]
+        assert len(client.calls) == 1
+
     def test_projection_reuses_trusted_origin_snapshot_from_inventory(self) -> None:
         native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         calls = 0

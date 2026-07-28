@@ -4074,6 +4074,7 @@ class SessionBridgeCoordinator:
         adapter = self._adapter(provider)
         pending_ids = await self._load_pending(provider)
         progress = await self._load_progress(provider)
+        seen_ids = await self._load_codex_seen_ids()
         recent_inventory = getattr(adapter, "list_recent_inventory", None)
         if (
             discovery_mode is DiscoveryMode.CONTINUOUS
@@ -4085,6 +4086,7 @@ class SessionBridgeCoordinator:
                 adapter,
                 include_archived=self._config.catalog.include_archived_codex,
                 after=self._continuous_watermark,
+                known_native_ids=frozenset(seen_ids),
             )
         else:
             discovered_summaries = await self._provider_call(
@@ -4102,7 +4104,6 @@ class SessionBridgeCoordinator:
             summaries_by_native_id[native_id] = summary
             inventory_ids.append(native_id)
 
-        seen_ids = await self._load_codex_seen_ids()
         cataloged_rows = await self._cataloged_codex_rows(inventory_ids)
         cataloged_ids = set(cataloged_rows)
         genuinely_new_ids = [
@@ -4709,6 +4710,7 @@ def _codex_recent_inventory(
     *,
     include_archived: bool,
     after: float,
+    known_native_ids: frozenset[str],
 ) -> list[object]:
     passes = [False, True] if include_archived else [False]
     merged: dict[str, object] = {}
@@ -4718,6 +4720,7 @@ def _codex_recent_inventory(
             "list_recent_inventory",
             archived=archived,
             after=after,
+            known_native_ids=known_native_ids,
         )
         try:
             batch = list(summaries)
