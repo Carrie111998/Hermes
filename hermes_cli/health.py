@@ -46,6 +46,11 @@ class HealthRow:
     action: str = ""
 
 
+def _diagnostic_name(exc: BaseException) -> str:
+    """Return source-independent exception metadata safe for health output."""
+    return type(exc).__name__
+
+
 def _aggregate_status(rows: list[HealthRow]) -> str:
     if not rows:
         return "healthy"
@@ -88,7 +93,7 @@ def _read_raw_config(config_path: Path) -> tuple[dict[str, Any] | None, HealthRo
         # echo it: malformed config may contain credentials and health output
         # is commonly persisted by monitoring systems.
         mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
-        diagnostic = type(exc).__name__
+        diagnostic = _diagnostic_name(exc)
         location = ""
         if mark is not None:
             line = getattr(mark, "line", None)
@@ -219,12 +224,12 @@ def _check_state_db(home: Path) -> HealthRow:
                     raise sqlite3.DatabaseError(f"quick_check failed: {quick_check!r}")
             finally:
                 conn.close()
-    except _StateDbSnapshotBusy as exc:
+    except _StateDbSnapshotBusy:
         return HealthRow(
             "state_db",
             "state DB availability",
             "warning",
-            f"{db_path} is busy: {exc}",
+            f"{db_path} changed while its snapshot was copied",
             "retry health after current database activity settles",
         )
     except Exception as exc:
@@ -232,7 +237,7 @@ def _check_state_db(home: Path) -> HealthRow:
             "state_db",
             "state DB availability",
             "critical",
-            f"{db_path} is not readable as SQLite: {exc}",
+            f"{db_path} is not readable as SQLite ({_diagnostic_name(exc)})",
             "check permissions or restore state.db from backup",
         )
     return HealthRow("state_db", "state DB availability", "healthy", f"readable: {db_path}")
@@ -266,7 +271,7 @@ def _read_cron_jobs_read_only(home: Path) -> tuple[list[dict[str, Any]], str, st
     try:
         payload = json.loads(jobs_path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
-        return [], "invalid", str(exc)
+        return [], "invalid", _diagnostic_name(exc)
     if isinstance(payload, dict):
         jobs = payload.get("jobs", [])
         if not isinstance(jobs, list):
@@ -332,7 +337,13 @@ def _check_disk(home: Path) -> HealthRow:
     try:
         usage = shutil.disk_usage(home)
     except Exception as exc:
-        return HealthRow("disk", "disk/free space", "critical", f"cannot read disk usage for {home}: {exc}", "check filesystem")
+        return HealthRow(
+            "disk",
+            "disk/free space",
+            "critical",
+            f"cannot read disk usage for {home} ({_diagnostic_name(exc)})",
+            "check filesystem",
+        )
     free_gb = usage.free / (1024 ** 3)
     free_ratio = usage.free / usage.total if usage.total else 0
     detail = f"{free_gb:.1f} GiB free ({free_ratio:.0%}) at {home}"
@@ -410,7 +421,7 @@ def run_health(args) -> int:
         # Exception messages and arguments can contain config values, paths,
         # credentials, or other user-controlled data. Keep automation output
         # source-independent while retaining the exception class for triage.
-        diagnostic = type(exc).__name__
+        diagnostic = _diagnostic_name(exc)
         result = {
             "schema_version": 1,
             "status": "critical",

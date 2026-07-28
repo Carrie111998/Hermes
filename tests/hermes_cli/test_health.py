@@ -253,6 +253,44 @@ def test_unexpected_health_failure_does_not_disclose_exception_text(monkeypatch,
         assert "health collection failed (RuntimeError)" in output
 
 
+def test_row_failures_do_not_disclose_exception_text(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "profile"
+    _write_profile(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    sentinel = "SUPER_SECRET_CREDENTIAL_123"
+    original_read_text = Path.read_text
+
+    def raise_sentinel(*_args, **_kwargs):
+        raise RuntimeError(sentinel)
+
+    def install_cron_failure(patcher):
+        def read_text(path, *args, **kwargs):
+            if path.name == "jobs.json":
+                raise RuntimeError(sentinel)
+            return original_read_text(path, *args, **kwargs)
+
+        patcher.setattr(Path, "read_text", read_text)
+
+    failure_installers = (
+        lambda patcher: patcher.setattr(
+            health_mod, "_copy_coherent_state_snapshot", raise_sentinel
+        ),
+        install_cron_failure,
+        lambda patcher: patcher.setattr(health_mod.shutil, "disk_usage", raise_sentinel),
+    )
+
+    for install_failure in failure_installers:
+        with monkeypatch.context() as patcher:
+            install_failure(patcher)
+            for json_output in (True, False):
+                code = health_mod.run_health(SimpleNamespace(json=json_output, quiet=False))
+                output = capsys.readouterr().out
+                assert code == 2
+                assert sentinel not in output
+                if json_output:
+                    assert "RuntimeError" in output
+
+
 def test_collect_health_critical_exit_two_for_non_mapping_config(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()
