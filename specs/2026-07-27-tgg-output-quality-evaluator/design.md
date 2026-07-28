@@ -4,7 +4,8 @@ WB: `47c0aa00-51bb-42c4-9f80-f5972c1b79e9`
 
 ## Outcome
 
-Every newly processed TGG case batch is inspected as a TGG manager sees it:
+Every newly processed TGG case is inspected as a TGG manager sees it, across
+bounded batches:
 the authenticated rendered case page is judged against the raw WhatsApp
 messages and retained media that caused the case change. Defects reach Edna's
 queue with screenshot and message-id evidence. Human catches permanently
@@ -33,6 +34,16 @@ One Studio runner owns a durable local cursor and run ledger.
 - Evaluate at the daily backstop when the delta is non-zero.
 - A run commits its cursor only after bundles, screenshots, judge output, and
   defect filing are durably recorded.
+- The consumer check runner has a measured 120-second hard ceiling even though
+  the repository check declaration currently carries a longer timeout. The
+  live consumer is authoritative: the 176-case backlog took 985 seconds, so
+  each run is capped at one case (with a same-source-event tie group treated
+  as indivisible) and leaves the remainder behind the cursor.
+- A registry change spends one bounded run on the golden regression alone and
+  persists the validated registry hash without moving the source cursor. The
+  next trigger judges live work with a fresh budget; combining the measured
+  ~54.5-second golden pass with the 90.5-second live pass would exceed the
+  consumer ceiling and create another cursor ratchet.
 - A stable defect key prevents duplicate WB rows across retries.
 
 ### Steps
@@ -45,8 +56,10 @@ One Studio runner owns a durable local cursor and run ledger.
 4. Log into the public portal through the `tgg-pa-admin` agent-browser auth
    profile, open the case through the real Cases UI, and capture a full-page
    screenshot plus accessibility snapshot.
-5. Run two isolated vision passes in order for every touched case, with up to
-   three cases evaluated concurrently. Pass one is a cold, naive TGG
+5. Run two isolated vision passes concurrently for every selected case. The
+   selected batch is one case, except that cases sharing the same first source
+   event are an indivisible cursor group. A global semaphore keeps actual
+   checker processes at no more than three. Pass one is a cold, naive TGG
    manager read with no registry or checklist exposure: every page claim must
    trace to source, every source fact must be represented, and the page must
    read sensibly. Pass two receives the versioned registry and runs every
@@ -77,7 +90,8 @@ One Studio runner owns a durable local cursor and run ledger.
 with `max_silence=PT26H`. Its JSON result carries:
 
 - `batches_evaluated` and `batches_occurred`;
-- `coverage_ratio`;
+- `coverage_ratio` and `pending_cases`, so a healthy bounded run cannot hide a
+  growing remainder;
 - defects by recent batch (trend);
 - `human_caught` and `loop_caught`;
 - last successful run and cursor position.

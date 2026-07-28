@@ -65,6 +65,32 @@ def two_case_snapshot() -> dict:
     return value
 
 
+def many_case_snapshot(count: int = core.MAX_CASES_PER_RUN + 1) -> dict:
+    events = []
+    observations = []
+    cases = []
+    for index in range(1, count + 1):
+        message_id = f"wa-{index}"
+        events.append(completed(index, message_id))
+        observations.append(
+            {
+                "id": index,
+                "case_id": index,
+                "source_ref": message_id,
+                "fields": "{}",
+                "_matched_source_refs": [message_id],
+            }
+        )
+        cases.append(
+            {
+                "id": index,
+                "job_no": f"AM/JOB/2607/{index:04d}",
+                "state": "completed",
+            }
+        )
+    return {"events": events, "observations": observations, "cases": cases}
+
+
 def judgment(checker: str = "judge-2") -> dict:
     registry = core.load_registry()
     values = ["pass", "fail", "unsure"]
@@ -152,6 +178,22 @@ def test_bundle_mapping_refuses_observation_without_case_row():
     value["observations"][0]["case_id"] = 999
     with pytest.raises(core.EvalError, match="missing case row"):
         core.make_bundles(value)
+
+
+def test_case_cap_stops_cursor_before_first_unjudged_case():
+    value = two_case_snapshot()
+    # Case 1 starts first but has a later event after case 2 starts. Judging
+    # case 1 must not license advancing over case 2's first source event.
+    seq_by_message = {"wa-10": 10, "wa-11": 13, "wa-12": 11, "wa-13": 12}
+    for event in value["events"]:
+        event["seq"] = seq_by_message[event["message_id"]]
+    selected, _unmapped, cursor, completed_rows, capped_out = core.select_case_batch(
+        value, max_cases=1
+    )
+    assert [item["case"]["id"] for item in selected] == [7]
+    assert cursor == 10
+    assert completed_rows == 1
+    assert capped_out == 1
 
 
 def test_exact_public_per_case_url():
@@ -292,14 +334,16 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_THREAD_ID", "maker-thread")
     monkeypatch.setenv("MARSHAL_SESSION_ID", "maker-thread")
     monkeypatch.setenv("TGG_OUTPUT_EVAL_JUDGE_COMMAND", "forbidden-single-pass")
-    seen = {"argv": [], "env": [], "prompts": []}
+    seen = {"by_schema": {}, "env": []}
 
     def command(argv, **kwargs):
-        seen["argv"].append(argv)
         seen["env"].append(kwargs["env"])
-        seen["prompts"].append(kwargs["input"])
         output = Path(argv[argv.index("--output-last-message") + 1])
         schema = Path(argv[argv.index("--output-schema") + 1]).name
+        seen["by_schema"][schema] = {
+            "argv": argv,
+            "prompt": kwargs["input"],
+        }
         if schema == "naive-judge-schema.json":
             output.write_text(
                 json.dumps(
@@ -338,21 +382,29 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     assert result["naive_checker_session_id"] == "fresh-naive-checker"
     assert result["registry_checker_session_id"] == "fresh-registry-checker"
     assert result["summary"] == "cold manager read"
-    assert len(seen["argv"]) == 2
-    assert "registry=" not in seen["prompts"][0]
-    assert "checklist" in seen["prompts"][0]
-    assert "registry=" in seen["prompts"][1]
-    assert "-C" in seen["argv"][0]
-    assert "--skip-git-repo-check" in seen["argv"][0]
+    assert set(seen["by_schema"]) == {
+        "naive-judge-schema.json",
+        "registry-judge-schema.json",
+    }
+    naive = seen["by_schema"]["naive-judge-schema.json"]
+    registry = seen["by_schema"]["registry-judge-schema.json"]
+    assert "registry=" not in naive["prompt"]
+    assert "checklist" in naive["prompt"]
+    assert "registry=" in registry["prompt"]
+    assert "-C" in naive["argv"]
+    assert "--skip-git-repo-check" in naive["argv"]
     for item in core.load_registry().checks:
-        assert item.id not in seen["prompts"][0]
-        assert item.statement not in seen["prompts"][0]
+        assert item.id not in naive["prompt"]
+        assert item.statement not in naive["prompt"]
     assert all("CODEX_THREAD_ID" not in env for env in seen["env"])
     assert all("MARSHAL_SESSION_ID" not in env for env in seen["env"])
-    assert all(argv[0:2] == ["codex", "exec"] for argv in seen["argv"])
+    assert all(
+        item["argv"][0:2] == ["codex", "exec"]
+        for item in seen["by_schema"].values()
+    )
     image_args = [
-        seen["argv"][0][index + 1]
-        for index, value in enumerate(seen["argv"][0])
+        naive["argv"][index + 1]
+        for index, value in enumerate(naive["argv"])
         if value == "-i"
     ]
     assert str(source_image) in image_args
@@ -451,6 +503,35 @@ def test_defect_filing_dedupes_locally(tmp_path):
     assert filer.file(**kwargs) == ("wb-123", True)
     assert filer.file(**kwargs) == ("wb-123", False)
     assert sum(argv[2] == "create" for argv in calls) == 1
+    create_argv = next(argv for argv in calls if argv[2] == "create")
+    assert create_argv[create_argv.index("--completion-contract") + 1] == "classify"
+    assert create_argv[create_argv.index("--runtime") + 1] == "cc"
+    assert "--dispatch-now" in create_argv
+    assert "--description-file" in create_argv
+    assert "--dod-file" in create_argv
+
+
+def test_defect_filing_reports_stdout_error_envelope(tmp_path):
+    store = core.StateStore(tmp_path)
+
+    def command(argv, **_kwargs):
+        if argv[2] == "search":
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"ok": True, "data": []}), ""
+            )
+        return subprocess.CompletedProcess(
+            argv, 1, '{"ok":false,"error":"BUILD_WORK_REQUIREMENTS_UNMET"}', ""
+        )
+
+    filer = core.DefectFiler(store, command=command)
+    with pytest.raises(core.EvalError, match="BUILD_WORK_REQUIREMENTS_UNMET"):
+        filer.file(
+            job_no="AM/JOB/2607/0001",
+            check={"id": "no-contact-emoji-leak", "result": "fail", "evidence": "emoji"},
+            screenshot="/tmp/case.png",
+            message_ids=["wa-10"],
+            judgment_path="/tmp/judgment.json",
+        )
 
 
 def test_defect_dedupe_read_failure_keeps_existing_row(tmp_path):
@@ -620,6 +701,9 @@ class FakeFiler:
 
 def test_failed_run_does_not_advance_cursor_and_retry_occurrence_is_idempotent(tmp_path):
     store = core.StateStore(tmp_path)
+    state = store.load()
+    state["registry_hash"] = core.load_registry().digest
+    store.save(state)
     judge = FakeJudge(fail=True)
     evaluator = core.Evaluator(
         store,
@@ -651,6 +735,10 @@ def test_successful_run_commits_cursor_after_artifacts_and_defects(tmp_path, mon
         filer=filer,
         clock=lambda: NOW,
     )
+    golden = evaluator.run(trigger="deploy", maker_session_id="maker-1")
+    assert golden["ran"] is False
+    assert golden["reason"] == "golden-regression-completed"
+    assert store.load()["cursor"] == 0
     result = evaluator.run(trigger="deploy", maker_session_id="maker-1")
     assert result["ran"] is True
     assert result["run_id"] == "cursor-1-11"
@@ -661,7 +749,7 @@ def test_successful_run_commits_cursor_after_artifacts_and_defects(tmp_path, mon
     assert store.load()["batches_evaluated"] == 1
     assert store.load()["last_completed_rows"] == 2
     assert store.load()["last_unmapped_count"] == 0
-    assert judge.calls == 2  # golden regression, then the live case
+    assert judge.calls == 2  # bounded golden run, then the live case
     assert any(call["check"]["result"] == "unsure" for call in filer.calls)
     receipt = next((tmp_path / "runs").glob("*/receipt.json"))
     assert json.loads(receipt.read_text())["completed_rows"] == 2
@@ -671,6 +759,9 @@ def test_successful_run_commits_cursor_after_artifacts_and_defects(tmp_path, mon
 def test_multi_case_run_judges_every_touched_case(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
     store = core.StateStore(tmp_path)
+    state = store.load()
+    state["registry_hash"] = core.load_registry().digest
+    store.save(state)
     judge = FakeJudge()
     result = core.Evaluator(
         store,
@@ -679,15 +770,78 @@ def test_multi_case_run_judges_every_touched_case(tmp_path, monkeypatch):
         judge=judge,
         filer=FakeFiler(),
         clock=lambda: NOW,
+        max_cases_per_run=2,
     ).run(trigger="deploy", maker_session_id="maker-1")
     assert result["cases_evaluated"] == 2
     assert result["committed_cursor"] == 13
-    assert judge.calls == 3  # golden plus both touched cases
+    assert judge.calls == 2
+
+
+def test_capped_run_advances_cursor_by_exactly_judged_case_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
+    store = core.StateStore(tmp_path)
+    state = store.load()
+    state["registry_hash"] = core.load_registry().digest
+    store.save(state)
+    judge = FakeJudge()
+    result = core.Evaluator(
+        store,
+        collect=lambda _cursor: many_case_snapshot(),
+        browser=FakeBrowser(),
+        judge=judge,
+        filer=FakeFiler(),
+        clock=lambda: NOW,
+    ).run(trigger="deploy", maker_session_id="maker-1")
+    assert result["cases_evaluated"] == core.MAX_CASES_PER_RUN
+    assert result["cases_capped_out"] == 1
+    assert result["committed_cursor"] == core.MAX_CASES_PER_RUN
+    assert store.load()["cursor"] == core.MAX_CASES_PER_RUN
+    assert judge.calls == core.MAX_CASES_PER_RUN
+
+
+def test_case_cap_keeps_same_source_event_tie_group_atomic():
+    value = many_case_snapshot(3)
+    value["events"][1]["seq"] = value["events"][0]["seq"]
+    selected, _unmapped, cursor, completed_rows, capped_out = core.select_case_batch(
+        value, max_cases=1
+    )
+    assert [bundle["case"]["id"] for bundle in selected] == [1, 2]
+    assert cursor == 1
+    assert completed_rows == 2
+    assert capped_out == 1
+
+
+def test_case_cap_must_be_positive():
+    with pytest.raises(core.EvalError, match="must be positive"):
+        core.select_case_batch(many_case_snapshot(), max_cases=0)
+
+
+def test_mapping_failure_records_occurrence_without_advancing_cursor(tmp_path):
+    value = snapshot()
+    value["observations"][0]["case_id"] = 999
+    store = core.StateStore(tmp_path)
+    evaluator = core.Evaluator(
+        store,
+        collect=lambda _cursor: value,
+        browser=FakeBrowser(),
+        judge=FakeJudge(),
+        filer=FakeFiler(),
+        clock=lambda: NOW,
+    )
+    with pytest.raises(core.EvalError, match="missing case row"):
+        evaluator.run(trigger="deploy", maker_session_id="maker-1")
+    state = store.load()
+    assert state["cursor"] == 0
+    assert state["batches_occurred"] == 1
+    assert state["batches_evaluated"] == 0
 
 
 def test_multi_case_failure_keeps_cursor_and_files_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
     store = core.StateStore(tmp_path)
+    state = store.load()
+    state["registry_hash"] = core.load_registry().digest
+    store.save(state)
     filer = FakeFiler()
     evaluator = core.Evaluator(
         store,
@@ -696,11 +850,31 @@ def test_multi_case_failure_keeps_cursor_and_files_nothing(tmp_path, monkeypatch
         judge=SecondCaseFailJudge(),
         filer=filer,
         clock=lambda: NOW,
+        max_cases_per_run=2,
     )
     with pytest.raises(core.EvalError, match="second case broke"):
         evaluator.run(trigger="deploy", maker_session_id="maker-1")
     assert store.load()["cursor"] == 0
     assert filer.calls == []
+
+
+def test_capped_run_judging_failure_advances_cursor_by_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
+    store = core.StateStore(tmp_path)
+    state = store.load()
+    state["registry_hash"] = core.load_registry().digest
+    store.save(state)
+    evaluator = core.Evaluator(
+        store,
+        collect=lambda _cursor: many_case_snapshot(),
+        browser=FakeBrowser(),
+        judge=FakeJudge(fail=True),
+        filer=FakeFiler(),
+        clock=lambda: NOW,
+    )
+    with pytest.raises(core.EvalError, match="judge broke"):
+        evaluator.run(trigger="deploy", maker_session_id="maker-1")
+    assert store.load()["cursor"] == 0
 
 
 def test_successful_run_reconciles_prior_failed_occurrences(tmp_path, monkeypatch):
@@ -745,6 +919,7 @@ def test_health_reports_required_population_metrics(tmp_path):
             "cursor": 99,
             "last_completed_rows": 25,
             "last_unmapped_count": 2,
+            "pending_cases": 7,
         }
     )
     store.save(state)
@@ -754,6 +929,7 @@ def test_health_reports_required_population_metrics(tmp_path):
     assert result["defect_trend"] == [{"defects": 2}]
     assert (result["human_caught"], result["loop_caught"]) == (1, 4)
     assert (result["last_completed_rows"], result["last_unmapped_count"]) == (25, 2)
+    assert result["pending_cases"] == 7
 
 
 def test_run_cli_emits_top_level_health_metrics(tmp_path, monkeypatch, capsys):
@@ -778,6 +954,7 @@ def test_run_cli_emits_top_level_health_metrics(tmp_path, monkeypatch, capsys):
             "loop_caught": 3,
             "last_completed_rows": 25,
             "last_unmapped_count": 0,
+            "pending_cases": 6,
         },
     )
     assert core.main(
@@ -795,6 +972,7 @@ def test_run_cli_emits_top_level_health_metrics(tmp_path, monkeypatch, capsys):
     assert output["coverage_ratio"] == 1.0
     assert output["defect_trend"] == [{"defects": 1}]
     assert (output["human_caught"], output["loop_caught"]) == (2, 3)
+    assert output["pending_cases"] == 6
 
 
 def test_initialize_cursor_requires_pristine_state(tmp_path):

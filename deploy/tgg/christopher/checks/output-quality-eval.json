@@ -17,7 +17,7 @@
       "checker_error_direction": "fail_closed",
       "freshness_sla_seconds": 93600,
       "active": true,
-      "metrics": ["batches_evaluated", "batches_occurred", "coverage_ratio", "defect_trend", "human_caught", "loop_caught"]
+      "metrics": ["batches_evaluated", "batches_occurred", "coverage_ratio", "pending_cases", "defect_trend", "human_caught", "loop_caught"]
     }
   ]
 }
