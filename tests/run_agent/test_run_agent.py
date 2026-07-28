@@ -5726,6 +5726,50 @@ class TestRunConversation:
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/thinkon" in result["final_response"]
 
+    def test_length_reasoning_content_only_skips_continuation(self, agent):
+        """Structured reasoning with no visible answer exhausts the budget."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content=None,
+            reasoning_content="internal reasoning",
+            finish_reason="length",
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert "reasoning" in result["error"].lower()
+        assert "Thinking Budget Exhausted" in result["final_response"]
+
+    def test_length_visible_content_with_structured_reasoning_retries_normally(self, agent):
+        """A partial visible answer must still use the continuation path."""
+        self._setup_agent(agent)
+        first = _mock_response(
+            content="Part 1 ",
+            reasoning_content="internal reasoning",
+            finish_reason="length",
+        )
+        second = _mock_response(content="Part 2", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == "Part 1 Part 2"
+
     def test_length_empty_content_without_think_tags_retries_normally(self, agent):
         """When finish_reason='length' and content is None but no think tags,
         fall through to normal continuation retry (not thinking-exhaustion)."""

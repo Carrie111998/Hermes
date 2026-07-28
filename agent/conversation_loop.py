@@ -2767,12 +2767,24 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    _has_structured_reasoning = bool(
+                        _trunc_msg
+                        and (agent._extract_reasoning(_trunc_msg) or "").strip()
+                    )
+                    _has_visible_content = bool(
+                        isinstance(_trunc_content, str) and _trunc_content.strip()
+                    )
                     _thinking_exhausted = (
                         not _trunc_has_tool_calls
-                        and _has_think_tags
                         and (
-                            (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
-                            or _trunc_content is None
+                            (
+                                _has_think_tags
+                                and not agent._has_content_after_think_block(_trunc_content)
+                            )
+                            or (
+                                _has_structured_reasoning
+                                and not _has_visible_content
+                            )
                         )
                     )
 
