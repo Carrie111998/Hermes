@@ -7449,6 +7449,22 @@ def _catalog_provider_env_metadata() -> dict:
                 "advanced": existing.get("advanced", True),
                 "category": "provider",
             }
+            # API key (Express Mode) env vars — shown when using API key auth.
+            for api_key_env, desc in (
+                ("GOOGLE_VERTEX_API_KEY", "Vertex AI API key (Express Mode)"),
+                ("GOOGLE_VERTEX_PROJECT", "Vertex AI GCP project ID"),
+                ("GOOGLE_VERTEX_LOCATION", "Vertex AI region (default: us-central1)"),
+            ):
+                ek = meta.get(api_key_env, {})
+                meta[api_key_env] = {
+                    "provider": d.slug,
+                    "provider_label": d.label,
+                    "description": desc,
+                    "url": ek.get("url"),
+                    "is_password": api_key_env == "GOOGLE_VERTEX_API_KEY",
+                    "advanced": api_key_env != "GOOGLE_VERTEX_API_KEY",
+                    "category": "provider",
+                }
     return meta
 
 
@@ -7464,13 +7480,14 @@ async def get_env_vars(profile: Optional[str] = None):
         cat_meta = catalog_meta.get(var_name) or {}
         # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
         # gaps (description/url) and always supplies provider grouping hints.
+        is_password = info.get("password") if "password" in info else cat_meta.get("is_password", False)
         return {
             "is_set": bool(value),
-            "redacted_value": redact_key(value) if value else None,
+            "redacted_value": (redact_key(value) if is_password else value) if value else None,
             "description": info.get("description") or cat_meta.get("description", ""),
             "url": info.get("url") if info.get("url") is not None else cat_meta.get("url"),
             "category": info.get("category") or cat_meta.get("category", ""),
-            "is_password": info.get("password", cat_meta.get("is_password", False)),
+            "is_password": is_password,
             "tools": info.get("tools", []),
             "advanced": info.get("advanced", cat_meta.get("advanced", False)),
             # True when this var is a messaging-platform credential owned by a

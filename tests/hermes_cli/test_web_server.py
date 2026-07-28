@@ -3090,6 +3090,16 @@ class TestWebServerEndpoints:
         # Should contain known env var names
         assert any(k.endswith("_API_KEY") or k.endswith("_TOKEN") for k in data.keys())
 
+    def test_get_env_vars_non_password_fields_unredacted(self):
+        from hermes_cli.config import save_env_value
+        save_env_value("GOOGLE_VERTEX_PROJECT", "magnetic-flare-495120-r5")
+        save_env_value("GOOGLE_VERTEX_API_KEY", "secret_key_12345")
+        data = self.client.get("/api/env").json()
+        assert data["GOOGLE_VERTEX_PROJECT"]["is_password"] is False
+        assert data["GOOGLE_VERTEX_PROJECT"]["redacted_value"] == "magnetic-flare-495120-r5"
+        assert data["GOOGLE_VERTEX_API_KEY"]["is_password"] is True
+        assert data["GOOGLE_VERTEX_API_KEY"]["redacted_value"] != "secret_key_12345"
+
     def test_get_env_vars_marks_channel_managed_keys(self):
         from hermes_cli.web_server import _channel_managed_env_keys
 
