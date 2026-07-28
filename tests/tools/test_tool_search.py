@@ -46,6 +46,9 @@ class TestConfigParsing:
         assert cfg.enabled == "auto"
         assert cfg.search_default_limit == 5
         assert cfg.max_search_limit == 20
+        assert cfg.listing == "auto"
+        assert cfg.threshold_pct == 5.0
+        assert cfg.listing_max_tokens == 20000
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -84,6 +87,18 @@ class TestConfigParsing:
         })
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
+
+    def test_listing_settings_normalized_and_clamped(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "listing": "invalid",
+            "threshold_pct": 999,
+            "listing_max_tokens": 1,
+        })
+        assert cfg.listing == "auto"
+        assert cfg.threshold_pct == 100.0
+        assert cfg.listing_max_tokens == 200
 
 
 # ---------------------------------------------------------------------------
@@ -637,8 +652,7 @@ class TestStableBridgeSchemas:
         assert "Deferred tool catalog" not in serialized
         assert "live catalog" in serialized
 
-    def test_legacy_listing_config_is_ignored(self):
-        """Old config files remain loadable without restoring dynamic schemas."""
+    def test_listing_config_controls_user_turn_manifest_not_bridge(self):
         from tools.tool_search import ToolSearchConfig
 
         cfg = ToolSearchConfig.from_raw({
@@ -648,7 +662,124 @@ class TestStableBridgeSchemas:
             "listing_max_tokens": 60000,
         })
         assert cfg.enabled == "auto"
-        assert not hasattr(cfg, "listing")
+        assert cfg.listing == "on"
+        assert cfg.threshold_pct == 99
+        assert cfg.listing_max_tokens == 60000
+
+
+class TestUserTurnCatalogSnapshot:
+    @staticmethod
+    def _register(name, description="Deferred capability.", properties=None):
+        from tools.registry import registry
+
+        registry.register(
+            name=name,
+            handler=lambda args, **kw: json.dumps({"ok": True}),
+            schema=_td(name, description, properties)["function"],
+            toolset="mcp-user-turn-snapshot",
+        )
+
+    def test_snapshot_is_deterministic_and_kept_out_of_bridge(self):
+        from tools.registry import registry
+        from tools.tool_search import build_catalog_snapshot, bridge_tool_schemas
+
+        names = ["snapshot_zeta", "snapshot_alpha"]
+        for name in names:
+            self._register(name, f"Does {name} work.")
+        try:
+            defs = [_td(name, f"Does {name} work.") for name in names]
+            first = build_catalog_snapshot(defs)
+            second = build_catalog_snapshot(list(reversed(defs)))
+
+            assert first == second
+            assert "snapshot_alpha" in first.notice
+            assert first.notice.index("snapshot_alpha") < first.notice.index("snapshot_zeta")
+            assert first.snapshot_id in first.notice
+
+            bridge_json = json.dumps(bridge_tool_schemas())
+            assert "snapshot_alpha" not in bridge_json
+            assert first.snapshot_id not in bridge_json
+        finally:
+            for name in names:
+                registry.deregister(name)
+
+    def test_snapshot_id_changes_for_same_name_schema_edit(self):
+        from tools.registry import registry
+        from tools.tool_search import build_catalog_snapshot
+
+        name = "snapshot_schema_edit"
+        self._register(name, properties={"old": {"type": "string"}})
+        try:
+            old = build_catalog_snapshot([
+                _td(name, "Deferred capability.", {"old": {"type": "string"}})
+            ])
+            new = build_catalog_snapshot([
+                _td(name, "Deferred capability.", {"fresh": {"type": "integer"}})
+            ])
+            assert old.snapshot_id != new.snapshot_id
+        finally:
+            registry.deregister(name)
+
+    def test_snapshot_id_changes_when_budget_changes_rendered_manifest(self):
+        from tools.registry import registry
+        from tools.tool_search import build_catalog_snapshot
+
+        names = [f"snapshot_render_{index:03d}" for index in range(30)]
+        for name in names:
+            self._register(name, "A verbose deferred capability for rendering.")
+        try:
+            defs = [
+                _td(name, "A verbose deferred capability for rendering.")
+                for name in names
+            ]
+            full = build_catalog_snapshot(defs, max_tokens=20_000)
+            compact = build_catalog_snapshot(defs, max_tokens=300)
+            assert full.listing_form != compact.listing_form
+            assert full.snapshot_id != compact.snapshot_id
+        finally:
+            for name in names:
+                registry.deregister(name)
+
+    def test_snapshot_budget_degrades_to_searchable_summary(self):
+        from tools.registry import registry
+        from tools.tool_search import build_catalog_snapshot
+
+        names = [f"snapshot_budget_{index:03d}" for index in range(80)]
+        for name in names:
+            self._register(name, "A moderately verbose deferred capability.")
+        try:
+            snapshot = build_catalog_snapshot(
+                [
+                    _td(name, "A moderately verbose deferred capability.")
+                    for name in names
+                ],
+                max_tokens=300,
+            )
+            assert snapshot.listing_form in {"names", "groups", "none"}
+            assert snapshot.count == len(names)
+            notice = snapshot.notice.lower()
+            assert (
+                "use `tool_search`" in notice
+                or "discover via `tool_search`" in notice
+            )
+        finally:
+            for name in names:
+                registry.deregister(name)
+
+    def test_empty_snapshot_is_explicit_and_extractable(self):
+        from tools.tool_search import (
+            build_catalog_snapshot,
+            catalog_snapshot_id_from_text,
+        )
+
+        snapshot = build_catalog_snapshot([])
+        assert snapshot.count == 0
+        assert "No deferred MCP/plugin tools" in snapshot.notice
+        assert catalog_snapshot_id_from_text(snapshot.notice) == snapshot.snapshot_id
+        assert catalog_snapshot_id_from_text([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            {"type": "text", "text": snapshot.notice},
+        ]) == snapshot.snapshot_id
 
 
 class TestDeferredCallSchemaProbe:

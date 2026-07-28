@@ -3060,6 +3060,13 @@ DEFAULT_CONFIG = {
             "search_default_limit": 5,
             # Hard upper bound the model can request via ``limit``. Range 1..50.
             "max_search_limit": 20,
+            # Compact capability manifest attached to the first real user turn
+            # and again only when the live catalog changes. It is never embedded
+            # in the bridge schema, so catalog edits preserve the tools= prefix.
+            "listing": "auto",
+            # Manifest budget = min(context-relative percentage, absolute cap).
+            "threshold_pct": 5,
+            "listing_max_tokens": 20000,
         },
     },
 

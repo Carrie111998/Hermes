@@ -491,6 +491,240 @@ def test_pending_mcp_notice_folds_into_next_real_user_turn_once():
     assert second.messages[-1]["content"] == "hello"
 
 
+def test_initial_tool_catalog_snapshot_folds_into_real_user_turn():
+    from tools.registry import registry
+    from tools.tool_search import BRIDGE_TOOL_NAMES, ToolSearchConfig
+
+    name = "mcp_turn_snapshot_initial"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Create a turn snapshot.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    registry.register(
+        name=name,
+        handler=lambda args, **kw: "{}",
+        schema=tool_def["function"],
+        toolset="mcp-turn-snapshot",
+    )
+    try:
+        agent = _FakeAgent()
+        agent._skip_mcp_refresh = True
+        agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+        agent.context_compressor.context_length = 200_000
+        with patch(
+            "model_tools.get_tool_definitions", return_value=[tool_def]
+        ) as get_defs, patch(
+            "tools.tool_search.load_config",
+            return_value=ToolSearchConfig.from_raw({"listing": "auto"}),
+        ):
+            ctx = _build(agent)
+            second = _build(
+                agent,
+                conversation_history=[
+                    {
+                        "role": "user",
+                        "content": "hello",
+                        "api_content": ctx.messages[-1]["content"],
+                    },
+                    {"role": "assistant", "content": "done"},
+                ],
+            )
+
+        content = ctx.messages[-1]["content"]
+        assert content.endswith("\n\nhello")
+        assert "[HERMES TOOL CATALOG SNAPSHOT" in content
+        assert name in content
+        assert ctx.original_user_message == "hello"
+        assert [message["role"] for message in ctx.messages] == ["user"]
+        assert second.messages[-1]["content"] == "hello"
+        get_defs.assert_called_once()
+    finally:
+        registry.deregister(name)
+
+
+def test_resumed_agent_reuses_prior_snapshot_without_reannouncing():
+    from tools.registry import registry
+    from tools.tool_search import BRIDGE_TOOL_NAMES, ToolSearchConfig
+
+    name = "mcp_turn_snapshot_resume"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Resume a catalog snapshot.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    registry.register(
+        name=name,
+        handler=lambda args, **kw: "{}",
+        schema=tool_def["function"],
+        toolset="mcp-turn-snapshot",
+    )
+    try:
+        config = ToolSearchConfig.from_raw({"listing": "auto"})
+        first_agent = _FakeAgent()
+        first_agent._skip_mcp_refresh = True
+        first_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+        first_agent.context_compressor.context_length = 200_000
+        with patch("model_tools.get_tool_definitions", return_value=[tool_def]), patch(
+            "tools.tool_search.load_config", return_value=config
+        ):
+            first = _build(first_agent)
+
+        history = [
+            {
+                "role": "user",
+                "content": "hello",
+                "api_content": first.messages[-1]["content"],
+            },
+            {"role": "assistant", "content": "done"},
+        ]
+        resumed_agent = _FakeAgent()
+        resumed_agent._skip_mcp_refresh = True
+        resumed_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+        resumed_agent.context_compressor.context_length = 200_000
+        with patch("model_tools.get_tool_definitions", return_value=[tool_def]), patch(
+            "tools.tool_search.load_config", return_value=config
+        ):
+            resumed = _build(resumed_agent, conversation_history=history)
+
+        assert resumed.messages[-1]["content"] == "hello"
+        assert [message["role"] for message in resumed.messages] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+    finally:
+        registry.deregister(name)
+
+
+def test_same_agent_reannounces_snapshot_when_history_is_absent():
+    from tools.registry import registry
+    from tools.tool_search import BRIDGE_TOOL_NAMES, ToolSearchConfig
+
+    name = "mcp_turn_snapshot_stateless"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Serve a stateless catalog snapshot.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    registry.register(
+        name=name,
+        handler=lambda args, **kw: "{}",
+        schema=tool_def["function"],
+        toolset="mcp-turn-snapshot",
+    )
+    try:
+        agent = _FakeAgent()
+        agent._skip_mcp_refresh = True
+        agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+        agent.context_compressor.context_length = 200_000
+        with patch("model_tools.get_tool_definitions", return_value=[tool_def]), patch(
+            "tools.tool_search.load_config",
+            return_value=ToolSearchConfig.from_raw({"listing": "auto"}),
+        ):
+            first = _build(agent)
+            second = _build(agent)
+
+        assert "[HERMES TOOL CATALOG SNAPSHOT" in first.messages[-1]["content"]
+        assert "[HERMES TOOL CATALOG SNAPSHOT" in second.messages[-1]["content"]
+    finally:
+        registry.deregister(name)
+
+
+def test_schema_change_appends_superseding_catalog_snapshot():
+    from tools.registry import registry
+    from tools.tool_search import BRIDGE_TOOL_NAMES, ToolSearchConfig
+
+    name = "mcp_turn_snapshot_schema_change"
+    old_def = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Schema-changing tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {"old": {"type": "string"}},
+            },
+        },
+    }
+    new_def = {
+        "type": "function",
+        "function": {
+            **old_def["function"],
+            "parameters": {
+                "type": "object",
+                "properties": {"fresh": {"type": "integer"}},
+            },
+        },
+    }
+    registry.register(
+        name=name,
+        handler=lambda args, **kw: "{}",
+        schema=old_def["function"],
+        toolset="mcp-turn-snapshot",
+    )
+    try:
+        config = ToolSearchConfig.from_raw({"listing": "auto"})
+        old_agent = _FakeAgent()
+        old_agent._skip_mcp_refresh = True
+        old_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+        old_agent.context_compressor.context_length = 200_000
+        with patch("model_tools.get_tool_definitions", return_value=[old_def]), patch(
+            "tools.tool_search.load_config", return_value=config
+        ):
+            old_ctx = _build(old_agent)
+
+        history = [
+            {
+                "role": "user",
+                "content": "hello",
+                "api_content": old_ctx.messages[-1]["content"],
+            },
+            {"role": "assistant", "content": "done"},
+        ]
+        new_agent = _FakeAgent()
+        new_agent._skip_mcp_refresh = True
+        new_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+        new_agent.context_compressor.context_length = 200_000
+        new_agent._pending_mcp_catalog_notice = "[TOOL CATALOG UPDATED]"
+        with patch("model_tools.get_tool_definitions", return_value=[new_def]), patch(
+            "tools.tool_search.load_config", return_value=config
+        ):
+            new_ctx = _build(new_agent, conversation_history=history)
+
+        current = new_ctx.messages[-1]["content"]
+        assert current.startswith("[TOOL CATALOG UPDATED]\n\n")
+        assert "[HERMES TOOL CATALOG SNAPSHOT" in current
+        assert "supersedes every earlier" in current
+        assert current.endswith("\n\nhello")
+    finally:
+        registry.deregister(name)
+
+
+def test_listing_off_keeps_stable_bridge_bare_on_initial_turn():
+    from tools.tool_search import BRIDGE_TOOL_NAMES, ToolSearchConfig
+
+    agent = _FakeAgent()
+    agent._skip_mcp_refresh = True
+    agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+    with patch(
+        "tools.tool_search.load_config",
+        return_value=ToolSearchConfig.from_raw({"listing": "off"}),
+    ):
+        ctx = _build(agent)
+
+    assert ctx.messages[-1]["content"] == "hello"
+
+
 def test_prepend_user_note_preserves_multimodal_parts():
     image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
     parts = [{"type": "text", "text": "caption"}, image]

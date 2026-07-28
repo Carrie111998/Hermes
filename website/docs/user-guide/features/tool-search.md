@@ -61,8 +61,21 @@ the current live registry, filtered to the session's enabled/disabled toolsets.
 
 Keeping the bridge present from the start makes the model-facing `tools=` prefix
 identical across MCP additions, removals, equal-count swaps, and schema edits.
-Hermes folds a one-shot note into the next real user turn after a catalog update,
-prompting the model to search again without creating a synthetic user message.
+
+The model still needs to know which deferred capabilities exist. Hermes attaches
+a compact, skills-style catalog snapshot to the API copy of the first real user
+turn. The stored user text stays clean, and the exact API copy is retained for
+byte-identical cache replay. A full-schema fingerprint identifies the snapshot.
+When membership, descriptions, or parameter schemas change, Hermes attaches a
+new snapshot to the next real user turn and explicitly supersedes older ones.
+The rendered manifest form is part of the identifier too, so a budget change
+that exposes a richer or more compact listing is also announced. Hermes never
+inserts a standalone synthetic user message, so strict role alternation is
+preserved.
+
+The snapshot uses the same size fallbacks as the earlier embedded listing:
+names plus short descriptions, names only, then per-server summaries. The live
+registry remains authoritative for search, schema loading, and invocation.
 
 ## Configuration
 
@@ -72,6 +85,9 @@ tools:
     enabled: auto       # auto (default), on, or off
     search_default_limit: 5
     max_search_limit: 20
+    listing: auto       # catalog snapshot on a real user turn
+    threshold_pct: 5    # snapshot budget as a percentage of context
+    listing_max_tokens: 20000
 ```
 
 | Key | Default | Meaning |
@@ -79,6 +95,9 @@ tools:
 | `enabled` | `auto` | `auto`/`on` keep the stable bridge enabled; `off` exposes eligible schemas directly. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
+| `listing` | `auto` | `auto`/`on` attach a catalog snapshot to the first real user turn and again when its full-schema fingerprint changes; `off` uses a bare stable bridge. The listing is never embedded in a tool schema. |
+| `threshold_pct` | `5` | Snapshot budget as a percentage of the active model's context length. Range 0–100. |
+| `listing_max_tokens` | `20000` | Absolute cap on the snapshot manifest. Range 200–60000. |
 
 You can also flip the legacy boolean shape:
 
@@ -89,9 +108,10 @@ tools:
 
 ## When NOT to use it
 
-Tool Search trades a fixed per-turn token cost (the three small bridge schemas)
-and at least one extra round trip on cold tools (search → describe → call) for
-the savings and cache stability of deferred schemas.
+Tool Search trades a fixed per-turn token cost (the three small bridge schemas),
+an append-only catalog snapshot on first use/change, and at least one extra round
+trip on cold tools (describe → call when the name is listed; otherwise search →
+describe → call) for the savings and cache stability of deferred schemas.
 
 If you want the old always-eager behavior for a small toolset, set
 `enabled: off`.
@@ -128,6 +148,11 @@ to any progressive-disclosure design, not specific to this implementation:
 - **Catalog is live, not embedded.** Each bridge invocation rebuilds its
   session-scoped view from the current registry. Tool changes therefore take
   effect immediately without replacing the model-facing bridge schemas.
+- **Catalog hints are append-only.** Snapshot metadata rides on a real user
+  turn and is fingerprinted from the full scoped schemas. A resumed agent reads
+  the prior `api_content` sidecar and does not repeat an unchanged snapshot. If
+  the supplied history no longer contains the current snapshot, Hermes attaches
+  it again at the append-only edge.
 - **The catalog is scoped to the session's toolsets.** `tool_search`,
   `tool_describe`, and `tool_call` only ever see and invoke tools the
   session was actually granted. A subagent, kanban worker, or gateway

@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -72,6 +73,116 @@ def prepend_user_note(content: Any, note: str) -> Any:
                 return parts
         return [{"type": "text", "text": note}, *parts]
     return content
+
+
+def build_tool_catalog_turn_note(
+    agent: Any,
+    conversation_history: Optional[List[Dict[str, Any]]],
+    pending_notice: Any,
+) -> str:
+    """Return cache-safe Tool Search metadata for the next real user turn.
+
+    The bridge schema stays byte-stable. A compact catalog snapshot is instead
+    appended at the conversation tail, where it preserves the provider's warm
+    prefix. Snapshot ids cover full schemas, and prior ``api_content`` sidecars
+    are inspected so resumed/rebuilt agents do not re-announce an unchanged
+    catalog on every turn.
+    """
+    pending = pending_notice if isinstance(pending_notice, str) else ""
+    try:
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            build_catalog_snapshot,
+            catalog_snapshot_id_from_text,
+            listing_token_budget,
+            load_config as load_tool_search_config,
+        )
+
+        valid_names = getattr(agent, "valid_tool_names", set()) or set()
+        if not BRIDGE_TOOL_NAMES.issubset(valid_names):
+            return pending
+
+        config = load_tool_search_config()
+        if config.listing == "off":
+            return pending
+
+        previous_id = None
+        for message in reversed(conversation_history or []):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            previous_id = catalog_snapshot_id_from_text(
+                message.get("api_content")
+            ) or catalog_snapshot_id_from_text(message.get("content"))
+            if previous_id:
+                break
+
+        # Avoid serializing a Cloudflare-scale raw catalog on every turn. The
+        # registry generation, session toolset scope, and config-file fingerprint
+        # are the inputs that can change the scoped definitions cache. A fresh
+        # agent still computes once so it can compare against persisted history.
+        from tools.registry import registry as tool_registry
+
+        try:
+            from hermes_cli.config import get_config_path
+
+            config_stat = get_config_path().stat()
+            config_fingerprint = (config_stat.st_mtime_ns, config_stat.st_size)
+        except (FileNotFoundError, OSError, ImportError):
+            config_fingerprint = None
+        enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+        disabled_toolsets = getattr(agent, "disabled_toolsets", None)
+        try:
+            from agent.delegation_context import is_delegated_child_context
+
+            delegated_child = is_delegated_child_context()
+        except Exception:
+            delegated_child = False
+        source_key = (
+            tool_registry._generation,
+            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+            frozenset(disabled_toolsets) if disabled_toolsets else None,
+            config_fingerprint,
+            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            delegated_child,
+        )
+        known_id = getattr(agent, "_tool_catalog_snapshot_id", None)
+        known_notice = getattr(agent, "_tool_catalog_snapshot_notice", None)
+        if (
+            known_id
+            and isinstance(known_notice, str)
+            and known_notice
+            and getattr(agent, "_tool_catalog_snapshot_source_key", None)
+            == source_key
+        ):
+            if previous_id == known_id:
+                return pending
+            return f"{pending}\n\n{known_notice}" if pending else known_notice
+
+        from model_tools import get_tool_definitions
+
+        current_defs = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        context_length = getattr(
+            getattr(agent, "context_compressor", None), "context_length", None
+        )
+        snapshot = build_catalog_snapshot(
+            current_defs,
+            max_tokens=listing_token_budget(config, context_length),
+        )
+
+        agent._tool_catalog_snapshot_id = snapshot.snapshot_id
+        agent._tool_catalog_snapshot_notice = snapshot.notice
+        agent._tool_catalog_snapshot_source_key = source_key
+        if previous_id == snapshot.snapshot_id:
+            return pending
+        return f"{pending}\n\n{snapshot.notice}" if pending else snapshot.notice
+    except Exception:
+        logger.debug("tool catalog turn snapshot skipped", exc_info=True)
+        return pending
 
 
 def compose_user_api_content(
@@ -453,17 +564,22 @@ def build_turn_context(
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
-    # A refresh queues this note instead of injecting a standalone user-role
-    # message. Fold it into the next real user turn and keep the clean input as
-    # the persistence override, exactly like model/skill reload notes.
+    # Keep dynamic catalog metadata out of tools=. The first scoped catalog
+    # snapshot, and each changed full-schema fingerprint, rides on the next
+    # real user turn. A refresh may add a terse reason prefix. The clean input
+    # remains the persistence override, exactly like model/skill reload notes.
     pending_mcp_notice = getattr(agent, "_pending_mcp_catalog_notice", None)
-    if pending_mcp_notice:
+    tool_catalog_note = build_tool_catalog_turn_note(
+        agent, conversation_history, pending_mcp_notice
+    )
+    if tool_catalog_note:
         clean_user_message = (
             persist_user_message if persist_user_message is not None else user_message
         )
-        user_message = prepend_user_note(user_message, pending_mcp_notice)
+        user_message = prepend_user_note(user_message, tool_catalog_note)
         if persist_user_message is None:
             persist_user_message = clean_user_message
+    if pending_mcp_notice:
         agent._pending_mcp_catalog_notice = None
 
     # Sanitize surrogate characters from user input.

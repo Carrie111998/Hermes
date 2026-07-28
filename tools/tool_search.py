@@ -14,7 +14,10 @@ Design constraints this module is built around:
   prefix or invalidate its provider prompt cache.
 * The catalog is resolved from the current session-scoped live registry on
   every search/describe/call. There is no catalog embedded in the bridge
-  description and no session-keyed catalog that can drift out of sync.
+  description and no session-keyed catalog that can drift out of sync. A
+  compact fingerprinted manifest rides on the first real user turn and again
+  after changes, preserving both capability discoverability and the cached
+  ``tools=`` prefix.
 * Bridge tools route through ``model_tools.handle_function_call`` exactly
   like a direct call, so guardrails, plugin pre/post hooks, approval flows,
   and tool-result truncation all fire identically.
@@ -25,6 +28,7 @@ Design constraints this module is built around:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -63,6 +67,12 @@ class ToolSearchConfig:
     enabled: str  # "auto" | "on" | "off"
     search_default_limit: int
     max_search_limit: int
+    # The catalog manifest is delivered on a real user turn, never embedded in
+    # the bridge schema. This preserves the listing-mode discoverability win
+    # without making ``tools=`` dynamic.
+    listing: str = "auto"  # "auto" | "on" | "off"
+    threshold_pct: float = 5.0
+    listing_max_tokens: int = 20000
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -95,16 +105,42 @@ class ToolSearchConfig:
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
 
+        listing_raw = str(raw.get("listing", "auto")).strip().lower()
+        if listing_raw in ("true", "1", "yes"):
+            listing = "on"
+        elif listing_raw in ("false", "0", "no"):
+            listing = "off"
+        elif listing_raw in ("auto", "on", "off"):
+            listing = listing_raw
+        else:
+            listing = "auto"
+        threshold_pct = max(
+            0.0, min(100.0, _safe_float(raw.get("threshold_pct"), 5.0))
+        )
+        listing_max_tokens = max(
+            200, min(60000, _safe_int(raw.get("listing_max_tokens"), 20000))
+        )
+
         return cls(
             enabled=enabled,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            listing=listing,
+            threshold_pct=threshold_pct,
+            listing_max_tokens=listing_max_tokens,
         )
 
 
 def _safe_int(value: Any, fallback: int) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_float(value: Any, fallback: float) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return fallback
 
@@ -231,6 +267,22 @@ def should_activate(
     """
     del deferrable_tokens, context_length
     return config.enabled != "off"
+
+
+def listing_token_budget(
+    config: ToolSearchConfig,
+    context_length: Optional[int],
+) -> int:
+    """Return the budget for the user-turn catalog manifest.
+
+    The manifest uses the former tiered-listing budget, but its bytes now live
+    at the append-only edge of the conversation instead of inside ``tools=``.
+    """
+    if context_length and context_length > 0:
+        pct_leg = int(context_length * (config.threshold_pct / 100.0))
+    else:
+        pct_leg = 10_000
+    return max(0, min(config.listing_max_tokens, pct_leg))
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +443,248 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [e for _, e in scored[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# User-turn catalog manifest
+# ---------------------------------------------------------------------------
+
+
+_SENTENCE_END_RE = re.compile(r"[.!?\n]")
+_CATALOG_SNAPSHOT_RE = re.compile(
+    r"\[HERMES TOOL CATALOG SNAPSHOT id=([0-9a-f]{16})\b"
+)
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    """A deterministic, session-scoped catalog snapshot for one user turn."""
+
+    snapshot_id: str
+    count: int
+    listing_form: str
+    notice: str
+
+
+def _short_desc(description: str, max_chars: int = 60) -> str:
+    """Return the first sentence of a tool description, clipped tersely."""
+    text = " ".join((description or "").split())
+    if not text:
+        return ""
+    match = _SENTENCE_END_RE.search(text)
+    if match:
+        text = text[:match.start() + (1 if text[match.start()] == "." else 0)]
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.rstrip(",;: ") + "…"
+
+
+def _listing_group_label(source_name: str) -> str:
+    label = source_name or "other"
+    return label[4:] if label.startswith("mcp-") else label
+
+
+def build_catalog_listing_with_form(
+    deferrable: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 20000,
+) -> Tuple[Optional[str], str]:
+    """Render a deterministic, budgeted catalog manifest.
+
+    The fallback order is full descriptions, names only, then per-server
+    summaries. Degradation is per server so one huge MCP surface cannot hide
+    the names of a small co-attached server.
+    """
+    if not deferrable:
+        return None, "none"
+
+    groups: Dict[str, List[Tuple[str, str]]] = {}
+    for tool_def in deferrable:
+        fn = tool_def.get("function") or {}
+        name = fn.get("name", "")
+        if not name:
+            continue
+        source, source_name = _classify_source(name)
+        label = _listing_group_label(
+            source_name if source != "other" else "other"
+        )
+        groups.setdefault(label, []).append(
+            (name, _short_desc(fn.get("description", "")))
+        )
+
+    if not groups:
+        return None, "none"
+
+    def render_group(label: str, mode: str) -> str:
+        tools = sorted(groups[label])
+        if mode == "summary":
+            return (
+                f"{label} ({len(tools)} tools — names not listed; "
+                f"discover via `{TOOL_SEARCH_NAME}`)"
+            )
+        lines = [f"{label} tools ({len(tools)}):"]
+        if mode == "full":
+            lines.extend(
+                f"- {name}: {desc}" if desc else f"- {name}"
+                for name, desc in tools
+            )
+        else:
+            lines.append(", ".join(name for name, _ in tools))
+        return "\n".join(lines)
+
+    def assemble(modes: Dict[str, str]) -> str:
+        return "\n".join(
+            render_group(label, modes[label]) for label in sorted(groups)
+        )
+
+    def fits(text: str) -> bool:
+        return math.ceil(len(text) / CHARS_PER_TOKEN) <= max_tokens
+
+    modes = {label: "full" for label in groups}
+    rendered = assemble(modes)
+    if fits(rendered):
+        return rendered, "full"
+
+    modes = {label: "names" for label in groups}
+    rendered = assemble(modes)
+    if fits(rendered):
+        return rendered, "names"
+
+    by_size = sorted(
+        groups,
+        key=lambda label: (-len(render_group(label, "names")), label),
+    )
+    for label in by_size:
+        modes[label] = "summary"
+        rendered = assemble(modes)
+        if fits(rendered):
+            form = (
+                "groups"
+                if all(mode == "summary" for mode in modes.values())
+                else "mixed"
+            )
+            return rendered, form
+
+    return None, "none"
+
+
+def build_catalog_listing(
+    deferrable: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 20000,
+) -> Optional[str]:
+    """Return only the rendered catalog manifest.
+
+    Kept as the compatibility wrapper for callers that do not need to inspect
+    which budget fallback was selected.
+    """
+    listing, _listing_form = build_catalog_listing_with_form(
+        deferrable,
+        max_tokens=max_tokens,
+    )
+    return listing
+
+
+def _catalog_snapshot_id(
+    deferrable: List[Dict[str, Any]],
+    listing: Optional[str],
+    listing_form: str,
+) -> str:
+    """Fingerprint full schemas and their rendered manifest representation."""
+    ordered = sorted(
+        deferrable,
+        key=lambda tool_def: (tool_def.get("function") or {}).get("name", ""),
+    )
+    try:
+        payload = json.dumps(
+            {
+                "schemas": ordered,
+                "listing": listing,
+                "listing_form": listing_form,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        payload = repr((ordered, listing, listing_form))
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def build_catalog_snapshot(
+    current_tool_defs: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 20000,
+) -> CatalogSnapshot:
+    """Build the API-only catalog snapshot attached to a real user turn.
+
+    Full schemas remain behind ``tool_describe``. The compact name/description
+    manifest restores capability discoverability while keeping all dynamic
+    catalog bytes out of the provider's model-facing ``tools=`` prefix.
+    """
+    _, deferrable = classify_tools(current_tool_defs)
+    # Reserve room for the framing and instructions around the manifest.
+    listing, listing_form = build_catalog_listing_with_form(
+        deferrable,
+        max_tokens=max(0, max_tokens - 220),
+    )
+    snapshot_id = _catalog_snapshot_id(deferrable, listing, listing_form)
+
+    lines = [
+        f"[HERMES TOOL CATALOG SNAPSHOT id={snapshot_id} count={len(deferrable)}",
+        "Runtime metadata; this is not part of the user's request. This snapshot "
+        "supersedes every earlier tool-catalog snapshot in the conversation.",
+    ]
+    if not deferrable:
+        lines.append(
+            "No deferred MCP/plugin tools are currently available. The stable "
+            "bridge remains present so later catalog changes do not alter tools=."
+        )
+    elif listing is None:
+        lines.append(
+            f"{len(deferrable)} deferred tools are available, but their manifest "
+            f"does not fit the listing budget. Use `{TOOL_SEARCH_NAME}` before "
+            "deciding that a capability is unavailable."
+        )
+    else:
+        lines.append(
+            "The deferred capabilities below are available. When an exact tool "
+            f"name is visible, load its current schema with `{TOOL_DESCRIBE_NAME}`; "
+            f"use `{TOOL_SEARCH_NAME}` for summarized servers or uncertain matches."
+        )
+        if listing_form == "mixed":
+            lines.append(
+                "Servers marked 'names not listed' also have available tools; "
+                "search them before substituting terminal/browser or declaring "
+                "the capability unavailable."
+            )
+        lines.append(listing)
+    lines.append("END HERMES TOOL CATALOG SNAPSHOT]")
+    return CatalogSnapshot(
+        snapshot_id=snapshot_id,
+        count=len(deferrable),
+        listing_form=listing_form,
+        notice="\n".join(lines),
+    )
+
+
+def catalog_snapshot_id_from_text(content: Any) -> Optional[str]:
+    """Extract a Hermes-emitted snapshot id from a prior API message copy."""
+    if isinstance(content, list):
+        for part in reversed(content):
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            snapshot_id = catalog_snapshot_id_from_text(part.get("text"))
+            if snapshot_id:
+                return snapshot_id
+        return None
+    if not isinstance(content, str):
+        return None
+    match = _CATALOG_SNAPSHOT_RE.search(content)
+    return match.group(1) if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +1049,7 @@ __all__ = [
     "BRIDGE_TOOL_NAMES",
     "ToolSearchConfig",
     "CatalogEntry",
+    "CatalogSnapshot",
     "AssemblyResult",
     "load_config",
     "is_enabled_in_config",
@@ -762,8 +1057,13 @@ __all__ = [
     "classify_tools",
     "estimate_tokens_from_schemas",
     "should_activate",
+    "listing_token_budget",
     "build_catalog",
     "search_catalog",
+    "build_catalog_listing",
+    "build_catalog_listing_with_form",
+    "build_catalog_snapshot",
+    "catalog_snapshot_id_from_text",
     "bridge_tool_schemas",
     "assemble_tool_defs",
     "is_bridge_tool",
