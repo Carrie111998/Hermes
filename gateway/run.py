@@ -18500,6 +18500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         RETRY = "retry"                    # transient failure; watcher should retry
         DROP_DUPLICATE = "drop_duplicate"  # already delivered by another path
         DROP_UNROUTABLE = "drop_unroutable"  # permanently unroutable; do not retry
+        DROPPED_OVERFLOW = "dropped_overflow"  # batch capacity exceeded; counted in summary
         SHUTTING_DOWN = "shutting_down"    # gateway shutting down; retry next cycle
 
     @staticmethod
@@ -18571,7 +18572,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"\n  {session_id}: "
                 f"exit_code={exit_code}, reason={reason}{elapsed}"
             )
-            output = str(evt.get("output") or "").strip()
+            output = _redact_gateway_user_facing_secrets(
+                str(evt.get("output") or "")
+            ).strip()
             if output:
                 if len(output) > 800:
                     output = f"[… truncated …]\n{output[-800:]}"
@@ -18712,10 +18715,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         with self._completion_notification_batch_lock:
             batch = self._completion_notification_batches.setdefault(key, [])
             if len(batch) >= self._completion_notification_batch_max:
-                # Cap reached — resolve immediately as dropped so the
+                # Cap reached — resolve immediately as overflow so the
                 # watcher doesn't wait for a flush that will never include
-                # this entry.
-                future.set_result(self.CompletionDisposition.DROP_UNROUTABLE)
+                # this entry. DROPPED_OVERFLOW is counted and distinct
+                # from DROP_UNROUTABLE (route exists, capacity exceeded).
+                future.set_result(self.CompletionDisposition.DROPPED_OVERFLOW)
                 return await future
             batch.append((synth_text, evt, future))
 
