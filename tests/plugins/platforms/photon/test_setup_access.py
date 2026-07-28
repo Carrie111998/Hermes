@@ -11,11 +11,12 @@ import argparse
 
 import pytest
 
-from hermes_cli.config import get_env_value, save_env_value
+from hermes_cli.config import get_env_value, load_config, save_env_value
 from gateway.config import PlatformConfig
 from plugins.platforms.photon.adapter import (
     _apply_yaml_config,
     _env_enablement,
+    is_connected,
     validate_config,
 )
 from plugins.platforms.photon import cli
@@ -121,6 +122,17 @@ def test_local_mode_yaml_config_supports_nested_platform_extra() -> None:
     }
 
 
+def test_local_mode_is_connected_from_canonical_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PHOTON_IMESSAGE_MODE", raising=False)
+    monkeypatch.delenv("PHOTON_PROJECT_ID", raising=False)
+    monkeypatch.delenv("PHOTON_PROJECT_SECRET", raising=False)
+    assert cli._save_imessage_mode("local")
+
+    assert is_connected(PlatformConfig(enabled=True, token="", extra={}))
+
+
 def test_setup_hint_uses_gateway_service_command(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     monkeypatch.setattr(cli.photon_auth, "load_photon_token", lambda: "token")
     # The dashboard id *is* the Spectrum project id (ids unified), so setup no
@@ -158,3 +170,50 @@ def test_setup_hint_uses_gateway_service_command(monkeypatch: pytest.MonkeyPatch
     out = capsys.readouterr().out
     assert "Start the gateway:  hermes gateway start" in out
     assert "--platform photon" not in out
+
+
+def test_local_setup_skips_cloud_and_explains_macos_access(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        cli.photon_auth,
+        "load_photon_token",
+        lambda: pytest.fail("local setup must not load Photon cloud credentials"),
+    )
+    monkeypatch.setattr(cli, "_install_sidecar", lambda: 0)
+
+    rc = cli._cmd_setup(
+        argparse.Namespace(
+            mode="local",
+            phone="+15551234567",
+            skip_sidecar_install=False,
+        )
+    )
+
+    assert rc == 0
+    assert load_config()["photon"]["imessage_mode"] == "local"
+    assert get_env_value("PHOTON_ALLOWED_USERS") == "+15551234567"
+    assert get_env_value("PHOTON_HOME_CHANNEL") == "+15551234567"
+    out = capsys.readouterr().out
+    assert "does not use Spectrum project credentials" in out
+    assert "signed into Messages" in out
+    assert "Full Disk Access" in out
+    assert "~/Library/Messages/chat.db" in out
+
+
+def test_gateway_setup_passes_selected_local_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+    monkeypatch.setattr(cli, "_prompt", lambda _prompt: "local")
+
+    def _capture_setup(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_cmd_setup", _capture_setup)
+
+    cli.gateway_setup()
+
+    assert captured["args"].mode == "local"

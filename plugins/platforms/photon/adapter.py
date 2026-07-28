@@ -234,7 +234,24 @@ def validate_config(cfg: PlatformConfig) -> bool:
 
 
 def is_connected(cfg: PlatformConfig) -> bool:
-    return validate_config(cfg)
+    if validate_config(cfg):
+        return True
+
+    # The gateway setup menu checks plugin status with a synthetic config,
+    # before load_gateway_config() has copied plugin YAML into ``extra``.
+    # Consult the canonical behavior setting so a completed local setup is
+    # immediately shown as configured and the wizard offers to start/install
+    # the gateway.
+    if not cfg.extra:
+        try:
+            from hermes_cli.config import load_config
+
+            photon = load_config().get("photon")
+            if isinstance(photon, dict) and photon.get("imessage_mode") == "local":
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _imessage_mode(extra: Optional[dict] = None) -> str:

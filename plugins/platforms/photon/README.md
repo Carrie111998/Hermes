@@ -128,6 +128,10 @@ All env vars are documented in `plugin.yaml`. The most important:
 Behavioral settings live in `~/.hermes/config.yaml`. Set
 `photon.imessage_mode: local` to use Spectrum's open-source macOS Messages
 path; the adapter exports `PHOTON_IMESSAGE_MODE` only to the sidecar process.
+The unified `hermes gateway setup` wizard exposes both modes. Local setup does
+not use Spectrum project credentials; the Mac must be signed into Messages,
+and the process that starts Hermes may need Full Disk Access to read
+`~/Library/Messages/chat.db`.
 
 ## Attachments & limitations
 

@@ -3575,6 +3575,8 @@ class TestWebServerEndpoints:
             {"value": "cloud", "label": "Photon cloud"},
             {"value": "local", "label": "Local Mac"},
         ]
+        assert "Full Disk Access" in mode["description"]
+        assert "~/Library/Messages/chat.db" in mode["description"]
         assert "config_key" not in mode
         assert fields["PHOTON_PROJECT_ID"]["visible_when"] == {
             "key": "PHOTON_IMESSAGE_MODE",
