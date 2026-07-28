@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -2154,11 +2155,18 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "approval_id", "deadline")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
-        self.data = data          # command, description, pattern_keys, …
+        self.data = dict(data)    # command, description, pattern_keys, …
+        timeout = max(_get_approval_timeout(), 0)
+        created_at = time.time()
+        self.approval_id = f"approval_{uuid.uuid4().hex}"
+        self.data["approval_id"] = self.approval_id
+        self.data["created_at"] = created_at
+        self.data["expires_at"] = created_at + timeout
+        self.deadline = time.monotonic() + timeout
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
@@ -2168,6 +2176,8 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_resolved_gateway_approvals: dict[tuple[str, str], dict] = {}
+_RESOLVED_GATEWAY_APPROVALS_MAX = 1024
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2229,6 +2239,97 @@ def resolve_gateway_approval(session_key: str, choice: str,
             entry.reason = reason
         entry.event.set()
     return len(targets)
+
+
+def resolve_gateway_approval_cas(
+    session_key: str,
+    choice: str,
+    expected_approval_id: str,
+    reason: Optional[str] = None,
+) -> dict:
+    """Atomically resolve exactly the pending approval named by the caller.
+
+    A repeated decision with the same approval id and choice is idempotent.
+    Reusing an approval id with a different choice, or presenting an id that
+    does not name a currently pending request, fails without resolving any
+    other approval in the session.
+    """
+    expected_approval_id = str(expected_approval_id or "").strip()
+    if not expected_approval_id:
+        return {"status": "approval_id_required", "resolved": 0}
+
+    target = None
+    expired = False
+    key = (session_key, expected_approval_id)
+    with _lock:
+        previous = _resolved_gateway_approvals.get(key)
+        if previous is not None:
+            if previous["choice"] == choice:
+                return {
+                    "status": "already_resolved",
+                    "resolved": 0,
+                    "approval_id": expected_approval_id,
+                    "choice": choice,
+                    "idempotent": True,
+                }
+            return {
+                "status": "decision_conflict",
+                "resolved": 0,
+                "approval_id": expected_approval_id,
+                "choice": choice,
+                "previous_choice": previous["choice"],
+            }
+
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return {
+                "status": "not_pending",
+                "resolved": 0,
+                "approval_id": expected_approval_id,
+            }
+
+        for entry in queue:
+            if entry.approval_id == expected_approval_id:
+                target = entry
+                break
+        if target is None:
+            return {
+                "status": "mismatch",
+                "resolved": 0,
+                "approval_id": expected_approval_id,
+            }
+
+        queue.remove(target)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+
+        if time.monotonic() >= target.deadline:
+            expired = True
+        else:
+            target.result = choice
+            if reason:
+                target.reason = reason
+            _resolved_gateway_approvals[key] = {
+                "choice": choice,
+                "resolved_at": time.time(),
+            }
+            while len(_resolved_gateway_approvals) > _RESOLVED_GATEWAY_APPROVALS_MAX:
+                _resolved_gateway_approvals.pop(next(iter(_resolved_gateway_approvals)))
+        target.event.set()
+
+    if expired:
+        return {
+            "status": "expired",
+            "resolved": 0,
+            "approval_id": expected_approval_id,
+        }
+    return {
+        "status": "resolved",
+        "resolved": 1,
+        "approval_id": expected_approval_id,
+        "choice": choice,
+        "idempotent": False,
+    }
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -3263,7 +3364,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     # Notify the user (bridges sync agent thread → async gateway)
     try:
-        notify_cb(approval_data)
+        notify_cb(entry.data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
@@ -3274,15 +3375,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
-
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    _deadline = entry.deadline
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
@@ -3301,6 +3400,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             )
             entry.result = "deny"
             entry.event.set()
+            resolved = True
+            break
+        if entry.event.is_set():
             resolved = True
             break
         _remaining = _deadline - time.monotonic()

@@ -457,7 +457,10 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={
+                        "choice": "once",
+                        "expected_approval_id": "approval_not_pending",
+                    },
                 )
                 assert approval_resp.status == 409
                 approval_data = await approval_resp.json()
@@ -467,29 +470,30 @@ class TestRunEvents:
                 }
 
     @pytest.mark.asyncio
-    async def test_approval_string_false_does_not_resolve_all(self, adapter):
-        """Quoted false must not fan out approval resolution across the queue."""
+    async def test_approval_without_expected_id_cannot_resolve_bound_request(self, adapter):
         app = _create_runs_app(adapter)
         run_id = "run_bool_parse"
         adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
         adapter._run_approval_sessions[run_id] = "session-123"
+        pending = approval_mod._ApprovalEntry({"command": "danger"})
+        with approval_mod._lock:
+            approval_mod._gateway_queues["session-123"] = [pending]
 
         async with TestClient(TestServer(app)) as cli:
-            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
-                approval_resp = await cli.post(
-                    f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once", "all": "false"},
-                )
+            approval_resp = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "once"},
+            )
+            response = await approval_resp.json()
 
-        assert approval_resp.status == 200
-        mock_resolve.assert_called_once_with(
-            "session-123",
-            "once",
-            resolve_all=False,
-        )
+        assert approval_resp.status == 409
+        assert response["error"]["code"] == "approval_id_required"
+        assert not pending.event.is_set()
+        with approval_mod._lock:
+            approval_mod._gateway_queues.pop("session-123", None)
 
     @pytest.mark.asyncio
-    async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
+    async def test_exact_approval_is_scoped_to_target_run(self, auth_adapter):
         """Same client session_id must not let one run approve another run's queue."""
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -535,7 +539,10 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={
+                        "choice": "always",
+                        "expected_approval_id": attacker_entry.data["approval_id"],
+                    },
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
@@ -572,6 +579,221 @@ class TestRunEvents:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/runs/run_any/events")
         assert resp.status == 401
+
+
+class TestRunApprovalCompareAndSet:
+    @staticmethod
+    def _bind_pending(adapter, run_id, *entries):
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval"}
+        adapter._run_approval_sessions[run_id] = run_id
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = list(entries)
+
+    @pytest.mark.asyncio
+    async def test_pause_state_exposes_immutable_approval_id(self, adapter):
+        app = _create_runs_app(adapter)
+        requested = threading.Event()
+
+        def _request_approval(**_kwargs):
+            session_key = approval_mod.get_current_session_key()
+            with approval_mod._lock:
+                notify = approval_mod._gateway_notify_cbs[session_key]
+            requested.set()
+            decision = approval_mod._await_gateway_decision(
+                session_key,
+                notify,
+                {
+                    "command": "bash -c dangerous",
+                    "description": "dangerous command",
+                    "pattern_key": "shell-c",
+                    "pattern_keys": ["shell-c"],
+                },
+            )
+            return {"final_response": decision["choice"] or "denied"}
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = _request_approval
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                start = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start.json())["run_id"]
+                assert requested.wait(timeout=3)
+
+                for _ in range(40):
+                    status_response = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_response.json()
+                    pending = status.get("pending_approval")
+                    if pending:
+                        break
+                    await asyncio.sleep(0.05)
+
+                approval_id = pending["approval_id"]
+                assert approval_id.startswith("approval_")
+                assert pending["created_at"] < pending["expires_at"]
+
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "expected_approval_id": approval_id,
+                    },
+                )
+                body = await response.json()
+                for _ in range(40):
+                    terminal_response = await cli.get(f"/v1/runs/{run_id}")
+                    terminal = await terminal_response.json()
+                    if terminal["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                retry = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "expected_approval_id": approval_id,
+                    },
+                )
+                retry_body = await retry.json()
+
+        assert response.status == 200
+        assert body["approval_id"] == approval_id
+        assert body["resolved"] == 1
+        assert body["idempotent"] is False
+        assert terminal["status"] == "completed"
+        assert retry.status == 200
+        assert retry_body["resolved"] == 0
+        assert retry_body["idempotent"] is True
+
+    @pytest.mark.asyncio
+    async def test_delayed_duplicate_for_a_never_resolves_replacement_b(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_replacement"
+        approval_a = approval_mod._ApprovalEntry({"command": "danger-a"})
+        self._bind_pending(adapter, run_id, approval_a)
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "once",
+                    "expected_approval_id": approval_a.data["approval_id"],
+                },
+            )
+            approval_b = approval_mod._ApprovalEntry({"command": "danger-b"})
+            with approval_mod._lock:
+                approval_mod._gateway_queues[run_id] = [approval_b]
+
+            duplicate = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "once",
+                    "expected_approval_id": approval_a.data["approval_id"],
+                },
+            )
+            duplicate_body = await duplicate.json()
+            conflicting_duplicate = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "deny",
+                    "expected_approval_id": approval_a.data["approval_id"],
+                },
+            )
+            conflict_body = await conflicting_duplicate.json()
+
+        assert first.status == 200
+        assert duplicate.status == 200
+        assert duplicate_body["idempotent"] is True
+        assert duplicate_body["resolved"] == 0
+        assert conflicting_duplicate.status == 409
+        assert conflict_body["error"]["code"] == "approval_decision_conflict"
+        assert approval_b.result is None
+        assert not approval_b.event.is_set()
+        with approval_mod._lock:
+            assert approval_mod._gateway_queues[run_id] == [approval_b]
+            approval_mod._gateway_queues.pop(run_id, None)
+
+    @pytest.mark.asyncio
+    async def test_mismatched_id_fails_without_action(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_mismatch"
+        current = approval_mod._ApprovalEntry({"command": "current-danger"})
+        self._bind_pending(adapter, run_id, current)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "once",
+                    "expected_approval_id": "approval_replaced",
+                },
+            )
+            body = await response.json()
+
+        assert response.status == 409
+        assert body["error"]["code"] == "approval_id_mismatch"
+        assert current.result is None
+        assert not current.event.is_set()
+        with approval_mod._lock:
+            approval_mod._gateway_queues.pop(run_id, None)
+
+    def test_concurrent_matching_decisions_resolve_once(self):
+        run_id = "run_concurrent_cas"
+        pending = approval_mod._ApprovalEntry({"command": "danger"})
+        self._bind_pending(_make_adapter(), run_id, pending)
+        approval_id = pending.data["approval_id"]
+        barrier = threading.Barrier(3)
+        results = []
+
+        def _resolve():
+            barrier.wait()
+            results.append(
+                approval_mod.resolve_gateway_approval_cas(
+                    run_id,
+                    "once",
+                    approval_id,
+                )
+            )
+
+        threads = [threading.Thread(target=_resolve) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        assert {result["status"] for result in results} == {
+            "resolved",
+            "already_resolved",
+        }
+        assert sum(result["resolved"] for result in results) == 1
+        assert pending.result == "once"
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_expired_match_fails_closed(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_expired_approval"
+        expired = approval_mod._ApprovalEntry({"command": "old-danger"})
+        expired.deadline = time.monotonic() - 1
+        self._bind_pending(adapter, run_id, expired)
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={
+                    "choice": "once",
+                    "expected_approval_id": expired.data["approval_id"],
+                },
+            )
+            body = await response.json()
+
+        assert response.status == 409
+        assert body["error"]["code"] == "approval_expired"
+        assert expired.result is None
+        assert expired.event.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +863,10 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={
+                        "choice": "once",
+                        "expected_approval_id": pending.data["approval_id"],
+                    },
                 )
                 assert approval_resp.status == 200
                 assert pending.event.is_set()

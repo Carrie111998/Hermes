@@ -1252,6 +1252,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Resolved approval decisions retained with terminal run status so
+        # retries remain idempotent after the agent thread has exited.
+        self._run_approval_decisions: Dict[str, Dict[str, str]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
@@ -6216,6 +6219,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        pending_approval={
+                            "approval_id": event.get("approval_id"),
+                            "created_at": event.get("created_at"),
+                            "expires_at": event.get("expires_at"),
+                            "choices": event["choices"],
+                        },
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -6522,6 +6531,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        expected_approval_id = str(body.get("expected_approval_id", "")).strip()
+        if not expected_approval_id:
+            return web.json_response(
+                _openai_error(
+                    "Missing 'expected_approval_id' for approval compare-and-set",
+                    code="approval_id_required",
+                ),
+                status=409,
+            )
+
+        previous_choice = self._run_approval_decisions.get(run_id, {}).get(
+            expected_approval_id
+        )
+        if previous_choice is not None:
+            if previous_choice != choice:
+                return web.json_response(
+                    _openai_error(
+                        "Approval id was already resolved with a different choice",
+                        code="approval_decision_conflict",
+                    ),
+                    status=409,
+                )
+            return web.json_response({
+                "object": "hermes.run.approval_response",
+                "run_id": run_id,
+                "approval_id": expected_approval_id,
+                "choice": choice,
+                "resolved": 0,
+                "idempotent": True,
+            })
+
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
             return web.json_response(
@@ -6536,30 +6576,57 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        if resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "'resolve_all' is incompatible with an exact approval decision",
+                    code="approval_resolve_all_not_supported",
+                ),
+                status=400,
+            )
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import resolve_gateway_approval_cas
 
-            resolved = resolve_gateway_approval(
+            resolution = resolve_gateway_approval_cas(
                 approval_session_key,
                 choice,
-                resolve_all=resolve_all,
+                expected_approval_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
 
-        if resolved <= 0:
+        resolution_status = resolution["status"]
+        if resolution_status not in {"resolved", "already_resolved"}:
+            error_codes = {
+                "approval_id_required": "approval_id_required",
+                "decision_conflict": "approval_decision_conflict",
+                "expired": "approval_expired",
+                "mismatch": "approval_id_mismatch",
+                "not_pending": "approval_not_pending",
+            }
             return web.json_response(
                 _openai_error(
-                    f"Run has no pending approval: {run_id}",
-                    code="approval_not_pending",
+                    f"Approval compare-and-set failed: {resolution_status}",
+                    code=error_codes.get(resolution_status, "approval_conflict"),
                 ),
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        resolved = resolution["resolved"]
+        idempotent = resolution["idempotent"]
+        self._run_approval_decisions.setdefault(run_id, {})[
+            expected_approval_id
+        ] = choice
+        if not idempotent:
+            self._set_run_status(
+                run_id,
+                "running",
+                last_event="approval.responded",
+                pending_approval=None,
+            )
         q = self._run_streams.get(run_id)
-        if q is not None:
+        if q is not None and not idempotent:
             try:
                 q.put_nowait({
                     "event": "approval.responded",
@@ -6567,6 +6634,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
+                    "approval_id": expected_approval_id,
                 })
             except Exception:
                 pass
@@ -6574,8 +6642,10 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "approval_id": expected_approval_id,
             "choice": choice,
             "resolved": resolved,
+            "idempotent": idempotent,
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
@@ -6649,6 +6719,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_approval_decisions.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
