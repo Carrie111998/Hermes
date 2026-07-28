@@ -56,7 +56,7 @@ _CLAUDE_STARTUP_THEMES = frozenset({
 })
 _RESPONSE_SETTLE_SECONDS = 0.5
 _READINESS_SETTLE_SECONDS = 0.5
-_PROMPT_SUBMIT_DELAY_SECONDS = 0.01
+_PROMPT_SUBMIT_DELAY_SECONDS = 0.5
 _CLAUDE_FORCED_ONBOARDING = frozenset({"banner", "step"})
 _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
     "CLAUDE_CODE_POWERUP_ONBOARDING",
@@ -1733,10 +1733,12 @@ def _response_timeout_reason(output: str, *, prompt: str | None) -> str:
 
     if _known_claude_input_modal_visible(output):
         return "known_input_modal"
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace(
+        "\r", ""
+    )
+    if re.search(r"\[Pasted text #\d+(?: \+\d+ lines)?\]", cleaned):
+        return "pasted_input_visible"
     if _claude_main_repl_ready(output):
-        cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace(
-            "\r", ""
-        )
         prompt_echoed = prompt is not None and (
             prompt in cleaned or prompt.replace("\n", "") in cleaned
         )

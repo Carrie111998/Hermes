@@ -302,6 +302,7 @@ def registrar(
     **kwargs: Any,
 ):
     startup_theme = kwargs.pop("startup_theme", "light")
+    sleep = kwargs.pop("sleep", lambda _value: None)
     return ClaudeNativeRegistrar(
         store or FakeStore(),
         source,
@@ -310,7 +311,7 @@ def registrar(
         pty_factory=factory,
         clock=lambda: 100.0,
         monotonic=lambda: 1.0,
-        sleep=lambda _value: None,
+        sleep=sleep,
         process_timeout=2.0,
         exit_timeout=1.0,
         discovery_timeout=0.0,
@@ -383,6 +384,31 @@ def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
     assert process.ready_waits == [2.0]
     assert process.ready_trust_acceptances == [True]
     assert process.closed and process.waits == [1.0]
+
+
+def test_launch_waits_for_multiline_paste_before_submitting_return() -> None:
+    events: list[tuple[str, object]] = []
+
+    class OrderedPty(FakePty):
+        def write(self, data: str) -> None:
+            events.append(("write", data))
+            super().write(data)
+
+    item = claim()
+    process = OrderedPty(output="REGISTERED\r\n")
+    source = FakeSource([None, projection_for(item)])
+
+    result = registrar(
+        source,
+        FakeFactory(process),
+        sleep=lambda seconds: events.append(("sleep", seconds)),
+    ).process(item)
+
+    assert result.status == "visible"
+    assert events[0][0] == "write"
+    assert str(events[0][1]).startswith("\x1b[200~")
+    assert events[1] == ("sleep", 0.5)
+    assert events[2] == ("write", "\r")
 
 
 @pytest.mark.parametrize(
@@ -1272,6 +1298,29 @@ def test_winpty_response_timeout_reports_bounded_main_repl_phase() -> None:
         _WinPtyProcess(Process()).read_until(0.05, prompt=prompt)
 
     assert failure.value.reason == "main_repl_after_prompt"
+
+
+def test_winpty_response_timeout_reports_visible_pasted_input() -> None:
+    output = (
+        "[Pasted text #1 +12 lines]\r\n"
+        "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([output])
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+    with pytest.raises(_PtyResponseTimeout) as failure:
+        _WinPtyProcess(Process()).read_until(0.05, prompt="registration prompt")
+
+    assert failure.value.reason == "pasted_input_visible"
 
 
 def test_winpty_reader_drains_extra_output_after_registered_before_acceptance() -> None:
