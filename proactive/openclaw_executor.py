@@ -11,6 +11,7 @@ from hermes_cli import kanban_db as kb
 from plugins.openclaw_bridge.tools import delegate_to_openclaw
 from proactive.execution_backends import (
     ExecutionRequirements,
+    next_poll_delay_seconds,
     route_execution_backend,
 )
 from proactive.loop_contract import contract_fingerprint, validate_loop_contract
@@ -107,10 +108,6 @@ def _review_readonly_result(
     expected_contract_fingerprint: str,
 ) -> tuple[bool, list[str]]:
     errors: list[str] = []
-    # This adapter invokes the synchronous, terminal
-    # openclaw.browser.read_snapshot HTTP template. Queued/running results are
-    # invalid for this entrypoint; asynchronous backend lifecycle belongs to
-    # the package-2 router rather than leaving this exact Kanban run open.
     if result.get("status") != "succeeded":
         errors.append("OpenClaw result status is not succeeded.")
     if result.get("protocol_version") != "2.0":
@@ -578,6 +575,27 @@ def execute_readonly_browser_snapshot(
                 existing is not None
                 and existing.status == "running"
                 and existing_run is not None
+                and existing_run.backend_status == "queued"
+                and not existing_run.backend_run_id
+                and (existing_run.metadata or {}).get(
+                    "admission_ambiguous"
+                )
+                is True
+            ):
+                replay_metadata = existing_run.metadata or {}
+                stored_generation = replay_metadata.get(
+                    "circuit_generation"
+                )
+                if (
+                    isinstance(stored_generation, int)
+                    and not isinstance(stored_generation, bool)
+                ):
+                    circuit_generation = int(stored_generation)
+                    replaying_delegation = True
+            elif (
+                existing is not None
+                and existing.status == "running"
+                and existing_run is not None
                 and existing_run.backend_status is not None
             ):
                 existing_metadata = existing_run.metadata or {}
@@ -655,7 +673,7 @@ def execute_readonly_browser_snapshot(
                     "deduplicated": True,
                     "backend_run_id": existing_run.backend_run_id,
                 }
-            if (
+            elif (
                 existing is not None
                 and existing.status == "running"
                 and existing_run is not None
@@ -805,9 +823,19 @@ def execute_readonly_browser_snapshot(
             if task is not None and task.status == "running":
                 run = kb.latest_run(conn, execution_task_id)
                 metadata = run.metadata if run else {}
+                admission_replayable = bool(
+                    run is not None
+                    and run.backend_status == "queued"
+                    and not run.backend_run_id
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("admission_ambiguous") is True
+                )
                 if (
                     run is None
-                    or run.backend_status is not None
+                    or (
+                        run.backend_status is not None
+                        and not admission_replayable
+                    )
                     or not isinstance(metadata, Mapping)
                     or metadata.get("contract_fingerprint") != fingerprint
                     or metadata.get("delegation_id")
@@ -859,9 +887,19 @@ def execute_readonly_browser_snapshot(
                         "delegation_id": f"grace:{execution_task_id}",
                         "attempt_id": f"{execution_task_id}:run:{run_id}",
                         "idempotency_key": f"{execution_task_id}:run:{run_id}",
+                        "start_idempotency_key": (
+                            f"{execution_task_id}:run:{run_id}"
+                        ),
                         "contract_fingerprint": fingerprint,
                         "review_task_id": review_task_id,
                         "circuit_generation": circuit_generation,
+                        "requested_url": url,
+                        "project": str(identity["project"]),
+                        "topic_id": str(
+                            identity.get("thread_id")
+                            or identity["topic_name"]
+                        ),
+                        "executor_profile": "browser-readonly",
                     },
                 ):
                     raise RuntimeError(
@@ -985,11 +1023,188 @@ def execute_readonly_browser_snapshot(
         returned_protocol = str(
             delegated_result.get("protocol_version") or ""
         ).strip()
+        admission_output = next(
+            (
+                artifact.get("value")
+                for artifact in delegated_result.get("artifacts") or []
+                if (
+                    isinstance(artifact, Mapping)
+                    and artifact.get("type") == "openclaw_result"
+                    and isinstance(artifact.get("value"), Mapping)
+                )
+            ),
+            None,
+        )
+        admission_evidence = (
+            admission_output.get("evidence")
+            if isinstance(admission_output, Mapping)
+            else None
+        )
+        admission_pending = (
+            delegated_status in {"queued", "running"}
+            and returned_protocol == "2.0"
+            and delegated_result.get("protocol_correlated") is True
+            and identity_matches
+            and not backend_run_id
+            and isinstance(admission_evidence, Mapping)
+            and admission_evidence.get("admissionPending") is True
+            and admission_evidence.get("terminal") is False
+        )
+        if admission_pending:
+            claim_renewed = False
+            with kb.write_txn(conn):
+                recorded = kb.merge_active_run_metadata(
+                    conn,
+                    execution_task_id,
+                    expected_run_id=run_id,
+                    metadata={"admission_ambiguous": True},
+                ) and kb.record_backend_lifecycle(
+                    conn,
+                    execution_task_id,
+                    expected_run_id=run_id,
+                    status="queued",
+                    protocol_version="2.0",
+                    workspace_ref=str(READONLY_BROWSER_WORKSPACE),
+                    result_digest=_canonical_digest(delegated_result),
+                    next_poll_seconds=2,
+                )
+                if recorded:
+                    claim_renewed = kb.renew_external_backend_claim(
+                        conn,
+                        execution_task_id,
+                        expected_run_id=run_id,
+                    )
+            if not recorded:
+                kb.block_task(
+                    conn,
+                    execution_task_id,
+                    reason=(
+                        "OpenClaw browser admission could not be durably "
+                        "scheduled for reconciliation."
+                    ),
+                    kind="capability",
+                    expected_run_id=run_id,
+                )
+                return {
+                    "execution_task_id": execution_task_id,
+                    "review_task_id": review_task_id,
+                    "status": "blocked",
+                    "delegated_result": delegated_result,
+                }
+            return {
+                "execution_task_id": execution_task_id,
+                "review_task_id": review_task_id,
+                "run_id": run_id,
+                "status": "retrying",
+                "routing_decision": routing_decision,
+                "delegated_result": delegated_result,
+                "deduplicated": replaying_delegation,
+                "claim_renewed": claim_renewed,
+            }
         lifecycle_identity_valid = (
             returned_protocol == "2.0"
             and delegated_result.get("protocol_correlated") is True
             and identity_matches
+            and backend_run_id
+            and backend_agent_id == READONLY_BROWSER_AGENT
+            and str(
+                delegated_result.get("backend_session_key") or ""
+            ).strip()
         )
+        if (
+            lifecycle_identity_valid
+            and delegated_status in {"queued", "running"}
+        ):
+            backend_session_key = str(
+                delegated_result["backend_session_key"]
+            ).strip()
+            with kb.write_txn(conn):
+                recorded = kb.merge_active_run_metadata(
+                    conn,
+                    execution_task_id,
+                    expected_run_id=run_id,
+                    metadata={
+                        "backend_session_key": backend_session_key,
+                    },
+                ) and kb.record_backend_lifecycle(
+                    conn,
+                    execution_task_id,
+                    expected_run_id=run_id,
+                    status=delegated_status,
+                    backend_run_id=backend_run_id,
+                    backend_agent_id=backend_agent_id,
+                    protocol_version=returned_protocol,
+                    workspace_ref=str(READONLY_BROWSER_WORKSPACE),
+                    result_digest=_canonical_digest(delegated_result),
+                    next_poll_seconds=next_poll_delay_seconds(1),
+                )
+                if recorded:
+                    recorded = kb.renew_external_backend_claim(
+                        conn,
+                        execution_task_id,
+                        expected_run_id=run_id,
+                    )
+                if recorded:
+                    kb.record_backend_circuit_outcome(
+                        conn,
+                        "openclaw",
+                        succeeded=True,
+                        expected_generation=circuit_generation,
+                    )
+            if not recorded:
+                lifecycle_error = (
+                    "Active browser backend lifecycle could not be durably "
+                    "renewed; exact cancellation cleanup is pending."
+                )
+                with kb.write_txn(conn):
+                    recovery_saved = kb.merge_active_run_metadata(
+                        conn,
+                        execution_task_id,
+                        expected_run_id=run_id,
+                        metadata={
+                            "backend_session_key": backend_session_key,
+                            "stop_rule_cleanup_pending": True,
+                            "stop_rule_reason": lifecycle_error,
+                            "cleanup_attempt_count": 0,
+                            "cleanup_attempt_limit": 3,
+                            "cleanup_deadline_at": (
+                                int(kb.time.time()) + 120
+                            ),
+                        },
+                    ) and kb.record_backend_lifecycle(
+                        conn,
+                        execution_task_id,
+                        expected_run_id=run_id,
+                        status=delegated_status,
+                        backend_run_id=backend_run_id,
+                        backend_agent_id=backend_agent_id,
+                        protocol_version=returned_protocol,
+                        workspace_ref=str(READONLY_BROWSER_WORKSPACE),
+                        result_digest=_canonical_digest(
+                            delegated_result
+                        ),
+                        next_poll_seconds=1,
+                    )
+                return {
+                    "execution_task_id": execution_task_id,
+                    "review_task_id": review_task_id,
+                    "status": (
+                        "running" if recovery_saved else "retrying"
+                    ),
+                    "review_errors": [lifecycle_error],
+                    "delegated_result": delegated_result,
+                }
+            return {
+                "execution_task_id": execution_task_id,
+                "review_task_id": review_task_id,
+                "status": delegated_status,
+                "deduplicated": replaying_delegation,
+                "backend_run_id": backend_run_id,
+                "backend_agent_id": backend_agent_id,
+                "backend_session_key": backend_session_key,
+                "routing_decision": routing_decision,
+                "delegated_result": delegated_result,
+            }
         if not kb.record_backend_lifecycle(
             conn,
             execution_task_id,
@@ -1178,3 +1393,451 @@ def execute_readonly_browser_snapshot(
         "routing_decision": routing_decision,
         "delegated_result": delegated_result,
     }
+
+
+def _readonly_browser_delegation_args(
+    run: kb.Run,
+    *,
+    openclaw_task_id: str,
+    idempotency_key: str,
+    start_idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    metadata = run.metadata or {}
+    requested_url = str(metadata.get("requested_url") or "").strip()
+    if not requested_url:
+        raise ValueError("Browser run is missing its durable requested URL.")
+    args: dict[str, Any] = {
+        "task_id": run.task_id,
+        "objective": (
+            "Cancel and clean up the exact read-only browser snapshot run."
+            if openclaw_task_id
+            == "openclaw.browser.read_snapshot_cancel"
+            else "Resume the exact read-only browser snapshot run."
+        ),
+        "context_refs": [
+            f"kanban:{run.task_id}",
+            f"loop-contract:{metadata['contract_fingerprint']}",
+        ],
+        "allowed_tools": ["browser.read"],
+        "denied_tools": [
+            "browser.click",
+            "browser.type",
+            "browser.upload",
+            "message.send",
+            "shell",
+            "filesystem.write",
+        ],
+        "risk_level": "low",
+        "requires_confirmation": False,
+        "max_runtime_seconds": int(run.max_runtime_seconds or 300),
+        "output_format": "json",
+        "audit_required": True,
+        "requested_by": "hermes",
+        "protocol_version": "2.0",
+        "delegation_id": str(metadata["delegation_id"]),
+        "attempt_id": str(metadata["attempt_id"]),
+        "contract_fingerprint": str(metadata["contract_fingerprint"]),
+        "project": str(metadata["project"]),
+        "topic_id": str(metadata["topic_id"]),
+        "executor_backend": "openclaw",
+        "executor_profile": "browser-readonly",
+        "backend_agent_id": READONLY_BROWSER_AGENT,
+        "external_effect_budget": 0,
+        "workspace_policy": "dedicated",
+        "session_policy": "ephemeral",
+        "credential_refs": [],
+        "idempotency_key": idempotency_key,
+        "openclaw_task_id": openclaw_task_id,
+        "target_url": requested_url,
+        "dry_run": False,
+    }
+    if start_idempotency_key:
+        args.update(
+            {
+                "start_idempotency_key": start_idempotency_key,
+                "backend_run_id": str(run.backend_run_id or ""),
+            }
+        )
+    return args
+
+
+def make_readonly_browser_poll_adapter(
+    *,
+    transport: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    policy_path: Optional[str] = None,
+) -> Callable[[kb.Run], Mapping[str, Any]]:
+    """Replay or cancel an admitted browser run from durable correlation."""
+
+    def poll(run: kb.Run) -> Mapping[str, Any]:
+        metadata = run.metadata or {}
+        start_key = str(
+            metadata.get("start_idempotency_key")
+            or metadata.get("idempotency_key")
+            or ""
+        ).strip()
+        if not start_key:
+            raise ValueError(
+                "Browser run is missing durable start correlation."
+            )
+        if (
+            not run.backend_run_id
+            and metadata.get("admission_ambiguous") is True
+        ):
+            result = delegate_to_openclaw(
+                _readonly_browser_delegation_args(
+                    run,
+                    openclaw_task_id="openclaw.browser.read_snapshot",
+                    idempotency_key=start_key,
+                ),
+                transport=transport,
+                policy_path=policy_path,
+            )
+            status = str(result.get("status") or "").strip().lower()
+            if status not in {
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "blocked",
+            }:
+                raise ValueError(
+                    f"Unexpected OpenClaw browser admission status={status!r}."
+                )
+            if not _result_identity_matches(
+                result,
+                expected_delegation_id=str(
+                    metadata.get("delegation_id") or ""
+                ),
+                expected_attempt_id=str(
+                    metadata.get("attempt_id") or ""
+                ),
+                expected_contract_fingerprint=str(
+                    metadata.get("contract_fingerprint") or ""
+                ),
+            ):
+                raise ValueError(
+                    "OpenClaw browser admission replay identity did not match."
+                )
+            returned_run_id = str(
+                result.get("backend_run_id") or ""
+            ).strip()
+            returned_agent_id = str(
+                result.get("backend_agent_id") or ""
+            ).strip()
+            returned_session_key = str(
+                result.get("backend_session_key") or ""
+            ).strip()
+            admission_output = next(
+                (
+                    artifact.get("value")
+                    for artifact in result.get("artifacts") or []
+                    if (
+                        isinstance(artifact, Mapping)
+                        and artifact.get("type") == "openclaw_result"
+                        and isinstance(artifact.get("value"), Mapping)
+                    )
+                ),
+                None,
+            )
+            admission_evidence = (
+                admission_output.get("evidence")
+                if isinstance(admission_output, Mapping)
+                else None
+            )
+            if (
+                status in {"queued", "running"}
+                and not returned_run_id
+                and result.get("protocol_version") == "2.0"
+                and result.get("protocol_correlated") is True
+                and isinstance(admission_evidence, Mapping)
+                and admission_evidence.get("admissionPending") is True
+                and admission_evidence.get("terminal") is False
+            ):
+                return {
+                    "status": "queued",
+                    "protocol_version": "2.0",
+                    "result_digest": _canonical_digest(result),
+                    "delegated_result": result,
+                }
+            if (
+                status in {"failed", "blocked"}
+                and not returned_run_id
+                and result.get("protocol_version") == "2.0"
+                and result.get("protocol_correlated") is True
+            ):
+                return {
+                    "status": status,
+                    "protocol_version": "2.0",
+                    "result_digest": _terminal_evidence_digest(result),
+                    "delegated_result": result,
+                }
+            if (
+                result.get("protocol_version") != "2.0"
+                or result.get("protocol_correlated") is not True
+                or not returned_run_id
+                or returned_agent_id != READONLY_BROWSER_AGENT
+                or not returned_session_key
+            ):
+                raise ValueError(
+                    "OpenClaw browser admission replay returned incomplete "
+                    "backend identity."
+                )
+            return {
+                "status": status,
+                "backend_run_id": returned_run_id,
+                "backend_agent_id": returned_agent_id,
+                "backend_session_key": returned_session_key,
+                "protocol_version": "2.0",
+                "result_digest": (
+                    _terminal_evidence_digest(result)
+                    if status in {"succeeded", "failed", "blocked"}
+                    else _canonical_digest(result)
+                ),
+                "delegated_result": result,
+            }
+        if not run.backend_run_id:
+            raise ValueError(
+                "Browser run is missing durable backend correlation."
+            )
+        stop_cleanup_pending = bool(
+            metadata.get("stop_rule_cleanup_pending")
+        )
+        result = delegate_to_openclaw(
+            _readonly_browser_delegation_args(
+                run,
+                openclaw_task_id=(
+                    "openclaw.browser.read_snapshot_cancel"
+                    if stop_cleanup_pending
+                    else "openclaw.browser.read_snapshot_poll"
+                ),
+                idempotency_key=(
+                    (
+                        f"{start_key}:cancel:"
+                        f"{run.backend_poll_count + 1}"
+                    )
+                    if stop_cleanup_pending
+                    else (
+                        f"{start_key}:poll:"
+                        f"{run.backend_poll_count + 1}"
+                    )
+                ),
+                start_idempotency_key=(
+                    start_key
+                ),
+            ),
+            transport=transport,
+            policy_path=policy_path,
+        )
+        status = str(result.get("status") or "").strip().lower()
+        if status not in {
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "blocked",
+        }:
+            raise ValueError(
+                f"Unexpected OpenClaw browser poll status={status!r}."
+            )
+        if not _result_identity_matches(
+            result,
+            expected_delegation_id=str(metadata.get("delegation_id") or ""),
+            expected_attempt_id=str(metadata.get("attempt_id") or ""),
+            expected_contract_fingerprint=str(
+                metadata.get("contract_fingerprint") or ""
+            ),
+        ):
+            raise ValueError(
+                "OpenClaw browser replay identity did not match its Kanban run."
+            )
+        returned_run_id = str(result.get("backend_run_id") or "").strip()
+        returned_agent_id = str(
+            result.get("backend_agent_id") or ""
+        ).strip()
+        returned_session_key = str(
+            result.get("backend_session_key") or ""
+        ).strip()
+        expected_session_key = str(
+            metadata.get("backend_session_key") or ""
+        ).strip()
+        if (
+            result.get("protocol_version") != "2.0"
+            or result.get("protocol_correlated") is not True
+            or returned_run_id != run.backend_run_id
+            or returned_agent_id != READONLY_BROWSER_AGENT
+            or returned_session_key != expected_session_key
+        ):
+            raise ValueError(
+                "OpenClaw browser replay returned different backend identity."
+            )
+        cleanup_in_progress = (
+            stop_cleanup_pending
+            and status in {"queued", "running"}
+        )
+        if (
+            stop_cleanup_pending
+            and not cleanup_in_progress
+            and not _browser_cleanup_evidence_valid(
+                result,
+                run=run,
+                metadata=metadata,
+            )
+        ):
+            raise ValueError(
+                "OpenClaw browser cancellation did not prove exact terminal "
+                "resource cleanup."
+            )
+        lifecycle_status = (
+            "running"
+            if cleanup_in_progress and run.backend_status == "running"
+            else status
+        )
+        return {
+            "status": lifecycle_status,
+            "backend_run_id": returned_run_id,
+            "backend_agent_id": returned_agent_id,
+            "backend_session_key": returned_session_key,
+            "protocol_version": "2.0",
+            "result_digest": (
+                _terminal_evidence_digest(result)
+                if status in {"succeeded", "failed", "blocked"}
+                else _canonical_digest(result)
+            ),
+            "delegated_result": result,
+            "stop_cleanup_pending": stop_cleanup_pending,
+            "cleanup_in_progress": cleanup_in_progress,
+        }
+
+    return poll
+
+
+def _browser_cleanup_evidence_valid(
+    result: Mapping[str, Any],
+    *,
+    run: kb.Run,
+    metadata: Mapping[str, Any],
+) -> bool:
+    output = _result_output(result)
+    evidence = (
+        output.get("evidence") if isinstance(output, Mapping) else None
+    )
+    return (
+        result.get("status") == "blocked"
+        and result.get("protocol_version") == "2.0"
+        and result.get("protocol_correlated") is True
+        and _result_identity_matches(
+            result,
+            expected_delegation_id=str(
+                metadata.get("delegation_id") or ""
+            ),
+            expected_attempt_id=str(metadata.get("attempt_id") or ""),
+            expected_contract_fingerprint=str(
+                metadata.get("contract_fingerprint") or ""
+            ),
+        )
+        and result.get("backend_run_id") == run.backend_run_id
+        and result.get("backend_agent_id") == READONLY_BROWSER_AGENT
+        and result.get("backend_session_key")
+        == metadata.get("backend_session_key")
+        and isinstance(evidence, Mapping)
+        and evidence.get("externalEffectBudget") == 0
+        and evidence.get("sideEffectsPerformed") is False
+        and evidence.get("terminal") is True
+        and evidence.get("cancellationRequested") is True
+        and evidence.get("terminationProven") is True
+        and evidence.get("sessionCleaned") is True
+        and evidence.get("browserTabsCleaned") is True
+    )
+
+
+def make_readonly_browser_terminal_handler(
+    *,
+    board: Optional[str] = None,
+) -> Callable[[kb.Run, Mapping[str, Any]], Mapping[str, Any]]:
+    """Close a browser run only after terminal or cancellation evidence."""
+
+    def handle(run: kb.Run, observation: Mapping[str, Any]) -> Mapping[str, Any]:
+        metadata = run.metadata or {}
+        result = observation.get("delegated_result")
+        if not isinstance(result, Mapping):
+            raise ValueError(
+                "Browser terminal observation is missing delegated evidence."
+            )
+        circuit_value = observation.get("circuit_generation")
+        circuit_generation = (
+            int(circuit_value) if circuit_value is not None else None
+        )
+        if metadata.get("stop_rule_cleanup_pending"):
+            cleanup_valid = (
+                observation.get("status") == "blocked"
+                and _browser_cleanup_evidence_valid(
+                    result,
+                    run=run,
+                    metadata=metadata,
+                )
+            )
+            reason = str(
+                metadata.get("stop_rule_reason")
+                or "Browser execution was cancelled by its stop rule."
+            )
+            with kb.connect_closing(board=board) as conn:
+                with kb.write_txn(conn):
+                    kb.record_backend_circuit_outcome(
+                        conn,
+                        "openclaw",
+                        succeeded=cleanup_valid,
+                        error=(
+                            None
+                            if cleanup_valid
+                            else "Browser cancellation evidence failed review."
+                        ),
+                        expected_generation=circuit_generation,
+                    )
+                    kb.block_task(
+                        conn,
+                        run.task_id,
+                        reason=(
+                            reason
+                            if cleanup_valid
+                            else (
+                                "Browser cancellation did not prove exact "
+                                "terminal resource cleanup."
+                            )
+                        ),
+                        kind=(
+                            "transient"
+                            if cleanup_valid
+                            else "capability"
+                        ),
+                        expected_run_id=run.id,
+                    )
+            return {"accepted": False, "cleanup_verified": cleanup_valid}
+
+        review_task_id = str(metadata.get("review_task_id") or "")
+        requested_url = str(metadata.get("requested_url") or "")
+        with kb.connect_closing(board=board) as conn:
+            accepted, errors, digest = _finalize_readonly_terminal(
+                conn,
+                execution_task_id=run.task_id,
+                review_task_id=review_task_id,
+                execution_run=run,
+                delegated_result=result,
+                expected_url=requested_url,
+                expected_delegation_id=str(
+                    metadata.get("delegation_id") or ""
+                ),
+                expected_attempt_id=str(
+                    metadata.get("attempt_id") or ""
+                ),
+                expected_contract_fingerprint=str(
+                    metadata.get("contract_fingerprint") or ""
+                ),
+                expected_circuit_generation=int(circuit_generation or 0),
+            )
+        return {
+            "accepted": accepted,
+            "review_errors": errors,
+            "result_digest": digest,
+        }
+
+    return handle

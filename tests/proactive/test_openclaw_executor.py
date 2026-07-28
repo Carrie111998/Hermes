@@ -7,6 +7,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from proactive import openclaw_executor
+from proactive.backend_poll_worker import poll_due_openclaw_runs
 from proactive.openclaw_executor import execute_readonly_browser_snapshot
 
 
@@ -106,6 +107,38 @@ def _successful_result(task, *, requires_human_review=False, result_text=None):
         "backend_run_id": "openclaw-run-1",
         "backend_agent_id": "missioncrew-browser-readonly",
         "backend_session_key": "agent:missioncrew-browser-readonly:subagent:test",
+    }
+
+
+def _pending_browser_admission_result(task):
+    return {
+        "task_id": task["task_id"],
+        "status": "running",
+        "summary": "OpenClaw browser admission remains pending.",
+        "artifacts": [
+            {
+                "type": "openclaw_result",
+                "value": {
+                    "evidence": {
+                        "externalEffectBudget": 0,
+                        "sideEffectsPerformed": False,
+                        "terminal": False,
+                        "admissionPending": True,
+                    }
+                },
+            }
+        ],
+        "tool_calls": [{"name": "openclaw_bridge_http"}],
+        "audit_log": ["accepted"],
+        "errors": [],
+        "requires_human_review": False,
+        "recommended_next_action": "Replay the same start key.",
+        "protocol_version": "2.0",
+        "protocol_correlated": True,
+        "delegation_id": task["delegation_id"],
+        "attempt_id": task["attempt_id"],
+        "contract_fingerprint": task["contract_fingerprint"],
+        "identity_correlated": True,
     }
 
 
@@ -507,16 +540,14 @@ def test_readonly_half_open_probe_covers_contract_runtime(
     assert observed["lease_seconds"] == 150
 
 
-@pytest.mark.parametrize("status", ["queued", "running"])
-def test_readonly_openclaw_executor_blocks_nonterminal_synchronous_response(
+def test_readonly_nonterminal_response_resumes_through_restart_safe_poller(
     kanban_home,
-    status,
 ):
-    def transport(task):
+    def admit(task):
         return {
             "task_id": task["task_id"],
-            "status": status,
-            "summary": f"OpenClaw backend is {status}.",
+            "status": "running",
+            "summary": "OpenClaw backend is running.",
             "artifacts": [],
             "tool_calls": [{"name": "openclaw_bridge_http"}],
             "audit_log": ["accepted"],
@@ -537,22 +568,431 @@ def test_readonly_openclaw_executor_blocks_nonterminal_synchronous_response(
     result = execute_readonly_browser_snapshot(
         "https://example.com/",
         contract=_contract(),
-        transport=transport,
+        transport=admit,
     )
 
-    assert result["status"] == "blocked"
-    assert "OpenClaw result status is not succeeded." in result["review_errors"]
+    assert result["status"] == "running"
     with kb.connect() as conn:
         execution = kb.get_task(conn, result["execution_task_id"])
         review = kb.get_task(conn, result["review_task_id"])
         run = kb.latest_run(conn, result["execution_task_id"])
-        assert execution is not None and execution.status == "blocked"
+        assert execution is not None and execution.status == "running"
         assert review is not None and review.status == "todo"
         assert run is not None
-        assert run.status == "blocked"
-        assert run.backend_status == "failed"
+        assert run.status == "running"
+        assert run.backend_status == "running"
         assert run.backend_run_id == "openclaw-async-run-1"
-        assert run.backend_next_poll_at is None
+        assert run.backend_next_poll_at is not None
+        due_at = int(run.backend_next_poll_at)
+        start_key = run.metadata["start_idempotency_key"]
+
+    def complete_after_restart(task):
+        assert (
+            task["openclaw_task_id"]
+            == "openclaw.browser.read_snapshot_poll"
+        )
+        assert task["idempotency_key"].startswith(f"{start_key}:poll:")
+        assert task["start_idempotency_key"] == start_key
+        assert task["backend_run_id"] == "openclaw-async-run-1"
+        assert task["objective"].startswith("Resume")
+        terminal = _successful_result(task)
+        terminal["backend_run_id"] = "openclaw-async-run-1"
+        terminal["backend_session_key"] = (
+            "agent:missioncrew-browser-readonly:async"
+        )
+        return terminal
+
+    polled = poll_due_openclaw_runs(
+        owner="browser-restart-poller",
+        now=due_at,
+        transport=complete_after_restart,
+    )
+
+    assert polled.terminal == 1
+    assert polled.errors == ()
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, result["execution_task_id"])
+        review = kb.get_task(conn, result["review_task_id"])
+        run = kb.latest_run(conn, result["execution_task_id"])
+        assert execution is not None and execution.status == "done"
+        assert review is not None and review.status == "done"
+        assert review.result == "accepted"
+        assert run is not None and run.outcome == "completed"
+        assert run.backend_status == "succeeded"
+
+
+def test_readonly_pending_admission_replays_same_start_key(
+    kanban_home,
+):
+    started = execute_readonly_browser_snapshot(
+        "https://example.com/",
+        contract=_contract(),
+        transport=_pending_browser_admission_result,
+    )
+
+    assert started["status"] == "retrying"
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert run is not None
+        assert run.backend_status == "queued"
+        assert run.backend_run_id is None
+        assert run.metadata["admission_ambiguous"] is True
+        assert run.backend_next_poll_at is not None
+        due_at = int(run.backend_next_poll_at)
+        start_key = run.metadata["start_idempotency_key"]
+
+    def reconcile(task):
+        assert task["openclaw_task_id"] == (
+            "openclaw.browser.read_snapshot"
+        )
+        assert task["idempotency_key"] == start_key
+        return {
+            **_pending_browser_admission_result(task),
+            "status": "running",
+            "artifacts": [],
+            "backend_run_id": "openclaw-browser-reconciled",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "backend_session_key": (
+                "agent:missioncrew-browser-readonly:reconciled"
+            ),
+        }
+
+    polled = poll_due_openclaw_runs(
+        owner="browser-admission-reconciler",
+        now=due_at,
+        transport=reconcile,
+    )
+
+    assert polled.observed == 1
+    assert polled.errors == ()
+    with kb.connect() as conn:
+        recovered = kb.latest_run(conn, started["execution_task_id"])
+        assert recovered is not None
+        assert recovered.backend_status == "running"
+        assert recovered.backend_run_id == "openclaw-browser-reconciled"
+        assert recovered.metadata["backend_session_key"] == (
+            "agent:missioncrew-browser-readonly:reconciled"
+        )
+
+
+def test_readonly_pending_admission_accepts_terminal_rejection_without_run_id(
+    kanban_home,
+):
+    started = execute_readonly_browser_snapshot(
+        "https://example.com/",
+        contract=_contract(),
+        transport=_pending_browser_admission_result,
+    )
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert run is not None and run.backend_next_poll_at is not None
+        due_at = int(run.backend_next_poll_at)
+        start_key = run.metadata["start_idempotency_key"]
+
+    def reject(task):
+        assert task["idempotency_key"] == start_key
+        result = _pending_browser_admission_result(task)
+        result.update(
+            {
+                "status": "failed",
+                "summary": (
+                    "OpenClaw rejected browser admission before allocating a run."
+                ),
+                "artifacts": [],
+                "errors": ["admission_rejected"],
+            }
+        )
+        return result
+
+    polled = poll_due_openclaw_runs(
+        owner="browser-rejected-admission-poller",
+        now=due_at,
+        transport=reject,
+    )
+
+    assert polled.terminal == 1
+    assert polled.errors == ()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert task is not None and task.status == "blocked"
+        assert run is not None and run.backend_status == "failed"
+        assert run.backend_run_id is None
+
+
+def test_readonly_stop_rule_cancels_exact_backend_before_blocking(
+    kanban_home,
+):
+    started = execute_readonly_browser_snapshot(
+        "https://example.com/",
+        contract=_contract(),
+        transport=lambda task: {
+            **_successful_result(task),
+            "status": "running",
+            "summary": "OpenClaw backend is running.",
+            "artifacts": [],
+            "backend_run_id": "openclaw-cancel-run",
+            "backend_session_key": (
+                "agent:missioncrew-browser-readonly:cancel"
+            ),
+        },
+    )
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert run is not None and run.backend_next_poll_at is not None
+        assert kb.merge_active_run_metadata(
+            conn,
+            started["execution_task_id"],
+            expected_run_id=run.id,
+            metadata={
+                "stop_rule_cleanup_pending": True,
+                "stop_rule_reason": "max_runtime_seconds reached",
+            },
+        )
+        due_at = int(run.backend_next_poll_at)
+        start_key = run.metadata["start_idempotency_key"]
+
+    def cancel(task):
+        assert (
+            task["openclaw_task_id"]
+            == "openclaw.browser.read_snapshot_cancel"
+        )
+        assert task["start_idempotency_key"] == start_key
+        assert task["backend_run_id"] == "openclaw-cancel-run"
+        assert task["objective"].startswith("Cancel")
+        result = _successful_result(task)
+        result.update(
+            {
+                "status": "blocked",
+                "summary": "OpenClaw browser run was cancelled and cleaned.",
+                "backend_run_id": "openclaw-cancel-run",
+                "backend_session_key": (
+                    "agent:missioncrew-browser-readonly:cancel"
+                ),
+            }
+        )
+        result["artifacts"] = [
+            {
+                "type": "openclaw_result",
+                "value": {
+                    "evidence": {
+                        "requestedUrl": "https://example.com/",
+                        "externalEffectBudget": 0,
+                        "sideEffectsPerformed": False,
+                        "terminal": True,
+                        "cancellationRequested": True,
+                        "terminationProven": True,
+                        "sessionCleaned": True,
+                        "browserTabsCleaned": True,
+                    }
+                },
+            }
+        ]
+        return result
+
+    polled = poll_due_openclaw_runs(
+        owner="browser-cancel-poller",
+        now=due_at,
+        transport=cancel,
+    )
+
+    assert polled.terminal == 1
+    assert polled.errors == ()
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, started["execution_task_id"])
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert execution is not None and execution.status == "blocked"
+        blocked_row = conn.execute(
+            "SELECT block_kind FROM tasks WHERE id = ?",
+            (started["execution_task_id"],),
+        ).fetchone()
+        assert blocked_row is not None
+        assert blocked_row["block_kind"] == "transient"
+        assert run is not None and run.backend_status == "blocked"
+        evidence = run.metadata["backend_terminal_observation"][
+            "delegated_result"
+        ]["artifacts"][0]["value"]["evidence"]
+        assert evidence["terminationProven"] is True
+        assert evidence["browserTabsCleaned"] is True
+
+
+def test_readonly_invalid_cancel_evidence_retries_without_abandoning_run(
+    kanban_home,
+):
+    started = execute_readonly_browser_snapshot(
+        "https://example.com/",
+        contract=_contract(),
+        transport=lambda task: {
+            **_successful_result(task),
+            "status": "running",
+            "artifacts": [],
+            "backend_run_id": "openclaw-invalid-cancel",
+            "backend_session_key": (
+                "agent:missioncrew-browser-readonly:invalid-cancel"
+            ),
+        },
+    )
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert run is not None and run.backend_next_poll_at is not None
+        assert kb.merge_active_run_metadata(
+            conn,
+            started["execution_task_id"],
+            expected_run_id=run.id,
+            metadata={
+                "stop_rule_cleanup_pending": True,
+                "stop_rule_reason": "max_runtime_seconds reached",
+            },
+        )
+        due_at = int(run.backend_next_poll_at)
+
+    def invalid_cancel(task):
+        result = _successful_result(task)
+        result.update(
+            {
+                "status": "blocked",
+                "backend_run_id": "openclaw-invalid-cancel",
+                "backend_session_key": (
+                    "agent:missioncrew-browser-readonly:invalid-cancel"
+                ),
+            }
+        )
+        result["artifacts"] = [
+            {
+                "type": "openclaw_result",
+                "value": {
+                    "evidence": {
+                        "externalEffectBudget": 0,
+                        "sideEffectsPerformed": False,
+                        "terminal": True,
+                        "cancellationRequested": True,
+                        "terminationProven": False,
+                        "sessionCleaned": False,
+                        "browserTabsCleaned": False,
+                    }
+                },
+            }
+        ]
+        return result
+
+    polled = poll_due_openclaw_runs(
+        owner="browser-invalid-cancel-poller",
+        now=due_at,
+        transport=invalid_cancel,
+    )
+
+    assert polled.terminal == 0
+    assert polled.retried == 1
+    assert "did not prove exact terminal resource cleanup" in polled.errors[0]
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, started["execution_task_id"])
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert execution is not None and execution.status == "running"
+        assert run is not None and run.backend_status == "running"
+        assert run.backend_next_poll_at is not None
+        assert run.metadata["stop_rule_cleanup_pending"] is True
+        assert run.metadata["cleanup_attempt_count"] == 1
+
+
+def test_readonly_cancel_progress_does_not_consume_cleanup_failure_budget(
+    kanban_home,
+):
+    started = execute_readonly_browser_snapshot(
+        "https://example.com/",
+        contract=_contract(),
+        transport=lambda task: {
+            **_successful_result(task),
+            "status": "running",
+            "artifacts": [],
+            "backend_run_id": "openclaw-cancel-progress",
+            "backend_session_key": (
+                "agent:missioncrew-browser-readonly:cancel-progress"
+            ),
+        },
+    )
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert run is not None and run.backend_next_poll_at is not None
+        assert kb.merge_active_run_metadata(
+            conn,
+            started["execution_task_id"],
+            expected_run_id=run.id,
+            metadata={
+                "stop_rule_cleanup_pending": True,
+                "stop_rule_reason": "max_runtime_seconds reached",
+            },
+        )
+        due_at = int(run.backend_next_poll_at)
+
+    def cancellation_progress(task):
+        assert ":cancel:" in task["idempotency_key"]
+        return {
+            **_successful_result(task),
+            "status": "running",
+            "artifacts": [],
+            "backend_run_id": "openclaw-cancel-progress",
+            "backend_session_key": (
+                "agent:missioncrew-browser-readonly:cancel-progress"
+            ),
+        }
+
+    polled = poll_due_openclaw_runs(
+        owner="browser-cancel-progress-poller",
+        now=due_at,
+        transport=cancellation_progress,
+    )
+
+    assert polled.observed == 1
+    assert polled.retried == 0
+    assert polled.errors == ()
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, started["execution_task_id"])
+        run = kb.latest_run(conn, started["execution_task_id"])
+        assert execution is not None and execution.status == "running"
+        assert run is not None and run.backend_status == "running"
+        assert run.backend_next_poll_at is not None
+        assert run.metadata["stop_rule_cleanup_pending"] is True
+        assert run.metadata["cleanup_attempt_count"] == 0
+
+
+def test_readonly_binding_failure_preserves_pollable_cleanup(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kb,
+        "renew_external_backend_claim",
+        lambda *_args, **_kwargs: False,
+    )
+
+    result = execute_readonly_browser_snapshot(
+        "https://example.com/",
+        contract=_contract(),
+        transport=lambda task: {
+            **_successful_result(task),
+            "status": "running",
+            "summary": "OpenClaw backend is running.",
+            "artifacts": [],
+            "backend_run_id": "openclaw-binding-recovery",
+            "backend_session_key": (
+                "agent:missioncrew-browser-readonly:binding-recovery"
+            ),
+        },
+    )
+
+    assert result["status"] == "running"
+    with kb.connect() as conn:
+        execution = kb.get_task(conn, result["execution_task_id"])
+        run = kb.latest_run(conn, result["execution_task_id"])
+        assert execution is not None and execution.status == "running"
+        assert run is not None
+        assert run.backend_status == "running"
+        assert run.backend_run_id == "openclaw-binding-recovery"
+        assert run.backend_next_poll_at is not None
+        assert run.metadata["stop_rule_cleanup_pending"] is True
+        assert run.metadata["backend_session_key"].endswith(
+            ":binding-recovery"
+        )
 
 
 @pytest.mark.parametrize(

@@ -467,14 +467,22 @@ def poll_due_backend_runs(
                         if refreshed_run is not None:
                             run = refreshed_run
                     if recorded and status in {"queued", "running"}:
+                        progress_metadata: dict[str, Any] = {
+                            "last_poll_error": None,
+                            "same_poll_error_count": 0,
+                        }
+                        if (
+                            stop_cleanup_pending
+                            and observation.get("cleanup_in_progress") is True
+                        ):
+                            progress_metadata["cleanup_attempt_count"] = (
+                                cleanup_attempt_count
+                            )
                         kb.merge_active_run_metadata(
                             conn,
                             run.task_id,
                             expected_run_id=run.id,
-                            metadata={
-                                "last_poll_error": None,
-                                "same_poll_error_count": 0,
-                            },
+                            metadata=progress_metadata,
                         )
                         kb.record_backend_circuit_outcome(
                             conn,
@@ -662,18 +670,60 @@ def poll_due_openclaw_runs(
         make_zero_effect_async_poll_adapter,
         make_zero_effect_async_terminal_handler,
     )
+    from proactive.openclaw_executor import (
+        make_readonly_browser_poll_adapter,
+        make_readonly_browser_terminal_handler,
+    )
+
+    async_poll = make_zero_effect_async_poll_adapter(
+        transport=transport,
+        policy_path=policy_path,
+    )
+    browser_poll = make_readonly_browser_poll_adapter(
+        transport=transport,
+        policy_path=policy_path,
+    )
+    async_terminal = make_zero_effect_async_terminal_handler(board=board)
+    browser_terminal = make_readonly_browser_terminal_handler(board=board)
+
+    def openclaw_profile(run: kb.Run) -> str:
+        profile = str(
+            (run.metadata or {}).get("executor_profile") or ""
+        ).strip()
+        if profile:
+            return profile
+        return {
+            "clawops-ops": "zero-effect-async",
+            "clawops-browser": "browser-readonly",
+        }.get(str(run.profile or ""), "")
+
+    def poll_openclaw(run: kb.Run) -> Mapping[str, Any]:
+        profile = openclaw_profile(run)
+        if profile == "zero-effect-async":
+            return async_poll(run)
+        if profile == "browser-readonly":
+            return browser_poll(run)
+        raise ValueError(
+            f"Unsupported OpenClaw executor profile={profile!r}."
+        )
+
+    def handle_openclaw_terminal(
+        run: kb.Run,
+        observation: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        profile = openclaw_profile(run)
+        if profile == "zero-effect-async":
+            return async_terminal(run, observation)
+        if profile == "browser-readonly":
+            return browser_terminal(run, observation)
+        raise ValueError(
+            f"Unsupported OpenClaw executor profile={profile!r}."
+        )
 
     return poll_due_backend_runs(
-        adapters={
-            "openclaw": make_zero_effect_async_poll_adapter(
-                transport=transport,
-                policy_path=policy_path,
-            )
-        },
-        terminal_handlers={
-            "openclaw": make_zero_effect_async_terminal_handler(board=board)
-        },
-        executor_profiles=("zero-effect-async",),
+        adapters={"openclaw": poll_openclaw},
+        terminal_handlers={"openclaw": handle_openclaw_terminal},
+        executor_profiles=("zero-effect-async", "browser-readonly"),
         board=board,
         owner=owner,
         limit=limit,

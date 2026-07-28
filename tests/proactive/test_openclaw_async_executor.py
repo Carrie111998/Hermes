@@ -111,6 +111,28 @@ def _result(task, status):
     }
 
 
+def _pending_admission_result(task):
+    result = _result(task, "running")
+    result.pop("backend_run_id")
+    result.pop("backend_agent_id")
+    result.pop("backend_session_key")
+    result["artifacts"] = [
+        {
+            "type": "openclaw_result",
+            "value": {
+                "evidence": {
+                    "externalEffectBudget": 0,
+                    "sideEffectsPerformed": False,
+                    "toolsAllowed": [],
+                    "terminal": False,
+                    "admissionPending": True,
+                }
+            },
+        }
+    ]
+    return result
+
+
 def test_async_openclaw_start_poll_terminal_and_grace_review(kanban_home):
     poll_statuses = iter(["running", "succeeded"])
 
@@ -295,6 +317,114 @@ def test_async_start_replays_ambiguous_timeout_with_same_key(kanban_home):
         assert recovered is not None
         assert recovered.backend_status == "queued"
         assert recovered.backend_run_id == "openclaw-real-async-1"
+
+
+def test_async_start_reconciles_pending_admission_without_duplicate_run(
+    kanban_home,
+    monkeypatch,
+):
+    original_renew = kb.renew_external_backend_claim
+    monkeypatch.setattr(
+        kb,
+        "renew_external_backend_claim",
+        lambda *_args, **_kwargs: False,
+    )
+    first = start_zero_effect_async_acceptance(
+        contract=_contract(),
+        transport=_pending_admission_result,
+    )
+
+    assert first["status"] == "retrying"
+    assert first["claim_renewed"] is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first["execution_task_id"])
+        pending_run = kb.get_run(conn, first["run_id"])
+        assert task is not None and task.status == "running"
+        assert pending_run is not None
+        assert pending_run.backend_status == "queued"
+        assert pending_run.backend_run_id is None
+        assert pending_run.metadata["admission_ambiguous"] is True
+        assert pending_run.backend_next_poll_at is not None
+        retry_due = int(pending_run.backend_next_poll_at)
+        start_key = pending_run.metadata["start_idempotency_key"]
+    monkeypatch.setattr(
+        kb,
+        "renew_external_backend_claim",
+        original_renew,
+    )
+
+    def reconcile(task):
+        assert task["openclaw_task_id"] == (
+            "openclaw.agent.zero_effect_async_start"
+        )
+        assert task["idempotency_key"] == start_key
+        return _result(task, "queued")
+
+    observed = poll_due_backend_runs(
+        adapters={
+            "openclaw": make_zero_effect_async_poll_adapter(
+                transport=reconcile
+            )
+        },
+        terminal_handlers={
+            "openclaw": make_zero_effect_async_terminal_handler()
+        },
+        owner="pending-admission-poller",
+        now=retry_due,
+    )
+
+    assert observed.observed == 1
+    with kb.connect() as conn:
+        reconciled = kb.get_run(conn, first["run_id"])
+        assert reconciled is not None
+        assert reconciled.backend_status == "queued"
+        assert reconciled.backend_run_id == "openclaw-real-async-1"
+
+
+def test_async_pending_admission_accepts_terminal_rejection_without_run_id(
+    kanban_home,
+):
+    started = start_zero_effect_async_acceptance(
+        contract=_contract(),
+        transport=_pending_admission_result,
+    )
+    with kb.connect() as conn:
+        run = kb.get_run(conn, started["run_id"])
+        assert run is not None and run.backend_next_poll_at is not None
+        due_at = int(run.backend_next_poll_at)
+        start_key = run.metadata["start_idempotency_key"]
+
+    def reject(task):
+        assert task["idempotency_key"] == start_key
+        result = _result(task, "blocked")
+        result.pop("backend_run_id")
+        result.pop("backend_agent_id")
+        result.pop("backend_session_key")
+        result["summary"] = "OpenClaw rejected admission before allocating a run."
+        result["errors"] = ["admission_rejected"]
+        return result
+
+    observed = poll_due_backend_runs(
+        adapters={
+            "openclaw": make_zero_effect_async_poll_adapter(
+                transport=reject
+            )
+        },
+        terminal_handlers={
+            "openclaw": make_zero_effect_async_terminal_handler()
+        },
+        owner="rejected-admission-poller",
+        now=due_at,
+    )
+
+    assert observed.terminal == 1
+    assert observed.errors == ()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, started["execution_task_id"])
+        run = kb.get_run(conn, started["run_id"])
+        assert task is not None and task.status == "blocked"
+        assert run is not None and run.backend_status == "blocked"
+        assert run.backend_run_id is None
 
 
 def test_async_stop_rule_uses_cancel_and_closes_only_after_cleanup_evidence(

@@ -1103,6 +1103,60 @@ def test_protocol_v2_readonly_browser_payload_allows_one_zero_effect_live_templa
 
 
 @pytest.mark.parametrize(
+    "template",
+    [
+        "openclaw.browser.read_snapshot_poll",
+        "openclaw.browser.read_snapshot_cancel",
+    ],
+)
+def test_protocol_v2_readonly_browser_lifecycle_payload_requires_exact_run(
+    template,
+):
+    from plugins.openclaw_bridge import tools
+
+    task = tools.build_delegated_task(
+        {
+            "task_id": "browser-lifecycle-1",
+            "objective": "Control the exact admitted browser run.",
+            "risk_level": "low",
+            "allowed_tools": ["browser.read"],
+            "requested_by": "hermes",
+            "protocol_version": "2.0",
+            "delegation_id": "delegation-1",
+            "attempt_id": "attempt-1",
+            "contract_fingerprint": "sha256:contract",
+            "project": "hub_ops",
+            "topic_id": "readonly-browser",
+            "executor_backend": "openclaw",
+            "executor_profile": "browser-readonly",
+            "backend_agent_id": "missioncrew-browser-readonly",
+            "external_effect_budget": 0,
+            "workspace_policy": "dedicated",
+            "session_policy": "ephemeral",
+            "credential_refs": [],
+            "idempotency_key": f"attempt-1:{template.rsplit('_', 1)[-1]}",
+            "start_idempotency_key": "attempt-1",
+            "backend_run_id": "backend-run-1",
+            "openclaw_task_id": template,
+            "target_url": "https://example.com/",
+            "dry_run": False,
+        }
+    )
+    config = tools.OpenClawBridgeConfig(
+        base_url="http://127.0.0.1:18789",
+        gateway_token="gateway-token",
+        bridge_token="bridge-token",
+    )
+
+    payload = tools._openclaw_payload(task, config)
+
+    assert payload["taskId"] == template
+    assert payload["input"]["startIdempotencyKey"] == "attempt-1"
+    assert payload["input"]["backendRunId"] == "backend-run-1"
+    assert payload["dryRun"] is False
+
+
+@pytest.mark.parametrize(
     ("template", "extra", "expected_input"),
     [
         ("openclaw.agent.zero_effect_async_start", {}, {}),

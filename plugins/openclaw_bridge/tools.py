@@ -433,7 +433,12 @@ def _openclaw_payload(
     template = str(task.get("openclaw_task_id") or config.task_template or DEFAULT_OPENCLAW_TEMPLATE)
     is_live_read_snapshot = (
         task.get("protocol_version") == "2.0"
-        and template == "openclaw.browser.read_snapshot"
+        and template
+        in {
+            "openclaw.browser.read_snapshot",
+            "openclaw.browser.read_snapshot_poll",
+            "openclaw.browser.read_snapshot_cancel",
+        }
         and task.get("dry_run") is False
         and task.get("executor_backend") == "openclaw"
         and task.get("executor_profile") == "browser-readonly"
@@ -448,6 +453,13 @@ def _openclaw_payload(
         and bool(str(task.get("project") or "").strip())
         and bool(str(task.get("topic_id") or "").strip())
         and bool(str(task.get("idempotency_key") or "").strip())
+        and (
+            template == "openclaw.browser.read_snapshot"
+            or (
+                bool(str(task.get("start_idempotency_key") or "").strip())
+                and bool(str(task.get("backend_run_id") or "").strip())
+            )
+        )
     )
     is_live_zero_effect_async = (
         live_async_capability is _ZERO_EFFECT_ASYNC_CAPABILITY

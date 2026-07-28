@@ -457,6 +457,7 @@ def start_zero_effect_async_acceptance(
                         "topic_id": str(
                             identity.get("thread_id") or identity["topic_name"]
                         ),
+                        "executor_profile": "zero-effect-async",
                         "start_idempotency_key": start_idempotency_key,
                         "review_task_id": review_task_id,
                         "circuit_generation": circuit_generation,
@@ -595,6 +596,82 @@ def start_zero_effect_async_acceptance(
                 "routing_decision": routing_decision,
                 "delegated_result": result,
                 "deduplicated": replaying_admission,
+            }
+        admission_output = next(
+            (
+                artifact.get("value")
+                for artifact in result.get("artifacts") or []
+                if (
+                    isinstance(artifact, Mapping)
+                    and artifact.get("type") == "openclaw_result"
+                    and isinstance(artifact.get("value"), Mapping)
+                )
+            ),
+            None,
+        )
+        admission_evidence = (
+            admission_output.get("evidence")
+            if isinstance(admission_output, Mapping)
+            else None
+        )
+        admission_pending = (
+            status in {"queued", "running"}
+            and identity_ok
+            and not backend_run_id
+            and protocol_version == "2.0"
+            and result.get("protocol_correlated") is True
+            and isinstance(admission_evidence, Mapping)
+            and admission_evidence.get("admissionPending") is True
+            and admission_evidence.get("terminal") is False
+        )
+        if admission_pending:
+            claim_renewed = False
+            with kb.write_txn(conn):
+                persisted = kb.merge_active_run_metadata(
+                    conn,
+                    task_id,
+                    expected_run_id=run_id,
+                    metadata={"admission_ambiguous": True},
+                ) and kb.record_backend_lifecycle(
+                    conn,
+                    task_id,
+                    expected_run_id=run_id,
+                    status="queued",
+                    protocol_version="2.0",
+                    next_poll_seconds=2,
+                )
+                if persisted:
+                    claim_renewed = kb.renew_external_backend_claim(
+                        conn,
+                        task_id,
+                        expected_run_id=run_id,
+                    )
+            if not persisted:
+                kb.block_task(
+                    conn,
+                    task_id,
+                    reason=(
+                        "OpenClaw pending admission could not be durably "
+                        "scheduled for reconciliation."
+                    ),
+                    kind="capability",
+                    expected_run_id=run_id,
+                )
+                return {
+                    "execution_task_id": task_id,
+                    "review_task_id": review_task_id,
+                    "status": "blocked",
+                    "delegated_result": result,
+                }
+            return {
+                "execution_task_id": task_id,
+                "review_task_id": review_task_id,
+                "run_id": run_id,
+                "status": "retrying",
+                "routing_decision": routing_decision,
+                "delegated_result": result,
+                "deduplicated": replaying_admission,
+                "claim_renewed": claim_renewed,
             }
         if (
             status
@@ -799,6 +876,50 @@ def make_zero_effect_async_poll_adapter(
             backend_session_key = str(
                 result.get("backend_session_key") or ""
             ).strip()
+            admission_output = next(
+                (
+                    artifact.get("value")
+                    for artifact in result.get("artifacts") or []
+                    if (
+                        isinstance(artifact, Mapping)
+                        and artifact.get("type") == "openclaw_result"
+                        and isinstance(artifact.get("value"), Mapping)
+                    )
+                ),
+                None,
+            )
+            admission_evidence = (
+                admission_output.get("evidence")
+                if isinstance(admission_output, Mapping)
+                else None
+            )
+            if (
+                status in {"queued", "running"}
+                and not backend_run_id
+                and result.get("protocol_version") == "2.0"
+                and result.get("protocol_correlated") is True
+                and isinstance(admission_evidence, Mapping)
+                and admission_evidence.get("admissionPending") is True
+                and admission_evidence.get("terminal") is False
+            ):
+                return {
+                    "status": "queued",
+                    "protocol_version": "2.0",
+                    "result_digest": _digest(result),
+                    "delegated_result": result,
+                }
+            if (
+                status in {"failed", "blocked"}
+                and not backend_run_id
+                and result.get("protocol_version") == "2.0"
+                and result.get("protocol_correlated") is True
+            ):
+                return {
+                    "status": status,
+                    "protocol_version": "2.0",
+                    "result_digest": _terminal_evidence_digest(result),
+                    "delegated_result": result,
+                }
             if (
                 result.get("protocol_correlated") is not True
                 or not backend_run_id
