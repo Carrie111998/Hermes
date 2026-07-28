@@ -1973,6 +1973,22 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    def platform_persistence_metadata(self) -> Dict[str, str]:
+        """Return chat-scoped provenance for durable transcript persistence."""
+        metadata: Dict[str, str] = {}
+        source = self.source
+        platform = getattr(source, "platform", None) if source else None
+        if platform is not None:
+            metadata["platform"] = str(getattr(platform, "value", platform))
+        chat_id = getattr(source, "chat_id", None) if source else None
+        if chat_id is not None:
+            metadata["chat_id"] = str(chat_id)
+        if self.message_id is not None:
+            metadata["message_id"] = str(self.message_id)
+        if self.reply_to_message_id is not None:
+            metadata["reply_to_message_id"] = str(self.reply_to_message_id)
+        return metadata
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

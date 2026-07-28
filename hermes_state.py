@@ -1307,6 +1307,7 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_reasoning_items TEXT,
     codex_message_items TEXT,
     platform_message_id TEXT,
+    platform_metadata TEXT,
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
@@ -6810,6 +6811,41 @@ class SessionDB:
             return None
         return meta
 
+    @staticmethod
+    def _encode_platform_metadata(platform_metadata: Any) -> Optional[str]:
+        """Serialize structured inbound-platform provenance as a JSON object."""
+        if not platform_metadata:
+            return None
+        if isinstance(platform_metadata, str):
+            try:
+                platform_metadata = json.loads(platform_metadata)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Ignoring non-JSON platform metadata on write")
+                return None
+        if not isinstance(platform_metadata, dict):
+            logger.warning("Ignoring non-object platform metadata on write")
+            return None
+        try:
+            return json.dumps(platform_metadata)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring non-serializable platform metadata on write")
+            return None
+
+    @staticmethod
+    def _decode_platform_metadata(raw: Any) -> Optional[Dict[str, Any]]:
+        """Decode a ``platform_metadata`` column without exposing invalid rows."""
+        if raw is None:
+            return None
+        try:
+            metadata = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Ignoring invalid platform metadata on message row")
+            return None
+        if not isinstance(metadata, dict):
+            logger.warning("Ignoring non-object platform metadata on message row")
+            return None
+        return metadata
+
     def append_message(
         self,
         session_id: str,
@@ -6825,7 +6861,7 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
-        platform_message_id: str = None,
+        platform_message_id: Optional[str] = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
@@ -6833,6 +6869,7 @@ class SessionDB:
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
+        platform_metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -6841,10 +6878,15 @@ class SessionDB:
         if role is 'tool' or tool_calls is present).
 
         ``platform_message_id`` is the external messaging platform's own
-        message ID (e.g. Telegram update_id, Yuanbao msg_id).  It is
+        message ID (e.g. Telegram message_id, Yuanbao msg_id).  It is
         independent of the SQLite autoincrement primary key and is used by
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
+
+        ``platform_metadata`` stores structured, chat-scoped inbound provenance
+        such as the platform, chat ID, message ID, and reply target. It is
+        available to transcript readers but intentionally excluded from the
+        model conversation projection.
 
         ``api_content`` is the exact content string sent to the API for this
         message when it differs from ``content`` (ephemeral memory/plugin
@@ -6857,6 +6899,7 @@ class SessionDB:
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
+        platform_metadata_json = self._encode_platform_metadata(platform_metadata)
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
             json.dumps(reasoning_details)
@@ -6925,8 +6968,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, platform_metadata, observed,
+                   active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6944,6 +6988,7 @@ class SessionDB:
                     codex_items_json,
                     codex_message_items_json,
                     platform_message_id,
+                    platform_metadata_json,
                     1 if observed else 0,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
@@ -7066,8 +7111,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, platform_metadata, observed,
+                   active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -7085,6 +7131,7 @@ class SessionDB:
                     codex_items_json,
                     codex_message_items_json,
                     platform_msg_id,
+                    self._encode_platform_metadata(msg.get("platform_metadata")),
                     1 if msg.get("observed") else 0,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
@@ -7140,6 +7187,40 @@ class SessionDB:
                 and session["end_reason"] == "compression"
             ):
                 raise CompressionSessionClosedError(session_id)
+
+            # Model-safe replay intentionally omits platform_metadata, but it
+            # retains the indexed platform message id under ``message_id``.
+            # Transcript rewrites built from that replay shape must not erase
+            # durable reply-correlation metadata. Carry it forward by stable
+            # platform id without mutating the caller's message dictionaries.
+            existing_platform_metadata: Dict[str, Dict[str, str]] = {}
+            for row in conn.execute(
+                "SELECT platform_message_id, platform_metadata FROM messages "
+                f"WHERE session_id = ?{active_clause} "
+                "AND platform_message_id IS NOT NULL "
+                "AND platform_metadata IS NOT NULL",
+                (session_id,),
+            ).fetchall():
+                decoded = self._decode_platform_metadata(row["platform_metadata"])
+                if decoded is not None:
+                    existing_platform_metadata[str(row["platform_message_id"])] = decoded
+
+            messages_to_insert: List[Dict[str, Any]] = []
+            for message in messages:
+                platform_id = message.get("platform_message_id") or message.get(
+                    "message_id"
+                )
+                preserved = (
+                    existing_platform_metadata.get(str(platform_id))
+                    if platform_id is not None
+                    and message.get("platform_metadata") is None
+                    else None
+                )
+                if preserved is not None:
+                    message = dict(message)
+                    message["platform_metadata"] = preserved
+                messages_to_insert.append(message)
+
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
@@ -7149,7 +7230,7 @@ class SessionDB:
                 (session_id,),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages_to_insert
             )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -7305,6 +7386,8 @@ class SessionDB:
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("platform_metadata") is not None:
+                msg["platform_metadata"] = self._decode_platform_metadata(msg["platform_metadata"])
             result.append(msg)
         return result
 
@@ -7376,6 +7459,8 @@ class SessionDB:
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("platform_metadata") is not None:
+                msg["platform_metadata"] = self._decode_platform_metadata(msg["platform_metadata"])
             result.append(msg)
 
         # before_rows includes the anchor itself; subtract 1 for the count of
@@ -7500,6 +7585,8 @@ class SessionDB:
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("platform_metadata") is not None:
+                msg["platform_metadata"] = self._decode_platform_metadata(msg["platform_metadata"])
             return msg
 
         return {

@@ -3083,6 +3083,7 @@ class SessionStore:
             codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
             codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
+            platform_metadata=message.get("platform_metadata"),
             observed=bool(message.get("observed")),
             timestamp=message.get("timestamp"),
             # api_content sidecar: the exact bytes sent to the API for

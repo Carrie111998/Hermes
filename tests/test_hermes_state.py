@@ -7810,3 +7810,55 @@ class TestDisplayMetadataReadPaths:
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
 
+
+def test_message_platform_metadata_round_trips_without_entering_model_history(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("s1", source="telegram")
+    metadata = {
+        "platform": "telegram",
+        "chat_id": "8531920232",
+        "message_id": "4456",
+        "reply_to_message_id": "4455",
+    }
+
+    db.append_message(
+        "s1",
+        role="user",
+        content="ack",
+        platform_message_id="4456",
+        platform_metadata=metadata,
+    )
+
+    row = db.get_messages("s1")[0]
+    assert row["platform_message_id"] == "4456"
+    assert row["platform_metadata"] == metadata
+    history = db.get_messages_as_conversation("s1")
+    assert history[0]["message_id"] == "4456"
+    assert "platform_metadata" not in history[0]
+
+
+def test_replace_messages_preserves_platform_metadata(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("s1", source="telegram")
+    metadata = {
+        "platform": "telegram",
+        "chat_id": "8531920232",
+        "message_id": "4456",
+        "reply_to_message_id": "4455",
+    }
+
+    db.replace_messages(
+        "s1",
+        [
+            {
+                "role": "user",
+                "content": "ack",
+                "platform_message_id": "4456",
+                "platform_metadata": metadata,
+            }
+        ],
+    )
+
+    row = db.get_messages("s1")[0]
+    assert row["platform_message_id"] == "4456"
+    assert row["platform_metadata"] == metadata

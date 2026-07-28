@@ -208,6 +208,21 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_stamps_inbound_platform_metadata_on_current_user_turn():
+    agent = _FakeAgent()
+    metadata = {
+        "platform": "telegram",
+        "chat_id": "8531920232",
+        "message_id": "4456",
+        "reply_to_message_id": "4455",
+    }
+
+    ctx = _build(agent, persist_user_platform_metadata=metadata)
+
+    assert ctx.messages[-1]["platform_message_id"] == "4456"
+    assert ctx.messages[-1]["platform_metadata"] == metadata
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
