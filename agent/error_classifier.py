@@ -31,6 +31,7 @@ class FailoverReason(enum.Enum):
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
+    local_request_limit = "local_request_limit"  # Per-request/provider worker call budget exhausted — abort/fallback, never retry
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
     upstream_rate_limit = "upstream_rate_limit"
@@ -675,6 +676,19 @@ def classify_api_error(
             FailoverReason.thinking_signature,
             retryable=True,
             should_compress=False,
+        )
+
+    # NVIDIA/DeepSeek-style worker budgets are deterministic for the current
+    # agent run: once the server says the worker's local total request limit
+    # is reached (for example ``173/48``), short backoff retries just reproduce
+    # the same failure and amplify gateway/curator log spam. Treat this like a
+    # local iteration-budget wall: allow the normal fallback path once, but do
+    # not enter the retry/backoff loop.
+    if "worker local total request limit reached" in error_msg:
+        return _result(
+            FailoverReason.local_request_limit,
+            retryable=False,
+            should_fallback=True,
         )
 
     # Anthropic long-context tier gate (429 "extra usage" + "long context")
