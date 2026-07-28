@@ -209,7 +209,7 @@ class OpenAIStreamer(StreamingTTSProvider):
 
         client = OpenAI(
             api_key=get_env_value("OPENAI_API_KEY"),
-            base_url=get_env_value("OPENAI_BASE_URL") or None,
+            base_url=self.section.get("base_url") or get_env_value("OPENAI_BASE_URL") or None,
         )
         model = self.section.get("model", "gpt-4o-mini-tts")
         voice = self.section.get("voice", "alloy")
