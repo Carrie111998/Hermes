@@ -7008,6 +7008,7 @@ class AIAgent:
             set_accounting_context,
         )
         from agent.conversation_loop import run_conversation
+        from agent.result_normalizer import normalize_model_result
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -7035,7 +7036,7 @@ class AIAgent:
         # which may be observed from another thread.
         with bind_subagent_parent(self), scoped_runtime_main({}):
             try:
-                return run_conversation(
+                return normalize_model_result(run_conversation(
                     self,
                     user_message,
                     system_message,
@@ -7047,7 +7048,7 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
-                )
+                ))
             finally:
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
@@ -7064,7 +7065,7 @@ class AIAgent:
             str: Final assistant response
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
-        return result["final_response"]
+        return result.get("final_response", "")
 
     def _run_codex_app_server_turn(
         self,

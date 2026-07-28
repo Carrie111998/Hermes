@@ -2767,9 +2767,21 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    # Reasoning can also be signalled out-of-band (GPT-OSS on
+                    # Groq, DeepSeek, Moonshot) via the transport's separate
+                    # reasoning/reasoning_content field rather than inline
+                    # <think> tags in content (see NormalizedResponse) --
+                    # normalize_response() keeps them apart from content, so
+                    # check both or thinking-budget exhaustion is missed for
+                    # these providers and the turn silently returns empty.
+                    _trunc_reasoning = getattr(_trunc_msg, "reasoning", None) if _trunc_msg else None
+                    _trunc_reasoning_content = getattr(_trunc_msg, "reasoning_content", None) if _trunc_msg else None
+                    _has_reasoning_signal = bool(
+                        _has_think_tags or _trunc_reasoning or _trunc_reasoning_content
+                    )
                     _thinking_exhausted = (
                         not _trunc_has_tool_calls
-                        and _has_think_tags
+                        and _has_reasoning_signal
                         and (
                             (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
                             or _trunc_content is None
@@ -2777,6 +2789,19 @@ def run_conversation(
                     )
 
                     if _thinking_exhausted:
+                        # Try the next fallback provider before giving up --
+                        # a differently sized/tuned model may not exhaust its
+                        # budget on reasoning alone. Never surface an empty
+                        # result as success.
+                        if agent._fallback_chain and agent._try_activate_fallback():
+                            agent._vprint(
+                                f"{agent.log_prefix}💭 Reasoning exhausted the output token "
+                                f"budget — switching to fallback provider "
+                                f"({agent.model} / {agent.provider}).",
+                                force=True,
+                            )
+                            continue
+
                         _exhaust_error = (
                             "Model used all output tokens on reasoning with none left "
                             "for the response. Try lowering reasoning effort or "
