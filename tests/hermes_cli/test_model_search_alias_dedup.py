@@ -1,8 +1,8 @@
 """Picker dedup must fold live bare wire-ids into their curated public slug.
 
 Kimi Coding Plan live-discovers its flagship as the bare id ``k3`` while the
-curated catalog carries ``kimi-k3``. The curated-first picker merge must not
-render both as separate rows for the same model.
+curated catalog also uses ``k3`` (canonical). The curated-first picker merge
+must not render both as separate rows for the same model.
 """
 
 from unittest.mock import patch
@@ -12,9 +12,9 @@ from hermes_cli.models import provider_model_ids
 
 
 class TestModelAliasCanonical:
-    def test_bare_k3_folds_to_public_slug(self):
-        assert model_alias_canonical("k3") == "kimi-k3"
-        assert model_alias_canonical("K3") == "kimi-k3"
+    def test_bare_k3_is_canonical(self):
+        assert model_alias_canonical("k3") == "k3"
+        assert model_alias_canonical("K3") == "k3"
 
     def test_non_alias_ids_are_identity(self):
         assert model_alias_canonical("kimi-k2.6") == "kimi-k2.6"
@@ -23,8 +23,8 @@ class TestModelAliasCanonical:
 
 
 class TestPickerMergeAliasDedup:
-    def test_live_bare_k3_not_duplicated_against_curated_kimi_k3(self):
-        """Coding Plan key: live returns bare ``k3``; curated has ``kimi-k3``.
+    def test_live_bare_k3_not_duplicated_against_curated_k3(self):
+        """Coding Plan key: live returns bare ``k3``; curated also has ``k3``.
         Exactly one k3-family row must survive (the curated slug leads)."""
         with (
             patch(
@@ -41,8 +41,8 @@ class TestPickerMergeAliasDedup:
         ):
             out = provider_model_ids("kimi-coding")
 
-        k3_rows = [m for m in out if model_alias_canonical(m) == "kimi-k3"]
-        assert k3_rows == ["kimi-k3"], out
+        k3_rows = [m for m in out if model_alias_canonical(m) == "k3"]
+        assert k3_rows == ["k3"], out
         # Live-only entries with no curated twin still surface.
         assert "kimi-for-coding" in out
 

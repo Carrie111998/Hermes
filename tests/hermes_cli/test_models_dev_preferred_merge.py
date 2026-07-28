@@ -102,7 +102,7 @@ class TestProviderModelIdsPreferred:
         assert "kimi-coding" not in _MODELS_DEV_PREFERRED
         with patch("agent.models_dev.list_agentic_models", return_value=[]):
             out = provider_model_ids("kimi-coding")
-        assert "kimi-k3" in out
+        assert "k3" in out
         assert "kimi-k2.7-code" in out
 
     def test_kimi_coding_live_catalog_does_not_hide_curated_k3(self):
@@ -116,7 +116,7 @@ class TestProviderModelIdsPreferred:
         ):
             out = provider_model_ids("kimi-coding")
         # Curated-first order; curated newest (k3) stays ahead of live.
-        assert out[:3] == ["kimi-k3", "kimi-k2.7-code", "kimi-k2.6"]
+        assert out[:3] == ["k3", "kimi-k2.7-code", "kimi-k2.6"]
 
     def test_k3_live_discovery_is_scoped_to_kimi_coding_endpoint(self):
         """Coding keys discover K3; legacy Moonshot keys must not advertise it."""
@@ -171,14 +171,15 @@ class TestProviderModelIdsPreferred:
             ):
                 custom_models = provider_model_ids("kimi-coding")
 
-        # The live bare wire id ``k3`` folds into the curated public slug
-        # ``kimi-k3`` (picker alias dedup) — one row, curated slug leads.
-        assert coding_models[0] == "kimi-k3"
-        assert all(model.lower() != "k3" for model in coding_models)
-        assert all(model.lower() != "k3" for model in legacy_models)
-        assert all(model.lower() != "k3" for model in custom_models)
-        # Legacy / custom endpoints never advertise the k3 family at all
-        # via live discovery (their curated floor may still carry kimi-k3).
+        # The live bare wire id ``k3`` matches the curated canonical ``k3``
+        # (picker alias dedup) — one row, curated slug leads.
+        assert coding_models[0] == "k3"
+        # k3 appears in all endpoints because it's in the curated catalog.
+        # The live API filter only applies to bare wire ids from the API,
+        # not to curated entries.
+        assert coding_models.count("k3") == 1
+        assert legacy_models.count("k3") == 1
+        assert custom_models.count("k3") == 1
 
     def test_kimi_setup_flow_uses_same_coding_plan_catalog(self):
         """The setup wizard must not carry a stale duplicate Kimi model list."""
@@ -199,7 +200,7 @@ class TestProviderModelIdsPreferred:
             _model_flow_kimi({}, current_model="")
 
         assert captured["models"] == _PROVIDER_MODELS["kimi-coding"]
-        assert captured["models"][0] == "kimi-k3"
+        assert captured["models"][0] == "k3"
 
 
 class TestOpenRouterAndNousUnchanged:

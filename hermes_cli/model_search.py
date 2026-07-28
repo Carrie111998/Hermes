@@ -20,7 +20,7 @@ _MODEL_SEARCH_ALIASES: dict[str, tuple[str, ...]] = {
 # don't render as two rows for the same model. Derived from the FIRST alias
 # entry, which by convention is the full public slug.
 _MODEL_ALIAS_CANONICAL: dict[str, str] = {
-    wire_id: aliases[0].lower()
+    wire_id: wire_id
     for wire_id, aliases in _MODEL_SEARCH_ALIASES.items()
     if aliases
 }

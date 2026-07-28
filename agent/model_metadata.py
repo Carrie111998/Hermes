@@ -325,8 +325,8 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Kimi — K3 ships with a 1 Mi context window (1,048,576; verified against
     # models.dev and OpenRouter live metadata, matching the endpoint-scoped
     # override in _endpoint_scoped_context_length). Longest-key-first substring
-    # matching ensures "kimi-k3" resolves to 1M while older/unknown Kimi models
-    # still hit the generic 256K fallback.
+    # matching ensures "k3" (endpoint-scoped) and "kimi-k3" (global) resolve
+    # to 1M while older/unknown Kimi models still hit the generic 256K fallback.
     "kimi-k3": 1_048_576,
     "kimi": 262144,
     # Upstage Solar — api.upstage.ai/v1/models does not return context_length,

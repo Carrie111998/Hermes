@@ -707,7 +707,7 @@ def test_direct_start_preserves_context_for_registry_provider_alias():
     """Legacy and models.dev provider IDs may identify the same route."""
     cfg = {
         "model": {
-            "default": "kimi-k3",
+            "default": "k3",
             "provider": "kimi-for-coding",
             "context_length": 1_048_576,
         }
@@ -716,11 +716,11 @@ def test_direct_start_preserves_context_for_registry_provider_alias():
     routed_client = MagicMock(api_key="fake-test-token", base_url="")
     with patch(
         "agent.auxiliary_client.resolve_provider_client",
-        return_value=(routed_client, "kimi-k3"),
+        return_value=(routed_client, "k3"),
     ):
         agent = _make_direct_start_agent(
             cfg,
-            model="kimi-k3",
+            model="k3",
             provider="kimi-coding",
             base_url="",
         )
