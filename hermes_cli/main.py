@@ -6830,6 +6830,7 @@ def _scan_dashboard_processes(
         "hermes_cli.main serve",
         "hermes_cli/main.py serve",
     ]
+    lifecycle_flags = (" --status", " --stop")
     self_pid = os.getpid()
     dashboard_processes: list[tuple[int, str]] = []
 
@@ -6867,6 +6868,7 @@ def _scan_dashboard_processes(
                     pid_str = line[len("ProcessId=") :]
                     if (
                         any(p in current_cmd for p in patterns)
+                        and not any(flag in current_cmd for flag in lifecycle_flags)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -6899,6 +6901,8 @@ def _scan_dashboard_processes(
                     except ValueError:
                         continue
                     command = parts[1]
+                    if any(flag in command for flag in lifecycle_flags):
+                        continue
                     if any(p in command for p in patterns) and pid != self_pid:
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
