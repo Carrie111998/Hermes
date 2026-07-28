@@ -14,7 +14,8 @@ operator automation.
 | [`harness/`](harness/README.md) | Upstream merge policy, overlays, and sync entry points (`scripts/merge_tools/`) |
 | [`extensions/`](extensions/README.md) | Fork-owned plugins, core tool deltas, and optional skills |
 | [`operations/`](operations/README.md) | Windows stack scripts, cron helpers, Tailscale/ngrok, daily automation |
-| [`local-workspace/`](local-workspace/README.md) | Gitignored root-level scratch files (kept on disk, never committed) |
+| [`local-workspace/`](local-workspace/README.md) | Root scratch policy + `notes/` for tracked operator drafts |
+| [`harness/upstream-development-guide.md`](harness/upstream-development-guide.md) | Full upstream-aligned AGENTS-style development guide |
 
 ## Rules for contributors and agents
 
@@ -40,4 +41,5 @@ py -3 -m hermes_cli.main desktop --build-only --force-build
 ## Related docs
 
 - Root [`README.md`](../README.md) — fork feature summary for humans
-- Root [`AGENTS.md`](../AGENTS.md) — full Hermes development guide (upstream + fork notes)
+- Root [`AGENTS.md`](../AGENTS.md) — short agent entrypoint (fork + learned prefs)
+- [`harness/upstream-development-guide.md`](harness/upstream-development-guide.md) — long-form core guide

@@ -76,5 +76,17 @@ and run it only with an explicit temporary workspace and bounded permissions.
 | `run_agent.py`, `cli.py` | `temp_script.py` |
 | `scripts/daily_*.py` | `tmp/probes/test_*.py` probes |
 | `plugins/`, `skills/` | `output/media/*` renders |
+| `fork/local-workspace/notes/` (operator drafts) | `comparison_*.md`, tweet `.txt` probes |
 
-See [`AGENTS.md`](AGENTS.md) for agent handling rules.
+### Tracked notes (not gitignored)
+
+Operator drafts that must stay in git but must not clutter the upstream-style
+root live under [`notes/`](notes/):
+
+| File | Purpose |
+|------|---------|
+| `notes/TASK_SUMMARY.md` | Local task / sync summary |
+| `notes/hermes_v019_tweet.md` | Release tweet draft |
+
+See [`AGENTS.md`](AGENTS.md) for agent handling rules. Root policy summary:
+[`../../AGENTS.md`](../../AGENTS.md) § Root Layout Policy.

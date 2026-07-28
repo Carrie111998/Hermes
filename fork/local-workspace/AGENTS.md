@@ -5,6 +5,9 @@
 1. Check `.gitignore` — the file is probably intentional local scratch.
 2. Read [`README.md`](README.md) category table before moving or deleting.
 3. **Never** `git add` logs, media, secrets, or `_docs/` unless the operator explicitly requests it.
+4. Do **not** relocate official root entry modules (`run_agent.py`, `cli.py`,
+   `model_tools.py`, …) — they match upstream packaging. Prefer
+   `tmp/probes/` / `output/reports/` for scratch, or `notes/` for tracked drafts.
 
 ## Moving files
 

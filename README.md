@@ -261,8 +261,18 @@ scripts/run_tests.sh
 
 This repository tracks upstream Hermes while keeping fork-only behavior at the
 extension and operations edges. See [`fork/README.md`](fork/README.md) for the
-layout and merge policy. Before upstream intake, run the policy dry-run; on
-Windows, use the stack restart script for routine recovery:
+layout and merge policy. Agent entrypoint: short [`AGENTS.md`](AGENTS.md);
+long-form upstream-aligned guide:
+[`fork/harness/upstream-development-guide.md`](fork/harness/upstream-development-guide.md).
+
+**Root layout:** keep official packaging/entry modules at the repository root
+(same as upstream). One-off probes and drafts go under `tmp/probes/` or
+`output/reports/` (gitignored); tracked operator notes live under
+[`fork/local-workspace/notes/`](fork/local-workspace/notes/). Details:
+[`fork/local-workspace/README.md`](fork/local-workspace/README.md).
+
+Before upstream intake, run the policy dry-run; on Windows, use the stack
+restart script for routine recovery:
 
 ```powershell
 py -3 scripts\sync_all.py --dry-run --allow-preflight-blockers
