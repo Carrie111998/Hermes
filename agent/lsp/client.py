@@ -366,7 +366,9 @@ class LSPClient:
                 creationflags=creationflags,
             )
             if os.name != "nt":
-                self._process_group_id = self._proc.pid
+                process_id = getattr(self._proc, "pid", None)
+                if isinstance(process_id, int) and process_id > 0:
+                    self._process_group_id = process_id
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
