@@ -506,6 +506,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
     )
+    p_reclaim.add_argument(
+        "--force-local", action="store_true",
+        help=(
+            "Attempt worker termination even when the claim's hostname "
+            "no longer matches the current host (e.g. after a DHCP "
+            "hostname change). The PID must still be alive and its "
+            "command line must look like a Hermes worker process."
+        ),
+    )
 
     p_reassign = sub.add_parser(
         "reassign",
@@ -1829,6 +1838,7 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         ok = kb.reclaim_task(
             conn, args.task_id,
             reason=getattr(args, "reason", None),
+            force_local=getattr(args, "force_local", False),
         )
     if not ok:
         print(

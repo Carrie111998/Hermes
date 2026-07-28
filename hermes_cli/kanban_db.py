@@ -4456,6 +4456,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    force_local: bool = False,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -4464,6 +4465,12 @@ def reclaim_task(
     regardless of TTL. Intended for the dashboard/CLI recovery flow
     when an operator wants to abort a running worker without waiting
     for the TTL to expire (e.g. after seeing a hallucination warning).
+
+    When *force_local* is True and the hostname in the claim lock no
+    longer matches the current host (e.g. after a DHCP hostname change
+    on macOS), the function still attempts to terminate the worker if
+    the PID is alive and its command line looks like a Hermes process.
+    See :func:`_terminate_reclaimed_worker` for the safety check.
 
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
@@ -4480,6 +4487,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        force_local=force_local,
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -6870,13 +6878,60 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _verify_pid_is_hermes_worker(pid: int) -> bool:
+    """Return True when *pid* is a live local process whose command line
+    looks like a Hermes kanban worker.
+
+    Used as the safety check when ``--force-local`` overrides a hostname
+    mismatch in claim_lock.  Reading the process command line provides
+    the "additional local proof" required by #73277: we never signal a
+    PID just because it exists — it must *look like* a Hermes worker.
+    """
+    if not _pid_alive(pid):
+        return False
+    try:
+        from gateway.status import _read_process_cmdline
+        cmdline = _read_process_cmdline(pid)
+    except Exception:
+        cmdline = None
+    if not cmdline:
+        return False
+    # Hermes workers are launched as ``hermes -p <profile> --cli chat -q ...``
+    # and always carry HERMES_KANBAN_TASK in their environment.  The command
+    # line must contain the hermes entrypoint and "chat" (the worker subcmd).
+    # This is intentionally broad — we're confirming the PID *is* a Hermes
+    # process, not that it's a specific task's worker.  The narrower check
+    # (matching a specific task_id) would require /proc/<pid>/environ on
+    # Linux which is fragile and platform-dependent.
+    cli_name = os.path.basename(sys.argv[0]) if sys.argv else "hermes"
+    # Match either the bare name (e.g. "hermes") or the full python invocation
+    # (e.g. "python -m hermes_cli.main").
+    return (
+        cli_name in cmdline
+        or "hermes_cli" in cmdline
+        or "hermes_cli.main" in cmdline
+    )
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    force_local: bool = False,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    When *force_local* is True and the hostname in *claim_lock* no longer
+    matches the current host (e.g. after a macOS hostname change between
+    network contexts), the function still attempts termination **iff**
+    the PID is alive and its command line looks like a Hermes worker.
+    This closes the #73277 gap where a hostname change silently skips
+    termination of a proven-local worker.
+
+    Safety: ``force_local`` never signals a PID without additional proof
+    that it belongs to Hermes — see :func:`_verify_pid_is_hermes_worker`.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -6885,14 +6940,22 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "force_local": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
 
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
+    if str(claim_lock).startswith(host_prefix):
+        info["host_local"] = True
+    elif force_local and _verify_pid_is_hermes_worker(int(pid)):
+        # Hostname changed since claim creation, but PID is alive and
+        # its command line matches a Hermes worker — treat as local.
+        info["host_local"] = True
+        info["force_local"] = True
+
+    if not info["host_local"]:
         return info
-    info["host_local"] = True
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None

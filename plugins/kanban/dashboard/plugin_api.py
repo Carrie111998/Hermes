@@ -1554,6 +1554,7 @@ def inspect_run_endpoint(
 
 class TerminateRunBody(BaseModel):
     reason: Optional[str] = None
+    force_local: bool = False
 
 
 @router.post("/runs/{run_id}/terminate")
@@ -1590,7 +1591,10 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(
+            conn, r.task_id, reason=payload.reason,
+            force_local=payload.force_local,
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,
@@ -1610,6 +1614,7 @@ def terminate_run_endpoint(
 
 class ReclaimBody(BaseModel):
     reason: Optional[str] = None
+    force_local: bool = False
 
 
 @router.post("/tasks/{task_id}/reclaim")
@@ -1624,11 +1629,19 @@ def reclaim_task_endpoint(
     abort a stuck worker (e.g. one that keeps hallucinating card ids)
     without waiting for the claim TTL. Maps 1:1 to
     ``hermes kanban reclaim <task_id> --reason ...``.
+
+    When *force_local* is True, the endpoint attempts worker termination
+    even if the claim's hostname no longer matches the current host.
+    The PID must be alive and its command line must look like a Hermes
+    worker — see ``_terminate_reclaimed_worker`` for the safety check.
     """
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(
+            conn, task_id, reason=payload.reason,
+            force_local=payload.force_local,
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,
