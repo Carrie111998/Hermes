@@ -50,6 +50,7 @@ Usage:
 """
 
 import atexit
+import base64
 import functools
 import json
 import logging
@@ -1090,7 +1091,8 @@ def _run_chrome_fallback_command(
         _npx_bin = shutil.which("npx") or "npx"
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
-        cmd_prefix = [browser_cmd]
+        # Same cmd.exe re-parsing hazard as _run_browser_command.
+        cmd_prefix = [_resolve_batch_shim(browser_cmd)]
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
 
     task_socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{tmp_session}")
@@ -1103,7 +1105,7 @@ def _run_chrome_fallback_command(
         browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
 
     def _run_tmp(cmd: str, cmd_args: List[str]) -> Dict[str, Any]:
-        full = base_args + [cmd] + cmd_args
+        full = base_args + [cmd] + _cmd_safe_browser_args(cmd, cmd_args)
         # Use temp-file stdout/stderr pattern (same as _run_browser_command)
         # to avoid pipe hang from agent-browser daemon inheriting fds.
         stdout_path = os.path.join(task_socket_dir, f"_stdout_{cmd}")
@@ -2297,6 +2299,63 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+# Matches the single quoted `%~dp0`-relative executable an npm shim invokes:
+#   "%~dp0node_modules\agent-browser\bin\agent-browser-win32-x64.exe" %*
+_BATCH_SHIM_TARGET_RE = re.compile(r'%~dp0([^"\r\n]+?\.exe)', re.IGNORECASE)
+
+
+def _resolve_batch_shim(path: str) -> str:
+    """Unwrap an npm ``.cmd``/``.bat`` shim to the executable it calls.
+
+    ``CreateProcess`` cannot run a batch file directly — Windows routes it
+    through ``cmd.exe``, which *re-parses* the whole command line.  Python's
+    ``subprocess.list2cmdline`` quotes only arguments containing spaces or
+    quotes, so a space-free argument reaches cmd.exe bare and its ``>``, ``&``,
+    ``|`` and ``^`` characters are interpreted as shell operators.  For the
+    browser tools that meant a compact JS one-liner's ``=>`` arrow became an
+    output redirection: the script was truncated (SyntaxError) and a
+    cwd-relative junk file was created holding the CLI's JSON error response.
+
+    npm's Windows shim is a two-line wrapper around a real executable, so
+    spawning that executable directly keeps cmd.exe out of the picture and
+    restores normal argv semantics for every argument.
+
+    Falls back to ``path`` unchanged whenever the shim can't be read or its
+    target is missing, so a layout we don't recognise never breaks discovery.
+    """
+    if not path.lower().endswith((".cmd", ".bat")):
+        return path
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return path
+
+    shim_dir = os.path.dirname(os.path.abspath(path))
+    for match in _BATCH_SHIM_TARGET_RE.finditer(text):
+        candidate = os.path.normpath(os.path.join(shim_dir, match.group(1)))
+        if os.path.isfile(candidate):
+            return candidate
+    return path
+
+
+def _cmd_safe_browser_args(command: str, args: List[str]) -> List[str]:
+    """Encode ``eval`` payloads so no shell can misread them.
+
+    agent-browser ships ``eval -b <base64>`` precisely because "shell escaping
+    with nested quotes and special characters is error-prone".  Base64 output
+    is restricted to ``A-Za-z0-9+/=``, which contains no cmd.exe or POSIX shell
+    metacharacter, so the expression survives intact no matter what wrapper
+    ends up between us and the CLI — including the ``npx.cmd`` fallback, which
+    :func:`_resolve_batch_shim` cannot unwrap.
+    """
+    if command != "eval" or not args:
+        return args
+    if args[0] in ("-b", "--base64"):
+        return args
+    encoded = base64.b64encode(args[0].encode("utf-8")).decode("ascii")
+    return ["-b", encoded] + list(args[1:])
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -2401,12 +2460,14 @@ def _run_browser_command(
         _npx_bin = shutil.which("npx") or "npx"
         cmd_prefix = [_npx_bin, "agent-browser"]
     else:
-        cmd_prefix = [browser_cmd]
+        # Unwrap npm's .cmd shim so CreateProcess doesn't hand our argv to
+        # cmd.exe for re-parsing (see _resolve_batch_shim).
+        cmd_prefix = [_resolve_batch_shim(browser_cmd)]
 
     cmd_parts = cmd_prefix + backend_args + [
         "--json",
         command
-    ] + args
+    ] + _cmd_safe_browser_args(command, args)
 
     try:
         # Give each task its own socket directory to prevent concurrency conflicts.
