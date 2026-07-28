@@ -1172,6 +1172,25 @@ class _CuaDriverSession:
             or isinstance(exc, (BrokenPipeError, EOFError))
         )
 
+    _SESSION_EXPIRED_PATTERNS = (
+        "has ended",
+        "session .* ended",
+        "session .* expired",
+        "session .* invalid",
+        "call start_session",
+    )
+
+    @classmethod
+    def _is_session_expired_error(cls, error_text: str) -> bool:
+        """Return True when the cua-driver daemon rejected the call because our
+        session id is no longer valid (daemon was restarted, session timed out,
+        or a concurrent caller ended it)."""
+        if not error_text:
+            return False
+        import re as _re
+        lower = error_text.lower()
+        return any(_re.search(pat, lower) for pat in cls._SESSION_EXPIRED_PATTERNS)
+
     @staticmethod
     def _is_transient_daemon_error(exc: Exception) -> bool:
         """Return True for the cua-driver daemon-proxy EAGAIN congestion error.
@@ -1337,6 +1356,34 @@ class _CuaDriverSession:
     # into start() when the session-start hasn't flipped _started yet.
     _LIFECYCLE_CALLS = frozenset({"start_session", "end_session"})
 
+    @classmethod
+    def _mcp_result_error_text(cls, mcp_result: Any) -> str:
+        """Extract the combined error text from an MCP CallToolResult.
+
+        Returns the concatenated text from all text-type content parts,
+        or an empty string when there is none.
+        """
+        parts: list = []
+        for part in getattr(mcp_result, "content", []) or []:
+            if getattr(part, "type", None) == "text":
+                t = getattr(part, "text", "")
+                if t:
+                    parts.append(str(t))
+        return " ".join(parts)
+
+    @classmethod
+    def _is_session_expired_mcp_result(cls, mcp_result: Any) -> bool:
+        """Return True when the daemon rejected the call because our session id
+        is no longer valid (daemon restart, session timeout, etc.).
+
+        This is NOT a transport error — the MCP bridge responded successfully —
+        so the normal transport-retry path never triggers.  We detect it by
+        inspecting the ``isError`` flag and the error text in content parts.
+        """
+        if getattr(mcp_result, "isError", False) is not True:
+            return False
+        return cls._is_session_expired_error(cls._mcp_result_error_text(mcp_result))
+
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         # A prior session may have died (MCP drop / driver crash): its
         # lifecycle coro reset _started to False in its finally (#55048
@@ -1359,8 +1406,16 @@ class _CuaDriverSession:
         # and on the transient/transport error fall straight through to the CLI
         # transport (which has its own retry + screenshot-to-file mitigation)
         # rather than burning a long backoff chain on a path that won't recover.
+        #
+        # Two distinct recovery paths sit between the first try and the
+        # final return:
+        # 1. Transport errors (broken pipe, closed resource) → reconnect once.
+        # 2. Session-expiry errors (daemon restarted, session timed out)
+        #    → the MCP bridge responded successfully, but our session id is
+        #    stale.  Generate a new id + call start_session, then retry once.
+        result: Any = None
         try:
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            result = self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
         except Exception as e:
             if self._is_transient_daemon_error(e):
                 logger.warning(
@@ -1377,6 +1432,30 @@ class _CuaDriverSession:
             with self._lock:
                 self._restart_session_locked()
             return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+
+        # No transport error — but the daemon may have rejected our session id
+        # (daemon restart, session timeout).  The MCP bridge responded normally,
+        # so the exception path above never saw it.  Detect the logical error
+        # and regenerate the session once.
+        if self._is_session_expired_mcp_result(result):
+            logger.warning(
+                "cua-driver session expired during %s; regenerating and retrying once",
+                name,
+            )
+            with self._lock:
+                self._restart_session_locked()
+            try:
+                return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            except Exception as e:
+                if self._is_transient_daemon_error(e):
+                    logger.warning(
+                        "cua-driver MCP transport failed on %s after session restart (%s); "
+                        "falling back to CLI transport", name, e,
+                    )
+                    return self._call_tool_via_cli(name, args, timeout)
+                raise
+
+        return result
 
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
