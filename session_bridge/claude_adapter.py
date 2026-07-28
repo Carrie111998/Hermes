@@ -214,6 +214,17 @@ class ClaudeSourceAdapter:
             records,
             transcript_path=transcript_path,
         )
+        record_scope = (
+            delta_native_id
+            if len(_record_native_ids(records)) > 1
+            else None
+        )
+        if record_scope is not None:
+            records = [
+                record
+                for record in records
+                if _nonempty_string(record.get("sessionId")) == record_scope
+            ]
         metadata_delta = _metadata_delta(records, native_id=delta_native_id)
         warm_increment = (
             previous is not None
@@ -267,6 +278,11 @@ class ClaudeSourceAdapter:
         for line in lines:
             if line.record is None:
                 malformed_lines += 1
+                continue
+            if (
+                record_scope is not None
+                and _nonempty_string(line.record.get("sessionId")) != record_scope
+            ):
                 continue
             record_type = line.record.get("type")
             if record_type not in _RECOGNIZED_RECORD_TYPES:
@@ -991,14 +1007,11 @@ def _validated_record_native_id(
     *,
     transcript_path: Path,
 ) -> str | None:
-    native_ids: set[str] = set()
+    native_ids = _record_native_ids(records)
     agent_ids: set[str] = set()
     for record in records:
         if record.get("type") not in _RECOGNIZED_RECORD_TYPES:
             continue
-        native_id = _nonempty_string(record.get("sessionId"))
-        if native_id is not None:
-            native_ids.add(native_id)
         agent_id = _nonempty_string(record.get("agentId"))
         if agent_id is not None:
             agent_ids.add(agent_id)
@@ -1008,7 +1021,18 @@ def _validated_record_native_id(
         if len(agent_ids) > 1 or (agent_ids and agent_ids != {expected_agent_id}):
             raise ValueError("Claude transcript native identity conflict")
         return subagent_native_id
+    if len(native_ids) > 1 and transcript_path.stem in native_ids:
+        return transcript_path.stem
     return _single_native_id(native_ids)
+
+
+def _record_native_ids(records: list[dict[str, Any]]) -> set[str]:
+    return {
+        native_id
+        for record in records
+        if record.get("type") in _RECOGNIZED_RECORD_TYPES
+        and (native_id := _nonempty_string(record.get("sessionId"))) is not None
+    }
 
 
 def _subagent_native_id(path: Path) -> str | None:

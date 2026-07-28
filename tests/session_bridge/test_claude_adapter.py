@@ -340,6 +340,31 @@ def test_full_parse_rejects_mixed_native_session_ids(tmp_path):
         ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
 
 
+def test_full_parse_recovers_mixed_ids_when_filename_is_an_exact_session_id(
+    tmp_path,
+):
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(
+        b"".join([
+            _json_line(_message_record("preserve this", session_id=BASIC_SESSION_ID)),
+            _json_line(
+                _message_record(
+                    "belongs to the other transcript",
+                    session_id=TOOLS_SESSION_ID,
+                    event_id="30303030-3030-4303-8303-303030303030",
+                )
+            ),
+        ])
+    )
+
+    parsed = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert parsed.projection.native_id == BASIC_SESSION_ID
+    assert [
+        message.content for message in parsed.projection.messages
+    ] == ["preserve this"]
+
+
 def test_warm_increment_rejects_changed_native_id_without_mutating_cache(tmp_path):
     path = tmp_path / "warm-identity.jsonl"
     original = _json_line(_message_record("first"))
