@@ -4310,9 +4310,14 @@ class SessionBridgeCoordinator:
         progress = await self._load_progress(provider)
         seen_ids = await self._load_codex_seen_ids()
         recent_inventory = getattr(adapter, "list_recent_inventory", None)
+        # An empty durable seen-set is a bootstrap or outage-recovery state.
+        # The continuous watermark can be newer than every native task, so a
+        # recent-only query would incorrectly declare recovery successful
+        # without ever indexing the existing inventory.
         if (
             discovery_mode is DiscoveryMode.CONTINUOUS
             and self._continuous_watermark is not None
+            and seen_ids
             and callable(recent_inventory)
         ):
             discovered_summaries = await self._provider_call(
