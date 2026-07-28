@@ -88,6 +88,16 @@ def register_worker(
     organization_id = (
         str(ceo["organization_id"]) if ceo is not None else "__unscoped__"
     )
+
+    # Bind tenant context so all downstream authority store calls are scoped.
+    try:
+        from gateway.session_context import set_tenant_context
+
+        tenant_id = os.environ.get("HERMES_TENANT_ID", "")
+        set_tenant_context(tenant_id=tenant_id, organization_id=organization_id)
+    except ImportError:
+        pass
+
     with conn:
         conn.execute(
             """INSERT INTO objective_workers

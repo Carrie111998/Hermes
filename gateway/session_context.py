@@ -119,6 +119,13 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Multi-tenant isolation context (RFC-0.23.0).  Every authority store call in
+# the governed runtime reads these to scope queries.  The gateway binds them
+# at session-entry time; the objective runtime binds them from the active CEO
+# record.  Both fallback to os.environ for CLI/cron/subprocess compat.
+_SESSION_TENANT_ID: ContextVar = ContextVar("HERMES_TENANT_ID", default=_UNSET)
+_SESSION_ORGANIZATION_ID: ContextVar = ContextVar("HERMES_ORGANIZATION_ID", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -135,6 +142,8 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_TENANT_ID": _SESSION_TENANT_ID,
+    "HERMES_ORGANIZATION_ID": _SESSION_ORGANIZATION_ID,
 }
 
 
@@ -168,6 +177,8 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    tenant_id: str = "",
+    organization_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -203,6 +214,8 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_TENANT_ID.set(tenant_id),
+        _SESSION_ORGANIZATION_ID.set(organization_id),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -237,6 +250,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_TENANT_ID,
+        _SESSION_ORGANIZATION_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -381,3 +396,36 @@ def async_delivery_supported() -> bool:
     if value is _UNSET:
         return True
     return bool(value)
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant context accessors (RFC-0.23.0)
+# ---------------------------------------------------------------------------
+
+
+def get_tenant_id() -> str:
+    """Return the current session's tenant_id, or empty string if unbound.
+
+    Resolution: ContextVar → os.environ HERMES_TENANT_ID → "".
+    """
+    return get_session_env("HERMES_TENANT_ID", "")
+
+
+def get_organization_id() -> str:
+    """Return the current session's organization_id, or empty string if unbound.
+
+    Resolution: ContextVar → os.environ HERMES_ORGANIZATION_ID → "".
+    """
+    return get_session_env("HERMES_ORGANIZATION_ID", "")
+
+
+def set_tenant_context(tenant_id: str, organization_id: str = "") -> None:
+    """Bind tenant context mid-session (e.g. from objective runtime).
+
+    Unlike set_session_vars (which is called once at session entry and latches
+    _session_context_engaged), this can be called later in the lifecycle once
+    the organization is resolved from the database.
+    """
+    _SESSION_TENANT_ID.set(tenant_id)
+    if organization_id:
+        _SESSION_ORGANIZATION_ID.set(organization_id)
