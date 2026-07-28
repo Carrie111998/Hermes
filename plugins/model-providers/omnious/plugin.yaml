@@ -1,0 +1,5 @@
+name: omnious-provider
+kind: model-provider
+version: 1.0.0
+description: Omnious live-market inference
+author: Omnious
