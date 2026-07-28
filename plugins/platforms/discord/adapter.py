@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
@@ -3040,6 +3041,17 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        if not (content or "").strip():
+            logger.warning(
+                "[%s] Dropped empty message to chat=%s (caller bug). Call site:\n%s",
+                self.name,
+                chat_id,
+                "".join(traceback.format_stack(limit=12)[:-1]),
+            )
+            return SendResult(
+                success=False,
+                error="Refusing to send empty message",
+            )
 
         try:
             # Determine target channel: thread_id in metadata takes precedence.
