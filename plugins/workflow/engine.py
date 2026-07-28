@@ -2906,9 +2906,11 @@ class WorkflowEngine:
                         layer_idx += 1
                     else:
                         layer_idx += 1
-                # Fall through to re-check blocked nodes and advance
-                # naturally instead of continuing, so the next layer
-                # gets processed.
+                    # Continue to top of outer loop so the next layer
+                    # gets processed naturally — don't fall through to
+                    # the blocked-nodes re-check which could re-dispatch
+                    # an already-completed card.
+                    continue
 
             # Re-check blocked nodes — if their dependencies unblocked,
             # dispatch them now instead of waiting for the next layer.
