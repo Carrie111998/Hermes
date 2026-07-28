@@ -8,8 +8,10 @@ Unrecognized schema: "object"`` errors on local inference backends.
 from __future__ import annotations
 
 import copy
+import json
 
 from tools.schema_sanitizer import (
+    convert_tuple_items_to_prefix_items,
     sanitize_tool_schemas,
     strip_pattern_and_format,
     strip_slash_enum,
@@ -867,3 +869,153 @@ def test_unrename_passes_unknown_keys_through():
 def test_sanitize_property_key_empty_falls_back():
     assert sanitize_property_key("~~~") == "___"
     assert sanitize_property_key("") == "param"
+
+
+def test_tuple_items_converted_to_prefix_items():
+    # Draft-07 positional ``items`` -> 2020-12 ``prefixItems`` (Anthropic rejects
+    # the former with HTTP 400 "must match JSON Schema draft 2020-12").
+    schema = {"type": "array", "items": [{"type": "integer"}, {"type": "string"}]}
+    out = convert_tuple_items_to_prefix_items(schema)
+    assert out == {"type": "array", "prefixItems": [{"type": "integer"}, {"type": "string"}]}
+
+
+def test_hand_authored_prefix_items_wins_over_tuple_items():
+    schema = {"type": "array", "items": [{"type": "integer"}], "prefixItems": [{"type": "string"}]}
+    out = convert_tuple_items_to_prefix_items(schema)
+    assert out == {"type": "array", "prefixItems": [{"type": "string"}]}
+
+
+def test_additional_items_renamed_to_items_alongside_tuple():
+    schema = {
+        "type": "array",
+        "items": [{"type": "integer"}],
+        "additionalItems": {"type": "string"},
+    }
+    out = convert_tuple_items_to_prefix_items(schema)
+    assert out == {
+        "type": "array",
+        "prefixItems": [{"type": "integer"}],
+        "items": {"type": "string"},
+    }
+
+
+def test_single_schema_items_left_untouched():
+    schema = {"type": "array", "items": {"type": "string"}, "minItems": 1}
+    assert convert_tuple_items_to_prefix_items(schema) == schema
+
+
+def test_nested_tuple_items_inside_properties():
+    schema = {"type": "object", "properties": {
+        "coord": {"type": "array", "items": [{"type": "integer"}, {"type": "integer"}]},
+        "name": {"type": "string"},
+    }}
+    out = convert_tuple_items_to_prefix_items(schema)
+    assert out["properties"]["coord"] == {
+        "type": "array",
+        "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+    }
+    assert out["properties"]["name"] == {"type": "string"}
+
+
+def test_annotation_values_with_literal_items_are_preserved():
+    # Regression: the converter must not descend into annotation keywords.
+    # ``default: {"items": [1, 2]}`` is instance data — rewriting it to
+    # ``prefixItems`` would change the tool's default value, not its schema.
+    schema = {
+        "type": "object",
+        "properties": {
+            "cfg": {
+                "type": "object",
+                "default": {"items": [1, 2]},
+                "const": {"items": ["a"]},
+                "examples": [{"items": [3]}],
+                "enum": [{"items": [4]}],
+            },
+            "coord": {"type": "array", "items": [{"type": "integer"}, {"type": "integer"}]},
+        },
+    }
+    out = convert_tuple_items_to_prefix_items(schema)
+    cfg = out["properties"]["cfg"]
+    assert cfg["default"] == {"items": [1, 2]}
+    assert cfg["const"] == {"items": ["a"]}
+    assert cfg["examples"] == [{"items": [3]}]
+    assert cfg["enum"] == [{"items": [4]}]
+    assert "prefixItems" not in json.dumps(cfg)
+    # the real schema alongside them is still converted
+    assert out["properties"]["coord"] == {
+        "type": "array",
+        "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+    }
+    # annotations are copied, not aliased back to the caller's dict
+    cfg["default"]["items"].append(99)
+    assert schema["properties"]["cfg"]["default"] == {"items": [1, 2]}
+
+
+def test_convert_tools_to_anthropic_emits_prefix_items_and_keeps_defaults():
+    # End-to-end at the Anthropic conversion boundary, not just the helper.
+    from agent.anthropic_adapter import convert_tools_to_anthropic
+
+    tools = [_tool("plot", {
+        "type": "object",
+        "properties": {
+            "coord": {"type": "array", "items": [{"type": "integer"}, {"type": "string"}]},
+            "cfg": {"type": "object", "default": {"items": [1, 2]}},
+        },
+    })]
+    props = convert_tools_to_anthropic(tools)[0]["input_schema"]["properties"]
+    assert props["coord"] == {
+        "type": "array",
+        "prefixItems": [{"type": "integer"}, {"type": "string"}],
+    }
+    assert props["cfg"]["default"] == {"items": [1, 2]}
+
+
+def test_conversion_reaches_every_schema_valued_keyword():
+    # Guards the allowlist: restricting recursion must not stop the converter
+    # reaching a tuple-form ``items`` nested under any applicator keyword.
+    tuple_form = {"type": "array", "items": [{"type": "integer"}, {"type": "string"}]}
+    expected = {
+        "type": "array",
+        "prefixItems": [{"type": "integer"}, {"type": "string"}],
+    }
+    single = [
+        "additionalItems", "additionalProperties", "contains", "propertyNames",
+        "not", "if", "then", "else", "unevaluatedItems", "unevaluatedProperties",
+        "contentSchema", "items",
+    ]
+    for key in single:
+        out = convert_tuple_items_to_prefix_items(
+            {"type": "object", key: copy.deepcopy(tuple_form)})
+        assert out[key] == expected, key
+    for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        out = convert_tuple_items_to_prefix_items(
+            {"type": "object", key: [copy.deepcopy(tuple_form)]})
+        assert out[key][0] == expected, key
+    for key in ("properties", "patternProperties", "dependentSchemas", "$defs", "definitions"):
+        out = convert_tuple_items_to_prefix_items(
+            {"type": "object", key: {"x": copy.deepcopy(tuple_form)}})
+        assert out[key]["x"] == expected, key
+
+
+def test_empty_tuple_items_does_not_emit_empty_prefix_items():
+    # ``prefixItems`` MUST be a non-empty array of schemas (2020-12 core; the
+    # applicator metaschema enforces minItems: 1), so translating an empty
+    # draft-07 tuple into ``prefixItems: []`` would emit an invalid schema from
+    # a function whose whole purpose is producing valid ones.
+    assert convert_tuple_items_to_prefix_items({"type": "array", "items": []}) == {"type": "array"}
+    # ``additionalItems`` still becomes ``items``; with no ``prefixItems`` it
+    # applies to every element, which is exactly what draft-07 ``items: []``
+    # plus ``additionalItems`` meant.
+    out = convert_tuple_items_to_prefix_items({
+        "type": "array",
+        "items": [],
+        "additionalItems": {"type": "string"},
+    })
+    assert out == {"type": "array", "items": {"type": "string"}}
+    # a hand-authored ``prefixItems`` still wins over an empty tuple
+    out = convert_tuple_items_to_prefix_items({
+        "type": "array",
+        "items": [],
+        "prefixItems": [{"type": "integer"}],
+    })
+    assert out == {"type": "array", "prefixItems": [{"type": "integer"}]}
