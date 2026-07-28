@@ -1,8 +1,8 @@
 # Charterforge Roadmap to v1.0.0
 
-**Current Version:** v1.0.0-rc1 (2026-07-28)  
-**Release Type:** Pre-release candidate — feature APIs complete, runtime proof pending  
-**Gap:** Decisive multi-process, multi-tenant acceptance test required before v1.0.0
+**Current Version:** v1.0.0-rc2 (2026-07-28)  
+**Release Type:** Release candidate — runtime proof passes, CI verification pending  
+**Gap:** CI green on combined test suite required before v1.0.0 final
 
 ---
 
@@ -20,7 +20,7 @@
 | **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | ✅ Released |
 | **0.28.0** | Disaster Recovery | Backup/restore, failover drill | ✅ Released |
 | **0.29.0** | Security Hardening | Audit logging, secret management | ✅ Released |
-| **1.0.0** | Production Release | Feature-complete, documented, stable API | 🟡 RC1 — runtime gate pending |
+| **1.0.0** | Production Release | Feature-complete, documented, stable API | 🟡 RC2 — CI verification pending |
 
 ---
 
@@ -113,25 +113,27 @@
 
 **Goal:** Prove the full stack works as an autonomous business runtime under realistic failure conditions.
 
-**Status:** 🟡 RC1 — feature APIs complete, decisive runtime proof required.
+**Status:** 🟡 RC2 — runtime proof passes, CI verification pending.
 
-### What v1.0.0-rc1 has (architectural preview)
+### What v1.0.0-rc2 proves (release-admissibility test)
 
-- Fenced Postgres authority with 12 idempotent migrations
-- Bridge-level lifecycle integration tests
-- Tenant-scoped service modules (billing, marketplace, integrations, monitoring, DR, secrets)
-- Extensive local integration tests (feature-isolated)
+- Two real worker subprocesses (separate Python interpreters)
+- Explicit tenant UUIDs (not DEFAULT_TENANT_ID)
+- Shared Postgres authority with tenant-isolated claims
+- Deterministic external provider (independent schema, state outside authority DB)
+- SIGKILL after provider commit, before local evidence recording
+- Fresh recovery interpreter with authoritative provider read-back
+- No duplicate provider calls (verified via call_log)
+- Exactly one effect record and one completion per tenant
+- Stale worker fully fenced (complete, release, permit, consume all rejected)
+- Zero cross-tenant visibility or mutation
 
-### What v1.0.0-rc1 does NOT yet prove
+### What v1.0.0-rc2 does NOT yet prove
 
-- Two real worker processes (not bridge objects in one test process)
-- Actual objective_service execution through the tick cycle
-- Real worker event consumption and subordinate launch
-- Process death via SIGKILL (not manual SQL claim expiry)
-- Restart from a new interpreter
-- Provider read-back after crash (not "effect row already exists")
-- Same identifiers across two explicit tenants with isolation enforced
-- Container or host separation
+- Actual objective_service tick-cycle execution (test uses direct authority API)
+- Real worker event consumption via the runtime event loop
+- Container or host separation (same machine, different processes)
+- Network partition tolerance (single-node Postgres)
 
 ### v1.0.0 Release Gate: Decisive Acceptance Test
 
