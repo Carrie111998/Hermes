@@ -2348,9 +2348,25 @@ class WorkflowEngine:
                                         rev_state.completed_at = None
                                         rev_state.result = None
                                         print(f"   🔓 {rev_id} unblocked — reviewer re-engaged")
-                            # Don't wait for the dispatcher — the next
-                            # _monitor_layer call will detect the
-                            # "ready" → "running" transition naturally.
+                            # Wait for the dispatcher to claim the reviewer
+                            # before returning, so the next layer's
+                            # _monitor_layer finds it as "running".
+                            for rev_entry in workflow.nodes[implement_nid].reviews:
+                                rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                                if rev_id and rev_id in states:
+                                    rev_state = states[rev_id]
+                                    if rev_state.kanban_card_id:
+                                        for _ in range(10):  # Wait up to ~30s
+                                            time.sleep(3)
+                                            try:
+                                                card = self.get_card_status(rev_state.kanban_card_id)
+                                                card_status = card.get("status", "").lower()
+                                                if card_status == "running":
+                                                    rev_state.status = "running"
+                                                    print(f"   🔄 {rev_id} claimed by dispatcher — monitoring layer")
+                                                    return True
+                                            except Exception:
+                                                pass
                             return True
                 except Exception:
                     pass
@@ -3227,15 +3243,6 @@ class WorkflowEngine:
                     card = self.get_card_status(state.kanban_card_id)
                     card_status = card.get("status", card.get("column", "unknown"))
                     card_status_lower = card_status.lower()
-
-                    # ── Sync in-memory status with actual card status ──
-                    # If the in-memory status says "running" but the card
-                    # is still "ready" (dispatcher hasn't claimed it yet),
-                    # sync back to "ready" so we keep polling instead of
-                    # waiting forever for a "running" card to transition.
-                    if state.status == "running" and card_status_lower == "ready":
-                        state.status = "ready"
-                        continue
 
                     # ── Done states ──
                     if card_status_lower in ("done", "completed", "complete"):
