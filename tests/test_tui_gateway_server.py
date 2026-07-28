@@ -37,7 +37,7 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
-def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
+def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text("max_concurrent_sessions: 1\n", encoding="utf-8")
@@ -56,23 +56,31 @@ def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
         monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
         monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
 
+        # Opening a chat must NOT take a slot. Every tile paint and every
+        # background reconnect-resume calls session.create, and an unprompted
+        # draft has no DB row and is filtered out of the sidebar — so a slot
+        # held here is invisible to the user while still starving the other
+        # surfaces that share this cap.
         first = server._methods["session.create"]("r1", {"cols": 80})
-        assert "result" in first
-        sid = first["result"]["session_id"]
-
         second = server._methods["session.create"]("r2", {"cols": 80})
-        assert second["error"]["message"] == (
-            "Hermes is at the active session limit (1/1). "
-            "Try again when another session finishes."
-        )
-        assert list(server._sessions) == [sid]
+        assert "result" in first and "result" in second
+        sid = first["result"]["session_id"]
+        other = second["result"]["session_id"]
+        assert active_session_registry_snapshot() == []
+
+        # The first turn is what claims the slot, and is re-entrant.
+        assert server._ensure_active_session_slot(sid, server._sessions[sid]) is None
+        assert server._ensure_active_session_slot(sid, server._sessions[sid]) is None
+        assert len(active_session_registry_snapshot()) == 1
+
+        blocked = server._ensure_active_session_slot(other, server._sessions[other])
+        assert "active session limit (1/1)" in blocked
 
         closed = server._methods["session.close"]("r3", {"session_id": sid})
         assert closed["result"]["closed"] is True
         assert active_session_registry_snapshot() == []
 
-        third = server._methods["session.create"]("r4", {"cols": 80})
-        assert "result" in third
+        assert server._ensure_active_session_slot(other, server._sessions[other]) is None
     finally:
         _clear_server_sessions()
         server._cfg_cache = None
@@ -1304,6 +1312,55 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
             captured["silence_duration"] == 3.0
         ), f"bool silence_duration leaked through for {bad_bool_cfg!r}"
         assert captured["auto_restart"] is False
+
+
+def test_voice_record_start_forwards_max_recording_seconds(monkeypatch):
+    """voice.max_recording_seconds must reach start_continuous from the TUI.
+
+    The CLI wiring alone doesn't cover TUI recordings: the gateway forwards
+    recorder params explicitly, so a missing kwarg here silently leaves the
+    cap dead in the TUI while CLI tests stay green. Semantics mirror the
+    silence params: non-numeric / bool / missing falls back to the documented
+    120 default, an explicit numeric value <= 0 disables the cap.
+    """
+    captured: dict = {}
+
+    def fake_start_continuous(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=fake_start_continuous, stop_continuous=lambda: None
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+
+    for cfg, expected in (
+        ({"max_recording_seconds": 45}, 45),        # explicit cap forwarded as-is
+        ({"max_recording_seconds": 0}, 0.0),        # explicit 0 = disabled
+        ({"max_recording_seconds": -5}, 0.0),       # negative = disabled
+        ({}, 120.0),                                # missing = documented default
+        ({"max_recording_seconds": True}, 120.0),   # bool must not become 1s cap
+        ({"max_recording_seconds": "long"}, 120.0), # garbage = documented default
+    ):
+        captured.clear()
+        monkeypatch.setattr(server, "_load_cfg", lambda c=cfg: {"voice": c})
+
+        resp = server.dispatch(
+            {
+                "id": "voice-record-cap",
+                "method": "voice.record",
+                "params": {"action": "start"},
+            }
+        )
+
+        assert "result" in resp, f"voice.record raised for cfg={cfg!r}: {resp.get('error')}"
+        assert resp["result"]["status"] == "recording"
+        assert (
+            captured["max_recording_seconds"] == expected
+        ), f"cfg={cfg!r} forwarded {captured.get('max_recording_seconds')!r}, expected {expected!r}"
 
 
 def test_voice_record_stop_forces_transcription(monkeypatch):
@@ -7584,6 +7641,54 @@ def test_rollback_restore_resolves_number_and_file_path():
     assert calls["args"][2] == "src/app.tsx"
 
 
+def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
+    """rollback.restore must truncate from the last *real* user turn,
+    not a display_kind timeline marker (same bug class as /undo).
+    """
+    from pathlib import Path as _Path
+
+    class _Mgr:
+        enabled = True
+
+        def list_checkpoints(self, cwd):
+            return [{"hash": "abc123"}]
+
+        def restore(self, cwd, target, file_path=None):
+            return {"success": True, "message": "restored"}
+
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+        {
+            "role": "user",
+            "content": "background agent finished",
+            "display_kind": "async_delegation_complete",
+        },
+    ]
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
+        history=list(history),
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "rollback.restore",
+                "params": {"session_id": "sid", "hash": "abc123"},
+            }
+        )
+
+        assert resp["result"]["success"] is True
+        assert resp["result"]["history_removed"] == 3  # q2 + a2 + marker
+        # Only first exchange remains
+        remaining = server._sessions["sid"]["history"]
+        assert [m["content"] for m in remaining] == ["first question", "first answer"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 # ── session.steer ────────────────────────────────────────────────────
 
 
@@ -8117,6 +8222,105 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         ]
         assert server._sessions["sid"]["history_version"] == 2
         assert stub_db.replaced == [("session-key", original_history[:2])]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+# ---------------------------------------------------------------------------
+# session.interrupt must only cancel pending prompts owned by the calling
+# session — it must not blast-resolve clarify/sudo/secret prompts on
+# unrelated sessions sharing the same tui_gateway process.  Without
+# session scoping the other sessions' prompts silently resolve to empty
+# strings, unblocking their agent threads as if the user cancelled.
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
+    """truncate_before_user_ordinal must count only real user turns.
+
+    display_kind timeline rows (model_switch, async_delegation_complete, …)
+    are role=user but no client counts them as user turns. Without the
+    filter, a trailing marker shifts the ordinal so the wrong message is
+    targeted for truncation.
+    """
+
+    seen = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            seen["prompt"] = prompt
+            seen["history"] = conversation_history
+            return {
+                "final_response": "reply",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+        {
+            "role": "user",
+            "content": "background agent finished",
+            "display_kind": "async_delegation_complete",
+        },
+    ]
+    server._sessions["sid"] = _session(agent=_Agent(), history=original_history)
+
+    class _StubDb:
+        def __init__(self):
+            self.replaced = []
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    stub_db = _StubDb()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+
+        # ordinal=1 means "truncate before the 2nd-from-last real user turn"
+        # which is "first". The display_kind marker must NOT shift the ordinal.
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": "edited first",
+                    "truncate_before_user_ordinal": 1,
+                },
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+
+        # With display_kind filter: user_indices = [0, 2] (indices of "first" and "second").
+        # ordinal=1 → user_indices[1] = 2, truncated = history[:2] = [first, first reply].
+        # Without the filter: user_indices = [0, 2, 4] (includes the marker),
+        # ordinal=1 → user_indices[1] = 2, same result by luck — but ordinal=0
+        # would truncate to history[:0] vs history[:0], and higher ordinals shift.
+        assert seen["history"] == original_history[:2], (
+            f"Expected truncation to first 2 messages, got {seen['history']}"
+        )
+        assert stub_db.replaced == [("session-key", original_history[:2])], (
+            f"Expected DB replace with first 2 messages, got {stub_db.replaced}"
+        )
     finally:
         server._sessions.pop("sid", None)
 
