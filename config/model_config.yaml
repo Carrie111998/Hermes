@@ -1,0 +1,46 @@
+# Per-agent model configuration for IYARI.
+#
+# Model choice is configuration, not code: editing this file changes which
+# model an agent uses, with no code changes required. Read by
+# agent/model_router.py:select_model(). Fase 1 uses explicit profile
+# selection only (the caller picks cheap/main/premium) -- no automatic
+# complexity-based classifier yet, that is future work.
+#
+# Every profile's fallback_chain feeds directly into the fallback mechanism
+# that already exists in the codebase (agent/chat_completion_helpers.py:
+# try_activate_fallback), so retry/backoff/rate-limit handling is not
+# reimplemented here -- select_model() only translates this file into the
+# shape that mechanism already consumes.
+
+agent_id: "iyari"
+
+profiles:
+  cheap:
+    provider: openrouter
+    model: minimax/minimax-01
+    max_tokens: 2048
+    timeout: 15
+    max_retries: 2
+    fallback_chain:
+      - provider: openrouter
+        model: openai/gpt-4o-mini
+
+  main:
+    provider: openrouter
+    model: moonshotai/kimi-k2.7-code
+    max_tokens: 8192
+    timeout: 30
+    max_retries: 3
+    fallback_chain:
+      - provider: openrouter
+        model: anthropic/claude-sonnet-4
+
+  premium:
+    provider: openrouter
+    model: deepseek/deepseek-reasoner
+    max_tokens: 16384
+    timeout: 60
+    max_retries: 3
+    fallback_chain:
+      - provider: openrouter
+        model: anthropic/claude-sonnet-4
