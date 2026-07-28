@@ -2757,6 +2757,9 @@ DEFAULT_CONFIG = {
             "chats": [],              # Chat IDs where unaddressed free-response turns are relevance-gated
             "allow_keywords": [],     # Optional override; defaults cover orga/calendar/research tasks
             "risk_keywords": [],      # Optional override; defaults cover timing/fee/deadline risks
+            "judge_enabled": True,    # V2: ambiguous messages use a bounded auxiliary relevance judge
+            "context_messages": 3,    # Only this many recent observed group messages go to the judge
+            "judge_timeout": 4,       # Seconds; errors/timeouts default to SILENT
         },
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
         "extra": {

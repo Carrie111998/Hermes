@@ -511,6 +511,120 @@ def test_shared_chat_guard_direct_command_reply_and_mention_still_dispatch():
     ) is True
 
 
+def test_shared_chat_guard_hard_allow_bypasses_judge(monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    judge = Mock(return_value=telegram_adapter.TelegramSharedChatRelevance(False, "judge_silent"))
+    monkeypatch.setattr(telegram_adapter, "judge_telegram_shared_chat_relevance", judge)
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(judge_enabled=True),
+    )
+
+    assert adapter._should_process_message(_group_message("Bitte den Kurs buchen", chat_id=-5312735398)) is True
+    judge.assert_not_called()
+
+
+def test_shared_chat_guard_hard_silent_bypasses_judge(monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    judge = Mock(return_value=telegram_adapter.TelegramSharedChatRelevance(True, "judge_allow"))
+    monkeypatch.setattr(telegram_adapter, "judge_telegram_shared_chat_relevance", judge)
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(judge_enabled=True),
+    )
+
+    assert adapter._should_process_message(_group_message("Ja, klingt gut ❤️", chat_id=-5312735398)) is False
+    judge.assert_not_called()
+
+
+def test_shared_chat_guard_ambiguous_allow_from_judge_permits(monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    judge = Mock(return_value=telegram_adapter.TelegramSharedChatRelevance(True, "judge:route risk"))
+    monkeypatch.setattr(telegram_adapter, "judge_telegram_shared_chat_relevance", judge)
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(judge_enabled=True),
+    )
+
+    assert adapter._should_process_message(_group_message("Schaffen wir das vorher noch?", chat_id=-5312735398)) is True
+    judge.assert_called_once()
+
+
+def test_shared_chat_guard_ambiguous_silent_from_judge_silences(monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    judge = Mock(return_value=telegram_adapter.TelegramSharedChatRelevance(False, "judge:humans decide"))
+    monkeypatch.setattr(telegram_adapter, "judge_telegram_shared_chat_relevance", judge)
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(judge_enabled=True),
+    )
+
+    assert adapter._should_process_message(_group_message("Schaffen wir das vorher noch?", chat_id=-5312735398)) is False
+    judge.assert_called_once()
+
+
+def test_shared_chat_guard_judge_error_defaults_silent(monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    judge = Mock(side_effect=RuntimeError("provider unavailable"))
+    monkeypatch.setattr(telegram_adapter, "judge_telegram_shared_chat_relevance", judge)
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-5312735398"],
+        shared_chat_guard=_shared_chat_guard(judge_enabled=True),
+    )
+
+    assert adapter._should_process_message(_group_message("Schaffen wir das vorher noch?", chat_id=-5312735398)) is False
+    judge.assert_called_once()
+
+
+def test_shared_chat_guard_judge_prompt_uses_minimal_bounded_context(monkeypatch):
+    from agent import auxiliary_client
+    from plugins.platforms.telegram.adapter import judge_telegram_shared_chat_relevance
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "decision": "ALLOW",
+            "reason": "deadline risk",
+        })))])
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+    huge_old_context = "old secret should not be sent " + ("x" * 2000)
+    recent_context = [
+        huge_old_context,
+        "Alice: Wir müssen um 17 Uhr los.",
+        "Bob: Der Kurs startet um 18 Uhr.",
+        "Alice: Es gibt eine Stornofrist.",
+        "Bob: Können wir vorher noch einkaufen?",
+    ]
+
+    decision = judge_telegram_shared_chat_relevance(
+        "Schaffen wir das vorher noch?",
+        recent_context=recent_context,
+        guard_config={"judge_enabled": True, "context_messages": 3},
+    )
+
+    assert decision.allow is True
+    prompt_payload = captured["messages"][1]["content"]
+    assert "old secret should not be sent" not in prompt_payload
+    assert "Schaffen wir das vorher noch?" in prompt_payload
+    assert "calendar" in prompt_payload
+    assert "Stornofrist" in prompt_payload
+    assert "Kurs startet" in prompt_payload
+    assert "müssen um 17 Uhr los" not in prompt_payload
+
+
 def test_shared_chat_guard_classifier_allows_tasks_and_risks_but_not_time_chatter():
     from plugins.platforms.telegram.adapter import classify_telegram_shared_chat_relevance
 

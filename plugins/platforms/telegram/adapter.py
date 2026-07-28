@@ -34,7 +34,16 @@ _DEFAULT_SHARED_CHAT_RISK_KEYWORDS = (
     "storno", "no-show", "noshow", "gebühr", "gebuehr", "deadline",
     "frist", "zu spät", "zu spaet", "verspät", "verspaet", "konflikt",
     "überschneid", "ueberschneid", "passt zeitlich", "zeitlich reicht",
-    "reicht zeitlich", "schaffen wir das", "location", "adresse",
+    "reicht zeitlich", "location", "adresse",
+)
+_DEFAULT_SHARED_CHAT_CAPABILITIES = (
+    "calendar", "bookings", "research", "routes/time buffers", "reminders",
+    "shopping/organization", "risk/cost/deadlines",
+)
+_SHARED_CHAT_HARD_SILENT_PATTERNS = (
+    r"^\s*(ja|nein|nee|ok|okay|alles klar|passt|stimmt|genau|safe|jup|jo)\W*$",
+    r"\b(klingt gut|freut mich|haha|lol|danke|dankeschön|dankeschoen|gute nacht|schlaf gut)\b",
+    r"[❤❤️💕💖😘😂😅🙂😊]",
 )
 
 
@@ -44,6 +53,7 @@ class TelegramSharedChatRelevance:
 
     allow: bool
     reason: str
+    needs_judge: bool = False
 
 
 def _shared_chat_guard_bool(value: Any, default: bool = False) -> bool:
@@ -60,6 +70,97 @@ def _shared_chat_guard_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(part).strip() for part in value if str(part).strip()]
     return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _shared_chat_guard_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _clip_shared_chat_text(value: Any, max_chars: int = 360) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _extract_shared_chat_judge_json(text: str) -> dict:
+    body = (text or "").strip()
+    if not body:
+        return {}
+    if body.startswith("```"):
+        body = re.sub(r"^```(?:json)?\s*", "", body, flags=re.IGNORECASE).strip()
+        body = re.sub(r"\s*```$", "", body).strip()
+    try:
+        return json.loads(body)
+    except Exception:
+        match = re.search(r"\{.*\}", body, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return {}
+
+
+def judge_telegram_shared_chat_relevance(
+    text: str,
+    *,
+    recent_context: Optional[list[str]] = None,
+    guard_config: Optional[dict] = None,
+) -> TelegramSharedChatRelevance:
+    """Ask a bounded auxiliary LLM whether an ambiguous group turn needs Hermes.
+
+    Fail closed: unavailable provider, malformed output, or any non-ALLOW result
+    returns SILENT. The prompt intentionally contains only the current message,
+    a tiny recent observed window, chat mode, and a capability list.
+    """
+
+    cfg = guard_config if isinstance(guard_config, dict) else {}
+    context_limit = _shared_chat_guard_int(cfg.get("context_messages"), 3)
+    timeout = float(cfg.get("judge_timeout", 4) or 4)
+    recent = list(recent_context or [])[-context_limit:] if context_limit else []
+    payload = {
+        "chat_mode": "Telegram shared human group; bot should stay silent unless it can add concrete value",
+        "capabilities": _shared_chat_guard_list(cfg.get("capabilities")) or list(_DEFAULT_SHARED_CHAT_CAPABILITIES),
+        "recent_context": [_clip_shared_chat_text(item) for item in recent],
+        "current_message": _clip_shared_chat_text(text, 700),
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a conservative relevance gate for Hermes/NORA in a shared Telegram group. "
+                "Return only JSON: {\"decision\":\"ALLOW\"|\"SILENT\",\"reason\":\"short\"}. "
+                "ALLOW only when Hermes can help with calendar, bookings, research, routes/time buffers, "
+                "reminders, shopping/organization, or risk/cost/deadlines. If uncertain, choose SILENT."
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    try:
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+        response = call_llm(
+            task="telegram_shared_chat_guard",
+            messages=messages,
+            temperature=0,
+            max_tokens=80,
+            timeout=timeout,
+        )
+        data = _extract_shared_chat_judge_json(extract_content_or_reasoning(response))
+    except Exception as exc:
+        logger.debug("[Telegram] shared_chat_guard judge failed: %s", exc)
+        return TelegramSharedChatRelevance(False, "judge_error")
+
+    decision = str(data.get("decision", "")).strip().upper()
+    reason = _clip_shared_chat_text(data.get("reason") or "judge", 120) or "judge"
+    if decision == "ALLOW":
+        return TelegramSharedChatRelevance(True, f"judge:{reason}")
+    return TelegramSharedChatRelevance(False, f"judge:{reason or 'silent'}")
 
 
 def classify_telegram_shared_chat_relevance(
@@ -96,6 +197,9 @@ def classify_telegram_shared_chat_relevance(
         if keyword.lower() in lowered:
             return TelegramSharedChatRelevance(True, f"task:{keyword}")
 
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in _SHARED_CHAT_HARD_SILENT_PATTERNS):
+        return TelegramSharedChatRelevance(False, "social_silent")
+
     # Decision-help questions are only enough when they carry an orga/factual
     # shape.  This catches "Sollen wir den Kurs buchen?" without replying to
     # general emotional/social questions between the humans.
@@ -105,6 +209,12 @@ def classify_telegram_shared_chat_relevance(
     ):
         if re.search(r"\b(zeit|uhr|morgen|heute|kurs|termin|bus|bahn|route|adresse|buchen)\b", lowered):
             return TelegramSharedChatRelevance(True, "orga-question")
+
+    if "?" in body or re.search(
+        r"\b(schaffen wir|sollen wir|könnten wir|koennten wir|müssen wir|muessen wir|brauchen wir)\b",
+        lowered,
+    ):
+        return TelegramSharedChatRelevance(False, "ambiguous", needs_judge=True)
 
     return TelegramSharedChatRelevance(False, "default_silent")
 
@@ -7740,12 +7850,56 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
         return bool(chat_id and chat_id in self._telegram_shared_chat_guard_chats())
 
+    def _telegram_shared_chat_guard_recent_context(self, message) -> list[str]:
+        cfg = self._telegram_shared_chat_guard_config()
+        limit = _shared_chat_guard_int(cfg.get("context_messages"), 3)
+        if limit <= 0:
+            return []
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return []
+        try:
+            # Unit tests keep an in-memory append log; use it directly so the
+            # prompt-size invariant is easy to assert without touching SQLite.
+            if hasattr(store, "messages"):
+                entries = [item[1] for item in getattr(store, "messages", [])]
+            else:
+                event = self._build_message_event(message, MessageType.TEXT)
+                shared_source = self._telegram_group_observe_shared_source(event.source)
+                session_entry = store.get_or_create_session(shared_source)
+                entries = store.load_transcript(session_entry.session_id)
+            context: list[str] = []
+            for entry in entries[-limit:]:
+                if isinstance(entry, dict):
+                    content = entry.get("content") or ""
+                else:
+                    content = str(entry or "")
+                if content:
+                    context.append(_clip_shared_chat_text(content))
+            return context
+        except Exception:
+            logger.debug("[Telegram] shared_chat_guard recent-context lookup failed", exc_info=True)
+            return []
+
     def _telegram_shared_chat_guard_allows(self, message) -> TelegramSharedChatRelevance:
         text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
-        return classify_telegram_shared_chat_relevance(
+        relevance = classify_telegram_shared_chat_relevance(
             text,
             self._telegram_shared_chat_guard_config(),
         )
+        if relevance.needs_judge and _shared_chat_guard_bool(
+            self._telegram_shared_chat_guard_config().get("judge_enabled"), True
+        ):
+            try:
+                return judge_telegram_shared_chat_relevance(
+                    text,
+                    recent_context=self._telegram_shared_chat_guard_recent_context(message),
+                    guard_config=self._telegram_shared_chat_guard_config(),
+                )
+            except Exception as exc:
+                logger.debug("[Telegram] shared_chat_guard judge failed closed: %s", exc)
+                return TelegramSharedChatRelevance(False, "judge_error")
+        return relevance
 
     def _telegram_free_response_topics(self) -> set[str]:
         """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.

@@ -724,6 +724,29 @@ class TestLoadGatewayConfig:
             config.platforms[Platform.SLACK].typing_status_text == "chasing yarn…"
         )
 
+    def test_telegram_shared_chat_guard_from_toplevel_block_reaches_extra(self, tmp_path, monkeypatch):
+        """``telegram.shared_chat_guard`` must reach the Telegram adapter via
+        PlatformConfig.extra, matching the real user-facing config.yaml path."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "telegram:\n"
+            "  shared_chat_guard:\n"
+            "    enabled: true\n"
+            "    chats:\n"
+            "      - '-5312735398'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.TELEGRAM].extra
+        assert extra["shared_chat_guard"] == {
+            "enabled": True,
+            "chats": ["-5312735398"],
+        }
+
     def test_multiplex_profiles_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.multiplex_profiles: true`` (the nested form written by
         ``hermes config set gateway.multiplex_profiles true``) must enable
