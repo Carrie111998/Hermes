@@ -1,4 +1,4 @@
-import { type CSSProperties, useState } from 'react'
+import type { CSSProperties } from 'react'
 
 import { capitalize, normalize } from '@/lib/text'
 
@@ -157,8 +157,7 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 }
 
 export function Intro({ personality, seed }: IntroProps) {
-  const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
-  const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+  const copy = resolveCopy(personality, seed ?? 2)
 
   return (
     <div
@@ -166,10 +165,13 @@ export function Intro({ personality, seed }: IntroProps) {
       data-slot="aui_intro"
     >
       <div className="w-full min-w-0">
+        <div aria-hidden="true" className="hermes-intro-medallion">
+          <img alt="" src={`${import.meta.env.BASE_URL}nous-girl.jpg`} />
+        </div>
         <p
           aria-label={WORDMARK}
-          className="fit-text mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
-          style={{ '--fit-min': '2.75rem' } as CSSProperties}
+          className="fit-text hermes-intro-wordmark mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
+          style={{ '--fit-min': '3.2rem' } as CSSProperties}
         >
           <span>
             <span>{WORDMARK}</span>
@@ -177,7 +179,11 @@ export function Intro({ personality, seed }: IntroProps) {
           <span aria-hidden="true">{WORDMARK}</span>
         </p>
 
+        <div aria-hidden="true" className="hermes-intro-divider">
+          <span />
+        </div>
         <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>
+        <div className="hermes-intro-ready-pill">Ready when you are</div>
       </div>
     </div>
   )

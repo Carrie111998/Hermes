@@ -171,6 +171,72 @@ export const emberTheme: DesktopTheme = {
   }
 }
 
+/** Soft classical glass: pale blue marble, haze, and winged serifs. */
+export const atlasTheme: DesktopTheme = {
+  name: 'atlas',
+  label: 'Atlas',
+  description: 'Soft classical glass with pale-blue Hermes accents',
+  colors: {
+    background: '#f7fbff',
+    foreground: '#24314a',
+    card: 'rgba(255, 255, 255, 0.58)',
+    cardForeground: '#24314a',
+    muted: 'rgba(239, 246, 255, 0.68)',
+    mutedForeground: '#71809c',
+    popover: 'rgba(255, 255, 255, 0.76)',
+    popoverForeground: '#24314a',
+    primary: '#2563eb',
+    primaryForeground: '#ffffff',
+    secondary: 'rgba(219, 234, 254, 0.64)',
+    secondaryForeground: '#24314a',
+    accent: 'rgba(191, 219, 254, 0.6)',
+    accentForeground: '#1d4ed8',
+    border: 'rgba(178, 194, 224, 0.48)',
+    input: 'rgba(219, 234, 254, 0.7)',
+    ring: '#2563eb',
+    midground: '#2563eb',
+    composerRing: '#7aa7ff',
+    destructive: '#ef4444',
+    destructiveForeground: '#ffffff',
+    sidebarBackground: 'rgba(248, 251, 255, 0.56)',
+    sidebarBorder: 'rgba(178, 194, 224, 0.44)',
+    userBubble: 'rgba(219, 234, 254, 0.42)',
+    userBubbleBorder: 'rgba(147, 197, 253, 0.46)'
+  },
+  darkColors: {
+    background: '#07101f',
+    foreground: '#eef6ff',
+    card: 'rgba(15, 23, 42, 0.78)',
+    cardForeground: '#eef6ff',
+    muted: 'rgba(30, 41, 59, 0.82)',
+    mutedForeground: '#b7c7df',
+    popover: 'rgba(15, 23, 42, 0.86)',
+    popoverForeground: '#eef6ff',
+    primary: '#93c5fd',
+    primaryForeground: '#07101f',
+    secondary: 'rgba(30, 58, 138, 0.58)',
+    secondaryForeground: '#e0f2fe',
+    accent: 'rgba(37, 99, 235, 0.48)',
+    accentForeground: '#dbeafe',
+    border: 'rgba(96, 165, 250, 0.32)',
+    input: 'rgba(30, 41, 59, 0.88)',
+    ring: '#93c5fd',
+    midground: '#93c5fd',
+    composerRing: '#bfdbfe',
+    destructive: '#f87171',
+    destructiveForeground: '#0b1220',
+    sidebarBackground: 'rgba(8, 15, 30, 0.82)',
+    sidebarBorder: 'rgba(96, 165, 250, 0.28)',
+    userBubble: 'rgba(30, 58, 138, 0.46)',
+    userBubbleBorder: 'rgba(96, 165, 250, 0.34)'
+  },
+  typography: {
+    fontSans: `"Inter", ${SYSTEM_SANS}`,
+    fontMono: SYSTEM_MONO,
+    fontUrl: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap'
+  }
+}
+
 /** Clean grayscale. Matches the CLI mono skin and dashboard mono theme. */
 export const monoTheme: DesktopTheme = {
   name: 'mono',
@@ -278,6 +344,7 @@ export const slateTheme: DesktopTheme = {
 }
 
 export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
+  atlas: atlasTheme,
   nous: nousTheme,
   midnight: midnightTheme,
   ember: emberTheme,
@@ -289,4 +356,4 @@ export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
 export const BUILTIN_THEME_LIST = Object.values(BUILTIN_THEMES)
 
 /** Skin used when nothing is persisted or the persisted name is retired. */
-export const DEFAULT_SKIN_NAME = 'nous'
+export const DEFAULT_SKIN_NAME = 'atlas'
