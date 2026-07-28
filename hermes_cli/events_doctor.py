@@ -6,17 +6,19 @@ import argparse
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from events.paths import (
     audit_log_path, events_db_path, quiet_hours_path,
     telegram_topics_path, telegram_verbosity_path,
 )
-from events.producers.code_drift_monitor import watched_repos
+from events.producers.code_drift_monitor import (
+    DEFAULT_TRUNK_REF, MISCONFIG_HEAD_UNRESOLVED, _agent_src_root,
+    sample_code_drift, watched_repos,
+)
 
 # telegram-mirror retired 2026-04-28 (scribe_daily topic cutover made it
 # duplicate every mailbox_message); checking it produced a permanent false
@@ -52,28 +54,14 @@ def _check(name: str, ok: bool, detail: str = "") -> bool:
 # Trunk ref names differ per repo and ~/.hermes has NO `main` branch, so the
 # trunk is configured alongside the path — see the loud-vs-skip note in
 # check_code_drift().
-_AGENT_SRC_DEFAULT = Path.home() / ".hermes" / "agent-src"
-
-
-def _agent_src_root() -> Path:
-    return Path(os.getenv("HERMES_AGENT_SRC") or _AGENT_SRC_DEFAULT)
-
-
-def _git(repo: Path, *args: str) -> Tuple[int, str]:
-    """Run a read-only git command; returns (returncode, stdout)."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True, text=True, timeout=15,
-        )
-        return proc.returncode, proc.stdout
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return 127, str(e)
-
-
+#
+# Both the watched-repo registry AND the git probe itself come from the
+# CODE_DRIFT producer: this file renders, it does not probe.  The duplicate
+# probe it used to carry is what let the unresolvable-trunk blind spot exist
+# in two places at once.
 def check_code_drift(
     repo_path: Optional[Path] = None,
-    trunk_ref: str = "refs/heads/main",
+    trunk_ref: str = DEFAULT_TRUNK_REF,
     *,
     label: str = "",
 ) -> int:
@@ -82,77 +70,84 @@ def check_code_drift(
     Read-only -- never mutates the repo.  Returns the number of issues found
     (0 or 1).
 
+    RENDERS the CODE_DRIFT producer's ``sample_code_drift()``; it does not
+    probe git itself.  Until 2026-07-28 this function carried its own
+    near-duplicate copy of that probe (`_git`, `_agent_src_root`, a
+    hardcoded `refs/heads/main`), and BOTH copies independently degraded an
+    unresolvable trunk ref to a quiet skip.  That is the failure mode worth
+    designing against: a blind spot fixed in one surface and left open in
+    the other is worse than one fixed nowhere, because the surface that got
+    fixed is then cited as proof the box is clean.  One probe, two
+    renderings -- so the hole cannot be reopened by halves.
+
     Deliberately NOT gated by WatchedRepo.executed_dirs, unlike the
-    event-bus producer.  The producer narrows ALERTS so a phone does not
-    buzz for inert docs churn; this is a diagnostic the operator ran on
-    purpose, so it reports every divergence and lets them judge.
+    event-bus producer -- note ``executed_dirs=()`` below.  The producer
+    narrows ALERTS so a phone does not buzz for inert docs churn; this is a
+    diagnostic the operator ran on purpose, so it reports every divergence
+    and lets them judge.  Sharing the probe does not mean sharing the alert
+    policy: the gate is a parameter of the probe, so this surface simply
+    declines it.
 
     Skip vs FAIL, the 2026-07-28 lesson: an ABSENT repo (no .git) degrades
     to a skip note so the doctor stays usable on boxes without the shared
-    checkout.  A repo that is PRESENT but whose configured trunk ref does
-    not resolve is a FAILURE, not a skip -- that combination means drift
-    cannot be evaluated at all, and reporting it quietly is how a watcher
+    checkout -- that is the ONLY case the sampler returns None for.  A repo
+    that is PRESENT but cannot be evaluated comes back state="misconfigured"
+    and is a FAILURE here, because reporting it quietly is how a watcher
     ends up certifying an unwatched repo as clean.  ~/.hermes has no `main`
-    branch, so under the old hardcoded ref this was the guaranteed outcome.
+    branch, so under the old hardcoded ref that was the guaranteed outcome.
     """
-    repo = repo_path or _agent_src_root()
+    repo = Path(repo_path) if repo_path else _agent_src_root()
     trunk_name = trunk_ref.rsplit("/", 1)[-1]
     tag = f"code drift [{label}]" if label else "code drift"
-    # .git is a directory in a normal checkout and a file in a worktree.
-    if not (repo / ".git").exists():
+
+    sample = sample_code_drift(
+        repo, trunk_ref,
+        repo_name=label or "agent-src",
+        executed_dirs=(),   # diagnostic: report every divergence, gate nothing
+    )
+    # None means the repo is genuinely absent (no .git) -- the one case that
+    # is a skip rather than a finding.
+    if sample is None:
         print(f"[--] {tag} -- skipped ({repo} is not a git checkout)")
         return 0
 
-    rc_head, head = _git(repo, "rev-parse", "--verify", "HEAD")
-    rc_trunk, trunk = _git(repo, "rev-parse", "--verify", trunk_ref)
-    if rc_trunk != 0:
-        print(f"[FAIL] {tag}: configured trunk ref {trunk_ref} does not exist "
-              f"in {repo} -- drift CANNOT be evaluated, so this repo is "
-              "effectively UNMONITORED (not clean)")
-        print(f"  remediation: check the real trunk name (git -C {repo} "
-              "branch --list) and fix the watched-repo entry's trunk_ref")
+    if sample.state == "misconfigured":
+        print(f"[FAIL] {tag}: {sample.detail} in {repo} -- drift CANNOT be "
+              "evaluated, so this repo is effectively UNMONITORED (not clean)")
+        if sample.detail != MISCONFIG_HEAD_UNRESOLVED:
+            print(f"  remediation: check the real trunk name (git -C {repo} "
+                  "branch --list) and fix the watched-repo entry's trunk_ref")
         return 1
-    if rc_head != 0:
-        print(f"[FAIL] {tag}: cannot resolve HEAD in {repo} -- drift CANNOT "
-              "be evaluated, so this repo is effectively UNMONITORED")
-        return 1
-    head, trunk = head.strip(), trunk.strip()
 
-    dirty = bool(_git(repo, "status", "--porcelain")[1].strip())
-    if dirty:
+    if sample.dirty:
         print(f"[NOTE] {tag}: working tree at {repo} is DIRTY "
               "(uncommitted changes -- inspect manually, never auto-fixed)")
 
-    if head == trunk:
-        _check(f"{tag} (HEAD vs {trunk_name})", True, f"in sync @ {head[:9]}")
+    if sample.state == "in_sync":
+        _check(f"{tag} (HEAD vs {trunk_name})", True,
+               f"in sync @ {sample.head[:9]}")
         return 0
 
-    head_behind = _git(repo, "merge-base", "--is-ancestor", "HEAD", trunk_ref)[0] == 0
-    head_ahead = _git(repo, "merge-base", "--is-ancestor", trunk_ref, "HEAD")[0] == 0
-
-    if head_behind:
-        count = _git(repo, "rev-list", "--count", f"HEAD..{trunk_ref}")[1].strip()
-        subjects = _git(repo, "log", "--format=  missed: %h %s", "-5",
-                        f"HEAD..{trunk_ref}")[1].rstrip()
-        print(f"[WARN] {tag}: working tree LAGS {trunk_name} by {count} "
-              "commit(s) -- landed fixes are NOT running")
-        if subjects:
-            print(subjects)
+    if sample.state == "behind":
+        print(f"[WARN] {tag}: working tree LAGS {trunk_name} by "
+              f"{sample.behind_count} commit(s) -- landed fixes are NOT running")
+        for subject in sample.missed_subjects:
+            print(f"  missed: {subject}")
         print("  remediation: FF the checkout: "
               f"git -C {repo} merge --ff-only {trunk_name} "
               "(check for a clean tree first), then restart the gateway")
         return 1
 
-    if head_ahead:
-        count = _git(repo, "rev-list", "--count", f"{trunk_ref}..HEAD")[1].strip()
-        print(f"[WARN] {tag}: HEAD is AHEAD of {trunk_name} by {count} "
-              f"commit(s) (working tree carries unlanded state -- land it on "
-              f"{trunk_name} or move the checkout back to the {trunk_name} tip)")
+    if sample.state == "ahead":
+        print(f"[WARN] {tag}: HEAD is AHEAD of {trunk_name} by "
+              f"{sample.ahead_count} commit(s) (working tree carries unlanded "
+              f"state -- land it on {trunk_name} or move the checkout back to "
+              f"the {trunk_name} tip)")
         return 1
 
     print(f"[WARN] {tag}: HEAD has DIVERGED from {trunk_name} "
-          f"(HEAD {head[:9]} vs {trunk_name} {trunk[:9]}, neither is an "
-          "ancestor of the other -- reconcile manually)")
+          f"(HEAD {sample.head[:9]} vs {trunk_name} {sample.trunk[:9]}, "
+          "neither is an ancestor of the other -- reconcile manually)")
     return 1
 
 

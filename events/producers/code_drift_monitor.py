@@ -70,6 +70,14 @@ _AGENT_SRC_DEFAULT = Path.home() / ".hermes" / "agent-src"
 
 DEFAULT_TRUNK_REF = "refs/heads/main"
 
+# The two ways a PRESENT repo can be unevaluable, as named constants rather
+# than inline prose: hermes_cli.events_doctor renders the SAME sample and has
+# to branch on which one it got, because the remediations differ (fix the
+# watched-repo entry's trunk_ref vs. investigate a broken/empty checkout).
+# A substring match on prose would rot the moment someone reworded a message.
+MISCONFIG_TRUNK_UNRESOLVED = "configured trunk ref {trunk_ref} does not exist"
+MISCONFIG_HEAD_UNRESOLVED = "HEAD does not resolve"
+
 
 def _agent_src_root() -> Path:
     return Path(os.getenv("HERMES_AGENT_SRC") or _AGENT_SRC_DEFAULT)
@@ -246,9 +254,9 @@ def sample_code_drift(
     rc_head, head = _git(repo, "rev-parse", "--verify", "HEAD")
     rc_trunk, trunk = _git(repo, "rev-parse", "--verify", trunk_ref)
     if rc_trunk != 0:
-        return _misconfigured(f"configured trunk ref {trunk_ref} does not exist")
+        return _misconfigured(MISCONFIG_TRUNK_UNRESOLVED.format(trunk_ref=trunk_ref))
     if rc_head != 0:
-        return _misconfigured("HEAD does not resolve")
+        return _misconfigured(MISCONFIG_HEAD_UNRESOLVED)
     head, trunk = head.strip(), trunk.strip()
     dirty = bool(_git(repo, "status", "--porcelain")[1].strip())
 

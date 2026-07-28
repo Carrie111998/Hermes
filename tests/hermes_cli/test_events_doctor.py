@@ -283,6 +283,105 @@ class TestCodeDrift:
         status = _git(repo, "status", "--porcelain").stdout
         assert "scratch.txt" in status  # still untracked, nothing committed/stashed
 
+    def test_doctor_renders_the_producer_probe_rather_than_its_own(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Spec decision 2: ONE probe, two renderings.
+
+        Until 2026-07-28 this module carried a near-duplicate copy of
+        sample_code_drift() and both copies independently degraded an
+        unresolvable trunk ref to a quiet skip.  A blind spot closed in one
+        surface but not the other is worse than one closed nowhere, because
+        the fixed surface gets cited as proof the box is clean.
+
+        Stubbing the PRODUCER's sampler must therefore change what the
+        DOCTOR prints.  If someone reintroduces a local git probe here this
+        test fails, because the doctor would ignore the stub and report on
+        the real (in-sync) repo instead.
+        """
+        from events.producers.code_drift_monitor import DriftSample
+        import hermes_cli.events_doctor as doctor
+
+        repo = _make_repo(tmp_path)
+        _commit(repo, "a")   # a REAL repo, genuinely in sync with main
+
+        monkeypatch.setattr(doctor, "sample_code_drift", lambda *a, **k: DriftSample(
+            state="behind", head="dead" * 10, trunk="beef" * 10,
+            behind_count=7, missed_subjects=("abc1234 only via the producer",),
+        ))
+
+        issues = check_code_drift(repo_path=repo)
+        out = capsys.readouterr().out
+
+        assert issues == 1
+        assert "LAGS main by 7 commit" in out
+        assert "only via the producer" in out
+
+    def test_doctor_asks_the_probe_for_an_UNGATED_sample(
+        self, tmp_path, monkeypatch
+    ):
+        """Sharing the probe must NOT drag the producer's alert gate along.
+
+        The producer narrows ALERTS to executed-dir changes so a phone does
+        not buzz for inert docs churn.  The doctor is a diagnostic run on
+        purpose, so it reports every divergence -- it opts out by passing
+        executed_dirs=().  Gating here would hide real drift from the one
+        surface whose whole job is to show it.
+        """
+        import hermes_cli.events_doctor as doctor
+
+        real = doctor.sample_code_drift
+        seen = {}
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(doctor, "sample_code_drift", _spy)
+
+        repo = _make_repo(tmp_path)
+        _commit(repo, "a")
+        check_code_drift(repo_path=repo)
+
+        assert seen.get("executed_dirs") == (), (
+            "doctor must request an ungated sample; gating it would suppress "
+            "the very drift the operator ran the doctor to see"
+        )
+
+    def test_unresolvable_HEAD_is_loud_but_omits_trunk_remediation(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Both unevaluable causes FAIL, but the advice must differ.
+
+        Telling the operator to "check the real trunk name" is wrong advice
+        when the trunk resolved fine and HEAD did not, so that remediation
+        line is withheld -- which is why the producer names its two causes
+        as constants instead of prose the doctor greps.
+
+        Stubbed rather than staged from a real repo on purpose:
+        sample_code_drift() verifies the trunk BEFORE HEAD, so an empty
+        checkout reports the trunk cause and this branch is unreachable
+        from any natural repo state.
+        """
+        from events.producers.code_drift_monitor import (
+            DriftSample, MISCONFIG_HEAD_UNRESOLVED,
+        )
+        import hermes_cli.events_doctor as doctor
+
+        monkeypatch.setattr(doctor, "sample_code_drift", lambda *a, **k: DriftSample(
+            state="misconfigured", head="", trunk="",
+            detail=MISCONFIG_HEAD_UNRESOLVED,
+        ))
+
+        issues = check_code_drift(repo_path=tmp_path / "anything")
+        out = capsys.readouterr().out
+
+        assert issues == 1
+        assert "[FAIL]" in out
+        assert "UNMONITORED" in out
+        assert "skip" not in out.lower()
+        assert "fix the watched-repo entry" not in out
+
     def test_run_doctor_surfaces_drift_and_fails(self, tmp_path, monkeypatch, capsys):
         repo = _make_repo(tmp_path)
         sha_a = _commit(repo, "a")
