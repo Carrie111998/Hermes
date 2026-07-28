@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import utf16_len
 
 
 def _ensure_telegram_mock():
@@ -113,6 +114,26 @@ async def test_voice_caption_overflow_skips_formatting(monkeypatch, tmp_path):
     kwargs = adapter._bot.send_voice.await_args.kwargs
     assert kwargs["parse_mode"] is None
     assert kwargs["caption"] == caption[:1024]
+
+
+@pytest.mark.asyncio
+async def test_voice_plain_caption_fallback_uses_utf16_limit(monkeypatch, tmp_path):
+    """Plain caption fallback must respect Telegram's UTF-16 unit limit."""
+    monkeypatch.setattr(
+        telegram_mod, "_probe_voice_duration_seconds", lambda _p: 3
+    )
+    adapter = _make_adapter()
+    caption = "😀" * 513
+
+    result = await adapter.send_voice(
+        "123", str(_write_ogg(tmp_path)), caption=caption
+    )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_voice.await_args.kwargs
+    assert kwargs["parse_mode"] is None
+    assert kwargs["caption"] == "😀" * 512
+    assert utf16_len(kwargs["caption"]) == 1024
 
 
 @pytest.mark.asyncio

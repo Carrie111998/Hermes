@@ -939,6 +939,7 @@ async def test_native_media_dm_topic_reply_not_found_retry_drops_thread_id(
     result = await getattr(adapter, method_name)(
         chat_id="123",
         **{path_kw: str(media_path)},
+        caption="**Important:** caption",
         metadata={
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,
@@ -949,9 +950,99 @@ async def test_native_media_dm_topic_reply_not_found_retry_drops_thread_id(
     assert result.success is True
     assert call_log[0]["reply_to_message_id"] == 462
     assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[0]["parse_mode"] is not None
     assert call_log[1]["reply_to_message_id"] is None
     assert "message_thread_id" not in call_log[1]
     assert "direct_messages_topic_id" not in call_log[1]
+    assert call_log[1]["parse_mode"] is not None
+
+
+@pytest.mark.asyncio
+async def test_native_media_dm_topic_retry_can_then_retry_plain_caption(tmp_path):
+    """Stale topic fallback remains eligible for Markdown caption fallback."""
+    adapter = _make_adapter()
+    media_path = tmp_path / "clip.mp3"
+    media_path.write_bytes(b"mp3-data")
+    call_log = []
+
+    async def mock_send_audio(**kwargs):
+        call_log.append(dict(kwargs))
+        if len(call_log) == 1:
+            raise FakeBadRequest("Message to be replied not found")
+        if len(call_log) == 2:
+            raise FakeBadRequest("can't parse entities: can't find end of Bold entity")
+        return SimpleNamespace(message_id=787)
+
+    adapter._bot = SimpleNamespace(send_audio=mock_send_audio)
+
+    result = await adapter.send_voice(
+        chat_id="123",
+        audio_path=str(media_path),
+        caption="**Important:** caption",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert len(call_log) == 3
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[0]["parse_mode"] is not None
+    assert call_log[1]["reply_to_message_id"] is None
+    assert "message_thread_id" not in call_log[1]
+    assert call_log[1]["parse_mode"] is not None
+    assert call_log[2]["reply_to_message_id"] is None
+    assert "message_thread_id" not in call_log[2]
+    assert "parse_mode" not in call_log[2]
+    assert "**" not in call_log[2]["caption"]
+
+
+@pytest.mark.asyncio
+async def test_voice_dm_topic_retry_preserves_stripped_routing_for_plain_caption(
+    tmp_path,
+):
+    adapter = _make_adapter()
+    media_path = tmp_path / "clip.ogg"
+    media_path.write_bytes(b"ogg-data")
+    call_log = []
+
+    async def mock_send_voice(**kwargs):
+        call_log.append(dict(kwargs))
+        if len(call_log) == 1:
+            raise FakeBadRequest("Message to be replied not found")
+        if len(call_log) == 2:
+            raise FakeBadRequest(
+                "can't parse entities: can't find end of Bold entity"
+            )
+        return SimpleNamespace(message_id=788)
+
+    adapter._bot = SimpleNamespace(send_voice=mock_send_voice)
+
+    result = await adapter.send_voice(
+        chat_id="123",
+        audio_path=str(media_path),
+        caption="**Important:** caption",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert len(call_log) == 3
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[0]["parse_mode"] is not None
+    assert call_log[1]["reply_to_message_id"] is None
+    assert "message_thread_id" not in call_log[1]
+    assert call_log[1]["parse_mode"] is not None
+    assert call_log[2]["reply_to_message_id"] is None
+    assert "message_thread_id" not in call_log[2]
+    assert call_log[2]["parse_mode"] is None
 
 
 @pytest.mark.asyncio
@@ -970,6 +1061,7 @@ async def test_animation_dm_topic_reply_not_found_retry_drops_thread_id():
     result = await adapter.send_animation(
         chat_id="123",
         animation_url="https://example.com/anim.gif",
+        caption="**Important:** caption",
         metadata={
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,
@@ -980,9 +1072,11 @@ async def test_animation_dm_topic_reply_not_found_retry_drops_thread_id():
     assert result.success is True
     assert call_log[0]["reply_to_message_id"] == 462
     assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[0]["parse_mode"] is not None
     assert call_log[1]["reply_to_message_id"] is None
     assert "message_thread_id" not in call_log[1]
     assert "direct_messages_topic_id" not in call_log[1]
+    assert call_log[1]["parse_mode"] is not None
 
 
 @pytest.mark.asyncio
@@ -1036,6 +1130,7 @@ async def test_send_image_url_dm_topic_reply_not_found_retry_drops_thread_id(mon
     result = await adapter.send_image(
         chat_id="123",
         image_url="https://example.com/photo.png",
+        caption="**Important:** caption",
         metadata={
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,
@@ -1046,7 +1141,9 @@ async def test_send_image_url_dm_topic_reply_not_found_retry_drops_thread_id(mon
     assert result.success is True
     assert call_log[0]["reply_to_message_id"] == 462
     assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[0]["parse_mode"] is not None
     assert call_log[1]["reply_to_message_id"] is None
+    assert call_log[1]["parse_mode"] is not None
     assert "message_thread_id" not in call_log[1]
     assert "direct_messages_topic_id" not in call_log[1]
 
@@ -1096,6 +1193,7 @@ async def test_send_image_upload_dm_topic_reply_not_found_retry_drops_thread_id(
     result = await adapter.send_image(
         chat_id="123",
         image_url="https://example.com/photo.png",
+        caption="**Important:** caption",
         metadata={
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,
@@ -1106,9 +1204,12 @@ async def test_send_image_upload_dm_topic_reply_not_found_retry_drops_thread_id(
     assert result.success is True
     assert call_log[0]["reply_to_message_id"] == 462
     assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[0]["parse_mode"] is not None
     assert call_log[1]["reply_to_message_id"] == 462
     assert call_log[1]["message_thread_id"] == 20197
+    assert call_log[1]["parse_mode"] is not None
     assert call_log[2]["reply_to_message_id"] is None
+    assert call_log[2]["parse_mode"] is not None
     assert "message_thread_id" not in call_log[2]
     assert "direct_messages_topic_id" not in call_log[2]
 
