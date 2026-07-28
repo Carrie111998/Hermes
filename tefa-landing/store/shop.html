@@ -198,9 +198,17 @@
 @media (max-width:620px){.shelf{grid-template-columns:1fr}}
 
 .product{display:flex; flex-direction:column; gap:0; background:var(--card); border:1px solid var(--rule);
-  border-radius:3px; overflow:hidden; transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease;
-  text-decoration:none; color:inherit}
+  border-radius:3px; overflow:hidden; transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease}
 .product:hover{transform:translateY(-3px); box-shadow:var(--shadow); border-color:color-mix(in oklab,var(--accent-lit) 45%,var(--rule))}
+/* .product as a plain <a> (related-items rail): whole card is one link.
+   .product as an <article> (shop grid): a .product-link inner anchor for
+   navigation, plus a separate button so "view" and "add to order" are
+   distinct actions — matches how real ESA marketplaces do product cards. */
+a.product{text-decoration:none; color:inherit}
+.product-link{display:block; text-decoration:none; color:inherit}
+.product-link:hover h4{color:var(--accent)}
+.price-line{display:flex; align-items:baseline; justify-content:space-between; gap:.75rem}
+.price-line .price{font-size:1.3rem}
 .thumb{aspect-ratio:4/3; background:
     repeating-linear-gradient(135deg, var(--rule-soft) 0 2px, transparent 2px 14px);
   border-bottom:1px solid var(--rule); display:flex; align-items:center; justify-content:center;
@@ -341,33 +349,42 @@
       <p>Real tools, real repairs, real money. The competence that makes a household run.</p>
     </div>
     <div class="shelf">
-      <a class="product" href="product.html">
-        <div class="thumb">Home &amp; Repair<br>Tool Roll</div>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Home &amp; Repair Tool Roll">
+          <div class="thumb">Home &amp; Repair<br>Tool Roll</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-PR-101</span>
-          <h4>Home &amp; Repair Tool Roll</h4>
+          <div class="price-line"><span class="price">$83.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Home &amp; Repair Tool Roll</h4></a>
           <p class="desc">18-piece tool roll plus the eight repairs that cover most of what breaks in a house.</p>
-          <div class="price-row"><span class="price">$83.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-PR-101</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-PR-101">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Money &amp;<br>First Job Kit</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Money &amp; First Job Kit">
+          <div class="thumb">Money &amp;<br>First Job Kit</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-PR-102</span>
-          <h4>Money &amp; First Job Kit</h4>
+          <div class="price-line"><span class="price">$48.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Money &amp; First Job Kit</h4></a>
           <p class="desc">A first-paycheck simulation, budget ledger, and how to negotiate a rate without flinching.</p>
-          <div class="price-row"><span class="price">$48.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-PR-102</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-PR-102">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Kitchen &amp;<br>Provision Kit</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Kitchen &amp; Provision Kit">
+          <div class="thumb">Kitchen &amp;<br>Provision Kit</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-PR-103</span>
-          <h4>Kitchen &amp; Provision Kit</h4>
+          <div class="price-line"><span class="price">$59.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Kitchen &amp; Provision Kit</h4></a>
           <p class="desc">Feeding yourself well and cheaply — a life skill and a maths lesson at once.</p>
-          <div class="price-row"><span class="price">$59.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-PR-103</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-PR-103">Add to order</button>
         </div>
-      </a>
+      </article>
     </div>
 
     <!-- DEPT 02 -->
@@ -377,33 +394,42 @@
       <p>The department nobody else stocks. Rehearsal for the moments that actually decide things.</p>
     </div>
     <div class="shelf">
-      <a class="product" href="product.html">
-        <div class="thumb">Situation<br>Handling Deck</div>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Situation Handling Deck">
+          <div class="thumb">Situation<br>Handling Deck</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-SC-201</span>
-          <h4>Situation Handling Deck</h4>
+          <div class="price-line"><span class="price">$30.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Situation Handling Deck</h4></a>
           <p class="desc">Sixty scenarios worked through before they happen, so the response is practised, not improvised.</p>
-          <div class="price-row"><span class="price">$30.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-SC-201</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-SC-201">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Focus &amp;<br>Energy System</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Focus &amp; Energy System">
+          <div class="thumb">Focus &amp;<br>Energy System</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-SC-202</span>
-          <h4>Focus &amp; Energy System</h4>
+          <div class="price-line"><span class="price">$52.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Focus &amp; Energy System</h4></a>
           <p class="desc">A physical planning system for students who bounce off apps — paper holds people accountable.</p>
-          <div class="price-row"><span class="price">$52.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-SC-202</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-SC-202">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Self-Advocacy<br>Workbook</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Self-Advocacy Workbook">
+          <div class="thumb">Self-Advocacy<br>Workbook</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-SC-203</span>
-          <h4>Self-Advocacy Workbook</h4>
+          <div class="price-line"><span class="price">$24.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Self-Advocacy Workbook</h4></a>
           <p class="desc">Asking for what you need, holding a boundary, and putting it in writing when it matters.</p>
-          <div class="price-row"><span class="price">$24.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-SC-203</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-SC-203">Add to order</button>
         </div>
-      </a>
+      </article>
     </div>
 
     <!-- DEPT 03 -->
@@ -413,33 +439,42 @@
       <p>Professional creative tools, taught to a finished portfolio and a first paid job.</p>
     </div>
     <div class="shelf">
-      <a class="product" href="product.html">
-        <div class="thumb">Graphic<br>Design Bench</div>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Graphic Design Bench">
+          <div class="thumb">Graphic<br>Design Bench</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-CS-301</span>
-          <h4>Graphic Design Bench</h4>
+          <div class="price-line"><span class="price">$318.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Graphic Design Bench</h4></a>
           <p class="desc">A real drawing tablet and the fundamentals that separate design from decoration.</p>
-          <div class="price-row"><span class="price">$318.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-CS-301</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-CS-301">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Motion &amp;<br>Video Kit</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Motion &amp; Video Kit">
+          <div class="thumb">Motion &amp;<br>Video Kit</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-CS-302</span>
-          <h4>Motion &amp; Video Kit</h4>
+          <div class="price-line"><span class="price">$363.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Motion &amp; Video Kit</h4></a>
           <p class="desc">Lighting, sound, and an edit that holds attention. Six finished pieces by the end.</p>
-          <div class="price-row"><span class="price">$363.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-CS-302</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-CS-302">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Skill-to-<br>Income Pack</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Skill-to-Income Pack">
+          <div class="thumb">Skill-to-<br>Income Pack</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-CS-303</span>
-          <h4>Skill-to-Income Pack</h4>
+          <div class="price-line"><span class="price">$35.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Skill-to-Income Pack</h4></a>
           <p class="desc">What creative courses skip: what the work is worth and how to get paid for it.</p>
-          <div class="price-row"><span class="price">$35.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-CS-303</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-CS-303">Add to order</button>
         </div>
-      </a>
+      </article>
     </div>
 
     <!-- DEPT 04 -->
@@ -449,33 +484,42 @@
       <p>How the machines actually work, built and tested by hand — not narrated on a screen.</p>
     </div>
     <div class="shelf">
-      <a class="product" href="product.html">
-        <div class="thumb">AI Literacy<br>Bench Kit</div>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View AI Literacy Bench Kit">
+          <div class="thumb">AI Literacy<br>Bench Kit</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-AT-401</span>
-          <h4>AI Literacy Bench Kit</h4>
+          <div class="price-line"><span class="price">$92.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>AI Literacy Bench Kit</h4></a>
           <p class="desc">Starts offline. What a model is, where it fails, and how not to be fooled by one.</p>
-          <div class="price-row"><span class="price">$92.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-AT-401</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-AT-401">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Electronics &amp;<br>Robotics Starter</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Electronics &amp; Robotics Starter">
+          <div class="thumb">Electronics &amp;<br>Robotics Starter</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-AT-402</span>
-          <h4>Electronics &amp; Robotics Starter</h4>
+          <div class="price-line"><span class="price">$127.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Electronics &amp; Robotics Starter</h4></a>
           <p class="desc">A microcontroller, a pile of sensors, and eight builds that end in something that moves.</p>
-          <div class="price-row"><span class="price">$127.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-AT-402</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-AT-402">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">3D Design &amp;<br>Fabrication Intro</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View 3D Design &amp; Fabrication Intro">
+          <div class="thumb">3D Design &amp;<br>Fabrication Intro</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-AT-403</span>
-          <h4>3D Design &amp; Fabrication Intro</h4>
+          <div class="price-line"><span class="price">$462.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>3D Design &amp; Fabrication Intro</h4></a>
           <p class="desc">Model it to spec, hold it in your hand, find out where the tolerance was wrong.</p>
-          <div class="price-row"><span class="price">$462.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-AT-403</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-AT-403">Add to order</button>
         </div>
-      </a>
+      </article>
     </div>
 
     <!-- DEPT 05 -->
@@ -485,42 +529,54 @@
       <p>The ordinary supplies and curriculum every homeschool needs, invoiced the same way as everything else here.</p>
     </div>
     <div class="shelf">
-      <a class="product" href="product.html">
-        <div class="thumb">Core Subjects<br>Workbook Set</div>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Core Subjects Workbook Set">
+          <div class="thumb">Core Subjects<br>Workbook Set</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-HS-501</span>
-          <h4>Core Subjects Workbook Set</h4>
+          <div class="price-line"><span class="price">$70.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Core Subjects Workbook Set</h4></a>
           <p class="desc">Math, reading, and science workbooks with answer keys and a scope-and-sequence chart.</p>
-          <div class="price-row"><span class="price">$70.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-HS-501</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-HS-501">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Homeschool Assessment<br>&amp; Portfolio Kit</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Homeschool Assessment &amp; Portfolio Kit">
+          <div class="thumb">Homeschool Assessment<br>&amp; Portfolio Kit</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-HS-502</span>
-          <h4>Homeschool Assessment &amp; Portfolio Kit</h4>
+          <div class="price-line"><span class="price">$57.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Homeschool Assessment &amp; Portfolio Kit</h4></a>
           <p class="desc">Practice assessments, a work-sample log, and the portfolio binder some programs require on file.</p>
-          <div class="price-row"><span class="price">$57.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-HS-502</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-HS-502">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Daily Supply<br>Restock Box</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Daily Supply Restock Box">
+          <div class="thumb">Daily Supply<br>Restock Box</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-HS-503</span>
-          <h4>Daily Supply Restock Box</h4>
+          <div class="price-line"><span class="price">$41.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Daily Supply Restock Box</h4></a>
           <p class="desc">Paper, pencils, folders, and glue — the ordinary consumables every homeschool burns through.</p>
-          <div class="price-row"><span class="price">$41.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-HS-503</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-HS-503">Add to order</button>
         </div>
-      </a>
-      <a class="product" href="product.html">
-        <div class="thumb">Art &amp; Craft<br>Foundations Kit</div>
+      </article>
+      <article class="product">
+        <a class="product-link" href="product.html" aria-label="View Art &amp; Craft Foundations Kit">
+          <div class="thumb">Art &amp; Craft<br>Foundations Kit</div>
+        </a>
         <div class="pbody">
-          <span class="sku">MMM-HS-504</span>
-          <h4>Art &amp; Craft Foundations Kit</h4>
+          <div class="price-line"><span class="price">$46.95</span><span class="eligible">ESA eligible</span></div>
+          <a class="product-link" href="product.html"><h4>Art &amp; Craft Foundations Kit</h4></a>
           <p class="desc">Supplies for an elective or creative-credit block, sized for a semester.</p>
-          <div class="price-row"><span class="price">$46.95</span><span class="eligible">ESA eligible</span></div>
+          <span class="sku">MMM-HS-504</span>
+          <button type="button" class="btn btn-solid btn-sm btn-block" data-add-to-cart="MMM-HS-504">Add to order</button>
         </div>
-      </a>
+      </article>
     </div>
 
     <p class="note" style="margin-top:2rem">Eligible categories differ by program and by state. Tell us

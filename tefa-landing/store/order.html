@@ -196,9 +196,17 @@
 @media (max-width:620px){.shelf{grid-template-columns:1fr}}
 
 .product{display:flex; flex-direction:column; gap:0; background:var(--card); border:1px solid var(--rule);
-  border-radius:3px; overflow:hidden; transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease;
-  text-decoration:none; color:inherit}
+  border-radius:3px; overflow:hidden; transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease}
 .product:hover{transform:translateY(-3px); box-shadow:var(--shadow); border-color:color-mix(in oklab,var(--accent-lit) 45%,var(--rule))}
+/* .product as a plain <a> (related-items rail): whole card is one link.
+   .product as an <article> (shop grid): a .product-link inner anchor for
+   navigation, plus a separate button so "view" and "add to order" are
+   distinct actions — matches how real ESA marketplaces do product cards. */
+a.product{text-decoration:none; color:inherit}
+.product-link{display:block; text-decoration:none; color:inherit}
+.product-link:hover h4{color:var(--accent)}
+.price-line{display:flex; align-items:baseline; justify-content:space-between; gap:.75rem}
+.price-line .price{font-size:1.3rem}
 .thumb{aspect-ratio:4/3; background:
     repeating-linear-gradient(135deg, var(--rule-soft) 0 2px, transparent 2px 14px);
   border-bottom:1px solid var(--rule); display:flex; align-items:center; justify-content:center;
