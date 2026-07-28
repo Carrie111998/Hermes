@@ -418,7 +418,13 @@ api_server:
   split_runtime: true
 ```
 
-or via the `API_SERVER_SPLIT_RUNTIME=true` environment variable. `/v1/capabilities` reports the live value under `runtime.split_runtime`, so a client can feature-detect before offering device tools.
+It is also read from the adapter's platform config and from the environment, in this order of precedence:
+
+1. `platforms.api_server.extra.split_runtime`
+2. `API_SERVER_SPLIT_RUNTIME=true`
+3. the top-level `api_server: split_runtime:` block shown above
+
+`/v1/capabilities` reports the resolved value under `runtime.split_runtime`, so a client can feature-detect before offering device tools — check there rather than inferring from your own config.
 
 Enabling the flag alone changes nothing: the relay only engages when a run **also** carries a non-empty `tools` array.
 

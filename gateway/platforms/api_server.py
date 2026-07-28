@@ -2735,13 +2735,38 @@ class APIServerAdapter(BasePlatformAdapter):
     def _split_runtime_enabled(self) -> bool:
         """Whether split-runtime (client-tool relay) is enabled.
 
-        Set via ``platforms.api_server.extra.split_runtime`` in the gateway
-        config (or ``API_SERVER_SPLIT_RUNTIME``), alongside the other
-        api_server knobs. Off by default: only when it is true AND a run
-        actually carries a ``tools`` array does the relay path activate, so
-        existing server-side behaviour is untouched.
+        Resolved from, in order:
+
+          1. ``platforms.api_server.extra.split_runtime`` (adapter config),
+          2. the ``API_SERVER_SPLIT_RUNTIME`` environment variable,
+          3. the profile config's top-level ``api_server: split_runtime:``
+             block — the same place ``gateway_timeout`` and the other
+             api_server knobs live, and the form the docs describe.
+
+        (3) is a fallback rather than the primary source because the adapter's
+        ``extra`` is the canonical platform-config channel; it exists because
+        the top-level block is where an operator naturally puts this and the
+        shared-key bridge in ``gateway.config`` does not carry the key into
+        ``extra``.  Resolved once and memoized — this is consulted per run.
+
+        Off by default: only when it is true AND a run actually carries a
+        ``tools`` array does the relay path activate, so existing server-side
+        behaviour is untouched.
         """
-        return self._split_runtime
+        if self._split_runtime:
+            return True
+        cached = getattr(self, "_split_runtime_from_config", None)
+        if cached is None:
+            try:
+                from hermes_cli.config import load_config
+
+                cfg = load_config() or {}
+                api_cfg = cfg.get("api_server", {}) or {}
+                cached = _coerce_request_bool(api_cfg.get("split_runtime", False))
+            except Exception:
+                cached = False
+            self._split_runtime_from_config = cached
+        return cached
 
     # ------------------------------------------------------------------
     # HTTP Handlers
