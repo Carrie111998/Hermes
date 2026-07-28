@@ -2132,15 +2132,17 @@ def _local_dashboard_request(request: Request) -> bool:
 
 
 def _default_hermes_root_is_opt_data() -> bool:
-    raw = os.environ.get("HERMES_HOME", "").strip()
-    if not raw:
+    from hermes_constants import get_explicit_hermes_home
+
+    home = get_explicit_hermes_home()
+    if home is None:
         return False
     try:
         from hermes_constants import get_default_hermes_root
 
         root = get_default_hermes_root().expanduser().resolve(strict=False)
     except (OSError, RuntimeError):
-        root = Path(raw).expanduser().resolve(strict=False)
+        root = home.expanduser().resolve(strict=False)
     return root == _HOSTED_MANAGED_FILES_ROOT
 
 

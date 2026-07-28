@@ -24,7 +24,11 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
+from hermes_constants import (
+    _get_platform_default_hermes_home,
+    get_hermes_home,
+    get_process_hermes_home,
+)
 from typing import Any, Callable, NamedTuple, Optional
 from utils import atomic_json_write
 
@@ -137,10 +141,7 @@ def _get_process_hermes_home() -> Path:
     profile directory when a profile-context task happens to be active at write
     time.  See issue #56986.
     """
-    val = os.environ.get("HERMES_HOME", "").strip()
-    if val:
-        return Path(val)
-    return _get_platform_default_hermes_home()
+    return get_process_hermes_home()
 
 
 def _canonical_hermes_home(path: Path | str) -> Path:

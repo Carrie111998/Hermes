@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
+from hermes_constants import get_hermes_home_env
+
 log = logging.getLogger(__name__)
 
 # Only this desired state triggers automatic restart. Everything else
@@ -571,7 +573,7 @@ def main() -> int:
         )
         return 0
 
-    hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    hermes_home = Path(get_hermes_home_env() or "/opt/data")
     scandir = Path(os.environ.get("S6_PROFILE_GATEWAY_SCANDIR", "/run/service"))
     actions = reconcile_profile_gateways(
         hermes_home=hermes_home, scandir=scandir,
