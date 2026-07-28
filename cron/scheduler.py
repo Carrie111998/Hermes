@@ -1512,6 +1512,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
+    # Redact secrets from the delivery text at this single chokepoint, BEFORE
+    # the live-adapter vs standalone send branches below. Shell-job stdout/stderr
+    # is already redacted where it is captured, but an LLM cron job's response
+    # text reaches delivery unscanned — so a job that surfaced a credential
+    # (e.g. echoed a failing curl with an API key, or summarised a config file)
+    # sent it verbatim to the chat. Redacting once here covers every platform
+    # and both send paths.
+    if cleaned_delivery_content:
+        try:
+            from agent.redact import redact_sensitive_text
+            cleaned_delivery_content = redact_sensitive_text(cleaned_delivery_content)
+        except Exception as e:
+            logger.warning("Failed to redact secrets from cron delivery content: %s", e)
+            cleaned_delivery_content = "[REDACTED - redaction failed]"
+
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
     # transcript so a user reply in that chat sees the cron output in context.
