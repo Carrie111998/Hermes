@@ -159,6 +159,44 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     return 0.0
 
 
+def resolve_codex_event_idle_timeout(
+    *,
+    default_seconds: float,
+    env_raw: object = None,
+    model: object = None,
+) -> tuple[float, bool]:
+    """Resolve Codex Responses post-first-byte event-idle budget.
+
+    Returns ``(timeout_seconds, enabled)``.
+
+    * Explicit ``HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS`` (including ``0``
+      to disable) always wins.
+    * On the implicit default path, known reasoning models raise the
+      timeout to :func:`get_reasoning_stale_timeout_floor` so xAI Grok and
+      peers are not killed mid-think after an opening SSE frame.
+    """
+    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
+    explicit = env_raw is not None and str(env_raw).strip() != ""
+    if explicit:
+        try:
+            timeout = float(env_raw)
+        except (TypeError, ValueError):
+            timeout = float(default_seconds)
+            explicit = False
+    else:
+        timeout = float(default_seconds)
+
+    if timeout <= 0:
+        return timeout, False
+
+    if not explicit:
+        floor = get_reasoning_stale_timeout_floor(model)
+        if floor is not None:
+            timeout = max(timeout, float(floor))
+    return timeout, True
+
+
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
@@ -830,13 +868,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             _ttfb_timeout = _ttfb_cap
 
-    _codex_idle_enabled = _codex_watchdog_enabled
-    _codex_idle_timeout = _env_float(
-        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
-        _codex_idle_timeout_default,
+    _codex_idle_env_raw = os.environ.get("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS")
+    _codex_idle_timeout, _codex_idle_enabled_flag = resolve_codex_event_idle_timeout(
+        default_seconds=_codex_idle_timeout_default,
+        env_raw=_codex_idle_env_raw,
+        model=api_kwargs.get("model") or getattr(agent, "model", None),
     )
-    if _codex_idle_timeout <= 0:
-        _codex_idle_enabled = False
+    _codex_idle_enabled = bool(_codex_watchdog_enabled and _codex_idle_enabled_flag)
+    if (
+        _codex_watchdog_enabled
+        and _codex_idle_enabled
+        and (_codex_idle_env_raw is None or str(_codex_idle_env_raw).strip() == "")
+        and _codex_idle_timeout > _codex_idle_timeout_default
+    ):
+        logger.info(
+            "Raised Codex event-idle watchdog from %.0fs to %.0fs for "
+            "reasoning model %s (context=~%s tokens). Set "
+            "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS to override.",
+            _codex_idle_timeout_default,
+            _codex_idle_timeout,
+            api_kwargs.get("model") or getattr(agent, "model", None),
+            f"{_est_tokens_for_codex_watchdog:,}",
+        )
 
     if _codex_watchdog_enabled:
         # Reset before the worker starts so a marker left over from a previous

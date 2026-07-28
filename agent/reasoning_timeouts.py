@@ -116,12 +116,23 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("claude-fable", 600),
     # xAI Grok reasoning variants.  Explicit reasoning-only keys
     # plus one for the ``non-reasoning`` variant so users picking
-    # the fast variant don't get the 300s floor.  Bare ``grok-3``,
+    # the fast variant don't get the deep floor.  Bare ``grok-3``,
     # ``grok-4`` etc. don't match — only the explicit reasoning /
-    # non-reasoning pairs.
+    # non-reasoning pairs and current GA flagship SKUs that accept
+    # ``reasoning_effort`` (high/xhigh routinely needs multi-minute
+    # silent thinking before the next content/SSE token).
+    #
+    # Floor is 600s (same tier as o1 / deepseek-r1 / nemotron-3-ultra):
+    # 300s was still too short for grok-4.5 + reasoning_effort=xhigh on
+    # ~50–70k-token sessions over xai-oauth codex_responses — the
+    # non-stream detector and the Codex event-idle watchdog both killed
+    # healthy mid-think calls (observed: 120s stream idle then 150s
+    # non-stream fallback when the model was not on the allowlist, and
+    # multi-minute TTFB/gaps even when it was).
     ("grok-4-fast-reasoning", 300),
     ("grok-4.20-reasoning", 300),
-    ("grok-4.5", 300),
+    ("grok-4.5", 600),
+    ("grok-build", 600),
     ("grok-4-fast-non-reasoning", 180),
 )
 
