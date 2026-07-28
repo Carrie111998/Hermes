@@ -1134,7 +1134,18 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
             c.print(f"[yellow]Warning:[/] {entry['name']} — path missing: {entry['install_path']}")
             continue
 
-        result = scan_skill(skill_path, source=entry.get("identifier", entry["source"]))
+        # Audit-time must mirror the install-time special case for official
+        # bundles: a multi-segment identifier like
+        # "official/software-development/subagent-driven-development" must be
+        # scanned with source="official", not the full identifier (which the
+        # trust resolver only recognizes as the literal "official"). Otherwise
+        # installed official skills are misclassified as community and can flip
+        # an allowed CAUTION verdict into a BLOCKED one. See issue #73099.
+        _audit_source = (
+            "official" if entry.get("source") == "official"
+            else entry.get("identifier", entry["source"])
+        )
+        result = scan_skill(skill_path, source=_audit_source)
         c.print(format_scan_report(result))
 
         if deep:
