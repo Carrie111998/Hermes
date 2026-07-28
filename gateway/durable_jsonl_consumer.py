@@ -1444,7 +1444,7 @@ def _event_media(item: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
     return result
 
 
-def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[Any, str]]:
+def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[int, Any, str]]:
     """Return spreadsheet-like documents with their provider-declared MIME."""
     values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths") or []
     if isinstance(values, (str, bytes, Mapping)):
@@ -1454,7 +1454,7 @@ def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[Any, str]]:
     declared_mimes = item.get("mediaMimes") or []
     if isinstance(declared_mimes, (str, bytes)):
         declared_mimes = [declared_mimes]
-    result: list[tuple[Any, str]] = []
+    result: list[tuple[int, Any, str]] = []
     for index, value in enumerate(values):
         raw_path = (
             value.get("path")
@@ -1481,7 +1481,7 @@ def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[Any, str]]:
             raise PermanentMediaRefusal(
                 "PROVENANCE_DIVERGENCE: spreadsheet has no provider-declared MIME"
             )
-        result.append((value, declared))
+        result.append((index, value, declared))
     return result
 
 
@@ -1524,6 +1524,20 @@ def _converge_retained_media(
         or "ledgerChanged" not in data
         or "observationsChanged" not in data
     ):
+        if isinstance(result, Mapping):
+            details: list[str] = []
+            if result.get("status_code") is not None:
+                details.append(f"status_code={result['status_code']}")
+            error = result.get("error")
+            if isinstance(error, Mapping):
+                if error.get("code"):
+                    details.append(f"code={error['code']}")
+                if error.get("message"):
+                    details.append(f"message={error['message']}")
+            if details:
+                raise MediaRetentionError(
+                    "media retention convergence failed: " + " ".join(details)
+                )
         raise MediaRetentionError(
             "media retention convergence returned an invalid Systems envelope"
         )
@@ -1543,35 +1557,6 @@ def _retain_record_media_impl(
     if config is None:
         return {"retained": 0, "bytes": 0, "operation": False}
     item = _bridge_item(record.raw)
-    spreadsheets = _event_spreadsheets(item)
-    if spreadsheets:
-        from tools.pa_business_tools import validate_tgg_spreadsheet
-
-        for raw_path, declared_mime in spreadsheets:
-            source = _contained_existing_file(raw_path, config["source_roots"])
-            try:
-                validate_tgg_spreadsheet(source, declared_mime=declared_mime)
-            except ValueError as exc:
-                raise PermanentMediaRefusal(str(exc)) from exc
-        if not _event_media(item):
-            return {
-                "retained": 0,
-                "bytes": 0,
-                "operation": False,
-                "validated_spreadsheets": len(spreadsheets),
-            }
-    media = _event_media(item)
-    if not media:
-        coarse_kind = str(
-            item.get("mediaType") or item.get("mimeType") or ""
-        ).split("/", 1)[0].strip().lower()
-        if coarse_kind != "image":
-            return {"retained": 0, "bytes": 0, "operation": False}
-        if item.get("hasMedia") is True:
-            raise MediaRetentionError(
-                "mandatory inbound media has no resolvable capture path"
-            )
-        return {"retained": 0, "bytes": 0, "operation": False}
     chat_id = str(item.get("chatId") or record.chat_id)
     message_id = str(item.get("messageId") or record.message_id)
     if chat_id != record.chat_id or message_id != record.message_id:
@@ -1582,6 +1567,89 @@ def _retain_record_media_impl(
     source_key = f"whatsapp-capture-v1:{identity_digest}"
     filename_prefix = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:24]
     root: Path = config["root"]
+    spreadsheets = _event_spreadsheets(item)
+    retained_spreadsheets = 0
+    spreadsheet_bytes = 0
+    if spreadsheets:
+        from tools.pa_business_tools import validate_tgg_spreadsheet
+
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        _assert_media_headroom(
+            config_path,
+            _media_root_metrics(config_path, inspect=True, count_root=False),
+        )
+        for ordinal, raw_path, declared_mime in spreadsheets:
+            source = _contained_existing_file(raw_path, config["source_roots"])
+            try:
+                validate_tgg_spreadsheet(source, declared_mime=declared_mime)
+            except ValueError as exc:
+                raise PermanentMediaRefusal(str(exc)) from exc
+            content = source.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            extension = source.suffix.lower()
+            target = (
+                root
+                / (
+                    f"{filename_prefix}_spreadsheet_{ordinal}_"
+                    f"{digest[:24]}{extension}"
+                )
+            ).resolve()
+            if not target.is_relative_to(root):
+                raise MediaRetentionError(
+                    "derived spreadsheet retention target escapes configured root"
+                )
+            ordinal_candidates = list(
+                root.glob(f"{filename_prefix}_spreadsheet_{ordinal}_*")
+            )
+            if ordinal_candidates and target not in ordinal_candidates:
+                raise MediaRetentionError(
+                    "PROVENANCE_DIVERGENCE: retained spreadsheet ordinal "
+                    f"{ordinal} changed"
+                )
+            if target.exists():
+                if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                    raise MediaRetentionError(
+                        "PROVENANCE_DIVERGENCE: retained spreadsheet ordinal "
+                        f"{ordinal} changed"
+                    )
+            else:
+                tmp = root / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(tmp, target)
+                    directory_fd = os.open(root, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        tmp.unlink()
+            retained_spreadsheets += 1
+            spreadsheet_bytes += len(content)
+    media = _event_media(item)
+    if not media:
+        if retained_spreadsheets:
+            return {
+                "retained": retained_spreadsheets,
+                "bytes": spreadsheet_bytes,
+                "operation": False,
+                "validated_spreadsheets": len(spreadsheets),
+            }
+        coarse_kind = str(
+            item.get("mediaType") or item.get("mimeType") or ""
+        ).split("/", 1)[0].strip().lower()
+        if coarse_kind != "image":
+            return {"retained": 0, "bytes": 0, "operation": False}
+        if item.get("hasMedia") is True:
+            raise MediaRetentionError(
+                "mandatory inbound media has no resolvable capture path"
+            )
+        return {"retained": 0, "bytes": 0, "operation": False}
     root.mkdir(parents=True, exist_ok=True, mode=0o750)
     _assert_media_headroom(
         config_path,
@@ -1650,7 +1718,16 @@ def _retain_record_media_impl(
         if isinstance(exc, MediaRetentionError):
             raise
         raise MediaRetentionError(f"media retention convergence failed: {exc}") from exc
-    return {"retained": len(retained), "bytes": total_bytes, "operation": True}
+    return {
+        "retained": retained_spreadsheets + len(retained),
+        "bytes": spreadsheet_bytes + total_bytes,
+        "operation": True,
+        **(
+            {"validated_spreadsheets": len(spreadsheets)}
+            if spreadsheets
+            else {}
+        ),
+    }
 
 
 def retain_record_media(record: InboxRecord, *, config_path: Path) -> dict[str, Any]:
@@ -1688,7 +1765,7 @@ def ensure_record_media_retained(
     inbox.record_retention(
         record,
         retained=int(result["retained"]),
-        bypassed=not bool(result.get("operation")),
+        bypassed=not bool(result.get("operation") or int(result["retained"]) > 0),
     )
     return result
 
@@ -1715,7 +1792,7 @@ async def retain_pending_media(
                 file=sys.stderr,
             )
             continue
-        if result.get("operation"):
+        if result.get("operation") or int(result["retained"]) > 0:
             summary["retained"] += int(result["retained"])
         else:
             summary["bypassed"] += 1

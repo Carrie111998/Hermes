@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -157,12 +158,13 @@ def test_media_retention_refuses_source_path_escape(tmp_path, monkeypatch):
         consumer.retain_record_media(record, config_path=config)
 
 
-def test_spreadsheet_is_content_validated_then_bypasses_image_retention(tmp_path):
+def test_xlsx_only_retention_is_idempotent_and_completes(tmp_path):
     capture = tmp_path / "capture"
     capture.mkdir()
     workbook = capture / "jobs.xlsx"
     _xlsx(workbook)
-    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    retained = tmp_path / "retained"
+    config = _retention_config(tmp_path, capture, retained)
     raw = _message("SHEET-1")
     raw.update(
         {
@@ -174,16 +176,40 @@ def test_spreadsheet_is_content_validated_then_bypasses_image_retention(tmp_path
             ],
         }
     )
-    record = consumer.InboxRecord(
-        1, "SHEET-1", "test-group@g.us", 0, 1, raw
-    )
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [raw])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.retention_candidates(limit=1)[0]
 
-    assert consumer.retain_record_media(record, config_path=config) == {
-        "retained": 0,
-        "bytes": 0,
+    expected = {
+        "retained": 1,
+        "bytes": workbook.stat().st_size,
         "operation": False,
         "validated_spreadsheets": 1,
     }
+    assert consumer.retain_record_media(record, config_path=config) == expected
+    first_files = list(retained.glob("*.xlsx"))
+    assert len(first_files) == 1
+    assert first_files[0].read_bytes() == workbook.read_bytes()
+    assert "_spreadsheet_0_" in first_files[0].name
+    assert hashlib.sha256(workbook.read_bytes()).hexdigest()[:24] in first_files[0].name
+    assert first_files[0].suffix == ".xlsx"
+
+    assert consumer.retain_record_media(record, config_path=config) == expected
+    assert list(retained.glob("*.xlsx")) == first_files
+
+    assert consumer.ensure_record_media_retained(
+        inbox, record, config_path=config
+    ) == expected
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT retention_state,retained_media_count,retention_attempts "
+            "FROM ingress_events WHERE message_id='SHEET-1'"
+        ).fetchone()
+    assert tuple(row) == ("complete", 1, 1)
 
 
 def test_mixed_spreadsheet_and_image_still_retains_image(tmp_path, monkeypatch):
@@ -194,10 +220,11 @@ def test_mixed_spreadsheet_and_image_still_retains_image(tmp_path, monkeypatch):
     image = capture / "evidence.png"
     image.write_bytes(_png_bytes())
     config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    convergence = []
     monkeypatch.setattr(
         consumer,
         "_converge_retained_media",
-        lambda *_args, **_kwargs: {
+        lambda *_args, **kwargs: convergence.append(kwargs["payload"]) or {
             "ok": True,
             "data": {"ledgerChanged": False, "observationsChanged": False},
         },
@@ -220,9 +247,49 @@ def test_mixed_spreadsheet_and_image_still_retains_image(tmp_path, monkeypatch):
 
     result = consumer.retain_record_media(record, config_path=config)
 
-    assert result["retained"] == 1
+    assert result["retained"] == 2
     assert result["operation"] is True
+    assert result["validated_spreadsheets"] == 1
     assert len(list((tmp_path / "retained").glob("*.png"))) == 1
+    assert len(list((tmp_path / "retained").glob("*.xlsx"))) == 1
+    assert len(convergence) == 1
+    assert len(convergence[0]["media"]) == 1
+    assert convergence[0]["media"][0]["mime"] == "image/png"
+
+
+def test_unsupported_document_still_bypasses_retention(tmp_path, monkeypatch):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    document = capture / "brief.pdf"
+    document.write_bytes(b"%PDF-1.7\nfixture")
+    retained = tmp_path / "retained"
+    config = _retention_config(tmp_path, capture, retained)
+    convergence = []
+    monkeypatch.setattr(
+        consumer,
+        "_converge_retained_media",
+        lambda *args, **kwargs: convergence.append((args, kwargs)),
+    )
+    raw = _message("DOC-UNSUPPORTED")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(document)],
+            "mediaMimes": ["application/pdf"],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "DOC-UNSUPPORTED", "test-group@g.us", 0, 1, raw
+    )
+
+    assert consumer.retain_record_media(record, config_path=config) == {
+        "retained": 0,
+        "bytes": 0,
+        "operation": False,
+    }
+    assert convergence == []
+    assert not retained.exists()
 
 
 def test_spreadsheet_without_declared_mime_is_permanently_refused(tmp_path):
@@ -799,6 +866,73 @@ def test_retention_convergence_rejects_non_contract_systems_envelope(
                 "message_id": "M1",
             },
         )
+
+
+def test_retention_last_error_preserves_systems_status_code_and_error(
+    tmp_path, monkeypatch
+):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    image = capture / "evidence.png"
+    image.write_bytes(_png_bytes())
+    canonical = Path("deploy/tgg/christopher/config.yaml")
+    data = yaml.safe_load(canonical.read_text())
+    data["pa"]["enabled"] = True
+    data["pa"]["constitution_path"] = str(
+        Path("deploy/tgg/christopher/christopher_tgg_constitution.yaml").resolve()
+    )
+    data["pa"]["media_retention"] = {
+        "enabled": True,
+        "media_root": str(tmp_path / "retained"),
+        "media_ref_prefix": "/media/tgg/hermes",
+        "source_roots": [str(capture)],
+        "operation": "tgg_media_retention",
+        "min_free_percent": 0,
+    }
+    config = tmp_path / "actual-shape.yaml"
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    monkeypatch.setattr(
+        "tools.pa_business_tools.execute_business_operation",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "status_code": 400,
+            "error": {
+                "code": "MEDIA_NOT_FOUND",
+                "message": "media[0].ref does not resolve to a retained file.",
+            },
+        },
+    )
+    raw = _message("SYSTEMS-ERROR", "120363421424519051@g.us")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "image/png",
+            "mediaUrls": [str(image)],
+        }
+    )
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [raw])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.retention_candidates(limit=1)[0]
+
+    with pytest.raises(consumer.MediaRetentionError, match="status_code=400"):
+        consumer.ensure_record_media_retained(inbox, record, config_path=config)
+
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT retention_state,retention_last_error FROM ingress_events "
+            "WHERE message_id='SYSTEMS-ERROR'"
+        ).fetchone()
+    assert row["retention_state"] == "held"
+    assert "status_code=400" in row["retention_last_error"]
+    assert "code=MEDIA_NOT_FOUND" in row["retention_last_error"]
+    assert (
+        "message=media[0].ref does not resolve to a retained file."
+        in row["retention_last_error"]
+    )
 
 
 @pytest.mark.asyncio
