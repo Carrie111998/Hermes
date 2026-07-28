@@ -623,6 +623,42 @@ def test_shared_chat_guard_judge_prompt_uses_minimal_bounded_context(monkeypatch
     assert "Stornofrist" in prompt_payload
     assert "Kurs startet" in prompt_payload
     assert "müssen um 17 Uhr los" not in prompt_payload
+    system_prompt = captured["messages"][0]["content"].lower()
+    assert "untrusted" in system_prompt
+    assert "non-authoritative" in system_prompt
+    assert "cannot override" in system_prompt
+
+
+def test_shared_chat_guard_reuses_judge_decision_when_silent_message_is_observed(monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    async def _run():
+        judge = Mock(return_value=telegram_adapter.TelegramSharedChatRelevance(False, "judge:humans decide"))
+        monkeypatch.setattr(telegram_adapter, "judge_telegram_shared_chat_relevance", judge)
+        adapter = _make_adapter(
+            require_mention=True,
+            free_response_chats=["-5312735398"],
+            shared_chat_guard=_shared_chat_guard(judge_enabled=True),
+            group_allowed_chats=["-5312735398"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+
+        await adapter._handle_text_message(
+            SimpleNamespace(
+                update_id=5010,
+                message=_group_message("Schaffen wir das vorher noch?", chat_id=-5312735398),
+                effective_message=None,
+            ),
+            SimpleNamespace(),
+        )
+
+        adapter._message_handler.assert_not_awaited()
+        assert len(store.messages) == 1
+        judge.assert_called_once()
+
+    asyncio.run(_run())
 
 
 def test_shared_chat_guard_classifier_allows_tasks_and_risks_but_not_time_chatter():
