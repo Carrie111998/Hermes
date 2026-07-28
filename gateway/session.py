@@ -176,6 +176,7 @@ class SessionSource:
     guild_id: Optional[str] = None  # @deprecated legacy alias for scope_id (D-Q2.5)
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    adapter_id: Optional[str] = None  # Concrete adapter instance that received the message
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
@@ -262,6 +263,8 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.adapter_id:
+            d["adapter_id"] = self.adapter_id
         if self.profile:
             d["profile"] = self.profile
         if self.auto_thread_created:
@@ -288,6 +291,7 @@ class SessionSource:
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            adapter_id=data.get("adapter_id"),
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
@@ -1014,16 +1018,38 @@ def _session_key_namespace(profile: Optional[str]) -> str:
     off ``session_id``, not this slot). Multi-profile multiplexing reuses this
     slot to carry the profile:
 
-    - default profile (or ``None``/``""``/``"default"``) → ``agent:main`` —
+    - default profile (or ``None``/``""``/``"default"``) -> ``agent:main`` -
       BYTE-IDENTICAL to every key ever generated, so existing sessions and all
       positional parsers (``parts[2]`` == platform, etc.) are unaffected.
-    - named profile ``coder`` → ``agent:coder`` — keeps the same positional
+    - named profile ``coder`` -> ``agent:coder`` - keeps the same positional
       layout, just a different namespace, so two profiles serving the same
       platform/chat never collide.
     """
     if not profile or profile == "default":
         return "agent:main"
     return f"agent:{profile}"
+
+
+def _session_key_prefix_parts(
+    source: SessionSource,
+    profile: Optional[str] = None,
+) -> list[str]:
+    """Return the namespace prefix for a source's session key.
+
+    Single-instance/default-profile platforms keep their historical
+    ``agent:main:<platform>`` prefix. Multi-profile gateways replace ``main``
+    with the profile namespace. Multi-instance adapters, such as multiple
+    Feishu apps, append the concrete adapter id so colliding app-scoped
+    chat/user ids cannot share an agent cache or transcript.
+    """
+    ns = _session_key_namespace(profile)
+    platform = source.platform.value
+    parts = [ns, platform]
+    adapter_id = str(getattr(source, "adapter_id", "") or "").strip()
+    if adapter_id and adapter_id != platform:
+        escaped = adapter_id.replace("%", "%25").replace(":", "%3A")
+        parts.append(f"adapter={escaped}")
+    return parts
 
 
 def build_session_key(
@@ -1064,8 +1090,8 @@ def build_session_key(
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
-    ns = _session_key_namespace(profile)
-    platform = source.platform.value
+    effective_profile = profile if profile is not None else source.profile
+    prefix_parts = _session_key_prefix_parts(source, effective_profile)
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
@@ -1076,7 +1102,7 @@ def build_session_key(
         if source.platform == Platform.WHATSAPP:
             dm_chat_id = canonical_whatsapp_identifier(source.chat_id)
 
-        dm_parts = [ns, platform, "dm"]
+        dm_parts = [*prefix_parts, "dm"]
         if slack_scope_id:
             dm_parts.append(slack_scope_id)
         if dm_chat_id:
@@ -1111,7 +1137,7 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = [ns, platform, source.chat_type]
+    key_parts = [*prefix_parts, source.chat_type]
 
     if slack_scope_id:
         key_parts.append(slack_scope_id)

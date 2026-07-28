@@ -103,7 +103,33 @@ def resolve_delivery_transport(
     """
     live_adapters = adapters or {}
     native = live_adapters.get(platform)
-    native_config = config.platforms.get(platform)
+    native_raw_config = config.platforms.get(platform)
+    native_configs = (
+        native_raw_config
+        if isinstance(native_raw_config, list)
+        else [native_raw_config]
+    )
+    native_configs = [cfg for cfg in native_configs if cfg is not None]
+    native_config = None
+    native_adapter_id = str(getattr(native, "adapter_id", "") or "")
+    if native_adapter_id:
+        for cfg in native_configs:
+            extra = cfg.extra if isinstance(cfg.extra, dict) else {}
+            configured_id = str(
+                extra.get("adapter_id")
+                or extra.get("app_id")
+                or extra.get("bot_id")
+                or extra.get("client_id")
+                or ""
+            ).strip()
+            if configured_id and native_adapter_id == f"{platform.value}:{configured_id}":
+                native_config = cfg
+                break
+    if native_config is None:
+        native_config = next(
+            (cfg for cfg in native_configs if cfg.enabled),
+            native_configs[0] if native_configs else None,
+        )
     # Preserve DeliveryRouter's historical support for explicitly supplied live
     # adapters with no config block, but never let an explicitly disabled native
     # adapter shadow an enabled Relay transport.
@@ -115,7 +141,17 @@ def resolve_delivery_transport(
         )
 
     relay = live_adapters.get(Platform.RELAY)
-    relay_config = config.platforms.get(Platform.RELAY)
+    relay_raw_config = config.platforms.get(Platform.RELAY)
+    relay_configs = (
+        relay_raw_config
+        if isinstance(relay_raw_config, list)
+        else [relay_raw_config]
+    )
+    relay_configs = [cfg for cfg in relay_configs if cfg is not None]
+    relay_config = next(
+        (cfg for cfg in relay_configs if cfg.enabled),
+        relay_configs[0] if relay_configs else None,
+    )
     fronts_platform = getattr(relay, "fronts_platform", None)
     if (
         relay is not None
@@ -640,7 +676,5 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
 
 

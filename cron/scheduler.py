@@ -1583,7 +1583,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         else:
             # No live transport: preserve the existing standalone delivery path,
             # which uses the logical platform's configured credential.
-            pconfig = config.platforms.get(platform)
+            raw_config = config.platforms.get(platform)
+            configs = raw_config if isinstance(raw_config, list) else [raw_config]
+            configs = [cfg for cfg in configs if cfg is not None]
+            enabled_configs = [cfg for cfg in configs if cfg.enabled]
+            pconfig = next(
+                (
+                    cfg
+                    for cfg in enabled_configs
+                    if getattr(cfg, "home_channel", None)
+                    and str(cfg.home_channel.chat_id) == str(chat_id)
+                ),
+                enabled_configs[0] if enabled_configs else None,
+            )
             runtime_adapter = None
 
         if not pconfig or not pconfig.enabled:

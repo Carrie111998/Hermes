@@ -682,6 +682,45 @@ class TestDeliverResultWrapping:
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: abc-123" in sent_content
 
+    def test_delivery_selects_matching_multi_app_config(self):
+        """List-valued platform configs must not crash or use the wrong app."""
+        from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+
+        first = PlatformConfig(
+            enabled=True,
+            extra={"app_id": "app-1"},
+            home_channel=HomeChannel(
+                platform=Platform.FEISHU,
+                chat_id="chat-app-1",
+                name="App 1",
+            ),
+        )
+        second = PlatformConfig(
+            enabled=True,
+            extra={"app_id": "app-2"},
+            home_channel=HomeChannel(
+                platform=Platform.FEISHU,
+                chat_id="chat-app-2",
+                name="App 2",
+            ),
+        )
+        config = GatewayConfig(platforms={Platform.FEISHU: [first, second]})
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True}),
+             ) as send_mock:
+            job = {
+                "id": "multi-app",
+                "deliver": "origin",
+                "origin": {"platform": "feishu", "chat_id": "chat-app-2"},
+            }
+            result = _deliver_result(job, "Output.")
+
+        assert result is None
+        assert send_mock.call_args.args[1] is second
+
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
         from gateway.config import Platform

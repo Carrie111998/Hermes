@@ -9385,7 +9385,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             
             for platform, (name, env_var) in platform_status.items():
                 pconfig = config.platforms.get(platform)
-                if pconfig and pconfig.enabled:
+                pconfigs = pconfig if isinstance(pconfig, list) else [pconfig]
+                if any(cfg is not None and cfg.enabled for cfg in pconfigs):
                     home = config.get_home_channel(platform)
                     home_str = f" → {home.name}" if home else ""
                     print(f"    ✓ {name:<12} Enabled{home_str}")

@@ -8302,7 +8302,8 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         return _err(rid, 5021, f"could not load gateway config: {e}")
     pcfg = gw_config.platforms.get(platform)
-    if not pcfg or not pcfg.enabled:
+    pcfgs = pcfg if isinstance(pcfg, list) else [pcfg]
+    if not any(cfg is not None and cfg.enabled for cfg in pcfgs):
         return _err(
             rid,
             4025,

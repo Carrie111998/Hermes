@@ -109,6 +109,25 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
 
 
+def test_active_profile_stamp_resolves_primary_adapter_id(monkeypatch):
+    """A named active profile must retain concrete multi-app routing."""
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    first_adapter = SimpleNamespace()
+    second_adapter = SimpleNamespace()
+    runner._active_profile_name = lambda: "dev"
+    runner.adapters[Platform.WECOM] = first_adapter
+    runner.adapters_by_id = {
+        "wecom:first": first_adapter,
+        "wecom:second": second_adapter,
+    }
+
+    assert runner._authorization_adapter(
+        Platform.WECOM,
+        profile="dev",
+        adapter_id="wecom:second",
+    ) is second_adapter
+
+
 def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
     """Ingress adapter lookup must use the stamped profile's adapter map."""
     runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
@@ -133,6 +152,39 @@ def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
             profile=None,
         )
     ) is default_adapter
+
+
+def test_adapter_for_source_resolves_secondary_profile_adapter_id(monkeypatch):
+    """A secondary multi-app source must resolve within its profile registry."""
+    runner, _default_adapter, first_secondary = _make_multiplex_runner(monkeypatch)
+    second_secondary = SimpleNamespace(
+        send=AsyncMock(),
+        enforces_own_access_policy=True,
+        _dm_policy="pairing",
+        _group_policy="pairing",
+    )
+    runner._profile_adapters_by_id = {
+        "coder": {
+            "wecom:first": first_secondary,
+            "wecom:second": second_secondary,
+        }
+    }
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="user",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="coder",
+        adapter_id="wecom:second",
+    )
+
+    assert runner._adapter_for_source(source) is second_secondary
+    assert runner._authorization_adapter(
+        Platform.WECOM,
+        profile="coder",
+        adapter_id="wecom:second",
+    ) is second_secondary
 
 
 def test_chat_routed_source_keeps_receiving_shared_adapter(monkeypatch):
@@ -295,6 +347,25 @@ def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     }
 
     violation = _own_policy_open_startup_violation(secondary_cfg)
+    assert violation is not None
+    assert "wecom" in violation
+    assert "open policy" in violation
+def test_list_config_open_policy_fails_startup_guard(monkeypatch):
+    """Every concrete config in a multi-app platform must pass the guard."""
+    from gateway.run import _own_policy_open_startup_violation
+
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.WECOM: [
+                PlatformConfig(enabled=True, extra={"dm_policy": "pairing"}),
+                PlatformConfig(enabled=True, extra={"dm_policy": "open"}),
+            ]
+        }
+    )
+
+    violation = _own_policy_open_startup_violation(config)
+
     assert violation is not None
     assert "wecom" in violation
     assert "open policy" in violation

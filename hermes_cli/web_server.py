@@ -8751,16 +8751,22 @@ def _messaging_platform_payload(
             gateway_config, platform, platform_config = _gateway_platform_config(
                 platform_id
             )
-            enabled = bool(platform_config and platform_config.enabled)
-            configured = bool(
+            platform_configs = (
                 platform_config
-                and gateway_config._is_platform_connected(platform, platform_config)
+                if isinstance(platform_config, list)
+                else [platform_config]
             )
-            home_channel = (
-                platform_config.home_channel.to_dict()
-                if platform_config and platform_config.home_channel
-                else None
+            platform_configs = [
+                cfg for cfg in platform_configs if cfg is not None
+            ]
+            enabled = any(cfg.enabled for cfg in platform_configs)
+            configured = any(
+                cfg.enabled
+                and gateway_config._is_platform_connected(platform, cfg)
+                for cfg in platform_configs
             )
+            home = gateway_config.get_home_channel(platform)
+            home_channel = home.to_dict() if home else None
         except Exception:
             enabled = False
             configured = all(
