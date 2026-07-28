@@ -116,12 +116,23 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(
+        self,
+        event: MessageEvent,
+        *,
+        cancel_notified: bool = False,
+    ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
         # Get existing session key
         session_key = self._session_key_for_source(source)
+        if not cancel_notified:
+            await self._notify_gateway_session_cancel(
+                session_key,
+                source,
+                reason="reset",
+            )
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -1357,6 +1368,11 @@ class GatewaySlashCommandsMixin:
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
+            await self._notify_gateway_session_cancel(
+                session_key,
+                source,
+                reason="stop",
+            )
             # Force-clean the sentinel so the session is unlocked.
             await self._interrupt_and_clear_session(
                 session_key,
@@ -1367,6 +1383,11 @@ class GatewaySlashCommandsMixin:
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:
+            await self._notify_gateway_session_cancel(
+                session_key,
+                source,
+                reason="stop",
+            )
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             await self._interrupt_and_clear_session(
@@ -1385,6 +1406,23 @@ class GatewaySlashCommandsMixin:
         # agent(s) that share this thread, gated on authorization.
         sibling_keys = self._sibling_thread_run_keys(source, session_key)
         if sibling_keys and self._is_user_authorized(source):
+            cancel_routes = [(session_key, source)] + [
+                (
+                    sibling_key,
+                    self._source_for_session_cancel(sibling_key, source),
+                )
+                for sibling_key in sibling_keys
+            ]
+            await asyncio.gather(
+                *(
+                    self._notify_gateway_session_cancel(
+                        key,
+                        route_source,
+                        reason="stop",
+                    )
+                    for key, route_source in cancel_routes
+                )
+            )
             for sibling_key in sibling_keys:
                 await self._interrupt_and_clear_session(
                     sibling_key,
@@ -1399,6 +1437,12 @@ class GatewaySlashCommandsMixin:
                 ", ".join(sibling_keys),
             )
             return EphemeralReply(t("gateway.stop.stopped"))
+
+        await self._notify_gateway_session_cancel(
+            session_key,
+            source,
+            reason="stop",
+        )
 
         # No running agent anywhere for this scope. A platform status
         # indicator can still be stuck — e.g. Slack's persistent

@@ -3,7 +3,7 @@
 import asyncio
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -48,6 +48,88 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_text_batch_retains_each_native_event_identity_and_mentions():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    adapter._text_batch_delay_seconds = 99
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chat",
+        chat_type="group",
+        user_id="7",
+    )
+    first = MessageEvent(
+        text="ordinary",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+        metadata={"mentioned_user_ids": (), "mentions_room": False},
+    )
+    second = MessageEvent(
+        text="@bot",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m2",
+        metadata={"mentioned_user_ids": ("9",), "mentions_room": False},
+    )
+
+    adapter._enqueue_text_event(first)
+    adapter._enqueue_text_event(second)
+    merged = next(iter(adapter._pending_text_batches.values()))
+    native_events = merged.metadata["_gateway_native_events"]
+
+    assert [(item.message_id, item.text) for item in native_events] == [
+        ("m1", "ordinary"),
+        ("m2", "@bot"),
+    ]
+    assert native_events[0].metadata["mentioned_user_ids"] == ()
+    assert native_events[1].metadata["mentioned_user_ids"] == ("9",)
+
+    for task in adapter._pending_text_batch_tasks.values():
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_text_batch_bound_splits_without_dropping_native_events():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    adapter._text_batch_delay_seconds = 99
+    adapter._MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH = 2
+    adapter.handle_message = AsyncMock()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chat",
+        chat_type="group",
+        user_id="7",
+    )
+    events = [
+        MessageEvent(
+            text=f"part-{index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"m{index}",
+            metadata={"mentioned_user_ids": (), "mentions_room": False},
+        )
+        for index in range(3)
+    ]
+
+    for event in events:
+        adapter._enqueue_text_event(event)
+    await asyncio.sleep(0)
+
+    adapter.handle_message.assert_awaited_once()
+    dispatched = adapter.handle_message.await_args.args[0]
+    assert [
+        item.message_id for item in dispatched.metadata["_gateway_native_events"]
+    ] == ["m0", "m1"]
+    pending = adapter._pending_text_batches[adapter._text_batch_key(events[-1])]
+    assert [
+        item.message_id for item in pending.metadata["_gateway_native_events"]
+    ] == ["m2"]
+
+    await adapter.cancel_background_tasks()
 
 
 @pytest.mark.asyncio

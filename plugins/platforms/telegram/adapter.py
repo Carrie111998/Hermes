@@ -10,6 +10,7 @@ Uses python-telegram-bot library for:
 import asyncio
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -266,6 +267,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    NativeDeliveryAck,
     ProcessingOutcome,
     SendResult,
     classify_send_error,
@@ -589,6 +591,24 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+def _attested_mention_user_ids(entities) -> tuple[str, ...] | None:
+    """Return transport-bound mention IDs, or None when Telegram cannot attest them."""
+    mentioned_user_ids: set[str] = set()
+    for entity in entities or ():
+        entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+        if entity_type == "mention":
+            # Username mentions carry text offsets but no immutable Telegram user ID.
+            return None
+        if entity_type != "text_mention":
+            continue
+        mentioned_user = getattr(entity, "user", None)
+        mentioned_user_id = getattr(mentioned_user, "id", None)
+        if mentioned_user_id is None:
+            return None
+        mentioned_user_ids.add(str(mentioned_user_id))
+    return tuple(sorted(mentioned_user_ids))
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -613,6 +633,7 @@ class TelegramAdapter(BasePlatformAdapter):
     # Threshold for detecting Telegram client-side message splits.
     # When a chunk is near this limit, a continuation is almost certain.
     _SPLIT_THRESHOLD = 4000
+    _MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH = 64
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
 
@@ -1100,6 +1121,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
+
+    @classmethod
+    def _native_delivery_room_id(
+        cls,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> str:
+        """Return the route identity attested by a native Telegram effect."""
+        thread_id = cls._metadata_thread_id(metadata)
+        if thread_id:
+            return f"{chat_id}:topic:{thread_id}"
+        return str(chat_id)
 
     @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1869,9 +1902,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 rich_sent_store.record(str(chat_id), str(message_id), content)
             except Exception:
                 pass
+        actor_id = self.authenticated_actor_id()
+        native_message_id = str(message_id) if message_id is not None else None
+        native_ack = None
+        if native_message_id is not None and actor_id is not None:
+            native_ack = NativeDeliveryAck(
+                platform="telegram",
+                room_id=self._native_delivery_room_id(str(chat_id), metadata),
+                self_actor_id=actor_id,
+                effect_kind="reply" if reply_to_id is not None else "send",
+                submitted_content=content,
+                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
+                message_id=native_message_id,
+                effect_id=native_message_id,
+            )
         return SendResult(
             success=True,
-            message_id=str(message_id) if message_id is not None else None,
+            message_id=native_message_id,
+            native_delivery_ack=native_ack,
         )
 
     async def _try_edit_rich(
@@ -4361,8 +4409,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             
             message_ids = []
+            reply_attested_id = None
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
+            require_topic_route = bool(
+                metadata and metadata.get("_hermes_require_topic_route")
+            )
             used_thread_fallback = False
             
             try:
@@ -4481,6 +4533,16 @@ class TelegramAdapter(BasePlatformAdapter):
                                     )
                                     continue
                                 # Second failure: the thread is genuinely gone.
+                                # Route-bound participant effects may never fall
+                                # back into the root chat after authorizing a topic.
+                                if require_topic_route:
+                                    return SendResult(
+                                        success=False,
+                                        error=_redact_telegram_error_text(send_err),
+                                        retryable=False,
+                                    )
+                                # Ordinary Hermes delivery retains its historical
+                                # fallback behavior outside the strict V2 seam.
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune
                                 # the stale binding so future inbound
@@ -4499,7 +4561,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
-                                if private_dm_topic_send:
+                                if private_dm_topic_send or require_topic_route:
                                     safe_send_error = _redact_telegram_error_text(send_err)
                                     return SendResult(
                                         success=False,
@@ -4572,6 +4634,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
+                if i == 0 and reply_to_id is not None:
+                    reply_attested_id = str(reply_to_id)
                 message_ids.append(str(msg.message_id))
 
             # Re-trigger typing indicator after sending a message.
@@ -4590,14 +4654,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
+            actor_id = self.authenticated_actor_id()
+            native_message_id = message_ids[0] if message_ids else None
+            native_ack = None
+            if native_message_id is not None and actor_id is not None:
+                native_ack = NativeDeliveryAck(
+                    platform="telegram",
+                    room_id=self._native_delivery_room_id(str(chat_id), metadata),
+                    self_actor_id=actor_id,
+                    effect_kind="reply" if reply_attested_id is not None else "send",
+                    submitted_content=content,
+                    reply_to_message_id=reply_attested_id,
+                    message_id=native_message_id,
+                    effect_id=native_message_id,
+                )
             return SendResult(
                 success=True,
-                message_id=message_ids[0] if message_ids else None,
+                message_id=native_message_id,
                 raw_response={
                     "message_ids": message_ids,
                     "requested_thread_id": requested_thread_id,
                     "thread_fallback": used_thread_fallback,
                 },
+                native_delivery_ack=native_ack,
             )
             
         except Exception as e:
@@ -8780,6 +8859,34 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
+    def _native_gateway_event_snapshot(self, event: MessageEvent) -> MessageEvent:
+        """Retain one native identity before host-agent batching mutates it."""
+        mentioned_user_ids = event.metadata.get("mentioned_user_ids")
+        return MessageEvent(
+            text=str(event.text or ""),
+            message_type=event.message_type,
+            source=event.source,
+            raw_message=None,
+            message_id=event.message_id,
+            platform_update_id=event.platform_update_id,
+            media_urls=list(event.media_urls),
+            media_types=list(event.media_types),
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_text=event.reply_to_text,
+            reply_to_author_id=event.reply_to_author_id,
+            reply_to_author_name=event.reply_to_author_name,
+            reply_to_is_own_message=event.reply_to_is_own_message,
+            metadata={
+                "mentioned_user_ids": (
+                    None
+                    if mentioned_user_ids is None
+                    else tuple(mentioned_user_ids)
+                ),
+                "mentions_room": event.metadata.get("mentions_room"),
+            },
+            timestamp=event.timestamp,
+        )
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -8794,11 +8901,26 @@ class TelegramAdapter(BasePlatformAdapter):
 
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
+        if existing is not None and len(
+            existing.metadata.get("_gateway_native_events", ())
+        ) >= self._MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH:
+            self._dispatch_full_gateway_native_batch(
+                key,
+                self._pending_text_batches,
+                self._pending_text_batch_tasks,
+            )
+            existing = None
         chunk_len = len(event.text or "")
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._pending_text_batches[key] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
@@ -8815,6 +8937,16 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+
+    def _dispatch_full_gateway_native_batch(self, key, batches, tasks) -> None:
+        """Split a full aggregation batch without dropping native ingress."""
+        batch = batches.pop(key)
+        prior_task = tasks.pop(key, None)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+        dispatch_task = asyncio.create_task(self.handle_message(batch))
+        self._background_tasks.add(dispatch_task)
+        dispatch_task.add_done_callback(self._background_tasks.discard)
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
@@ -8903,10 +9035,30 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[Telegram] Dropping photo batch enqueue after disconnect started")
             return
 
+        # Retain the same recovered route on the outer batch and every native
+        # participant snapshot. BasePlatformAdapter will apply this again at
+        # dispatch, but the immutable snapshots must not preserve a stale DM
+        # topic in the meantime.
+        self._apply_topic_recovery(event)
         existing = self._pending_photo_batches.get(batch_key)
+        if existing is not None and len(
+            existing.metadata.get("_gateway_native_events", ())
+        ) >= self._MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH:
+            self._dispatch_full_gateway_native_batch(
+                batch_key,
+                self._pending_photo_batches,
+                self._pending_photo_batch_tasks,
+            )
+            existing = None
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._pending_photo_batches[batch_key] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -9230,10 +9382,26 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[Telegram] Dropping media group enqueue after disconnect started")
             return
 
+        self._apply_topic_recovery(event)
         existing = self._media_group_events.get(media_group_id)
+        if existing is not None and len(
+            existing.metadata.get("_gateway_native_events", ())
+        ) >= self._MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH:
+            self._dispatch_full_gateway_native_batch(
+                media_group_id,
+                self._media_group_events,
+                self._media_group_tasks,
+            )
+            existing = None
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._media_group_events[media_group_id] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -9654,8 +9822,14 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        mention_entities = (
+            *(getattr(message, "entities", None) or ()),
+            *(getattr(message, "caption_entities", None) or ()),
+        )
+        mentioned_user_ids = _attested_mention_user_ids(mention_entities)
+
         return MessageEvent(
-            text=message.text or "",
+            text=message.text or getattr(message, "caption", None) or "",
             message_type=msg_type,
             source=source,
             raw_message=message,
@@ -9666,6 +9840,10 @@ class TelegramAdapter(BasePlatformAdapter):
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
+            metadata={
+                "mentioned_user_ids": mentioned_user_ids,
+                "mentions_room": False,
+            },
         )
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
@@ -9709,6 +9887,51 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] clear reactions failed: %s", self.name, _redact_telegram_error_text(e))
             return False
+
+    async def react(
+        self,
+        chat_id: str,
+        message_id: str,
+        reaction: str,
+        *,
+        operation: str = "add",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Apply one reaction to an exact Telegram message."""
+        if operation not in {"add", "remove"}:
+            return SendResult(success=False, error="Reaction is unavailable")
+        succeeded = (
+            await self._set_reaction(chat_id, message_id, reaction)
+            if operation == "add"
+            else await self._clear_reactions(chat_id, message_id)
+        )
+        actor_id = self.authenticated_actor_id()
+        ack = None
+        if succeeded and actor_id is not None:
+            native_room_id = self._native_delivery_room_id(str(chat_id), metadata)
+            identity = "\x00".join(
+                ("telegram", native_room_id, actor_id, str(message_id), operation, reaction)
+            )
+            ack = NativeDeliveryAck(
+                platform="telegram",
+                room_id=native_room_id,
+                self_actor_id=actor_id,
+                effect_kind="react",
+                target_message_id=str(message_id),
+                reaction=reaction,
+                reaction_operation="add" if operation == "add" else "remove",
+                effect_id=f"telegram:reaction:{hashlib.sha256(identity.encode()).hexdigest()}",
+            )
+        return SendResult(
+            success=succeeded,
+            message_id=str(message_id) if succeeded else None,
+            native_delivery_ack=ack,
+        )
+
+    def authenticated_actor_id(self) -> Optional[str]:
+        """Return the immutable actor id for the authenticated Telegram bot."""
+        actor_id = getattr(getattr(self, "_bot", None), "id", None)
+        return str(actor_id) if actor_id is not None else None
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""

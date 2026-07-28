@@ -12,6 +12,11 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 
+# Public, versioned contract for terminal gateway-message hooks and their
+# immutable route-bound delivery capabilities.
+GATEWAY_MESSAGE_HOOK_API_VERSION = 2
+
+
 _profile_fallback_warned: bool = False
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(

@@ -42,11 +42,12 @@ import os
 import sys
 import threading
 import types
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-from hermes_constants import get_hermes_home
+from hermes_constants import GATEWAY_MESSAGE_HOOK_API_VERSION, get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -74,6 +75,10 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+class PluginHookConflictError(RuntimeError):
+    """Raised when mutually exclusive behavior-changing hooks coexist."""
 
 
 logger = logging.getLogger(__name__)
@@ -171,6 +176,18 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Ordinary user-message interception after user access and gateway control
+    # handling, before either cold or busy-session agent behavior. Callbacks
+    # receive only immutable normalized event/route snapshots plus a route-bound
+    # delivery capability. Decisions: handled/suppress or continue/pass.
+    "gateway_message",
+    # Best-effort notification when a user explicitly cancels or resets a
+    # gateway session. Async plugin-owned work can stop at the same boundary.
+    "gateway_session_cancel",
+    # Awaited host lifecycle fence fired after route-delivery revocation and
+    # before adapter teardown. Sync and async callbacks may invalidate and
+    # persist plugin-owned work; returns are ignored.
+    "gateway_shutdown",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -404,6 +421,11 @@ class PluginContext:
             return get_active_profile_name()
         except Exception:
             return "default"
+
+    @property
+    def gateway_message_hook_api_version(self) -> int:
+        """Return the semantic version of the immutable gateway-message hook API."""
+        return GATEWAY_MESSAGE_HOOK_API_VERSION
 
     # -- tool registration --------------------------------------------------
 
@@ -1260,6 +1282,53 @@ class PluginContext:
         )
 
 
+async def _invoke_hook_off_thread(
+    callback: Callable[..., Any], kwargs: Dict[str, Any]
+) -> Any:
+    """Invoke a synchronous hook in a disposable daemon thread.
+
+    Cancellation observers are advisory and may be third-party code. A daemon
+    thread keeps a stuck synchronous callback from blocking the event loop,
+    consuming the shared asyncio executor indefinitely, or preventing process
+    shutdown. Awaitables returned by a synchronous wrapper are handed back to
+    the gateway loop; they are never awaited on a foreign event loop.
+    """
+
+    loop = asyncio.get_running_loop()
+    result_future = loop.create_future()
+
+    def publish_result(result: Any = None, error: BaseException | None = None) -> None:
+        if result_future.done():
+            return
+        if error is not None:
+            result_future.set_exception(error)
+        else:
+            result_future.set_result(result)
+
+    def run() -> None:
+        try:
+            result = callback(**kwargs)
+        except BaseException as exc:
+            try:
+                loop.call_soon_threadsafe(publish_result, None, exc)
+            except RuntimeError:
+                return
+        else:
+            try:
+                loop.call_soon_threadsafe(publish_result, result, None)
+            except RuntimeError:
+                return
+
+    callback_context = copy_context()
+    threading.Thread(
+        target=callback_context.run,
+        args=(run,),
+        name="hermes-plugin-hook",
+        daemon=True,
+    ).start()
+    return await result_future
+
+
 # ---------------------------------------------------------------------------
 # PluginManager
 # ---------------------------------------------------------------------------
@@ -1294,6 +1363,16 @@ class PluginManager:
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
+
+    def validate_hook_configuration(self) -> None:
+        """Reject incompatible behavior-changing ingress hooks deterministically."""
+        if self._hooks.get("gateway_message") and self._hooks.get(
+            "pre_gateway_dispatch"
+        ):
+            raise PluginHookConflictError(
+                "gateway_message and pre_gateway_dispatch are mutually exclusive; "
+                "disable one plugin before starting the gateway"
+            )
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
@@ -1486,6 +1565,11 @@ class PluginManager:
                 )
                 continue
             self._load_plugin(manifest)
+
+        # This is a configuration error, not an ingress-time policy decision.
+        # Validate after the complete sweep so plugin discovery order cannot
+        # decide which behavior-changing hook silently wins.
+        self.validate_hook_configuration()
 
         if manifests:
             logger.info(
@@ -1945,6 +2029,55 @@ class PluginManager:
                 )
         return results
 
+    async def invoke_hook_async(
+        self,
+        hook_name: str,
+        *,
+        raise_exceptions: bool = False,
+        stop_when: Optional[Callable[[Any], bool]] = None,
+        offload_sync: bool = False,
+        offload_callbacks: bool = False,
+        **kwargs: Any,
+    ) -> List[Any]:
+        """Await sync or async callbacks registered for *hook_name*.
+
+        Callback failures are isolated by default, matching :meth:`invoke_hook`.
+        Decision-style callers may request fail-fast behavior with
+        ``raise_exceptions=True``. Task cancellation always propagates.
+        ``offload_callbacks=True`` moves synchronous callback invocation to a
+        context-preserving disposable daemon thread so advisory hooks can be
+        abandoned by a hard host timeout. Async callbacks and awaitables
+        returned by sync wrappers always run on the caller's event loop.
+        """
+        callbacks = self._hooks.get(hook_name, [])
+        results: List[Any] = []
+        for cb in callbacks:
+            try:
+                ret = (
+                    await _invoke_hook_off_thread(cb, kwargs)
+                    if (offload_callbacks or offload_sync)
+                    and not inspect.iscoroutinefunction(cb)
+                    else cb(**kwargs)
+                )
+                if inspect.isawaitable(ret):
+                    ret = await ret
+                if ret is not None:
+                    results.append(ret)
+                    if stop_when is not None and stop_when(ret):
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Async hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+                if raise_exceptions:
+                    raise
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2071,6 +2204,26 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def invoke_hook_async(
+    hook_name: str,
+    *,
+    raise_exceptions: bool = False,
+    stop_when: Optional[Callable[[Any], bool]] = None,
+    offload_sync: bool = False,
+    offload_callbacks: bool = False,
+    **kwargs: Any,
+) -> List[Any]:
+    """Invoke sync or async lifecycle-hook callbacks and await completion."""
+    return await get_plugin_manager().invoke_hook_async(
+        hook_name,
+        raise_exceptions=raise_exceptions,
+        stop_when=stop_when,
+        offload_sync=offload_sync,
+        offload_callbacks=offload_callbacks,
+        **kwargs,
+    )
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

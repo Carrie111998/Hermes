@@ -159,6 +159,7 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
         send=AsyncMock(side_effect=fake_send),
     )
     adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=9),
         get_channel=lambda _chat_id: channel,
         fetch_channel=AsyncMock(),
     )
@@ -172,6 +173,9 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     ref_msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
     assert send_calls[0]["reference"] is reference_obj
     assert send_calls[1]["reference"] is None
+    assert result.native_delivery_ack is not None
+    assert result.native_delivery_ack.effect_kind == "send"
+    assert result.native_delivery_ack.reply_to_message_id is None
 
 
 @pytest.mark.asyncio

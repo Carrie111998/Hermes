@@ -8,6 +8,7 @@ import pytest
 from plugins.platforms.discord.adapter import (
     DiscordAdapter,
     _apply_yaml_config,
+    _attested_discord_mentions,
 )
 
 
@@ -26,6 +27,19 @@ class _FakeClient:
 
     def get_channel(self, channel_id):
         return self.channel
+
+
+def test_attested_discord_mentions_are_exact_and_deduplicated():
+    message = SimpleNamespace(
+        mentions=[SimpleNamespace(id=9), SimpleNamespace(id=7), SimpleNamespace(id=9)],
+        mention_everyone=True,
+    )
+
+    assert _attested_discord_mentions(message) == (("7", "9"), True)
+
+
+def test_attested_discord_mentions_default_to_transport_attested_empty():
+    assert _attested_discord_mentions(SimpleNamespace()) == ((), False)
 
 
 @pytest.mark.asyncio

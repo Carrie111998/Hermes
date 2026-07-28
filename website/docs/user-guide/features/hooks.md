@@ -372,9 +372,9 @@ def register(ctx):
 **General rules for all hooks:**
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility — new parameters may be added in future versions without breaking your plugin.
-- If a callback **crashes**, it's logged and skipped. Other hooks and the agent continue normally. A misbehaving plugin can never break the agent.
-- Two hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, and [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call. All other hooks are fire-and-forget observers.
-- Observer callbacks receive `telemetry_schema_version` automatically. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat `api_request_id` as an opaque identifier; do not parse its string format.
+- Callback failures are normally logged and skipped. `gateway_message` is deliberately stricter: once a callback matches, an exception or invalid terminal result suppresses normal dispatch. Task cancellation always propagates.
+- Three hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call, and [`gateway_message`](#gateway_message) can terminate or continue gateway dispatch. Other hooks are observers.
+- Observer callbacks invoked through the synchronous observer path receive `telemetry_schema_version` automatically. Async gateway hooks receive only the arguments documented for their specific contracts. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat `api_request_id` as an opaque identifier; do not parse its string format.
 
 ### Quick reference
 
@@ -392,6 +392,9 @@ def register(ctx):
 | [`subagent_start`](#subagent_start) | A `delegate_task` child has been constructed and is about to run | ignored |
 | [`subagent_stop`](#subagent_stop) | A `delegate_task` child has exited | ignored |
 | [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway received a user message, before auth + dispatch | `{"action": "skip" \| "rewrite" \| "allow", ...}` to influence flow |
+| [`gateway_message`](#gateway_message) | Authorized, routed ordinary user message after control interception, before normal agent dispatch | terminal handled/continue decision |
+| [`gateway_session_cancel`](#gateway_session_cancel) | Confirmed `/stop` or `/new`/reset gateway boundary | ignored |
+| [`gateway_shutdown`](#gateway_shutdown) | Gateway stop/restart after route revocation, before adapter teardown | ignored |
 | [`pre_approval_request`](#pre_approval_request) | An approval decision is requested, including smart-mode auto decisions | ignored |
 | [`post_approval_response`](#post_approval_response) | An approval decision is made (or a prompt times out) | ignored |
 | [`transform_tool_result`](#transform_tool_result) | After any tool returns, before the result is handed back to the model | `str` to replace the result, `None` to leave unchanged |
@@ -996,6 +999,79 @@ def register(ctx):
 :::info
 With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `subagent_stop` fires many times per turn. Keep your callback fast; push expensive work to a background queue.
 :::
+
+---
+
+### `gateway_message`
+
+Fires for an ordinary user message only after Hermes has admitted and authorized the native source, resolved its profile/session route, and intercepted slash commands and other gateway controls. It runs on both cold and active/busy session paths before normal agent dispatch.
+
+The host contract is capability-versioned independently of the Hermes package
+version. Plugins can inspect `ctx.gateway_message_hook_api_version` during
+`register(ctx)` and refuse activation with an actionable update message when
+the capability is absent or has an unsupported major version. Version 2 is the
+contract documented in this section. Backward-compatible additions retain the
+same major version; a future incompatible contract uses a new major version so
+plugins can fail visibly instead of relying on an exact Hermes release pin.
+
+The callback receives public immutable snapshots and a one-shot, route-bound
+delivery facade. Hermes plugins are trusted in-process Python code: this API
+narrows ordinary use but is not a sandbox against a hostile plugin importing
+private implementation modules or inspecting interpreter state.
+
+```python
+async def on_gateway_message(event, route, delivery, **kwargs):
+    if route.platform != "discord":
+        return None  # this handler did not match
+
+    receipt = await delivery.send("Handled by the plugin")
+    return {"decision": "handled"}
+
+def register(ctx):
+    ctx.register_hook("gateway_message", on_gateway_message)
+```
+
+- `event` is a frozen `GatewayMessageEvent`; it contains normalized message/reply/media facts but no raw native message, metadata, credentials, adapter, or mutable `MessageEvent`.
+- `route` is a frozen `GatewayMessageRoute` containing the resolved profile/session and current platform/chat/thread/user identity.
+- `delivery.send(text)`, `delivery.reply(text)`, and `delivery.react(reaction)`
+  can affect only that captured native route and are one-shot as a group. A
+  receipt is `sent` only when the adapter positively attests the requested
+  native effect, `failed` when non-occurrence is explicit, and `unknown` when
+  acknowledgement is missing, malformed, unattributable, or revocation raced
+  an already-started native invocation. Native error text is not exposed.
+
+Matched handlers return `{"decision": "handled"}` or `{"decision": "suppress"}` to stop normal dispatch, or `{"decision": "continue"}` / `{"decision": "pass"}` to allow it. `None` means the callback did not match. Callbacks may be synchronous or asynchronous. An exception or invalid non-`None` terminal result fails closed and suppresses normal dispatch; `asyncio.CancelledError` propagates.
+
+This hook is not invoked for unauthorized, internal, slash-command, or already-intercepted control events. Use it for extensions that need an authorized post-routing participant turn. Use `pre_gateway_dispatch` only for policies that intentionally operate before authorization. Enabling plugins that register both behavior-changing hooks is an invalid configuration: Hermes rejects it during plugin discovery regardless of load order.
+
+### `gateway_session_cancel`
+
+Fires after Hermes confirms an explicit `/stop` or `/new`/reset boundary. The callback receives the immutable `route` and a `reason` (`"stop"` or `"reset"`) so plugin-owned schedulers can invalidate active and pending work. It is a bounded best-effort observer notification: returns are ignored, callback failures are logged, and Hermes proceeds with the host interruption/reset if callbacks do not finish within two seconds. Caller task cancellation still propagates.
+
+```python
+async def cancel_plugin_work(route, reason, **kwargs):
+    await scheduler.cancel(route.session_key, reason=reason)
+
+def register(ctx):
+    ctx.register_hook("gateway_session_cancel", cancel_plugin_work)
+```
+
+### `gateway_shutdown`
+
+Fires during gateway stop or restart after all retained route-delivery facades
+have been synchronously revoked and before adapters disconnect. Sync and async
+callbacks are supported and awaited. Returns are ignored and callback failures
+are logged. After callbacks finish, Hermes waits for any adapter invocation
+that had already started to settle; it does not treat task cancellation as
+proof that an external native effect was aborted.
+
+```python
+async def close_plugin_runtime(reason, **kwargs):
+    await scheduler.close(reason=reason)  # reason is "stop" or "restart"
+
+def register(ctx):
+    ctx.register_hook("gateway_shutdown", close_plugin_runtime)
+```
 
 ---
 

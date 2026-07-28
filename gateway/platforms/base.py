@@ -541,7 +541,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union, Literal
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -2129,6 +2129,23 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+@dataclass(frozen=True)
+class NativeDeliveryAck:
+    """Adapter-produced attestation for one committed native platform effect."""
+
+    platform: str
+    room_id: str
+    self_actor_id: str
+    effect_kind: Literal["send", "reply", "react"]
+    submitted_content: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
+    target_message_id: Optional[str] = None
+    reaction: Optional[str] = None
+    reaction_operation: Optional[Literal["add", "remove"]] = None
+    message_id: Optional[str] = None
+    effect_id: Optional[str] = None
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -2136,6 +2153,7 @@ class SendResult:
     message_id: Optional[str] = None
     error: Optional[str] = None
     raw_response: Any = None
+    native_delivery_ack: Optional[NativeDeliveryAck] = None
     # Adapter-specific metadata.  Cross-layer contracts that affect delivery
     # semantics must be documented at the producer and consumer sites.  Current
     # known contract: Telegram edit overflow partials set
@@ -3404,6 +3422,17 @@ class BasePlatformAdapter(ABC):
             SendResult with success status and message ID
         """
         pass
+
+    async def react(
+        self,
+        chat_id: str,
+        message_id: str,
+        reaction: str,
+        *,
+        operation: str = "add",
+    ) -> SendResult:
+        """Apply one route-bound reaction when the adapter supports it."""
+        return SendResult(success=False, error="Reactions are unavailable")
 
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
@@ -5253,11 +5282,19 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        runner_session_key = getattr(
+            getattr(self, "gateway_runner", None),
+            "_session_key_for_source",
+            None,
         )
+        if callable(runner_session_key):
+            session_key = runner_session_key(event.source)
+        else:
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or

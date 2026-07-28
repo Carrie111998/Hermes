@@ -14,7 +14,7 @@ those contexts.
 from types import SimpleNamespace
 
 from gateway.config import Platform, PlatformConfig
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter, _attested_mention_user_ids
 
 
 def _make_adapter():
@@ -183,3 +183,17 @@ class TestCaseInsensitivity:
         text = "hi @Hermes_Bot"
         msg = _message(text=text, entities=[_mention_entity(text, mention="@Hermes_Bot")])
         assert adapter._message_mentions_bot(msg) is True
+
+
+class TestAttestedMentionIdentityExtraction:
+    def test_text_mentions_return_exact_transport_user_ids(self):
+        entities = [
+            _text_mention_entity(0, 3, user_id=123),
+            _text_mention_entity(4, 3, user_id=456),
+        ]
+        assert _attested_mention_user_ids(entities) == ("123", "456")
+
+    def test_username_mention_without_transport_user_id_is_unattested(self):
+        text = "@someone hello"
+        entities = [_mention_entity(text, mention="@someone")]
+        assert _attested_mention_user_ids(entities) is None

@@ -127,6 +127,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    NativeDeliveryAck,
     ProcessingOutcome,
     SendResult,
     cache_image_from_url,
@@ -883,6 +884,14 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+def _attested_discord_mentions(message) -> tuple[tuple[str, ...], bool]:
+    """Extract immutable Discord user and room mention facts from native ingress."""
+    mentioned_user_ids = tuple(
+        sorted({str(user.id) for user in (getattr(message, "mentions", None) or ())})
+    )
+    return mentioned_user_ids, bool(getattr(message, "mention_everyone", False))
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -900,6 +909,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # Discord message limits
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
+    _MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH = 64
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
@@ -2855,6 +2865,57 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] remove_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
+    async def react(
+        self,
+        chat_id: str,
+        message_id: str,
+        reaction: str,
+        *,
+        operation: str = "add",
+    ) -> SendResult:
+        """Apply one reaction to an exact Discord message."""
+        if not self._client or operation not in {"add", "remove"}:
+            return SendResult(success=False, error="Reaction is unavailable")
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(chat_id))
+            message = await channel.fetch_message(int(message_id))
+            succeeded = (
+                await self._add_reaction(message, reaction)
+                if operation == "add"
+                else await self._remove_reaction(message, reaction)
+            )
+            actor_id = self.authenticated_actor_id()
+            ack = None
+            if succeeded and actor_id is not None:
+                identity = "\x00".join(
+                    ("discord", str(chat_id), actor_id, str(message_id), operation, reaction)
+                )
+                ack = NativeDeliveryAck(
+                    platform="discord",
+                    room_id=str(chat_id),
+                    self_actor_id=actor_id,
+                    effect_kind="react",
+                    target_message_id=str(message_id),
+                    reaction=reaction,
+                    reaction_operation="add" if operation == "add" else "remove",
+                    effect_id=f"discord:reaction:{hashlib.sha256(identity.encode()).hexdigest()}",
+                )
+            return SendResult(
+                success=succeeded,
+                message_id=str(message_id) if succeeded else None,
+                native_delivery_ack=ack,
+            )
+        except Exception:
+            return SendResult(success=False, error="Reaction failed")
+
+    def authenticated_actor_id(self) -> Optional[str]:
+        """Return the immutable actor id for the authenticated Discord bot."""
+        actor = getattr(getattr(self, "_client", None), "user", None)
+        actor_id = getattr(actor, "id", None)
+        return str(actor_id) if actor_id is not None else None
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
@@ -2947,6 +3008,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             reference = None
+            reply_attested = False
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -2986,12 +3048,16 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
+                        chunk_reference = None
+                        reply_attested = False
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
                         )
                     else:
                         raise
+                if i == 0 and chunk_reference is not None:
+                    reply_attested = True
                 message_ids.append(str(msg.id))
 
             # Track the last message we sent in this channel for history
@@ -3003,10 +3069,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
 
+            actor_id = self.authenticated_actor_id()
+            native_ack = None
+            if message_ids and actor_id is not None:
+                native_ack = NativeDeliveryAck(
+                    platform="discord",
+                    room_id=str(getattr(channel, "id", chat_id)),
+                    self_actor_id=actor_id,
+                    effect_kind="reply" if reply_attested else "send",
+                    submitted_content=content,
+                    reply_to_message_id=str(reply_to) if reply_attested else None,
+                    message_id=message_ids[0],
+                    effect_id=message_ids[0],
+                )
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response={"message_ids": message_ids},
+                native_delivery_ack=native_ack,
             )
             await asyncio.to_thread(
                 self._record_discord_response,
@@ -7848,6 +7928,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
 
+        mentioned_user_ids, mentions_room = _attested_discord_mentions(message)
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,
@@ -7862,12 +7943,19 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata={
+                "mentioned_user_ids": mentioned_user_ids,
+                "mentions_room": mentions_room,
+            },
         )
 
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
         if thread_id:
             self._threads.mark(thread_id)
+
+        if recovered:
+            setattr(event, "_hermes_historical_replay", True)
 
         # Only live plain text messages use split-message batching. Recovery
         # candidates are already complete historical messages; coalescing them
@@ -7903,6 +7991,33 @@ class DiscordAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
+    def _native_gateway_event_snapshot(self, event: MessageEvent) -> MessageEvent:
+        """Retain one bounded-to-hook native identity before agent-text batching."""
+        mentioned_user_ids = event.metadata.get("mentioned_user_ids")
+        return MessageEvent(
+            text=str(event.text or ""),
+            message_type=event.message_type,
+            source=event.source,
+            raw_message=None,
+            message_id=event.message_id,
+            media_urls=list(event.media_urls),
+            media_types=list(event.media_types),
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_text=event.reply_to_text,
+            reply_to_author_id=event.reply_to_author_id,
+            reply_to_author_name=event.reply_to_author_name,
+            reply_to_is_own_message=event.reply_to_is_own_message,
+            metadata={
+                "mentioned_user_ids": (
+                    None
+                    if mentioned_user_ids is None
+                    else tuple(mentioned_user_ids)
+                ),
+                "mentions_room": event.metadata.get("mentions_room"),
+            },
+            timestamp=event.timestamp,
+        )
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -7912,17 +8027,39 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
+        if existing is not None and len(
+            existing.metadata.get("_gateway_native_events", ())
+        ) >= self._MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH:
+            self._dispatch_full_gateway_native_batch(
+                key,
+                self._pending_text_batches,
+                self._pending_text_batch_tasks,
+            )
+            existing = None
         chunk_len = len(event.text or "")
+        native_snapshot = self._native_gateway_event_snapshot(event)
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            event.metadata["_gateway_native_events"] = (native_snapshot,)
             self._pending_text_batches[key] = event
         else:
+            existing.metadata["_gateway_native_events"] = (
+                *existing.metadata.get("_gateway_native_events", ()),
+                native_snapshot,
+            )
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            existing_mentions = set(existing.metadata.get("mentioned_user_ids", ()))
+            existing_mentions.update(event.metadata.get("mentioned_user_ids", ()))
+            existing.metadata["mentioned_user_ids"] = sorted(existing_mentions)
+            existing.metadata["mentions_room"] = bool(
+                existing.metadata.get("mentions_room")
+                or event.metadata.get("mentions_room")
+            )
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -7930,6 +8067,16 @@ class DiscordAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+
+    def _dispatch_full_gateway_native_batch(self, key, batches, tasks) -> None:
+        """Split a full aggregation batch without dropping native ingress."""
+        batch = batches.pop(key)
+        prior_task = tasks.pop(key, None)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+        dispatch_task = asyncio.create_task(self.handle_message(batch))
+        self._background_tasks.add(dispatch_task)
+        dispatch_task.add_done_callback(self._background_tasks.discard)
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.

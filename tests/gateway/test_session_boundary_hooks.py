@@ -125,8 +125,8 @@ async def test_finalize_before_reset(mock_invoke_hook):
 
 @pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
-async def test_shutdown_fires_finalize_for_active_agents(mock_invoke_hook):
-    """Gateway stop() must fire on_session_finalize for each active agent."""
+async def test_shutdown_invalidates_plugin_lifecycle_before_finalizing_agents(mock_invoke_hook):
+    """Gateway stop must invalidate plugin effects before agent finalization."""
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
@@ -154,10 +154,25 @@ async def test_shutdown_fires_finalize_for_active_agents(mock_invoke_hook):
     agent2.session_id = "sess-b"
     runner._running_agents = {"key-a": agent1, "key-b": agent2}
 
-    with patch("gateway.status.remove_pid_file"), \
-         patch("gateway.status.write_runtime_status"):
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch(
+            "hermes_cli.plugins.invoke_hook_async",
+            new_callable=AsyncMock,
+        ) as mock_invoke_hook_async,
+    ):
         await runner.stop()
 
+    mock_invoke_hook_async.assert_awaited_once_with(
+        "gateway_shutdown",
+        reason="stop",
+        raise_exceptions=False,
+        offload_sync=True,
+    )
+    hook_names = [call.args[0] for call in mock_invoke_hook.call_args_list]
+    assert "gateway_shutdown" not in hook_names
+    assert hook_names.count("on_session_finalize") == 2
     finalize_calls = [
         c for c in mock_invoke_hook.call_args_list
         if c[0][0] == "on_session_finalize"
@@ -176,6 +191,23 @@ async def test_hook_error_does_not_break_reset(mock_invoke_hook):
 
     # Should still return a success message despite hook errors
     assert "Session reset" in result or "New session" in result
+
+
+@pytest.mark.asyncio
+async def test_reset_notifies_gateway_session_cancel_hook():
+    """The confirmed reset path must notify async plugin-owned work."""
+    runner = _make_runner()
+    runner._notify_gateway_session_cancel = AsyncMock()
+    event = _make_event("/new")
+    session_key = build_session_key(event.source)
+
+    await runner._handle_reset_command(event)
+
+    runner._notify_gateway_session_cancel.assert_awaited_once_with(
+        session_key,
+        event.source,
+        reason="reset",
+    )
 
 
 @pytest.mark.asyncio

@@ -45,6 +45,7 @@ def _make_adapter():
     adapter._text_batch_delay_seconds = 0.1  # fast for tests
     adapter._active_sessions = {}
     adapter._pending_messages = {}
+    adapter._background_tasks = set()
     adapter._message_handler = AsyncMock()
     adapter.handle_message = AsyncMock()
     return adapter
@@ -95,6 +96,201 @@ class TestTextBatching:
         dispatched = adapter.handle_message.call_args[0][0]
         assert "part one" in dispatched.text
         assert "split by Telegram" in dispatched.text
+
+    @pytest.mark.asyncio
+    async def test_split_batch_retains_each_native_identity_and_mentions(self):
+        adapter = _make_adapter()
+        first = _make_event("ordinary")
+        first.message_id = "m1"
+        first.metadata["mentioned_user_ids"] = ()
+        second = _make_event("@bot")
+        second.message_id = "m2"
+        second.source.user_id = "user-2"
+        second.metadata["mentioned_user_ids"] = ("9",)
+
+        adapter._enqueue_text_event(first)
+        adapter._enqueue_text_event(second)
+        pending = next(iter(adapter._pending_text_batches.values()))
+        native = pending.metadata["_gateway_native_events"]
+
+        assert [(item.message_id, item.text) for item in native] == [
+            ("m1", "ordinary"),
+            ("m2", "@bot"),
+        ]
+        assert native[0].metadata["mentioned_user_ids"] == ()
+        assert native[1].metadata["mentioned_user_ids"] == ("9",)
+        assert native[1].source.user_id == "user-2"
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_unattested_username_mention_remains_unknown_in_snapshot(self):
+        adapter = _make_adapter()
+        event = _make_event("@someone")
+        event.message_id = "m-unknown"
+        event.metadata["mentioned_user_ids"] = None
+
+        adapter._enqueue_text_event(event)
+        pending = next(iter(adapter._pending_text_batches.values()))
+        native = pending.metadata["_gateway_native_events"]
+
+        assert native[0].metadata["mentioned_user_ids"] is None
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_native_event_batch_bound_splits_without_dropping_events(self):
+        adapter = _make_adapter()
+        adapter._MAX_GATEWAY_NATIVE_EVENTS_PER_BATCH = 2
+        events = []
+        for index in range(3):
+            event = _make_event(f"part-{index}")
+            event.message_id = f"m{index}"
+            events.append(event)
+
+        for event in events:
+            adapter._enqueue_text_event(event)
+        await asyncio.sleep(0)
+
+        adapter.handle_message.assert_awaited_once()
+        dispatched = adapter.handle_message.await_args.args[0]
+        assert [
+            item.message_id
+            for item in dispatched.metadata["_gateway_native_events"]
+        ] == ["m0", "m1"]
+        pending = adapter._pending_text_batches[
+            adapter._text_batch_key(events[-1])
+        ]
+        assert [
+            item.message_id for item in pending.metadata["_gateway_native_events"]
+        ] == ["m2"]
+
+        adapter.handle_message.reset_mock()
+        photos = []
+        for index in range(3):
+            photo = _make_event(f"photo-{index}")
+            photo.message_type = MessageType.PHOTO
+            photo.message_id = f"p{index}"
+            photo.media_urls = [f"file:///p{index}.jpg"]
+            photo.media_types = ["image/jpeg"]
+            photos.append(photo)
+            adapter._enqueue_photo_event("photos", photo)
+        await asyncio.sleep(0)
+
+        adapter.handle_message.assert_awaited_once()
+        dispatched_photo = adapter.handle_message.await_args.args[0]
+        assert [
+            item.message_id
+            for item in dispatched_photo.metadata["_gateway_native_events"]
+        ] == ["p0", "p1"]
+        assert [
+            item.message_id
+            for item in adapter._pending_photo_batches["photos"].metadata[
+                "_gateway_native_events"
+            ]
+        ] == ["p2"]
+
+        adapter.handle_message.reset_mock()
+        for index in range(3):
+            album = _make_event("")
+            album.message_type = MessageType.PHOTO
+            album.message_id = f"a{index}"
+            album.media_urls = [f"file:///a{index}.jpg"]
+            album.media_types = ["image/jpeg"]
+            await adapter._queue_media_group_event("album", album)
+        await asyncio.sleep(0)
+
+        adapter.handle_message.assert_awaited_once()
+        dispatched_album = adapter.handle_message.await_args.args[0]
+        assert [
+            item.message_id
+            for item in dispatched_album.metadata["_gateway_native_events"]
+        ] == ["a0", "a1"]
+        assert [
+            item.message_id
+            for item in adapter._media_group_events["album"].metadata[
+                "_gateway_native_events"
+            ]
+        ] == ["a2"]
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_photo_and_media_group_batches_retain_native_ids(self):
+        adapter = _make_adapter()
+
+        first_photo = _make_event("caption one")
+        first_photo.message_type = MessageType.PHOTO
+        first_photo.message_id = "p1"
+        first_photo.media_urls = ["file:///p1.jpg"]
+        first_photo.media_types = ["image/jpeg"]
+        second_photo = _make_event("caption two")
+        second_photo.message_type = MessageType.PHOTO
+        second_photo.message_id = "p2"
+        second_photo.media_urls = ["file:///p2.jpg"]
+        second_photo.media_types = ["image/jpeg"]
+        adapter._enqueue_photo_event("photos", first_photo)
+        adapter._enqueue_photo_event("photos", second_photo)
+        photo_native = adapter._pending_photo_batches["photos"].metadata[
+            "_gateway_native_events"
+        ]
+        assert [item.message_id for item in photo_native] == ["p1", "p2"]
+
+        first_album = _make_event("")
+        first_album.message_type = MessageType.PHOTO
+        first_album.message_id = "a1"
+        first_album.media_urls = ["file:///a1.jpg"]
+        first_album.media_types = ["image/jpeg"]
+        second_album = _make_event("")
+        second_album.message_type = MessageType.PHOTO
+        second_album.message_id = "a2"
+        second_album.media_urls = ["file:///a2.jpg"]
+        second_album.media_types = ["image/jpeg"]
+        await adapter._queue_media_group_event("album", first_album)
+        await adapter._queue_media_group_event("album", second_album)
+        album_native = adapter._media_group_events["album"].metadata[
+            "_gateway_native_events"
+        ]
+        assert [item.message_id for item in album_native] == ["a1", "a2"]
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_photo_and_media_group_native_routes_are_recovered_before_snapshot(self):
+        adapter = _make_adapter()
+        adapter.set_topic_recovery_fn(
+            lambda source: "canonical" if source.thread_id == "stale" else None
+        )
+
+        photo = _make_event("photo")
+        photo.message_type = MessageType.PHOTO
+        photo.source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="user-1",
+            thread_id="stale",
+        )
+        adapter._enqueue_photo_event("photos", photo)
+        photo_native = adapter._pending_photo_batches["photos"].metadata[
+            "_gateway_native_events"
+        ]
+
+        album = _make_event("album")
+        album.message_type = MessageType.PHOTO
+        album.source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="user-1",
+            thread_id="stale",
+        )
+        await adapter._queue_media_group_event("album", album)
+        album_native = adapter._media_group_events["album"].metadata[
+            "_gateway_native_events"
+        ]
+
+        assert photo.source.thread_id == "canonical"
+        assert photo_native[0].source.thread_id == "canonical"
+        assert album.source.thread_id == "canonical"
+        assert album_native[0].source.thread_id == "canonical"
+        await adapter.disconnect()
 
     @pytest.mark.asyncio
     async def test_three_way_split_aggregated(self):

@@ -2651,6 +2651,7 @@ _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
+GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS = 2.0
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
@@ -6214,6 +6215,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        # Busy ingress bypasses the cold _handle_message entry. Apply the
+        # existing pre-dispatch policy after authorization but before drain,
+        # approval, queue, steer, redirect, or interrupt effects. Mark it
+        # one-shot so a later queue fallback cannot invoke it twice.
+        if self._run_pre_gateway_dispatch(event):
+            return True
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self._adapter_for_source(event.source)
@@ -6335,6 +6343,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
             return False
+
+        # Slash commands that are not in the adapter's immediate bypass set
+        # remain queued for canonical runner command interception. They are
+        # never ordinary participant-visible conversation ingress.
+        if event.is_command():
+            return False
+
+        if self._external_drain_active:
+            logger.info(
+                "Refusing busy-session follow-up for %s — external drain active.",
+                session_key,
+            )
+            reply_anchor = self._reply_anchor_for_event(event)
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=(
+                    "⏳ This agent is draining for a maintenance action and isn't "
+                    "accepting new turns right now. It'll be back in a moment — "
+                    "please resend shortly."
+                ),
+                reply_to=reply_anchor,
+                metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+            )
+            return True
+
+        # Real busy-session ingress returns from BasePlatformAdapter after this
+        # handler. Invoke the post-authorization participant seam before any
+        # host queue, steer, redirect, or interrupt effect so ordinary live
+        # follow-ups are neither invisible nor duplicated.
+        if await self._run_gateway_message_hook(event, event.source, session_key):
+            return True
 
         running_agent = self._running_agents.get(session_key)
 
@@ -7590,10 +7629,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(getattr(source, "platform", None), "value", None),
                 )
                 continue
-            # Mark this replay so _handle_message does not queue it again while
-            # the restore gate remains closed for any fresh inbound arrivals.
+            # This is accepted live ingress, not recovery replay. Mark it only
+            # to bypass this still-closed startup gate; participant and ordinary
+            # dispatch must both see it exactly once.
             try:
-                setattr(event, "_hermes_startup_restore_replay", True)
+                setattr(event, "_hermes_startup_restore_queued_live", True)
             except Exception:
                 pass
             await adapter.handle_message(event)
@@ -9823,6 +9863,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            # Revoke route capabilities synchronously before awaiting any
+            # plugin or adapter code. Async shutdown hooks may persist/cancel
+            # plugin-owned work, but cannot use a retained delivery meanwhile.
+            _revoke_deliveries = getattr(
+                self,
+                "_revoke_all_gateway_deliveries",
+                None,
+            )
+            if callable(_revoke_deliveries):
+                _revoke_deliveries()
+            try:
+                from hermes_cli.plugins import invoke_hook_async as _invoke_hook_async
+
+                await _invoke_hook_async(
+                    "gateway_shutdown",
+                    reason="restart" if restart else "stop",
+                    raise_exceptions=False,
+                    offload_sync=True,
+                )
+            except Exception:
+                logger.exception("gateway_shutdown lifecycle hook failed")
+            # Shutdown acceptance closes only after every retained participant
+            # delivery is invalid AND every native invocation that already
+            # won the race has settled, including sessions with no currently
+            # running host agent. Already-started adapter work is not cancelled:
+            # cancellation is not proof that an external effect was aborted.
+            _revoke_and_settle = getattr(
+                self,
+                "_revoke_all_gateway_deliveries_and_settle",
+                None,
+            )
+            if callable(_revoke_and_settle):
+                await _revoke_and_settle()
+            elif callable(_revoke_deliveries):
+                _revoke_deliveries()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -10992,6 +11067,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return switched
 
+    def _run_pre_gateway_dispatch(self, event: MessageEvent) -> bool:
+        """Apply legacy pre-dispatch only when no V2 message seam is active."""
+        marker = "_hermes_pre_gateway_dispatch_done"
+        if getattr(event, marker, False):
+            return False
+        setattr(event, marker, True)
+        if (
+            getattr(event, "_hermes_startup_restore_replay", False)
+            or getattr(event, "_hermes_historical_replay", False)
+        ):
+            return False
+        try:
+            from hermes_cli.plugins import has_hook as _has_hook
+
+            if _has_hook("gateway_message") and _has_hook("pre_gateway_dispatch"):
+                logger.error(
+                    "Refusing ordinary ingress: gateway_message conflicts with "
+                    "legacy pre_gateway_dispatch"
+                )
+                return True
+        except Exception:
+            # Hook-registry uncertainty cannot authorize a legacy behavior-changing
+            # path in front of participant-owned attention.
+            logger.exception("Could not verify gateway-message hook isolation")
+            return True
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+            hook_results = _invoke_hook(
+                "pre_gateway_dispatch",
+                event=event,
+                gateway=self,
+                # Bare-runner tests and partially initialized gateways may not
+                # have attached a store yet; the legacy hook still has to run.
+                session_store=getattr(self, "session_store", None),
+            )
+        except Exception as hook_exc:
+            logger.warning("pre_gateway_dispatch invocation failed: %s", hook_exc)
+            hook_results = []
+
+        for result in hook_results:
+            if not isinstance(result, dict):
+                continue
+            action = result.get("action")
+            if action == "skip":
+                source = event.source
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    result.get("reason"),
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                )
+                return True
+            if action == "rewrite":
+                new_text = result.get("text")
+                if isinstance(new_text, str):
+                    event.text = new_text
+                break
+            if action == "allow":
+                break
+        return False
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -11051,6 +11188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(self, "_startup_restore_in_progress", False)
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not getattr(event, "_hermes_startup_restore_queued_live", False)
         ):
             self._queue_startup_restore_event(event)
             return None
@@ -11063,49 +11201,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not is_internal:
             self._scale_to_zero_note_real_inbound()
 
-        # Fire pre_gateway_dispatch plugin hook for user-originated messages.
-        # Plugins receive the MessageEvent and may return a dict influencing flow:
-        #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
-        #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
-        # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
-            try:
-                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
-                    "pre_gateway_dispatch",
-                    event=event,
-                    gateway=self,
-                    # getattr: bare-runner tests build GatewayRunner via
-                    # object.__new__ without __init__ (pitfall #17), and the
-                    # hook must not fail dispatch over a missing attribute.
-                    session_store=getattr(self, "session_store", None),
-                )
-            except Exception as _hook_exc:
-                logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
-
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
-                    )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+        # Apply the legacy user-ingress policy exactly once. Busy ingress may
+        # already have passed through this seam in BasePlatformAdapter.
+        if not is_internal and self._run_pre_gateway_dispatch(event):
+            return None
 
         if is_internal:
             pass
@@ -11160,6 +11259,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Resolve Telegram topic-mode routing before deriving the session key or
+        # exposing the immutable post-authorization plugin route. A stale or
+        # foreign thread ID must not escape through a route-bound capability.
+        recovered = None
+        if not event.is_command():
+            recovered = await asyncio.to_thread(
+                self._recover_telegram_topic_thread_id,
+                source,
+            )
+        if recovered is not None:
+            logger.info(
+                "telegram topic recovery: chat=%s user=%s %r -> %s",
+                source.chat_id,
+                source.user_id,
+                source.thread_id,
+                recovered,
+            )
+            source = dataclasses.replace(source, thread_id=recovered)
+            event = dataclasses.replace(event, source=source)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -11451,6 +11570,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # _interrupt_requested.  Force-clean _running_agents so the session
             # is unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
+                await self._notify_gateway_session_cancel(
+                    _quick_key,
+                    source,
+                    reason="stop",
+                )
                 await self._interrupt_and_clear_session(
                     _quick_key,
                     source,
@@ -11468,6 +11592,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # doesn't get re-processed as a user message after the
             # interrupt completes.
             if _cmd_def_inner and _cmd_def_inner.name == "new":
+                # Notify plugin-owned work before the hard host interruption.
+                # The reset handler is told not to emit the same boundary twice.
+                await self._notify_gateway_session_cancel(
+                    _quick_key,
+                    source,
+                    reason="reset",
+                )
                 # Clear any pending messages so the old text doesn't replay
                 await self._interrupt_and_clear_session(
                     _quick_key,
@@ -11477,7 +11608,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
-                return await self._handle_reset_command(event)
+                return await self._handle_reset_command(event, cancel_notified=True)
 
             # /queue <prompt> — queue without interrupting.
             # Semantics: each /queue invocation produces its own full agent
@@ -11678,6 +11809,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
 
+            # Ordinary user messages reach the plugin seam only after access
+            # checks and every active-session control intercept above. During
+            # shutdown draining, no participant hook may create side effects.
+            if self._draining:
+                if self._queue_during_drain_enabled():
+                    self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    if self._queue_during_drain_enabled()
+                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                )
+            if (
+                not is_internal
+                and not event.is_command()
+                and await self._run_gateway_message_hook(event, source, _quick_key)
+            ):
+                return None
+
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
@@ -11733,14 +11882,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         merge_text=True,
                     )
                 return None
-            if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-                )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -12568,6 +12709,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            # This is the cold-session counterpart to the active-session seam.
+            # Claim before awaiting a plugin so a pass-through hook cannot
+            # reopen the duplicate-agent race protected by the sentinel.
+            if (
+                not is_internal
+                and not event.is_command()
+                and await self._run_gateway_message_hook(event, source, _quick_key)
+            ):
+                return None
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -13153,6 +13303,464 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _source_for_session_cancel(
+        self,
+        session_key: str,
+        fallback: SessionSource,
+    ) -> SessionSource:
+        """Recover the target route identity for a session cancellation."""
+        cached = self._get_cached_session_source(session_key)
+        if cached is not None:
+            return cached
+        thread_id = str(fallback.thread_id or "")
+        marker = f":{thread_id}:" if thread_id else ""
+        if marker and marker in session_key:
+            target_user = session_key.rsplit(marker, 1)[-1]
+            if target_user and ":" not in target_user:
+                return dataclasses.replace(
+                    fallback,
+                    user_id=target_user,
+                    user_id_alt=None,
+                )
+        return fallback
+
+    async def _run_gateway_message_hook(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> bool:
+        """Run ordinary-message hooks in the route's profile scope.
+
+        Platform adapters may batch adjacent native messages for the host agent.
+        The participant seam expands retained native snapshots so event IDs,
+        route actors, and mention facts remain attributable to each native event.
+        """
+        if getattr(event, "_hermes_startup_restore_replay", False) or getattr(
+            event,
+            "_hermes_historical_replay",
+            False,
+        ):
+            # Recovery is context-only.  Returning True terminally consumes the
+            # replay at both cold and busy call sites; False would bypass only
+            # participant hooks and fall through to the ordinary Hermes agent.
+            return True
+
+        async def _run_scoped() -> bool:
+            native_events = event.metadata.get("_gateway_native_events", ())
+            if native_events:
+                if not isinstance(native_events, tuple) or not all(
+                    isinstance(item, MessageEvent) for item in native_events
+                ):
+                    logger.warning(
+                        "invalid native-event batch metadata; suppressing normal dispatch"
+                    )
+                    return True
+                suppressed = False
+                for native_event in native_events:
+                    # Continue through the entire batch even after one terminal
+                    # result so no authorized native identity disappears.
+                    suppressed = (
+                        await self._run_gateway_message_hook_scoped(
+                            native_event,
+                            native_event.source,
+                            session_key,
+                        )
+                        or suppressed
+                    )
+                return suppressed
+            return await self._run_gateway_message_hook_scoped(
+                event,
+                source,
+                session_key,
+            )
+
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await _run_scoped()
+        return await _run_scoped()
+
+    async def _run_gateway_message_hook_scoped(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> bool:
+        """Return True when an ordinary user-message hook suppresses dispatch."""
+        result_marker = "_hermes_gateway_message_hook_result"
+        prior_result = getattr(event, result_marker, None)
+        if prior_result == "suppress":
+            return True
+        if prior_result == "continue":
+            return False
+        if prior_result == "pending":
+            # The same mutable host event must never enter participant hooks
+            # concurrently. Fail closed until its first invocation resolves.
+            return True
+
+        def _finish(suppress: bool) -> bool:
+            setattr(event, result_marker, "suppress" if suppress else "continue")
+            return suppress
+
+        from gateway.message_hooks import (
+            GatewayDelivery,
+            GatewayMessageEvent,
+            GatewayMessageRoute,
+        )
+        from gateway.platforms.base import SendResult
+        from hermes_cli.plugins import invoke_hook_async
+
+        adapter = self._adapter_for_source(source)
+        delivery_platform = source.platform
+        delivery_chat_id = str(source.chat_id)
+        delivery_room_id = delivery_chat_id
+        if delivery_platform == Platform.TELEGRAM and source.thread_id is not None:
+            delivery_thread_id = str(source.thread_id)
+            if delivery_thread_id:
+                delivery_room_id = f"{delivery_chat_id}:topic:{delivery_thread_id}"
+        delivery_message_id = str(event.message_id or "")
+        delivery_metadata = self._thread_metadata_for_source(source, event.message_id)
+        if delivery_room_id != delivery_chat_id:
+            delivery_metadata = dict(delivery_metadata or {})
+            delivery_metadata["_hermes_require_topic_route"] = True
+        delivery_via_relay = (
+            getattr(source, "delivered_via_upstream_relay", False) is True
+        )
+        delivery_profile = str(getattr(source, "profile", None) or "")
+        if not delivery_profile:
+            from hermes_cli.profiles import get_active_profile_name
+
+            delivery_profile = str(get_active_profile_name())
+        authenticated_actor: Optional[str] = None
+        actor_identity: Any = getattr(adapter, "authenticated_actor_id", None)
+        if callable(actor_identity):
+            try:
+                authenticated_actor = str(actor_identity() or "") or None
+            except Exception:
+                authenticated_actor = None
+        if delivery_via_relay:
+            delivery_metadata = dict(delivery_metadata or {})
+            if source.scope_id:
+                delivery_metadata["scope_id"] = str(source.scope_id)
+            if source.user_id:
+                delivery_metadata["user_id"] = str(source.user_id)
+
+        async def _send_to_source(content: str):
+            if adapter is None:
+                return SendResult(success=False)
+            metadata = dict(delivery_metadata) if delivery_metadata else None
+            if delivery_via_relay:
+                send_for_platform: Any = getattr(adapter, "send_for_platform", None)
+                if not callable(send_for_platform):
+                    return SendResult(success=False)
+                return await send_for_platform(
+                    delivery_platform,
+                    delivery_chat_id,
+                    content,
+                    metadata=metadata,
+                )
+            return await adapter.send(
+                delivery_chat_id,
+                content,
+                metadata=metadata,
+            )
+
+        async def _reply_to_source(content: str):
+            if adapter is None or not delivery_message_id:
+                return SendResult(success=False)
+            metadata = dict(delivery_metadata) if delivery_metadata else None
+            if delivery_via_relay:
+                send_for_platform: Any = getattr(adapter, "send_for_platform", None)
+                if not callable(send_for_platform):
+                    return SendResult(success=False)
+                return await send_for_platform(
+                    delivery_platform,
+                    delivery_chat_id,
+                    content,
+                    reply_to=delivery_message_id,
+                    metadata=metadata,
+                )
+            return await adapter.send(
+                delivery_chat_id,
+                content,
+                reply_to=delivery_message_id,
+                metadata=metadata,
+            )
+
+        async def _react_to_source(reaction: str, operation: str):
+            if adapter is None or delivery_via_relay or not delivery_message_id:
+                return SendResult(success=False)
+            react: Any = getattr(adapter, "react", None)
+            if not callable(react):
+                return SendResult(success=False)
+            if delivery_platform == Platform.TELEGRAM:
+                metadata = dict(delivery_metadata) if delivery_metadata else None
+                return await react(
+                    delivery_chat_id,
+                    delivery_message_id,
+                    reaction,
+                    operation=operation,
+                    metadata=metadata,
+                )
+            return await react(
+                delivery_chat_id,
+                delivery_message_id,
+                reaction,
+                operation=operation,
+            )
+
+        def _stop_after_terminal_result(result: Any) -> bool:
+            if not isinstance(result, dict):
+                return True
+            decision = str(result.get("decision", "")).strip().lower()
+            return decision not in {"continue", "pass"}
+
+        # Register each ordinary event's immutable route capability separately.
+        # New ingress may replace the scheduler's newest pending anchor, but it
+        # does not cancel an already-active participant turn.  Capabilities are
+        # revoked only by consumption, expiry, or an explicit session boundary.
+        delivery = GatewayDelivery(
+            _send_to_source,
+            reply_callback=_reply_to_source,
+            react_callback=_react_to_source,
+            platform=str(getattr(delivery_platform, "value", delivery_platform)),
+            room_id=delivery_room_id,
+            profile=delivery_profile,
+            self_actor_id=authenticated_actor,
+            source_message_id=delivery_message_id or None,
+        )
+        self._register_gateway_delivery(session_key, delivery)
+        setattr(event, result_marker, "pending")
+        try:
+            results = await invoke_hook_async(
+                "gateway_message",
+                event=GatewayMessageEvent.from_event(event),
+                route=GatewayMessageRoute.from_source(
+                    source,
+                    session_key=session_key,
+                ),
+                delivery=delivery,
+                raise_exceptions=True,
+                stop_when=_stop_after_terminal_result,
+            )
+        except asyncio.CancelledError:
+            await delivery._settle_revocation()
+            if getattr(event, result_marker, None) == "pending":
+                delattr(event, result_marker)
+            raise
+        except Exception as exc:
+            await delivery._settle_revocation()
+            logger.warning(
+                "gateway_message hook failed; suppressing normal dispatch (%s)",
+                type(exc).__name__,
+            )
+            return _finish(True)
+
+        for result in results:
+            if not isinstance(result, dict):
+                await delivery._settle_revocation()
+                logger.warning(
+                    "gateway_message hook returned invalid terminal result type %s; "
+                    "suppressing normal dispatch",
+                    type(result).__name__,
+                )
+                return _finish(True)
+            decision = str(result.get("decision", "")).strip().lower()
+            if decision in {"handled", "suppress"}:
+                return _finish(True)
+            if decision in {"continue", "pass"}:
+                continue
+            await delivery._settle_revocation()
+            logger.warning(
+                "gateway_message hook returned an invalid decision; "
+                "suppressing normal dispatch"
+            )
+            return _finish(True)
+        await delivery._settle_revocation()
+        return _finish(False)
+
+    def _register_gateway_delivery(self, session_key: str, delivery: Any) -> None:
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if deliveries is None:
+            deliveries = {}
+            self._gateway_deliveries_by_session = deliveries
+        deliveries.setdefault(str(session_key), set()).add(delivery)
+
+    def _revoke_gateway_deliveries(self, session_key: str) -> None:
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if not deliveries:
+            return
+        for delivery in deliveries.pop(str(session_key), ()):
+            try:
+                delivery._revoke()
+            except Exception:
+                logger.debug("gateway delivery revocation failed", exc_info=True)
+
+    def _begin_revoking_gateway_deliveries(
+        self, session_key: str
+    ) -> "list[asyncio.Task[None]]":
+        """Synchronously invalidate one session's deliveries; return workers.
+
+        The returned workers own any native invocations that already won
+        the race against revocation. A lifecycle boundary must not be
+        considered returned until those workers settle.
+        """
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if not deliveries:
+            return []
+        workers: "list[asyncio.Task[None]]" = []
+        for delivery in deliveries.pop(str(session_key), ()):
+            try:
+                worker = delivery._begin_revocation()
+            except Exception:
+                logger.debug("gateway delivery revocation failed", exc_info=True)
+                continue
+            if worker is not None:
+                workers.append(worker)
+        return workers
+
+    def _begin_revoking_all_gateway_deliveries(self) -> "list[asyncio.Task[None]]":
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if not deliveries:
+            return []
+        workers: "list[asyncio.Task[None]]" = []
+        for session_key in tuple(deliveries):
+            workers.extend(self._begin_revoking_gateway_deliveries(session_key))
+        return workers
+
+    async def _await_gateway_delivery_settlement(
+        self, workers: "list[asyncio.Task[None]]"
+    ) -> None:
+        """Await in-flight native effects before a lifecycle boundary returns.
+
+        Each worker is awaited shielded so cancellation of the boundary
+        path itself cannot detach the settlement wait: a boundary never
+        returns while a native effect it revoked is still live. Cancellation
+        propagation is deferred across the whole worker collection, rather
+        than escaping after the first settled worker and abandoning later
+        effects. A worker that unwinds into this wait from its own callback
+        frame is skipped to avoid self-await deadlock.
+        """
+        if not workers:
+            return
+        from gateway.message_hooks import _await_delivery_settlement
+
+        owner = asyncio.current_task()
+        deferred_cancel = False
+        for worker in workers:
+            try:
+                await _await_delivery_settlement(worker, owner=owner)
+            except asyncio.CancelledError:
+                deferred_cancel = True
+            except Exception:
+                logger.debug(
+                    "gateway delivery settlement wait failed", exc_info=True
+                )
+        if deferred_cancel:
+            raise asyncio.CancelledError()
+
+    def _revoke_all_gateway_deliveries(self) -> None:
+        deliveries = getattr(self, "_gateway_deliveries_by_session", None)
+        if not deliveries:
+            return
+        for session_key in tuple(deliveries):
+            self._revoke_gateway_deliveries(session_key)
+
+    async def _revoke_all_gateway_deliveries_and_settle(self) -> None:
+        """Shutdown acceptance: invalidate every retained delivery, then wait.
+
+        Every retained participant delivery is invalid synchronously; any
+        native invocation that already won the race must settle before
+        shutdown acceptance returns, so no revoked effect can remain live
+        past the boundary.
+        """
+        workers = self._begin_revoking_all_gateway_deliveries()
+        await self._await_gateway_delivery_settlement(workers)
+
+    async def _revoke_gateway_deliveries_and_settle(
+        self, session_key: str
+    ) -> None:
+        """Invalidate one session's deliveries, then await in-flight effects."""
+        workers = self._begin_revoking_gateway_deliveries(session_key)
+        await self._await_gateway_delivery_settlement(workers)
+
+    async def _notify_gateway_session_cancel(
+        self,
+        session_key: str,
+        source: SessionSource,
+        *,
+        reason: str,
+    ) -> None:
+        """Invalidate effects, settle in-flight native calls, then notify.
+
+        Invalidation is authoritative and synchronous. The bounded plugin
+        observer below cannot delay it or keep a stale route capability
+        live. A native invocation that already won the race against
+        revocation is awaited before this boundary returns, even if the
+        third-party callback suppresses cancellation; only self-await from
+        inside the delivery callback frame skips the settlement wait.
+        """
+        from gateway.message_hooks import GatewayMessageRoute
+        from hermes_cli.plugins import invoke_hook_async
+
+        workers = self._begin_revoking_gateway_deliveries(session_key)
+        await self._await_gateway_delivery_settlement(workers)
+
+        async def _invoke_cancel_observer() -> None:
+            observer_task = asyncio.create_task(
+                invoke_hook_async(
+                    "gateway_session_cancel",
+                    route=GatewayMessageRoute.from_source(
+                        source,
+                        session_key=session_key,
+                    ),
+                    reason=str(reason),
+                    offload_callbacks=True,
+                )
+            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {observer_task},
+                    timeout=GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                observer_task.cancel()
+                observer_task.add_done_callback(consume_detached_task_result)
+                raise
+            if not done:
+                # asyncio.wait_for() cannot enforce a hard boundary when a
+                # third-party coroutine suppresses cancellation: it waits for
+                # cancellation cleanup forever. Leave the same-loop observer
+                # detached instead; delivery revocation above is already the
+                # authoritative stale-effect fence.
+                observer_task.add_done_callback(consume_detached_task_result)
+                raise TimeoutError
+            await observer_task
+
+        try:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    await _invoke_cancel_observer()
+            else:
+                await _invoke_cancel_observer()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            logger.warning(
+                "gateway_session_cancel hook exceeded %.1fs for %s; "
+                "continuing the host session boundary",
+                GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS,
+                session_key,
+            )
+        except Exception as exc:
+            logger.warning(
+                "gateway_session_cancel hook failed for %s (%s)",
+                session_key,
+                type(exc).__name__,
+            )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -13166,22 +13774,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
 
-        # Get or create session
-        # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
-        # last-active topic so a cross-topic Reply or stripped plain reply
-        # doesn't fragment the conversation across sessions.
-        recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
-        if recovered is not None:
-            logger.info(
-                "telegram topic recovery: chat=%s user=%s %r -> %s",
-                source.chat_id, source.user_id, source.thread_id, recovered,
-            )
-            source = dataclasses.replace(source, thread_id=recovered)
-            try:
-                event.source = source
-            except Exception:
-                pass
-
+        # Get or create session. Telegram topic-mode recovery has already run
+        # before the post-authorization hook and session-key derivation.
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         pinned_session_id = str(
@@ -23425,6 +24019,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _interrupt_detected.set()
 
             if _inactivity_timeout:
+                # A timed-out turn is a session boundary for plugin-owned
+                # route capabilities: retained deliveries must be invalid
+                # before the timeout turn is considered returned, exactly as
+                # with an explicit stop/reset or shutdown. An in-flight
+                # native invocation that already won the race is awaited so
+                # its effect cannot remain live past this boundary.
+                if session_key:
+                    _timeout_workers = self._begin_revoking_gateway_deliveries(
+                        session_key
+                    )
+                    await self._await_gateway_delivery_settlement(
+                        _timeout_workers
+                    )
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
                 _activity = {}

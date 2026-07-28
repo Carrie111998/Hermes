@@ -607,19 +607,22 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
 | [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`) | `session_id: str, platform: str` | ignored |
+| [`gateway_message`](/user-guide/features/hooks#gateway_message) | Authorized, routed ordinary gateway message after control interception and before normal agent dispatch | `event: GatewayMessageEvent, route: GatewayMessageRoute, delivery: GatewayDelivery` | `{"decision": "handled" \| "suppress" \| "continue" \| "pass"}` or `None` when unmatched |
+| [`gateway_session_cancel`](/user-guide/features/hooks#gateway_session_cancel) | Confirmed gateway `/stop` or `/new`/reset boundary | `route: GatewayMessageRoute, reason: str` | ignored |
+| [`gateway_shutdown`](/user-guide/features/hooks#gateway_shutdown) | Stop/restart after delivery revocation, before adapter teardown | `reason: "stop" \| "restart"` | ignored |
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |
 
-Most hooks are fire-and-forget observers — their return values are ignored. The exception is `pre_llm_call`, which can inject context into the conversation.
+Most hooks are fire-and-forget observers — their return values are ignored. `pre_llm_call` can inject context into the conversation, and `gateway_message` makes a terminal handled/continue decision before normal gateway dispatch.
 
-All callbacks should accept `**kwargs` for forward compatibility. If a hook callback crashes, it's logged and skipped. Other hooks and the agent continue normally.
+All callbacks should accept `**kwargs` for forward compatibility. Observer-hook failures are logged and skipped. A matched `gateway_message` failure or invalid terminal result fails closed and suppresses normal-agent dispatch; task cancellation still propagates.
 
 The kanban lifecycle hooks fire **after** the board DB change commits, so a callback always sees durable state and can never hold the SQLite write lock. Because kanban workers run as separate `hermes -p <profile> chat -q` subprocesses, `kanban_task_claimed` fires in the **dispatcher** process while `kanban_task_completed` / `kanban_task_blocked` fire in the **worker** process — hook in the dispatcher to observe every transition centrally, or in the worker for per-task in-session context.
 
 ### `pre_llm_call` context injection
 
-This is the only hook whose return value matters. When a `pre_llm_call` callback returns a dict with a `"context"` key (or a plain string), Hermes injects that text into the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context.
+For `pre_llm_call`, a callback return value can inject context into the current turn. When it returns a dict with a `"context"` key (or a plain string), Hermes prepends that text to the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context. (`gateway_message` has its separate terminal-decision contract above.)
 
 #### Return format
 
