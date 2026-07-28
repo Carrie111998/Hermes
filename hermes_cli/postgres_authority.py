@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -435,6 +435,68 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ('hermes.calendar', 'Calendar', 'Calendar integration (Google, Outlook)', 'productivity', 'hermes', '1.0.0', 'builtin', 'hermes_cli.tools.calendar'),
             ('hermes.email', 'Email', 'Email send/receive integration', 'communication', 'hermes', '1.0.0', 'builtin', 'hermes_cli.tools.email')
         ON CONFLICT (listing_id) DO NOTHING;
+        """,
+    ),
+    # v8 → v9: external integrations framework (RFC-0.26.0).
+    (
+        8,
+        """
+        CREATE TABLE IF NOT EXISTS integration_credentials (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            integration_id  TEXT        NOT NULL,
+            provider        TEXT        NOT NULL,
+            credential_type TEXT        NOT NULL
+                CHECK (credential_type IN ('oauth2', 'api_key', 'smtp', 'webhook')),
+            encrypted_data  TEXT        NOT NULL,
+            scopes          TEXT[]      NOT NULL DEFAULT '{}',
+            expires_at      TIMESTAMPTZ,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT uq_credential_tenant_integration
+                UNIQUE (tenant_id, integration_id, provider)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_credentials_tenant
+            ON integration_credentials(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS integration_webhooks (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            integration_id  TEXT        NOT NULL,
+            provider        TEXT        NOT NULL,
+            event_type      TEXT        NOT NULL,
+            webhook_url     TEXT        NOT NULL,
+            secret          TEXT        NOT NULL DEFAULT '',
+            active          BOOLEAN     NOT NULL DEFAULT true,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT uq_webhook_tenant_event
+                UNIQUE (tenant_id, integration_id, event_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_webhooks_tenant
+            ON integration_webhooks(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS integration_events (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            integration_id  TEXT        NOT NULL,
+            provider        TEXT        NOT NULL,
+            event_type      TEXT        NOT NULL,
+            event_id        TEXT        NOT NULL,
+            payload         JSONB       NOT NULL DEFAULT '{}',
+            processed       BOOLEAN     NOT NULL DEFAULT false,
+            received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT uq_event_idempotency
+                UNIQUE (tenant_id, integration_id, event_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_tenant_unprocessed
+            ON integration_events(tenant_id, processed)
+            WHERE processed = false;
         """,
     ),
 ]
@@ -2488,6 +2550,241 @@ def get_reviews(
 
 
 # ---------------------------------------------------------------------------
+# Integrations: Credentials
+# ---------------------------------------------------------------------------
+
+
+def store_credential(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    integration_id: str,
+    provider: str,
+    credential_type: str,
+    data: str,
+    scopes: list[str] | None = None,
+    expires_at: float | None = None,
+) -> dict:
+    """Store an integration credential (upserts on conflict)."""
+    exp_dt = _ts(expires_at) if expires_at else None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO integration_credentials
+                (tenant_id, integration_id, provider, credential_type,
+                 encrypted_data, scopes, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, integration_id, provider) DO UPDATE SET
+                credential_type = EXCLUDED.credential_type,
+                encrypted_data = EXCLUDED.encrypted_data,
+                scopes = EXCLUDED.scopes,
+                expires_at = EXCLUDED.expires_at,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            (str(tenant_id), integration_id, provider, credential_type,
+             data, scopes or [], exp_dt),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def get_credential(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    integration_id: str,
+    provider: str,
+) -> Optional[dict]:
+    """Get a stored credential."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM integration_credentials "
+            "WHERE tenant_id = %s AND integration_id = %s AND provider = %s",
+            (str(tenant_id), integration_id, provider),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def delete_credential(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    integration_id: str,
+    provider: str,
+) -> bool:
+    """Delete a credential."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM integration_credentials "
+            "WHERE tenant_id = %s AND integration_id = %s AND provider = %s",
+            (str(tenant_id), integration_id, provider),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def list_credentials(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+) -> list[dict]:
+    """List all credentials for a tenant (without encrypted_data)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, tenant_id, integration_id, provider, credential_type, "
+            "scopes, expires_at, created_at, updated_at "
+            "FROM integration_credentials WHERE tenant_id = %s "
+            "ORDER BY created_at DESC",
+            (str(tenant_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Integrations: Webhooks
+# ---------------------------------------------------------------------------
+
+
+def register_webhook(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    integration_id: str,
+    provider: str,
+    event_type: str,
+    webhook_url: str,
+    secret: str = "",
+) -> dict:
+    """Register a webhook subscription (upserts)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO integration_webhooks
+                (tenant_id, integration_id, provider, event_type, webhook_url, secret)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, integration_id, event_type) DO UPDATE SET
+                webhook_url = EXCLUDED.webhook_url,
+                secret = EXCLUDED.secret,
+                provider = EXCLUDED.provider,
+                active = true
+            RETURNING *
+            """,
+            (str(tenant_id), integration_id, provider, event_type, webhook_url, secret),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def deactivate_webhook(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    integration_id: str,
+    event_type: str,
+) -> bool:
+    """Deactivate a webhook subscription."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE integration_webhooks SET active = false "
+            "WHERE tenant_id = %s AND integration_id = %s AND event_type = %s "
+            "AND active = true",
+            (str(tenant_id), integration_id, event_type),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def list_webhooks(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+) -> list[dict]:
+    """List all active webhooks for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM integration_webhooks "
+            "WHERE tenant_id = %s AND active = true ORDER BY created_at DESC",
+            (str(tenant_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Integrations: Events
+# ---------------------------------------------------------------------------
+
+
+def record_integration_event(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    integration_id: str,
+    provider: str,
+    event_type: str,
+    event_id: str,
+    payload: dict[str, Any],
+) -> bool:
+    """Record an inbound integration event. Idempotent via (tenant, integration, event_id).
+
+    Returns True if newly recorded, False if duplicate.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO integration_events
+                (tenant_id, integration_id, provider, event_type, event_id, payload)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, integration_id, event_id) DO NOTHING
+            RETURNING id
+            """,
+            (str(tenant_id), integration_id, provider, event_type, event_id,
+             json.dumps(payload)),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return row is not None
+
+
+def get_unprocessed_events(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    limit: int = 50,
+) -> list[dict]:
+    """Get unprocessed events for a tenant, oldest first."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM integration_events "
+            "WHERE tenant_id = %s AND processed = false "
+            "ORDER BY received_at ASC LIMIT %s",
+            (str(tenant_id), limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def mark_event_processed(
+    conn: "psycopg.Connection",
+    *,
+    event_id_internal: int,
+) -> bool:
+    """Mark an event as processed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE integration_events SET processed = true WHERE id = %s AND processed = false",
+            (event_id_internal,),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+# ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 
@@ -2563,6 +2860,16 @@ __all__ = [
     "mark_invoice_paid",
     "get_invoice",
     "list_invoices",
+    "store_credential",
+    "get_credential",
+    "delete_credential",
+    "list_credentials",
+    "register_webhook",
+    "deactivate_webhook",
+    "list_webhooks",
+    "record_integration_event",
+    "get_unprocessed_events",
+    "mark_event_processed",
     "publish_listing",
     "get_listing",
     "search_listings",
