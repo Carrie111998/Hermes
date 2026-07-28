@@ -1,8 +1,8 @@
 # Charterforge Roadmap to v1.0.0
 
-**Current Version:** v0.23.0 (2026-07-28)  
-**Release Type:** Multi-tenant isolation with governed worker runtime  
-**Gap:** Billing engine, marketplace, and production hardening
+**Current Version:** v0.25.0 (2026-07-28)  
+**Release Type:** Agent marketplace with tool/skill registry  
+**Gap:** External integrations, monitoring, disaster recovery, security hardening
 
 ---
 
@@ -14,9 +14,9 @@
 | **0.21.0** | Payment Rails | ≥3 payment rail plugins working | ✅ Released |
 | **0.22.0** | Postgres Authority Store | HA-capable authority database | ✅ Released |
 | **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | ✅ Released |
-| **0.24.0** | Billing Engine | Usage metering + invoicing | ✅ Complete |
-| **0.25.0** | Agent Marketplace | Tool/skill discovery + installation | 🔲 |
-| **0.26.0** | External Integrations | Email, calendar, CRM, project tools | 🔲 |
+| **0.24.0** | Billing Engine | Usage metering + invoicing | ✅ Released |
+| **0.25.0** | Agent Marketplace | Tool/skill discovery + installation | ✅ Released |
+| **0.26.0** | External Integrations | Email, calendar, CRM, project tools | 🟡 Next |
 | **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | 🔲 |
 | **0.28.0** | Disaster Recovery | Backup/restore, failover drill | 🔲 |
 | **0.29.0** | Security Hardening | Audit logging, secret management | 🔲 |
