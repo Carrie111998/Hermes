@@ -2913,8 +2913,9 @@ async function applyUpdates(opts = {}) {
     }, UPDATE_HANDOFF_DWELL_MS)
 
     return { ok: true, handedOff: true, updater }
-  } finally {
+  } catch (err) {
     updateInFlight = false
+    throw err
   }
 }
 
@@ -2922,6 +2923,12 @@ async function handOffWindowsBootstrapRecovery(reason) {
   if (!IS_WINDOWS || !IS_PACKAGED) {
     return false
   }
+
+  if (updateInFlight) {
+    return false
+  }
+
+  updateInFlight = true
 
   const updater = resolveUpdaterBinary()
 
