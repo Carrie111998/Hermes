@@ -11,6 +11,8 @@ Pure-function / config-driven; no live model calls.
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from agent import background_review as br
 
 
@@ -76,6 +78,28 @@ def test_routing_to_different_model_marks_routed_and_resolves_credentials():
     assert rt["max_tokens"] == 2048
 
 
+def test_routed_review_honors_task_output_cap():
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "custom",
+        "model": "qwen3.5:9b-s1-64k",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "max_tokens": 512,
+    }}}
+    fake_rp = {
+        "provider": "custom",
+        "api_key": "no-key-required",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "api_mode": "chat_completions",
+        "max_output_tokens": 8192,
+    }
+    with patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_rp):
+        rt = br._resolve_review_runtime(agent)
+    assert rt["routed"] is True
+    assert rt["max_tokens"] == 512
+
+
 def test_unrouted_runtime_keeps_parent_pool_and_overrides():
     agent = _FakeAgent()
     agent._credential_pool = "parent-pool"
@@ -109,6 +133,38 @@ def test_routing_resolution_failure_falls_back_to_parent():
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is False
     assert rt["provider"] == "openai-codex"
+
+
+def test_routing_resolution_failure_with_none_fails_closed():
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "custom",
+        "model": "qwen2.5:3b-s1-review-64k",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "fallback_policy": "none",
+    }}}
+    with patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               side_effect=RuntimeError("local runtime unavailable")), \
+         pytest.raises(RuntimeError, match="fallback_policy=none"):
+        br._resolve_review_runtime(agent)
+
+
+def test_routing_invalid_fallback_policy_fails_closed(caplog):
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "custom",
+        "model": "qwen2.5:3b-s1-review-64k",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "fallback_policy": "surprise-me",
+    }}}
+    with patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               side_effect=RuntimeError("local runtime unavailable")), \
+         caplog.at_level("WARNING"), \
+         pytest.raises(RuntimeError, match="fallback_policy=none"):
+        br._resolve_review_runtime(agent)
+    assert "invalid fallback_policy" in caplog.text
 
 
 # ---------------------------------------------------------------------------

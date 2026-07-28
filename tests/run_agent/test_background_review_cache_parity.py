@@ -296,3 +296,8 @@ def test_routed_review_fork_does_not_inherit_reasoning_config():
         "be invalid for the routed model/provider — it must be omitted so "
         "the fork uses provider defaults."
     )
+    assert init_kwargs.get("enabled_toolsets") == ["memory", "skills"], (
+        "A routed review has no parent-cache parity to preserve and must not "
+        "cold-write the parent's unrelated tool catalog."
+    )
+    assert init_kwargs.get("disabled_toolsets") is None

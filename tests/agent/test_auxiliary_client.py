@@ -33,6 +33,7 @@ from agent.auxiliary_client import (
     _resolve_auto,
     _resolve_task_provider_model,
     _resolve_xai_oauth_for_aux,
+    _task_provider_fallback_enabled,
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
 )
@@ -96,6 +97,148 @@ def codex_auth_dir(tmp_path, monkeypatch):
         lambda: "codex-test-token-abc123",
     )
     return codex_dir
+
+
+class TestAuxiliaryFailClosedFallbackPolicy:
+    def test_none_disables_cross_provider_fallback(self):
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_policy": "none"},
+        ):
+            assert _task_provider_fallback_enabled("compression") is False
+
+    def test_unknown_policy_fails_closed(self, caplog):
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_policy": "typo"},
+        ), caplog.at_level(logging.WARNING):
+            assert _task_provider_fallback_enabled("compression") is False
+        assert "invalid fallback_policy" in caplog.text
+
+    def test_sync_provider_failure_never_crosses_provider(self):
+        primary = MagicMock()
+        primary.base_url = "http://127.0.0.1:11434/v1"
+        primary.chat.completions.create.side_effect = Exception("Connection error")
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "custom",
+                    "qwen3.5:9b",
+                    "http://127.0.0.1:11434/v1",
+                    None,
+                    None,
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value={"fallback_policy": "none"},
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "qwen3.5:9b"),
+            ),
+            patch(
+                "agent.auxiliary_client._transient_retry_count",
+                return_value=0,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+            ) as configured_fallback,
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+            ) as main_fallback,
+            patch(
+                "agent.auxiliary_client._try_payment_fallback",
+            ) as discovery_fallback,
+            pytest.raises(Exception, match="Connection error"),
+        ):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        configured_fallback.assert_not_called()
+        main_fallback.assert_not_called()
+        discovery_fallback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_provider_failure_never_crosses_provider(self):
+        primary = MagicMock()
+        primary.base_url = "http://127.0.0.1:11434/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=Exception("Connection error")
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "custom",
+                    "qwen3.5:9b",
+                    "http://127.0.0.1:11434/v1",
+                    None,
+                    None,
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value={"fallback_policy": "none"},
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "qwen3.5:9b"),
+            ),
+            patch(
+                "agent.auxiliary_client._transient_retry_count",
+                return_value=0,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+            ) as configured_fallback,
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+            ) as main_fallback,
+            patch(
+                "agent.auxiliary_client._try_payment_fallback",
+            ) as discovery_fallback,
+            pytest.raises(Exception, match="Connection error"),
+        ):
+            await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        configured_fallback.assert_not_called()
+        main_fallback.assert_not_called()
+        discovery_fallback.assert_not_called()
+
+    def test_auto_resolution_stops_before_discovery_chain(self):
+        with (
+            patch(
+                "agent.auxiliary_client._read_main_provider",
+                return_value="custom",
+            ),
+            patch(
+                "agent.auxiliary_client._read_main_model",
+                return_value="qwen3.5:9b",
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value={"fallback_policy": "none"},
+            ),
+            patch(
+                "agent.auxiliary_client._get_provider_chain",
+            ) as discovery_chain,
+        ):
+            assert _resolve_auto(task="compression") == (None, None)
+
+        discovery_chain.assert_not_called()
 
 
 class TestAuxiliaryMaxTokensParam:

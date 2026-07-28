@@ -1698,6 +1698,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "fallback_policy": "auto",  # auto | none (fail closed; same-provider retries still apply)
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
@@ -1859,6 +1860,8 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "fallback_policy": "auto",  # auto | none (fail closed; same-provider retries still apply)
+            "max_tokens": 1024,       # output cap for routed review forks
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)

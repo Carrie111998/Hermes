@@ -604,6 +604,24 @@ prompt_caching:
 #     model: ""
 #     reasoning_effort: "low"
 #
+#   # Context compression. Pin an explicit backend and set fallback_policy to
+#   # "none" when crossing to another provider would violate spend policy.
+#   # Same-provider retries still apply.
+#   compression:
+#     provider: "custom"
+#     model: "qwen3.5:9b"
+#     base_url: "http://127.0.0.1:11434/v1"
+#     fallback_policy: "none"   # auto | none
+#
+#   # Background memory/skill review. Routed reviews receive only their actual
+#   # memory/skills tool surface and honor this output cap.
+#   background_review:
+#     provider: "custom"
+#     model: "qwen3.5:9b"
+#     base_url: "http://127.0.0.1:11434/v1"
+#     fallback_policy: "none"
+#     max_tokens: 1024
+#
 #   # Gemini 3.1 TTS hidden audio-tag insertion
 #   tts_audio_tags:
 #     provider: "auto"       # empty model = your main chat model

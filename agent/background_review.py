@@ -51,6 +51,8 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     the fork uses the main model and the warm cache, exactly as before. When
     ``auxiliary.background_review.{provider,model}`` names a concrete model
     different from the parent's, resolve that runtime and set ``routed=True``.
+    ``fallback_policy: none`` makes failure to resolve that explicit runtime a
+    hard failure instead of silently spending against the parent provider.
     """
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
@@ -80,6 +82,18 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
+    raw_fallback_policy = str(task.get("fallback_policy", "auto"))
+    fallback_policy = raw_fallback_policy.strip().lower() or "auto"
+    if fallback_policy not in {"auto", "none"}:
+        logger.warning(
+            "Background review: invalid fallback_policy=%r; failing closed",
+            raw_fallback_policy,
+        )
+        fallback_policy = "none"
+    try:
+        task_max_tokens = int(task.get("max_tokens") or 0) or None
+    except (TypeError, ValueError):
+        task_max_tokens = None
     if not (task_provider and task_provider != "auto" and task_model):
         return parent
     if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
@@ -100,12 +114,18 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "api_mode": rp.get("api_mode"),
             "credential_pool": rp.get("credential_pool"),
             "request_overrides": dict(rp.get("request_overrides") or {}),
-            "max_tokens": rp.get("max_output_tokens"),
+            "max_tokens": task_max_tokens or rp.get("max_output_tokens"),
             "command": rp.get("command"),
             "args": list(rp.get("args") or []),
             "routed": True,
         }
     except Exception as e:
+        if fallback_policy == "none":
+            raise RuntimeError(
+                "Configured auxiliary background-review provider "
+                f"{task_provider}/{task_model} is unavailable and "
+                "fallback_policy=none"
+            ) from e
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent
 
@@ -690,6 +710,19 @@ def _run_review_in_thread(
             # -> codex_responses downgrade is applied inside the resolver.
             _rt = _resolve_review_runtime(agent)
             _routed = bool(_rt.get("routed"))
+            # A different routed model has no parent-cache parity to preserve.
+            # Give it only the tools this fork can actually dispatch instead of
+            # cold-writing the parent's entire tool catalog to a local/cheap
+            # model. The runtime whitelist below remains defense in depth.
+            review_toolsets = ["skills"]
+            if agent._memory_enabled or agent._user_profile_enabled:
+                review_toolsets.insert(0, "memory")
+            if _routed:
+                fork_enabled_toolsets = review_toolsets
+                fork_disabled_toolsets = None
+            else:
+                fork_enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+                fork_disabled_toolsets = getattr(agent, "disabled_toolsets", None)
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -739,8 +772,8 @@ def _run_review_in_thread(
                 credential_pool=_rt.get("credential_pool"),
                 request_overrides=_rt.get("request_overrides") or {},
                 parent_session_id=agent.session_id,
-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                enabled_toolsets=fork_enabled_toolsets,
+                disabled_toolsets=fork_disabled_toolsets,
                 skip_memory=True,
                 **_fork_kwargs,
             )
@@ -834,9 +867,6 @@ def _run_review_in_thread(
             # Hardcoding ["memory", "skills"] granted the review LLM the MEMORY.md
             # read/write tool even when a profile set memory_enabled: false,
             # contaminating a memory-disabled profile (#54937 layer 2).
-            review_toolsets = ["skills"]
-            if review_agent._memory_enabled or review_agent._user_profile_enabled:
-                review_toolsets.insert(0, "memory")
             review_whitelist = {
                 t["function"]["name"]
                 for t in get_tool_definitions(

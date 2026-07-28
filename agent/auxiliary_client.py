@@ -4802,6 +4802,14 @@ def _resolve_auto(
                             main_provider, resolved or main_model)
                 return client, resolved or main_model
 
+    if task and not _task_provider_fallback_enabled(task):
+        logger.warning(
+            "Auxiliary %s: main provider unavailable and fallback_policy=none; "
+            "refusing automatic provider discovery",
+            task,
+        )
+        return None, None
+
     # ── Step 2: user-configured fallback policy ─────────────────────────
     # In auto mode, respect the task-specific fallback chain first, then the
     # main agent's top-level fallback_providers/fallback_model chain. The
@@ -6795,6 +6803,31 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
+def _task_provider_fallback_enabled(task: Optional[str]) -> bool:
+    """Return whether an auxiliary task may cross to another provider.
+
+    ``fallback_policy: none`` is a fail-closed boundary for tasks that must
+    stay on a pinned local or otherwise explicitly selected backend. The
+    default remains ``auto`` for backwards compatibility. Unknown values fail
+    closed so a typo cannot silently spend against an unintended provider.
+    Same-provider retries are unaffected.
+    """
+    if not task:
+        return True
+    raw = str(_get_auxiliary_task_config(task).get("fallback_policy", "auto"))
+    policy = raw.strip().lower() or "auto"
+    if policy == "auto":
+        return True
+    if policy == "none":
+        return False
+    logger.warning(
+        "Auxiliary %s: invalid fallback_policy=%r; failing closed",
+        task,
+        raw,
+    )
+    return False
+
+
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -8219,7 +8252,15 @@ def call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        fallback_enabled = _task_provider_fallback_enabled(task)
+        if should_fallback and (is_auto or is_capacity_error) and not fallback_enabled:
+            logger.warning(
+                "Auxiliary %s: provider failure on %s with "
+                "fallback_policy=none; refusing cross-provider fallback",
+                task or "call",
+                resolved_provider,
+            )
+        if should_fallback and (is_auto or is_capacity_error) and fallback_enabled:
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -8769,7 +8810,15 @@ async def async_call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        fallback_enabled = _task_provider_fallback_enabled(task)
+        if should_fallback and (is_auto or is_capacity_error) and not fallback_enabled:
+            logger.warning(
+                "Auxiliary %s (async): provider failure on %s with "
+                "fallback_policy=none; refusing cross-provider fallback",
+                task or "call",
+                resolved_provider,
+            )
+        if should_fallback and (is_auto or is_capacity_error) and fallback_enabled:
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
