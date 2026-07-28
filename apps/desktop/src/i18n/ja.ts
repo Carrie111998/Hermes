@@ -1010,6 +1010,7 @@ export const ja = defineLocale({
     noToolsetsTitle: 'ツールセットが見つかりません',
     noToolsetsDesc: '検索キーワードを広げてください。',
     noDescription: '説明はありません。',
+    useCount: '使用回数',
     configured: '設定済み',
     needsKeys: 'キーが必要',
     visionModelHint:

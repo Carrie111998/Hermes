@@ -980,6 +980,7 @@ export const en: Translations = {
     noToolsetsTitle: 'No toolsets found',
     noToolsetsDesc: 'Try a broader search query.',
     noDescription: 'No description.',
+    useCount: 'Use count',
     configured: 'Configured',
     needsKeys: 'Needs keys',
     visionModelHint:

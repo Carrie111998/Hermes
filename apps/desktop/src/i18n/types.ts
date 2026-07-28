@@ -856,6 +856,7 @@ export interface Translations {
     noToolsetsTitle: string
     noToolsetsDesc: string
     noDescription: string
+    useCount: string
     configured: string
     needsKeys: string
     visionModelHint: string
