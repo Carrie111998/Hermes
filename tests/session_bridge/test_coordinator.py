@@ -1951,6 +1951,51 @@ async def test_claude_bounded_scan_isolates_a_path_that_disappears_before_stat(
 
 
 @pytest.mark.asyncio
+async def test_claude_bounded_scan_retires_exactly_absent_persisted_pending_source() -> (
+    None
+):
+    operations: list[tuple[object, ...]] = []
+    store = _StateStore(operations)
+    store.states[_CLAUDE_PENDING_KEY] = {
+        "version": 1,
+        "native_ids": ["claude-gone"],
+    }
+    store.states[_CLAUDE_PROGRESS_KEY] = {
+        "version": 1,
+        "last_committed_native_id": "claude-last",
+        "indexed_total": 3,
+        "remaining": 1,
+    }
+    adapter = _BacklogClaudeAdapter(
+        discover_batches=[[]],
+        paths_by_native_id={},
+        operations=operations,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CLAUDE: adapter},
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.discovered == 1
+    assert summary.indexed == 0
+    assert summary.failed == 0
+    assert adapter.find_calls == ["claude-gone"]
+    assert store.get_state(_CLAUDE_PENDING_KEY) == {
+        "version": 1,
+        "native_ids": [],
+    }
+    assert store.get_state(_CLAUDE_PROGRESS_KEY) == {
+        "version": 1,
+        "last_committed_native_id": "claude-last",
+        "indexed_total": 3,
+        "remaining": 0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_codex_bounded_scan_stages_changed_inventory_before_seen_cache_loss() -> (
     None
 ):

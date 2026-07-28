@@ -3902,7 +3902,12 @@ class SessionBridgeCoordinator:
                         native_id,
                     )
                 if path is None:
-                    raise RuntimeError("staged Claude session is unavailable")
+                    # A complete discovery plus exact native-ID lookup proved
+                    # that this persisted queue entry no longer has a source.
+                    # Retire only the queue entry; a later reappearance is
+                    # rediscovered from its fingerprint and no catalog/native
+                    # history is deleted or fabricated here.
+                    continue
                 fingerprint = await asyncio.to_thread(_claude_path_fingerprint, path)
                 current_fingerprints[native_id] = fingerprint
                 parsed = await self._provider_call(_call, adapter, "parse", path)
@@ -4005,19 +4010,28 @@ class SessionBridgeCoordinator:
         remaining: int,
         previous_progress: dict[str, int | str] | None,
     ) -> None:
-        if not succeeded_ids:
+        if succeeded_ids:
+            indexed_total = (
+                int(previous_progress["indexed_total"])
+                if previous_progress is not None
+                else 0
+            ) + len(succeeded_ids)
+            progress: dict[str, int | str] = {
+                "version": 1,
+                "last_committed_native_id": succeeded_ids[-1],
+                "indexed_total": indexed_total,
+                "remaining": remaining,
+            }
+        elif (
+            previous_progress is not None
+            and int(previous_progress["remaining"]) != remaining
+        ):
+            progress = {
+                **previous_progress,
+                "remaining": remaining,
+            }
+        else:
             return
-        indexed_total = (
-            int(previous_progress["indexed_total"])
-            if previous_progress is not None
-            else 0
-        ) + len(succeeded_ids)
-        progress: dict[str, int | str] = {
-            "version": 1,
-            "last_committed_native_id": succeeded_ids[-1],
-            "indexed_total": indexed_total,
-            "remaining": remaining,
-        }
         await asyncio.to_thread(
             _call,
             self._store,
