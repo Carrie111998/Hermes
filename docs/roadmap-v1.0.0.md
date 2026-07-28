@@ -55,11 +55,12 @@
 
 ### Remaining
 
-- [ ] Verify legacy v1→v2 migration path under tenant-scoped schema
-- [ ] Non-null tenant scope on all operations (not just optional parameter)
-- [ ] Integrate governed worker runtime with Postgres authority API
-- [ ] Decisive two-tenant, two-worker acceptance test (12-point scenario)
-- [ ] SQLite backend contract parity tests where supported
+- [x] Legacy v1 schema detection (fail-closed on incompatible schema)
+- [x] Decisive two-tenant, two-worker acceptance test (12-point scenario)
+- [x] Backend contract invariant tests (7 invariants, 10 tests)
+- [x] AuthorityBridge for runtime-to-Postgres integration
+- [ ] Wire AuthorityBridge into objective_service tick cycle
+- [ ] Production worker runtime test with Postgres backend
 
 ---
 

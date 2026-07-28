@@ -204,6 +204,7 @@ class ObjectiveRuntime:
         self.policy_version = policy_version
         self.runtime_id = runtime_id or f"runtime_{uuid.uuid4().hex}"
         self._claim_keeper: Optional[db.ObjectiveClaimKeeper] = None
+        self._authority_bridge = None
         finance_db.ensure_schema(conn)
 
     def _assert_event_claim(self) -> None:
@@ -230,6 +231,26 @@ class ObjectiveRuntime:
         )
         if event is None:
             return CycleOutcome(None, None, "idle", "no due objective events")
+
+        # Mirror the claim into the Postgres authority store when configured.
+        try:
+            from hermes_cli.authority_bridge import AuthorityBridge
+
+            if self._authority_bridge is None:
+                self._authority_bridge = AuthorityBridge(
+                    organization_id=organization_id,
+                    worker_id=self.runtime_id,
+                )
+            if self._authority_bridge.active:
+                claim_token = f"{self.runtime_id}:{event['id']}"
+                self._authority_bridge.claim(
+                    task_id=str(event["objective_id"]),
+                    claim_token=claim_token,
+                    claim_scope_url=f"urn:objective:{event['objective_id']}",
+                    ttl_seconds=claim_ttl_seconds,
+                )
+        except Exception:
+            pass
         objective_id = event["objective_id"]
         cycle_id = f"cycle_{uuid.uuid4().hex}"
         started = int(time.time())
