@@ -3391,6 +3391,21 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         return self._is_retryable_error(body)
 
+    def _is_retryable_context_fetch_error(self, exc: Exception) -> bool:
+        """Retryable errors for the read-only conversations.replies fetch.
+
+        Extends :meth:`_is_retryable_upload_error` (429/5xx, rate-limit and
+        transient-connection text) with read/socket timeouts: the fetch is
+        idempotent, so retrying a timed-out request can't cause the duplicate
+        delivery that makes timeouts unsafe to retry for uploads and sends.
+        """
+        if self._is_retryable_upload_error(exc):
+            return True
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        body = str(exc).lower()
+        return "timed out" in body or "timeout" in body
+
     # ----- Markdown → mrkdwn conversion -----
 
     @staticmethod
@@ -7230,7 +7245,9 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(channel_id, team_id=team_id)
 
-            # Retry with exponential backoff for Tier-3 rate limits (429).
+            # Retry with exponential backoff on transient failures: Tier-3
+            # rate limits (429), 5xx responses, and connection/socket
+            # timeouts (safe to retry — this fetch is idempotent).
             result = None
             for attempt in range(3):
                 try:
@@ -7242,17 +7259,11 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     break
                 except Exception as exc:
-                    # Check for rate-limit error from slack_sdk
-                    err_str = str(exc).lower()
-                    is_rate_limit = (
-                        "ratelimited" in err_str
-                        or "429" in err_str
-                        or "rate_limited" in err_str
-                    )
-                    if is_rate_limit and attempt < 2:
+                    if attempt < 2 and self._is_retryable_context_fetch_error(exc):
                         retry_after = 1.0 * (2**attempt)  # 1s, 2s
                         logger.warning(
-                            "[Slack] conversations.replies rate limited; retrying in %.1fs (attempt %d/3)",
+                            "[Slack] conversations.replies failed transiently (%s); retrying in %.1fs (attempt %d/3)",
+                            exc,
                             retry_after,
                             attempt + 1,
                         )
