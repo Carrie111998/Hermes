@@ -1836,9 +1836,12 @@ def _prompt_input_visible(output: str, *, prompt: str) -> bool:
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
     if re.search(r"\[Pasted text #\d+(?: \+\d+ lines)?\]", cleaned):
         return True
+    compact = _compact_terminal_text(cleaned)
+    if "ctrl+gtoeditinnotepad" in compact.casefold():
+        return True
     if prompt in cleaned or prompt.replace("\n", "") in cleaned:
         return True
-    return _compact_terminal_text(prompt) in _compact_terminal_text(cleaned)
+    return _compact_terminal_text(prompt) in compact
 
 
 def _prompt_input_timeout_reason(output: str, *, prompt: str) -> str:

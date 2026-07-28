@@ -461,6 +461,27 @@ def test_winpty_waits_until_multiline_paste_is_visible_before_submit() -> None:
     assert "[Pasted text #1 +12 lines]" in output
 
 
+def test_winpty_accepts_current_claude_multiline_editor_hint() -> None:
+    output = (
+        "firstline\r\nsecond line\r\nthird line\r\n"
+        "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m"
+        "ctrl+gtoeditinNotepad"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([output])
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str | None:
+            return next(self.chunks)
+
+    observed = _WinPtyProcess(Process()).read_until_prompt_input(
+        1.0, prompt="a much longer multiline registration prompt"
+    )
+
+    assert "ctrl+gtoeditinNotepad" in observed
+
+
 @pytest.mark.parametrize(
     ("process", "expected_writes"),
     [
