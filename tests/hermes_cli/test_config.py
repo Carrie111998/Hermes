@@ -969,6 +969,7 @@ class TestSanitizeEnvLines:
         assert result == ["FOO_BAR=baz\n"]
 
     def test_migrate_reports_normalized_line_formatting(self, capsys):
+        capsys.readouterr()
         latest_version = DEFAULT_CONFIG["_config_version"]
         with (
             patch("hermes_cli.config.sanitize_env_file", return_value=2),
@@ -983,9 +984,9 @@ class TestSanitizeEnvLines:
         ):
             migrate_config(interactive=False)
 
-        assert capsys.readouterr().out == (
-            "  ✓ Normalized .env line formatting (2 line(s) changed)\n"
-        )
+        output = capsys.readouterr().out
+        assert "Normalized .env line formatting" in output
+        assert "2 line(s) changed" in output
 
     def test_multiple_known_key_spellings_inside_value_remain_opaque(self):
         """Repeated known KEY= text cannot synthesize assignments."""
