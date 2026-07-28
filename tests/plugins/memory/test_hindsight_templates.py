@@ -91,11 +91,28 @@ def _select_returning(idx):
     return _select
 
 
+def _select_seq(*returns):
+    it = iter(returns)
+
+    def _select(title, items, default=0, cancel_returns=None):
+        return next(it)
+
+    return _select
+
+
+def test_supported_for_mode():
+    assert tpl.supported_for_mode("cloud") is True
+    assert tpl.supported_for_mode("local_external") is True
+    assert tpl.supported_for_mode("local_embedded") is False
+    assert tpl.supported_for_mode("local") is False
+
+
 def test_run_template_step_applies_selected(monkeypatch):
     monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: [
         {"id": "hermes-gateway-bot", "name": "Gateway Bot", "manifest_file": "templates/x.json"},
     ])
     monkeypatch.setattr(tpl, "fetch_manifest", lambda entry, url=None: {"version": "1"})
+    monkeypatch.setattr(tpl, "probe_existing_customization", lambda *a: False)
     applied = {}
     monkeypatch.setattr(tpl, "apply_template",
                         lambda api_url, bank_id, api_key, manifest: applied.update(bank=bank_id))
@@ -142,3 +159,102 @@ def test_run_template_step_swallows_fetch_errors(monkeypatch):
         api_url="https://api", bank_id="hermes", api_key="k",
         select=_select_returning(0), cancelled=-1, log=lambda *_: None,
     ) is None
+
+
+def test_run_template_step_swallows_apply_errors(monkeypatch):
+    # gap 1: a failed apply (e.g. 401 for an OAuth-only user) must not crash setup.
+    import urllib.error
+
+    monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: [
+        {"id": "hermes-gateway-bot", "name": "Gateway Bot", "manifest_file": "templates/x.json"},
+    ])
+    monkeypatch.setattr(tpl, "fetch_manifest", lambda entry, url=None: {"version": "1"})
+    monkeypatch.setattr(tpl, "probe_existing_customization", lambda *a: False)
+
+    def _raise(*a, **k):
+        raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(tpl, "apply_template", _raise)
+    logs = []
+    result = tpl.run_template_step(
+        api_url="https://api", bank_id="hermes", api_key=None,
+        select=_select_returning(0), cancelled=-1, log=logs.append,
+    )
+    assert result is None
+    assert any("Could not apply" in line for line in logs)
+
+
+def _fake_urlopen(payload):
+    @contextmanager
+    def _cm(req, timeout=None):
+        class _Resp:
+            def read(self):
+                return json.dumps(payload).encode("utf-8")
+
+        yield _Resp()
+
+    return _cm
+
+
+def test_probe_existing_customization_true_when_bank_has_config(monkeypatch):
+    monkeypatch.setattr(tpl.urllib.request, "urlopen",
+                        _fake_urlopen({"version": "1", "bank": {"reflect_mission": "x"}}))
+    assert tpl.probe_existing_customization("https://api", "hermes", "k") is True
+
+
+def test_probe_existing_customization_false_when_empty(monkeypatch):
+    monkeypatch.setattr(tpl.urllib.request, "urlopen",
+                        _fake_urlopen({"version": "1"}))
+    assert tpl.probe_existing_customization("https://api", "hermes", "k") is False
+
+
+def test_probe_existing_customization_false_on_error(monkeypatch):
+    def _boom(req, timeout=None):
+        raise OSError("no bank")
+
+    monkeypatch.setattr(tpl.urllib.request, "urlopen", _boom)
+    assert tpl.probe_existing_customization("https://api", "missing", None) is False
+
+
+def _wire_apply(monkeypatch, customized):
+    monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: [
+        {"id": "hermes-gateway-bot", "name": "Gateway Bot", "manifest_file": "templates/x.json"},
+    ])
+    monkeypatch.setattr(tpl, "fetch_manifest", lambda entry, url=None: {"version": "1"})
+    monkeypatch.setattr(tpl, "probe_existing_customization", lambda *a: customized)
+    called = {"applied": False}
+    monkeypatch.setattr(tpl, "apply_template", lambda *a, **k: called.update(applied=True))
+    return called
+
+
+def test_warns_and_keeps_existing_when_declined(monkeypatch):
+    called = _wire_apply(monkeypatch, customized=True)
+    # first select = pick template (0); second select = confirm -> "Keep existing" (1)
+    result = tpl.run_template_step(
+        api_url="https://api", bank_id="hermes", api_key="k",
+        select=_select_seq(0, 1), cancelled=-1, log=lambda *_: None,
+    )
+    assert result is None
+    assert called["applied"] is False
+
+
+def test_warns_then_applies_when_confirmed(monkeypatch):
+    called = _wire_apply(monkeypatch, customized=True)
+    # pick template (0), confirm "Apply" (0)
+    result = tpl.run_template_step(
+        api_url="https://api", bank_id="hermes", api_key="k",
+        select=_select_seq(0, 0), cancelled=-1, log=lambda *_: None,
+    )
+    assert result == "hermes-gateway-bot"
+    assert called["applied"] is True
+
+
+def test_fresh_bank_skips_the_warning(monkeypatch):
+    called = _wire_apply(monkeypatch, customized=False)
+    # only ONE select call (no confirm) — _select_seq with a single value proves it
+    result = tpl.run_template_step(
+        api_url="https://api", bank_id="hermes", api_key="k",
+        select=_select_seq(0), cancelled=-1, log=lambda *_: None,
+    )
+    assert result == "hermes-gateway-bot"
+    assert called["applied"] is True

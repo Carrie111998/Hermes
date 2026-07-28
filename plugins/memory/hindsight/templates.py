@@ -28,6 +28,14 @@ _DEFAULT_CATALOG_URL = (
 )
 _HTTP_TIMEOUT = 15
 
+# The starter-template step needs the API reachable during setup. A
+# local_embedded daemon isn't running yet at that point, so it's skipped there.
+SUPPORTED_MODES = ("cloud", "local_external")
+
+
+def supported_for_mode(mode: str) -> bool:
+    return mode in SUPPORTED_MODES
+
 
 def catalog_url() -> str:
     return os.environ.get("HINDSIGHT_TEMPLATES_URL", _DEFAULT_CATALOG_URL)
@@ -65,6 +73,27 @@ def apply_template(api_url: str, bank_id: str, api_key: str | None, manifest: di
         resp.read()  # drain; urlopen raises HTTPError on non-2xx
 
 
+def probe_existing_customization(api_url: str, bank_id: str, api_key: str | None) -> bool:
+    """Best-effort: True if the bank already has template-level config, mental
+    models, or directives — i.e. applying a template would overwrite settings.
+
+    A missing bank, or any error, is treated as "not customized": the step must
+    never block on this probe.
+    """
+    endpoint = f"{api_url.rstrip('/')}/v1/default/banks/{bank_id}/export"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(endpoint, headers=headers)  # noqa: S310
+    try:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # missing bank / network — treat as not customized
+        logger.debug("Hindsight: bank customization probe skipped: %s", e)
+        return False
+    return bool(data.get("bank") or data.get("mental_models") or data.get("directives"))
+
+
 def run_template_step(
     *,
     api_url: str,
@@ -95,6 +124,22 @@ def run_template_step(
         return None  # blank or cancelled
 
     entry = entries[idx]
+
+    # If the bank is already configured (re-running setup on an existing bank),
+    # applying a template overwrites its config and upserts its models/directives.
+    # Confirm before clobbering.
+    if probe_existing_customization(api_url, bank_id, api_key):
+        confirm = select(
+            f"  Bank '{bank_id}' already has memory settings — apply this template on top?",
+            [("Apply", "Overwrite config; add/update mental models & directives"),
+             ("Keep existing", "Leave the bank as-is")],
+            default=1,
+            cancel_returns=cancelled,
+        )
+        if confirm != 0:
+            log(f"  Kept existing settings for bank '{bank_id}'.")
+            return None
+
     try:
         manifest = fetch_manifest(entry)
         apply_template(api_url, bank_id, api_key, manifest)

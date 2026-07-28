@@ -984,7 +984,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Step 5: Optional starter template. Only for cloud / local_external —
         # the API is reachable now; local_embedded's daemon isn't up during setup.
-        if mode in ("cloud", "local_external"):
+        from . import templates as _hs_templates
+        if _hs_templates.supported_for_mode(mode):
             self._offer_starter_template(mode, provider_config, env_writes)
 
         if mode == "local_embedded":
