@@ -215,6 +215,8 @@ class FakePty:
         read_error: Exception | None = None,
         ready_output: str = "\x1b[?2004h\x1b[2m⏵⏵ don't ask on\x1b[0m",
         ready_error: Exception | None = None,
+        prompt_input_output: str = "[Pasted text #1 +12 lines]\r\n",
+        prompt_input_error: Exception | None = None,
         write_error_at: int | None = None,
         wait_error: Exception | None = None,
     ):
@@ -223,6 +225,8 @@ class FakePty:
         self.read_error = read_error
         self.ready_output = ready_output
         self.ready_error = ready_error
+        self.prompt_input_output = prompt_input_output
+        self.prompt_input_error = prompt_input_error
         self.write_error_at = write_error_at
         self.wait_error = wait_error
         self.writes: list[str] = []
@@ -232,6 +236,7 @@ class FakePty:
         self.cleanup_result = PtyCleanupResult(True, True, True, exit_code)
         self.ready_waits: list[float] = []
         self.ready_trust_acceptances: list[bool] = []
+        self.prompt_input_waits: list[tuple[float, str]] = []
 
     def read_until_ready(
         self, timeout: float, *, accept_workspace_trust: bool = False
@@ -246,6 +251,12 @@ class FakePty:
         if self.read_error:
             raise self.read_error
         return self.output
+
+    def read_until_prompt_input(self, timeout: float, *, prompt: str) -> str:
+        self.prompt_input_waits.append((timeout, prompt))
+        if self.prompt_input_error is not None:
+            raise self.prompt_input_error
+        return self.prompt_input_output
 
     def write(self, data: str) -> None:
         if self.write_error_at == len(self.writes):
@@ -408,6 +419,10 @@ def test_launch_waits_for_multiline_paste_before_submitting_return() -> None:
             events.append(("write", data))
             super().write(data)
 
+        def read_until_prompt_input(self, timeout: float, *, prompt: str) -> str:
+            events.append(("prompt_input", timeout))
+            return super().read_until_prompt_input(timeout, prompt=prompt)
+
     item = claim()
     process = OrderedPty(output="REGISTERED\r\n")
     source = FakeSource([None, projection_for(item)])
@@ -422,7 +437,28 @@ def test_launch_waits_for_multiline_paste_before_submitting_return() -> None:
     assert events[0][0] == "write"
     assert str(events[0][1]).startswith("\x1b[200~")
     assert events[1] == ("sleep", 0.5)
-    assert events[2] == ("write", "\r")
+    assert events[2][0] == "prompt_input"
+    assert events[3] == ("write", "\r")
+
+
+def test_winpty_waits_until_multiline_paste_is_visible_before_submit() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                [
+                    "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m",
+                    "[Pasted text #1 +12 lines]\r\n",
+                ]
+            )
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str | None:
+            return next(self.chunks)
+
+    output = _WinPtyProcess(Process()).read_until_prompt_input(
+        1.0, prompt="multiline\nregistration\nprompt"
+    )
+
+    assert "[Pasted text #1 +12 lines]" in output
 
 
 @pytest.mark.parametrize(
@@ -1132,7 +1168,7 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
     item = claim()
     source = FakeSource([None, projection_for(item)])
     factory = FakeFactory()
-    ticks = iter([0.0, 0.0, 0.1, 0.1])
+    ticks = iter([0.0, 0.0, 0.1, 0.1, 0.2, 0.2])
     reg = ClaudeNativeRegistrar(
         FakeStore(),
         source,

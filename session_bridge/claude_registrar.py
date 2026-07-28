@@ -57,6 +57,7 @@ _CLAUDE_STARTUP_THEMES = frozenset({
 _RESPONSE_SETTLE_SECONDS = 0.5
 _READINESS_SETTLE_SECONDS = 0.5
 _PROMPT_SUBMIT_DELAY_SECONDS = 0.5
+_PROMPT_ACCEPTANCE_TIMEOUT_SECONDS = 10.0
 _CLAUDE_FORCED_ONBOARDING = frozenset({"banner", "step"})
 _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
     "CLAUDE_CODE_POWERUP_ONBOARDING",
@@ -114,6 +115,8 @@ class InteractivePty(Protocol):
     ) -> str: ...
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str: ...
+
+    def read_until_prompt_input(self, timeout: float, *, prompt: str) -> str: ...
     def write(self, data: str) -> None: ...
     def wait(self, timeout: float) -> int | None: ...
     def terminate(self, timeout: float = 1.0) -> bool: ...
@@ -579,6 +582,44 @@ class _WinPtyProcess:
             if candidate_seen:
                 settle_deadline = time.monotonic() + _RESPONSE_SETTLE_SECONDS
 
+    def read_until_prompt_input(self, timeout: float, *, prompt: str) -> str:
+        """Wait for Claude to render the pasted prompt before submitting Return."""
+
+        timed_read = getattr(self._process, "read_with_timeout", None)
+        if not callable(timed_read):
+            raise RuntimeError("PTY prompt-input read unavailable")
+        deadline = time.monotonic() + timeout
+        chunks: list[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _PtyResponseTimeout(
+                    _prompt_input_timeout_reason("".join(chunks), prompt=prompt)
+                )
+            try:
+                value = timed_read(4096, remaining)
+            except (EOFError, StopIteration) as exc:
+                raise RuntimeError("PTY closed before prompt input") from exc
+            except Exception as exc:
+                raise RuntimeError("PTY prompt-input read unavailable") from exc
+            if value is None:
+                continue
+            text = (
+                value.decode("utf-8", "replace")
+                if isinstance(value, bytes)
+                else str(value)
+            )
+            chunks.append(text)
+            joined = "".join(chunks)
+            if len(joined) > _MAX_RESPONSE_CHARS:
+                raise RuntimeError("PTY prompt-input output exceeded limit")
+            if (
+                _prompt_input_visible(joined, prompt=prompt)
+                or _is_authentication_failure(joined)
+                or _is_provider_limit_failure(joined)
+            ):
+                return joined
+
     def read_until_ready(
         self, timeout: float, *, accept_workspace_trust: bool = False
     ) -> str:
@@ -1031,27 +1072,40 @@ class ClaudeNativeRegistrar:
             else:
                 process.write(_interactive_prompt_frame(prompt))
                 self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
-                process.write("\r")
-                output = process.read_until(
-                    self._remaining_process_time(deadline), prompt=prompt
+                prompt_input = process.read_until_prompt_input(
+                    min(
+                        _PROMPT_ACCEPTANCE_TIMEOUT_SECONDS,
+                        self._remaining_process_time(deadline),
+                    ),
+                    prompt=prompt,
                 )
-                if _is_authentication_failure(output):
+                if _is_authentication_failure(prompt_input):
                     pending = (
                         "claude_authentication_unavailable",
                         "Claude authentication unavailable",
                     )
-                elif not _has_exact_registered_response(output, prompt):
-                    pending = ("bridge_conflict", "recovery response malformed")
                 else:
-                    process.write("/exit\r")
-                    exit_code = process.wait(self._exit_timeout)
-                    if type(exit_code) is not int or exit_code != 0:
+                    process.write("\r")
+                    output = process.read_until(
+                        self._remaining_process_time(deadline), prompt=prompt
+                    )
+                    if _is_authentication_failure(output):
                         pending = (
-                            "clean_exit_not_observed",
-                            "Claude did not exit cleanly",
+                            "claude_authentication_unavailable",
+                            "Claude authentication unavailable",
                         )
+                    elif not _has_exact_registered_response(output, prompt):
+                        pending = ("bridge_conflict", "recovery response malformed")
                     else:
-                        clean_exit = True
+                        process.write("/exit\r")
+                        exit_code = process.wait(self._exit_timeout)
+                        if type(exit_code) is not int or exit_code != 0:
+                            pending = (
+                                "clean_exit_not_observed",
+                                "Claude did not exit cleanly",
+                            )
+                        else:
+                            clean_exit = True
         except FileNotFoundError:
             pending = (
                 "claude_executable_unavailable",
@@ -1284,40 +1338,61 @@ class ClaudeNativeRegistrar:
             else:
                 process.write(_interactive_prompt_frame(prompt))
                 self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
-                process.write("\r")
-                output = process.read_until(
-                    self._remaining_process_time(deadline), prompt=prompt
+                prompt_input = process.read_until_prompt_input(
+                    min(
+                        _PROMPT_ACCEPTANCE_TIMEOUT_SECONDS,
+                        self._remaining_process_time(deadline),
+                    ),
+                    prompt=prompt,
                 )
-                if _is_authentication_failure(output):
+                if _is_authentication_failure(prompt_input):
                     pending = (
                         "retry",
                         "claude_authentication_unavailable",
                         "Claude authentication unavailable",
                     )
-                elif _is_provider_limit_failure(output):
+                elif _is_provider_limit_failure(prompt_input):
                     provider_limit_observed = True
                     pending = (
                         "retry",
                         "creation_ambiguous",
                         "Claude provider limit interrupted registration",
                     )
-                elif not _has_exact_registered_response(output, prompt):
-                    pending = (
-                        "fail",
-                        "bridge_conflict",
-                        "registration response malformed",
-                    )
                 else:
-                    process.write("/exit\r")
-                    exit_code = process.wait(self._exit_timeout)
-                    if type(exit_code) is not int or exit_code != 0:
+                    process.write("\r")
+                    output = process.read_until(
+                        self._remaining_process_time(deadline), prompt=prompt
+                    )
+                    if _is_authentication_failure(output):
                         pending = (
                             "retry",
-                            "clean_exit_not_observed",
-                            "Claude did not exit cleanly",
+                            "claude_authentication_unavailable",
+                            "Claude authentication unavailable",
+                        )
+                    elif _is_provider_limit_failure(output):
+                        provider_limit_observed = True
+                        pending = (
+                            "retry",
+                            "creation_ambiguous",
+                            "Claude provider limit interrupted registration",
+                        )
+                    elif not _has_exact_registered_response(output, prompt):
+                        pending = (
+                            "fail",
+                            "bridge_conflict",
+                            "registration response malformed",
                         )
                     else:
-                        clean_exit = True
+                        process.write("/exit\r")
+                        exit_code = process.wait(self._exit_timeout)
+                        if type(exit_code) is not int or exit_code != 0:
+                            pending = (
+                                "retry",
+                                "clean_exit_not_observed",
+                                "Claude did not exit cleanly",
+                            )
+                        else:
+                            clean_exit = True
         except FileNotFoundError:
             pending = (
                 "retry",
@@ -1754,6 +1829,27 @@ def _response_timeout_reason(output: str, *, prompt: str | None) -> str:
         return "no_response_output"
     if _bracketed_paste_enabled(output):
         return "response_pending"
+    return "terminal_input_disabled"
+
+
+def _prompt_input_visible(output: str, *, prompt: str) -> bool:
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    if re.search(r"\[Pasted text #\d+(?: \+\d+ lines)?\]", cleaned):
+        return True
+    if prompt in cleaned or prompt.replace("\n", "") in cleaned:
+        return True
+    return _compact_terminal_text(prompt) in _compact_terminal_text(cleaned)
+
+
+def _prompt_input_timeout_reason(output: str, *, prompt: str) -> str:
+    if _known_claude_input_modal_visible(output):
+        return "known_input_modal"
+    if _prompt_input_visible(output, prompt=prompt):
+        return "prompt_input_unsettled"
+    if _claude_main_repl_ready(output):
+        return "prompt_input_not_visible"
+    if _bracketed_paste_enabled(output):
+        return "prompt_input_pending"
     return "terminal_input_disabled"
 
 
