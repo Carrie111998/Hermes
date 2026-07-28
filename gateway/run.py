@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import enum
 import faulthandler
 import inspect
 import json
@@ -22092,6 +22093,207 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if tip is None or tip.get("ended_at"):
             return "retry"
         return "deliver"
+
+
+    # ------------------------------------------------------------------
+    # Completion disposition & pending registry (#70300 / PR #73427)
+    # ------------------------------------------------------------------
+
+    class CompletionDisposition(enum.Enum):
+        """Explicit resolution for every completion notification waiter."""
+        DELIVERED = "delivered"
+        RETRY = "retry"
+        DROP_DUPLICATE = "drop_duplicate"
+        DROP_UNROUTABLE = "drop_unroutable"
+        DROPPED_OVERFLOW = "dropped_overflow"
+        SHUTTING_DOWN = "shutting_down"
+
+    class CompletionStore:
+        """Protocol for optional durability of pending completions.
+
+        Default is ``NullCompletionStore`` — in-memory only, identical
+        behaviour to the pre-registry delivery path.
+        """
+        async def put(self, entry: dict) -> None: ...
+        async def remove(self, identity: str) -> None: ...
+        async def load_pending(self) -> list: ...
+
+    class NullCompletionStore(CompletionStore):
+        """Default no-op store. Completions are purely in-memory."""
+        async def put(self, entry: dict) -> None: return None
+        async def remove(self, identity: str) -> None: return None
+        async def load_pending(self) -> list: return []
+
+    class PendingCompletionRegistry:
+        """Explicit state machine for completion notification delivery.
+
+        One entry per completion identity.  Owned by the gateway lifecycle —
+        created at start, drained to ``STOPPING`` at shutdown before adapter
+        teardown.
+
+        State machine::
+
+            PENDING --claim(batch_id)--> CLAIMED --delivered--------> DELIVERED
+               ^                            |
+               |        +-- transient failure --> PENDING  (attempts+1, backoff)
+               |        +-- attempts exhausted -> FAILED            (logged)
+               |        +-- already delivered --> SUPERSEDED
+               |        +-- no route ----------> UNROUTABLE
+               |        +-- over capacity -----> DROPPED_OVERFLOW   (counted)
+               +-- cancel ---------------------+
+               +-- gateway stopping ----------> STOPPING            (counted)
+        """
+
+        MAX_ATTEMPTS = 5
+        BASE_BACKOFF = 0.5  # seconds, doubled each retry
+        BATCH_CAPACITY = 50
+
+        class State(enum.Enum):
+            PENDING = "pending"
+            CLAIMED = "claimed"
+            DELIVERED = "delivered"
+            FAILED = "failed"
+            SUPERSEDED = "superseded"
+            UNROUTABLE = "unroutable"
+            DROPPED_OVERFLOW = "dropped_overflow"
+            STOPPING = "stopping"
+
+        _TERMINAL = {
+            State.DELIVERED, State.FAILED, State.SUPERSEDED,
+            State.UNROUTABLE, State.DROPPED_OVERFLOW, State.STOPPING,
+        }
+
+        def __init__(self, store: CompletionStore | None = None):
+            import threading as _threading
+            self._lock = _threading.Lock()
+            self._entries: dict[str, dict] = {}
+            self._stopping = False
+            self._store = store or NullCompletionStore()
+            # Observability counters
+            self.counters: dict[str, int] = {
+                "delivered": 0, "failed": 0, "superseded": 0,
+                "unroutable": 0, "dropped_overflow": 0, "stopping": 0,
+            }
+
+        # -- public API -------------------------------------------------
+
+        def enqueue(
+            self, identity: str, route_key: tuple, payload: dict,
+        ) -> "asyncio.Future | None":
+            """Create a PENDING entry. Returns Future or None if capped."""
+            import asyncio as _asyncio
+            with self._lock:
+                if len(self._entries) >= self.BATCH_CAPACITY:
+                    self.counters["dropped_overflow"] += 1
+                    return None
+                future = _asyncio.get_running_loop().create_future()
+                self._entries[identity] = {
+                    "identity": identity,
+                    "route_key": route_key,
+                    "state": self.State.PENDING,
+                    "attempts": 0,
+                    "next_attempt_at": 0.0,
+                    "payload": payload,
+                    "batch_id": None,
+                    "future": future,
+                }
+            return future
+
+        def claim_batch(
+            self, identities: list[str], batch_id: str,
+        ) -> tuple[list[dict], list[str]]:
+            """Atomically transition PENDING->CLAIMED for every identity.
+
+            Returns ``(claimed, skipped)``.
+            """
+            claimed: list[dict] = []
+            skipped: list[str] = []
+            with self._lock:
+                for ident in identities:
+                    entry = self._entries.get(ident)
+                    if entry is None or entry["state"] is not self.State.PENDING:
+                        skipped.append(ident)
+                        continue
+                    entry["state"] = self.State.CLAIMED
+                    entry["batch_id"] = batch_id
+                    claimed.append(entry)
+            return claimed, skipped
+
+        def deliver(self, identity: str) -> None:
+            """Transition CLAIMED->DELIVERED."""
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is not None and entry["state"] is self.State.CLAIMED:
+                    entry["state"] = self.State.DELIVERED
+                    self.counters["delivered"] += 1
+
+        def retry(self, identity: str) -> float | None:
+            """Transition CLAIMED->PENDING with attempt counter.
+
+            Returns backoff deadline (monotonic seconds) or None if exhausted.
+            """
+            import time as _time
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is None or entry["state"] is not self.State.CLAIMED:
+                    return None
+                entry["attempts"] += 1
+                if entry["attempts"] >= self.MAX_ATTEMPTS:
+                    entry["state"] = self.State.FAILED
+                    self.counters["failed"] += 1
+                    return None
+                deadline = _time.monotonic() + self.BASE_BACKOFF * (2 ** (entry["attempts"] - 1))
+                entry["next_attempt_at"] = deadline
+                entry["state"] = self.State.PENDING
+                entry["batch_id"] = None
+                return deadline
+
+        def supersede(self, identity: str) -> None:
+            """Transition to SUPERSEDED."""
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is not None:
+                    entry["state"] = self.State.SUPERSEDED
+                    self.counters["superseded"] += 1
+
+        def mark_unroutable(self, identity: str) -> None:
+            """Transition to UNROUTABLE."""
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is not None:
+                    entry["state"] = self.State.UNROUTABLE
+                    self.counters["unroutable"] += 1
+
+        def signal_stop(self) -> list[dict]:
+            """Move all non-terminal entries to STOPPING. Returns the list."""
+            stopped: list[dict] = []
+            with self._lock:
+                self._stopping = True
+                for entry in self._entries.values():
+                    if entry["state"] not in self._TERMINAL:
+                        entry["state"] = self.State.STOPPING
+                        self.counters["stopping"] += 1
+                        stopped.append(entry)
+            return stopped
+
+        @property
+        def is_stopping(self) -> bool:
+            with self._lock:
+                return self._stopping
+
+        def resolve_futures(
+            self, entries: list[dict], disposition: "CompletionDisposition",
+        ) -> None:
+            """Resolve every entry's Future with *disposition* if not done."""
+            for entry in entries:
+                future = entry.get("future")
+                if future is not None and not future.done():
+                    future.set_result(disposition)
+
+        def snapshot(self) -> dict[str, "State"]:
+            """Return {identity: state} for testing."""
+            with self._lock:
+                return {k: v["state"] for k, v in self._entries.items()}
 
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
