@@ -1647,27 +1647,37 @@ def _workspace_trust_prompt_end(output: str) -> int | None:
     """Return the raw offset after the latest complete native trust frame."""
 
     text, _, raw_ends = _terminal_text_with_raw_offsets(output)
-    signature = (
-        "Accessing workspace:",
-        "Yes, I trust this folder",
-        "No, exit",
-        "Security guide",
+    signatures = (
+        (
+            "Accessing workspace:",
+            "Yes, I trust this folder",
+            "No, exit",
+            "Security guide",
+        ),
+        (
+            "Accessing workspace:",
+            "Yes, I trust this folder",
+            "No, continue without these permissions",
+            "Security guide",
+        ),
     )
     latest_end: int | None = None
-    search_from = 0
-    while True:
-        frame_start = text.find(signature[0], search_from)
-        if frame_start < 0:
-            return latest_end
-        frame_cursor = frame_start + len(signature[0])
-        for value in signature[1:]:
-            value_start = text.find(value, frame_cursor)
-            if value_start < 0:
+    for signature in signatures:
+        search_from = 0
+        while True:
+            frame_start = text.find(signature[0], search_from)
+            if frame_start < 0:
                 break
-            frame_cursor = value_start + len(value)
-        else:
-            latest_end = raw_ends[frame_cursor - 1]
-        search_from = frame_start + len(signature[0])
+            frame_cursor = frame_start + len(signature[0])
+            for value in signature[1:]:
+                value_start = text.find(value, frame_cursor)
+                if value_start < 0:
+                    break
+                frame_cursor = value_start + len(value)
+            else:
+                latest_end = max(latest_end or 0, raw_ends[frame_cursor - 1])
+            search_from = frame_start + len(signature[0])
+    return latest_end
 
 
 def _workspace_trust_prompt_prefix_start(output: str) -> int | None:

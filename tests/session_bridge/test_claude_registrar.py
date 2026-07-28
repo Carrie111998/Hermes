@@ -1527,6 +1527,49 @@ def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
     assert process.reads == 6
 
 
+def test_winpty_readiness_crosses_restricted_workspace_trust_gate_once() -> None:
+    trust = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\n"
+        "No, continue without these permissions\r\n"
+        "Security guide\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                [
+                    "\x1b[?2004h",
+                    trust,
+                    trust,
+                    "\x1b[?2004h",
+                    "\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m",
+                ]
+            )
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(
+        1.0, accept_workspace_trust=True
+    )
+
+    assert "\u23f5\u23f5 don't ask on" in output
+    assert process.writes == ["\r"]
+    assert process.reads == 6
+
+
 @pytest.mark.parametrize(
     "redraw_chunks, expected_reads",
     [
