@@ -1065,7 +1065,10 @@ class SessionBridgeCoordinator:
             self._running = True
             self._background_tasks = [
                 asyncio.create_task(self._reconcile_loop()),
-                asyncio.create_task(self._scan_loop()),
+                *(
+                    asyncio.create_task(self._scan_loop(provider))
+                    for provider in _EXTERNAL_PROVIDERS
+                ),
             ]
             if self._claude_projects_root is not None:
                 self._watch_stop_event = asyncio.Event()
@@ -4246,11 +4249,11 @@ class SessionBridgeCoordinator:
         )
         self._backfill_progress[provider] = dict(progress)
 
-    async def _scan_loop(self) -> None:
+    async def _scan_loop(self, provider: Provider) -> None:
         await self._initial_reconcile_done.wait()
         while self._running:
             try:
-                await self.scan_once()
+                await self.scan_once(provider)
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception:

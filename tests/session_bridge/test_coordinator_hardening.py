@@ -560,7 +560,9 @@ async def test_stop_timeout_blocks_restart_until_provider_tasks_drain() -> None:
     await coordinator.start()
     assert await asyncio.to_thread(started.wait, 1.0)
     await coordinator.stop()
-    assert coordinator.health()["provider_calls_inflight"] == 1
+    # Independent provider loops may leave the blocked Claude call plus a
+    # concurrently scheduled Codex call draining at the stop deadline.
+    assert coordinator.health()["provider_calls_inflight"] >= 1
 
     restart = asyncio.create_task(coordinator.start())
     await asyncio.sleep(0.03)
@@ -672,6 +674,45 @@ async def test_background_scan_failure_is_reported_and_next_cycle_runs(
         await asyncio.wait_for(recovered.wait(), timeout=1.0)
         assert "catalog_scan_loop_failed" in coordinator.health()["recent_error_codes"]
     finally:
+        await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_background_provider_scans_do_not_block_each_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = BridgeConfig()
+    config = replace(
+        base,
+        service=replace(base.service, catalog_scan_seconds=0.01),
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=config,
+        store=object(),
+        adapters={},
+    )
+    claude_scanned_twice = asyncio.Event()
+    codex_release = asyncio.Event()
+    claude_calls = 0
+
+    async def scan_once(provider: Provider | None = None):
+        nonlocal claude_calls
+        if provider is Provider.CLAUDE:
+            claude_calls += 1
+            if claude_calls >= 2:
+                claude_scanned_twice.set()
+            return None
+        await codex_release.wait()
+        return None
+
+    monkeypatch.setattr(coordinator, "scan_once", scan_once)
+
+    await coordinator.start()
+    try:
+        await asyncio.wait_for(claude_scanned_twice.wait(), timeout=1.0)
+        assert claude_calls >= 2
+    finally:
+        codex_release.set()
         await coordinator.stop()
 
 
