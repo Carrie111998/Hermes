@@ -121,22 +121,31 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
 
     Incomplete provider reasoning blocks are not valid replay items (Anthropic
     signs them; Responses reasoning items require their following output).
-    Preserve only what Hermes actually displayed, demoted to ordinary text,
-    then add the correction as a real user message. This keeps role alternation
+    Preserve only the *visible* response text, demoted to ordinary text, then
+    add the correction as a real user message. This keeps role alternation
     valid and leaves every previously cached message byte-for-byte unchanged.
+
+    INVARIANT — raw chain-of-thought must never be serialized into replayable
+    message content. Streamed reasoning is display-only state: it may be shown
+    live, but it does not re-enter the transcript as assistant (or user) text.
+    An assistant turn whose content inlines its own chain-of-thought reads to
+    Anthropic's output classifier as reasoning-injection/prefill jailbreak,
+    and because the poisoned checkpoint is persisted and replayed on every
+    subsequent call, the session dies permanently with deterministic
+    "Provider returned an empty response" storms that no retry, nudge, or
+    empty-recovery branch can escape (July 2026: four sessions bricked this
+    way; every reasoning-free checkpoint that week was untouched — same
+    mechanism as the ~/.hermes/prefill.json incident, 20/20 blocked with
+    assistant-exposed CoT vs 0/20 without). The interrupted reasoning was
+    incomplete by definition; the model regenerates it on the retried turn.
+    If a future path needs to preserve interrupted thinking, carry it in a
+    provider-gated reasoning *field*, never in content.
     """
-    reasoning = str(
-        getattr(agent, "_current_streamed_reasoning_text", "") or ""
-    ).strip()
     visible = agent._strip_think_blocks(
         getattr(agent, "_current_streamed_assistant_text", "") or ""
     ).strip()
 
     checkpoint_parts = ["[This response was interrupted by a user correction.]"]
-    if reasoning:
-        checkpoint_parts.extend(
-            ["Reasoning shown before the interruption:", reasoning]
-        )
     if visible:
         checkpoint_parts.extend(
             ["Visible response before the interruption:", visible]
@@ -159,7 +168,6 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         messages.append({"role": "user", "content": text})
 
     agent._current_streamed_assistant_text = ""
-    agent._current_streamed_reasoning_text = ""
     agent._stream_needs_break = True
 
 
@@ -1630,6 +1638,15 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
+        # NOTE (empty-content class fix): no send-time pad loop here.  The
+        # single owner for "never send a turn strict wire validation rejects
+        # as empty" is ``repair_empty_non_final_messages``, which runs inside
+        # ``_sanitize_api_messages`` above — the unconditional pre-send
+        # chokepoint shared with the summary path.  Its placeholder is
+        # non-whitespace, so it survives the whitespace-normalization pass
+        # regardless of ordering (a single-space pad here previously had to
+        # be sequenced after normalization to survive, forking the concept).
+
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
         # gateways. Auto-detected: if ``_use_prompt_caching`` is set, inject
@@ -2796,10 +2813,27 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
-                            interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                            messages.append(interim_msg)
-                            if assistant_message.content:
-                                truncated_response_parts.append(assistant_message.content)
+                            # An EMPTY partial-stream stub (stream dropped
+                            # mid tool-call before any text was delivered)
+                            # must not be appended as an interim assistant
+                            # message: it would serialize as
+                            # {"role": "assistant", "content": ""}, and
+                            # strict providers (Moonshot/Kimi via OpenRouter)
+                            # reject empty assistant content with HTTP 400
+                            # ("message ... with role 'assistant' must not be
+                            # empty") on the very next replay — permanently
+                            # poisoning the session history.  There is no
+                            # partial text to continue from anyway, so only
+                            # the continuation user-message is appended.
+                            _is_empty_partial_stub = (
+                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                                and not getattr(assistant_message, "content", None)
+                            )
+                            if not _is_empty_partial_stub:
+                                interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                                messages.append(interim_msg)
+                                if assistant_message.content:
+                                    truncated_response_parts.append(assistant_message.content)
 
                             if length_continue_retries < 4:
                                 _is_partial_stream_stub = (
