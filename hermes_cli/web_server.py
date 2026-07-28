@@ -799,7 +799,23 @@ def _memory_provider_options() -> List[str]:
     return list(dict.fromkeys(options))
 
 
+def _timezone_options() -> List[str]:
+    """Return sorted IANA timezone identifiers, cached at import time."""
+    try:
+        import zoneinfo
+        return sorted(zoneinfo.available_timezones()) or ["UTC"]
+    except Exception:  # pragma: no cover
+        return ["UTC"]
+
+
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "timezone": {
+        "type": "select",
+        "description": "IANA timezone (e.g. America/New_York). Blank uses the system timezone.",
+        "options": _timezone_options(),
+        "searchable": True,
+        "clearable": True,
+    },
     "memory.provider": {
         "type": "select",
         "description": "Memory provider plugin",
@@ -967,6 +983,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "computer_use": "agent",
+    # `telemetry.shared_metrics.enabled` is the only schema-surfaced telemetry
+    # field — fold it into security alongside the other privacy-posture toggles.
+    "telemetry": "security",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -11695,9 +11714,10 @@ async def get_session_stats(profile: Optional[str] = None):
         messages = db.message_count()
         by_source: Dict[str, int] = {}
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True, compact_rows=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
+            by_source = db.session_count_by_source(
+                include_archived=True,
+                exclude_children=True,
+            )
         except Exception:
             pass
         return {
@@ -13190,15 +13210,18 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         # (Figma's MCP catalog, etc.) 403 the register call before any
         # authorization URL exists — surface what's actually happening
         # instead of a bare "403 Forbidden".
-        lowered = msg.lower()
-        if "403" in msg and ("regist" in lowered or "forbidden" in lowered):
-            msg = (
-                f"'{flow.server_name}' only allows pre-approved OAuth clients — it rejected "
-                "client registration (403), so no browser flow can start. "
-                "Options: add a pre-registered client to this server's entry "
-                "(oauth: {client_id: ..., client_secret: ...}), or use the "
-                "provider's stdio / API-key server instead."
+        try:
+            from tools.mcp_oauth import humanize_oauth_registration_error
+
+            humanized = humanize_oauth_registration_error(
+                flow.server_name,
+                exc,
+                server_url=cfg.get("url") if isinstance(cfg, dict) else None,
             )
+            if humanized:
+                msg = humanized
+        except Exception:
+            pass
         flow.mark_error(msg)
     finally:
         flow.mark_worker_done()
