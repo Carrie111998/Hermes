@@ -19519,6 +19519,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        self._queued_events.pop(session_key, None)  # drain the full overflow queue too (#73060)
         if release_running_state:
             self._release_running_agent_state(session_key)
             # Evict the cached agent: ``_interrupt_requested`` is only
