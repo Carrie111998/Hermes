@@ -766,6 +766,7 @@ class TestPayloadFilters:
         mock_target = AsyncMock()
         mock_target.send = AsyncMock(return_value=SendResult(success=True))
         mock_runner = MagicMock()
+        mock_runner.config.multiplex_profiles = False
         mock_runner.adapters = {Platform.TELEGRAM: mock_target}
         adapter.gateway_runner = mock_runner
 

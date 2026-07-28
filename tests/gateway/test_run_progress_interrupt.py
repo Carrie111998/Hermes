@@ -125,15 +125,18 @@ class PartialTruncationAgent:
             "api_calls": 2,
             "completed": False,
             "partial": True,
-            "error": "Response truncated due to output length limit",
+            "incomplete_reason": "Response truncated due to output length limit",
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, hermes_home):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    from tests.gateway._profile_authority import install_frozen_profile_authority
+
+    install_frozen_profile_authority(runner, hermes_home)
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -165,7 +168,7 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(

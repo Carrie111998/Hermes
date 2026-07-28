@@ -11,6 +11,7 @@ from unittest import mock
 
 from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 def _make_runner(multiplex: bool) -> GatewayRunner:
@@ -20,7 +21,7 @@ def _make_runner(multiplex: bool) -> GatewayRunner:
 
 
 class TestBackgroundTaskProfileScope:
-    """_run_background_task installs _profile_runtime_scope when multiplexing is active."""
+    """_run_background_task installs the verified source profile scope."""
 
     def test_wraps_in_profile_scope_when_multiplex_active(self):
         runner = _make_runner(multiplex=True)
@@ -46,19 +47,22 @@ class TestBackgroundTaskProfileScope:
         scope.assert_called_once_with(Path("/fake/profile"))
         inner.assert_awaited_once()
 
-    def test_calls_inner_directly_when_multiplex_disabled(self):
+    def test_wraps_in_primary_profile_scope_when_multiplex_disabled(self, tmp_path):
         runner = _make_runner(multiplex=False)
+        identity = install_frozen_profile_authority(runner, tmp_path)
         inner = mock.AsyncMock(return_value=None)
         runner._run_background_task_inner = inner
+        source = mock.MagicMock()
+        source.profile = None
 
         with mock.patch("gateway.run._profile_runtime_scope") as scope:
             asyncio.run(
                 runner._run_background_task(
-                    prompt="test", source=mock.MagicMock(), task_id="bg_test"
+                    prompt="test", source=source, task_id="bg_test"
                 )
             )
 
-        scope.assert_not_called()
+        scope.assert_called_once_with(Path(identity.canonical_home))
         inner.assert_awaited_once()
 
     def test_inner_receives_all_arguments(self):

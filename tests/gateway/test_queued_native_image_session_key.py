@@ -9,6 +9,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 _ONE_BY_ONE_PNG = base64.b64decode(
@@ -65,9 +66,10 @@ class CaptureQueuedNativeImageAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, profile_home):
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
+    install_frozen_profile_authority(runner, profile_home)
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -107,7 +109,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     adapter = CaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
 
     image_path = tmp_path / "queued-image.png"
     image_path.write_bytes(_ONE_BY_ONE_PNG)

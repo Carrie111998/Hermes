@@ -21,7 +21,7 @@ import {
   writeEnvFile,
   writeMockProviderConfig
 } from './fixtures'
-import { MOCK_REPLY, startMockServer, VERIFICATION_STOP_TRIGGER } from './mock-server'
+import { MOCK_REPLY, startMockServer, VERIFICATION_STOP_TEXT, VERIFICATION_STOP_TRIGGER } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
 
 const SESSION_TITLE = 'E2E Hidden History Messages'
@@ -82,7 +82,7 @@ test('resume hides real context-compaction handoffs', async ({}, testInfo) => {
   }
 })
 
-test('live model responses do not revive legacy verify-on-stop continuations', async ({}, testInfo) => {
+test('code edits get one hidden bounded proof continuation and surface missing evidence', async ({}, testInfo) => {
   const sandbox = createSandbox('live-verification-nudge')
   // macOS resolves its default temp directory under /private/var, which the
   // file tool correctly treats as a protected system path. Use an isolated
@@ -123,15 +123,17 @@ test('live model responses do not revive legacy verify-on-stop continuations', a
     await page.keyboard.press('Enter')
 
     const transcript = page.locator('[data-slot="aui_thread-viewport"]')
-    await expect(transcript).toContainText('The code edit is complete.', { timeout: 60_000 })
-    await page.waitForTimeout(1_000)
+    await expect(transcript).toContainText('verification_evidence_missing', { timeout: 60_000 })
     expect(
-      mock.receivedPrompts.some(prompt => prompt.includes('[System: You edited code in this turn')),
-      'the fork keeps the model-authored final response instead of injecting a legacy continuation'
-    ).toBe(false)
+      mock.receivedPrompts.filter(prompt => prompt.includes('RUNTIME BOUNDED PROOF GATE')),
+      'the runtime requests fresh proof exactly once after the unverified completion'
+    ).toHaveLength(1)
     expect(fs.existsSync(changedFile), 'The scripted write_file call should edit only the sandbox project').toBe(true)
+    await expect(transcript).not.toContainText('The code edit is complete.')
+    await expect(transcript).not.toContainText(VERIFICATION_STOP_TEXT)
+    await expect(transcript).not.toContainText('RUNTIME BOUNDED PROOF GATE')
     await expect(transcript).not.toContainText('[System: You edited code in this turn')
-    await page.screenshot({ path: testInfo.outputPath('live-verification-nudge.png') })
+    await page.screenshot({ path: testInfo.outputPath('bounded-proof-missing-evidence.png') })
   } finally {
     await fixture.cleanup()
   }

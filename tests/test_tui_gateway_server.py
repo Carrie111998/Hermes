@@ -626,6 +626,16 @@ def test_profile_scoped_mcp_discovery_uses_target_home(monkeypatch, tmp_path):
     assert seen == [str(profile_home)]
 
 
+def _wait_for_deferred_agent_build(session, timeout=10):
+    """Join the owned build thread instead of racing its final ready.set()."""
+    thread = session.get("_agent_build_thread")
+    assert thread is not None
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), "deferred agent build did not finish"
+    assert session["agent_ready"].is_set()
+    assert "agent_error" not in session
+
+
 def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch, tmp_path
 ):
@@ -679,7 +689,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
-        assert ready.wait(timeout=2)
+        _wait_for_deferred_agent_build(session)
     finally:
         record = server._sessions.pop(sid, None)
         if record is not None:
@@ -752,7 +762,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
-        assert ready.wait(timeout=2)
+        _wait_for_deferred_agent_build(session)
     finally:
         record = server._sessions.pop(sid, None)
         if record is not None:

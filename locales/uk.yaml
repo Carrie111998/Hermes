@@ -320,6 +320,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**Агент активний:** {state}"
+    execution_this_run:    "**Виконання в цьому запуску:** {progress}"
     state_yes:             "Так ⚡"
     state_no:              "Ні"
     queued:                "**Черга продовжень:** {count}"

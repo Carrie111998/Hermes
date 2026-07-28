@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 SESSION_KEY = "agent:main:telegram:dm:12345"
@@ -87,10 +88,15 @@ class _Adapter:
         return None
 
 
-def _runner(session_store):
+def _runner(session_store, profile_home):
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: _Adapter()}
-    runner.config = SimpleNamespace(streaming=None, group_sessions_per_user=True, thread_sessions_per_user=False)
+    runner.config = SimpleNamespace(
+        streaming=None,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+        multiplex_profiles=False,
+    )
     runner.hooks = SimpleNamespace(loaded_hooks=False, emit=AsyncMock())
     runner.session_store = session_store
     runner._session_db = MagicMock()
@@ -115,13 +121,17 @@ def _runner(session_store):
         {"provider": "openai-codex", "api_mode": "codex_responses", "base_url": "https://chatgpt.com/backend-api/codex", "api_key": "token"},
     )
     runner._resolve_session_reasoning_config = lambda **_kwargs: None
-    runner._resolve_turn_agent_config = lambda message, model, runtime: {"model": model, "runtime": runtime}
+    runner._resolve_turn_agent_config = lambda message, model, runtime, **_kwargs: {
+        "model": model,
+        "runtime": runtime,
+    }
     runner._load_service_tier = lambda: None
     runner._agent_config_signature = lambda *_args, **_kwargs: ("sig",)
     runner._extract_cache_busting_config = lambda _config: ()
     runner._thread_metadata_for_source = lambda *_args, **_kwargs: None
     runner._sync_telegram_topic_binding = MagicMock()
     runner._release_running_agent_state = MagicMock()
+    install_frozen_profile_authority(runner, profile_home)
     return runner
 
 
@@ -156,11 +166,11 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
     )
 
 
-def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
+def test_failed_turn_still_syncs_compression_session_split(monkeypatch, tmp_path):
     _install_compression_failure_agent(monkeypatch)
 
     session_store = _SessionStore()
-    runner = _runner(session_store)
+    runner = _runner(session_store, tmp_path)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="user-1")
 
     result = _run_compression_failure_turn(runner, source)
@@ -179,7 +189,10 @@ def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
     )
 
 
-def test_stale_run_does_not_overwrite_new_session_after_compression(monkeypatch):
+def test_stale_run_does_not_overwrite_new_session_after_compression(
+    monkeypatch,
+    tmp_path,
+):
     """A /stop + /new can invalidate a run while its compression is still unwinding.
 
     The stale run may still return with a rotated agent.session_id, but it must
@@ -190,7 +203,7 @@ def test_stale_run_does_not_overwrite_new_session_after_compression(monkeypatch)
     _install_compression_failure_agent(monkeypatch)
 
     session_store = _SessionStore()
-    runner = _runner(session_store)
+    runner = _runner(session_store, tmp_path)
     runner._session_run_generation[SESSION_KEY] = 2
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="user-1")
 
@@ -205,7 +218,7 @@ def test_stale_run_does_not_overwrite_new_session_after_compression(monkeypatch)
     assert getattr(runner._sync_telegram_topic_binding, "call_count") == 0
 
 
-def test_session_split_sync_skips_when_binding_already_moved(monkeypatch):
+def test_session_split_sync_skips_when_binding_already_moved(monkeypatch, tmp_path):
     """A live session binding is identity-guarded, not blindly overwritten.
 
     This catches the exact race where an old run starts with session A, /new
@@ -216,7 +229,7 @@ def test_session_split_sync_skips_when_binding_already_moved(monkeypatch):
 
     session_store = _SessionStore()
     session_store.entry.session_id = "fresh-session-after-new"
-    runner = _runner(session_store)
+    runner = _runner(session_store, tmp_path)
     runner._session_run_generation[SESSION_KEY] = 1
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="user-1")
 

@@ -72,8 +72,12 @@ class _StatusAdapter:
         return None
 
 
-def _make_runner():
+def _make_runner(hermes_home=None):
     runner = object.__new__(gateway_run.GatewayRunner)
+    if hermes_home is not None:
+        from tests.gateway._profile_authority import install_frozen_profile_authority
+
+        install_frozen_profile_authority(runner, hermes_home)
     runner.adapters = {}
     runner.session_store = None
     runner.config = None
@@ -130,7 +134,7 @@ def _resolve_live_codex_override(provider, *, target_model=None):
     }
 
 
-def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
+def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
@@ -145,7 +149,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     _CapturingAgent.last_init = None
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
 
     source = SessionSource(
         platform=Platform.LOCAL,
@@ -193,6 +197,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
 )
 async def test_typed_terminal_status_is_exactly_deduped_at_turn_boundary(
     monkeypatch,
+    tmp_path,
     status_text,
     final_text,
     expected_statuses,
@@ -216,7 +221,7 @@ async def test_typed_terminal_status_is_exactly_deduped_at_turn_boundary(
 
     _TerminalStatusAgent.status_text = status_text
     _TerminalStatusAgent.final_text = final_text
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
     adapter = _StatusAdapter()
     runner.adapters[Platform.DISCORD] = adapter
     source = SessionSource(
@@ -242,7 +247,9 @@ async def test_typed_terminal_status_is_exactly_deduped_at_turn_boundary(
 
 
 @pytest.mark.asyncio
-async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch):
+async def test_background_task_prefers_session_override_over_global_runtime(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
     monkeypatch.setattr(
@@ -256,7 +263,7 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     _CapturingAgent.last_init = None
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
 
     adapter = AsyncMock()
     adapter.send = AsyncMock()
@@ -325,7 +332,7 @@ fallback_providers:
 
     monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
 
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
     model, runtime_kwargs = runner._resolve_session_agent_runtime(
         session_key="agent:main:telegram:group:-1003715515980:63",
         user_config={

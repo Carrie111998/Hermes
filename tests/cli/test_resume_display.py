@@ -660,6 +660,7 @@ class TestHandleResumeCommandRecap:
         mock_db.get_resume_conversations.return_value = (messages, messages)
         # resolve_resume_session_id passes the id through when no compression chain.
         mock_db.resolve_resume_session_id.return_value = "target_session"
+        mock_db.get_conversation_root.return_value = "target_session"
         cli._session_db = mock_db
 
         with (
@@ -683,6 +684,7 @@ class TestHandleResumeCommandRecap:
         mock_db.get_session.return_value = {"id": "target_session", "title": None}
         mock_db.get_resume_conversations.return_value = ([], [])
         mock_db.resolve_resume_session_id.return_value = "target_session"
+        mock_db.get_conversation_root.return_value = "target_session"
         cli._session_db = mock_db
 
         with (
@@ -709,6 +711,7 @@ class TestHandleResumeCommandRecap:
         mock_db.get_session.return_value = {"id": "session_b", "title": "Session B"}
         mock_db.get_resume_conversations.return_value = (messages_b, messages_b)
         mock_db.resolve_resume_session_id.return_value = "session_b"
+        mock_db.get_conversation_root.return_value = "session_b"
         cli._session_db = mock_db
 
         with (

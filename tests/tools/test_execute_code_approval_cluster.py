@@ -158,13 +158,19 @@ def test_guard_headless_local_approved(monkeypatch):
 
 
 def test_guard_cron_deny_blocks(monkeypatch):
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
     monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
-    res = A.check_execute_code_guard("import os", "local")
-    assert res["approved"] is False
-    assert res["outcome"] == "blocked"
+    tokens = set_session_vars(cron_session=True)
+    try:
+        res = A.check_execute_code_guard("import os", "local")
+        assert res["approved"] is False
+        assert res["outcome"] == "blocked"
+    finally:
+        clear_session_vars(tokens)
 
 
 def test_guard_gateway_user_approves_is_one_shot(gw_session):
@@ -335,20 +341,29 @@ def test_execute_code_entry_blocks_before_spawn_when_guard_denies(monkeypatch, t
     import tools.code_execution_tool as cet
     from tools import terminal_tool as TT
 
+    from gateway.session_context import clear_session_vars, set_session_vars
+
     marker = tmp_path / "child-ran.marker"
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
     monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
     monkeypatch.setattr(TT, "_get_env_config", lambda: {"env_type": "local"})
 
-    result = json.loads(
-        cet.execute_code(f"open({str(marker)!r}, 'w').close()", task_id="cluster-t")
-    )
-    assert result["status"] == "error"
-    assert "BLOCKED" in result["error"]
-    assert not marker.exists()  # guard denied before the child was spawned
+    tokens = set_session_vars(cron_session=True)
+    try:
+        result = json.loads(
+            cet.execute_code(
+                f"open({str(marker)!r}, 'w').close()",
+                task_id="cluster-t",
+            )
+        )
+        assert result["status"] == "error"
+        assert "BLOCKED" in result["error"]
+        assert not marker.exists()  # guard denied before the child was spawned
+    finally:
+        clear_session_vars(tokens)
 
 
 # ---------------------------------------------------------------------------

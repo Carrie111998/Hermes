@@ -14,6 +14,7 @@ from hermes_state import SessionDB
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 def _make_source(*, thread_id: str | None = None) -> SessionSource:
@@ -54,10 +55,12 @@ def _make_group_event(text: str, *, thread_id: str | None = None) -> MessageEven
     )
 
 
-def _make_runner(session_db=None):
+def _make_runner(session_db=None, profile_home=None):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    if profile_home is not None:
+        install_frozen_profile_authority(runner, profile_home)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -274,7 +277,7 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
         session_id="restored-session",
         managed_mode="restored",
     )
-    runner = _make_runner(session_db=session_db)
+    runner = _make_runner(session_db=session_db, profile_home=tmp_path)
     captured = {}
 
     async def fake_run_agent(*args, **kwargs):
@@ -533,7 +536,7 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
         session_id="parent-session",
     )
 
-    runner = _make_runner(session_db=session_db)
+    runner = _make_runner(session_db=session_db, profile_home=tmp_path)
     # switch_session() returns a SessionEntry pointing at whatever id was
     # requested; capture the requested id for assertion.
     switched_to: dict = {}

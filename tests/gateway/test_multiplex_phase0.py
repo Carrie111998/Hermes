@@ -169,13 +169,24 @@ class TestMultiplexConfigFlag:
 
 
 class TestSessionStoreProfileResolution:
-    """SessionStore._generate_session_key honors the flag: legacy namespace
-    when off, active-profile namespace when on."""
+    """SessionStore keys use the immutable profile set captured at construction."""
 
-    def _store(self, tmp_path, **cfg_kw):
+    def _store(
+        self,
+        tmp_path,
+        *,
+        primary_profile_name="default",
+        served_profile_names=None,
+        **cfg_kw,
+    ):
         config = GatewayConfig(**cfg_kw)
         with patch("gateway.session.SessionStore._ensure_loaded"):
-            s = SessionStore(sessions_dir=tmp_path, config=config)
+            s = SessionStore(
+                sessions_dir=tmp_path,
+                config=config,
+                primary_profile_name=primary_profile_name,
+                served_profile_names=served_profile_names,
+            )
         s._db = None
         s._loaded = True
         return s
@@ -190,17 +201,20 @@ class TestSessionStoreProfileResolution:
         store = self._store(tmp_path)
         assert store._resolve_profile_for_key() is None
 
-    def test_flag_on_uses_active_profile_namespace(self, tmp_path):
-        store = self._store(tmp_path, multiplex_profiles=True)
+    def test_flag_on_uses_frozen_primary_profile_namespace(self, tmp_path):
+        store = self._store(
+            tmp_path,
+            multiplex_profiles=True,
+            primary_profile_name="coder",
+            served_profile_names={"coder"},
+        )
         s = _src(chat_id="99", chat_type="dm")
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="coder"):
-            assert store._generate_session_key(s) == "agent:coder:telegram:dm:99"
+        assert store._generate_session_key(s) == "agent:coder:telegram:dm:99"
 
     def test_flag_on_default_profile_stays_legacy(self, tmp_path):
         store = self._store(tmp_path, multiplex_profiles=True)
         s = _src(chat_id="99", chat_type="dm")
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
-            assert store._generate_session_key(s) == "agent:main:telegram:dm:99"
+        assert store._generate_session_key(s) == "agent:main:telegram:dm:99"
 
 
 class _RecoveringDB:
@@ -218,10 +232,23 @@ class _RecoveringDB:
 class TestSessionStoreUnmultiplexedRecovery:
     """Turning multiplexing off must not recover another profile's session."""
 
-    def _store_with_row(self, tmp_path, row, **cfg_kw):
+    def _store_with_row(
+        self,
+        tmp_path,
+        row,
+        *,
+        primary_profile_name="default",
+        served_profile_names=None,
+        **cfg_kw,
+    ):
         config = GatewayConfig(**cfg_kw)
         with patch("gateway.session.SessionStore._ensure_loaded"):
-            store = SessionStore(sessions_dir=tmp_path, config=config)
+            store = SessionStore(
+                sessions_dir=tmp_path,
+                config=config,
+                primary_profile_name=primary_profile_name,
+                served_profile_names=served_profile_names,
+            )
         store._db = _RecoveringDB(row)
         store._loaded = True
         return store
@@ -235,31 +262,34 @@ class TestSessionStoreUnmultiplexedRecovery:
         store = self._store_with_row(tmp_path, row)
         source = _src(chat_id="99", chat_type="dm")
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
-            recovered = store._recover_session_from_db(
-                session_key="agent:main:telegram:dm:99",
-                source=source,
-                now=datetime.fromtimestamp(1700000001),
-            )
+        recovered = store._recover_session_from_db(
+            session_key="agent:main:telegram:dm:99",
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
 
         assert recovered is None
         assert store._db.reopened == []
 
-    def test_flag_off_allows_active_profile_peer_fallback(self, tmp_path):
+    def test_flag_off_allows_frozen_primary_profile_peer_fallback(self, tmp_path):
         row = {
             "id": "sess-coder",
             "started_at": 1700000000,
             "session_key": "agent:coder:telegram:dm:99",
         }
-        store = self._store_with_row(tmp_path, row)
+        store = self._store_with_row(
+            tmp_path,
+            row,
+            primary_profile_name="coder",
+            served_profile_names={"coder"},
+        )
         source = _src(chat_id="99", chat_type="dm")
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="coder"):
-            recovered = store._recover_session_from_db(
-                session_key="agent:main:telegram:dm:99",
-                source=source,
-                now=datetime.fromtimestamp(1700000001),
-            )
+        recovered = store._recover_session_from_db(
+            session_key="agent:main:telegram:dm:99",
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
 
         assert recovered is not None
         assert recovered.session_id == "sess-coder"

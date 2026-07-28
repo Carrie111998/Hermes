@@ -2733,6 +2733,7 @@ class GatewaySlashCommandsMixin:
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
         from gateway.run import _load_gateway_config
+        from hermes_constants import display_hermes_home
 
         args = event.get_command_args().strip().lower()
         profile_home = self._command_profile_home_for_source(event.source)
@@ -2748,7 +2749,7 @@ class GatewaySlashCommandsMixin:
         if not personalities:
             return t(
                 "gateway.personality.none_configured",
-                path=str(profile_home),
+                path=display_hermes_home(profile_home),
             )
 
         if not args:

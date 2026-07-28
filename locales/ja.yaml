@@ -320,6 +320,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**エージェント実行中:** {state}"
+    execution_this_run:    "**今回の実行:** {progress}"
     state_yes:             "はい ⚡"
     state_no:              "いいえ"
     queued:                "**キュー内の後続:** {count}"

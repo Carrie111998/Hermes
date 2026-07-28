@@ -10,6 +10,7 @@ import hermes_constants
 from hermes_constants import (
     VALID_REASONING_EFFORTS,
     agent_browser_runnable,
+    display_hermes_home,
     find_hermes_node_executable,
     find_node_executable,
     find_node_executable_on_path,
@@ -117,6 +118,32 @@ class TestGetHermesHome:
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
 
         assert get_hermes_home() == local_appdata / "hermes"
+
+
+class TestDisplayHermesHome:
+    def test_explicit_profile_home_uses_friendly_tilde_path(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+
+        assert (
+            display_hermes_home(profile_home)
+            == "~/.hermes/profiles/coder"
+        )
+
+    def test_explicit_external_home_remains_absolute(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        user_home = tmp_path / "user"
+        external_home = tmp_path / "runtime" / "hermes"
+        monkeypatch.setattr(Path, "home", lambda: user_home)
+
+        assert display_hermes_home(external_home) == str(external_home)
 
 
 class TestGetProcessHermesHome:

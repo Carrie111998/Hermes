@@ -39,6 +39,32 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_listener_profile_authority():
+    """Model a fresh gateway process for every gateway unit test.
+
+    Production deliberately freezes one event-delivery/profile inventory for
+    the lifetime of a gateway process.  The canonical test runner isolates
+    files in separate interpreters, but multiple tests inside one file still
+    model independent process lifetimes.  Reset only through the explicit
+    test hooks at that boundary; never weaken the production registration
+    guard to make a second live inventory replace the first.
+    """
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    async_delegation._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        async_delegation._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
+
+
 def make_async_session_db(sync_mock=None):
     """Wrap a sync mock SessionDB in AsyncSessionDB so gateway code that awaits
     the facade works in tests. Returns (facade, sync_mock); configure return
@@ -464,4 +490,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-

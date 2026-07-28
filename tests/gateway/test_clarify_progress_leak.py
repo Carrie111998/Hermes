@@ -29,6 +29,8 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
         self.edits = []
+        self.clarify_prompts = []
+        self.clarify_response = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -53,6 +55,28 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
 
+    async def send_clarify(
+        self,
+        chat_id,
+        question,
+        choices,
+        clarify_id,
+        session_key,
+        metadata=None,
+    ) -> SendResult:
+        self.clarify_prompts.append(
+            {
+                "chat_id": chat_id,
+                "question": question,
+                "choices": choices,
+            }
+        )
+        if self.clarify_response is not None:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            assert resolve_gateway_clarify(clarify_id, self.clarify_response)
+        return SendResult(success=True, message_id="clarify-1")
+
 
 class ClarifyThenToolAgent:
     """Emits a clarify tool.started (with raw args) then a normal tool."""
@@ -76,10 +100,49 @@ class ClarifyThenToolAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
-def _make_runner(adapter):
+class RoutineClarifyAgent:
+    """Calls clarify for a decision the blockers-only policy must own."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        answer = self.clarify_callback(
+            "Should I inspect the patch and run the focused tests?",
+            ["Proceed", "Stop"],
+        )
+        return {
+            "final_response": answer,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class DeployClarifyAgent:
+    """Calls clarify for production authority the policy must not assume."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        answer = self.clarify_callback(
+            "Should I merge and deploy this to production?",
+            ["Deploy to production", "Cancel"],
+        )
+        return {
+            "final_response": answer,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+def _make_runner(adapter, hermes_home):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
     runner = object.__new__(GatewayRunner)
+    from tests.gateway._profile_authority import install_frozen_profile_authority
+
+    install_frozen_profile_authority(runner, hermes_home)
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -126,7 +189,7 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
     interactive prompt (#52374).
     """
     adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, mode)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -154,3 +217,102 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
     assert "Asking" not in all_content
     # The unrelated terminal tool still renders progress normally.
     assert "pwd" in all_content
+
+
+@pytest.mark.asyncio
+async def test_blockers_only_resolves_routine_clarify_without_user_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    """Gateway config reaches the live callback without mutating agent prompts."""
+
+    from copy import deepcopy
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = _install_fakes(monkeypatch, "off")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RoutineClarifyAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    user_config = deepcopy(DEFAULT_CONFIG)
+    user_config["agent"]["clarify_policy"] = "blockers_only"
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: user_config,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        chat_type="dm",
+    )
+    result = await runner._run_agent(
+        message="finish the task",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-autonomy-clarify",
+        session_key="agent:main:discord:dm:C1",
+    )
+
+    assert "Proceed now" in result["final_response"]
+    assert adapter.clarify_prompts == []
+
+
+@pytest.mark.asyncio
+async def test_blockers_only_keeps_deploy_clarify_interactive_on_discord(
+    monkeypatch,
+    tmp_path,
+):
+    """High-impact production authority still renders a real Discord prompt."""
+
+    from copy import deepcopy
+    from hermes_cli.config import DEFAULT_CONFIG
+    from tools import clarify_gateway
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    adapter.clarify_response = "Cancel"
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = _install_fakes(monkeypatch, "off")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = DeployClarifyAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    user_config = deepcopy(DEFAULT_CONFIG)
+    user_config["agent"]["clarify_policy"] = "blockers_only"
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: user_config)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    session_key = "agent:main:discord:dm:C1"
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        chat_type="dm",
+    )
+    result = await runner._run_agent(
+        message="finish the task",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-deploy-clarify",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "Cancel"
+    assert adapter.clarify_prompts == [
+        {
+            "chat_id": "C1",
+            "question": "Should I merge and deploy this to production?",
+            "choices": ["Deploy to production", "Cancel"],
+        }
+    ]
+    assert clarify_gateway.get_pending_for_session(
+        session_key,
+        include_choice_prompts=True,
+    ) is None

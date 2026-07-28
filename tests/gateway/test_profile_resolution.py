@@ -11,16 +11,18 @@ from gateway.run import GatewayRunner
 from gateway.profile_routing import ProfileRoute
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import BasePlatformAdapter
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 @pytest.fixture
-def mock_runner():
+def mock_runner(tmp_path):
     """Create a minimal mock GatewayRunner with the methods we need."""
     runner = MagicMock(spec=GatewayRunner)
     runner.config = MagicMock(profile_routes=[])
     # Bind the actual methods to the mock
     runner._profile_name_for_source = GatewayRunner._profile_name_for_source.__get__(runner)
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
+    install_frozen_profile_authority(runner, tmp_path / "default")
     return runner
 
 
@@ -53,185 +55,121 @@ def telegram_source():
 
 
 class TestResolutionOrder:
-    """Tests that profile resolution follows the correct priority order."""
+    """Resolution uses only constructor-frozen profile authority."""
 
     def test_source_profile_wins_over_routing(self, mock_runner, discord_source):
-        """source.profile should be used even if routing would match."""
-        discord_source.profile = "from-source"
+        """An already-stamped source bypasses defensive route lookup."""
+        discord_source.profile = "default"
+        mock_runner._profile_name_for_source = MagicMock(return_value="unserved")
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    mock_get_dir.return_value = Path("/hermes/profiles/from-source")
-                    result = mock_runner._resolve_profile_home_for_source(discord_source)
+        result = mock_runner._resolve_profile_home_for_source(discord_source)
 
-                    assert result == Path("/hermes/profiles/from-source")
-                    mock_get_dir.assert_called_once_with("from-source")
+        assert result == Path(mock_runner._primary_profile_identity.canonical_home)
+        mock_runner._profile_name_for_source.assert_not_called()
 
     def test_routing_wins_over_active_profile(self, mock_runner, discord_source):
-        """When source.profile is empty, routing should win over active profile."""
+        """A defensive route may select a profile in the frozen inventory."""
         discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value="default")
 
-        # Mock routing to return a profile
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    mock_get_dir.return_value = Path("/hermes/profiles/routed")
+        result = mock_runner._resolve_profile_home_for_source(discord_source)
 
-                    # Manually set routing to return a profile
-                    mock_runner._profile_name_for_source = MagicMock(return_value="routed")
-
-                    result = mock_runner._resolve_profile_home_for_source(discord_source)
-
-                    assert result == Path("/hermes/profiles/routed")
-                    mock_get_dir.assert_called_once_with("routed")
+        assert result == Path(mock_runner._primary_profile_identity.canonical_home)
+        mock_runner._profile_name_for_source.assert_called_once_with(discord_source)
 
     def test_active_profile_fallback(self, mock_runner, discord_source):
-        """When source.profile and routing both return None, active profile is used."""
+        """No live active-profile lookup participates in request resolution."""
         discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value=None)
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes/profiles/active")
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            side_effect=AssertionError("live active profile must not be read"),
+        ):
+            result = mock_runner._resolve_profile_home_for_source(discord_source)
 
-                # No routing match
-                mock_runner._profile_name_for_source = MagicMock(return_value=None)
-
-                result = mock_runner._resolve_profile_home_for_source(discord_source)
-
-                assert result == Path("/hermes/profiles/active")
-                mock_get_dir.assert_called_once_with("active")
+        assert result == Path(mock_runner._primary_profile_identity.canonical_home)
 
     def test_default_fallback_when_no_active(self, mock_runner, discord_source):
-        """When even active profile is None, 'default' is used."""
+        """The constructor-frozen primary is the only fallback."""
         discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value=None)
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value=None):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes")
+        result = mock_runner._resolve_profile_home_for_source(discord_source)
 
-                mock_runner._profile_name_for_source = MagicMock(return_value=None)
-
-                result = mock_runner._resolve_profile_home_for_source(discord_source)
-
-                assert result == Path("/hermes")
-                mock_get_dir.assert_called_once_with("default")
+        assert result == Path(mock_runner._primary_profile_identity.canonical_home)
 
 
 class TestMissingProfileWarning:
-    """Explicit profile routes fail closed instead of crossing profiles."""
+    """Unknown profiles fail closed instead of crossing authority."""
 
     def test_nonexistent_profile_fails_closed(self, mock_runner, discord_source, caplog):
-        """A missing source.profile must never fall back to global state."""
+        """An unserved source.profile must never fall back to the primary."""
         discord_source.profile = "nonexistent"
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes/profiles/nonexistent")
-                with patch("hermes_cli.profiles.profile_exists", return_value=False):
-                    with patch("hermes_constants.get_hermes_home") as mock_home:
-                        with caplog.at_level(logging.ERROR):
-                            with pytest.raises(RuntimeError, match="does not exist"):
-                                mock_runner._resolve_profile_home_for_source(discord_source)
-
-                    mock_home.assert_not_called()
-                    assert len(caplog.records) == 1
-                    assert caplog.records[0].levelname == "ERROR"
-                    assert "nonexistent" in caplog.records[0].message
-                    assert "discord" in caplog.records[0].message
-                    assert "123456" in caplog.records[0].message
+        with pytest.raises(RuntimeError, match="not served by this gateway generation"):
+            mock_runner._resolve_profile_home_for_source(discord_source)
 
     def test_nonexistent_routing_profile_fails_closed(self, mock_runner, discord_source, caplog):
-        """A stale route must not leak into the active/global profile."""
+        """A stale route must not leak into the frozen primary profile."""
         discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value="routed")
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes/profiles/routed")
-                with patch("hermes_cli.profiles.profile_exists", return_value=False):
-                    with patch("hermes_constants.get_hermes_home") as mock_home:
-                        mock_runner._profile_name_for_source = MagicMock(return_value="routed")
-
-                        with caplog.at_level(logging.ERROR):
-                            with pytest.raises(RuntimeError, match="does not exist"):
-                                mock_runner._resolve_profile_home_for_source(discord_source)
-
-                    mock_home.assert_not_called()
-                    assert len(caplog.records) == 1
-                    assert "routed" in caplog.records[0].message
+        with pytest.raises(RuntimeError, match="not served by this gateway generation"):
+            mock_runner._resolve_profile_home_for_source(discord_source)
 
     def test_empty_source_profile_no_warning(self, mock_runner, discord_source, caplog):
-        """When source.profile is empty, silent fallback to active profile (no warning)."""
+        """An empty source silently resolves to the frozen primary."""
         discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value=None)
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes/profiles/active")
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    with caplog.at_level(logging.WARNING):
-                        mock_runner._profile_name_for_source = MagicMock(return_value=None)
+        with caplog.at_level(logging.WARNING):
+            result = mock_runner._resolve_profile_home_for_source(discord_source)
 
-                        result = mock_runner._resolve_profile_home_for_source(discord_source)
-
-                        # Should use active profile
-                        assert result == Path("/hermes/profiles/active")
-
-                        # No warnings (active profile exists)
-                        assert not any(r.levelname == "WARNING" for r in caplog.records)
+        assert result == Path(mock_runner._primary_profile_identity.canonical_home)
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
 
     def test_existing_profile_no_warning(self, mock_runner, discord_source, caplog):
-        """When the profile exists, no warning should be logged."""
-        discord_source.profile = "existing"
+        """A verified served profile resolves without warning."""
+        discord_source.profile = "default"
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                mock_get_dir.return_value = Path("/hermes/profiles/existing")
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    with caplog.at_level(logging.WARNING):
-                        result = mock_runner._resolve_profile_home_for_source(discord_source)
+        with caplog.at_level(logging.WARNING):
+            result = mock_runner._resolve_profile_home_for_source(discord_source)
 
-                        assert result == Path("/hermes/profiles/existing")
-
-                        # No warnings
-                        assert not any(r.levelname == "WARNING" for r in caplog.records)
+        assert result == Path(mock_runner._primary_profile_identity.canonical_home)
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
 
 
 class TestExceptionHandling:
-    """Tests for exception handling in profile resolution."""
+    """Frozen authority is independent of live helpers and is reverified."""
 
     def test_get_profile_dir_exception_fails_closed(self, mock_runner, discord_source, caplog):
-        """An explicit profile resolution exception propagates without fallback."""
-        discord_source.profile = "bad-profile"
+        """Live profile-directory helpers are never consulted per request."""
+        discord_source.profile = "default"
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir", side_effect=ValueError("Invalid profile name")):
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    with patch("hermes_constants.get_hermes_home") as mock_home:
-                        with caplog.at_level(logging.ERROR):
-                            with pytest.raises(ValueError, match="Invalid profile name"):
-                                mock_runner._resolve_profile_home_for_source(discord_source)
+        with patch(
+            "hermes_cli.profiles.get_profile_dir",
+            side_effect=AssertionError("live profile path must not be read"),
+        ):
+            result = mock_runner._resolve_profile_home_for_source(discord_source)
 
-                    mock_home.assert_not_called()
-                    assert len(caplog.records) == 1
-                    assert caplog.records[0].levelname == "ERROR"
-                    assert "bad-profile" in caplog.records[0].message
-                    assert "Explicit profile resolution blocked" in caplog.records[0].message
+        assert result == Path(mock_runner._primary_profile_identity.canonical_home)
 
     def test_exception_with_no_profile_name(self, mock_runner, discord_source, caplog):
-        """Exception when no profile was set should still log a warning."""
+        """A changed frozen profile generation is rejected with restart guidance."""
         discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value=None)
+        marker = (
+            Path(mock_runner._primary_profile_identity.canonical_home)
+            / ".api-server-profile-id"
+        )
+        marker.unlink()
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value=None):
-            with patch("hermes_cli.profiles.get_profile_dir", side_effect=RuntimeError("Filesystem error")):
-                with patch("hermes_constants.get_hermes_home", return_value=Path("/hermes")):
-                    mock_runner._profile_name_for_source = MagicMock(return_value=None)
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RuntimeError, match="changed after gateway construction"):
+                mock_runner._resolve_profile_home_for_source(discord_source)
 
-                    with caplog.at_level(logging.WARNING):
-                        result = mock_runner._resolve_profile_home_for_source(discord_source)
-
-                        assert result == Path("/hermes")
-
-                        assert "Default profile resolution failed" in caplog.records[0].message
+        assert any("restart is required" in record.message for record in caplog.records)
 
 
 class TestRoutingConsultation:
@@ -240,34 +178,20 @@ class TestRoutingConsultation:
     def test_routing_consulted_when_source_profile_empty(self, mock_runner, discord_source):
         """_profile_name_for_source should be called when source.profile is empty."""
         discord_source.profile = None
+        mock_runner._profile_name_for_source = MagicMock(return_value="default")
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    mock_get_dir.return_value = Path("/hermes/profiles/routed")
+        mock_runner._resolve_profile_home_for_source(discord_source)
 
-                    mock_runner._profile_name_for_source = MagicMock(return_value="routed")
-
-                    mock_runner._resolve_profile_home_for_source(discord_source)
-
-                    # Should have called routing
-                    mock_runner._profile_name_for_source.assert_called_once_with(discord_source)
+        mock_runner._profile_name_for_source.assert_called_once_with(discord_source)
 
     def test_routing_not_consulted_when_source_profile_set(self, mock_runner, discord_source):
         """_profile_name_for_source should NOT be called when source.profile is set."""
-        discord_source.profile = "from-source"
+        discord_source.profile = "default"
+        mock_runner._profile_name_for_source = MagicMock(return_value="routed")
 
-        with patch("hermes_cli.profiles.get_active_profile_name", return_value="active"):
-            with patch("hermes_cli.profiles.get_profile_dir") as mock_get_dir:
-                with patch("hermes_cli.profiles.profile_exists", return_value=True):
-                    mock_get_dir.return_value = Path("/hermes/profiles/from-source")
+        mock_runner._resolve_profile_home_for_source(discord_source)
 
-                    mock_runner._profile_name_for_source = MagicMock(return_value="routed")
-
-                    mock_runner._resolve_profile_home_for_source(discord_source)
-
-                    # Should NOT have called routing
-                    mock_runner._profile_name_for_source.assert_not_called()
+        mock_runner._profile_name_for_source.assert_not_called()
 
 
 class TestNonDiscordProfileRouting:

@@ -24,6 +24,7 @@ from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,12 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+def _new_gateway_runner(runner_cls, profile_home):
+    runner = object.__new__(runner_cls)
+    install_frozen_profile_authority(runner, profile_home)
+    return runner
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +348,7 @@ async def test_session_hygiene_model_path_is_disabled_only_for_capability_canary
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -443,7 +450,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -548,7 +555,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -648,7 +655,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -741,7 +748,7 @@ async def test_session_hygiene_skips_compression_during_failure_cooldown(monkeyp
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -870,7 +877,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -994,7 +1001,7 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1116,7 +1123,7 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1251,7 +1258,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1368,7 +1375,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1475,7 +1482,7 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1563,7 +1570,7 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = _new_gateway_runner(GatewayRunner, tmp_path)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )

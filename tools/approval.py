@@ -301,6 +301,34 @@ def _get_session_platform() -> str:
         return os.getenv("HERMES_SESSION_PLATFORM", "") or ""
 
 
+def _is_cron_session() -> bool:
+    """Return whether this execution context is a scheduled cron run.
+
+    Gateway-hosted cron uses task-local ContextVar state so a scheduled job
+    cannot leak its unattended approval policy into unrelated live turns.
+    The environment fallback keeps standalone cron processes compatible.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        value = os.getenv("HERMES_CRON_SESSION", "")
+    else:
+        try:
+            value = get_session_env("HERMES_CRON_SESSION", "")
+        except Exception:
+            # The gateway scheduler no longer writes a process-global cron
+            # marker. If task-local authority unexpectedly cannot be read,
+            # treating the turn as interactive could bypass cron_mode. Fail
+            # closed as unattended instead.
+            logger.warning(
+                "Could not read task-local cron authority; treating execution "
+                "as cron",
+                exc_info=True,
+            )
+            return True
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _is_gateway_approval_context() -> bool:
     """True when this call is inside a gateway/API session.
 
@@ -315,7 +343,7 @@ def _is_gateway_approval_context() -> bool:
     fall through to the gateway branch would submit a pending approval
     with no listener and block the job indefinitely.
     """
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_session():
         return False
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
@@ -4304,14 +4332,19 @@ def is_approval_bypass_active() -> bool:
       - the session-scoped gateway ``/yolo`` toggle,
       - ``approvals.mode: off`` in config.
 
+    Scheduled jobs are governed by ``approvals.cron_mode`` instead of the
+    interactive ``approvals.mode``. An explicit process/session yolo still
+    wins, but a global interactive ``mode: off`` must not silently turn
+    ``cron_mode: deny`` into approve.
+
     This is the pure-bypass sub-expression only. Callers that also honor a
     hardline blocklist / permanent allowlist must check those separately.
     """
-    return (
-        _YOLO_MODE_FROZEN
-        or is_current_session_yolo_enabled()
-        or _get_approval_mode() == "off"
-    )
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+        return True
+    if _is_cron_session():
+        return _get_cron_approval_mode() == "approve"
+    return _get_approval_mode() == "off"
 
 
 def _get_approval_timeout() -> int:
@@ -4568,7 +4601,7 @@ def _run_approval_gate(
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        if _is_cron_session():
             if _get_cron_approval_mode() == "deny":
                 return {
                     "approved": False,
@@ -5197,10 +5230,14 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # --yolo or approvals.mode=off: bypass all interactive approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # Scheduled jobs remain governed by approvals.cron_mode, so a global
+    # interactive mode=off cannot silently override cron_mode=deny.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+        return {"approved": True, "message": None}
+    if approval_mode == "off" and not _is_cron_session():
         return {"approved": True, "message": None}
 
     plan_id = consume_plan_capability(get_current_session_key(), command)
@@ -5218,7 +5255,7 @@ def check_all_command_guards(command: str, env_type: str,
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        if _is_cron_session():
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
@@ -5713,15 +5750,17 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
+    # Cron is intentionally evaluated first for mode=off so cron_mode=deny
+    # remains an independent safety boundary for unattended arbitrary code.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Cron: no user is present to approve arbitrary code.
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_session():
         if _get_cron_approval_mode() == "deny":
             return {
                 "approved": False,
@@ -5738,6 +5777,9 @@ def check_execute_code_guard(code: str, env_type: str,
                 "outcome": "blocked",
                 "user_consent": False,
             }
+        return {"approved": True, "message": None}
+
+    if approval_mode == "off":
         return {"approved": True, "message": None}
 
     # Only gateway/ask contexts get the one-shot whole-script approval.

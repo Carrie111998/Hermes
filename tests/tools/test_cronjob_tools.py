@@ -124,11 +124,35 @@ class TestCronjobRequirements:
 
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
-        tokens = set_session_vars(platform="discord")
+        tokens = set_session_vars(platform="discord", cron_session=True)
         try:
             assert check_cronjob_requirements() is False
         finally:
             clear_session_vars(tokens)
+
+    def test_live_context_suppresses_stale_process_cron_marker(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        tokens = set_session_vars(platform="discord", cron_session=False)
+        try:
+            assert check_cronjob_requirements() is True
+        finally:
+            clear_session_vars(tokens)
+
+    def test_unreadable_task_local_authority_hides_management_tool(
+        self,
+        monkeypatch,
+    ):
+        from unittest.mock import patch as mock_patch
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        with mock_patch(
+            "gateway.session_context.get_session_env",
+            side_effect=RuntimeError("context unavailable"),
+        ):
+            assert check_cronjob_requirements() is False
 
     def test_accepts_exec_ask(self, monkeypatch):
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)

@@ -37,10 +37,13 @@ def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
 
 
-def _make_runner():
+def _make_runner(hermes_home):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    from tests.gateway._profile_authority import install_frozen_profile_authority
+
+    install_frozen_profile_authority(runner, hermes_home)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -125,7 +128,7 @@ async def test_stacked_second_skill_disabled_for_platform_is_blocked(monkeypatch
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
     )
 
-    runner = _make_runner()
+    runner = _make_runner(skills_env.parent)
     result = await runner._handle_message(
         _make_event("/allowed-skill /disabled-skill do something")
     )
@@ -152,7 +155,7 @@ async def test_stacked_all_enabled_skills_still_load(monkeypatch, skills_env):
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
     )
 
-    runner = _make_runner()
+    runner = _make_runner(skills_env.parent)
     event = _make_event("/alpha-skill /beta-skill do something")
     result = await runner._handle_message(event)
 

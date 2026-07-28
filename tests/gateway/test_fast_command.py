@@ -13,6 +13,7 @@ import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 class _CapturingAgent:
@@ -151,12 +152,17 @@ async def test_handle_fast_command_session_scoped_by_default(monkeypatch, tmp_pa
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
 
-    response = await runner._handle_fast_command(_make_event("/fast fast"))
+    event = _make_event("/fast fast")
+    session_key = runner._session_key_for_source(event.source)
+    response = await runner._handle_fast_command(event)
 
     assert "FAST" in response
-    assert runner._service_tier == "priority"
+    assert runner._session_service_tier_overrides == {
+        session_key: "priority",
+    }
+    assert runner._resolve_session_service_tier(session_key=session_key) == "priority"
+    assert runner._service_tier is None
     # Session override recorded; config.yaml NOT written.
-    assert runner._session_service_tier_overrides
     assert not (tmp_path / "config.yaml").exists()
 
 
@@ -171,7 +177,7 @@ async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_
     response = await runner._handle_fast_command(_make_event("/fast fast --global"))
 
     assert "FAST" in response
-    assert runner._service_tier == "priority"
+    assert runner._service_tier is None
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert saved["agent"]["service_tier"] == "fast"
@@ -210,6 +216,7 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
 async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
+    install_frozen_profile_authority(runner, tmp_path)
 
     (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -261,6 +268,7 @@ async def test_runtime_resolution_failure_is_structured_and_secret_safe(
 ):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
+    install_frozen_profile_authority(runner, tmp_path)
     runner._resolve_session_agent_runtime = MagicMock(
         side_effect=RuntimeError(
             "authentication rejected for sk-secret-must-not-leak"
@@ -307,6 +315,7 @@ async def test_runtime_resolution_failure_is_structured_and_secret_safe(
 async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
+    install_frozen_profile_authority(runner, tmp_path)
     runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)

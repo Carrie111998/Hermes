@@ -320,6 +320,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**Ügynök fut:** {state}"
+    execution_this_run:    "**Végrehajtás ebben a futásban:** {progress}"
     state_yes:             "Igen ⚡"
     state_no:              "Nem"
     queued:                "**Sorban álló folytatások:** {count}"

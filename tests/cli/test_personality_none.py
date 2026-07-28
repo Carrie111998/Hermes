@@ -102,7 +102,9 @@ class TestGatewayPersonalityNone:
             event = self._make_event("none")
             result = await runner._handle_personality_command(event)
 
-        assert runner._ephemeral_system_prompt == ""
+        saved = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        assert saved["agent"]["system_prompt"] == ""
+        assert runner._ephemeral_system_prompt == "You are kawaii~"
         assert "cleared" in result.lower()
 
     @pytest.mark.asyncio
@@ -116,7 +118,9 @@ class TestGatewayPersonalityNone:
             event = self._make_event("default")
             result = await runner._handle_personality_command(event)
 
-        assert runner._ephemeral_system_prompt == ""
+        saved = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        assert saved["agent"]["system_prompt"] == ""
+        assert runner._ephemeral_system_prompt == "You are kawaii~"
 
     @pytest.mark.asyncio
     async def test_list_includes_none(self, tmp_path):

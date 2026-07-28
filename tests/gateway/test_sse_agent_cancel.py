@@ -362,6 +362,7 @@ class TestSSEAgentFailureFinishReason:
                 await adapter._write_sse_chat_completion(
                     _make_request(), "cmpl-fail", "gpt-4", 1234567890,
                     stream_q, agent_task,
+                    session_id="test-session",
                     cleanup_ref=_confirmed_cleanup_ref(),
                 )
             return _finish_reason(chunks)
@@ -393,8 +394,7 @@ class TestSSEAgentFailureFinishReason:
         async def trunc():
             return (
                 {"final_response": "half", "partial": True, "completed": False,
-                 "outcome_code": "output_truncated",
-                 "error": "output was truncated"},
+                 "outcome_code": "output_truncated"},
                 {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
             )
 
