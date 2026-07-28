@@ -3214,6 +3214,15 @@ class WorkflowEngine:
                     card_status = card.get("status", card.get("column", "unknown"))
                     card_status_lower = card_status.lower()
 
+                    # ── Sync in-memory status with actual card status ──
+                    # If the in-memory status says "running" but the card
+                    # is still "ready" (dispatcher hasn't claimed it yet),
+                    # sync back to "ready" so we keep polling instead of
+                    # waiting forever for a "running" card to transition.
+                    if state.status == "running" and card_status_lower == "ready":
+                        state.status = "ready"
+                        continue
+
                     # ── Done states ──
                     if card_status_lower in ("done", "completed", "complete"):
                         state.status = "done"
