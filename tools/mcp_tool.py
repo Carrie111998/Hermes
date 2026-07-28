@@ -1811,6 +1811,30 @@ class ElicitationHandler:
 # Server task -- each MCP server lives in one long-lived asyncio Task
 # ---------------------------------------------------------------------------
 
+
+def _compute_config_digest(config: dict) -> str:
+    """Compute a stable hash of config fields that affect server behavior.
+
+    Hashing only the fields that change the spawned subprocess or transport
+    session -- excluding meta-keys like enabled, supports_parallel_tool_calls,
+    and tools (those are consumed by Hermes itself, not by the server).
+    """
+    import hashlib
+    relevant: dict = {}
+    for k in (
+        "command", "args", "env",
+        "url", "headers", "transport",
+        "auth", "timeout", "connect_timeout", "keepalive_interval",
+        "idle_timeout_seconds", "max_lifetime_seconds",
+        "ssl_verify", "skip_preflight",
+        "sampling", "elicitation",
+    ):
+        if k in config:
+            relevant[k] = config[k]
+    raw = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
 class MCPServerTask:
     """Manages a single MCP server connection in a dedicated asyncio Task.
 
@@ -1824,7 +1848,7 @@ class MCPServerTask:
     __slots__ = (
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
-        "_tools", "_error", "_config",
+        "_tools", "_error", "_config", "_config_digest",
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
@@ -3022,6 +3046,7 @@ class MCPServerTask:
         connection drops unexpectedly (unless shutdown was requested).
         """
         self._config = config
+        self._config_digest = _compute_config_digest(config)
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
@@ -5654,10 +5679,43 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
     with _lock:
+        # --- Detect servers whose config changed ---
+        # Remove old server tasks whose config no longer matches so the
+        # fresh config is picked up below as a "new" server to connect.
+        changed_names: list[str] = []
+        for name, cfg in servers.items():
+            srv = _servers.get(name)
+            if srv is None:
+                continue
+            new_digest = _compute_config_digest(cfg)
+            if getattr(srv, "_config_digest", None) is not None and srv._config_digest != new_digest:
+                changed_names.append(name)
+        for name in changed_names:
+            srv = _servers.pop(name)
+            logger.info(
+                "MCP server '%s': config changed, restarting with new config",
+                name,
+            )
+            # Fire-and-forget shutdown — the old transport / subprocess
+            # will be reaped by the orphan-cleanup in _run_stdio.
+            srv._shutdown_event.set()
+            srv._reconnect_event.set()
+            if srv._task and not srv._task.done():
+                srv._task.cancel()
+            # Clear connect failure state so the new attempt isn't blocked
+            _server_connect_retry_after.pop(name, None)
+            _server_connect_failures.pop(name, None)
+            _server_connecting.discard(name)
+            _server_connect_errors.pop(name, None)
+            # Deregister tools to avoid stale tool entries
+            if callable(getattr(srv, "_deregister_tools", None)):
+                srv._deregister_tools()
+
         new_servers = {
             k: v
             for k, v in servers.items()
             if k not in _servers
+            and k not in _server_connecting
             and _parse_boolish(v.get("enabled", True), default=True)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
@@ -5789,7 +5847,9 @@ def discover_mcp_tools() -> List[str]:
         new_server_names = [
             name
             for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+            if name not in _servers
+            and name not in _server_connecting
+            and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
     tool_names = register_mcp_servers(servers)
