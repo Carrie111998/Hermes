@@ -194,6 +194,12 @@ class ElevenLabsStreamer(StreamingTTSProvider):
         )
 
 
+def _section_value(section: Dict, key: str) -> Optional[str]:
+    """Return a non-blank string from a provider's config section, else None."""
+    value = (section or {}).get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 @register("openai")
 class OpenAIStreamer(StreamingTTSProvider):
     """OpenAI speech with ``response_format=pcm`` (24 kHz mono int16)."""
@@ -207,10 +213,15 @@ class OpenAIStreamer(StreamingTTSProvider):
     def stream(self, text: str) -> Iterator[bytes]:
         from openai import OpenAI
 
-        client = OpenAI(
-            api_key=get_env_value("OPENAI_API_KEY"),
-            base_url=get_env_value("OPENAI_BASE_URL") or None,
-        )
+        # Mirror the synchronous path's precedence (tools/tts_tool.py): the
+        # configured endpoint wins over the environment, which is the
+        # last-resort default. Without this, a self-hosted OpenAI-compatible
+        # server works for ordinary replies and then streams from
+        # api.openai.com — asking it for a local model in a local voice.
+        base_url = _section_value(self.section, "base_url") or get_env_value("OPENAI_BASE_URL")
+        api_key = _section_value(self.section, "api_key") or get_env_value("OPENAI_API_KEY")
+
+        client = OpenAI(api_key=api_key, base_url=base_url or None)
         model = self.section.get("model", "gpt-4o-mini-tts")
         voice = self.section.get("voice", "alloy")
         with client.audio.speech.with_streaming_response.create(

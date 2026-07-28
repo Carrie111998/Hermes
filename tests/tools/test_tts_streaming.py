@@ -135,6 +135,81 @@ def test_openai_available_reflects_key(monkeypatch):
     assert ts.OpenAIStreamer.available() is True
 
 
+def _openai_client_kwargs(monkeypatch, section, env):
+    """Return the kwargs OpenAIStreamer builds its client with for *section*/*env*."""
+    seen = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def iter_bytes(self, *_a, **_kw):
+            return iter([b""])
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            speech = MagicMock()
+            speech.with_streaming_response.create = lambda **_kw: _FakeResponse()
+            self.audio = MagicMock(speech=speech)
+
+    monkeypatch.setattr(ts, "get_env_value", lambda k, *a: env.get(k))
+    with patch.dict("sys.modules", {"openai": MagicMock(OpenAI=_FakeClient)}):
+        list(ts.OpenAIStreamer({"openai": section}, section).stream("hi"))
+    return seen
+
+
+def test_openai_stream_prefers_configured_endpoint(monkeypatch):
+    """tts.openai.base_url beats the environment, as in the synchronous path.
+
+    Otherwise a self-hosted OpenAI-compatible server works for ordinary replies
+    and then streams from api.openai.com, asking it for a local model.
+    """
+    seen = _openai_client_kwargs(
+        monkeypatch,
+        {"base_url": "http://localhost:4003/v1", "api_key": "local"},
+        {"OPENAI_API_KEY": "env-key", "OPENAI_BASE_URL": "https://env.example/v1"},
+    )
+    assert seen["base_url"] == "http://localhost:4003/v1"
+    assert seen["api_key"] == "local"
+
+
+def test_openai_stream_falls_back_to_env(monkeypatch):
+    """Nothing configured — unchanged behaviour for real-OpenAI users."""
+    seen = _openai_client_kwargs(
+        monkeypatch,
+        {},
+        {"OPENAI_API_KEY": "env-key", "OPENAI_BASE_URL": "https://env.example/v1"},
+    )
+    assert seen["base_url"] == "https://env.example/v1"
+    assert seen["api_key"] == "env-key"
+
+
+def test_openai_stream_resolves_base_url_and_key_independently(monkeypatch):
+    """A configured endpoint with no configured key still uses the env key."""
+    seen = _openai_client_kwargs(
+        monkeypatch,
+        {"base_url": "http://localhost:4003/v1"},
+        {"OPENAI_API_KEY": "env-key"},
+    )
+    assert seen["base_url"] == "http://localhost:4003/v1"
+    assert seen["api_key"] == "env-key"
+
+
+def test_openai_stream_ignores_blank_config_values(monkeypatch):
+    """Empty/whitespace YAML values must not shadow the environment."""
+    seen = _openai_client_kwargs(
+        monkeypatch,
+        {"base_url": "   ", "api_key": ""},
+        {"OPENAI_API_KEY": "env-key", "OPENAI_BASE_URL": "https://env.example/v1"},
+    )
+    assert seen["base_url"] == "https://env.example/v1"
+    assert seen["api_key"] == "env-key"
+
+
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
 
 
