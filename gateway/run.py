@@ -10985,19 +10985,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or not getattr(source, "thread_id", None)
         ):
             return
-        adapter = adapter or self._adapter_for_source(source)
-        setter = getattr(adapter, "set_run_lifecycle_outcome", None)
-        register = getattr(adapter, "register_run_lifecycle_terminal", None)
-        if callable(setter):
-            setter(event, outcome)
-        if callable(register):
-            register(event)
-        pop_callback = getattr(adapter, "pop_post_delivery_callback", None)
-        callback = (
-            pop_callback(session_key, generation=generation)
-            if callable(pop_callback)
-            else None
-        )
+        try:
+            adapter = adapter or self._adapter_for_source(source)
+            setter = getattr(adapter, "set_run_lifecycle_outcome", None)
+            register = getattr(adapter, "register_run_lifecycle_terminal", None)
+            if callable(setter):
+                setter(event, outcome)
+            if callable(register):
+                register(event)
+            pop_callback = getattr(adapter, "pop_post_delivery_callback", None)
+            callback = (
+                pop_callback(session_key, generation=generation)
+                if callable(pop_callback)
+                else None
+            )
+        except Exception:
+            logger.debug(
+                "Recursive Discord run lifecycle bookkeeping failed for %s",
+                session_key,
+                exc_info=True,
+            )
+            return
         if not callable(callback):
             return
         try:

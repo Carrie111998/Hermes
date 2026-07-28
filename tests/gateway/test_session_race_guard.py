@@ -262,6 +262,54 @@ def test_nonempty_agent_result_preserves_failure_and_timeout_flags():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failing_stage", ["set", "register", "pop"])
+async def test_recursive_lifecycle_setup_failures_are_best_effort(failing_stage):
+    runner, _adapter, event = _make_discord_runner_and_event()
+
+    class FailingLifecycleAdapter:
+        def set_run_lifecycle_outcome(self, _event, _outcome):
+            if failing_stage == "set":
+                raise RuntimeError("setter failed")
+
+        def register_run_lifecycle_terminal(self, _event):
+            if failing_stage == "register":
+                raise RuntimeError("registration failed")
+
+        def pop_post_delivery_callback(self, _session_key, *, generation=None):
+            if failing_stage == "pop":
+                raise RuntimeError("pop failed")
+            return None
+
+    await runner._finish_recursive_discord_run_lifecycle(
+        event,
+        session_key=build_session_key(event.source),
+        generation=4,
+        outcome="success",
+        adapter=FailingLifecycleAdapter(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_recursive_lifecycle_callback_cancellation_still_propagates():
+    runner, _adapter, event = _make_discord_runner_and_event()
+
+    async def cancelled_callback():
+        raise asyncio.CancelledError()
+
+    adapter = MagicMock()
+    adapter.pop_post_delivery_callback.return_value = cancelled_callback
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._finish_recursive_discord_run_lifecycle(
+            event,
+            session_key=build_session_key(event.source),
+            generation=5,
+            outcome="stopped",
+            adapter=adapter,
+        )
+
+
+@pytest.mark.asyncio
 async def test_non_discord_agent_run_does_not_emit_run_lifecycle():
     runner = _make_runner()
     event = _make_event()
