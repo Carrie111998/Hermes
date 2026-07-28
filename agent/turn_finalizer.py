@@ -123,8 +123,9 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    silent_guardrail_halt = _turn_exit_reason == "guardrail_halt" and final_response is None
     completed = (
-        final_response is not None
+        (silent_guardrail_halt or final_response is not None)
         and not failed
         and (
             api_call_count < agent.max_iterations

@@ -66,7 +66,7 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
-from hermes_constants import PARTIAL_STREAM_STUB_ID
+from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_STREAM_INTERRUPTED
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
@@ -1738,6 +1738,41 @@ def run_conversation(
                         final_response=_refusal_response,
                         error_detail=_refusal_text or "model declined (content_filter)",
                     )
+
+                if finish_reason == FINISH_REASON_STREAM_INTERRUPTED:
+                    _trunc_transport = agent._get_transport()
+                    if agent.api_mode == "anthropic_messages":
+                        _partial_msg = _trunc_transport.normalize_response(
+                            response, strip_tool_prefix=agent._is_anthropic_oauth
+                        )
+                    else:
+                        _partial_msg = _trunc_transport.normalize_response(response)
+                    _partial_content = agent._strip_think_blocks(
+                        getattr(_partial_msg, "content", "") or ""
+                    ).strip()
+                    agent._vprint(
+                        f"{agent.log_prefix}⚠️  Stream interrupted by network error; "
+                        "not replaying the request automatically",
+                        force=True,
+                    )
+                    # Keep the half-finished reply in history — same rationale as
+                    # the user-interrupt path above: dropping it makes the model
+                    # "forget" what it already said on the next turn.
+                    if _partial_content:
+                        messages.append(
+                            {"role": "assistant", "content": _partial_content}
+                        )
+                    agent._cleanup_task_resources(effective_task_id)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _partial_content,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "finish_reason": FINISH_REASON_STREAM_INTERRUPTED,
+                        "error": "stream_interrupted: provider stream ended before a terminal event",
+                    }
 
                 if finish_reason == "length":
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
@@ -4690,24 +4725,16 @@ def run_conversation(
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
-                    final_response = agent._toolguard_controlled_halt_response(decision)
-                    agent._emit_status(
-                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
+                    # A guardrail halt is internal control flow, not assistant
+                    # prose. Preserve its structured metadata for callers and
+                    # logs, but do not append or stream a technical explanation
+                    # to user-facing transports.
+                    logger.info(
+                        "Tool guardrail halted turn: tool=%s code=%s count=%s",
+                        decision.tool_name,
+                        decision.code,
+                        decision.count,
                     )
-                    messages.append({"role": "assistant", "content": final_response})
-                    # Emit the halt message to the client so it's not
-                    # indistinguishable from a crash.  The stream display
-                    # was flushed (callback(None)) before tool execution,
-                    # but the callback is still alive — fire the text
-                    # through it so SSE/TUI clients see the explanation.
-                    if final_response:
-                        agent._safe_print(f"\n{final_response}\n")
-                        if agent.stream_delta_callback:
-                            try:
-                                agent.stream_delta_callback(final_response)
-                                agent.stream_delta_callback(None)
-                            except Exception:
-                                pass
                     break
 
                 # Reset per-turn retry counters after successful tool
@@ -5172,11 +5199,15 @@ def run_conversation(
                                  agent._verification_stop_nudges)
                     continue
 
-                # User verification-loop gate: when the agent edited code this
-                # turn, let a registered `pre_verify` hook (plugin/shell) keep it
-                # going one more turn. The shipped guidance is folded into the
-                # evidence-based verify-on-stop nudge above, so this path has no
-                # default continuation cost.
+                # Final-response verification gate: let a registered `pre_verify`
+                # hook (plugin/shell) reject a proposed final answer and continue
+                # the real model/tool loop. This deliberately is not limited to
+                # file edits: plugins also verify live facts, remote state, and
+                # other answer claims that require a same-turn tool call. Coding
+                # hooks retain the changed-paths payload and can no-op when it is
+                # empty. The shipped coding guidance remains in the evidence-
+                # based verify-on-stop nudge above, so this path has no default
+                # continuation cost.
                 _verify_nudge2 = None
                 _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
                 _attempt = getattr(agent, "_pre_verify_nudges", 0)
@@ -5184,7 +5215,7 @@ def run_conversation(
                     from agent.verify_hooks import max_verify_nudges
                     from hermes_cli.plugins import get_pre_verify_continue_message, has_hook
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
+                    if has_hook("pre_verify") and _attempt < max_verify_nudges():
                         # Posture is fixed for the session — resolve once + cache.
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:

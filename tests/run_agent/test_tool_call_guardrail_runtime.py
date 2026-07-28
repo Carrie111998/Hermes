@@ -295,7 +295,11 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
     assert result["turn_exit_reason"] == "guardrail_halt"
     assert "error" not in result
     assert result["completed"] is True
-    assert "stopped retrying" in result["final_response"]
+    assert result["final_response"] is None
+    assert not any(
+        message.get("role") == "assistant" and "stopped retrying" in (message.get("content") or "")
+        for message in result["messages"]
+    )
     assert result["guardrail"]["code"] == "repeated_exact_failure_block"
     assert result["guardrail"]["tool_name"] == "web_search"
 
@@ -306,14 +310,8 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         assert len(following_results) == len(call_ids)
 
 
-def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
-    """Regression for #30770: when the guardrail halts the loop, the
-    synthesized halt message must be pushed through ``stream_delta_callback``
-    so SSE/TUI clients see why the agent stopped instead of a silent stream
-    close.  Without this the chat-completions SSE writer drains an empty
-    queue and emits a finish chunk with zero content (indistinguishable
-    from a crash for Open WebUI and similar clients).
-    """
+def test_guardrail_halt_does_not_emit_technical_response_or_stream_delta():
+    """All guardrail halts stop the loop without user-facing technical prose."""
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}
     responses = [
@@ -343,13 +341,8 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
         result = agent.run_conversation("search repeatedly")
 
     assert result["turn_exit_reason"] == "guardrail_halt"
-    halt_text = result["final_response"]
-    assert "stopped retrying" in halt_text
-
-    # The halt message must have been pushed through the callback at least
-    # once.  Empty-queue SSE writers were the bug — clients saw no content
-    # delta before the finish chunk.
-    text_deltas = [d for d in deltas if isinstance(d, str)]
-    assert halt_text in text_deltas, (
-        f"halt message was never streamed; callback only saw {deltas!r}"
+    assert result["final_response"] is None
+    assert not any(
+        isinstance(delta, str) and "tool-call guardrail" in delta
+        for delta in deltas
     )
