@@ -6,7 +6,7 @@ import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { gitFor, repoStatus, resolveRenamePath } from './git-review-ops'
+import { gitFor, repoStatus, resolveRenamePath, reviewUnstage } from './git-review-ops'
 
 const tempDirs: string[] = []
 
@@ -68,6 +68,65 @@ test('resolveRenamePath: brace rename resolves to the new path', () => {
 
 test('resolveRenamePath: brace rename collapsing a segment', () => {
   assert.equal(resolveRenamePath('src/{lib => }/file.ts'), 'src/file.ts')
+})
+
+// A `git init` repo with work already staged and no commit yet, which is what the
+// review pane sees on a new project the agent has just written files into.
+function makeRepoBeforeFirstCommit() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-desktop-git-unborn-'))
+
+  tempDirs.push(dir)
+  execFileSync('git', ['init', '-q'], { cwd: dir })
+  fs.mkdirSync(path.join(dir, 'nested'))
+  fs.writeFileSync(path.join(dir, 'new.py'), 'print(1)\n')
+  fs.writeFileSync(path.join(dir, 'nested', 'deep.py'), 'print(2)\n')
+  execFileSync('git', ['add', '-A'], { cwd: dir })
+
+  return dir
+}
+
+// Paths the index carries for the next commit. Also valid on an unborn HEAD, where
+// `diff --cached` compares the index against the empty tree.
+function stagedPaths(dir: string) {
+  return execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: dir, encoding: 'utf8' })
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .sort()
+}
+
+test('reviewUnstage clears the whole index before the first commit', async () => {
+  const repo = makeRepoBeforeFirstCommit()
+
+  assert.deepEqual(stagedPaths(repo), ['nested/deep.py', 'new.py'])
+
+  await reviewUnstage(repo, null, 'git')
+
+  assert.deepEqual(stagedPaths(repo), [])
+  // A mixed reset moves the index only; the work itself has to survive.
+  assert.equal(fs.readFileSync(path.join(repo, 'new.py'), 'utf8'), 'print(1)\n')
+  assert.equal(fs.readFileSync(path.join(repo, 'nested', 'deep.py'), 'utf8'), 'print(2)\n')
+})
+
+test('reviewUnstage clears a single path before the first commit', async () => {
+  const repo = makeRepoBeforeFirstCommit()
+
+  await reviewUnstage(repo, 'new.py', 'git')
+
+  assert.deepEqual(stagedPaths(repo), ['nested/deep.py'])
+})
+
+test('reviewUnstage covers the whole index in a committed repo', async () => {
+  const repo = makeRepo()
+
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'changed\n')
+  fs.writeFileSync(path.join(repo, 'added.txt'), 'added\n')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  assert.deepEqual(stagedPaths(repo), ['added.txt', 'tracked.txt'])
+
+  await reviewUnstage(repo, null, 'git')
+
+  assert.deepEqual(stagedPaths(repo), [])
+  assert.equal(fs.readFileSync(path.join(repo, 'tracked.txt'), 'utf8'), 'changed\n')
 })
 
 test('repoStatus reports an untracked directory without recursively listing its contents', async () => {

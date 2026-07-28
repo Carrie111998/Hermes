@@ -402,10 +402,15 @@ async function reviewStage(repoPath, filePath, gitBin) {
   return { ok: true }
 }
 
+// Unstaging everything must not name HEAD: before the first commit it resolves to
+// no revision and `reset HEAD` exits 128, failing the whole operation. Bare `reset`
+// defaults to HEAD where one exists and to the empty tree where none does, resetting
+// the entire index in both cases. The pathspec form is safe as written, since a
+// path-limited reset already treats a missing HEAD as empty.
 async function reviewUnstage(repoPath, filePath, gitBin) {
   const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review unstage' })
 
-  await gitFor(cwd, gitBin).raw(filePath ? ['reset', '-q', 'HEAD', '--', filePath] : ['reset', '-q', 'HEAD'])
+  await gitFor(cwd, gitBin).raw(filePath ? ['reset', '-q', 'HEAD', '--', filePath] : ['reset', '-q'])
 
   return { ok: true }
 }
