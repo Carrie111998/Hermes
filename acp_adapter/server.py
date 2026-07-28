@@ -787,14 +787,14 @@ class HermesACPAgent(acp.Agent):
             # Named user-defined endpoints (providers: / custom_providers:)
             # are invisible to canonical provider enumeration — append them
             # so editor clients can select them like the TUI /model picker.
+            # Their catalogs combine declared and best-effort discovered models
+            # without completeness provenance, so omission must remain fail-open.
             for named_slug, named_label, named_catalog in _named_custom_provider_catalogs():
                 named_provider = normalize_provider(named_slug)
-                named_has_models = False
                 for named_model, named_desc in named_catalog:
                     named_choice = self._encode_model_choice(named_provider, named_model)
                     if not named_choice:
                         continue
-                    named_has_models = True
                     if named_choice in seen_ids:
                         continue
                     named_parts = [f"Provider: {named_label}"]
@@ -810,8 +810,6 @@ class HermesACPAgent(acp.Agent):
                         )
                     )
                     seen_ids.add(named_choice)
-                if named_has_models:
-                    authoritative_providers.add(named_provider)
 
             current_model_id = self._encode_model_choice(normalized_provider, model)
             if current_model_id and current_model_id not in seen_ids:

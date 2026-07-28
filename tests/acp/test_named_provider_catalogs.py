@@ -7,12 +7,12 @@ offer them — the TUI ``/model`` picker already renders these entries
 (#47039 implemented named endpoints for the TUI surface only).
 """
 
+import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from acp.exceptions import RequestError
 from acp_adapter.server import HermesACPAgent, _named_custom_provider_catalogs
 from acp_adapter.session import SessionManager
 from acp.schema import SessionModelState, SetSessionModelResponse
@@ -205,7 +205,7 @@ class TestModelStateIncludesNamedProviders:
         assert model == "openai.gpt-5.5"
 
     @pytest.mark.asyncio
-    async def test_set_model_validates_declared_named_provider_catalog(
+    async def test_set_model_keeps_named_provider_catalog_fail_open(
         self, tmp_path, monkeypatch
     ):
         db = SessionDB(tmp_path / "state.db")
@@ -220,13 +220,19 @@ class TestModelStateIncludesNamedProviders:
         )
         acp_agent = HermesACPAgent(session_manager=manager)
         state = manager.create_session(cwd=str(tmp_path))
-        replacement_agent = SimpleNamespace(
+        declared_agent = SimpleNamespace(
             model="openai.gpt-5.5",
             provider="custom:bedrock-mantle",
             base_url=MANTLE_URL,
             api_mode="codex_responses",
         )
-        make_agent = MagicMock(return_value=replacement_agent)
+        unadvertised_agent = SimpleNamespace(
+            model="openai.gpt-5.6",
+            provider="custom:bedrock-mantle",
+            base_url=MANTLE_URL,
+            api_mode="codex_responses",
+        )
+        make_agent = MagicMock(side_effect=[declared_agent, unadvertised_agent])
         monkeypatch.setattr(manager, "_make_agent", make_agent)
         picker_context = MagicMock()
         picker_context.with_overrides.return_value = picker_context
@@ -251,29 +257,43 @@ class TestModelStateIncludesNamedProviders:
                 ],
             ),
         ):
-            result = await acp_agent.set_session_model(
+            declared_result = await acp_agent.set_session_model(
                 model_id="custom:bedrock-mantle:openai.gpt-5.5",
                 session_id=state.session_id,
             )
-            with pytest.raises(RequestError) as exc_info:
-                await acp_agent.set_session_model(
-                    model_id="custom:bedrock-mantle:not-declared",
-                    session_id=state.session_id,
-                )
+            unadvertised_result = await acp_agent.set_session_model(
+                model_id="custom:bedrock-mantle:openai.gpt-5.6",
+                session_id=state.session_id,
+            )
 
-        assert isinstance(result, SetSessionModelResponse)
-        assert exc_info.value.code == -32602
-        error_data = exc_info.value.data
-        assert isinstance(error_data, dict)
-        assert error_data["provider"] == "custom:bedrock-mantle"
-        assert state.model == "openai.gpt-5.5"
-        assert state.agent is replacement_agent
-        make_agent.assert_called_once_with(
-            session_id=state.session_id,
-            cwd=str(tmp_path),
-            model="openai.gpt-5.5",
-            requested_provider="custom:bedrock-mantle",
-            base_url=None,
-            api_mode=None,
-        )
+        assert isinstance(declared_result, SetSessionModelResponse)
+        assert isinstance(unadvertised_result, SetSessionModelResponse)
+        assert state.model == "openai.gpt-5.6"
+        assert state.agent is unadvertised_agent
+        assert make_agent.call_args_list == [
+            call(
+                session_id=state.session_id,
+                cwd=str(tmp_path),
+                model="openai.gpt-5.5",
+                requested_provider="custom:bedrock-mantle",
+                base_url=None,
+                api_mode=None,
+            ),
+            call(
+                session_id=state.session_id,
+                cwd=str(tmp_path),
+                model="openai.gpt-5.6",
+                requested_provider="custom:bedrock-mantle",
+                base_url=MANTLE_URL,
+                api_mode="codex_responses",
+            ),
+        ]
+
+        persisted = db.get_session(state.session_id)
+        assert persisted is not None
+        assert persisted["model"] == "openai.gpt-5.6"
+        persisted_route = json.loads(persisted["model_config"])
+        assert persisted_route["provider"] == "custom:bedrock-mantle"
+        assert persisted_route["base_url"] == MANTLE_URL
+        assert persisted_route["api_mode"] == "codex_responses"
         db.close()
