@@ -1566,6 +1566,17 @@ def test_main_repl_readiness_rejects_repeated_modal_footer_redraws() -> None:
     assert not _claude_main_repl_ready(modal + footer + modal + footer)
 
 
+def test_main_repl_readiness_rejects_auto_default_nudge() -> None:
+    output = (
+        "\x1b[?2004h\x1b[2JMake auto mode your default permission mode?\r\n"
+        "Yes, set auto mode as my default permission mode\r\n"
+        "No, keep don't ask\r\n"
+        "\x1b[2m\u23f5\u23f5\x1b[0m"
+    )
+
+    assert not _claude_main_repl_ready(output)
+
+
 def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
     trust = (
         "\x1b[2JAccessing workspace:\r\n"
@@ -2034,6 +2045,8 @@ def test_factory_sets_cli_entrypoint_and_update_lock_only_in_child_environment(
 
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
     monkeypatch.delenv("DISABLE_UPDATES", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+    monkeypatch.delenv("DISABLE_GROWTHBOOK", raising=False)
     monkeypatch.setattr(
         "session_bridge.claude_registrar._registrar_pywinpty_process_type",
         lambda: ProcessType,
@@ -2043,8 +2056,12 @@ def test_factory_sets_cli_entrypoint_and_update_lock_only_in_child_environment(
 
     assert observed["env"]["CLAUDE_CODE_ENTRYPOINT"] == "cli"
     assert observed["env"]["DISABLE_UPDATES"] == "1"
+    assert observed["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert observed["env"]["DISABLE_GROWTHBOOK"] == "1"
     assert "CLAUDE_CODE_ENTRYPOINT" not in os.environ
     assert "DISABLE_UPDATES" not in os.environ
+    assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in os.environ
+    assert "DISABLE_GROWTHBOOK" not in os.environ
 
 
 @pytest.mark.parametrize(

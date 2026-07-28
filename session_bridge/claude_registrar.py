@@ -242,6 +242,8 @@ class WindowsConPtyFactory:
             raise RuntimeError("unsafe Claude launch environment")
         child_env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
         child_env["DISABLE_UPDATES"] = "1"
+        child_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        child_env["DISABLE_GROWTHBOOK"] = "1"
         process_type = _registrar_pywinpty_process_type()
         return process_type.spawn(
             argv, cwd=cwd, env=child_env, dimensions=(24, 120)
@@ -1808,6 +1810,11 @@ def _known_claude_input_modal_visible(output: str) -> bool:
         for signature in (
             ("let's get started.", "dark mode", "light mode", "syntax theme:"),
             ("standard part of your max plan", "yes, try it", "not now"),
+            (
+                "make auto mode your default permission mode?",
+                "yes, set auto mode as my default permission mode",
+                "no, keep",
+            ),
         )
     )
 
