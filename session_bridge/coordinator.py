@@ -892,6 +892,12 @@ _BACKFILL_KEYS = {
 }
 _MIRROR_WORKER_LOCK_POLL_SECONDS = 0.05
 _SIDEBAR_REGISTRATION_CURSOR_KEY = "session-bridge:sidebar:registration-cursor"
+_SIDEBAR_REGISTRATION_PROBE_FRONTIER_KEY = (
+    "session-bridge:sidebar:registration-probe-frontier"
+)
+_SIDEBAR_REGISTRATION_CATCHUP_STATE_KEY = (
+    "session-bridge:sidebar:registration-catchup"
+)
 _SIDEBAR_REGISTRATION_CURSOR_VERSION = 1
 # Bound database work independently from the number of jobs requested by a caller.
 _SIDEBAR_REGISTRATION_QUERY_BUDGET = 4
@@ -1895,11 +1901,35 @@ class SessionBridgeCoordinator:
         durable_cursor = (
             await self._load_sidebar_registration_cursor() if persist_cursor else None
         )
+        probe_frontier = (
+            await self._load_sidebar_registration_cursor(
+                key=_SIDEBAR_REGISTRATION_PROBE_FRONTIER_KEY
+            )
+            if persist_cursor
+            else None
+        )
+        catchup_state = (
+            await self._load_sidebar_registration_catchup()
+            if persist_cursor
+            else None
+        )
+        catchup_cursor = catchup_state[0] if catchup_state is not None else None
+        catchup_target = catchup_state[1] if catchup_state is not None else None
+        catchup_head = catchup_state[2] if catchup_state is not None else None
         cursor: tuple[float, str] | None = None
         newest_probe = True
-        seen_backfill_cursors = (
-            {durable_cursor} if durable_cursor is not None else set()
-        )
+        catchup_active = False
+        seen_backfill_cursors = {
+            candidate
+            for candidate in (
+                durable_cursor,
+                probe_frontier,
+                catchup_cursor,
+                catchup_target,
+                catchup_head,
+            )
+            if candidate is not None
+        }
         query_count = 0
         query_budget = (
             _SIDEBAR_REGISTRATION_QUERY_BUDGET
@@ -1921,7 +1951,9 @@ class SessionBridgeCoordinator:
                 )
             else:
                 remaining_queue_capacity = (
-                    limit - queued
+                    _SIDEBAR_REGISTRATION_PAGE_SIZE
+                    if persist_cursor and catchup_active
+                    else limit - queued
                     if persist_cursor
                     else _SIDEBAR_REGISTRATION_PAGE_SIZE
                 )
@@ -1956,7 +1988,15 @@ class SessionBridgeCoordinator:
                     next_cursor,
                 ):
                     raise ValueError("sidebar candidate cursor did not advance")
-                if not newest_probe and next_cursor in seen_backfill_cursors:
+                if (
+                    not newest_probe
+                    and next_cursor in seen_backfill_cursors
+                    and not (
+                        catchup_active
+                        and catchup_target is not None
+                        and next_cursor == catchup_target
+                    )
+                ):
                     raise ValueError("sidebar candidate cursor repeated")
             elif raw_page.next_cursor is not None:
                 raise ValueError("sidebar candidate cursor is unexpected")
@@ -2125,22 +2165,124 @@ class SessionBridgeCoordinator:
             if not raw_page.has_more:
                 if persist_cursor:
                     await self._save_sidebar_registration_cursor(None)
+                    await self._save_sidebar_registration_cursor(
+                        None,
+                        key=_SIDEBAR_REGISTRATION_PROBE_FRONTIER_KEY,
+                    )
+                    await self._save_sidebar_registration_catchup(None)
                 break
             assert next_cursor is not None
             if newest_probe:
                 newest_probe = False
-                if durable_cursor is None:
+                if catchup_cursor is not None:
+                    catchup_active = True
+                    cursor = catchup_cursor
+                elif probe_frontier is not None:
+                    if _sidebar_cursor_advances(next_cursor, probe_frontier):
+                        catchup_active = True
+                        catchup_cursor = next_cursor
+                        catchup_target = probe_frontier
+                        catchup_head = next_cursor
+                        seen_backfill_cursors.add(next_cursor)
+                        if persist_cursor:
+                            await self._save_sidebar_registration_catchup(
+                                (
+                                    catchup_cursor,
+                                    catchup_target,
+                                    catchup_head,
+                                )
+                            )
+                        cursor = catchup_cursor
+                    else:
+                        if next_cursor != probe_frontier:
+                            probe_frontier = next_cursor
+                            if persist_cursor:
+                                await self._save_sidebar_registration_cursor(
+                                    probe_frontier,
+                                    key=_SIDEBAR_REGISTRATION_PROBE_FRONTIER_KEY,
+                                )
+                        if durable_cursor is None or _sidebar_cursor_advances(
+                            durable_cursor,
+                            next_cursor,
+                        ):
+                            durable_cursor = next_cursor
+                            if persist_cursor:
+                                await self._save_sidebar_registration_cursor(
+                                    durable_cursor
+                                )
+                        cursor = durable_cursor
+                elif durable_cursor is None:
                     durable_cursor = next_cursor
                     seen_backfill_cursors.add(next_cursor)
                     if persist_cursor:
                         await self._save_sidebar_registration_cursor(durable_cursor)
-                cursor = durable_cursor
+                    cursor = durable_cursor
+                elif _sidebar_cursor_advances(
+                    next_cursor,
+                    durable_cursor,
+                ):
+                    catchup_active = True
+                    catchup_cursor = next_cursor
+                    catchup_target = durable_cursor
+                    catchup_head = next_cursor
+                    seen_backfill_cursors.add(next_cursor)
+                    if persist_cursor:
+                        await self._save_sidebar_registration_catchup(
+                            (
+                                catchup_cursor,
+                                catchup_target,
+                                catchup_head,
+                            )
+                        )
+                    cursor = catchup_cursor
+                else:
+                    cursor = durable_cursor
             else:
-                durable_cursor = next_cursor
-                seen_backfill_cursors.add(next_cursor)
-                if persist_cursor:
-                    await self._save_sidebar_registration_cursor(durable_cursor)
-                cursor = durable_cursor
+                if catchup_active:
+                    assert catchup_target is not None
+                    assert catchup_head is not None
+                if catchup_active and _sidebar_cursor_advances(
+                    next_cursor,
+                    catchup_target,
+                ):
+                    catchup_cursor = next_cursor
+                    seen_backfill_cursors.add(next_cursor)
+                    if persist_cursor:
+                        await self._save_sidebar_registration_catchup(
+                            (
+                                catchup_cursor,
+                                catchup_target,
+                                catchup_head,
+                            )
+                        )
+                    cursor = catchup_cursor
+                else:
+                    if catchup_active:
+                        assert catchup_target is not None
+                        assert catchup_head is not None
+                        probe_frontier = catchup_head
+                        if (
+                            durable_cursor is None
+                            or catchup_target == durable_cursor
+                            or _sidebar_cursor_advances(durable_cursor, next_cursor)
+                        ):
+                            durable_cursor = next_cursor
+                        if persist_cursor:
+                            await self._save_sidebar_registration_cursor(
+                                probe_frontier,
+                                key=_SIDEBAR_REGISTRATION_PROBE_FRONTIER_KEY,
+                            )
+                            await self._save_sidebar_registration_catchup(None)
+                    else:
+                        durable_cursor = next_cursor
+                    catchup_active = False
+                    catchup_cursor = None
+                    catchup_target = None
+                    catchup_head = None
+                    seen_backfill_cursors.add(next_cursor)
+                    if persist_cursor:
+                        await self._save_sidebar_registration_cursor(durable_cursor)
+                    cursor = durable_cursor
 
         summary = SidebarRegistrationSummary(
             examined=examined,
@@ -2154,12 +2296,16 @@ class SessionBridgeCoordinator:
             self._set_sidebar_registration_counts(summary)
         return summary
 
-    async def _load_sidebar_registration_cursor(self) -> tuple[float, str] | None:
+    async def _load_sidebar_registration_cursor(
+        self,
+        *,
+        key: str = _SIDEBAR_REGISTRATION_CURSOR_KEY,
+    ) -> tuple[float, str] | None:
         raw_state = await asyncio.to_thread(
             _call,
             self._store,
             "get_state",
-            _SIDEBAR_REGISTRATION_CURSOR_KEY,
+            key,
         )
         if raw_state is None:
             return None
@@ -2185,6 +2331,8 @@ class SessionBridgeCoordinator:
     async def _save_sidebar_registration_cursor(
         self,
         cursor: tuple[float, str] | None,
+        *,
+        key: str = _SIDEBAR_REGISTRATION_CURSOR_KEY,
     ) -> None:
         state: dict[str, object] = {
             "version": _SIDEBAR_REGISTRATION_CURSOR_VERSION,
@@ -2199,8 +2347,94 @@ class SessionBridgeCoordinator:
             _call,
             self._store,
             "set_state",
-            _SIDEBAR_REGISTRATION_CURSOR_KEY,
+            key,
             state,
+        )
+
+    async def _load_sidebar_registration_catchup(
+        self,
+    ) -> tuple[
+        tuple[float, str],
+        tuple[float, str],
+        tuple[float, str],
+    ] | None:
+        raw_state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _SIDEBAR_REGISTRATION_CATCHUP_STATE_KEY,
+        )
+        if raw_state is None:
+            return None
+        expected = {
+            "version",
+            "cursor_activity",
+            "cursor_session_id",
+            "target_activity",
+            "target_session_id",
+            "head_activity",
+            "head_session_id",
+        }
+        if not isinstance(raw_state, Mapping) or set(raw_state) != expected:
+            raise ValueError("sidebar registration catchup state is malformed")
+        if (
+            type(raw_state["version"]) is not int
+            or raw_state["version"] != _SIDEBAR_REGISTRATION_CURSOR_VERSION
+        ):
+            raise ValueError("sidebar registration catchup version is unsupported")
+        values = tuple(raw_state[key] for key in sorted(expected - {"version"}))
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise ValueError("sidebar registration catchup state is malformed")
+        return (
+            _validated_sidebar_page_cursor(
+                (raw_state["cursor_activity"], raw_state["cursor_session_id"])
+            ),
+            _validated_sidebar_page_cursor(
+                (raw_state["target_activity"], raw_state["target_session_id"])
+            ),
+            _validated_sidebar_page_cursor(
+                (raw_state["head_activity"], raw_state["head_session_id"])
+            ),
+        )
+
+    async def _save_sidebar_registration_catchup(
+        self,
+        state: tuple[
+            tuple[float, str],
+            tuple[float, str],
+            tuple[float, str],
+        ]
+        | None,
+    ) -> None:
+        document: dict[str, object] = {
+            "version": _SIDEBAR_REGISTRATION_CURSOR_VERSION,
+            "cursor_activity": None,
+            "cursor_session_id": None,
+            "target_activity": None,
+            "target_session_id": None,
+            "head_activity": None,
+            "head_session_id": None,
+        }
+        if state is not None:
+            cursor, target, head = (
+                _validated_sidebar_page_cursor(value) for value in state
+            )
+            document.update(
+                cursor_activity=cursor[0],
+                cursor_session_id=cursor[1],
+                target_activity=target[0],
+                target_session_id=target[1],
+                head_activity=head[0],
+                head_session_id=head[1],
+            )
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _SIDEBAR_REGISTRATION_CATCHUP_STATE_KEY,
+            document,
         )
 
     async def reconcile_once(self) -> ReconcileSummary:

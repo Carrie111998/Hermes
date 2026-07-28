@@ -4289,6 +4289,65 @@ async def test_sidebar_registration_is_bounded_durable_and_probes_newest_first(
     assert store.get_sidebar_job_for_source("older-eligible") is not None
 
 
+@pytest.mark.asyncio
+async def test_sidebar_registration_catches_up_new_gap_beyond_newest_probe(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    store = _BudgetRecordingSidebarStore(sidebar_db, clock=lambda: now)
+    for offset in range(50):
+        _add_hermes_sidebar_source(
+            sidebar_db,
+            session_id=f"historical-ack-{offset:02d}",
+            content="yes",
+            last_active=now - 1_000 - offset,
+        )
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    await coordinator.register_sidebar_jobs_once(now=now, limit=1)
+    historical_cursor = store.get_state(
+        "session-bridge:sidebar:registration-cursor"
+    )
+    assert historical_cursor is not None
+
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="new-gap-eligible",
+        content="Register this recovered Claude-style session",
+        last_active=now + 1,
+    )
+    for offset in range(30):
+        _add_hermes_sidebar_source(
+            sidebar_db,
+            session_id=f"new-gap-automation-{offset:02d}",
+            content="Automated maintenance result",
+            last_active=now + 2 + offset,
+            source="cron",
+        )
+
+    restarted = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now + 32,
+    )
+    summary = await restarted.register_sidebar_jobs_once(now=now + 32, limit=1)
+
+    assert summary.queued == 1
+    assert store.get_sidebar_job_for_source("new-gap-eligible") is not None
+    assert (
+        store.get_state("session-bridge:sidebar:registration-cursor")
+        == historical_cursor
+    )
+
+
 class _SlowEmptySidebarStore:
     def __init__(self) -> None:
         self.state: dict[str, dict[str, object]] = {}
