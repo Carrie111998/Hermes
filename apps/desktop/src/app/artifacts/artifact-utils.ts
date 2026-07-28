@@ -17,6 +17,17 @@ export interface ArtifactRecord {
   timestamp: number
 }
 
+function toEpochMs(value: null | number | undefined): null | number {
+  if (!Number.isFinite(value)) {
+    return null
+  }
+
+  const ts = Number(value)
+
+  // Session DB values are often Unix seconds while JS Date expects ms.
+  return ts < 100_000_000_000 ? ts * 1000 : ts
+}
+
 const MARKDOWN_IMAGE_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g
 const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(([^)\s]+)\)/g
 const URL_RE = /https?:\/\/[^\s<>"')]+/g
@@ -273,7 +284,11 @@ export function collectArtifactsForSession(session: SessionInfo, messages: Sessi
         label: artifactLabel(value),
         sessionId: session.id,
         sessionTitle: title,
-        timestamp: message.timestamp || session.last_active || session.started_at || Date.now()
+        timestamp:
+          toEpochMs(message.timestamp) ??
+          toEpochMs(session.last_active) ??
+          toEpochMs(session.started_at) ??
+          Date.now()
       })
     })
   }
