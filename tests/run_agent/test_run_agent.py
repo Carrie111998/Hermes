@@ -6754,9 +6754,13 @@ class TestReasoningReplayForStrictProviders:
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "kimi-coding"
 
+        # Note: prior_assistant has non-empty content so it survives
+        # `strip_empty_content_assistant_tool_calls` (#63200) on the
+        # outgoing api_messages copy. The reasoning-only / empty-content
+        # path is covered by `test_reasoning_only_assistant_with_tool_calls_is_stripped_from_wire`.
         prior_assistant = {
             "role": "assistant",
-            "content": "",
+            "content": "I'll check the date.",
             "tool_calls": [
                 {
                     "id": "c1",
@@ -6764,6 +6768,7 @@ class TestReasoningReplayForStrictProviders:
                     "function": {"name": "terminal", "arguments": "{\"command\":\"date\"}"},
                 }
             ],
+            "reasoning_content": " ",
         }
         tool_result = {"role": "tool", "tool_call_id": "c1", "content": "Tue Apr 21"}
         final_resp = _mock_response(content="done", finish_reason="stop")
@@ -6798,7 +6803,7 @@ class TestReasoningReplayForStrictProviders:
         agent.provider = "kimi-coding"
         prior_assistant = {
             "role": "assistant",
-            "content": "",
+            "content": "I'll search.",
             "tool_calls": [
                 {
                     "id": "c1",
@@ -6838,7 +6843,7 @@ class TestReasoningReplayForStrictProviders:
         agent.provider = "mistral"
         prior_assistant = {
             "role": "assistant",
-            "content": "",
+            "content": "I'll search.",
             "tool_calls": [
                 {
                     "id": "c1",
@@ -6866,6 +6871,74 @@ class TestReasoningReplayForStrictProviders:
         sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
         replayed_assistant = next(msg for msg in sent_messages if msg.get("role") == "assistant")
         assert "reasoning_content" not in replayed_assistant
+
+    def test_reasoning_only_assistant_with_tool_calls_is_stripped_from_wire(self, agent):
+        """Regression for #63200 (PR #71787): assistant messages with
+        ``content=""`` AND non-empty ``tool_calls`` are stripped from the
+        outgoing api_messages copy (sent to the provider) but kept in
+        the internal ``messages`` (so session persistence and resume
+        keep the full transcript).
+
+        Without this strip, strict providers (DeepSeek strict mode, some
+        OpenAI-compatible endpoints) reject with HTTP 400 because
+        ``content=""`` + ``tool_calls=[...]`` violates the
+        'every tool_call_id must be matched by a tool message' invariant.
+        """
+        self._setup_agent(agent)
+        agent.base_url = "https://api.deepseek.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "deepseek"
+
+        prior_assistant = {
+            "role": "assistant",
+            "content": "",          # reasoning-only / empty-content assistant turn
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{\"command\":\"date\"}"},
+                }
+            ],
+        }
+        tool_result = {"role": "tool", "tool_call_id": "c1", "content": "Tue Apr 21"}
+        final_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = final_resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "next step",
+                conversation_history=[prior_assistant, tool_result],
+            )
+
+        # The conversation itself completes (the strip is silent).
+        assert result["completed"] is True
+        # The outgoing wire-format copy has the offending assistant turn REMOVED.
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        # None of the sent assistant messages should be the offending empty+tool_calls pattern.
+        for msg in sent_messages:
+            if msg.get("role") != "assistant":
+                continue
+            assert not (
+                msg.get("content") in ("", None)
+                and isinstance(msg.get("tool_calls"), list)
+                and msg["tool_calls"]
+            ), f"offending empty-content+tool_calls pattern leaked to provider: {msg}"
+        # Specifically: the prior assistant turn (the one in conversation_history
+        # that triggered this bug) must NOT appear in sent_messages.
+        offending = [
+            m for m in sent_messages
+            if m.get("role") == "assistant"
+            and m.get("content") in ("", None)
+            and isinstance(m.get("tool_calls"), list)
+            and m["tool_calls"]
+        ]
+        assert offending == [], (
+            f"offending empty-content+tool_calls assistant turn leaked to wire: {offending}"
+        )
 
 
 # ---------------------------------------------------------------------------
