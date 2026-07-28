@@ -201,6 +201,9 @@ class TestMemoryQuotaMetadata:
         assert result["quota_usage"]["remaining_chars"] == 5
         assert result["quota_usage"]["attempted_total_chars"] > 40
         assert result["quota_usage"]["over_by_chars"] > 0
+        assert "current_entries" in result
+        assert "Consolidate now" in result["error"]
+        assert "retry this add" in result["error"]
 
     def test_replace_overflow_returns_structured_quota_state(self, store):
         store.memory_char_limit = 80
@@ -234,6 +237,113 @@ class TestMemoryQuotaMetadata:
         assert result["store_state_token"] == before["store_state_token"]
         assert result["quota_usage"]["attempted_total_chars"] > store.memory_char_limit
         assert store.memory_entries == ["keep"]
+
+
+class TestMemoryQuotaSameStateRetryGuard:
+    """End-to-end #35121 firebreak: MemoryStore tokens + guardrail skip."""
+
+    def test_add_overflow_remove_then_same_add_is_allowed(self, store):
+        from agent.tool_guardrails import ToolCallGuardrailController
+
+        store.memory_char_limit = 60
+        store.add("memory", "STALE:" + "a" * 20)
+        store.add("memory", "KEEP:" + "b" * 20)
+
+        controller = ToolCallGuardrailController()
+        new_fact = "NEW:" + "c" * 25
+        add_args = {"target": "memory", "action": "add", "content": new_fact}
+
+        token_before = store.stat("memory")["store_state_token"]
+        assert controller.before_call(
+            "memory", add_args, current_store_state_token=token_before
+        ).action == "allow"
+        overflow = store.add("memory", new_fact)
+        assert overflow["success"] is False
+        assert overflow["error_code"] == "memory_quota_exceeded"
+        assert "Consolidate now" in overflow["error"]
+        assert "current_entries" in overflow
+        warn = controller.after_call(
+            "memory", add_args, json.dumps(overflow), failed=True
+        )
+        assert warn.action == "warn"
+        assert warn.code == "memory_quota_exceeded_non_retryable"
+
+        identical = controller.before_call(
+            "memory",
+            add_args,
+            current_store_state_token=store.stat("memory")["store_state_token"],
+        )
+        assert identical.action == "skip"
+        assert identical.should_halt is False
+
+        remove_args = {"target": "memory", "action": "remove", "old_text": "STALE:"}
+        assert controller.before_call(
+            "memory",
+            remove_args,
+            current_store_state_token=store.stat("memory")["store_state_token"],
+        ).action == "allow"
+        removed = store.remove("memory", "STALE:")
+        assert removed["success"] is True
+        controller.after_call(
+            "memory", remove_args, json.dumps(removed), failed=False
+        )
+        assert removed["store_state_token"] != token_before
+
+        allowed = controller.before_call(
+            "memory",
+            add_args,
+            current_store_state_token=removed["store_state_token"],
+        )
+        assert allowed.action == "allow"
+        retry = store.add("memory", new_fact)
+        assert retry["success"] is True
+        assert new_fact in store.memory_entries
+
+    def test_post_cap_quota_overflow_still_skips_identical_retry(self, store):
+        from agent.tool_guardrails import ToolCallGuardrailController
+
+        store.memory_char_limit = 50
+        store.add("memory", "x" * 40)
+        controller = ToolCallGuardrailController()
+        # Burn the consolidation budget with distinct overflowing writes so the
+        # next identical write is the first time this signature hits the cap.
+        for i in range(store._MAX_CONSOLIDATION_FAILURES_PER_TURN):
+            args = {"target": "memory", "action": "add", "content": f"y{i}" + "z" * 20}
+            token = store.stat("memory")["store_state_token"]
+            assert controller.before_call(
+                "memory", args, current_store_state_token=token
+            ).action == "allow"
+            result = store.add("memory", args["content"])
+            assert result["error_code"] == "memory_quota_exceeded"
+            controller.after_call("memory", args, json.dumps(result), failed=True)
+
+        final_args = {
+            "target": "memory",
+            "action": "add",
+            "content": "post-cap" + "z" * 20,
+        }
+        token = store.stat("memory")["store_state_token"]
+        assert controller.before_call(
+            "memory", final_args, current_store_state_token=token
+        ).action == "allow"
+        capped = store.add("memory", final_args["content"])
+        assert capped["done"] is True
+        assert capped["error_code"] == "memory_quota_exceeded"
+        assert capped["store_state_token"].startswith("opaque:")
+        assert "continue with your reply" in capped["error"]
+        recorded = controller.after_call(
+            "memory", final_args, json.dumps(capped), failed=True
+        )
+        assert recorded.code == "memory_quota_exceeded_non_retryable"
+
+        skipped = controller.before_call(
+            "memory",
+            final_args,
+            current_store_state_token=capped["store_state_token"],
+        )
+        assert skipped.action == "skip"
+        assert skipped.code == "memory_quota_exceeded_non_retryable"
+        assert skipped.should_halt is False
 
 
 class TestMemoryStoreReplace:
@@ -298,6 +408,30 @@ class TestMemoryConsolidationGracefulDegrade:
         assert "current_entries" not in r
         assert "continue with your reply" in r["error"]
 
+    def test_add_overflow_degrades_after_cap(self, store):
+        # Fill near the 500-char user/memory limit so add() overflows.
+        store.add("memory", "x" * 200)
+        store.add("memory", "y" * 200)
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        big = "z" * 200
+        for _ in range(cap):
+            r = store.add("memory", big)
+            assert r["success"] is False
+            assert "retry this add" in r["error"]  # still instructs in-turn retry
+        r = store.add("memory", big)
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "continue with your reply" in r["error"]
+        # Cap response is terminal, but keep identity fields so the same-state
+        # retry guard can still recognize this as a deterministic quota miss.
+        assert r["error_code"] == "memory_quota_exceeded"
+        assert r["error_details"]["code"] == "memory_quota_exceeded"
+        assert r["store"] == "memory"
+        assert r["target"] == "memory"
+        assert isinstance(r["store_state_token"], str)
+        assert r["store_state_token"].startswith("opaque:")
+        assert "current_entries" not in r
+        assert "retry this add" not in r["error"]
 
     def test_apply_batch_failures_count_toward_budget(self, store):
         """apply_batch is the primary at-capacity consolidation path; its

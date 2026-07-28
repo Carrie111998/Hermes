@@ -189,6 +189,24 @@ def test_structured_memory_quota_failure_classifier_uses_error_code():
     assert classify_tool_failure("memory", _memory_quota_result()) == (True, " [full]")
 
 
+def test_legacy_memory_overflow_string_does_not_arm_same_state_skip():
+    controller = ToolCallGuardrailController()
+    args = {"target": "memory", "action": "add", "content": "too big"}
+    legacy = json.dumps({
+        "success": False,
+        "error": "Memory at 40/50 chars. Adding this entry would exceed the limit.",
+    })
+
+    assert controller.before_call(
+        "memory", args, current_store_state_token="opaque:A"
+    ).action == "allow"
+    decision = controller.after_call("memory", args, legacy, failed=True)
+    assert decision.code != "memory_quota_exceeded_non_retryable"
+    assert controller.before_call(
+        "memory", args, current_store_state_token="opaque:A"
+    ).action == "allow"
+
+
 def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(

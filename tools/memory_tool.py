@@ -190,7 +190,9 @@ class MemoryStore:
         self._consolidation_failures += 1
         if self._consolidation_failures <= self._MAX_CONSOLIDATION_FAILURES_PER_TURN:
             return response
-        return {
+        # Terminal "stop retrying" message, but keep quota identity fields so the
+        # same-store-state guardrail can still skip an identical write (#35121).
+        degraded: Dict[str, Any] = {
             "success": False,
             "done": True,
             "error": (
@@ -200,6 +202,16 @@ class MemoryStore:
                 "in a later turn."
             ),
         }
+        for key in (
+            "store",
+            "target",
+            "error_code",
+            "error_details",
+            "store_state_token",
+        ):
+            if key in response:
+                degraded[key] = response[key]
+        return degraded
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
