@@ -3188,6 +3188,16 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # When the task was created with ``initial_status='blocked'``,
+                # emit a ``blocked`` event so ``_has_sticky_block()``
+                # recognises it as sticky — without this the dispatcher's
+                # ``recompute_ready`` would promote it to ``ready`` on the
+                # next tick (t_fc1fdf31).
+                if initial_status == "blocked":
+                    _append_event(
+                        conn, task_id, "blocked",
+                        {"reason": "initial_status"},
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -3982,27 +3992,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if row is not None:
-        return row["kind"] == "blocked"
-    trow = conn.execute(
-        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if trow is None or trow["status"] != "blocked":
-        return False
-    if trow["block_kind"] == "dependency":
-        # Dependency blocks auto-clear via parent gating.
-        return False
-    gave_up = conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'gave_up' "
-        "LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if gave_up is not None:
-        # Circuit-breaker path: keep the documented auto-recover semantics.
-        return False
-    # Blocked STATUS with no event provenance: fail safe -- stay blocked
-    # until an explicit unblock or an approval auto-clear (apply_approvals).
-    return True
+    return bool(row) and row["kind"] == "blocked"
 
 
 def recompute_ready(
@@ -6807,6 +6797,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    skipped_block_gate: list[str] = field(default_factory=list)
+    """Ready task ids skipped because the task has an unresolved block gate
+    (t_fc1fdf31). A task that was worker/operator-blocked but somehow
+    reached the ready queue (manual DB edit, missed event, code-path bug)
+    is caught here: an audit event is logged and no spawn is attempted.
+    This is the defense-in-depth guard for the dispatch tick."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8384,6 +8380,23 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+
+        # Block-gate audit (t_fc1fdf31): defense-in-depth — if a ready
+        # task has an unresolved block gate (worker/operator ``kanban_block``
+        # without a subsequent unblock), something went wrong: manual DB
+        # edit, missed event, or a code-path bug. Log an audit event and
+        # skip the spawn so no claim is sent for a blocked card.
+        if _has_sticky_block(conn, row["id"]):
+            result.skipped_block_gate.append(row["id"])
+            if not dry_run:
+                at = _claimer_id()
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "block_gate_audit",
+                        {"origin": at, "task_id": row["id"]},
+                    )
+            continue
+
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
