@@ -30,6 +30,10 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+from agent.cognitive_rotation import (
+    CognitiveRotationConfig,
+    CognitiveRotationController,
+)
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
@@ -764,6 +768,7 @@ def init_agent(
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+    agent._cognitive_rotation = CognitiveRotationController()
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
@@ -1595,6 +1600,18 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+    try:
+        _agent_section = _agent_cfg.get("agent", {})
+        if not isinstance(_agent_section, dict):
+            _agent_section = {}
+        agent._cognitive_rotation = CognitiveRotationController(
+            CognitiveRotationConfig.from_mapping(
+                _agent_section.get("cognitive_rotation", {})
+            )
+        )
+    except Exception as _cr_err:
+        _ra().logger.warning("Cognitive rotation config ignored: %s", _cr_err)
+        agent._cognitive_rotation = CognitiveRotationController()
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

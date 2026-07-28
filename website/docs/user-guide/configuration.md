@@ -868,6 +868,27 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+## Cognitive Rotation Guardrail
+
+`agent.cognitive_rotation` is an **opt-in, session-scoped workflow circuit breaker** for long-running implementation contexts. It is disabled by default. When enabled, it reserves further direct source mutation for a fresh builder after a successful implementation delegation, a committed built-in compaction following a successful mutation, or exhaustion of the successful-mutation budget.
+
+```yaml
+agent:
+  cognitive_rotation:
+    enabled: false                 # Opt in; default is disabled
+    mutation_budget: 20            # Successful direct mutations before rotation
+    rotate_after_compaction: true  # Rotate after a committed, progressing compaction
+    lock_after_delegation: true    # Rotate after successful delegate_task
+```
+
+The direct mutators are exactly `patch`, `write_file`, and `execute_code`. The mutation that reaches the budget is allowed to finish; the next direct mutator is blocked. Set `mutation_budget: 0` (or another non-positive value) to disable only the budget trigger while leaving the enabled delegation and compaction triggers intact.
+
+Read and verification work remains available after rotation, including `read_file`, `search_files`, tests, `delegate_task`, and `terminal`. In particular, Hermes does not classify shell commands issued through `terminal` as mutations.
+
+:::warning Workflow guardrail, not a security boundary
+Cognitive rotation is not an adversarial security sandbox and is not a durable resume policy. Phase 1 state lives only in the current in-memory agent session: it is not persisted to the session database, does not automatically create a fresh session, and does not yet cover manual CLI/gateway compression, Codex app-server compaction, or plugin context engines. Those surfaces require separate phase 2 policy and persistence work.
+:::
+
 ## Standing Goals (`/goal`)
 
 When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.

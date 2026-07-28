@@ -22,6 +22,7 @@ import threading
 import time
 from typing import Any, Optional
 
+from agent.cognitive_rotation import cognitive_rotation_block_result
 from agent.display import (
     KawaiiSpinner,
     build_tool_preview as _build_tool_preview,
@@ -214,6 +215,72 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _append_cognitive_rotation_notice(result: Any, notice: str | None) -> Any:
+    """Append an activation notice without flattening multimodal results."""
+    if not notice:
+        return result
+    suffix = f"\n\n{notice}"
+    if _is_multimodal_tool_result(result):
+        _append_subdir_hint_to_multimodal(result, suffix)
+        return result
+    if isinstance(result, str):
+        return result + suffix
+    return f"{_multimodal_text_summary(result)}{suffix}"
+
+
+def _finalize_remaining_cognitive_rotation_reservations(
+    agent,
+    parsed_calls: list,
+    results: list,
+    reservations: dict[int, int],
+    *,
+    submitted_indices: set[int] | None = None,
+) -> None:
+    """Settle admitted mutations whose ordered results will not be consumed."""
+    if submitted_indices is None:
+        submitted_indices = set()
+
+    for index, (tool_call, function_name, *_rest) in enumerate(parsed_calls):
+        reservation_key = id(tool_call)
+        reservation_id = reservations.get(reservation_key)
+        if reservation_id is None:
+            continue
+
+        result = results[index] if index < len(results) else None
+        if result is not None:
+            # Result tuple positions are intentionally explicit here: [0] is
+            # the executed tool name, [4] is failure, and [5] is pre-dispatch
+            # blocking. Completed calls settle from their actual outcome.
+            if result[5]:
+                agent._cognitive_rotation.cancel_mutation_reservation(
+                    reservation_id
+                )
+            else:
+                agent._cognitive_rotation.observe_tool_result(
+                    result[0],
+                    failed=result[4],
+                    reservation_id=reservation_id,
+                )
+        elif index in submitted_indices:
+            # submit() returned, but no worker result is available. The source
+            # effect is unknowable, so fail closed by consuming the reservation.
+            agent._cognitive_rotation.observe_tool_result(
+                function_name,
+                failed=False,
+                reservation_id=reservation_id,
+            )
+        else:
+            # The executor never accepted this call (or dispatch was blocked).
+            agent._cognitive_rotation.cancel_mutation_reservation(reservation_id)
+        reservations.pop(reservation_key, None)
+
+    # A BaseException can land after admission but before parsed_calls.append().
+    # Such reservations were never submitted and therefore only need release.
+    for reservation_id in tuple(reservations.values()):
+        agent._cognitive_rotation.cancel_mutation_reservation(reservation_id)
+    reservations.clear()
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -351,7 +418,69 @@ def _run_agent_tool_execution_middleware(
     return result, observed_args
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    batch_has_delegation: bool | None = None,
+) -> None:
+    """Execute a concurrent batch behind an exact-once reservation boundary."""
+    parsed_calls: list = []
+    results: list = []
+    rotation_reservations: dict[int, int] = {}
+    submitted_indices: set[int] = set()
+    try:
+        return _execute_tool_calls_concurrent_impl(
+            agent,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+            finalize=finalize,
+            batch_has_delegation=batch_has_delegation,
+            parsed_calls=parsed_calls,
+            results=results,
+            rotation_reservations=rotation_reservations,
+            submitted_indices=submitted_indices,
+        )
+    except BaseException:
+        # This boundary spans admission through canonical post-processing
+        # without mechanically reindenting the large executor implementation.
+        # Settlement itself must never replace the original executor failure.
+        try:
+            _finalize_remaining_cognitive_rotation_reservations(
+                agent,
+                parsed_calls,
+                results,
+                rotation_reservations,
+                submitted_indices=submitted_indices,
+            )
+        except BaseException:
+            logger.exception(
+                "failed to settle cognitive-rotation reservations after "
+                "concurrent executor failure"
+            )
+        raise
+
+
+def _execute_tool_calls_concurrent_impl(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool,
+    batch_has_delegation: bool | None,
+    parsed_calls: list,
+    results: list,
+    rotation_reservations: dict[int, int],
+    submitted_indices: set[int],
+) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -363,10 +492,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+    if batch_has_delegation is None:
+        batch_has_delegation = any(
+            tool_call.function.name == "delegate_task"
+            for tool_call in tool_calls
+        )
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
+    _rotation_reservations = rotation_reservations
 
     # ── Pre-flight: interrupt check ──────────────────────────────────
     if agent._interrupt_requested:
@@ -386,7 +521,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         return
 
     # ── Parse args + pre-execution bookkeeping ───────────────────────
-    parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
+    # ``parsed_calls`` is shared with the outer exceptional-settlement boundary.
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
@@ -514,10 +649,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                rotation_decision = agent._cognitive_rotation.before_call(
+                    function_name,
+                    batch_has_delegation=batch_has_delegation,
+                )
+                if not rotation_decision.allows_execution:
+                    block_result = cognitive_rotation_block_result(
+                        rotation_decision
+                    )
                     _emit_terminal_post_tool_call(
                         agent,
                         function_name=function_name,
@@ -526,10 +665,34 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         effective_task_id=effective_task_id,
                         tool_call_id=getattr(tool_call, "id", "") or "",
                         status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
+                        error_type="cognitive_rotation_required",
+                        error_message=rotation_decision.message,
                         middleware_trace=list(middleware_trace),
                     )
+                else:
+                    if rotation_decision.reservation_id is not None:
+                        _rotation_reservations[id(tool_call)] = (
+                            rotation_decision.reservation_id
+                        )
+                    guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        agent._cognitive_rotation.cancel_mutation_reservation(
+                            _rotation_reservations.pop(id(tool_call), None)
+                        )
+                        block_result = agent._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
+                        _emit_terminal_post_tool_call(
+                            agent,
+                            function_name=function_name,
+                            function_args=function_args,
+                            result=block_result,
+                            effective_task_id=effective_task_id,
+                            tool_call_id=getattr(tool_call, "id", "") or "",
+                            status="blocked",
+                            error_type="guardrail_block",
+                            error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
+                            middleware_trace=list(middleware_trace),
+                        )
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
@@ -596,7 +759,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
-    results = [None] * num_tools
+    results.extend([None] * num_tools)
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
@@ -753,6 +916,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     middleware_trace,
                                 )
                         break
+                    submitted_indices.add(i)
                     futures.append(f)
                     future_to_index[f] = i
 
@@ -866,6 +1030,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
+        rotation_reservation_key = id(tc)
+        rotation_reservation_id = _rotation_reservations.get(
+            rotation_reservation_key
+        )
         is_error = True
         progress_function_name = name
         # A worker can finish and write results[i] in the window between the
@@ -876,6 +1044,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
+            agent._cognitive_rotation.observe_tool_result(
+                name,
+                failed=True,
+                reservation_id=rotation_reservation_id,
+            )
+            _rotation_reservations.pop(rotation_reservation_key, None)
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -892,6 +1066,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
             # Tool was cancelled (interrupt) or thread didn't return
+            agent._cognitive_rotation.observe_tool_result(
+                name,
+                failed=True,
+                reservation_id=rotation_reservation_id,
+            )
+            _rotation_reservations.pop(rotation_reservation_key, None)
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
                 _emit_terminal_post_tool_call(
@@ -926,8 +1106,33 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             progress_function_name = function_name
             if blocked:
                 effect_disposition = "none"
+                agent._cognitive_rotation.cancel_mutation_reservation(
+                    rotation_reservation_id
+                )
+                _rotation_reservations.pop(rotation_reservation_key, None)
 
             if not blocked:
+                # The verifier classifies the handler's JSON contract. Notice
+                # decoration deliberately makes that string non-JSON, so feed
+                # the raw result into the existing turn state first.
+                try:
+                    agent._record_file_mutation_result(
+                        function_name, function_args, function_result, is_error,
+                    )
+                except Exception as _ver_err:
+                    logging.debug(
+                        "file-mutation verifier record failed: %s", _ver_err
+                    )
+                rotation_notice = agent._cognitive_rotation.observe_tool_result(
+                    function_name,
+                    failed=is_error,
+                    reservation_id=rotation_reservation_id,
+                )
+                _rotation_reservations.pop(rotation_reservation_key, None)
+                function_result = _append_cognitive_rotation_notice(
+                    function_result,
+                    rotation_notice,
+                )
                 function_result = agent._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -939,17 +1144,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-
-            # Track file-mutation outcome for the turn-end verifier.
-            # `blocked` calls never actually ran — don't let a guardrail
-            # block count as either a failure or a success.
-            if not blocked:
-                try:
-                    agent._record_file_mutation_result(
-                        function_name, function_args, function_result, is_error,
-                    )
-                except Exception as _ver_err:
-                    logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -999,6 +1193,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             messages,
             stage=f"tool result {name}",
         ):
+            _finalize_remaining_cognitive_rotation_reservations(
+                agent,
+                parsed_calls,
+                results,
+                _rotation_reservations,
+            )
             return
 
         # Every completion surface is downstream of the canonical append. If
@@ -1075,7 +1275,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    batch_has_delegation: bool | None = None,
+) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1084,6 +1293,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    if batch_has_delegation is None:
+        batch_has_delegation = any(
+            tool_call.function.name == "delegate_task"
+            for tool_call in assistant_message.tool_calls
+        )
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -1199,13 +1413,35 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception:
                 pass
 
-        _guardrail_block_decision: ToolGuardrailDecision | None = None
+        _cognitive_rotation_block = None
+        _cognitive_rotation_reservation_id = None
         if _block_msg is None:
+            rotation_decision = agent._cognitive_rotation.before_call(
+                function_name,
+                batch_has_delegation=batch_has_delegation,
+            )
+            if not rotation_decision.allows_execution:
+                _cognitive_rotation_block = rotation_decision
+            else:
+                _cognitive_rotation_reservation_id = (
+                    rotation_decision.reservation_id
+                )
+
+        _guardrail_block_decision: ToolGuardrailDecision | None = None
+        if _block_msg is None and _cognitive_rotation_block is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
+                agent._cognitive_rotation.cancel_mutation_reservation(
+                    _cognitive_rotation_reservation_id
+                )
+                _cognitive_rotation_reservation_id = None
                 _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = (
+            _block_msg is not None
+            or _cognitive_rotation_block is not None
+            or _guardrail_block_decision is not None
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -1282,7 +1518,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
-        if _block_msg is not None:
+        if _cognitive_rotation_block is not None:
+            function_result = cognitive_rotation_block_result(
+                _cognitive_rotation_block
+            )
+            tool_duration = 0.0
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="cognitive_rotation_required",
+                error_message=_cognitive_rotation_block.message,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
@@ -1570,6 +1823,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
+                agent._cognitive_rotation.cancel_mutation_reservation(
+                    _cognitive_rotation_reservation_id
+                )
+                _cognitive_rotation_reservation_id = None
                 function_result = _emit_cancelled_terminal_post_tool_call(
                     agent,
                     function_name=function_name,
@@ -1611,6 +1868,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:
+                agent._cognitive_rotation.cancel_mutation_reservation(
+                    _cognitive_rotation_reservation_id
+                )
+                _cognitive_rotation_reservation_id = None
                 _emit_cancelled_terminal_post_tool_call(
                     agent,
                     function_name=function_name,
@@ -1666,6 +1927,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         if not _execution_blocked:
+            # Preserve the raw handler JSON for the existing turn verifier;
+            # cognitive/guardrail notices are model-visible decoration only.
+            try:
+                agent._record_file_mutation_result(
+                    function_name, function_args, function_result, _is_error_result,
+                )
+            except Exception as _ver_err:
+                logging.debug(
+                    "file-mutation verifier record failed: %s", _ver_err
+                )
+            rotation_notice = agent._cognitive_rotation.observe_tool_result(
+                function_name,
+                failed=_is_error_result,
+                reservation_id=_cognitive_rotation_reservation_id,
+            )
+            function_result = _append_cognitive_rotation_notice(
+                function_result,
+                rotation_notice,
+            )
             function_result = agent._append_guardrail_observation(
                 function_name,
                 function_args,
@@ -1679,18 +1959,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
-
-        # Track file-mutation outcome for the turn-end verifier.  See
-        # the concurrent path for the rationale; both paths must feed
-        # the same state so the footer reflects every tool call in the
-        # turn, not just the parallel ones.
-        if not _execution_blocked:
-            try:
-                agent._record_file_mutation_result(
-                    function_name, function_args, function_result, _is_error_result,
-                )
-            except Exception as _ver_err:
-                logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
         agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""
@@ -1721,7 +1989,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            effect_disposition=(
+                "none" if _cognitive_rotation_block is not None else None
+            ),
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -1856,6 +2131,10 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
+    batch_has_delegation = any(
+        tool_call.function.name == "delegate_task"
+        for tool_call in assistant_message.tool_calls
+    )
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -1864,11 +2143,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                batch_has_delegation=batch_has_delegation,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                batch_has_delegation=batch_has_delegation,
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):

@@ -2247,6 +2247,38 @@ def compress_context(
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
+        # Cognitive rotation is session-scoped workflow state, so observe only
+        # a real built-in compaction boundary that both made progress and landed
+        # durably. Aborted/no-op/uncommitted attempts must leave it untouched.
+        if _compression_made_progress and _context_engine_boundary_committed:
+            try:
+                _rotation_notice = agent._cognitive_rotation.observe_compaction(
+                    made_progress=True,
+                    committed=True,
+                )
+            except Exception as _rotation_err:
+                logger.debug(
+                    "cognitive rotation compaction observation failed: %s",
+                    _rotation_err,
+                )
+            else:
+                _rotation_status_callback = getattr(
+                    agent,
+                    "status_callback",
+                    None,
+                )
+                if _rotation_notice and _rotation_status_callback:
+                    try:
+                        _rotation_status_callback(
+                            "cognitive_rotation",
+                            _rotation_notice,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "status_callback error in cognitive rotation notice",
+                            exc_info=True,
+                        )
+
         # Notify the context engine that a compaction boundary occurred. Plugin
         # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve
         # DAG lineage / checkpoint per-session state across the boundary instead of

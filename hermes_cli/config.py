@@ -946,6 +946,15 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # Opt-in, session-scoped workflow circuit breaker for long-running
+        # implementation contexts. A non-positive mutation budget disables only
+        # the budget trigger; delegation and committed-compaction triggers remain.
+        "cognitive_rotation": {
+            "enabled": False,
+            "mutation_budget": 20,
+            "rotate_after_compaction": True,
+            "lock_after_delegation": True,
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -6493,6 +6502,8 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         _aux_curator_defaults = (
             DEFAULT_CONFIG.get("auxiliary", {}).get("curator", {})
         )
+        if not isinstance(_aux_curator_defaults, dict):
+            _aux_curator_defaults = {}
         raw_aux = config.get("auxiliary")
         if not isinstance(raw_aux, dict):
             raw_aux = {}
