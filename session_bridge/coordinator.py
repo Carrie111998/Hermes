@@ -3898,15 +3898,37 @@ class SessionBridgeCoordinator:
             try:
                 path = paths_by_native_id.get(native_id)
                 if path is None:
-                    path = await self._provider_call(
-                        _call,
+                    find_by_stem = getattr(
                         adapter,
-                        "find_native_session",
-                        native_id,
+                        "find_native_sessions_by_stem",
+                        None,
                     )
+                    if callable(find_by_stem):
+                        stem_matches = await self._provider_call(
+                            _call,
+                            adapter,
+                            "find_native_sessions_by_stem",
+                            native_id,
+                        )
+                        try:
+                            path = next(iter(stem_matches), None)
+                        except TypeError as exc:
+                            raise RuntimeError(
+                                "Claude stem lookup returned no path list"
+                            ) from exc
+                    else:
+                        path = await self._provider_call(
+                            _call,
+                            adapter,
+                            "find_native_session",
+                            native_id,
+                        )
                 if path is None:
-                    # A complete discovery plus exact native-ID lookup proved
-                    # that this persisted queue entry no longer has a source.
+                    # Complete discovery plus an exact filename-stem lookup
+                    # proved that this persisted queue entry no longer has a
+                    # source. Avoid the broader record-ID probe here: pending
+                    # scan identities are transcript stems, and probing every
+                    # unrelated transcript can block incremental discovery.
                     # Retire only the queue entry; a later reappearance is
                     # rediscovered from its fingerprint and no catalog/native
                     # history is deleted or fabricated here.

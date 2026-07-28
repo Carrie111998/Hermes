@@ -303,6 +303,7 @@ class _BacklogClaudeAdapter:
         self.operations = operations
         self.parsed_native_ids: list[str] = []
         self.find_calls: list[str] = []
+        self.find_stem_calls: list[str] = []
 
     def discover(self) -> list[Path]:
         batch = self.discover_batches.pop(0)
@@ -313,6 +314,12 @@ class _BacklogClaudeAdapter:
         self.find_calls.append(native_id)
         self.operations.append(("find", native_id))
         return self.paths_by_native_id.get(native_id)
+
+    def find_native_sessions_by_stem(self, native_id: str) -> list[Path]:
+        self.find_stem_calls.append(native_id)
+        self.operations.append(("find_stem", native_id))
+        path = self.paths_by_native_id.get(native_id)
+        return [path] if path is not None else []
 
     def parse(self, path: Path) -> ClaudeParseResult:
         native_id = path.stem
@@ -1899,7 +1906,8 @@ async def test_claude_bounded_scan_stages_tail_and_recovers_after_restart(
     assert second_summary.discovered == 1
     assert second_summary.indexed == 1
     assert second_summary.failed == 0
-    assert adapter.find_calls == ["claude-old"]
+    assert adapter.find_stem_calls == ["claude-old"]
+    assert adapter.find_calls == []
     assert store.upsert_attempts == ["claude-new", "claude-middle", "claude-old"]
     assert store.get_state(_CLAUDE_PENDING_KEY) == {
         "version": 1,
@@ -1982,7 +1990,8 @@ async def test_claude_bounded_scan_retires_exactly_absent_persisted_pending_sour
     assert summary.discovered == 1
     assert summary.indexed == 0
     assert summary.failed == 0
-    assert adapter.find_calls == ["claude-gone"]
+    assert adapter.find_stem_calls == ["claude-gone"]
+    assert adapter.find_calls == []
     assert store.get_state(_CLAUDE_PENDING_KEY) == {
         "version": 1,
         "native_ids": [],
