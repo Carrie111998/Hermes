@@ -289,9 +289,13 @@ class TestProbeBot:
 
         assert result is None
 
-    @patch("plugins.platforms.feishu.adapter.FEISHU_AVAILABLE", False)
+    # Patch the loader, not FEISHU_AVAILABLE: the SDK is no longer imported at
+    # module scope, so the flag means "not loaded yet" rather than "cannot be
+    # loaded". probe_bot asks check_feishu_requirements(), which would import
+    # the real SDK and take the SDK path (and hit the network).
+    @patch("plugins.platforms.feishu.adapter.check_feishu_requirements", return_value=False)
     @patch("plugins.platforms.feishu.adapter.urlopen")
-    def test_http_fallback_when_sdk_unavailable(self, mock_urlopen_fn):
+    def test_http_fallback_when_sdk_unavailable(self, mock_urlopen_fn, _mock_check):
         """Without lark_oapi, probe falls back to raw HTTP."""
         from plugins.platforms.feishu.adapter import probe_bot
 
@@ -303,9 +307,9 @@ class TestProbeBot:
         assert result is not None
         assert result["bot_name"] == "HttpBot"
 
-    @patch("plugins.platforms.feishu.adapter.FEISHU_AVAILABLE", False)
+    @patch("plugins.platforms.feishu.adapter.check_feishu_requirements", return_value=False)
     @patch("plugins.platforms.feishu.adapter.urlopen")
-    def test_http_fallback_returns_none_on_network_error(self, mock_urlopen_fn):
+    def test_http_fallback_returns_none_on_network_error(self, mock_urlopen_fn, _mock_check):
         from plugins.platforms.feishu.adapter import probe_bot
         from urllib.error import URLError
 

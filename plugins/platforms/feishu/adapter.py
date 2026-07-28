@@ -85,45 +85,46 @@ try:
 except ImportError:
     websockets = None  # type: ignore[assignment]
 
-try:
-    import lark_oapi as lark
-    from lark_oapi.api.application.v6 import GetApplicationRequest
-    from lark_oapi.api.im.v1 import (
-        CreateFileRequest,
-        CreateFileRequestBody,
-        CreateImageRequest,
-        CreateImageRequestBody,
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-        GetChatRequest,
-        GetMessageRequest,
-        GetMessageResourceRequest,
-        P2ImMessageMessageReadV1,
-        ReplyMessageRequest,
-        ReplyMessageRequestBody,
-        UpdateMessageRequest,
-        UpdateMessageRequestBody,
-    )
-    from lark_oapi.core import AccessTokenType, HttpMethod
-    from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
-    from lark_oapi.core.model import BaseRequest
-    from lark_oapi.event.callback.model.p2_card_action_trigger import (
-        CallBackCard,
-        P2CardActionTriggerResponse,
-    )
-    from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-    from lark_oapi.ws import Client as FeishuWSClient
-
-    FEISHU_AVAILABLE = True
-except ImportError:
-    FEISHU_AVAILABLE = False
-    lark = None  # type: ignore[assignment]
-    CallBackCard = None  # type: ignore[assignment]
-    P2CardActionTriggerResponse = None  # type: ignore[assignment]
-    EventDispatcherHandler = None  # type: ignore[assignment]
-    FeishuWSClient = None  # type: ignore[assignment]
-    FEISHU_DOMAIN = None  # type: ignore[assignment]
-    LARK_DOMAIN = None  # type: ignore[assignment]
+# lark_oapi is NOT imported here — it is loaded on first real use by
+# ``check_feishu_requirements()``, which rebinds every name below.
+#
+# Why: the SDK is ~9k small modules. ``load_gateway_config()`` calls
+# ``platform_registry.plugin_entries()``, whose ``_resolve_all()`` imports every
+# bundled platform adapter *before* the gateway binds :8642 — so importing lark
+# at module scope taxed every boot even with Feishu unconfigured. Measured on a
+# chronically-full disk: 36.6s of a 40.9s resolve-all (89.5%; every other
+# adapter combined is 4.3s). That exceeded the Hermes-Gateway-Watchdog's ~6 min
+# respawn cadence, stacking concurrent boots that mutually starved on disk I/O.
+#
+# ``FEISHU_AVAILABLE`` therefore means "SDK loaded and bound", not "SDK
+# installed". Never branch on it to decide whether Feishu *can* work — call
+# ``check_feishu_requirements()``, which answers that by doing the load.
+FEISHU_AVAILABLE = False
+lark = None  # type: ignore[assignment]
+GetApplicationRequest = None  # type: ignore[assignment]
+CreateFileRequest = None  # type: ignore[assignment]
+CreateFileRequestBody = None  # type: ignore[assignment]
+CreateImageRequest = None  # type: ignore[assignment]
+CreateImageRequestBody = None  # type: ignore[assignment]
+CreateMessageRequest = None  # type: ignore[assignment]
+CreateMessageRequestBody = None  # type: ignore[assignment]
+GetChatRequest = None  # type: ignore[assignment]
+GetMessageRequest = None  # type: ignore[assignment]
+GetMessageResourceRequest = None  # type: ignore[assignment]
+P2ImMessageMessageReadV1 = None  # type: ignore[assignment]
+ReplyMessageRequest = None  # type: ignore[assignment]
+ReplyMessageRequestBody = None  # type: ignore[assignment]
+UpdateMessageRequest = None  # type: ignore[assignment]
+UpdateMessageRequestBody = None  # type: ignore[assignment]
+AccessTokenType = None  # type: ignore[assignment]
+HttpMethod = None  # type: ignore[assignment]
+BaseRequest = None  # type: ignore[assignment]
+CallBackCard = None  # type: ignore[assignment]
+P2CardActionTriggerResponse = None  # type: ignore[assignment]
+EventDispatcherHandler = None  # type: ignore[assignment]
+FeishuWSClient = None  # type: ignore[assignment]
+FEISHU_DOMAIN = None  # type: ignore[assignment]
+LARK_DOMAIN = None  # type: ignore[assignment]
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -1372,10 +1373,17 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
 
 
 def check_feishu_requirements() -> bool:
-    """Check if Feishu/Lark dependencies are available.
+    """Load the Feishu/Lark SDK if needed and report whether it is usable.
 
-    Lazy-installs lark-oapi via ``tools.lazy_deps.ensure("platform.feishu")``
-    on first call if not present. Rebinds all module-level globals on success.
+    This is the module's single "the SDK is actually needed now" entry point:
+    ``lark_oapi`` is deliberately not imported at module scope (see the
+    FEISHU_AVAILABLE block near the top), so this performs the deferred import
+    and rebinds all module-level globals on success. Idempotent and cheap once
+    loaded.
+
+    Falls back to lazy-installing lark-oapi via
+    ``tools.lazy_deps.ensure("platform.feishu")`` only when the SDK genuinely
+    cannot be imported.
     """
     if FEISHU_AVAILABLE:
         return True
@@ -1429,6 +1437,18 @@ def check_feishu_requirements() -> bool:
             "FEISHU_AVAILABLE": True,
         }
 
+    # Try a plain import first. The SDK is normally already installed, and this
+    # is the deferred half of what used to be a module-scope import — so it must
+    # behave identically. Routing it through lazy_deps instead would consult the
+    # pinned spec (lark-oapi==1.6.8) and report a working but differently
+    # versioned install (e.g. 1.5.3) as "missing", triggering a pip install on a
+    # box where Feishu already works.
+    try:
+        globals().update(_import())
+        return True
+    except ImportError:
+        pass
+
     from tools.lazy_deps import ensure_and_bind
     return ensure_and_bind("platform.feishu", _import, globals(), prompt=False)
 
@@ -1452,6 +1472,14 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def __init__(self, config: PlatformConfig):
+        # Constructing an adapter means real Feishu work is imminent, so load
+        # the SDK here: the send/edit/upload paths reference the request-builder
+        # globals directly and are reachable without going through connect().
+        # This restores the invariant the old module-scope import provided — a
+        # live adapter always has the SDK bound — while keeping the import off
+        # the platform-registry resolution path that gates the :8642 bind.
+        # A missing SDK is not fatal here; connect() reports it cleanly.
+        check_feishu_requirements()
         super().__init__(config, Platform.FEISHU)
 
         self._settings = self._load_settings(config.extra or {})
@@ -1728,7 +1756,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # A fresh connect (or reconnect) re-arms the SDK executor after a prior
         # disconnect set the closing flag.
         self._sdk_executor_closing = False
-        if not FEISHU_AVAILABLE:
+        # Loads the SDK on first use — it is not imported at module scope.
+        if not check_feishu_requirements():
             logger.error("[Feishu] lark-oapi not installed")
             return False
         if not self._app_id or not self._app_secret:
@@ -5259,7 +5288,7 @@ def probe_bot(app_id: str, app_secret: str, domain: str) -> Optional[dict]:
     Note: ``bot_open_id`` here is the bot's app-scoped open_id — the same ID
     that Feishu puts in @mention payloads.  It is NOT the app_id.
     """
-    if FEISHU_AVAILABLE:
+    if check_feishu_requirements():
         return _probe_bot_sdk(app_id, app_secret, domain)
     return _probe_bot_http(app_id, app_secret, domain)
 
@@ -5363,6 +5392,11 @@ def qr_register(
     Returns None on expected failures (network, auth denied, timeout).
     Unexpected errors (bugs, protocol regressions) propagate to the caller.
     """
+    # The scan-to-create flow drives the SDK via _build_onboard_client, so load
+    # it here — it is not imported at module scope.
+    if not check_feishu_requirements():
+        logger.warning("[Feishu onboard] lark-oapi not installed")
+        return None
     try:
         return _qr_register_inner(initial_domain=initial_domain, timeout_seconds=timeout_seconds)
     except (RuntimeError, URLError, OSError, json.JSONDecodeError) as exc:
@@ -5447,7 +5481,7 @@ async def _standalone_send(
     FeishuAdapter, hydrates its lark client, and sends text + native media
     (images, video, voice, documents). Replaces the legacy _send_feishu helper.
     """
-    if not FEISHU_AVAILABLE:
+    if not check_feishu_requirements():
         return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
 
     media_files = media_files or []
