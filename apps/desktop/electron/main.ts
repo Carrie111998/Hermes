@@ -1737,7 +1737,7 @@ function unpackedPathFor(filePath) {
   return filePath.replace(/app\.asar(?=$|[\\/])/, 'app.asar.unpacked')
 }
 
-function findOnPath(command) {
+function findOnPath(command, { extraDirs = [] } = {}) {
   if (!command) {
     return null
   }
@@ -1757,6 +1757,14 @@ function findOnPath(command) {
   const pathEntries = String(process.env.PATH || '')
     .split(path.delimiter)
     .filter(Boolean)
+
+  // Append extra directories (e.g. ~/.local/bin) that GUI-launched apps may
+  // miss from process.env.PATH because launchd/snapd strip shell rc additions.
+  for (const dir of extraDirs) {
+    if (dir && !pathEntries.includes(dir)) {
+      pathEntries.push(dir)
+    }
+  }
 
   // On Windows, try PATHEXT extensions BEFORE the bare (empty-extension) name.
   // A real command must resolve via its .exe/.cmd (Windows command-resolution
@@ -3767,7 +3775,21 @@ function resolveHermesBackend(backendArgs) {
         rememberLog(`Ignoring Windows Hermes override under WSL: ${hermesOverride}`)
       }
     } else {
-      hermesCommand = findOnPath('hermes')
+      // On POSIX, also check ~/.local/bin which is the default target for
+      // pip install --user and scripts/install.sh.  GUI-launched apps on macOS
+      // inherit launchd's minimal PATH which omits shell-rc additions like
+      // ~/.local/bin — so findOnPath('hermes') would silently return null.
+      const extraDirs = !IS_WINDOWS
+        ? [path.join(os.homedir(), '.local', 'bin')]
+        : []
+      hermesCommand = findOnPath('hermes', { extraDirs })
+
+      if (!hermesCommand) {
+        rememberLog(
+          `[boot] findOnPath('hermes') returned null — searched PATH (${(process.env.PATH || '').split(path.delimiter).length} entries)` +
+          (extraDirs.length ? ` and ${extraDirs.join(', ')}` : '')
+        )
+      }
     }
 
     if (hermesCommand) {
