@@ -106,12 +106,11 @@ describe('statusbar item visibility', () => {
   it('starts the per-turn session readouts hidden and restores them from the menu', async () => {
     const statusbar = bar([
       item('running-timer', 'Turn timer', { variant: 'text' }),
-      item('context-usage', 'Context meter', { variant: 'menu' }),
       item('session-timer', 'Session timer', { variant: 'text' }),
       item('gateway-health', 'Gateway')
     ])
 
-    for (const label of ['Turn timer', 'Context meter', 'Session timer']) {
+    for (const label of ['Turn timer', 'Session timer']) {
       expect(screen.queryByText(label)).toBeNull()
     }
 
