@@ -363,6 +363,29 @@ def _ts(unix: float) -> datetime:
 # ---------------------------------------------------------------------------
 
 
+def _detect_legacy_v1_schema(conn: "psycopg.Connection") -> bool:
+    """Detect the pre-fencing legacy v1 schema (claim_lock based).
+
+    The original v1 schema (commit 00197ac59) used a `claim_lock` column
+    and had no lease_generation fencing. If this is detected, the database
+    cannot be migrated by the current migration path and must be manually
+    migrated or recreated.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'task_claims'
+                  AND column_name = 'claim_lock'
+                  AND table_schema = current_schema()
+                """
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 def init_schema(conn: "psycopg.Connection") -> None:
     """Apply all pending migrations and verify schema version.
 
@@ -370,14 +393,24 @@ def init_schema(conn: "psycopg.Connection") -> None:
     - Fresh install: applies all migrations in order.
     - Already at current version: no-op.
     - Ahead of SCHEMA_VERSION (future schema): raises RuntimeError (fail closed).
+    - Legacy v1 schema detected: raises RuntimeError (incompatible).
     - Mid-migration failure: rolls back the failed migration and re-raises.
 
     Args:
         conn: Postgres connection
 
     Raises:
-        RuntimeError: If schema is ahead of known version.
+        RuntimeError: If schema is ahead of known version or legacy v1 detected.
     """
+    if _detect_legacy_v1_schema(conn):
+        raise RuntimeError(
+            "Legacy v1 authority schema detected (claim_lock column present). "
+            "This schema predates lease-generation fencing and is incompatible "
+            "with the current migration path. Run "
+            "'hermes authority migrate-legacy' to upgrade, or recreate the "
+            "authority database. See docs/multi-tenant-migration-guide.md."
+        )
+
     with conn.cursor() as cur:
         # Create schema_version if it doesn't exist yet (bootstrapping case).
         cur.execute(

@@ -13,7 +13,7 @@
 | **0.20.0** | Crash Recovery | Proven supervised worker lifecycle | ✅ Released |
 | **0.21.0** | Payment Rails | ≥3 payment rail plugins working | ✅ Released |
 | **0.22.0** | Postgres Authority Store | HA-capable authority database | ✅ Released |
-| **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | ✅ Released |
+| **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | 🟡 In Progress |
 | **0.24.0** | Billing Engine | Usage metering + invoicing | 🔲 |
 | **0.25.0** | Agent Marketplace | Tool/skill discovery + installation | 🔲 |
 | **0.26.0** | External Integrations | Email, calendar, CRM, project tools | 🔲 |
@@ -28,7 +28,7 @@
 
 **Goal:** Secure tenant boundaries preventing cross-organization data leakage.
 
-**Status:** ✅ Complete — all scope items implemented and tested.
+**Status:** 🟡 In progress — API + schema complete, runtime integration pending.
 
 ### Scope
 
@@ -52,6 +52,14 @@
 - [x] Gateway tenant_id extraction (env-based, session context propagation)
 - [x] RBAC enforcement (enforce_capability with opt-in fail-open)
 - [x] Documentation: migration guide and capability model
+
+### Remaining
+
+- [ ] Verify legacy v1→v2 migration path under tenant-scoped schema
+- [ ] Non-null tenant scope on all operations (not just optional parameter)
+- [ ] Integrate governed worker runtime with Postgres authority API
+- [ ] Decisive two-tenant, two-worker acceptance test (12-point scenario)
+- [ ] SQLite backend contract parity tests where supported
 
 ---
 
