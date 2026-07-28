@@ -6471,6 +6471,7 @@ class SessionDB:
     def list_sessions_rich(
         self,
         source: str = None,
+        chat_id: str = None,
         exclude_sources: List[str] = None,
         cwd_prefix: str = None,
         limit: int = 20,
@@ -6551,6 +6552,9 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        if chat_id:
+            where_clauses.append("s.chat_id = ?")
+            params.append(chat_id)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -9332,6 +9336,7 @@ class SessionDB:
     def session_count(
         self,
         source: str = None,
+        chat_id: str = None,
         cwd_prefix: str = None,
         min_message_count: int = 0,
         include_archived: bool = False,
@@ -9365,6 +9370,9 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        if chat_id:
+            where_clauses.append("s.chat_id = ?")
+            params.append(chat_id)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
