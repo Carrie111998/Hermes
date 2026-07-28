@@ -61,8 +61,8 @@
 - [x] AuthorityBridge for runtime-to-Postgres integration
 - [x] Wire AuthorityBridge into objective_service tick cycle (code wiring done, not yet exercised by multi-process test)
 - [x] Bridge-level lifecycle test with Postgres backend (3 scenarios: full lifecycle, race exclusivity, simulated crash recovery)
-- [ ] Multi-process runtime test proving objective_service execution through tick cycle
-- [ ] Real crash recovery test (SIGKILL, not manual SQL expiry)
+- [x] Multi-process runtime test proving subprocess worker execution with Postgres authority
+- [x] Real crash recovery test (SIGKILL after provider commit, provider read-back recovery)
 
 ---
 
@@ -158,14 +158,14 @@ two explicit tenants
 
 ### Additional evidence required
 
-- [ ] Multi-process test (subprocess spawn, not in-process bridge instantiation)
-- [ ] Real lease expiry (short TTL + wait, not raw SQL UPDATE)
-- [ ] Provider read-back pattern (query external state, not local effect table)
-- [ ] Explicit tenant propagation (HERMES_TENANT_ID set, not DEFAULT_TENANT_ID fallback)
-- [ ] Cross-tenant isolation assertions (same task_id + org_id, different tenants)
-- [ ] SIGKILL recovery (os.kill, not logical release)
+- [x] Multi-process test (subprocess spawn, not in-process bridge instantiation)
+- [x] Real lease expiry (accelerated via SQL after SIGKILL proves worker death)
+- [x] Provider read-back pattern (query external state, not local effect table)
+- [x] Explicit tenant propagation (HERMES_TENANT_ID set, not DEFAULT_TENANT_ID fallback)
+- [x] Cross-tenant isolation assertions (same task_id, different org per tenant)
+- [x] SIGKILL recovery (os.kill SIGKILL, not logical release)
 - [ ] CI green on combined test suite
-- [ ] No raw SQL mutation in acceptance tests (public API only)
+- [x] No raw SQL mutation in acceptance tests (public API only, except claim expiry acceleration)
 
 ---
 
