@@ -68,6 +68,7 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    always_visible: frozenset[str] = frozenset()
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -105,12 +106,23 @@ class ToolSearchConfig:
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
+        always_visible_raw = raw.get("always_visible")
+        if isinstance(always_visible_raw, str):
+            always_visible_raw = [always_visible_raw]
+        if not isinstance(always_visible_raw, list):
+            always_visible_raw = []
+        always_visible = frozenset(
+            name.strip()
+            for name in always_visible_raw
+            if isinstance(name, str) and name.strip()
+        )
 
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            always_visible=always_visible,
         )
 
 
@@ -186,7 +198,11 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    always_visible: frozenset[str] = frozenset(),
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
@@ -201,6 +217,9 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         if name in BRIDGE_TOOL_NAMES:
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
+            continue
+        if name in always_visible:
+            visible.append(td)
             continue
         if is_deferrable_tool_name(name):
             deferrable.append(td)
@@ -551,7 +570,10 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(
+        incoming,
+        always_visible=config.always_visible,
+    )
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -619,7 +641,10 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(
+        current_tool_defs,
+        always_visible=config.always_visible,
+    )
     catalog = build_catalog(deferrable)
     hits = search_catalog(catalog, query, limit=limit)
     return json.dumps({
@@ -657,7 +682,11 @@ def dispatch_tool_describe(args: Dict[str, Any],
     }, ensure_ascii=False)
 
 
-def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+def scoped_deferrable_names(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    config: Optional[ToolSearchConfig] = None,
+) -> frozenset[str]:
     """Return the set of deferrable tool names present in ``tool_defs``.
 
     ``tool_defs`` is expected to be the *pre-assembly* tool list for the
@@ -669,12 +698,17 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
     an out-of-scope tool via the bridge.
     """
-    names: set[str] = set()
-    for td in tool_defs:
-        name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
-            names.add(name)
-    return frozenset(names)
+    if config is None:
+        config = load_config()
+    _, deferrable = classify_tools(
+        tool_defs,
+        always_visible=config.always_visible,
+    )
+    return frozenset(
+        name
+        for td in deferrable
+        if (name := (td.get("function") or {}).get("name", ""))
+    )
 
 
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:

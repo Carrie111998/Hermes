@@ -78,6 +78,10 @@ tools:
     threshold_pct: 10   # percentage of context — only used in auto mode
     search_default_limit: 5
     max_search_limit: 20
+    always_visible:     # optional MCP/plugin tools kept directly callable
+      - mcp_browser_control_search
+      - mcp_browser_control_get_schema
+      - mcp_browser_control_execute
 ```
 
 | Key | Default | Meaning |
@@ -86,6 +90,7 @@ tools:
 | `threshold_pct` | `10` | Percentage of context length at which `auto` mode kicks in. Range 0–100. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
+| `always_visible` | `[]` | Exact MCP/plugin tool names that remain in the model-facing tool list instead of being deferred. Use this for small CodeMode or routing surfaces that already provide their own search/execute layer. |
 
 You can also flip the legacy boolean shape:
 

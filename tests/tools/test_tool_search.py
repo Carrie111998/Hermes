@@ -82,6 +82,24 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_always_visible_normalizes_tool_names(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "always_visible": [
+                " mcp_browser_control_search ",
+                "mcp_browser_control_execute",
+                "mcp_browser_control_execute",
+                "",
+                42,
+            ],
+        })
+
+        assert cfg.always_visible == frozenset({
+            "mcp_browser_control_search",
+            "mcp_browser_control_execute",
+        })
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -278,6 +296,36 @@ class TestAssembly:
         # activation happened; here it didn't).
         assert "tool_search" not in names
 
+    def test_always_visible_mcp_tool_stays_direct_when_search_activates(self):
+        from tools.registry import registry
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        for name in ("mcp_browser_control_execute", "mcp_other_deferred"):
+            registry.register(
+                name=name,
+                handler=lambda _args: "{}",
+                schema=_td(name),
+                toolset="mcp-browser-control-test",
+            )
+
+        result = assemble_tool_defs(
+            [
+                _td("mcp_browser_control_execute"),
+                _td("mcp_other_deferred"),
+            ],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "always_visible": ["mcp_browser_control_execute"],
+            }),
+        )
+
+        names = {entry["function"]["name"] for entry in result.tool_defs}
+        assert result.activated
+        assert "mcp_browser_control_execute" in names
+        assert "mcp_other_deferred" not in names
+        assert {"tool_search", "tool_describe", "tool_call"} <= names
+
 
 # ---------------------------------------------------------------------------
 # Bridge dispatch
@@ -303,6 +351,55 @@ class TestBridgeDispatch:
             {"name": "terminal"}, current_tool_defs=[_td("terminal", "Run shell")],
         )
         assert "error" in json.loads(result)
+
+    def test_search_catalog_excludes_always_visible_tools(self):
+        from tools.registry import registry
+        from tools.tool_search import dispatch_tool_search, ToolSearchConfig
+
+        for name in ("mcp_pinned_router", "mcp_deferred_action"):
+            registry.register(
+                name=name,
+                handler=lambda _args: "{}",
+                schema=_td(name, "browser operation"),
+                toolset="mcp-search-catalog-test",
+            )
+
+        parsed = json.loads(dispatch_tool_search(
+            {"query": "browser operation"},
+            current_tool_defs=[
+                _td("mcp_pinned_router", "browser operation"),
+                _td("mcp_deferred_action", "browser operation"),
+            ],
+            config=ToolSearchConfig.from_raw({
+                "always_visible": ["mcp_pinned_router"],
+            }),
+        ))
+
+        assert parsed["total_available"] == 1
+        assert {match["name"] for match in parsed["matches"]} == {
+            "mcp_deferred_action",
+        }
+
+    def test_scoped_catalog_excludes_always_visible_tools(self):
+        from tools.registry import registry
+        from tools.tool_search import scoped_deferrable_names, ToolSearchConfig
+
+        for name in ("mcp_pinned_scope", "mcp_deferred_scope"):
+            registry.register(
+                name=name,
+                handler=lambda _args: "{}",
+                schema=_td(name),
+                toolset="mcp-scope-catalog-test",
+            )
+
+        names = scoped_deferrable_names(
+            [_td("mcp_pinned_scope"), _td("mcp_deferred_scope")],
+            config=ToolSearchConfig.from_raw({
+                "always_visible": ["mcp_pinned_scope"],
+            }),
+        )
+
+        assert names == frozenset({"mcp_deferred_scope"})
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
@@ -535,4 +632,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-
