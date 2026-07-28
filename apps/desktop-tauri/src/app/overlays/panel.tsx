@@ -143,16 +143,12 @@ export function PanelList({
 
 interface PanelListRowProps {
   active: boolean
-  // Leading status dot color class (e.g. 'bg-emerald-500'); omit for none.
   dotClassName?: string
-  // Leading codicon glyph name (used when there's no lead/dot).
   icon?: string
-  // Custom leading element (colored swatch, avatar, …). Wins over dot/icon.
   lead?: ReactNode
-  // Trailing per-row kebab menu (pass a <PanelRowMenu/>). Reveals on hover/focus.
   menu?: ReactNode
-  // Short always-visible trailing meta (a tag/time, like the trace label's duration).
   meta?: ReactNode
+  onContextMenu?: (e: React.MouseEvent) => void
   onSelect: () => void
   rowKey?: string
   title: ReactNode
@@ -168,6 +164,7 @@ export function PanelListRow({
   lead,
   menu,
   meta,
+  onContextMenu,
   onSelect,
   rowKey,
   title
@@ -179,6 +176,7 @@ export function PanelListRow({
         active ? 'bg-(--ui-row-active-background) text-foreground' : 'text-(--ui-text-secondary)'
       )}
       data-panel-row={rowKey}
+      onContextMenu={onContextMenu}
     >
       <RowButton
         className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md pl-2 pr-1 text-left"

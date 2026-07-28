@@ -162,7 +162,16 @@ export function installDesktopBridge() {
     },
 
     profile: {
-      get: () => Promise.resolve({ name: 'default', home: '' }),
+      get: async () => {
+        try {
+          const result = await window.hermesDesktop!.api<{ current: string }>({
+            path: '/api/profiles/active'
+          })
+          return { profile: result.current || 'default', home: '' }
+        } catch {
+          return { profile: 'default', home: '' }
+        }
+      },
       set: async (name: string) => {
         try {
           const result = await window.hermesDesktop!.api<{ active: string }>({

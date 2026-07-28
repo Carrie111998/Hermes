@@ -31,7 +31,7 @@ import { slug } from '@/lib/sanitize'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $profileColors, refreshProfiles } from '@/store/profile'
+import { $profileColors, $profiles, refreshProfiles } from '@/store/profile'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import {
@@ -62,7 +62,7 @@ interface ProfilesViewProps {
 export function ProfilesView({ onClose }: ProfilesViewProps) {
   const { t } = useI18n()
   const p = t.profiles
-  const [profiles, setProfiles] = useState<null | ProfileInfo[]>(null)
+  const profiles = useStore($profiles)
   const [selectedName, setSelectedName] = useState<null | string>(null)
   const [query, setQuery] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
@@ -73,7 +73,6 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
   const refresh = useCallback(async () => {
     try {
       const list = await refreshProfiles()
-      setProfiles(list)
       setSelectedName(current => {
         if (current && list.some(p => p.name === current)) {
           return current
@@ -296,22 +295,71 @@ function ProfileRow({
   profile: ProfileInfo
 }) {
   const colors = useStore($profileColors)
+  const [ctxOpen, setCtxOpen] = useState(false)
+  const [ctxPos, setCtxPos] = useState({ x: 0, y: 0 })
+
+  // Right-click on non-default profile opens a simple context menu (bypasses
+  // Radix Portal which can glitch in WebKitGTK's z-stack).
+  const handleCtx = useCallback((e: React.MouseEvent) => {
+    if (profile.is_default) return
+    e.preventDefault()
+    setCtxPos({ x: e.clientX, y: e.clientY })
+    setCtxOpen(true)
+  }, [profile.is_default])
+
+  useEffect(() => {
+    if (!ctxOpen) return
+    const close = () => setCtxOpen(false)
+    window.addEventListener('click', close)
+    return () => window.removeEventListener('click', close)
+  }, [ctxOpen])
 
   return (
-    <PanelListRow
-      active={active}
-      lead={
-        <ProfileGlyph
-          color={resolveProfileColor(profile.name, colors)}
-          isDefault={profile.is_default}
-          name={profile.name}
-        />
-      }
-      menu={menu}
-      onSelect={onSelect}
-      rowKey={profile.name}
-      title={profile.name}
-    />
+    <>
+      <PanelListRow
+        active={active}
+        lead={
+          <ProfileGlyph
+            color={resolveProfileColor(profile.name, colors)}
+            isDefault={profile.is_default}
+            name={profile.name}
+          />
+        }
+        menu={menu}
+        onSelect={onSelect}
+        rowKey={profile.name}
+        title={profile.name}
+        onContextMenu={handleCtx}
+      />
+      {ctxOpen && !profile.is_default && (
+        <div
+          className="fixed z-[1500] min-w-36 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-1 shadow-md"
+          style={{ left: ctxPos.x, top: ctxPos.y }}
+        >
+          <button
+            className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-xs text-foreground hover:bg-(--ui-control-active-background)"
+            onClick={() => { setCtxOpen(false); void window.hermesDesktop.profile.set(profile.name).then(() => window.location.reload()) }}
+          >
+            <Codicon name="star-empty" size="0.875rem" />
+            <span>Set as default</span>
+          </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-xs text-foreground hover:bg-(--ui-control-active-background)"
+            onClick={() => setCtxOpen(false)}
+          >
+            <Codicon name="edit" size="0.875rem" />
+            <span>{/* rename label injected via menu */}</span>
+          </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+            onClick={() => setCtxOpen(false)}
+          >
+            <Codicon name="trash" size="0.875rem" />
+            <span>Delete</span>
+          </button>
+        </div>
+      )}
+    </>
   )
 }
 
