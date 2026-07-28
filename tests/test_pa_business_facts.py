@@ -1093,6 +1093,17 @@ def test_tgg_retainable_document_gate_accepts_pdf_and_docx_octet_stream(tmp_path
     ).endswith("wordprocessingml.document")
 
 
+def test_shared_retainable_document_gate_is_tenant_neutral(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    document = tmp_path / "customer-evidence.pdf"
+    document.write_bytes(b"%PDF-1.7\narbitrary tenant evidence")
+
+    assert pbt.validate_retainable_document(
+        document, declared_mime="application/pdf"
+    ) == "application/pdf"
+
+
 @pytest.mark.parametrize("suffix", [".pdf", ".docx", ".csv"])
 def test_tgg_retainable_document_gate_refuses_bad_octet_stream_sniff(
     tmp_path, suffix

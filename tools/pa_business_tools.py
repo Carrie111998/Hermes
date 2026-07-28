@@ -1137,9 +1137,9 @@ _TGG_SPREADSHEET_CANONICAL_MIME = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".csv": "text/csv",
 }
-_TGG_DOCUMENT_EXTENSIONS = frozenset({".pdf", ".docx"})
-_TGG_DOCUMENT_MACRO_EXTENSIONS = frozenset({".docm", ".dotm"})
-_TGG_DOCUMENT_MIMES = {
+_RETAINABLE_DOCUMENT_EXTENSIONS = frozenset({".pdf", ".docx"})
+_RETAINABLE_DOCUMENT_MACRO_EXTENSIONS = frozenset({".docm", ".dotm"})
+_RETAINABLE_DOCUMENT_MIMES = {
     ".pdf": frozenset({"application/pdf"}),
     ".docx": frozenset(
         {
@@ -1147,17 +1147,17 @@ _TGG_DOCUMENT_MIMES = {
         }
     ),
 }
-_TGG_DOCUMENT_CANONICAL_MIME = {
+_RETAINABLE_DOCUMENT_CANONICAL_MIME = {
     ".pdf": "application/pdf",
     ".docx": (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ),
 }
-_TGG_OCTET_STREAM_MIME = "application/octet-stream"
+_RETAINABLE_DOCUMENT_OCTET_STREAM_MIME = "application/octet-stream"
 _TGG_XLSX_MAIN_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
 )
-_TGG_DOCX_MAIN_CONTENT_TYPE = (
+_DOCX_MAIN_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument."
     "wordprocessingml.document.main+xml"
 )
@@ -1165,7 +1165,7 @@ _TGG_SPREADSHEET_MACRO_MARKERS = ("macroenabled", "vbaproject", "macrosheet")
 _TGG_SPREADSHEET_MAX_ZIP_ENTRIES = 20_000
 _TGG_SPREADSHEET_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 _TGG_SPREADSHEET_MAX_FILE_BYTES = 64 * 1024 * 1024
-_TGG_RETAINABLE_DOCUMENT_MAX_FILE_BYTES = _TGG_SPREADSHEET_MAX_FILE_BYTES
+_RETAINABLE_DOCUMENT_MAX_FILE_BYTES = _TGG_SPREADSHEET_MAX_FILE_BYTES
 _TGG_SPREADSHEET_MAX_JOB_NUMBERS = 10_000
 _TGG_JOB_HEADER_NAMES = frozenset(
     {"job no", "job number", "job no.", "job number."}
@@ -1240,13 +1240,13 @@ def _sniff_tgg_xlsx(path: Path) -> bool:
     return _TGG_XLSX_MAIN_CONTENT_TYPE in declared_types
 
 
-def _sniff_tgg_pdf(path: Path) -> bool:
+def _sniff_pdf(path: Path) -> bool:
     """Return whether the file starts with the PDF header signature."""
     with path.open("rb") as handle:
         return handle.read(5) == b"%PDF-"
 
 
-def _sniff_tgg_docx(path: Path) -> bool:
+def _sniff_docx(path: Path) -> bool:
     """Validate an OOXML Word document without extracting active content."""
     with path.open("rb") as handle:
         if handle.read(4) not in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}:
@@ -1295,27 +1295,34 @@ def _sniff_tgg_docx(path: Path) -> bool:
         for marker in _TGG_SPREADSHEET_MACRO_MARKERS
     ):
         return False
-    return _TGG_DOCX_MAIN_CONTENT_TYPE in declared_types
+    return _DOCX_MAIN_CONTENT_TYPE in declared_types
 
 
-def validate_tgg_retainable_document(
+def validate_retainable_document(
     path: str | Path,
     *,
     declared_mime: str,
 ) -> str:
-    """Validate an allowlisted spreadsheet, PDF, or Word document."""
+    """Validate an allowlisted spreadsheet, PDF, or Word document.
+
+    This is a shared-plane content gate. Tenant-specific policy decides
+    whether the gate is used; the byte/MIME validation itself is tenant
+    neutral.
+    """
     candidate = Path(path).expanduser().resolve(strict=True)
     if not candidate.is_file():
         raise ValueError("INVALID_MEDIA_REF: document is not a regular file")
-    if candidate.stat().st_size > _TGG_RETAINABLE_DOCUMENT_MAX_FILE_BYTES:
+    if candidate.stat().st_size > _RETAINABLE_DOCUMENT_MAX_FILE_BYTES:
         raise ValueError("DOCUMENT_TOO_LARGE: file exceeds the media gate limit")
     suffix = candidate.suffix.lower()
     mime = str(declared_mime or "").split(";", 1)[0].strip().lower()
-    if suffix in {".xlsm", ".xltm"} | _TGG_DOCUMENT_MACRO_EXTENSIONS:
+    if suffix in {".xlsm", ".xltm"} | _RETAINABLE_DOCUMENT_MACRO_EXTENSIONS:
         raise ValueError(
             "UNSUPPORTED_MEDIA_TYPE: macro-enabled document formats are refused"
         )
-    allowed_extensions = _TGG_SPREADSHEET_EXTENSIONS | _TGG_DOCUMENT_EXTENSIONS
+    allowed_extensions = (
+        _TGG_SPREADSHEET_EXTENSIONS | _RETAINABLE_DOCUMENT_EXTENSIONS
+    )
     if suffix not in allowed_extensions:
         raise ValueError("UNSUPPORTED_MEDIA_TYPE: document format is not allowlisted")
 
@@ -1328,17 +1335,17 @@ def validate_tgg_retainable_document(
         allowed_mimes = _TGG_SPREADSHEET_MIMES[suffix]
         canonical_mime = _TGG_SPREADSHEET_CANONICAL_MIME[suffix]
     elif suffix == ".pdf":
-        sniffed = _sniff_tgg_pdf(candidate)
-        allowed_mimes = _TGG_DOCUMENT_MIMES[suffix]
-        canonical_mime = _TGG_DOCUMENT_CANONICAL_MIME[suffix]
+        sniffed = _sniff_pdf(candidate)
+        allowed_mimes = _RETAINABLE_DOCUMENT_MIMES[suffix]
+        canonical_mime = _RETAINABLE_DOCUMENT_CANONICAL_MIME[suffix]
     else:
-        sniffed = _sniff_tgg_docx(candidate)
-        allowed_mimes = _TGG_DOCUMENT_MIMES[suffix]
-        canonical_mime = _TGG_DOCUMENT_CANONICAL_MIME[suffix]
+        sniffed = _sniff_docx(candidate)
+        allowed_mimes = _RETAINABLE_DOCUMENT_MIMES[suffix]
+        canonical_mime = _RETAINABLE_DOCUMENT_CANONICAL_MIME[suffix]
 
     octet_stream_allowed = suffix in {".csv", ".pdf", ".docx"}
     if mime not in allowed_mimes and not (
-        octet_stream_allowed and mime == _TGG_OCTET_STREAM_MIME
+        octet_stream_allowed and mime == _RETAINABLE_DOCUMENT_OCTET_STREAM_MIME
     ):
         raise ValueError(
             "PROVENANCE_DIVERGENCE: document MIME does not match extension"
@@ -1348,6 +1355,15 @@ def validate_tgg_retainable_document(
             "PROVENANCE_DIVERGENCE: document MIME does not match bytes"
         )
     return canonical_mime
+
+
+def validate_tgg_retainable_document(
+    path: str | Path,
+    *,
+    declared_mime: str,
+) -> str:
+    """Compatibility entry point for the pre-de-fusion TGG tool surface."""
+    return validate_retainable_document(path, declared_mime=declared_mime)
 
 
 def validate_tgg_spreadsheet(
@@ -1366,7 +1382,7 @@ def validate_tgg_spreadsheet(
     if suffix not in _TGG_SPREADSHEET_EXTENSIONS:
         raise ValueError("UNSUPPORTED_MEDIA_TYPE: spreadsheet format is not allowlisted")
     try:
-        return validate_tgg_retainable_document(
+        return validate_retainable_document(
             candidate, declared_mime=declared_mime
         )
     except ValueError as exc:

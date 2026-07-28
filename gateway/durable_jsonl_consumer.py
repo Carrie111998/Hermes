@@ -1674,7 +1674,7 @@ def _retain_record_media_impl(
     document_bytes = 0
     retained_spreadsheets = 0
     if documents:
-        from tools.pa_business_tools import validate_tgg_retainable_document
+        from tools.pa_business_tools import validate_retainable_document
 
         root.mkdir(parents=True, exist_ok=True, mode=0o750)
         _assert_media_headroom(
@@ -1684,7 +1684,7 @@ def _retain_record_media_impl(
         for ordinal, raw_path, declared_mime in documents:
             source = _contained_existing_file(raw_path, config["source_roots"])
             try:
-                validate_tgg_retainable_document(
+                validate_retainable_document(
                     source, declared_mime=declared_mime
                 )
             except ValueError as exc:
