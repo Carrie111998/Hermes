@@ -10,6 +10,7 @@ and structured output without spending model/provider quota.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -133,6 +134,50 @@ def _check_profile_config(home: Path) -> tuple[HealthRow, dict[str, Any] | None]
     )
 
 
+class _StateDbSnapshotBusy(Exception):
+    """Raised when a live SQLite generation cannot be copied coherently."""
+
+
+def _copy_with_sha256(source: Path, destination: Path) -> str:
+    digest = hashlib.sha256()
+    with source.open("rb") as source_file, destination.open("wb") as destination_file:
+        while chunk := source_file.read(1024 * 1024):
+            destination_file.write(chunk)
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source_file:
+        while chunk := source_file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_coherent_state_snapshot(db_path: Path, snapshot_path: Path) -> None:
+    """Copy one unchanged DB/WAL generation without opening the live profile."""
+    wal_path = Path(f"{db_path}-wal")
+    snapshot_wal_path = Path(f"{snapshot_path}-wal")
+    for _attempt in range(3):
+        snapshot_path.unlink(missing_ok=True)
+        snapshot_wal_path.unlink(missing_ok=True)
+        try:
+            copied_db_hash = _copy_with_sha256(db_path, snapshot_path)
+            copied_wal_hash = (
+                _copy_with_sha256(wal_path, snapshot_wal_path)
+                if wal_path.exists()
+                else None
+            )
+            source_db_hash = _sha256_file(db_path)
+            source_wal_hash = _sha256_file(wal_path) if wal_path.exists() else None
+        except FileNotFoundError:
+            continue
+        if copied_db_hash == source_db_hash and copied_wal_hash == source_wal_hash:
+            return
+    raise _StateDbSnapshotBusy("state.db changed while the read-only snapshot was copied")
+
+
 def _check_state_db(home: Path) -> HealthRow:
     db_path = home / "state.db"
     if not db_path.exists():
@@ -145,13 +190,10 @@ def _check_state_db(home: Path) -> HealthRow:
         )
     try:
         # mode=ro may still create state.db-shm for WAL databases. Validate a
-        # disposable db+wal snapshot so the profile remains untouched.
+        # coherent disposable db+wal generation so the profile remains untouched.
         with tempfile.TemporaryDirectory(prefix="hermes-health-state-") as temp_dir:
             snapshot_path = Path(temp_dir) / "state.db"
-            shutil.copyfile(db_path, snapshot_path)
-            wal_path = Path(f"{db_path}-wal")
-            if wal_path.exists():
-                shutil.copyfile(wal_path, Path(f"{snapshot_path}-wal"))
+            _copy_coherent_state_snapshot(db_path, snapshot_path)
             conn = sqlite3.connect(snapshot_path, timeout=2)
             try:
                 conn.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
@@ -160,6 +202,14 @@ def _check_state_db(home: Path) -> HealthRow:
                     raise sqlite3.DatabaseError(f"quick_check failed: {quick_check!r}")
             finally:
                 conn.close()
+    except _StateDbSnapshotBusy as exc:
+        return HealthRow(
+            "state_db",
+            "state DB availability",
+            "warning",
+            f"{db_path} is busy: {exc}",
+            "retry health after current database activity settles",
+        )
     except Exception as exc:
         return HealthRow(
             "state_db",

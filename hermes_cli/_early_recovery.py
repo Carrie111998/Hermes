@@ -160,6 +160,50 @@ def _probe_broken_packages() -> list[str]:
     return broken
 
 
+def _emit_health_dependency_failure(args: list[str], broken: list[str]) -> None:
+    """Exit through the health contract before importing broken dependencies."""
+    profile = os.environ.get("HERMES_PROFILE", "default")
+    for index, argument in enumerate(args):
+        if argument == "--profile" and index + 1 < len(args):
+            profile = args[index + 1]
+        elif argument.startswith("--profile="):
+            profile = argument.split("=", 1)[1]
+
+    package = sys.modules.get("hermes_cli")
+    version = str(getattr(package, "__version__", "unknown"))
+    home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    detail = f"core runtime dependencies unavailable: {', '.join(broken)}"
+    result = {
+        "schema_version": 1,
+        "status": "critical",
+        "exit_code": 2,
+        "profile": profile,
+        "hermes_home": home,
+        "hermes_version": version,
+        "checks": [
+            {
+                "id": "runtime_dependencies",
+                "subsystem": "runtime dependencies",
+                "status": "critical",
+                "detail": detail,
+                "action": "run: hermes update",
+            }
+        ],
+    }
+    if "--json" in args:
+        import json
+
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print()
+        print("Hermes Health")
+        print("Status: critical (exit 2)")
+        print(f"Profile: {profile}")
+        print(f"CRITICAL runtime dependencies: {detail}")
+        print("Action: run: hermes update")
+    raise SystemExit(2)
+
+
 def _run_repair_install(specs: list[str], project_root: Path) -> bool:
     """ensurepip + ``pip install --force-reinstall`` the given specs.
 
@@ -209,8 +253,11 @@ def recover_if_needed(
     """
     try:
         args = sys.argv[1:] if argv is None else argv
-        # Health must report interrupted recovery, not mutate the venv with pip.
+        # Health must report broken dependencies, not mutate the venv with pip.
         if early_cli_subcommand(args) == "health":
+            broken = _probe_broken_packages()
+            if broken:
+                _emit_health_dependency_failure(args, broken)
             return
         # Same deliberately-loose match as main(): the real update flow writes
         # and clears its own markers — a recovery install must not race it.

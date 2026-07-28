@@ -138,6 +138,40 @@ def test_state_db_wal_snapshot_does_not_create_profile_shm(tmp_path):
     assert not Path(f"{db_path}-shm").exists()
 
 
+def test_state_db_snapshot_retries_across_wal_checkpoint(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    db_path = home / "state.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE sessions (id text)")
+    conn.execute("INSERT INTO sessions VALUES ('from-wal')")
+    conn.commit()
+    wal_path = Path(f"{db_path}-wal")
+    assert wal_path.exists()
+
+    original_copy = health_mod._copy_with_sha256
+    checkpointed = False
+
+    def copy_and_checkpoint(source, destination):
+        nonlocal checkpointed
+        digest = original_copy(source, destination)
+        if source == wal_path and not checkpointed:
+            checkpointed = True
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return digest
+
+    monkeypatch.setattr(health_mod, "_copy_with_sha256", copy_and_checkpoint)
+    try:
+        row = health_mod._check_state_db(home)
+    finally:
+        conn.close()
+
+    assert checkpointed is True
+    assert row.status == "healthy"
+
+
 def test_collect_health_critical_exit_two_for_bad_config(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()
@@ -346,29 +380,44 @@ def test_early_cli_subcommand_distinguishes_command_from_argument():
     assert _early_cli_subcommand(["--model", "health", "chat"]) == "chat"
 
 
-def test_health_process_import_skips_early_repair(tmp_path):
+def test_health_process_reports_broken_dependency_without_early_repair(tmp_path):
     root = tmp_path / "checkout"
     root.mkdir()
     (root / "pyproject.toml").write_text("[project]\nname='probe'\n", encoding="utf-8")
-    (root / ".update-incomplete").write_text("interrupted\n", encoding="utf-8")
+    recovery_marker = root / ".update-incomplete"
+    recovery_marker.write_text("interrupted\n", encoding="utf-8")
+    original_marker = recovery_marker.read_bytes()
     repair_marker = tmp_path / "repair-invoked"
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "yaml.py").write_text(
+        "raise ImportError('deliberately broken yaml')\n", encoding="utf-8"
+    )
     script = f"""
 import pathlib
 import sys
 import hermes_cli._early_recovery as recovery
 recovery._project_root = lambda: pathlib.Path({str(root)!r})
-recovery._probe_broken_packages = lambda: ["PyYAML"]
 recovery._run_repair_install = lambda specs, project_root: pathlib.Path({str(repair_marker)!r}).write_text("called")
 sys.argv = ["hermes", "health", "--json"]
 import hermes_cli.main
 """
     proc = subprocess.run(
-        [sys.executable, "-c", script], cwd=os.getcwd(),
-        env={**os.environ, "PYTHONPATH": os.getcwd()}, text=True,
-        capture_output=True, timeout=30,
+        [sys.executable, "-c", script],
+        cwd=os.getcwd(),
+        env={**os.environ, "PYTHONPATH": f"{shadow}{os.pathsep}{os.getcwd()}"},
+        text=True,
+        capture_output=True,
+        timeout=30,
     )
 
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 2, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["status"] == "critical"
+    assert payload["exit_code"] == 2
+    assert payload["checks"][0]["id"] == "runtime_dependencies"
+    assert "PyYAML" in payload["checks"][0]["detail"]
+    assert recovery_marker.read_bytes() == original_marker
     assert not repair_marker.exists()
 
 
