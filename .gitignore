@@ -166,6 +166,7 @@ _artifacts/
 *.log
 vendor/openclaw-mirror/AI-Scientist
 vendor/openclaw-mirror/ShinkaEvolve
+vendor/akari-video
 
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
@@ -240,6 +241,7 @@ _fork_assets_backup/
 nul
 
 .venv312/
+vendor/
 
 # Local scratch / misgenerated Electron bundle (never publish)
 _tmp/
