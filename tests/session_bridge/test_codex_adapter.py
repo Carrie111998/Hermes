@@ -1538,6 +1538,34 @@ class TestInventory:
 
 
 class TestFindThread:
+    def test_read_exact_thread_reuses_cached_metadata_for_lean_response(self) -> None:
+        row = {
+            "id": "thread-active",
+            "title": "Cached title",
+            "cwd": "C:/cached",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "revision": "cached-revision",
+        }
+        response = _fixture("thread-read.json")
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": [row]}],
+            "thread/read": [response],
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+        assert adapter.list_inventory(archived=False)[0].native_id == "thread-active"
+
+        projection = adapter.read_native_thread("thread-active")
+
+        assert projection.native_id == "thread-active"
+        assert projection.title == "Cached title"
+        assert projection.cwd == "C:/cached"
+        assert [method for method, _params, _timeout in client.calls] == [
+            "thread/list",
+            "thread/read",
+            "thread/list",
+        ]
+
     def test_read_exact_thread_does_not_page_full_inventory(self) -> None:
         response = _fixture("thread-read.json")
         response["thread"]["createdAt"] = 1

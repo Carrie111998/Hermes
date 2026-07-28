@@ -1131,9 +1131,19 @@ class CodexSourceAdapter:
             timeout=_REQUEST_TIMEOUT,
         )
         thread = _thread_from_response(response)
-        summary = _normalize_summary(thread, archived=False)
-        if summary.native_id != wanted:
+        observed = _nonempty_string(
+            _first(thread, "id", "threadId", "thread_id", "sessionId", "session_id")
+        )
+        if observed != wanted:
             raise ValueError("Codex thread/read returned a different thread identity")
+        try:
+            summary = _normalize_summary(thread, archived=False)
+        except ValueError as exc:
+            if str(exc) != "Codex inventory entry has no valid timestamps":
+                raise
+            summary = self.find_native_thread(wanted)
+            if summary is None:
+                raise RuntimeError("Codex thread is unavailable") from exc
         summary = self._refresh_trusted_origins([summary])[0]
         self._inventory_cache[wanted] = summary
         return self.project_thread(summary, response=response)
