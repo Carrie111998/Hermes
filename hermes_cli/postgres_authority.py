@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -599,6 +599,51 @@ _MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_drills_tenant
             ON failover_drills(tenant_id);
+        """,
+    ),
+    # v11 → v12: security hardening (RFC-0.29.0).
+    (
+        11,
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            actor_type      TEXT        NOT NULL,
+            actor_id        TEXT        NOT NULL,
+            action          TEXT        NOT NULL,
+            resource_type   TEXT        NOT NULL DEFAULT '',
+            resource_id     TEXT        NOT NULL DEFAULT '',
+            outcome         TEXT        NOT NULL
+                CHECK (outcome IN ('success', 'denied', 'error')),
+            details         JSONB       NOT NULL DEFAULT '{}',
+            ip_address      TEXT        NOT NULL DEFAULT '',
+            user_agent      TEXT        NOT NULL DEFAULT '',
+            recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_time
+            ON audit_log(tenant_id, recorded_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_actor
+            ON audit_log(tenant_id, actor_type, actor_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_resource
+            ON audit_log(resource_type, resource_id);
+
+        CREATE TABLE IF NOT EXISTS secrets (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            secret_name     TEXT        NOT NULL,
+            encrypted_value TEXT        NOT NULL,
+            version         INTEGER     NOT NULL DEFAULT 1,
+            created_by      TEXT        NOT NULL DEFAULT '',
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            rotated_at      TIMESTAMPTZ,
+            expires_at      TIMESTAMPTZ,
+
+            CONSTRAINT uq_secret_name UNIQUE (tenant_id, secret_name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_secrets_tenant
+            ON secrets(tenant_id);
         """,
     ),
 ]
@@ -3236,6 +3281,162 @@ def list_drills(
 
 
 # ---------------------------------------------------------------------------
+# Security: Audit Log
+# ---------------------------------------------------------------------------
+
+
+def record_audit_event(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    actor_type: str,
+    actor_id: str,
+    action: str,
+    resource_type: str = "",
+    resource_id: str = "",
+    outcome: str,
+    details: dict[str, Any] | None = None,
+    ip_address: str = "",
+    user_agent: str = "",
+) -> None:
+    """Record an immutable audit log entry."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO audit_log
+                (tenant_id, actor_type, actor_id, action, resource_type,
+                 resource_id, outcome, details, ip_address, user_agent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (str(tenant_id), actor_type, actor_id, action, resource_type,
+             resource_id, outcome, json.dumps(details or {}),
+             ip_address, user_agent),
+        )
+    conn.commit()
+
+
+def query_audit_log(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    actor_id: str = "",
+    action: str = "",
+    resource_type: str = "",
+    since_seconds: int = 86400,
+    limit: int = 100,
+) -> list[dict]:
+    """Query audit log entries with optional filters."""
+    conditions = ["tenant_id = %s", "recorded_at > NOW() - make_interval(secs => %s)"]
+    params: list[Any] = [str(tenant_id), since_seconds]
+
+    if actor_id:
+        conditions.append("actor_id = %s")
+        params.append(actor_id)
+    if action:
+        conditions.append("action = %s")
+        params.append(action)
+    if resource_type:
+        conditions.append("resource_type = %s")
+        params.append(resource_type)
+
+    params.append(limit)
+    where = " AND ".join(conditions)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM audit_log WHERE {where} "
+            f"ORDER BY recorded_at DESC LIMIT %s",
+            params,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Security: Secret Management
+# ---------------------------------------------------------------------------
+
+
+def store_secret(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    secret_name: str,
+    encrypted_value: str,
+    created_by: str = "",
+    expires_at: float | None = None,
+) -> dict:
+    """Store a secret (upserts, incrementing version on update)."""
+    exp_dt = _ts(expires_at) if expires_at else None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO secrets
+                (tenant_id, secret_name, encrypted_value, created_by, expires_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, secret_name) DO UPDATE SET
+                encrypted_value = EXCLUDED.encrypted_value,
+                version = secrets.version + 1,
+                rotated_at = NOW(),
+                expires_at = EXCLUDED.expires_at
+            RETURNING *
+            """,
+            (str(tenant_id), secret_name, encrypted_value, created_by, exp_dt),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def get_secret(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    secret_name: str,
+) -> Optional[dict]:
+    """Get a secret by name."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM secrets WHERE tenant_id = %s AND secret_name = %s",
+            (str(tenant_id), secret_name),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def delete_secret(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    secret_name: str,
+) -> bool:
+    """Delete a secret."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM secrets WHERE tenant_id = %s AND secret_name = %s",
+            (str(tenant_id), secret_name),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def list_secrets(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+) -> list[dict]:
+    """List secrets for a tenant (names and metadata only, no values)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, tenant_id, secret_name, version, created_by, "
+            "created_at, rotated_at, expires_at "
+            "FROM secrets WHERE tenant_id = %s ORDER BY secret_name",
+            (str(tenant_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 
@@ -3311,6 +3512,12 @@ __all__ = [
     "mark_invoice_paid",
     "get_invoice",
     "list_invoices",
+    "record_audit_event",
+    "query_audit_log",
+    "store_secret",
+    "get_secret",
+    "delete_secret",
+    "list_secrets",
     "create_backup",
     "complete_backup",
     "list_backups",
