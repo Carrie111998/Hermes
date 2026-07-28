@@ -9,13 +9,35 @@ from pathlib import Path
 _PATCHER = Path("plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs")
 
 
+def _file_url(path: Path) -> str:
+    """Windows-safe ``file://`` URL for Node ESM imports."""
+    return Path(path).resolve().as_uri()
+
 def test_sidecar_applies_spectrum_patch_before_importing_sdk() -> None:
     """Existing installs should self-heal at runtime, not only during npm postinstall."""
     index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
     assert "import { patchSpectrumTs }" in index
     assert "patchSpectrumTs();" in index
     assert index.index("patchSpectrumTs();") < index.index('await import("spectrum-ts")')
+    # Patch miss must not kill the sidecar — upstream 8.2+ already preserves
+    # mixed text, and a mismatched rewrite used to exit(3) every start.
+    patch_block = index[index.index("patchSpectrumTs();") : index.index('await import("spectrum-ts")')]
+    assert "process.exit(3)" not in patch_block
+    assert "continuing without it" in patch_block
 
+
+def test_adapter_runs_spectrum_patch_off_event_loop() -> None:
+    """Sync node patch on the asyncio loop starved Discord heartbeats (#photon)."""
+    adapter = Path("plugins/platforms/photon/adapter.py").read_text(encoding="utf-8")
+    assert "asyncio.to_thread(" in adapter
+    assert "_run_spectrum_mixed_attachment_patch" in adapter
+    assert "_spectrum_mixed_attachment_patch_satisfied" in adapter
+    # The connect path must not call subprocess.run for the patch inline.
+    start = adapter.index("async def _start_sidecar")
+    body = adapter[start : start + 4500]
+    assert "await asyncio.to_thread(" in body
+    assert "_run_spectrum_mixed_attachment_patch" in body
+    assert "subprocess.run(" not in body.split("self._sidecar_proc = subprocess.Popen")[0]
 
 def test_sidecar_healthz_reports_stream_health() -> None:
     """Local process health must include upstream stream health."""
@@ -198,6 +220,59 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     assert chunk.read_text(encoding="utf-8") == patched
 
 
+def test_spectrum_patch_accepts_upstream_mixed_text_helper(tmp_path: Path) -> None:
+    """spectrum-ts 8.2+ already orders text+attachments — treat as success no-op."""
+    dist = tmp_path / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    dist.mkdir(parents=True)
+    chunk = dist / "index.js"
+    # Minimal shape of the real 8.2.2 build: mappers delegate to
+    # buildUnwrappedContentMessage which calls toOrderedParts(...).
+    chunk.write_text(
+        _tabify(
+            """
+const buildUnwrappedContentMessage = async (client, base, message, messageGuidStr) => {
+  const attachments = messageAttachments(message);
+  if (attachments.length === 0) {
+    const text = message.content.text;
+    return { ...base, id: messageGuidStr, content: text ? asText(text) : asCustom(message) };
+  }
+  const parts = toOrderedParts(message.content.text, attachments);
+  return { ...base, id: messageGuidStr, content: asProviderGroup(parts) };
+};
+const rebuildFromAppleMessage = async (client, message, phone, chatGuidHint) => {
+  return buildUnwrappedContentMessage(client, {}, message, message.guid);
+};
+const toInboundMessages = async (client, cache, event, phone) => {
+  const msg = await buildUnwrappedContentMessage(client, {}, event.message, event.message.guid);
+  return [msg];
+};
+"""
+        ),
+        encoding="utf-8",
+    )
+    before = chunk.read_text(encoding="utf-8")
+    result = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "upstream preserves mixed text+attachments" in result.stderr
+    assert chunk.read_text(encoding="utf-8") == before
+    assert "Preserve mixed text + attachment iMessage payloads" not in before
+
+
+def test_spectrum_patch_satisfied_helper_detects_upstream() -> None:
+    from plugins.platforms.photon.adapter import (
+        _spectrum_mixed_attachment_patch_satisfied,
+    )
+
+    sidecar = Path("plugins/platforms/photon/sidecar")
+    assert _spectrum_mixed_attachment_patch_satisfied(sidecar) is True
+
+
 def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
     """Execute the patched mappers and assert mixed bubbles become groups whose
     first child is the typed text, while text-free bubbles keep their exact
@@ -214,7 +289,7 @@ def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
 
     harness = textwrap.dedent(
         f"""
-        import {{ rebuildFromAppleMessage, toInboundMessages }} from {str(chunk)!r};
+        import {{ rebuildFromAppleMessage, toInboundMessages }} from {_file_url(chunk)!r};
         const assert = (c, m) => {{ if (!c) {{ console.error("FAIL: " + m); process.exit(1); }} }};
 
         // Mixed text + single attachment -> group [text@0, attachment@1].

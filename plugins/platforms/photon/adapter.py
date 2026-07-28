@@ -91,6 +91,19 @@ _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 # connect path indefinitely.
 _NPM_REINSTALL_TIMEOUT = 600
 
+# Best-effort Spectrum mixed-attachment rewrite before sidecar spawn. Must stay
+# short: a wedged node (AV scan, hung cwd) used to block the asyncio loop for
+# the full timeout and starve Discord heartbeats / the 30s platform connect.
+_SPECTRUM_PATCH_TIMEOUT = 10
+
+# Markers that mean the sidecar does not need the legacy Hermes rewrite.
+_SPECTRUM_PATCH_MARKER = (
+    "Hermes patch: Preserve mixed text + attachment iMessage payloads"
+)
+_SPECTRUM_UPSTREAM_MIXED_MARKER = (
+    "toOrderedParts(message.content.text, attachments)"
+)
+
 # Photon / Envoy / spectrum-ts error substrings that indicate a transient
 # upstream overload rather than a permanent failure.  These are not in the
 # core _RETRYABLE_ERROR_PATTERNS because they are specific to this adapter.
@@ -159,6 +172,56 @@ def _sidecar_deps_stale() -> bool:
         return lockfile.stat().st_mtime > marker.stat().st_mtime
     except OSError:
         return False
+
+
+def _spectrum_mixed_attachment_patch_satisfied(sidecar_dir: Path = _SIDECAR_DIR) -> bool:
+    """True when the installed ``@spectrum-ts/imessage`` already keeps mixed text.
+
+    Either Hermes already rewrote the chunk (legacy marker) or upstream 8.2+
+    ships ``toOrderedParts(...)`` — both mean spawning ``node`` for the patch
+    script is wasted work on every connect.
+    """
+    dist = sidecar_dir / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    try:
+        if not dist.is_dir():
+            return False
+        for path in dist.glob("*.js"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if (
+                _SPECTRUM_PATCH_MARKER in text
+                or _SPECTRUM_UPSTREAM_MIXED_MARKER in text
+            ):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _run_spectrum_mixed_attachment_patch(
+    node_bin: str,
+    sidecar_dir: Path = _SIDECAR_DIR,
+    *,
+    timeout: float = _SPECTRUM_PATCH_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """Blocking Spectrum patch invocation (run via ``asyncio.to_thread``)."""
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    return subprocess.run(  # noqa: S603
+        [
+            node_bin,
+            str(sidecar_dir / "patch-spectrum-mixed-attachments.mjs"),
+            str(sidecar_dir),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+        # Windows: suppress the brief console flash this short-lived
+        # node patch run would otherwise pop on every sidecar start.
+        creationflags=windows_hide_flags(),
+    )
 
 
 def _reinstall_sidecar_deps() -> None:
@@ -954,30 +1017,31 @@ class PhotonAdapter(BasePlatformAdapter):
         # discord/whatsapp adapters use for their sidecar spawns.
         from hermes_cli._subprocess_compat import windows_hide_flags
 
-        try:
-            patch = subprocess.run(  # noqa: S603
-                [
+        # Spectrum mixed-attachment rewrite is best-effort and must not block
+        # the asyncio loop — a 10s sync hang here starved Discord heartbeats
+        # and tripped the gateway's 30s platform-connect budget. Skip when the
+        # installed SDK already preserves mixed text (upstream 8.2+ or a prior
+        # Hermes rewrite); otherwise run off-thread and fail open.
+        if _spectrum_mixed_attachment_patch_satisfied():
+            logger.debug(
+                "[photon] spectrum mixed attachment patch already satisfied; skipping"
+            )
+        else:
+            try:
+                patch = await asyncio.to_thread(
+                    _run_spectrum_mixed_attachment_patch,
                     self._node_bin,
-                    str(_SIDECAR_DIR / "patch-spectrum-mixed-attachments.mjs"),
-                    str(_SIDECAR_DIR),
-                ],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=10,
-                check=False,
-                # Windows: suppress the brief console flash this short-lived
-                # node patch run would otherwise pop on every sidecar start.
-                creationflags=windows_hide_flags(),
-            )
-            if patch.returncode != 0:
-                raise RuntimeError((patch.stderr or patch.stdout or "").strip())
-            if patch.stderr.strip():
-                logger.debug("[photon] %s", patch.stderr.strip())
-        except Exception as exc:
-            logger.warning(
-                "[photon] failed to apply Spectrum mixed attachment patch: %s",
-                exc,
-            )
+                    _SIDECAR_DIR,
+                )
+                if patch.returncode != 0:
+                    raise RuntimeError((patch.stderr or patch.stdout or "").strip())
+                if patch.stderr.strip():
+                    logger.debug("[photon] %s", patch.stderr.strip())
+            except Exception as exc:
+                logger.warning(
+                    "[photon] failed to apply Spectrum mixed attachment patch: %s",
+                    exc,
+                )
 
         self._sidecar_proc = subprocess.Popen(  # noqa: S603
             [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],

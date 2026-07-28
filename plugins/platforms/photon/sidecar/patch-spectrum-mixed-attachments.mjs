@@ -115,6 +115,14 @@ function patchChildIndices(source) {
   );
 }
 
+// spectrum-ts 8.2+ already preserves mixed text+attachments via
+// `toOrderedParts(message.content.text, attachments)` inside
+// `buildUnwrappedContentMessage`. When that helper is present the Hermes
+// rewrite is unnecessary — and its old anchors no longer match, so treating
+// the miss as fatal would exit the sidecar (process.exit(3)) on every start.
+const UPSTREAM_MIXED_MARKER =
+  "toOrderedParts(message.content.text, attachments)";
+
 export function patchSpectrumTs(root = scriptDir()) {
   const dist = path.join(
     root,
@@ -135,6 +143,14 @@ export function patchSpectrumTs(root = scriptDir()) {
     if (raw.includes(MARKER)) {
       return { patched: false, file, reason: "already patched" };
     }
+    // Upstream already ships the behavior this patch used to inject.
+    if (raw.includes(UPSTREAM_MIXED_MARKER)) {
+      return {
+        patched: false,
+        file,
+        reason: "upstream preserves mixed text+attachments",
+      };
+    }
     // Normalize to LF for matching so the patch works regardless of the
     // checkout's line-ending style (Windows git autocrlf produces CRLF,
     // which would otherwise defeat the \n-based search strings). The
@@ -146,6 +162,16 @@ export function patchSpectrumTs(root = scriptDir()) {
     const original = usedCRLF ? raw.split(CRLF).join("\n") : raw;
     if (!original.includes("const toInboundMessages = async") ||
         !original.includes("const rebuildFromAppleMessage = async")) {
+      continue;
+    }
+    // Only rewrite the pre-8.2 mapper shape (attachment-first branches).
+    // Newer builds are handled by UPSTREAM_MIXED_MARKER above; anything else
+    // that still has the async mappers but not the old anchors falls through.
+    if (
+      !original.includes(
+        "\tconst attachments = messageAttachments(message);\n\tif (attachments.length === 1) {"
+      )
+    ) {
       continue;
     }
     let patched = original;
@@ -170,7 +196,10 @@ if (_invokedDirectly) {
     const root = process.argv[2] ? path.resolve(process.argv[2]) : scriptDir();
     const result = patchSpectrumTs(root);
     const action = result.patched ? "patched" : "ok";
-    console.error(`photon-sidecar: spectrum mixed attachment patch ${action}: ${result.file}`);
+    const reason = result.reason ? ` (${result.reason})` : "";
+    console.error(
+      `photon-sidecar: spectrum mixed attachment patch ${action}: ${result.file}${reason}`
+    );
   } catch (err) {
     console.error(`photon-sidecar: spectrum mixed attachment patch failed: ${err?.stack || err}`);
     process.exit(1);

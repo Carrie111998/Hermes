@@ -214,23 +214,28 @@ if (!projectId || !projectSecret || !sharedToken) {
 // Lazy-load spectrum-ts so a missing install fails with a clear message
 // instead of a cryptic module-resolution error during import. Apply Hermes'
 // pinned-sdk compatibility patch first so existing installs self-heal at
-// runtime, not only during npm postinstall.
+// runtime, not only during npm postinstall. Fail open on patch miss —
+// spectrum-ts 8.2+ already preserves mixed text+attachments upstream, and a
+// mismatched rewrite must not take down the whole Photon platform.
 try {
   const patchResult = patchSpectrumTs();
   if (patchResult.patched) {
     console.error(
       `photon-sidecar: spectrum mixed attachment patch applied: ${patchResult.file}`
     );
+  } else if (patchResult.reason) {
+    console.error(
+      `photon-sidecar: spectrum mixed attachment patch skipped: ${patchResult.reason}`
+    );
   }
 } catch (e) {
   console.error(
-    "photon-sidecar: spectrum mixed attachment patch failed. " +
+    "photon-sidecar: spectrum mixed attachment patch failed (continuing without it). " +
       "Run `npm install` inside plugins/platforms/photon/sidecar/ or " +
       "upgrade the Photon sidecar patch for the pinned spectrum-ts version. " +
       "Original error: " +
       (e && e.stack ? e.stack : String(e))
   );
-  process.exit(3);
 }
 let Spectrum,
   imessage,

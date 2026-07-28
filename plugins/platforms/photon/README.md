@@ -179,9 +179,12 @@ deliberate:
 4. Re-validate `sidecar/patch-spectrum-mixed-attachments.mjs`. It rewrites the
    compiled iMessage inbound mappers in `@spectrum-ts/imessage/dist/index.js`
    so a bubble with both text and attachments keeps its typed text; the anchors
-   are tied to that build's output. `npm install` runs it via `postinstall` and
-   fails loudly if the anchors no longer match — update them to the new output
-   (`test_spectrum_patch.py` covers the patch).
+   are tied to that build's output. **spectrum-ts 8.2+ already ships
+   `toOrderedParts(message.content.text, attachments)`**, so the patcher treats
+   that as a successful no-op (and the sidecar fails open if anchors still miss)
+   instead of exiting. `npm install` runs it via `postinstall`.
+   `test_spectrum_patch.py` covers both the legacy rewrite and the upstream
+   skip path.
 5. Run `pytest tests/plugins/platforms/photon/`.
 6. Verify end-to-end: `hermes photon status`, a DM and a group roundtrip,
    and an agent reply into a group right after a gateway restart (exercises
