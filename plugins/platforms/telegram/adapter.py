@@ -4363,6 +4363,7 @@ class TelegramAdapter(BasePlatformAdapter):
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
+            strict_route = bool((metadata or {}).get("_hermes_strict_route"))
             used_thread_fallback = False
             
             try:
@@ -4480,6 +4481,12 @@ class TelegramAdapter(BasePlatformAdapter):
                                         self.name, effective_thread_id,
                                     )
                                     continue
+                                if strict_route:
+                                    return SendResult(
+                                        success=False,
+                                        error=_redact_telegram_error_text(send_err),
+                                        retryable=False,
+                                    )
                                 # Second failure: the thread is genuinely gone.
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune

@@ -5,6 +5,26 @@ import pytest
 from gateway.config import GatewayConfig
 
 
+def _seed_pending_repair(home):
+    from cron.output_provenance import ProvenanceStore
+
+    store = ProvenanceStore(home)
+    store.bootstrap()
+    issued = store.issue(
+        profile_id="profile", job_id="job", occurrence_id="occurrence", target_id="target",
+        route_digest="sha256:route", raw_body=b"body", template_digest="sha256:template",
+        producer_class="llm_final",
+    )
+    claim = store.verify_and_claim(
+        proof=issued["proof"], raw_body_b64=issued["raw_body_b64"], decision="allow",
+    )
+    store.begin_send(
+        capability_id=claim["capability_id"], claim_id=claim["claim_id"], body=b"body",
+        rendered_body=b"body", route_digest="sha256:route",
+        post_send_repair_context={"content": "body"},
+    )
+
+
 def test_gateway_startup_recovery_delegates_to_the_profile_level_sweep(monkeypatch):
     from gateway.run import _recover_protected_final_results_at_gateway_startup
 
@@ -148,6 +168,7 @@ async def test_gateway_start_blocks_before_adapter_start_when_recovery_is_pendin
             self._restart_requested = False
             self._restart_via_service = False
 
+    _seed_pending_repair(tmp_path)
     _patch_gateway_boot_dependencies(monkeypatch, tmp_path, Runner)
     monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
     class Registry:
@@ -159,13 +180,12 @@ async def test_gateway_start_blocks_before_adapter_start_when_recovery_is_pendin
 
     monkeypatch.setattr("gateway.hooks.HookRegistry", Registry)
     monkeypatch.setattr(
-        gateway_run,
-        "_recover_protected_final_results_at_gateway_startup",
-        lambda: calls.append("recovery") or ["repair pending"],
+        "gateway.outbound_boundary.load_installed_outbound_hooks",
+        lambda _home: None,
     )
 
     assert await gateway_run.start_gateway(config=GatewayConfig(), replace=False, verbosity=0) is False
-    assert calls == ["hook_discovery", "recovery"]
+    assert calls == ["hook_discovery"]
 
 
 @pytest.mark.asyncio

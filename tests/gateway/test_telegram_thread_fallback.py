@@ -437,6 +437,39 @@ async def test_send_retries_transient_thread_not_found_before_fallback():
 
 
 @pytest.mark.asyncio
+async def test_delivery_transport_strict_route_never_falls_back_from_telegram_topic():
+    """Protected transport retries may not escape the proven Telegram topic."""
+    from gateway.delivery import DeliveryTransport
+
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message thread not found")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    transport = DeliveryTransport(
+        adapter=adapter,
+        config=adapter.config,
+        transport_platform=Platform.TELEGRAM,
+    )
+
+    result = await transport.send(
+        Platform.TELEGRAM,
+        "-100123",
+        "protected final result",
+        {"thread_id": "99999"},
+        strict_route=True,
+    )
+
+    assert result.success is False
+    assert "thread not found" in result.error.lower()
+    assert call_log
+    assert all(call.get("message_thread_id") == 99999 for call in call_log)
+
+
+@pytest.mark.asyncio
 async def test_send_private_dm_topic_uses_direct_messages_topic_id():
     """Private Telegram topics route sends via direct_messages_topic_id."""
     adapter = _make_adapter()

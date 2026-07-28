@@ -21,6 +21,26 @@ import time
 from unittest.mock import patch
 
 
+def _seed_pending_repair(home):
+    from cron.output_provenance import ProvenanceStore
+
+    store = ProvenanceStore(home)
+    store.bootstrap()
+    issued = store.issue(
+        profile_id="profile", job_id="job", occurrence_id="occurrence", target_id="target",
+        route_digest="sha256:route", raw_body=b"body", template_digest="sha256:template",
+        producer_class="llm_final",
+    )
+    claim = store.verify_and_claim(
+        proof=issued["proof"], raw_body_b64=issued["raw_body_b64"], decision="allow",
+    )
+    store.begin_send(
+        capability_id=claim["capability_id"], claim_id=claim["claim_id"], body=b"body",
+        rendered_body=b"body", route_digest="sha256:route",
+        post_send_repair_context={"content": "body"},
+    )
+
+
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
 
@@ -420,13 +440,20 @@ def test_fire_due_does_not_claim_when_profile_recovery_raises(monkeypatch):
     assert claimed == []
 
 
-def test_fire_due_does_not_claim_while_protected_recovery_remains_pending(monkeypatch):
+def test_fire_due_does_not_claim_when_pending_repair_has_no_active_hook(
+    monkeypatch, tmp_path,
+):
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
+    _seed_pending_repair(tmp_path)
     claimed = []
-    monkeypatch.setattr(sched, "recover_protected_final_result_repairs_for_home", lambda: ["repair pending"])
+    monkeypatch.setattr(sched, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "gateway.outbound_boundary.load_installed_outbound_hooks",
+        lambda _home: None,
+    )
     monkeypatch.setattr(jobs, "claim_job_for_fire", lambda _job_id: claimed.append(True) or True, raising=False)
 
     assert InProcessCronScheduler().fire_due("job") is False

@@ -50,6 +50,25 @@ def _ledger(store: ProvenanceStore) -> dict:
     return json.loads(store.ledger_path.read_text(encoding="utf-8"))
 
 
+def _seed_pending_repair(home: Path) -> ProvenanceStore:
+    store = ProvenanceStore(home)
+    store.bootstrap()
+    issued = store.issue(
+        profile_id="profile", job_id="job", occurrence_id="occurrence", target_id="target",
+        route_digest="sha256:route", raw_body=b"body", template_digest="sha256:template",
+        producer_class="llm_final",
+    )
+    claim = store.verify_and_claim(
+        proof=issued["proof"], raw_body_b64=issued["raw_body_b64"], decision="allow",
+    )
+    store.begin_send(
+        capability_id=claim["capability_id"], claim_id=claim["claim_id"], body=b"body",
+        rendered_body=b"body", route_digest="sha256:route",
+        post_send_repair_context={"content": "body"},
+    )
+    return store
+
+
 def _pinned_live_transport(monkeypatch, *, result: object) -> tuple[object, AsyncMock]:
     """Install one resolved native transport and synchronously run its coroutine."""
     from gateway.config import Platform
@@ -92,6 +111,7 @@ def test_protected_final_result_claims_then_sends_once(tmp_path, monkeypatch):
 
     assert result is None
     send.assert_awaited_once()
+    assert send.await_args.kwargs["metadata"]["_hermes_strict_route"] is True
     assert hooks.contexts[0]["source_kind"] == "gateway_reply"
     assert hooks.events == ["outbound:before_send", "outbound:after_send"]
     assert hooks.contexts[1]["success"] is True
@@ -238,6 +258,20 @@ def test_prepared_startup_without_pending_observer_does_not_require_active_hook(
     assert recover_protected_final_result_repairs_for_home(tmp_path) == []
 
 
+def test_pending_observer_without_active_hook_returns_hard_error(monkeypatch, tmp_path):
+    from cron.scheduler import recover_protected_final_result_repairs_for_home
+
+    _seed_pending_repair(tmp_path)
+    monkeypatch.setattr(
+        "gateway.outbound_boundary.load_installed_outbound_hooks",
+        lambda _home: None,
+    )
+
+    assert recover_protected_final_result_repairs_for_home(tmp_path) == [
+        "protected_final_result_recovery_blocked:active_hook_unavailable"
+    ]
+
+
 def test_post_send_repair_failure_remains_pending_without_transport(tmp_path):
     from cron.scheduler import repair_protected_final_result_after_send
 
@@ -328,10 +362,27 @@ def test_profile_recovery_uses_the_requested_home_without_the_cron_jobs_lock(mon
     assert recover_protected_final_result_repairs_for_home(tmp_path) == ["recovered"]
 
 
-def test_scheduler_sweep_skips_when_no_activated_hook(monkeypatch):
-    from cron.scheduler import sweep_protected_final_result_repairs
-    monkeypatch.setattr("gateway.outbound_boundary.load_installed_outbound_hooks", lambda _home: None)
-    assert sweep_protected_final_result_repairs() == []
+def test_tick_blocks_pending_observer_when_active_hook_is_unavailable(
+    monkeypatch, tmp_path, caplog,
+):
+    from cron.scheduler import tick
+
+    _seed_pending_repair(tmp_path)
+    due_reads = []
+    monkeypatch.setattr("cron.scheduler._get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("cron.scheduler._get_lock_paths", lambda: (tmp_path, tmp_path / ".tick.lock"))
+    monkeypatch.setattr(
+        "gateway.outbound_boundary.load_installed_outbound_hooks",
+        lambda _home: None,
+    )
+    monkeypatch.setattr(
+        "cron.scheduler.get_due_jobs",
+        lambda: due_reads.append(True) or [],
+    )
+
+    assert tick(verbose=False) == 0
+    assert due_reads == []
+    assert "protected_final_result_recovery_blocked:active_hook_unavailable" in caplog.text
 
 
 def test_tick_logs_and_continues_when_recovery_sweep_fails(tmp_path, monkeypatch):

@@ -1737,7 +1737,13 @@ def _deliver_protected_final_result(
             from agent.async_utils import safe_schedule_threadsafe
 
             future = safe_schedule_threadsafe(
-                runtime_transport.send(platform, route_target.chat_id, rendered, route_metadata),
+                runtime_transport.send(
+                    platform,
+                    route_target.chat_id,
+                    rendered,
+                    route_metadata,
+                    strict_route=True,
+                ),
                 loop,
             )
             if future is None:
@@ -1826,7 +1832,7 @@ def recover_protected_final_result_repairs_for_home(home: str | os.PathLike[str]
             raise
     hooks = load_installed_outbound_hooks(profile_home)
     if hooks is None:
-        return []
+        return ["protected_final_result_recovery_blocked:active_hook_unavailable"]
     return recover_protected_final_result_repairs(
         provenance_store=provenance_store, hooks=hooks,
     )
