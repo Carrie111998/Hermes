@@ -1326,10 +1326,13 @@ def build_oauth_auth(
     if not _OAUTH_AVAILABLE or (
         OAuthClientProvider is None and not _ensure_sdk_loaded()
     ):
+        from tools.lazy_deps import feature_install_command
+
         logger.warning(
             "MCP OAuth requested for '%s' but SDK auth types are not available. "
-            "Install with: pip install 'mcp>=1.26.0'",
+            "Install with: %s",
             server_name,
+            feature_install_command("tool.computer_use"),
         )
         return None
 

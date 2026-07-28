@@ -130,11 +130,14 @@ class TestHermesTokenStorage:
 # ---------------------------------------------------------------------------
 
 class TestBuildOAuthAuth:
-    def test_returns_none_without_sdk(self, monkeypatch):
+    def test_returns_none_without_sdk(self, monkeypatch, caplog):
+        from tools.lazy_deps import feature_install_command
+
         import tools.mcp_oauth as mod
         monkeypatch.setattr(mod, "_OAUTH_AVAILABLE", False)
         result = build_oauth_auth("test", "https://example.com")
         assert result is None
+        assert feature_install_command("tool.computer_use") in caplog.text
 
 
     def test_scope_passed_through(self, tmp_path, monkeypatch):

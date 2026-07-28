@@ -13,9 +13,34 @@ call is mocked — we never actually shell out during unit tests.
 from __future__ import annotations
 
 
+import tomllib
+from pathlib import Path
+
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 import tools.lazy_deps as ld
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _exact_version(spec: str) -> Version:
+    requirement = Requirement(spec)
+    exact_versions = [
+        clause.version
+        for clause in requirement.specifier
+        if clause.operator == "=="
+    ]
+    assert len(exact_versions) == 1, f"{spec} must have one exact version"
+    return Version(exact_versions[0])
+
+
+def _requirement(specs: list[str], package: str) -> str:
+    matches = [spec for spec in specs if Requirement(spec).name.lower() == package]
+    assert len(matches) == 1, f"expected one {package} requirement, got {matches}"
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +166,137 @@ class TestEnsure:
         )
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
+
+    def test_computer_use_repairs_vulnerable_server_dependencies(self, monkeypatch):
+        """The runtime installer upgrades every protected server dependency."""
+        import importlib.metadata as metadata
+
+        floors = {
+            "mcp": Version("1.28.1"),
+            "starlette": Version("1.3.1"),
+        }
+        installed = {
+            "mcp": "1.26.0",
+            "starlette": "0.46.1",
+        }
+        specs = ld.feature_specs("tool.computer_use")
+        requirements = {
+            Requirement(spec).name.lower(): Requirement(spec)
+            for spec in specs
+        }
+
+        assert requirements.keys() == floors.keys()
+        monkeypatch.setattr(metadata, "version", installed.__getitem__)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        assert ld.feature_missing("tool.computer_use") == specs
+
+        def install(requested, **_kwargs):
+            assert requested == specs
+            for name, requirement in requirements.items():
+                exact_versions = [
+                    clause.version
+                    for clause in requirement.specifier
+                    if clause.operator == "=="
+                ]
+                assert len(exact_versions) == 1
+                installed[name] = exact_versions[0]
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", install)
+
+        ld.ensure("tool.computer_use", prompt=False)
+
+        assert ld.feature_missing("tool.computer_use") == ()
+        for package, floor in floors.items():
+            assert Version(installed[package]) >= floor
+
+    def test_server_dependency_floors_stay_synchronized(self):
+        """Every server dependency surface uses one exact version above its floor."""
+        project = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())[
+            "project"
+        ]
+        lock_packages = tomllib.loads((_REPO_ROOT / "uv.lock").read_text())[
+            "package"
+        ]
+        optional = project["optional-dependencies"]
+        hermes_lock = next(
+            package for package in lock_packages if package["name"] == "hermes-agent"
+        )
+        lock_requirements = hermes_lock["metadata"]["requires-dist"]
+
+        def lock_requirement(package: str, extra: str | None = None) -> str:
+            marker = None if extra is None else f"extra == '{extra}'"
+            matches = [
+                requirement
+                for requirement in lock_requirements
+                if requirement["name"] == package
+                and requirement.get("marker") == marker
+            ]
+            assert len(matches) == 1, (
+                f"expected one locked {package} requirement for {extra}, got {matches}"
+            )
+            return package + matches[0]["specifier"]
+
+        def resolved_version(package: str) -> Version:
+            matches = [
+                entry["version"]
+                for entry in lock_packages
+                if entry["name"] == package
+            ]
+            assert len(matches) == 1, (
+                f"expected one resolved {package} package, got {matches}"
+            )
+            return Version(matches[0])
+
+        surfaces = {
+            "mcp": (
+                Version("1.28.1"),
+                [
+                    *(
+                        _requirement(optional[extra], "mcp")
+                        for extra in ("dev", "mcp", "computer-use")
+                    ),
+                    _requirement(list(ld.feature_specs("tool.computer_use")), "mcp"),
+                    *(
+                        lock_requirement("mcp", extra)
+                        for extra in ("dev", "mcp", "computer-use")
+                    ),
+                ],
+            ),
+            "starlette": (
+                Version("1.3.1"),
+                [
+                    _requirement(project["dependencies"], "starlette"),
+                    *(
+                        _requirement(optional[extra], "starlette")
+                        for extra in ("dev", "mcp", "computer-use", "web")
+                    ),
+                    _requirement(
+                        list(ld.feature_specs("tool.computer_use")), "starlette"
+                    ),
+                    lock_requirement("starlette"),
+                    *(
+                        lock_requirement("starlette", extra)
+                        for extra in ("dev", "mcp", "computer-use", "web")
+                    ),
+                ],
+            ),
+            "python-multipart": (
+                Version("0.0.32"),
+                [
+                    _requirement(project["dependencies"], "python-multipart"),
+                    _requirement(optional["web"], "python-multipart"),
+                    lock_requirement("python-multipart"),
+                    lock_requirement("python-multipart", "web"),
+                ],
+            ),
+        }
+
+        for package, (floor, requirements) in surfaces.items():
+            versions = {_exact_version(spec) for spec in requirements}
+            versions.add(resolved_version(package))
+            assert len(versions) == 1, f"{package} versions diverged: {versions}"
+            assert versions.pop() >= floor
 
 
 # ---------------------------------------------------------------------------

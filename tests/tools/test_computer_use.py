@@ -780,9 +780,12 @@ class TestLazyMcpInstall:
         surfaces the actionable FeatureUnavailable rather than a session that
         crashes later on a bare import."""
         from tools.computer_use import cua_backend
+        from tools import lazy_deps
         from tools.lazy_deps import FeatureUnavailable
         unavailable = FeatureUnavailable(
-            "tool.computer_use", ("mcp==1.28.1",), "lazy installs disabled"
+            "tool.computer_use",
+            lazy_deps.feature_specs("tool.computer_use")[:1],
+            "lazy installs disabled",
         )
         with patch.object(cua_backend, "_maybe_nudge_update"), \
              patch("tools.lazy_deps.ensure", side_effect=unavailable), \
