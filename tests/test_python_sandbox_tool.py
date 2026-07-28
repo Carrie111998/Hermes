@@ -285,6 +285,78 @@ def test_result_cap_and_file_listing(tmp_path):
     ]
 
 
+def test_xlsx_file_listing_includes_configured_client_url(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "weekly-report.xlsx").write_bytes(b"workbook")
+
+    payload, error = sandbox._harvest(
+        work,
+        "summary",
+        "",
+        "success",
+        sandbox.DEFAULTS,
+        run_id="r_12ab34cd",
+        artifact_url_base="https://portal.example/artifacts/",
+    )
+
+    assert error == ""
+    assert payload["files"] == [
+        {
+            "path": "work/weekly-report.xlsx",
+            "bytes": 8,
+            "client_url": (
+                "https://portal.example/artifacts/r_12ab34cd/weekly-report.xlsx"
+            ),
+            "lines": 1,
+        }
+    ]
+
+
+def test_file_listing_omits_client_url_when_base_is_unset(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "weekly-report.xlsx").write_bytes(b"workbook")
+
+    payload, _ = sandbox._harvest(
+        work,
+        "",
+        "",
+        "success",
+        sandbox.DEFAULTS,
+        run_id="r_12ab34cd",
+    )
+
+    assert all("client_url" not in item for item in payload["files"])
+
+
+@pytest.mark.parametrize(
+    ("run_id", "filename"),
+    [
+        ("r_12ab34cd", "weekly report.xlsx"),
+        ("r_nothex00", "weekly-report.xlsx"),
+    ],
+)
+def test_file_listing_omits_client_url_for_invalid_contract_values(
+    tmp_path, run_id, filename
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / filename).write_bytes(b"workbook")
+
+    payload, _ = sandbox._harvest(
+        work,
+        "",
+        "",
+        "success",
+        sandbox.DEFAULTS,
+        run_id=run_id,
+        artifact_url_base="https://portal.example/artifacts",
+    )
+
+    assert all("client_url" not in item for item in payload["files"])
+
+
 def test_result_and_file_metadata_are_recursively_sanitized(tmp_path, monkeypatch):
     work = tmp_path / "work"
     work.mkdir()

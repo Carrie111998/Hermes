@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -495,8 +496,27 @@ def _assemble_drain(
     )
 
 
-def _list_files(work: Path) -> list[dict[str, Any]]:
+_CLIENT_ARTIFACT_NAME = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.xlsx$"
+)
+_CLIENT_ARTIFACT_RUN_ID = re.compile(r"^r_[a-f0-9]{8}$")
+
+
+def _list_files(
+    work: Path,
+    *,
+    run_id: str | None = None,
+    artifact_url_base: Any = None,
+) -> list[dict[str, Any]]:
     files = []
+    client_url_base = (
+        artifact_url_base.rstrip("/")
+        if isinstance(artifact_url_base, str)
+        else ""
+    )
+    valid_run_id = isinstance(run_id, str) and bool(
+        _CLIENT_ARTIFACT_RUN_ID.fullmatch(run_id)
+    )
     for path in sorted(work.rglob("*")):
         try:
             metadata = path.stat(follow_symlinks=False)
@@ -508,6 +528,12 @@ def _list_files(work: Path) -> list[dict[str, Any]]:
             "path": f"work/{path.relative_to(work).as_posix()}",
             "bytes": metadata.st_size,
         }
+        if (
+            client_url_base
+            and valid_run_id
+            and _CLIENT_ARTIFACT_NAME.fullmatch(path.name)
+        ):
+            item["client_url"] = f"{client_url_base}/{run_id}/{path.name}"
         try:
             with path.open("rb") as handle:
                 item["lines"] = sum(1 for _ in handle)
@@ -523,6 +549,9 @@ def _harvest(
     stderr: str,
     status: str,
     limits: Mapping[str, int],
+    *,
+    run_id: str | None = None,
+    artifact_url_base: Any = None,
 ) -> tuple[dict[str, Any], str]:
     stdout, stdout_truncated = _cap_head_tail(_clean(stdout))
     stderr = _clean(stderr)[-STDERR_CAP:]
@@ -563,7 +592,11 @@ def _harvest(
             "stdout": stdout,
             "stderr": stderr if status != "success" else "",
             "result": result,
-            "files": _list_files(work),
+            "files": _list_files(
+                work,
+                run_id=run_id,
+                artifact_url_base=artifact_url_base,
+            ),
             "truncated": {
                 "stdout": stdout_truncated,
                 "result": result_truncated,
@@ -805,7 +838,15 @@ def python_sandbox(
         stderr = f"sandbox launch failed: {exc}"
 
     duration = round(time.monotonic() - started, 3)
-    payload, harvest_error = _harvest(work, stdout, stderr, status, limits)
+    payload, harvest_error = _harvest(
+        work,
+        stdout,
+        stderr,
+        status,
+        limits,
+        run_id=run_id,
+        artifact_url_base=config.get("artifact_url_base"),
+    )
     payload.update(
         {
             "datasets_attached": datasets,
@@ -863,7 +904,8 @@ _BASE_DESCRIPTION = (
     "~50 items, sums/statistics, and parsing spreadsheets or CSVs. Aggregate "
     "in code. Print only counts, totals, and up to ~20 examples. Write the "
     "structured answer to RESULT_PATH as JSON (8KB cap); keep large detail "
-    "in /work files."
+    "in /work files. A files[] client_url is the client-shareable link for "
+    "that workbook."
 )
 
 PYTHON_SANDBOX_SCHEMA = {

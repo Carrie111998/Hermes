@@ -385,6 +385,7 @@ memory:
   user_profile_enabled: false
 python_sandbox:
   enabled: true
+  artifact_url_base: https://systems.papercut-labs.com/api/view/sandbox-artifacts
   datasets:
     cases:
       type: sqlite

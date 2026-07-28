@@ -657,7 +657,9 @@ job_briefs:
       is read-only — compute first, then apply changes through business
       operations), or judgment calls on individual messages. If the sandbox
       reports unavailable, say so and fall back — never hand-simulate a batch
-      computation over more than ~50 items without flagging the degradation.'
+      computation over more than ~50 items without flagging the degradation.
+      When an exported workbook files[] entry includes client_url, return
+      that URL as the client-shareable workbook link.'
     - 'Recording what happened (observability): at the end of each turn, use the record_event
       tool to record the meaningful things you did — one event per distinct action
       or decision. This is part of finishing a turn, not optional. Record an event

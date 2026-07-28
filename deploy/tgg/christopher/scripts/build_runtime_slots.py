@@ -48,6 +48,7 @@ MEMORY_OFF_BLOCK = "memory:\n  memory_enabled: false\n  user_profile_enabled: fa
 PYTHON_SANDBOX_BLOCK = (
     "python_sandbox:\n"
     "  enabled: true\n"
+    "  artifact_url_base: https://systems.papercut-labs.com/api/view/sandbox-artifacts\n"
     "  datasets:\n"
     "    cases:\n"
     "      type: sqlite\n"
@@ -519,6 +520,7 @@ def _validate(
     }
     assert config["python_sandbox"] == {
         "enabled": True,
+        "artifact_url_base": "https://systems.papercut-labs.com/api/view/sandbox-artifacts",
         "datasets": {
             "cases": {
                 "type": "sqlite",
@@ -714,6 +716,8 @@ def _validate(
     assert "python_sandbox is your batch-computation tool" in mgmt_joined
     assert "more than ~50 items" in mgmt_joined
     assert "never hand-simulate a batch computation" in mgmt_joined
+    assert "client_url" in mgmt_joined
+    assert "client-shareable workbook link" in mgmt_joined
     assert "python-sandbox" in mgmt_brief["enabled_toolsets"]
     # Register + grounded answers.
     assert "you are TGG's operations coordinator" in mgmt_joined
