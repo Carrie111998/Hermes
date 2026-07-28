@@ -8,6 +8,7 @@ pairing code to the chat.
 """
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,6 +21,23 @@ from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
+@pytest.fixture(autouse=True)
+def _reset_gateway_profile_inventory():
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    async_delegation._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        async_delegation._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -30,6 +48,17 @@ class _FakeRegistry:
     def __init__(self, sessions):
         self._sessions = list(sessions)
         self._completion_consumed: set = set()
+        self._checkpoint_path: Path | None = None
+
+    def bind_checkpoint_path(self, path):
+        candidate = Path(path).expanduser().resolve(strict=False)
+        if (
+            self._checkpoint_path is not None
+            and self._checkpoint_path != candidate
+        ):
+            raise RuntimeError("fake registry checkpoint path changed")
+        self._checkpoint_path = candidate
+        return candidate
 
     def get(self, session_id):
         if self._sessions:

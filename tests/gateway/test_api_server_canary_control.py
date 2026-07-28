@@ -399,6 +399,7 @@ def test_non_mapping_agent_result_is_never_completed() -> None:
         "incomplete": True,
         "finish_reason": "error",
         "turn_exit_reason": "invalid_agent_result",
+        "terminal_outcome_contradictory": False,
     }
 
 
@@ -416,9 +417,11 @@ def test_non_mapping_agent_result_is_never_completed() -> None:
                 "outcome_code": "output_truncated",
                 "error": "output was truncated",
             },
-            "partial",
-            "length",
+            "failed",
+            "error",
         ),
+        ({"status": "failed"}, "failed", "error"),
+        ({"status": "failed", "partial": True}, "failed", "error"),
     ],
 )
 def test_agent_outcome_normalization_is_shared_and_mechanical(
@@ -437,7 +440,7 @@ def test_free_form_truncation_text_does_not_select_length_finish_reason() -> Non
     outcome = _session_stream_outcome(
         {"partial": True, "error": "output was truncated"}
     )
-    assert outcome["status"] == "partial"
+    assert outcome["status"] == "failed"
     assert outcome["finish_reason"] == "error"
 
 
@@ -1065,8 +1068,9 @@ async def test_stop_keeps_run_nonterminal_until_blocking_revoke_confirms(
             status = await (await client.get(f"/v1/runs/{run_id}")).json()
             assert status["status"] == "stopping"
             assert status["terminal"] is False
-            assert run_id in adapter._active_run_tasks
-            assert run_id in adapter._run_approval_sessions
+            run_scope = adapter._api_request_scope("run", run_id)
+            assert run_scope in adapter._active_run_tasks
+            assert run_scope in adapter._run_approval_sessions
 
             release_revoke.set()
             events_response = await client.get(f"/v1/runs/{run_id}/events")
@@ -1078,8 +1082,8 @@ async def test_stop_keeps_run_nonterminal_until_blocking_revoke_confirms(
             ).json()
             assert final_status["status"] == "completed"
             assert final_status["terminal"] is True
-            assert run_id not in adapter._active_run_tasks
-            assert run_id not in adapter._run_approval_sessions
+            assert run_scope not in adapter._active_run_tasks
+            assert run_scope not in adapter._run_approval_sessions
     finally:
         release_revoke.set()
 
@@ -1316,6 +1320,7 @@ async def test_http_client_cannot_supply_epoch_and_revoke_precedes_clear(
     during_revoke = {}
     during_local_clear = {}
     cleanup_order = []
+    runtime_keys: list[str] = []
 
     class FakeAgent:
         session_prompt_tokens = 1
@@ -1344,16 +1349,21 @@ async def test_http_client_cannot_supply_epoch_and_revoke_precedes_clear(
     monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
 
     def fake_revoke(key: str, epoch: str) -> dict:
-        assert key == session_id
-        assert epoch == trusted_runtime_envelope()["capability_epoch_sha256"]
+        envelope = trusted_runtime_envelope()
+        assert key != session_id
+        assert hashlib.sha256(key.encode()).hexdigest() == envelope[
+            "session_key_sha256"
+        ]
+        assert epoch == envelope["capability_epoch_sha256"]
+        runtime_keys.append(key)
         cleanup_order.append("durable_revoke")
-        during_revoke.update(trusted_runtime_envelope())
+        during_revoke.update(envelope)
         return _local_revoke_receipt(key, epoch)
 
     real_local_clear = adapter._clear_api_server_run_local_authority
 
     def recording_local_clear(key: str, capability_epoch_sha256: str) -> None:
-        assert key == session_id
+        assert runtime_keys == [key]
         cleanup_order.append("local_clear")
         during_local_clear.update(trusted_runtime_envelope())
         assert (
@@ -1488,6 +1498,7 @@ async def test_run_local_authority_cannot_survive_stable_session_key_boundary(
     session_id = "stable-api-session"
     pattern_key = "dangerous-pattern"
     observed_epochs: list[str] = []
+    observed_run_keys: list[str] = []
     call_count = 0
     approval.clear_session_local(stable_key)
 
@@ -1502,23 +1513,30 @@ async def test_run_local_authority_cannot_survive_stable_session_key_boundary(
         def run_conversation(self, **_kwargs):
             nonlocal call_count
             envelope = trusted_runtime_envelope()
+            run_key = approval.get_current_session_key(default="")
+            assert run_key
+            assert run_key != stable_key
+            assert hashlib.sha256(run_key.encode()).hexdigest() == envelope[
+                "session_key_sha256"
+            ]
             observed_epochs.append(envelope["capability_epoch_sha256"])
+            observed_run_keys.append(run_key)
             if call_count == 0:
-                assert approval.approve_session(stable_key, pattern_key) is True
-                assert approval.enable_session_yolo(stable_key) is True
-                approval.submit_pending(stable_key, {"command": "dangerous"})
+                assert approval.approve_session(run_key, pattern_key) is True
+                assert approval.enable_session_yolo(run_key) is True
+                approval.submit_pending(run_key, {"command": "dangerous"})
                 with approval._lock:
-                    approval._plan_capabilities[stable_key] = {
+                    approval._plan_capabilities[run_key] = {
                         "plan-1": {"state": "granted"}
                     }
-                assert approval.is_approved(stable_key, pattern_key) is True
-                assert approval.is_session_yolo_enabled(stable_key) is True
+                assert approval.is_approved(run_key, pattern_key) is True
+                assert approval.is_session_yolo_enabled(run_key) is True
             else:
-                assert approval.is_approved(stable_key, pattern_key) is False
-                assert approval.is_session_yolo_enabled(stable_key) is False
+                assert approval.is_approved(run_key, pattern_key) is False
+                assert approval.is_session_yolo_enabled(run_key) is False
                 with approval._lock:
-                    assert stable_key not in approval._pending
-                    assert stable_key not in approval._plan_capabilities
+                    assert run_key not in approval._pending
+                    assert run_key not in approval._plan_capabilities
             call_count += 1
             return {"final_response": "done"}
 
@@ -1536,12 +1554,13 @@ async def test_run_local_authority_cannot_survive_stable_session_key_boundary(
             session_id=session_id,
             gateway_session_key=stable_key,
         )
+        first_run_key = observed_run_keys[0]
         with approval._lock:
-            assert stable_key not in approval._session_approved
-            assert stable_key not in approval._session_yolo
-            assert stable_key not in approval._pending
-            assert stable_key not in approval._plan_capabilities
-            assert (stable_key, observed_epochs[0]) in (
+            assert first_run_key not in approval._session_approved
+            assert first_run_key not in approval._session_yolo
+            assert first_run_key not in approval._pending
+            assert first_run_key not in approval._plan_capabilities
+            assert (first_run_key, observed_epochs[0]) in (
                 approval._retired_session_capability_epochs
             )
 
@@ -1553,9 +1572,12 @@ async def test_run_local_authority_cannot_survive_stable_session_key_boundary(
         )
     finally:
         approval.clear_session_local(stable_key)
+        for run_key in observed_run_keys:
+            approval.clear_session_local(run_key)
 
     assert call_count == 2
     assert len(observed_epochs) == 2
+    assert observed_run_keys[0] == observed_run_keys[1]
     assert observed_epochs[0] != observed_epochs[1]
 
 

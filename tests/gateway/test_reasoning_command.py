@@ -13,6 +13,7 @@ import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", chat_id="67890"):
@@ -26,9 +27,11 @@ def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", 
     return MessageEvent(text=text, source=source)
 
 
-def _make_runner():
+def _make_runner(profile_home=None):
     """Create a bare GatewayRunner without calling __init__."""
     runner = object.__new__(gateway_run.GatewayRunner)
+    if profile_home is not None:
+        install_frozen_profile_authority(runner, profile_home)
     runner.adapters = {}
     runner._ephemeral_system_prompt = ""
     runner._prefill_messages = []
@@ -105,8 +108,10 @@ class TestReasoningCommand:
 
         assert "**Effort:** `none (disabled)`" in result
         assert "**Display:** on ✓" in result
-        assert runner._reasoning_config == {"enabled": False}
-        assert runner._show_reasoning is True
+        # The status query reads current config without mutating the
+        # constructor snapshot shared by other turns.
+        assert runner._reasoning_config == {"enabled": True, "effort": "xhigh"}
+        assert runner._show_reasoning is False
 
     @pytest.mark.asyncio
     async def test_handle_reasoning_command_updates_config_and_cache(self, tmp_path, monkeypatch):
@@ -124,7 +129,9 @@ class TestReasoningCommand:
 
         saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         assert saved["agent"]["reasoning_effort"] == "low"
-        assert runner._reasoning_config == {"enabled": True, "effort": "low"}
+        # Global writes take effect through request-local config reload; the
+        # startup snapshot is deliberately not rewritten in place.
+        assert runner._reasoning_config == {"enabled": True, "effort": "medium"}
         assert "takes effect on next message" in result
 
     @pytest.mark.asyncio
@@ -166,7 +173,7 @@ class TestReasoningCommand:
         saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         assert saved["agent"]["reasoning_effort"] == "medium"
         assert runner._session_reasoning_overrides[session_key] == {"enabled": True, "effort": "high"}
-        assert runner._reasoning_config == {"enabled": True, "effort": "high"}
+        assert runner._reasoning_config is None
         assert "session only" in result
 
     @pytest.mark.asyncio
@@ -271,7 +278,7 @@ class TestReasoningCommand:
         monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
         _CapturingAgent.last_init = None
-        runner = _make_runner()
+        runner = _make_runner(hermes_home)
         runner._reasoning_config = {"enabled": True, "effort": "xhigh"}
 
         source = SessionSource(
@@ -320,7 +327,7 @@ class TestReasoningCommand:
         monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
         _CapturingAgent.last_init = None
-        runner = _make_runner()
+        runner = _make_runner(hermes_home)
         session_key = "agent:main:local:dm"
         runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
 
@@ -379,7 +386,7 @@ class TestReasoningCommand:
         monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
         _CapturingAgent.last_init = None
-        runner = _make_runner()
+        runner = _make_runner(hermes_home)
 
         source = SessionSource(
             platform=Platform.LOCAL,
@@ -431,7 +438,7 @@ class TestReasoningCommand:
         monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
         _CapturingAgent.last_init = None
-        runner = _make_runner()
+        runner = _make_runner(hermes_home)
 
         source = SessionSource(
             platform=Platform.HOMEASSISTANT,

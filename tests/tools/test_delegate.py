@@ -35,6 +35,7 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
+    _isolated_worker_selected_for_delegation,
     _looks_like_error_output,
 )
 
@@ -1014,9 +1015,203 @@ class TestDelegateObservability(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
-            self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "partial")
+            self.assertEqual(entry["exit_reason"], "max_iterations")
+            self.assertIs(entry["usable_result"], False)
+            self.assertIs(entry["summary_missing"], True)
 
-    def test_execution_lease_receipt_is_partial_not_completed(self):
+    def test_explicit_empty_partial_stays_partial_and_unusable(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "",
+                "completed": False,
+                "partial": True,
+                "failed": False,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Test explicit empty partial",
+                    parent_agent=parent,
+                )
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "partial")
+        self.assertEqual(entry["exit_reason"], "max_iterations")
+        self.assertIs(entry["usable_result"], False)
+        self.assertIs(entry["summary_missing"], True)
+        self.assertNotIn("error", entry)
+        self.assertNotIn("terminal_outcome_contradictory", entry)
+
+    def test_preserved_verification_candidate_is_partial_not_completed(self):
+        """Useful text at the iteration boundary is not completion authority."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "Unverified final candidate with useful evidence.",
+                "completed": False,
+                "failed": False,
+                "partial": False,
+                "interrupted": False,
+                "turn_exit_reason": "max_iterations_reached(50/50)",
+                "api_calls": 50,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test preserved candidate", parent_agent=parent)
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "partial")
+        self.assertEqual(entry["exit_reason"], "max_iterations_reached(50/50)")
+        self.assertIn("useful evidence", entry["summary"])
+
+    def test_completed_child_preserves_real_turn_exit_reason(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "Verified and complete.",
+                "completed": True,
+                "failed": False,
+                "partial": False,
+                "interrupted": False,
+                "turn_exit_reason": "text_response(finish_reason=stop)",
+                "api_calls": 2,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test completed exit reason", parent_agent=parent)
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(
+            entry["exit_reason"],
+            "text_response(finish_reason=stop)",
+        )
+
+    def test_failed_child_diagnostic_is_not_promoted_to_completed(self):
+        """Failure explanations remain evidence even when they are non-empty."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "Provider failed after retries; no task result.",
+                "completed": False,
+                "failed": True,
+                "partial": False,
+                "interrupted": False,
+                "turn_exit_reason": "provider_failure",
+                "error": "provider unavailable",
+                "api_calls": 3,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test provider failure", parent_agent=parent)
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "provider_failure")
+        self.assertEqual(entry["error"], "provider unavailable")
+        self.assertIn("Provider failed", entry["summary"])
+
+    def test_explicit_failed_status_precedes_completed_flag(self):
+        """All delegation boundaries share failed > completed precedence."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "status": "failed",
+                "final_response": "Diagnostic evidence only.",
+                "completed": True,
+                "api_calls": 2,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Test contradictory terminal status",
+                    parent_agent=parent,
+                )
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "failed")
+        self.assertIs(entry["terminal_outcome_contradictory"], True)
+        self.assertIn("Diagnostic evidence", entry["summary"])
+
+    def test_failed_flag_precedes_interrupted_flag(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.6-sol"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "Failure diagnostic survived cancellation.",
+                "completed": False,
+                "failed": True,
+                "interrupted": True,
+                "turn_exit_reason": "provider_failure",
+                "api_calls": 2,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Test failure versus interrupt",
+                    parent_agent=parent,
+                )
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "provider_failure")
+        self.assertIs(entry["terminal_outcome_contradictory"], True)
+        self.assertIn("survived cancellation", entry["summary"])
+
+    def test_execution_lease_failure_precedes_partial_receipt(self):
         parent = _make_mock_parent(depth=0)
 
         with patch("run_agent.AIAgent") as MockAgent:
@@ -1044,16 +1239,13 @@ class TestDelegateObservability(unittest.TestCase):
             )
 
         entry = result["results"][0]
-        self.assertEqual(entry["status"], "partial")
+        self.assertEqual(entry["status"], "failed")
         self.assertEqual(entry["exit_reason"], "execution_lease_exhausted")
+        self.assertIs(entry["terminal_outcome_contradictory"], True)
         self.assertIn("Task remains open", entry["summary"])
 
-    def test_empty_sentinel_marks_status_failed(self):
-        """Regression: a child that returns the literal '(empty)' sentinel
-        (emitted by run_agent.py when the LLM returns empty responses after
-        retries — e.g. transport misrouting) must be reported as failed, not
-        silently accepted as a completed delegation. Otherwise the parent
-        surfaces an empty string as if the subagent succeeded."""
+    def test_empty_sentinel_cannot_override_completed_terminal_authority(self):
+        """Text usability is separate from the canonical terminal outcome."""
         parent = _make_mock_parent(depth=0)
 
         with patch("run_agent.AIAgent") as MockAgent:
@@ -1071,7 +1263,11 @@ class TestDelegateObservability(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
-            self.assertEqual(result["results"][0]["status"], "failed")
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "completed")
+            self.assertIs(entry["usable_result"], False)
+            self.assertIs(entry["summary_missing"], True)
+            self.assertNotIn("error", entry)
 
 
 class TestSubagentCostRollup(unittest.TestCase):
@@ -3313,6 +3509,189 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+
+    def test_isolated_worker_child_inherits_root_authority_atomically(self):
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "root-session"
+        parent._workspace_lease_authority = "root-session"
+        parent._isolated_worker_backend_selected = True
+        child = MagicMock()
+        child.session_id = "child-session"
+        child._workspace_lease_binding_owner_id = "child-owner"
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch(
+                "tools.terminal_tool.isolated_worker_backend_selected",
+                return_value=True,
+            ),
+            patch(
+                "tools.terminal_tool.register_workspace_lease_authorities",
+                return_value=("child-session", "subagent-1"),
+            ) as register,
+        ):
+            built = _build_child_agent(
+                task_index=0,
+                goal="shared workspace",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertIs(built, child)
+        self.assertEqual(child._workspace_lease_authority, "root-session")
+        self.assertEqual(
+            child._workspace_lease_runtime_ids,
+            ("child-session", "subagent-1"),
+        )
+        register.assert_called_once()
+        runtime_ids, authority = register.call_args.args
+        self.assertEqual(runtime_ids[0], "child-session")
+        self.assertTrue(runtime_ids[1].startswith("sa-0-"))
+        self.assertEqual(authority, "root-session")
+        self.assertEqual(
+            register.call_args.kwargs,
+            {"owner_id": "child-owner"},
+        )
+
+    def test_isolated_worker_child_closes_when_atomic_bind_fails(self):
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "root-session"
+        parent._workspace_lease_authority = "root-session"
+        parent._isolated_worker_backend_selected = True
+        child = MagicMock()
+        child.session_id = "child-session"
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch(
+                "tools.terminal_tool.register_workspace_lease_authorities",
+                side_effect=RuntimeError("workspace_lease_authority_rebind_denied"),
+            ),
+            patch(
+                "tools.terminal_tool.isolated_worker_backend_selected",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "workspace_lease_authority_rebind_denied",
+            ):
+                _build_child_agent(
+                    task_index=0,
+                    goal="shared workspace",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        child.close.assert_called_once()
+
+    def test_isolated_worker_child_import_failure_preserves_root_cause(self):
+        """A partial terminal-tool import must not mask itself with an unbound
+        cleanup symbol, and an isolated child must still fail closed."""
+
+        import tools.terminal_tool as terminal_tool
+
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "root-session"
+        parent._workspace_lease_authority = "root-session"
+        parent._isolated_worker_backend_selected = True
+        child = MagicMock()
+        child.session_id = "child-session"
+
+        register = terminal_tool.__dict__.pop(
+            "register_workspace_lease_authorities"
+        )
+        try:
+            with (
+                patch("run_agent.AIAgent", return_value=child),
+                patch(
+                    "tools.terminal_tool.isolated_worker_backend_selected",
+                    return_value=True,
+                ),
+            ):
+                with self.assertRaises(ImportError) as raised:
+                    _build_child_agent(
+                        task_index=0,
+                        goal="shared workspace",
+                        context=None,
+                        toolsets=None,
+                        model=None,
+                        max_iterations=10,
+                        parent_agent=parent,
+                        task_count=1,
+                    )
+        finally:
+            terminal_tool.register_workspace_lease_authorities = register
+
+        self.assertNotIsInstance(raised.exception, UnboundLocalError)
+        child.close.assert_called_once()
+
+    def test_trusted_isolated_parent_detection_failure_is_fail_closed(self):
+        parent = _make_mock_parent(depth=0)
+        parent._isolated_worker_backend_selected = True
+
+        with patch(
+            "tools.terminal_tool.isolated_worker_backend_selected",
+            side_effect=RuntimeError("config read failed"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "isolated_worker_delegation_detection_failed",
+            ):
+                _isolated_worker_selected_for_delegation(parent)
+
+    def test_trusted_isolated_parent_state_mismatch_is_fail_closed(self):
+        parent = _make_mock_parent(depth=0)
+        parent._isolated_worker_backend_selected = True
+
+        with patch(
+            "tools.terminal_tool.isolated_worker_backend_selected",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "isolated_worker_delegation_state_mismatch",
+            ):
+                _isolated_worker_selected_for_delegation(parent)
+
+    def test_detection_failure_creates_no_child_and_dispatches_nothing(self):
+        parent = _make_mock_parent(depth=0)
+        parent._isolated_worker_backend_selected = True
+
+        with (
+            patch(
+                "tools.delegate_tool._isolated_worker_selected_for_delegation",
+                side_effect=RuntimeError(
+                    "isolated_worker_delegation_detection_failed"
+                ),
+            ),
+            patch(
+                "tools.delegate_tool._build_child_preserving_parent_tools"
+            ) as build_child,
+            patch(
+                "tools.async_delegation.dispatch_async_delegation_batch"
+            ) as dispatch,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "isolated_worker_delegation_detection_failed",
+            ):
+                delegate_task(
+                    goal="must not start",
+                    background=True,
+                    parent_agent=parent,
+                )
+
+        build_child.assert_not_called()
+        dispatch.assert_not_called()
 
     def test_child_gets_no_fallback_when_parent_chain_empty(self):
         """When parent._fallback_chain is empty, fallback_model is None."""

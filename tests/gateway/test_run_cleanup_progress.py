@@ -143,10 +143,13 @@ class FailingAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, hermes_home):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
     runner = object.__new__(GatewayRunner)
+    from tests.gateway._profile_authority import install_frozen_profile_authority
+
+    install_frozen_profile_authority(runner, hermes_home)
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -211,7 +214,7 @@ async def test_cleanup_off_by_default_leaves_bubbles(monkeypatch, tmp_path):
     """Without ``cleanup_progress: true``, firing whatever callback is
     registered never reaches delete_message."""
     adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=False)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -250,7 +253,7 @@ async def test_messaging_agent_forwards_checkpoint_config(monkeypatch, tmp_path)
             super().__init__(**kwargs)
 
     adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(
         monkeypatch, CheckpointCaptureAgent, cleanup_on=False,
     )
@@ -289,7 +292,7 @@ async def test_messaging_agent_forwards_checkpoint_config(monkeypatch, tmp_path)
 async def test_cleanup_registers_callback_and_deletes_on_success(monkeypatch, tmp_path):
     """With the flag on, the cleanup callback deletes the progress bubble."""
     adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -330,7 +333,7 @@ async def test_cleanup_registers_callback_and_deletes_on_success(monkeypatch, tm
 async def test_slack_cleanup_flag_deletes_progress_bubbles(monkeypatch, tmp_path):
     """Slack's per-platform cleanup flag uses the same post-delivery cleanup path."""
     adapter = CleanupCaptureAdapter(Platform.SLACK)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(
         monkeypatch,
         ProgressAgent,
@@ -369,7 +372,7 @@ async def test_slack_cleanup_flag_deletes_progress_bubbles(monkeypatch, tmp_path
 async def test_cleanup_skipped_on_failed_run(monkeypatch, tmp_path):
     """Failed runs skip cleanup registration — breadcrumbs stay."""
     adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, FailingAgent, cleanup_on=True)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -402,7 +405,7 @@ async def test_cleanup_noop_on_adapter_without_delete_support(monkeypatch, tmp_p
     detected up front — the cleanup path never registers its callback so
     a stray bg-review callback (if present) can fire harmlessly."""
     adapter = NoDeleteAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -430,7 +433,7 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     """When a bg-review-style callback is already registered, the cleanup
     callback chains with it — both fire, neither clobbers the other."""
     adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 

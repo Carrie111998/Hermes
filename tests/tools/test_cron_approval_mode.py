@@ -5,18 +5,25 @@ import pytest
 import tools.approval as approval_module
 from tools.approval import (
     _get_cron_approval_mode,
+    _is_cron_session,
     check_all_command_guards,
     check_dangerous_command,
+    check_execute_code_guard,
     detect_dangerous_command,
+    is_approval_bypass_active,
 )
 
 
 @pytest.fixture(autouse=True)
 def _clear_approval_state():
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
     yield
+    reset_session_vars()
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
@@ -380,7 +387,11 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="telegram", chat_id="123")
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="123",
+            cron_session=True,
+        )
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
@@ -402,7 +413,11 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="discord", chat_id="456")
+        tokens = set_session_vars(
+            platform="discord",
+            chat_id="456",
+            cron_session=True,
+        )
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
@@ -422,7 +437,11 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="telegram", chat_id="789")
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="789",
+            cron_session=True,
+        )
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
@@ -430,5 +449,89 @@ class TestCronWithGatewayOrigin:
                 assert not result["approved"]
                 assert "BLOCKED" in result["message"]
                 assert result.get("status") != "approval_required"
+        finally:
+            clear_session_vars(tokens)
+
+
+class TestTaskLocalCronIsolation:
+    """Scheduled-job policy is task-local inside the shared gateway process."""
+
+    def test_live_turn_suppresses_stale_process_cron_marker(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        tokens = set_session_vars(platform="discord", cron_session=False)
+        try:
+            assert _is_cron_session() is False
+        finally:
+            clear_session_vars(tokens)
+
+    def test_cron_turn_does_not_need_process_global_marker(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        tokens = set_session_vars(cron_session=True)
+        try:
+            assert _is_cron_session() is True
+        finally:
+            clear_session_vars(tokens)
+
+    def test_unreadable_task_local_authority_fails_closed(self, monkeypatch):
+        from unittest.mock import patch as mock_patch
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        with mock_patch(
+            "gateway.session_context.get_session_env",
+            side_effect=RuntimeError("context unavailable"),
+        ):
+            assert _is_cron_session() is True
+
+    def test_cron_deny_overrides_interactive_mode_off_for_commands(
+        self, monkeypatch
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from unittest.mock import patch as mock_patch
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        tokens = set_session_vars(cron_session=True)
+        try:
+            with (
+                mock_patch("tools.approval._get_approval_mode", return_value="off"),
+                mock_patch(
+                    "tools.approval._get_cron_approval_mode",
+                    return_value="deny",
+                ),
+            ):
+                result = check_all_command_guards(
+                    "rm -rf /tmp/stuff",
+                    "local",
+                )
+                assert result["approved"] is False
+                assert is_approval_bypass_active() is False
+        finally:
+            clear_session_vars(tokens)
+
+    def test_cron_deny_overrides_interactive_mode_off_for_execute_code(
+        self, monkeypatch
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from unittest.mock import patch as mock_patch
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        tokens = set_session_vars(cron_session=True)
+        try:
+            with (
+                mock_patch("tools.approval._get_approval_mode", return_value="off"),
+                mock_patch(
+                    "tools.approval._get_cron_approval_mode",
+                    return_value="deny",
+                ),
+            ):
+                result = check_execute_code_guard("print('unsafe')", "local")
+                assert result["approved"] is False
+                assert result["outcome"] == "blocked"
         finally:
             clear_session_vars(tokens)

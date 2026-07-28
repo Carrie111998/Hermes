@@ -248,16 +248,45 @@ class PairingStore:
     directory (backward-compat for the ``hermes pairing`` CLI).
     """
 
-    def __init__(self, profile: Optional[str] = None):
+    def __init__(
+        self,
+        profile: Optional[str] = None,
+        *,
+        storage_dir: Optional[Path] = None,
+        profile_identity=None,
+    ):
         # Resolve storage directory lazily — tests use a temp HERMES_HOME
         # and PairingStore may be constructed before the env is set.
-        if profile:
+        self._profile_identity = profile_identity
+        if profile_identity is not None:
+            from gateway.api_request_scope import verify_api_profile_identity
+
+            identity_profile = str(
+                getattr(profile_identity, "profile", "") or ""
+            )
+            if profile and str(profile) != identity_profile:
+                raise ValueError(
+                    "PairingStore profile does not match its frozen identity"
+                )
+            verify_api_profile_identity(profile_identity)
+            profile = identity_profile
+            canonical_home = Path(profile_identity.canonical_home)
+            expected = canonical_home / "pairing"
+            if storage_dir is not None and Path(storage_dir) != expected:
+                raise ValueError(
+                    "PairingStore storage directory does not match its "
+                    "frozen profile identity"
+                )
+            self._dir = expected
+        elif storage_dir is not None:
+            self._dir = Path(storage_dir).expanduser().resolve(strict=False)
+        elif profile:
             from hermes_constants import get_hermes_home
             self._dir = get_hermes_home() / "profiles" / profile / "pairing"
         else:
             self._dir = PAIRING_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
-        if not profile:
+        if not profile and profile_identity is None and storage_dir is None:
             # Heal installs whose global pairing data ended up split across
             # the legacy and new directories (per-profile stores never had
             # the legacy/new split).
@@ -267,18 +296,29 @@ class PairingStore:
         self._lock = threading.RLock()
         self._profile = profile  # for diagnostics / log lines
 
+    def _verify_profile_identity(self) -> None:
+        identity = self._profile_identity
+        if identity is None:
+            return
+        from gateway.api_request_scope import verify_api_profile_identity
+
+        verify_api_profile_identity(identity)
+
     @property
     def profile(self) -> Optional[str]:
         """Profile name this store is scoped to, or None for the global store."""
         return self._profile
 
     def _pending_path(self, platform: str) -> Path:
+        self._verify_profile_identity()
         return self._dir / f"{platform}-pending.json"
 
     def _approved_path(self, platform: str) -> Path:
+        self._verify_profile_identity()
         return self._dir / f"{platform}-approved.json"
 
     def _rate_limit_path(self) -> Path:
+        self._verify_profile_identity()
         return self._dir / "_rate_limits.json"
 
     def _load_json(self, path: Path) -> dict:
@@ -652,8 +692,9 @@ class PairingStore:
 
     def _all_platforms(self, suffix: str) -> list:
         """List all platforms that have data files of a given suffix."""
+        self._verify_profile_identity()
         platforms = []
-        for f in PAIRING_DIR.iterdir():
+        for f in self._dir.iterdir():
             if f.name.endswith(f"-{suffix}.json"):
                 platform = f.name.replace(f"-{suffix}.json", "")
                 if not platform.startswith("_"):

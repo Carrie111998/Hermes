@@ -222,22 +222,28 @@ def test_background_and_main_agent_paths_refresh_only_outside_sealed_canary():
         for keyword in node.keywords
         if keyword.arg == "fallback_model"
     ]
+    guarded_names = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.IfExp)
+        and isinstance(node.value.test, ast.Attribute)
+        and isinstance(node.value.test.value, ast.Name)
+        and node.value.test.value.id == "self"
+        and node.value.test.attr == "_require_capability_canary"
+        and isinstance(node.value.body, ast.Constant)
+        and node.value.body.value is None
+        and isinstance(node.value.orelse, ast.BoolOp)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+        and target.id in {"fallback_model", "turn_fallback_model"}
+    }
     guarded_refreshes = [
         value
         for value in fallback_values
-        if isinstance(value, ast.IfExp)
-        and isinstance(value.test, ast.Attribute)
-        and isinstance(value.test.value, ast.Name)
-        and value.test.value.id == "self"
-        and value.test.attr == "_require_capability_canary"
-        and isinstance(value.body, ast.Constant)
-        and value.body.value is None
-        and isinstance(value.orelse, ast.Call)
-        and isinstance(value.orelse.func, ast.Attribute)
-        and isinstance(value.orelse.func.value, ast.Name)
-        and value.orelse.func.value.id == "self"
-        and value.orelse.func.attr == "_refresh_fallback_model"
+        if isinstance(value, ast.Name) and value.id in guarded_names
     ]
+    assert guarded_names == {"fallback_model", "turn_fallback_model"}
     assert len(guarded_refreshes) == 2
     # The cached-agent reuse path (the load-bearing fix for a long-lived
     # session in a running gateway) must apply the refreshed chain.

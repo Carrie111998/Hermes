@@ -10,6 +10,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_state import (
+    normalize_session_model_config as _real_normalize_session_model_config,
+)
+
 _original_stdout = sys.stdout
 
 
@@ -21,11 +25,15 @@ def _restore_stdout():
 
 @pytest.fixture()
 def server():
+    hermes_state_stub = MagicMock()
+    hermes_state_stub.normalize_session_model_config = (
+        _real_normalize_session_model_config
+    )
     with patch.dict("sys.modules", {
         "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
         "hermes_cli.env_loader": MagicMock(),
         "hermes_cli.banner": MagicMock(),
-        "hermes_state": MagicMock(),
+        "hermes_state": hermes_state_stub,
     }):
         import importlib
         mod = importlib.import_module("tui_gateway.server")
@@ -50,6 +58,28 @@ def capture(server):
     buf = io.StringIO()
     server._real_stdout = buf
     return server, buf
+
+
+def _minimal_session_init(server):
+    """Test double for _init_session that preserves its registration contract."""
+
+    def _init(sid, key, agent, history, cols=80, **kwargs):
+        now = time.time()
+        server._sessions[sid] = {
+            "agent": agent,
+            "cols": cols,
+            "created_at": now,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "last_active": now,
+            "profile_home": kwargs.get("profile_home"),
+            "profile_name": kwargs.get("profile_name"),
+            "running": False,
+            "session_key": key,
+            "source": kwargs.get("source") or "tui",
+        }
+
+    return _init
 
 
 # ── JSON-RPC envelope ────────────────────────────────────────────────
@@ -367,7 +397,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
-    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
+    monkeypatch.setattr(server, "_init_session", _minimal_session_init(server))
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
 
     resp = server.handle_request(
@@ -579,7 +609,7 @@ def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
-    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
+    monkeypatch.setattr(server, "_init_session", _minimal_session_init(server))
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
 
     resp = server.handle_request(
@@ -722,7 +752,8 @@ def test_session_resume_lazy_reports_running_for_inflight_child(server, monkeypa
     monkeypatch.setattr(
         server, "_make_agent", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no build"))
     )
-    server._active_child_runs[target] = time.time()
+    child_state_key = server._child_profile_state_key(target, None)
+    server._active_child_runs[child_state_key] = time.time()
     try:
         resp = server.handle_request(
             {
@@ -732,7 +763,7 @@ def test_session_resume_lazy_reports_running_for_inflight_child(server, monkeypa
             }
         )
     finally:
-        server._active_child_runs.pop(target, None)
+        server._active_child_runs.pop(child_state_key, None)
 
     assert "error" not in resp
     assert resp["result"]["running"] is True
@@ -784,7 +815,8 @@ def test_session_resume_lazy_tolerates_missing_row_for_active_child(server, monk
         server, "_make_agent", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no build"))
     )
     # Child is live in the relay registry even though its row isn't written.
-    server._active_child_runs[target] = time.time()
+    child_state_key = server._child_profile_state_key(target, None)
+    server._active_child_runs[child_state_key] = time.time()
     try:
         resp = server.handle_request(
             {
@@ -794,7 +826,7 @@ def test_session_resume_lazy_tolerates_missing_row_for_active_child(server, monk
             }
         )
     finally:
-        server._active_child_runs.pop(target, None)
+        server._active_child_runs.pop(child_state_key, None)
 
     # The resume must succeed (no "session not found") and register a live,
     # agent-less watch session the mirror can find by stored key.
@@ -859,6 +891,7 @@ def test_session_resume_reuses_existing_live_session(server, monkeypatch):
     target = "20260409_010101_abc123"
     created_sids: list[str] = []
     closed_sids: list[str] = []
+    loser_close_ownership: list[tuple[bool, bool]] = []
     first_agent_started = threading.Event()
     agent_can_finish = threading.Event()
 
@@ -896,9 +929,17 @@ def test_session_resume_reuses_existing_live_session(server, monkeypatch):
             self.sid = sid
             self.model = "test/model"
             self.session_id = session_id
+            self._owns_runtime_resources = True
+            self._end_session_on_close = True
 
         def close(self):
             closed_sids.append(self.sid)
+            loser_close_ownership.append(
+                (
+                    self._owns_runtime_resources,
+                    self._end_session_on_close,
+                )
+            )
 
     def make_agent(sid, key, session_id=None, session_db=None, **_kwargs):
         created_sids.append(sid)
@@ -982,6 +1023,7 @@ def test_session_resume_reuses_existing_live_session(server, monkeypatch):
     survivors = [sid for sid in created_sids if sid not in closed_sids]
     assert survivors == [winner]
     assert all(sid == winner for sid in server._sessions)
+    assert loser_close_ownership == [(False, False)]
 
 
 def test_session_resume_reuses_live_agent_after_compression_rotation(server, monkeypatch):
@@ -1262,7 +1304,7 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
             model="test/model", session_id=session_id or key
         ),
     )
-    monkeypatch.setattr(server, "_init_session", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_init_session", _minimal_session_init(server))
     monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_session_cwd", lambda _s: "/tmp/branch-cwd")
@@ -1323,7 +1365,7 @@ def test_session_branch_forwards_original_timestamps(server, monkeypatch):
             model="test/model", session_id=session_id or key
         ),
     )
-    monkeypatch.setattr(server, "_init_session", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_init_session", _minimal_session_init(server))
     monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_session_cwd", lambda _s: "/tmp/branch-cwd")

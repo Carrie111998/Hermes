@@ -317,6 +317,7 @@ gateway:
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**Agente activo:** {state}"
+    execution_this_run:    "**Ejecución actual:** {progress}"
     state_yes:             "Sí ⚡"
     state_no:              "No"
     queued:                "**Seguimientos en cola:** {count}"

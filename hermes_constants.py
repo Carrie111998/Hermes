@@ -641,8 +641,8 @@ def _legacy_path_has_content(path: Path) -> bool:
     return True
 
 
-def display_hermes_home() -> str:
-    """Return a user-friendly display string for the current HERMES_HOME.
+def display_hermes_home(home: str | Path | None = None) -> str:
+    """Return a user-friendly display string for a Hermes home.
 
     Uses ``~/`` shorthand for readability::
 
@@ -650,15 +650,19 @@ def display_hermes_home() -> str:
         profile:  ``~/.hermes/profiles/coder``
         custom:   ``/opt/hermes-custom``
 
+    When *home* is omitted, resolve the current context-local HERMES_HOME.
+    Callers that already hold a constructor-frozen profile path may pass it
+    directly, avoiding a second ambient profile lookup for user-facing text.
+
     Use this in **user-facing** print/log messages instead of hardcoding
     ``~/.hermes``.  For code that needs a real ``Path``, use
     :func:`get_hermes_home` instead.
     """
-    home = get_hermes_home()
+    resolved_home = Path(home) if home is not None else get_hermes_home()
     try:
-        return "~/" + str(home.relative_to(Path.home()))
+        return "~/" + str(resolved_home.relative_to(Path.home()))
     except ValueError:
-        return str(home)
+        return str(resolved_home)
 
 
 def secure_parent_dir(path: Path) -> None:

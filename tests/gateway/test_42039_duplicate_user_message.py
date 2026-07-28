@@ -22,9 +22,26 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
+import tools.async_delegation as async_delegation
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
+from tools.process_registry import process_registry
+
+
+@pytest.fixture(autouse=True)
+def _reset_listener_delivery_inventory():
+    """Each unit test models a fresh gateway listener process."""
+    async_delegation._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        async_delegation._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
 
 
 def _bootstrap(monkeypatch, tmp_path):
@@ -210,6 +227,80 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_turn_is_not_marked_persisted_when_session_update_fails(
+    monkeypatch, tmp_path
+):
+    """The real handler must leave its delivery lifecycle false on write failure."""
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    event = _event()
+    event.internal = True
+    event.metadata = {}
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Hello!",
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "Hello!"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    runner.session_store.update_session.side_effect = OSError(
+        "simulated session persistence failure"
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert "unexpected error" in response
+    assert event.metadata.get("_hermes_internal_turn_persisted") is not True
+
+
+@pytest.mark.asyncio
+async def test_internal_turn_is_marked_only_after_successful_session_update(
+    monkeypatch, tmp_path
+):
+    """The direct internal path emits its host receipt after the real writes."""
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    event = _event()
+    event.internal = True
+    event.metadata = {"_hermes_internal_turn_persisted": True}
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Hello!",
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "Hello!"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    # Mirror BasePlatform's per-run sanitization of stale/authored receipts.
+    event.metadata.pop("_hermes_internal_turn_persisted")
+    response = await runner._handle_message_with_agent(
+        event,
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response == "Hello!"
+    runner.session_store.update_session.assert_called_once()
+    assert event.metadata["_hermes_internal_turn_persisted"] is True
 
 
 # ── Post-stream MEDIA delivery keeps prior-turn deduplication ──────────

@@ -1637,6 +1637,33 @@ class TestOpenAIModelExecutionGuidance:
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
 
+    def test_guidance_owns_routine_engineering_decisions(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "clarify" in text
+        assert "not a permission tool" in text
+        for routine_action in ("read-only", "local edits", "tests", "lint"):
+            assert routine_action in text
+        assert "asked you to implement, change, build, or fix" in text
+        assert "within that requested scope" in text
+        assert "within that requested implementation scope" in text
+        assert "choose the best safe reversible option yourself" in text
+        assert "user-only access/authorization" in text
+
+    def test_guidance_does_not_turn_analysis_into_unrequested_mutation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        for report_only_request in (
+            "answer",
+            "explanation",
+            "analysis",
+            "diagnosis",
+            "review",
+            "planning",
+            "status",
+        ):
+            assert report_only_request in text
+        assert "inspect and report without making edits" in text
+        assert "unless the user also asked for a change" in text
+
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE

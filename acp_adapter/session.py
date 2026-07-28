@@ -515,24 +515,64 @@ class SessionManager:
         if row.get("source") != "acp":
             return None
 
-        # Extract cwd from model_config.
-        cwd = "."
-        requested_provider = row.get("billing_provider")
-        restored_base_url = row.get("billing_base_url")
-        restored_api_mode = None
-        mc = row.get("model_config")
-        if mc:
-            try:
-                meta = json.loads(mc)
-                if isinstance(meta, dict):
-                    cwd = meta.get("cwd", ".")
-                    requested_provider = meta.get("provider") or requested_provider
-                    restored_base_url = meta.get("base_url") or restored_base_url
-                    restored_api_mode = meta.get("api_mode") or restored_api_mode
-            except (json.JSONDecodeError, TypeError):
-                pass
+        # Validate the complete persisted runtime unit before agent creation.
+        # Old/external rows predate the current SessionDB write guards.
+        try:
+            from gateway.api_execution_context import (
+                canonicalize_session_endpoint,
+                normalize_api_mode,
+                normalize_model_identifier,
+                normalize_provider_slug,
+                normalize_session_provider_identifier,
+            )
+            from hermes_state import normalize_session_model_config
 
-        model = row.get("model") or None
+            meta = normalize_session_model_config(
+                row.get("model_config"),
+                field="ACP resumed session.model_config",
+            ) or {}
+            cwd_value = meta.get("cwd", ".")
+            if not isinstance(cwd_value, str):
+                raise ValueError("ACP resumed session cwd must be a string")
+            cwd = cwd_value
+            model = normalize_model_identifier(
+                row.get("model") or meta.get("model"),
+                field="ACP resumed session.model",
+            ) or None
+            if meta.get("provider"):
+                requested_provider = normalize_session_provider_identifier(
+                    meta.get("provider"),
+                    field="ACP resumed session.provider",
+                )
+            else:
+                requested_provider = normalize_provider_slug(
+                    row.get("billing_provider"),
+                    field="ACP resumed session.billing_provider",
+                )
+            endpoint_value = meta.get("base_url") or row.get(
+                "billing_base_url"
+            )
+            restored_base_url = (
+                canonicalize_session_endpoint(endpoint_value)
+                if endpoint_value
+                else None
+            )
+            restored_api_mode = (
+                normalize_api_mode(
+                    meta.get("api_mode"),
+                    field="ACP resumed session.api_mode",
+                )
+                if meta.get("api_mode")
+                else None
+            )
+            if not requested_provider:
+                restored_base_url = None
+                restored_api_mode = None
+        except ValueError:
+            logger.warning(
+                "Refusing ACP restore with unsafe durable runtime metadata"
+            )
+            return None
 
         # Load conversation history. repair_alternation: this restore feeds
         # LIVE REPLAY — the loaded list becomes the resumed agent's working
@@ -555,6 +595,7 @@ class SessionManager:
                 requested_provider=requested_provider,
                 base_url=restored_base_url,
                 api_mode=restored_api_mode,
+                durable_replay=True,
             )
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
@@ -596,6 +637,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        durable_replay: bool = False,
     ):
         if self._agent_factory is not None:
             return self._agent_factory()
@@ -634,17 +676,51 @@ class SessionManager:
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            if durable_replay:
+                from gateway.api_execution_context import (
+                    canonicalize_session_endpoint,
+                    normalize_api_mode,
+                )
+
+                if base_url:
+                    if canonicalize_session_endpoint(
+                        base_url
+                    ) != canonicalize_session_endpoint(runtime.get("base_url")):
+                        raise RuntimeError(
+                            "Stored ACP endpoint no longer matches provider"
+                        )
+                if api_mode:
+                    if normalize_api_mode(
+                        api_mode,
+                        field="stored ACP api_mode",
+                    ) != normalize_api_mode(
+                        runtime.get("api_mode"),
+                        field="resolved ACP api_mode",
+                    ):
+                        raise RuntimeError(
+                            "Stored ACP API mode no longer matches provider"
+                        )
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
-                    "api_mode": api_mode or runtime.get("api_mode"),
-                    "base_url": base_url or runtime.get("base_url"),
+                    "api_mode": (
+                        runtime.get("api_mode")
+                        if durable_replay
+                        else api_mode or runtime.get("api_mode")
+                    ),
+                    "base_url": (
+                        runtime.get("base_url")
+                        if durable_replay
+                        else base_url or runtime.get("base_url")
+                    ),
                     "api_key": runtime.get("api_key"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                 }
             )
         except Exception:
+            if durable_replay:
+                raise
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)

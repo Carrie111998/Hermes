@@ -1605,13 +1605,27 @@ def _mark_verification_stale(
     task_id: str,
     resolved_paths: list[str],
     session_id: str | None = None,
-) -> None:
+) -> str | None:
     """Best-effort note that successful edits made prior verification stale."""
     paths = [p for p in resolved_paths if p]
     if not paths:
-        return
+        return None
     if _terminal_env_type_for_task(task_id) == "isolated_worker":
-        return
+        try:
+            from tools.terminal_tool import get_active_env
+
+            environment = get_active_env(task_id)
+            marker = getattr(environment, "mark_edited", None)
+            if not callable(marker):
+                return "isolated_worker_proof_authority_unavailable"
+            marker(paths)
+            return None
+        except Exception as exc:
+            logger.warning(
+                "isolated worker proof marker failed closed: %s",
+                type(exc).__name__,
+            )
+            return "isolated_worker_proof_authority_rejected_edit_marker"
     try:
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import (
@@ -1620,7 +1634,7 @@ def _mark_verification_stale(
         )
 
         if not verification_ledger_enabled():
-            return
+            return None
 
         cwd = None
         for path in paths:
@@ -1641,6 +1655,7 @@ def _mark_verification_stale(
         mark_workspace_edited(session_id=session_id or task_id, cwd=cwd, paths=paths)
     except Exception:
         logger.debug("verification stale marker failed", exc_info=True)
+    return None
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
@@ -1684,7 +1699,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             if stale_warning:
                 result_dict["_warning"] = stale_warning
             if not result_dict.get("error"):
-                _mark_verification_stale(task_id, [path], session_id=session_id)
+                proof_error = _mark_verification_stale(
+                    task_id,
+                    [path],
+                    session_id=session_id,
+                )
+                if proof_error:
+                    result_dict["_proof_authority_error"] = proof_error
             _update_read_timestamp(path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
 
@@ -1715,7 +1736,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             result_dict["resolved_path"] = _resolved
             if not result_dict.get("error"):
                 result_dict["files_modified"] = [_resolved]
-                _mark_verification_stale(task_id, [_resolved], session_id=session_id)
+                proof_error = _mark_verification_stale(
+                    task_id,
+                    [_resolved],
+                    session_id=session_id,
+                )
+                if proof_error:
+                    result_dict["_proof_authority_error"] = proof_error
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
             _update_read_timestamp(path, task_id)
@@ -1876,7 +1903,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 result_dict["files_modified"] = _resolved_modified
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
-                _mark_verification_stale(task_id, _resolved_modified, session_id=session_id)
+                proof_error = _mark_verification_stale(
+                    task_id,
+                    _resolved_modified,
+                    session_id=session_id,
+                )
+                if proof_error:
+                    result_dict["_proof_authority_error"] = proof_error
                 for _p in _paths_to_check:
                     _update_read_timestamp(_p, task_id)
                     _r = _path_to_resolved.get(_p)

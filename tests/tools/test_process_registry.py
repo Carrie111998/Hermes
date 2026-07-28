@@ -30,6 +30,8 @@ def _make_session(
     sid="proc_test123",
     command="echo hello",
     task_id="t1",
+    owner_task_id=None,
+    session_key="",
     exited=False,
     exit_code=None,
     output="",
@@ -40,6 +42,10 @@ def _make_session(
         id=sid,
         command=command,
         task_id=task_id,
+        owner_task_id=(
+            task_id if owner_task_id is None else owner_task_id
+        ),
+        session_key=session_key,
         started_at=started_at or time.time(),
         exited=exited,
         exit_code=exit_code,
@@ -682,9 +688,12 @@ class TestSpawnEnvSanitization:
             patch("subprocess.Popen", side_effect=fake_popen), \
             patch("threading.Thread", return_value=fake_thread), \
             patch.object(registry, "_write_checkpoint"):
-            registry.spawn_local(
+            session = registry.spawn_local(
                 "echo hello",
                 cwd="/tmp",
+                task_id="shared-sandbox",
+                owner_task_id="task-alpha",
+                session_key="agent:alpha:discord:dm:user-1",
                 env_vars={
                     "MY_CUSTOM_VAR": "keep-me",
                     "TELEGRAM_BOT_TOKEN": "drop-me",
@@ -692,6 +701,12 @@ class TestSpawnEnvSanitization:
                 },
             )
 
+        assert session.id.startswith("proc_")
+        assert len(session.id) == len("proc_") + 32
+        assert all(char in "0123456789abcdef" for char in session.id[5:])
+        assert session.task_id == "shared-sandbox"
+        assert session.owner_task_id == "task-alpha"
+        assert session.session_key == "agent:alpha:discord:dm:user-1"
         env = captured["env"]
         assert env["MY_CUSTOM_VAR"] == "keep-me"
         assert env["TELEGRAM_BOT_TOKEN"] == "forced-bot-token"
@@ -716,9 +731,21 @@ class TestSpawnEnvSanitization:
 
         with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
             patch.object(registry, "_write_checkpoint"):
-            session = registry.spawn_via_env(env, "echo hello")
+            session = registry.spawn_via_env(
+                env,
+                "echo hello",
+                task_id="shared-sandbox",
+                owner_task_id="task-alpha",
+                session_key="agent:alpha:discord:dm:user-1",
+            )
 
         bg_command = env.commands[0][0]
+        assert session.id.startswith("proc_")
+        assert len(session.id) == len("proc_") + 32
+        assert all(char in "0123456789abcdef" for char in session.id[5:])
+        assert session.task_id == "shared-sandbox"
+        assert session.owner_task_id == "task-alpha"
+        assert session.session_key == "agent:alpha:discord:dm:user-1"
         assert session.pid == 4321
         assert "/data/data/com.termux/files/usr/tmp/hermes_bg_" in bg_command
         assert ".exit" in bg_command
@@ -1072,6 +1099,7 @@ class TestCheckpoint:
             data = json.loads((tmp_path / "procs.json").read_text())
             assert len(data) == 1
             assert data[0]["session_id"] == s.id
+            assert data[0]["owner_task_id"] == "t1"
 
     def test_recover_no_file(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "missing.json"):
@@ -1137,6 +1165,25 @@ class TestCheckpoint:
             assert w["user_name"] == "alice"
             assert w["thread_id"] == "42"
             assert w["check_interval"] == 60
+
+    def test_recovery_preserves_exact_process_owner(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_" + "d" * 32,
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "task_id": "shared-sandbox",
+            "owner_task_id": "task-alpha",
+            "session_key": "agent:alpha:discord:dm:user-1",
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+
+        restored = registry.get("proc_" + "d" * 32)
+        assert restored is not None
+        assert restored.task_id == "shared-sandbox"
+        assert restored.owner_task_id == "task-alpha"
+        assert restored.session_key == "agent:alpha:discord:dm:user-1"
 
     def test_recover_skips_watcher_when_no_interval(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
@@ -1327,6 +1374,232 @@ class TestProcessToolHandler:
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
+
+    @pytest.mark.parametrize(
+        ("action", "method_name"),
+        [
+            ("poll", "poll"),
+            ("log", "read_log"),
+            ("wait", "wait"),
+            ("kill", "kill_process"),
+            ("write", "write_stdin"),
+            ("submit", "submit_stdin"),
+            ("close", "close_stdin"),
+        ],
+    )
+    def test_cross_profile_process_actions_fail_closed(
+        self,
+        monkeypatch,
+        action,
+        method_name,
+    ):
+        """Knowing alpha's process UUID gives beta no read/control authority."""
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+        from tools import process_registry as pr
+
+        reg = ProcessRegistry()
+        alpha = _make_session(
+            sid="proc_" + "a" * 32,
+            task_id="sandbox-alpha",
+            owner_task_id="task-alpha",
+            session_key="agent:alpha:discord:dm:user-1",
+            output="alpha secret output",
+        )
+        reg._running[alpha.id] = alpha
+        monkeypatch.setattr(pr, "process_registry", reg)
+        dispatched = MagicMock(return_value={"status": "ok"})
+        monkeypatch.setattr(reg, method_name, dispatched)
+
+        tokens = set_session_vars(
+            platform="discord",
+            profile="beta",
+            session_key="agent:beta:discord:dm:user-1",
+            session_id="beta-session",
+        )
+        approval_token = set_current_session_key(
+            "agent:beta:discord:dm:user-1"
+        )
+        try:
+            result = json.loads(
+                pr._handle_process(
+                    {
+                        "action": action,
+                        "session_id": alpha.id,
+                        "data": "malicious input",
+                        "timeout": 1,
+                    },
+                    task_id="task-beta",
+                )
+            )
+        finally:
+            reset_current_session_key(approval_token)
+            clear_session_vars(tokens)
+
+        assert result["status"] == "forbidden"
+        assert "alpha" not in result["error"]
+        dispatched.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("action", "method_name"),
+        [
+            ("poll", "poll"),
+            ("log", "read_log"),
+            ("wait", "wait"),
+            ("kill", "kill_process"),
+            ("write", "write_stdin"),
+            ("submit", "submit_stdin"),
+            ("close", "close_stdin"),
+        ],
+    )
+    def test_exact_session_key_can_manage_its_cross_turn_process(
+        self,
+        monkeypatch,
+        action,
+        method_name,
+    ):
+        """A later task in the same exact gateway session remains authorized."""
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+        from tools import process_registry as pr
+
+        reg = ProcessRegistry()
+        alpha_key = "agent:alpha:discord:dm:user-1"
+        alpha = _make_session(
+            sid="proc_" + "b" * 32,
+            task_id="shared-sandbox",
+            owner_task_id="old-alpha-turn",
+            session_key=alpha_key,
+        )
+        reg._running[alpha.id] = alpha
+        monkeypatch.setattr(pr, "process_registry", reg)
+        dispatched = MagicMock(return_value={"status": "ok"})
+        monkeypatch.setattr(reg, method_name, dispatched)
+
+        tokens = set_session_vars(
+            platform="discord",
+            profile="alpha",
+            session_key=alpha_key,
+            session_id="alpha-session",
+        )
+        approval_token = set_current_session_key(alpha_key)
+        try:
+            result = json.loads(
+                pr._handle_process(
+                    {
+                        "action": action,
+                        "session_id": alpha.id,
+                        "data": "expected input",
+                        "timeout": 1,
+                    },
+                    task_id="new-alpha-turn",
+                )
+            )
+        finally:
+            reset_current_session_key(approval_token)
+            clear_session_vars(tokens)
+
+        assert result["status"] == "ok"
+        dispatched.assert_called_once()
+
+    def test_exact_owner_task_is_sufficient_in_gateway_context(
+        self,
+        monkeypatch,
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+        from tools import process_registry as pr
+
+        reg = ProcessRegistry()
+        alpha = _make_session(
+            sid="proc_" + "c" * 32,
+            owner_task_id="host-authored-alpha-task",
+            session_key="agent:alpha:discord:dm:user-1",
+        )
+        reg._running[alpha.id] = alpha
+        monkeypatch.setattr(pr, "process_registry", reg)
+        poll = MagicMock(return_value={"status": "running"})
+        monkeypatch.setattr(reg, "poll", poll)
+
+        tokens = set_session_vars(
+            platform="discord",
+            profile="alpha",
+            session_key="agent:alpha:discord:dm:user-2",
+            session_id="another-alpha-session",
+        )
+        approval_token = set_current_session_key(
+            "agent:alpha:discord:dm:user-2"
+        )
+        try:
+            result = json.loads(
+                pr._handle_process(
+                    {"action": "poll", "session_id": alpha.id},
+                    task_id="host-authored-alpha-task",
+                )
+            )
+        finally:
+            reset_current_session_key(approval_token)
+            clear_session_vars(tokens)
+
+        assert result["status"] == "running"
+        poll.assert_called_once_with(alpha.id)
+
+    def test_ownerless_legacy_process_fails_closed_in_gateway_context(
+        self,
+        monkeypatch,
+    ):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+        from tools import process_registry as pr
+
+        reg = ProcessRegistry()
+        legacy = _make_session(
+            sid="proc_" + "e" * 32,
+            task_id="default",
+            owner_task_id="",
+            session_key="",
+        )
+        reg._running[legacy.id] = legacy
+        monkeypatch.setattr(pr, "process_registry", reg)
+        poll = MagicMock(return_value={"status": "running"})
+        monkeypatch.setattr(reg, "poll", poll)
+
+        tokens = set_session_vars(
+            platform="discord",
+            profile="beta",
+            session_key="agent:beta:discord:dm:user-1",
+            session_id="beta-session",
+        )
+        approval_token = set_current_session_key(
+            "agent:beta:discord:dm:user-1"
+        )
+        try:
+            result = json.loads(
+                pr._handle_process(
+                    {"action": "poll", "session_id": legacy.id},
+                    task_id="default",
+                )
+            )
+        finally:
+            reset_current_session_key(approval_token)
+            clear_session_vars(tokens)
+
+        assert result["status"] == "forbidden"
+        poll.assert_not_called()
 
 
 # =========================================================================
@@ -2130,6 +2403,7 @@ class TestPidReuseGuard:
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 1
+        assert registry.get("proc_legacy").owner_task_id == ""
 
     def test_write_checkpoint_backfills_host_start_time(self, registry, tmp_path):
         """A host session is checkpointed with a kernel start time recorded."""
@@ -2351,7 +2625,12 @@ class TestHandleProcessRedaction:
             monkeypatch, "printenv",
             "MY_SERVICE_TOKEN=abc123randomopaquetokenvalue999\nHOME=/home/u",
         )
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(
+            pr._handle_process(
+                {"action": "log", "session_id": sess.id},
+                task_id="t1",
+            )
+        )
         assert "abc123randomopaquetokenvalue999" not in out["output"]
         assert "HOME=/home/u" in out["output"]
 
@@ -2360,7 +2639,12 @@ class TestHandleProcessRedaction:
             monkeypatch, "python app.py",
             "leaked OPENAI_API_KEY sk-proj-abc123def456ghi789jkl012 here",
         )
-        out = json.loads(pr._handle_process({"action": "poll", "session_id": sess.id}))
+        out = json.loads(
+            pr._handle_process(
+                {"action": "poll", "session_id": sess.id},
+                task_id="t1",
+            )
+        )
         assert "abc123def456" not in out["output_preview"]
 
     def test_disabled_passes_through(self, monkeypatch):
@@ -2374,7 +2658,12 @@ class TestHandleProcessRedaction:
         sess.exit_code = 0
         reg._running[sess.id] = sess
         monkeypatch.setattr(pr, "process_registry", reg)
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(
+            pr._handle_process(
+                {"action": "log", "session_id": sess.id},
+                task_id="t1",
+            )
+        )
         assert "zzzopaque1234567890abcdef" in out["output"]
 
 

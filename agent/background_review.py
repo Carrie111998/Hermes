@@ -795,6 +795,22 @@ def _run_review_in_thread(
                 # if a future code path bypasses the cache.
                 review_agent.session_start = agent.session_start
             review_agent.session_id = agent.session_id
+            _parent_workspace_authority = getattr(
+                agent,
+                "_workspace_lease_authority",
+                None,
+            )
+            if _parent_workspace_authority:
+                review_agent._workspace_lease_authority = (
+                    _parent_workspace_authority
+                )
+                review_agent._isolated_worker_backend_selected = bool(
+                    getattr(
+                        agent,
+                        "_isolated_worker_backend_selected",
+                        False,
+                    )
+                )
             # The fork shares the parent's live session_id (pinned above for
             # prefix-cache parity). It is single-lifecycle and calls close()
             # right after this run_conversation(); without opting out, close()
@@ -802,6 +818,10 @@ def _run_review_in_thread(
             # conversation (the review fires every ~10 turns). Leave session
             # finalization to the real owner (CLI close / gateway reset / cron).
             review_agent._end_session_on_close = False
+            # The fork also shares the parent's process/browser/workspace
+            # namespace. Its close() must release only its own authority claim,
+            # never kill resources still used by the foreground agent.
+            review_agent._owns_runtime_resources = False
             # Never let the review fork compress. It shares the parent's
             # session_id, so if it won a compression race it would rotate the
             # parent into a NEW child that the gateway never adopts (the fork

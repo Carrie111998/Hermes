@@ -205,6 +205,46 @@ def test_text_response_exit_not_rewritten_at_iteration_limit(monkeypatch):
     assert agent._handle_max_iterations_called is False
 
 
+def test_cumulative_calls_above_slice_size_do_not_fake_exhaustion(monkeypatch):
+    """Renewed runs use current-slice state, not total_calls / slice_size."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=4)
+    agent.iteration_budget.used = 56
+    agent._budget_renewal_count = 1
+
+    result = _finalize(
+        agent,
+        final_response="recovered response",
+        exit_reason="recovery_complete",
+        api_call_count=176,
+    )
+
+    assert result["final_response"] == "recovered response"
+    assert result["turn_exit_reason"] == "recovery_complete"
+    assert result["completed"] is True
+    assert result["iteration_budget_used"] == 56
+    assert result["iteration_budget_max"] == 60
+    assert result["iteration_budget_renewals"] == 1
+    assert agent._handle_max_iterations_called is False
+
+
+def test_exhausted_slice_reason_never_uses_cumulative_call_count(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=176,
+    )
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    assert "176/60" not in result["turn_exit_reason"]
+    assert result["iteration_budget_used"] == 60
+    assert result["iteration_budget_max"] == 60
+
+
 @pytest.mark.parametrize(
     "exit_reason",
     [

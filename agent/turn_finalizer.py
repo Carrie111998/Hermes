@@ -94,6 +94,9 @@ def finalize_turn(
     execution_lease_exhausted = (
         str(_turn_exit_reason) == "execution_lease_exhausted"
     )
+    bounded_proof_gate_unverified = (
+        str(_turn_exit_reason) == "bounded_proof_gate_unverified"
+    )
     if execution_lease_exhausted and final_response is None:
         lease = getattr(agent, "execution_lease", None)
         lease_used = getattr(lease, "used", 0)
@@ -108,10 +111,25 @@ def finalize_turn(
         )
         failed = True
 
-    budget_exhausted = (
-        api_call_count >= agent.max_iterations
-        or agent.iteration_budget.remaining <= 0
+    _iteration_budget = getattr(agent, "iteration_budget", None)
+    _budget_used = getattr(_iteration_budget, "used", 0)
+    _budget_max = getattr(_iteration_budget, "max_total", 0)
+    _budget_remaining = getattr(_iteration_budget, "remaining", 0)
+    _budget_renewals = getattr(agent, "_budget_renewal_count", 0)
+    _budget_stalled_boundaries = getattr(
+        agent,
+        "_budget_stagnant_boundary_count",
+        0,
     )
+    _execution_lease = getattr(agent, "execution_lease", None)
+    _lease_used = getattr(_execution_lease, "used", 0)
+    _lease_max = getattr(_execution_lease, "max_total", 0)
+
+    # api_call_count is cumulative across renewable slices; max_iterations is
+    # only the size of the current slice. Comparing them after a renewal turns
+    # healthy values such as 176 total calls with an 86/90 current slice into a
+    # false budget exhaustion. The slice object is the sole local boundary.
+    budget_exhausted = _budget_remaining <= 0
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
@@ -138,7 +156,9 @@ def finalize_turn(
         # response-loss blocker)
         if _pending_verification_response_previewed:
             agent._response_was_previewed = True
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        _turn_exit_reason = (
+            f"max_iterations_reached({_budget_used}/{_budget_max})"
+        )
         iteration_limit_fallback = True
         preserved_verification_fallback = True
     elif final_response is None and budget_fallback_eligible:
@@ -146,14 +166,16 @@ def finalize_turn(
         # closing response. Report the mechanical boundary truthfully. This
         # compatibility helper performs no provider dispatch, does not remove
         # tools, and never injects a synthetic user turn.
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        _turn_exit_reason = (
+            f"max_iterations_reached({_budget_used}/{_budget_max})"
+        )
         agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+            f"⚠️ Iteration budget exhausted ({_budget_used}/{_budget_max}) "
             "— task remains open and resumable"
         )
         if not agent.quiet_mode:
             agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                f"\n⚠️  Iteration budget exhausted ({_budget_used}/{_budget_max}) "
                 "— task remains open and resumable."
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
@@ -187,7 +209,7 @@ def finalize_turn(
                         _kanban_task,
                         error=(
                             f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
+                            f"({_budget_used}/{_budget_max}) — "
                             "task could not complete within the allowed "
                             "iterations"
                         ),
@@ -195,13 +217,13 @@ def finalize_turn(
                         release_claim=True,
                         end_run=True,
                         event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
+                            "budget_used": _budget_used,
+                            "budget_max": _budget_max,
                         },
                     )
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
+                        _kanban_task, _budget_used, _budget_max,
                     )
                 finally:
                     try:
@@ -217,6 +239,7 @@ def finalize_turn(
 
     _runtime_boundary_receipt = (
         execution_lease_exhausted
+        or bounded_proof_gate_unverified
         or (
             not preserved_verification_fallback
             and str(_turn_exit_reason).startswith("max_iterations_reached(")
@@ -232,7 +255,7 @@ def finalize_turn(
         final_response is not None
         and not failed
         and (
-            api_call_count < agent.max_iterations
+            not budget_exhausted
             or normal_text_response
         )
     )
@@ -430,21 +453,17 @@ def finalize_turn(
         if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
     )
     _resp_len = len(final_response) if final_response else 0
-    _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
-    _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
-    _budget_renewals = getattr(agent, "_budget_renewal_count", 0)
-    _execution_lease = getattr(agent, "execution_lease", None)
-    _lease_used = getattr(_execution_lease, "used", 0)
-    _lease_max = getattr(_execution_lease, "max_total", 0)
 
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d slice=%d/%d renewals=%d "
+        "stalled_boundaries=%d "
         "execution_lease=%d/%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count,
         _budget_used, _budget_max, _budget_renewals,
+        _budget_stalled_boundaries,
         _lease_used, _lease_max,
         _turn_tool_count, _last_msg_role, _resp_len,
         agent.session_id or "none",
@@ -640,7 +659,12 @@ def finalize_turn(
         "last_reasoning": last_reasoning,
         "messages": messages,
         "api_calls": api_call_count,
+        "iteration_budget_used": _budget_used,
+        "iteration_budget_max": _budget_max,
         "iteration_budget_renewals": _budget_renewals,
+        "iteration_budget_stalled_boundaries": (
+            _budget_stalled_boundaries
+        ),
         "execution_lease_used": _lease_used,
         "execution_lease_max": _lease_max,
         "completed": completed,
@@ -676,6 +700,8 @@ def finalize_turn(
     }
     if execution_lease_exhausted:
         result["error"] = "execution_lease_exhausted"
+    elif bounded_proof_gate_unverified:
+        result["error"] = "verification_evidence_missing"
     elif _runtime_boundary_receipt:
         result["error"] = "iteration_budget_exhausted"
     if agent._tool_guardrail_halt_decision is not None:

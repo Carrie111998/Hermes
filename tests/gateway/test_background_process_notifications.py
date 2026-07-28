@@ -8,6 +8,7 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 """
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,6 +16,24 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+
+
+@pytest.fixture(autouse=True)
+def _reset_gateway_profile_inventory():
+    """Each test models a fresh gateway listener process."""
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    async_delegation._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        async_delegation._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +46,17 @@ class _FakeRegistry:
     def __init__(self, sessions, consumed=False):
         self._sessions = list(sessions)
         self._consumed = consumed
+        self._checkpoint_path: Path | None = None
+
+    def bind_checkpoint_path(self, path):
+        candidate = Path(path).expanduser().resolve(strict=False)
+        if (
+            self._checkpoint_path is not None
+            and self._checkpoint_path != candidate
+        ):
+            raise RuntimeError("fake registry checkpoint path changed")
+        self._checkpoint_path = candidate
+        return candidate
 
     def get(self, session_id):
         if self._sessions:
@@ -64,6 +94,18 @@ def _watcher_dict(session_id="proc_test", thread_id=""):
     if thread_id:
         d["thread_id"] = thread_id
     return d
+
+
+def _live_api_session_db():
+    return SimpleNamespace(
+        get_session=lambda session_id: {
+            "id": session_id,
+            "ended_at": None,
+            "end_reason": None,
+        },
+        get_compression_tip=lambda session_id: session_id,
+        get_conversation_root=lambda _session_id: None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +655,17 @@ def test_parse_session_key_thread_chat_type():
     assert result == {"platform": "discord", "chat_type": "thread", "chat_id": "chan1", "thread_id": "thread99"}
 
 
+def test_parse_session_key_preserves_named_profile():
+    result = _parse_session_key("agent:alpha:discord:dm:chan1:thread99")
+    assert result == {
+        "profile": "alpha",
+        "platform": "discord",
+        "chat_type": "dm",
+        "chat_id": "chan1",
+        "thread_id": "thread99",
+    }
+
+
 def test_parse_session_key_too_short():
     assert _parse_session_key("agent:main:telegram") is None
     assert _parse_session_key("") is None
@@ -620,7 +673,7 @@ def test_parse_session_key_too_short():
 
 def test_parse_session_key_wrong_prefix():
     assert _parse_session_key("cron:main:telegram:dm:123") is None
-    assert _parse_session_key("agent:cron:telegram:dm:123") is None
+    assert _parse_session_key("agent:NOT_VALID:telegram:dm:123") is None
 
 
 # ---------------------------------------------------------------------------
@@ -638,12 +691,16 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
         supports_async_delivery=False,
         handle_message=AsyncMock(),
         _host="127.0.0.1", _port=8642, _api_key="k", _model_name="m",
+        _api_profile_inventory=runner._freeze_served_profile_inventory(),
+        _ensure_session_db_async=AsyncMock(
+            return_value=_live_api_session_db()
+        ),
     )
     runner.adapters[Platform.API_SERVER] = api_adapter
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kwargs):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -671,12 +728,16 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
         supports_async_delivery=False,
         handle_message=AsyncMock(),
         _host="127.0.0.1", _port=8642, _api_key="k", _model_name="m",
+        _api_profile_inventory=runner._freeze_served_profile_inventory(),
+        _ensure_session_db_async=AsyncMock(
+            return_value=_live_api_session_db()
+        ),
     )
     runner.adapters[Platform.API_SERVER] = api_adapter
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kwargs):
         posts.append(session_id)
 
     import gateway.wake as wake_mod

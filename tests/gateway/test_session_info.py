@@ -165,16 +165,16 @@ model:
 
 class TestResetNoticeSessionInfo:
     """#59003: the auto-reset banner must report the serving profile's config,
-    not the multiplexer's base config."""
+    using the profile identity frozen when that gateway process was built."""
 
     _RUNTIME = {"provider": "", "base_url": "", "api_key": ""}
 
-    def _source(self):
+    def _source(self, profile="planner"):
         from gateway.config import Platform
         from gateway.session import SessionSource
         return SessionSource(
             platform=Platform.TELEGRAM, chat_id="123", user_id="u1",
-            profile="planner",
+            profile=profile,
         )
 
     def _homes(self, tmp_path):
@@ -188,12 +188,14 @@ class TestResetNoticeSessionInfo:
             "model:\n  default: profile-model\n  provider: anthropic\n  context_length: 2000\n")
         return base, profile
 
-    def test_multiplex_uses_profile_config(self, runner, tmp_path):
+    def test_named_process_uses_its_frozen_profile_config(self, runner, tmp_path):
         from types import SimpleNamespace
+        from tests.gateway._profile_authority import install_frozen_profile_authority
+
         base, profile = self._homes(tmp_path)
-        runner.config = SimpleNamespace(multiplex_profiles=True)
+        install_frozen_profile_authority(runner, profile, profile="planner")
+        runner.config = SimpleNamespace(multiplex_profiles=False)
         with patch("gateway.run._hermes_home", base), \
-             patch.object(GatewayRunner, "_resolve_profile_home_for_source", return_value=profile), \
              patch("gateway.run._resolve_runtime_agent_kwargs", return_value=self._RUNTIME):
             info = runner._reset_notice_session_info(self._source())
         assert "profile-model" in info
@@ -202,10 +204,13 @@ class TestResetNoticeSessionInfo:
 
     def test_single_profile_uses_base_config(self, runner, tmp_path):
         from types import SimpleNamespace
+        from tests.gateway._profile_authority import install_frozen_profile_authority
+
         base, _profile = self._homes(tmp_path)
+        install_frozen_profile_authority(runner, base)
         runner.config = SimpleNamespace(multiplex_profiles=False)
         with patch("gateway.run._hermes_home", base), \
              patch("gateway.run._resolve_runtime_agent_kwargs", return_value=self._RUNTIME):
-            info = runner._reset_notice_session_info(self._source())
+            info = runner._reset_notice_session_info(self._source(profile=None))
         assert "base-model" in info
         assert "profile-model" not in info

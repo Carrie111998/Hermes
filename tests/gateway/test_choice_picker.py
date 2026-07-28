@@ -153,7 +153,7 @@ class TestReasoningChoicePicker:
         assert current == ["xhigh"]
 
     @pytest.mark.asyncio
-    async def test_picker_show_choice_toggles_display(self, tmp_path, monkeypatch):
+    async def test_picker_show_choice_persists_platform_display(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
@@ -161,9 +161,9 @@ class TestReasoningChoicePicker:
 
         await runner._handle_reasoning_command(event)
         on_choice = adapter.calls[0]["on_choice_selected"]
-        await on_choice(event.source.chat_id, "show")
+        reply = await on_choice(event.source.chat_id, "show")
 
-        assert runner._show_reasoning is True
+        assert "telegram" in reply
         saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert saved["display"]["platforms"]["telegram"]["show_reasoning"] is True
 
@@ -195,13 +195,19 @@ class TestFastChoicePicker:
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
         event = _make_event("/fast")
+        session_key = runner._session_key_for_source(event.source)
 
         await runner._handle_fast_command(event)
         on_choice = adapter.calls[0]["on_choice_selected"]
         await on_choice(event.source.chat_id, "fast")
 
-        assert runner._service_tier == "priority"
-        assert runner._session_service_tier_overrides
+        assert (
+            runner._resolve_session_service_tier(session_key=session_key)
+            == "priority"
+        )
+        assert runner._session_service_tier_overrides == {
+            session_key: "priority"
+        }
         assert not (tmp_path / "config.yaml").exists()
 
     @pytest.mark.asyncio
@@ -211,14 +217,17 @@ class TestFastChoicePicker:
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
         event = _make_event("/fast --global")
+        session_key = runner._session_key_for_source(event.source)
 
         await runner._handle_fast_command(event)
         on_choice = adapter.calls[0]["on_choice_selected"]
         await on_choice(event.source.chat_id, "fast")
 
-        assert runner._service_tier == "priority"
         saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert saved["agent"]["service_tier"] == "fast"
+        assert session_key not in getattr(
+            runner, "_session_service_tier_overrides", {}
+        )
 
     @pytest.mark.asyncio
     async def test_bare_fast_falls_back_to_text_without_picker(self, tmp_path, monkeypatch):

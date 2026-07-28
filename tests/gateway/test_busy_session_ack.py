@@ -618,7 +618,7 @@ class TestBusySessionAck:
 
     @pytest.mark.asyncio
     async def test_includes_status_detail_when_opted_in(self, monkeypatch):
-        """Ack message should include iteration and tool info when available."""
+        """Ack detail uses compatible aggregate/slice counters."""
         import gateway.run as _gr
 
         monkeypatch.setattr(
@@ -637,6 +637,11 @@ class TestBusySessionAck:
         agent.get_activity_summary.return_value = {
             "api_call_count": 21,
             "max_iterations": 60,
+            "budget_used": 21,
+            "budget_max": 60,
+            "iteration_budget_renewals": 0,
+            "execution_lease_used": 21,
+            "execution_lease_max": 600,
             "current_tool": "terminal",
             "last_activity_ts": time.time(),
             "last_activity_desc": "terminal",
@@ -650,7 +655,8 @@ class TestBusySessionAck:
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
-        assert "21/60" in content  # iteration
+        assert "execution 21/600" in content
+        assert "slice 21/60" in content
         assert "terminal" in content  # current tool
         assert "10 min" in content  # elapsed
 
@@ -684,6 +690,38 @@ class TestBusySessionAck:
         assert "21/60" not in content
         assert "terminal" not in content
         assert "10 min" not in content
+
+    def test_activity_progress_never_pairs_total_calls_with_slice_size(self):
+        from gateway.run import _format_activity_progress
+
+        rendered = _format_activity_progress(
+            {
+                "api_call_count": 176,
+                "max_iterations": 90,
+                "budget_used": 86,
+                "budget_max": 90,
+                "iteration_budget_renewals": 1,
+                "execution_lease_used": 176,
+                "execution_lease_max": 900,
+            },
+            include_slice=True,
+            include_renewals=True,
+        )
+
+        assert rendered == "execution 176/900, slice 86/90, renewals 1"
+        assert "iteration 176/90" not in rendered
+        assert "slice 176/90" not in rendered
+        assert "call 176/90" not in rendered
+
+    def test_activity_progress_legacy_fallback_has_no_false_denominator(self):
+        from gateway.run import _format_activity_progress
+
+        rendered = _format_activity_progress(
+            {"api_call_count": 176, "max_iterations": 90}
+        )
+
+        assert rendered == "call 176"
+        assert "/" not in rendered
 
     @pytest.mark.asyncio
     async def test_draining_still_works(self):

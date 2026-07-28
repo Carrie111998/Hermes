@@ -54,6 +54,25 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+def _persisted_conversation_root(
+    session_db: Any,
+    session_id: Optional[str],
+) -> Optional[str]:
+    """Return lineage authority only when the current row already exists."""
+
+    if session_db is None or not session_id:
+        return None
+    session_reader = getattr(session_db, "get_session", None)
+    lineage_reader = getattr(session_db, "get_conversation_root", None)
+    if not callable(session_reader) or not callable(lineage_reader):
+        return None
+    row = session_reader(session_id)
+    if not isinstance(row, Mapping):
+        return None
+    root = lineage_reader(session_id)
+    return str(root) if root else None
+
+
 def _neutralize_reserved_runtime_markers(
     content: Any,
     provenance: Any = None,
@@ -337,6 +356,142 @@ def _should_idle_compact(
     return tokens > floor_tokens
 
 
+def _runtime_effect_failure(
+    agent: Any,
+    reason: str,
+    *,
+    recoverable_with_fresh_proof: bool = False,
+) -> None:
+    """Arm the bounded proof gate for an unreadable cross-turn effect."""
+
+    agent._turn_isolated_worker_runtime_effect_active = True
+    agent._turn_isolated_worker_baseline_attempted = True
+    agent._turn_isolated_worker_proof_error = reason
+    agent._turn_runtime_effect_uncertainty_recoverable = bool(
+        recoverable_with_fresh_proof
+    )
+    changed = getattr(agent, "_turn_file_mutation_paths", None)
+    if isinstance(changed, set):
+        changed.add("/workspace")
+
+
+def _validate_runtime_effect_receipt(
+    authority: str,
+    receipt: Any,
+) -> dict[str, Any]:
+    """Validate the worker-owned proof receipt used by a runtime effect."""
+
+    from gateway.isolated_worker import (
+        PROOF_RECEIPT_SCHEMA,
+        canonical_lease_id,
+    )
+
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("schema") != PROOF_RECEIPT_SCHEMA
+        or receipt.get("lease_id") != canonical_lease_id(authority)
+        or type(receipt.get("edit_generation")) is not int
+        or receipt["edit_generation"] < 0
+        or type(receipt.get("verified_generation")) is not int
+        or receipt["verified_generation"] < 0
+        or receipt["verified_generation"] > receipt["edit_generation"]
+        or receipt.get("status")
+        not in {"unverified", "passed", "failed", "stale"}
+        or receipt.get("applicability")
+        not in {"applicable", "not_applicable", "unknown"}
+        or not isinstance(receipt.get("pending_paths"), list)
+    ):
+        raise ValueError("runtime_effect_proof_receipt_invalid")
+    return dict(receipt)
+
+
+def _apply_runtime_effect(
+    agent: Any,
+    runtime_effect: Any,
+    *,
+    isolated_worker_selected: bool,
+) -> None:
+    """Seed current-turn proof state from trusted cross-turn metadata."""
+
+    if runtime_effect is None:
+        return
+    agent._turn_isolated_worker_runtime_effect_active = True
+
+    try:
+        from agent.runtime_effects import normalize_runtime_effect
+
+        effect = normalize_runtime_effect(runtime_effect)
+    except Exception as exc:
+        _runtime_effect_failure(
+            agent,
+            f"runtime_effect_malformed:{type(exc).__name__}",
+        )
+        return
+
+    authority = str(
+        getattr(agent, "_workspace_lease_authority", None) or ""
+    )
+    if effect["workspace_lease_authority"] != authority:
+        # This is a routing/lineage violation, not uncertain proof.  Never run
+        # the model under a completion minted for another conversation root.
+        raise RuntimeError("runtime_effect_workspace_authority_mismatch")
+
+    if not isolated_worker_selected:
+        _runtime_effect_failure(
+            agent,
+            "runtime_effect_isolated_worker_unavailable",
+        )
+        return
+
+    try:
+        from tools.terminal_tool import (
+            isolated_worker_proof_status_for_authority,
+        )
+
+        receipt = _validate_runtime_effect_receipt(
+            authority,
+            isolated_worker_proof_status_for_authority(authority),
+        )
+    except Exception as exc:
+        _runtime_effect_failure(
+            agent,
+            f"runtime_effect_proof_status_failed:{type(exc).__name__}",
+            recoverable_with_fresh_proof=True,
+        )
+        return
+
+    current_generation = receipt["edit_generation"]
+    observed_generation = effect["baseline_edit_generation"]
+    # Re-baseline at the current worker epoch so another edit made during this
+    # completion turn is still detected by the normal live gate.
+    agent._turn_isolated_worker_baseline_attempted = True
+    agent._turn_isolated_worker_baseline_generation = current_generation
+    agent._turn_isolated_worker_proof_receipt = receipt
+
+    if observed_generation is None:
+        _runtime_effect_failure(
+            agent,
+            "runtime_effect_baseline_unavailable",
+            recoverable_with_fresh_proof=True,
+        )
+        return
+    if current_generation < observed_generation:
+        _runtime_effect_failure(
+            agent,
+            "runtime_effect_generation_rollback",
+        )
+        return
+    if current_generation == observed_generation:
+        return
+
+    pending = [
+        str(path)
+        for path in receipt.get("pending_paths", [])
+        if isinstance(path, str) and path
+    ]
+    agent._turn_file_mutation_paths.update(pending or ["/workspace"])
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -379,6 +534,7 @@ def build_turn_context(
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
     user_message_provenance: Optional[Dict[str, Any]] = None,
+    runtime_effect: Optional[Dict[str, Any]] = None,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -518,6 +674,81 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
+    _track_runtime_resources = getattr(
+        agent,
+        "_track_runtime_resource_task_ids",
+        None,
+    )
+    if callable(_track_runtime_resources):
+        _track_runtime_resources((effective_task_id,))
+    _session_db = getattr(agent, "_session_db", None)
+    from tools.terminal_tool import (
+        isolated_worker_backend_selected,
+        register_workspace_lease_authorities,
+    )
+
+    _isolated_worker_selected = isolated_worker_backend_selected()
+    agent._isolated_worker_backend_selected = _isolated_worker_selected
+    if _isolated_worker_selected:
+        _workspace_authority = getattr(
+            agent,
+            "_workspace_lease_authority",
+            None,
+        )
+        # Lineage is part of the isolated-worker security boundary. A durable
+        # DB read failure must abort before any alias is published; a genuinely
+        # fresh, not-yet-created session row still returns None and falls back
+        # to its own trusted session identity.
+        _lineage_root = _persisted_conversation_root(
+            _session_db,
+            getattr(agent, "session_id", None),
+        )
+        if (
+            _workspace_authority
+            and _lineage_root
+            and str(_workspace_authority) != str(_lineage_root)
+        ):
+            raise RuntimeError(
+                "workspace_lease_authority_lineage_mismatch"
+            )
+        if not _workspace_authority:
+            _workspace_authority = (
+                _lineage_root or agent.session_id or effective_task_id
+            )
+            agent._workspace_lease_authority = _workspace_authority
+        _workspace_owner_id = getattr(
+            agent,
+            "_workspace_lease_binding_owner_id",
+            None,
+        )
+        if not isinstance(_workspace_owner_id, str):
+            _workspace_owner_id = None
+        _session_runtime_identity = (
+            str(getattr(agent, "session_id", "") or "")
+        )
+        agent._current_workspace_lease_session_runtime_id = (
+            _session_runtime_identity
+        )
+        _runtime_identities = tuple(
+            str(value)
+            for value in (
+                getattr(agent, "session_id", None),
+                effective_task_id,
+            )
+            if value
+        )
+        register_workspace_lease_authorities(
+            _runtime_identities,
+            str(agent._workspace_lease_authority),
+            owner_id=_workspace_owner_id,
+        )
+        _track_persistent = getattr(
+            agent,
+            "_track_workspace_lease_persistent_runtime_ids",
+            None,
+        )
+        if callable(_track_persistent) and _session_runtime_identity:
+            _track_persistent((_session_runtime_identity,))
     turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
     agent._current_turn_id = turn_id
     # Clear before any fallible prologue work so a cached agent can never carry
@@ -637,6 +868,25 @@ def build_turn_context(
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
         agent._hydrate_todo_store(conversation_history)
+    _plan_progress_reader = getattr(
+        agent._todo_store,
+        "execution_progress_token",
+        None,
+    )
+    _plan_progress_token = (
+        _plan_progress_reader()
+        if callable(_plan_progress_reader)
+        else None
+    )
+    if not isinstance(_plan_progress_token, str):
+        _plan_progress_token = None
+    agent._budget_plan_progress_token = _plan_progress_token
+    agent._budget_seen_plan_progress_tokens = (
+        {_plan_progress_token}
+        if _plan_progress_token is not None
+        else set()
+    )
+    agent._budget_stagnant_boundary_count = 0
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
     if conversation_history and agent._user_turn_count == 0:
@@ -1217,6 +1467,47 @@ def build_turn_context(
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    agent._turn_isolated_worker_proof_receipt = None
+    agent._turn_isolated_worker_proof_error = None
+    agent._turn_isolated_worker_baseline_generation = None
+    agent._turn_isolated_worker_baseline_attempted = False
+    agent._turn_isolated_worker_runtime_effect_active = False
+    agent._turn_runtime_effect_uncertainty_recoverable = False
+    agent._turn_runtime_effect_fresh_proof_observed = False
+    if _isolated_worker_selected:
+        # Session creation and preflight compression have completed by this
+        # point. Revalidate the trusted authority against the now-durable row,
+        # then bind any rotated session id before the first executable tool.
+        _current_session = getattr(agent, "session_id", None)
+        _current_root = _persisted_conversation_root(
+            _session_db,
+            _current_session,
+        )
+        if (
+            _current_root
+            and str(_current_root)
+            != str(agent._workspace_lease_authority)
+        ):
+            raise RuntimeError(
+                "workspace_lease_authority_lineage_mismatch"
+            )
+        register_workspace_lease_authorities(
+            tuple(
+                str(value)
+                for value in (_current_session, effective_task_id)
+                if value
+            )
+            ,
+            str(agent._workspace_lease_authority),
+            owner_id=_workspace_owner_id,
+        )
+        if callable(_track_persistent) and _current_session:
+            _track_persistent((str(_current_session),))
+    _apply_runtime_effect(
+        agent,
+        runtime_effect,
+        isolated_worker_selected=_isolated_worker_selected,
+    )
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

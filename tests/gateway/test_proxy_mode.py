@@ -8,6 +8,7 @@ from gateway.config import Platform, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 def _make_runner(proxy_url=None):
@@ -16,6 +17,7 @@ def _make_runner(proxy_url=None):
     runner.adapters = {}
     runner.config = MagicMock()
     runner.config.streaming = StreamingConfig()
+    runner.config.multiplex_profiles = False
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner._session_model_overrides = {}
@@ -171,9 +173,10 @@ class TestRunAgentProxyDispatch:
     """Test that _run_agent() delegates to proxy when configured."""
 
     @pytest.mark.asyncio
-    async def test_run_agent_delegates_to_proxy(self, monkeypatch):
+    async def test_run_agent_delegates_to_proxy(self, monkeypatch, tmp_path):
         monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
         runner = _make_runner()
+        install_frozen_profile_authority(runner, tmp_path)
         source = _make_source()
 
         expected_result = {

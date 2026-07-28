@@ -320,6 +320,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**Agent loop:** {state}"
+    execution_this_run:    "**Uitvoering tydens hierdie lopie:** {progress}"
     state_yes:             "Ja ⚡"
     state_no:              "Nee"
     queued:                "**Opgehoopte opvolge:** {count}"

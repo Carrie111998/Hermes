@@ -58,7 +58,21 @@ class FakeTree:
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    # Production config bootstrap in gateway.run enables the public-target
+    # reaction guard process-wide.  Keep these lifecycle tests independent of
+    # collection order; the dedicated visibility test opts back into the guard.
+    monkeypatch.setattr(
+        discord_adapter_module,
+        "_discord_public_only_policy_required",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        discord_adapter_module,
+        "_discord_policy_public_target_error",
+        lambda _target: None,
+    )
+    monkeypatch.setenv("DISCORD_REACTIONS", "true")
     config = PlatformConfig(enabled=True, token="***")
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(
@@ -127,6 +141,62 @@ async def test_process_message_background_adds_and_swaps_reactions(adapter):
     assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
     assert raw_message.remove_reaction.await_args_list[0].args == ("👀", adapter._client.user)
     assert raw_message.add_reaction.await_args_list[1].args == ("✅",)
+
+
+@pytest.mark.asyncio
+async def test_delivered_partial_receipt_is_marked_incomplete(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+
+    async def handler(event):
+        event.logical_processing_outcome = ProcessingOutcome.INCOMPLETE
+        return "I deployed part of the change, but validation is still blocked."
+
+    async def hold_typing(_chat_id, interval=2.0, metadata=None):
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
+    adapter._keep_typing = hold_typing
+
+    event = _make_event("partial", raw_message)
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
+    assert raw_message.remove_reaction.await_args_list[0].args == (
+        "👀",
+        adapter._client.user,
+    )
+    assert raw_message.add_reaction.await_args_list[1].args == ("⚠️",)
+    assert all(call.args != ("✅",) for call in raw_message.add_reaction.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_overrides_logical_success(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+
+    async def handler(event):
+        event.logical_processing_outcome = ProcessingOutcome.SUCCESS
+        return "done"
+
+    async def hold_typing(_chat_id, interval=2.0, metadata=None):
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="forbidden"))
+    adapter._keep_typing = hold_typing
+
+    event = _make_event("delivery-failed", raw_message)
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
+    assert raw_message.add_reaction.await_args_list[1].args == ("❌",)
+    assert all(call.args != ("✅",) for call in raw_message.add_reaction.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -332,8 +402,8 @@ async def test_reactions_stop_after_public_visibility_is_revoked(adapter, monkey
     event = _make_event("public-then-private", raw_message)
     monkeypatch.setattr(
         discord_adapter_module,
-        "_discord_public_only_policy_required",
-        lambda: True,
+        "_discord_policy_public_target_error",
+        lambda _target: None if state["public"] else "private target",
     )
 
     await adapter.on_processing_start(event)
@@ -356,3 +426,17 @@ async def test_on_processing_complete_cancelled_removes_eyes_without_terminal_re
 
     raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
     raw_message.add_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_incomplete_uses_warning_reaction(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+
+    event = _make_event("8", raw_message)
+    await adapter.on_processing_complete(event, ProcessingOutcome.INCOMPLETE)
+
+    raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
+    raw_message.add_reaction.assert_awaited_once_with("⚠️")

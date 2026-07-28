@@ -18,6 +18,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 def _source():
@@ -183,6 +184,7 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
 
     adapter = _PendingVoiceAdapter()
     runner = _run_agent_runner(adapter)
+    install_frozen_profile_authority(runner, tmp_path)
     source = _source()
     session_key = "telegram:dm:12345"
     event = MessageEvent(

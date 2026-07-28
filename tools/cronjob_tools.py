@@ -924,15 +924,22 @@ def check_cronjob_requirements() -> bool:
     """
     from utils import env_var_enabled
 
-    if env_var_enabled("HERMES_CRON_SESSION"):
-        return False
-
     try:
         from gateway.session_context import get_session_env
-
-        gateway_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-    except Exception:
+    except ImportError:
+        cron_session = "1" if env_var_enabled("HERMES_CRON_SESSION") else ""
         gateway_platform = ""
+    else:
+        try:
+            cron_session = get_session_env("HERMES_CRON_SESSION", "")
+            gateway_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        except Exception:
+            # A cron job must never acquire the scheduler-management tool just
+            # because task-local authority became unreadable. Fail closed.
+            return False
+
+    if str(cron_session).strip().lower() in {"1", "true", "yes", "on"}:
+        return False
 
     return bool(gateway_platform) or (
         env_var_enabled("HERMES_INTERACTIVE")

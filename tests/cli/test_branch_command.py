@@ -11,7 +11,7 @@ Verifies that:
 
 import os
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -143,6 +143,65 @@ class TestBranchCommandCLI:
         # session_id should not have changed
         assert cli_instance.session_id == "20260403_120000_abc123"
 
+    def test_branch_create_failure_leaves_parent_live(
+        self,
+        cli_instance,
+        session_db,
+    ):
+        from cli import HermesCLI
+
+        parent_id = cli_instance.session_id
+        with (
+            patch.object(
+                session_db,
+                "create_session",
+                side_effect=RuntimeError("database unavailable"),
+            ),
+            patch("cli._cprint"),
+        ):
+            HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        assert cli_instance.session_id == parent_id
+        assert session_db.get_session(parent_id)["ended_at"] is None
+
+    def test_branch_authority_failure_leaves_parent_live(
+        self,
+        cli_instance,
+        session_db,
+    ):
+        from cli import HermesCLI
+
+        parent_id = cli_instance.session_id
+        agent = MagicMock()
+        agent.session_id = parent_id
+        agent.transition_workspace_lease_conversation.side_effect = (
+            RuntimeError("workspace claim conflict")
+        )
+        cli_instance.agent = agent
+
+        with (
+            patch.object(
+                session_db,
+                "end_session",
+                wraps=session_db.end_session,
+            ) as end_session,
+            patch("cli._cprint"),
+        ):
+            HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        assert cli_instance.session_id == parent_id
+        assert agent.session_id == parent_id
+        assert session_db.get_session(parent_id)["ended_at"] is None
+        assert not any(
+            call.args == (parent_id, "branched")
+            for call in end_session.call_args_list
+        )
+        assert any(
+            len(call.args) >= 2
+            and call.args[1] == "branch_switch_failed"
+            for call in end_session.call_args_list
+        )
+
     def test_branch_syncs_agent(self, cli_instance, session_db):
         """If an agent is active, branch should sync it to the new session."""
         from cli import HermesCLI
@@ -157,6 +216,11 @@ class TestBranchCommandCLI:
         assert agent.session_id == cli_instance.session_id
         assert agent.reset_session_state.called
         assert agent._last_flushed_db_idx == 4  # len(conversation_history)
+        agent.transition_workspace_lease_conversation.assert_called_once_with(
+            cli_instance.session_id,
+            "20260403_120000_abc123",
+            retain_existing_aliases=True,
+        )
 
     def test_branch_sets_resumed_flag(self, cli_instance, session_db):
         """Branch should set _resumed=True to prevent auto-title generation."""

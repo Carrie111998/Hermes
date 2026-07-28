@@ -67,7 +67,7 @@ def live_transcript_root() -> Path:
 
 def new_live_delegation_id() -> str:
     """Same shape as async_delegation's ids so the dir name matches the handle."""
-    return f"deleg_{uuid.uuid4().hex[:8]}"
+    return f"deleg_{uuid.uuid4().hex}"
 
 
 def _one_line(text: Any, limit: int) -> str:

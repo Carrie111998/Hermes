@@ -820,6 +820,27 @@ def init_agent(
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
+
+    # Isolated-worker workspace authority is conversation-lineage state, not a
+    # model-selected task id.  Session identities remain registered between
+    # turns so background runtime work can resolve the same root lease; true
+    # conversation switches and hard close release them explicitly.
+    agent._workspace_lease_authority = None
+    agent._workspace_lease_persistent_runtime_ids: set[str] = set()
+    agent._workspace_lease_runtime_ids: tuple[str, ...] = ()
+    agent._runtime_resource_task_ids: set[str] = set()
+    agent._workspace_lease_authority_lock = threading.RLock()
+    agent._workspace_lease_binding_owner_id = uuid.uuid4().hex
+    agent._isolated_worker_backend_selected = False
+    # ``close()`` is a one-way lifecycle transition.  Guard it explicitly so
+    # a repeated/concurrent close cannot clean resources that a later agent has
+    # already claimed under the same runtime identity.
+    agent._close_started = False
+    # Most agents own the process/browser/sandbox resources keyed by their
+    # session identity. Temporary forks that deliberately share a live
+    # session (background review and compression helpers) opt out so their
+    # close() cannot tear down the foreground owner's resources.
+    agent._owns_runtime_resources = True
     
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed
@@ -880,6 +901,9 @@ def init_agent(
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
     agent._budget_renewal_count = 0
+    agent._budget_plan_progress_token = None
+    agent._budget_seen_plan_progress_tokens: set[str] = set()
+    agent._budget_stagnant_boundary_count = 0
 
     # Activity tracking — updated on each API call, tool execution, and
     # stream chunk.  Used by the gateway timeout handler to report what the

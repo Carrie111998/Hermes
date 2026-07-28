@@ -13,6 +13,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 def _make_event(text="/background", platform=Platform.TELEGRAM,
@@ -27,7 +28,7 @@ def _make_event(text="/background", platform=Platform.TELEGRAM,
     return MessageEvent(text=text, source=source)
 
 
-def _make_runner():
+def _make_runner(profile_home=None):
     """Create a bare GatewayRunner with minimal mocks."""
     from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
@@ -47,6 +48,9 @@ def _make_runner():
 
     from gateway.hooks import HookRegistry
     runner.hooks = HookRegistry()
+
+    if profile_home is not None:
+        install_frozen_profile_authority(runner, profile_home)
 
     return runner
 
@@ -197,9 +201,9 @@ class TestRunBackgroundTask:
     """Tests for GatewayRunner._run_background_task (the actual execution)."""
 
     @pytest.mark.asyncio
-    async def test_no_adapter_returns_silently(self):
+    async def test_no_adapter_returns_silently(self, tmp_path):
         """When no adapter is available, the task returns without error."""
-        runner = _make_runner()
+        runner = _make_runner(tmp_path)
         source = SessionSource(
             platform=Platform.TELEGRAM,
             user_id="12345",
@@ -210,9 +214,9 @@ class TestRunBackgroundTask:
         await runner._run_background_task("test prompt", source, "bg_test")
 
     @pytest.mark.asyncio
-    async def test_no_credentials_sends_error(self):
+    async def test_no_credentials_sends_error(self, tmp_path):
         """When provider credentials are missing, an error is sent."""
-        runner = _make_runner()
+        runner = _make_runner(tmp_path)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
@@ -233,9 +237,9 @@ class TestRunBackgroundTask:
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
 
     @pytest.mark.asyncio
-    async def test_successful_task_sends_result(self):
+    async def test_successful_task_sends_result(self, tmp_path):
         """When the agent completes successfully, the result is sent."""
-        runner = _make_runner()
+        runner = _make_runner(tmp_path)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -285,7 +289,7 @@ class TestRunBackgroundTask:
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_media_files_routed_by_type(self, monkeypatch):
+    async def test_media_files_routed_by_type(self, monkeypatch, tmp_path):
         """Result media is routed to the type-specific sender, not send_document.
 
         A TTS clip should arrive as a voice bubble, a video as a video, an
@@ -293,7 +297,7 @@ class TestRunBackgroundTask:
         """
         from gateway import run as gateway_run
 
-        runner = _make_runner()
+        runner = _make_runner(tmp_path)
         runner._resolve_session_agent_runtime = MagicMock(
             return_value=("test-model", {"api_key": "test-key"})
         )
@@ -375,11 +379,15 @@ class TestRunBackgroundTask:
             _shutil.rmtree(_tmpdir, ignore_errors=True)
 
     @pytest.mark.asyncio
-    async def test_telegram_dm_topic_completion_preserves_reply_anchor_metadata(self, monkeypatch):
+    async def test_telegram_dm_topic_completion_preserves_reply_anchor_metadata(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
         """Background completion metadata must let Telegram send thread id plus reply id."""
         from gateway import run as gateway_run
 
-        runner = _make_runner()
+        runner = _make_runner(tmp_path)
         runner._resolve_session_agent_runtime = MagicMock(
             return_value=("test-model", {"api_key": "test-key"})
         )
@@ -427,9 +435,9 @@ class TestRunBackgroundTask:
         }
 
     @pytest.mark.asyncio
-    async def test_agent_cleanup_runs_when_background_agent_raises(self):
+    async def test_agent_cleanup_runs_when_background_agent_raises(self, tmp_path):
         """Temporary background agents must be cleaned up on error paths too."""
-        runner = _make_runner()
+        runner = _make_runner(tmp_path)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
@@ -456,9 +464,9 @@ class TestRunBackgroundTask:
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_exception_sends_error_message(self):
+    async def test_exception_sends_error_message(self, tmp_path):
         """When the agent raises an exception, an error message is sent."""
-        runner = _make_runner()
+        runner = _make_runner(tmp_path)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter

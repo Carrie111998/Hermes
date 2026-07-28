@@ -8,9 +8,27 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, ProcessingOutcome
 from gateway.session import SessionEntry, SessionSource
 from gateway.response_filters import should_suppress_delivery
+
+
+@pytest.fixture(autouse=True)
+def _reset_gateway_listener_authority():
+    """Each test constructs the one gateway listener for a fresh process."""
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    async_delegation._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        async_delegation._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
 
 
 def _source():
@@ -31,6 +49,7 @@ def _event():
 
 
 def _runner(monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     runner = gateway_run.GatewayRunner(GatewayConfig())
     runner.adapters = {}
     runner._running_agents = {}
@@ -63,7 +82,6 @@ def _runner(monkeypatch, tmp_path):
     runner.session_store.append_to_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
 
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
@@ -304,3 +322,18 @@ async def test_failed_turn_delivers_even_with_structured_suppress(monkeypatch, t
     )
 
     assert text in response
+
+
+@pytest.mark.asyncio
+async def test_swallowed_agent_exception_is_logical_failure(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    event = _event()
+    runner._run_agent = AsyncMock(side_effect=RuntimeError("private failure detail"))
+
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert "unexpected error" in response
+    assert "private failure detail" not in response
+    assert event.logical_processing_outcome is ProcessingOutcome.FAILURE

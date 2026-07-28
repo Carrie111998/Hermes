@@ -47,8 +47,12 @@ class _FakePickerAdapter:
         return types.SimpleNamespace(success=True)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, home=None, *, profile="default"):
     runner = object.__new__(GatewayRunner)
+    if home is not None:
+        from tests.gateway._profile_authority import install_frozen_profile_authority
+
+        install_frozen_profile_authority(runner, home, profile=profile)
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner._session_model_overrides = {}
@@ -117,20 +121,10 @@ def _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value):
     return cfg_path
 
 
-def _make_named_runner(monkeypatch, default_adapter, named_adapter, named_home):
-    runner = _make_runner(default_adapter)
-    monkeypatch.setattr(
-        runner, "config", types.SimpleNamespace(multiplex_profiles=True), raising=False
-    )
-    monkeypatch.setattr(
-        runner,
-        "_profile_adapters",
-        {"named": {Platform.TELEGRAM: named_adapter}},
-        raising=False,
-    )
-    monkeypatch.setattr(
-        runner, "_resolve_profile_home_for_source", lambda source: named_home
-    )
+def _make_named_runner(named_adapter, named_home):
+    """Model the named profile as its own one-profile gateway process."""
+    runner = _make_runner(named_adapter, named_home, profile="named")
+    runner.config = types.SimpleNamespace(multiplex_profiles=False)
     return runner
 
 
@@ -185,7 +179,10 @@ async def test_picker_tap_global_flag_persists(tmp_path, monkeypatch, seed_model
     adapter = _FakePickerAdapter()
     cfg_path = _setup_isolated_home(tmp_path, monkeypatch, seed_model)
 
-    confirmation = await _drive_picker(_make_runner(adapter), _make_event("/model --global"))
+    confirmation = await _drive_picker(
+        _make_runner(adapter, cfg_path.parent),
+        _make_event("/model --global"),
+    )
 
     assert confirmation is not None
     assert "gpt-5.5" in confirmation
@@ -211,7 +208,7 @@ async def test_picker_tap_is_session_scoped_by_default(tmp_path, monkeypatch):
     cfg_path = _setup_isolated_home(
         tmp_path, monkeypatch, {"default": "old-model", "provider": "openrouter"}
     )
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, cfg_path.parent)
 
     confirmation = await _drive_picker(runner, _make_event("/model"))
 
@@ -238,7 +235,7 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     cfg_path = _setup_isolated_home(
         tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
     )
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, cfg_path.parent)
 
     confirmation = await _drive_picker(runner, _make_event("/model --session"))
 
@@ -257,18 +254,17 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_multiplex_picker_keeps_profile_adapter_and_callback_scope(
+async def test_named_process_picker_keeps_adapter_and_callback_scope(
     tmp_path, monkeypatch
 ):
     """A named profile must present and execute its picker under one identity."""
-    from agent.secret_scope import get_secret, set_multiplex_active
+    from agent.secret_scope import get_secret
 
-    default_adapter = _FakePickerAdapter()
     named_adapter = _FakePickerAdapter()
     named_home = tmp_path / "profiles" / "named"
     named_home.mkdir(parents=True)
     (named_home / ".env").write_text("PROFILE_MODEL_KEY=named-secret\n", encoding="utf-8")
-    runner = _make_named_runner(monkeypatch, default_adapter, named_adapter, named_home)
+    runner = _make_named_runner(named_adapter, named_home)
     _setup_isolated_home(
         tmp_path,
         monkeypatch,
@@ -283,33 +279,26 @@ async def test_multiplex_picker_keeps_profile_adapter_and_callback_scope(
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", _profile_switch)
     event = _named_event("--session")
 
-    set_multiplex_active(True)
-    try:
-        sent = await runner._handle_model_command(event)
+    sent = await runner._handle_model_command(event)
 
-        assert sent is None
-        assert default_adapter.captured_callback is None
-        assert named_adapter.captured_callback is not None
-        assert resolved == []
+    assert sent is None
+    assert named_adapter.captured_callback is not None
+    assert resolved == []
 
-        confirmation = await named_adapter.captured_callback(
-            "named-chat", "gpt-5.5", "openrouter"
-        )
-    finally:
-        set_multiplex_active(False)
+    confirmation = await named_adapter.captured_callback(
+        "named-chat", "gpt-5.5", "openrouter"
+    )
 
     assert "gpt-5.5" in confirmation
     assert resolved == ["named-secret"]
 
 
 @pytest.mark.asyncio
-async def test_multiplex_picker_global_persists_only_named_profile(
+async def test_named_process_picker_global_persists_only_named_profile(
     tmp_path, monkeypatch
 ):
     """A named picker must not seed its global write from the default profile."""
     import gateway.run as gateway_run
-    from agent.secret_scope import set_multiplex_active
-
     default_home = tmp_path / "default"
     named_home = tmp_path / "profiles" / "named"
     default_home.mkdir(parents=True)
@@ -329,24 +318,19 @@ async def test_multiplex_picker_global_persists_only_named_profile(
         yaml.safe_dump(named_cfg, sort_keys=False), encoding="utf-8"
     )
 
-    default_adapter = _FakePickerAdapter()
     named_adapter = _FakePickerAdapter()
-    runner = _make_named_runner(monkeypatch, default_adapter, named_adapter, named_home)
+    runner = _make_named_runner(named_adapter, named_home)
     monkeypatch.setattr(gateway_run, "_hermes_home", default_home)
     _stub_picker_dependencies(monkeypatch)
     event = _named_event("--global")
 
-    set_multiplex_active(True)
-    try:
-        with gateway_run._profile_runtime_scope(named_home):
-            sent = await runner._handle_model_command(event)
-        assert sent is None
-        assert named_adapter.captured_callback is not None
-        confirmation = await named_adapter.captured_callback(
-            "named-chat", "gpt-5.5", "openrouter"
-        )
-    finally:
-        set_multiplex_active(False)
+    with gateway_run._profile_runtime_scope(named_home):
+        sent = await runner._handle_model_command(event)
+    assert sent is None
+    assert named_adapter.captured_callback is not None
+    confirmation = await named_adapter.captured_callback(
+        "named-chat", "gpt-5.5", "openrouter"
+    )
 
     assert "gpt-5.5" in confirmation
     assert yaml.safe_load((default_home / "config.yaml").read_text()) == default_cfg

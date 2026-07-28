@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import os
 import threading
+from typing import Any, Sequence
 from pathlib import Path
 
 from gateway.isolated_worker import (
@@ -51,7 +53,10 @@ class IsolatedWorkerEnvironment(BaseEnvironment):
             expected_socket_gid=expected_socket_gid,
         )
         self._client_close_lock = threading.Lock()
+        self._proof_receipt_lock = threading.Lock()
+        self._last_completed_proof_receipt: dict[str, Any] | None = None
         self._closed = False
+        self._persistent = True
         super().__init__(cwd=cwd, timeout=timeout)
         bootstrap = self._execute_worker(
             "umask 077; mkdir -p /workspace/.hermes-runtime",
@@ -79,7 +84,7 @@ class IsolatedWorkerEnvironment(BaseEnvironment):
         cwd: Path,
         timeout: int,
         stdin_data: str | None = None,
-        job_ref: dict[str, str | None] | None = None,
+        job_ref: dict[str, Any] | None = None,
     ) -> tuple[str, int]:
         if self._closed:
             raise RuntimeError("isolated_worker_environment_closed")
@@ -105,6 +110,11 @@ class IsolatedWorkerEnvironment(BaseEnvironment):
                 returncode = result.get("returncode")
                 if type(returncode) is not int:
                     returncode = 124 if result.get("state") == "timed_out" else 137
+                receipt = result.get("proof_receipt")
+                if not isinstance(receipt, dict):
+                    raise ProtocolError("proof_receipt_missing")
+                if job_ref is not None:
+                    job_ref["proof_receipt"] = dict(receipt)
                 combined = bytes(stdout) + bytes(stderr)
                 return combined.decode("utf-8", errors="replace"), returncode
 
@@ -117,7 +127,11 @@ class IsolatedWorkerEnvironment(BaseEnvironment):
         stdin_data: str | None = None,
     ):
         del login  # The worker intentionally uses a sealed, profile-free shell.
-        job_ref: dict[str, str | None] = {"session_id": None}
+        job_ref: dict[str, Any] = {
+            "session_id": None,
+            "proof_receipt": None,
+            "proof_error": None,
+        }
 
         def execute() -> tuple[str, int]:
             try:
@@ -129,6 +143,7 @@ class IsolatedWorkerEnvironment(BaseEnvironment):
                     job_ref=job_ref,
                 )
             except (OSError, ProtocolError) as exc:
+                job_ref["proof_error"] = str(exc) or type(exc).__name__
                 return f"isolated worker rejected execution: {exc}\n", 1
 
         def cancel() -> None:
@@ -139,7 +154,73 @@ class IsolatedWorkerEnvironment(BaseEnvironment):
                 except (OSError, ProtocolError):
                     pass
 
-        return _ThreadedProcessHandle(execute, cancel_fn=cancel)
+        handle = _ThreadedProcessHandle(execute, cancel_fn=cancel)
+        handle._isolated_worker_job_ref = job_ref
+        return handle
+
+    def _wait_for_process(
+        self,
+        proc,
+        timeout: int = 120,
+        *,
+        bounded_capture: bool = False,
+    ) -> dict:
+        result = super()._wait_for_process(
+            proc,
+            timeout=timeout,
+            bounded_capture=bounded_capture,
+        )
+        job_ref = getattr(proc, "_isolated_worker_job_ref", None)
+        if isinstance(job_ref, dict):
+            receipt = job_ref.get("proof_receipt")
+            if isinstance(receipt, dict):
+                result["isolated_worker_proof_receipt"] = dict(receipt)
+                with self._proof_receipt_lock:
+                    self._last_completed_proof_receipt = dict(receipt)
+            if job_ref.get("proof_error"):
+                result["isolated_worker_proof_error"] = str(
+                    job_ref["proof_error"]
+                )
+        return result
+
+    def proof_status(self) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("isolated_worker_environment_closed")
+        receipt = dict(self._client.proof_status())
+        with self._proof_receipt_lock:
+            self._last_completed_proof_receipt = dict(receipt)
+        return receipt
+
+    def mark_edited(self, paths: Sequence[str]) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("isolated_worker_environment_closed")
+        normalized: list[str] = []
+        for raw in paths:
+            candidate = Path(str(raw))
+            if not candidate.is_absolute():
+                candidate = Path(self.cwd or "/workspace") / candidate
+            candidate = Path(os.path.normpath(str(candidate)))
+            try:
+                candidate.relative_to(Path("/workspace"))
+            except ValueError as exc:
+                raise ProtocolError("proof_path_outside_lease") from exc
+            normalized.append(str(candidate))
+        if not normalized:
+            raise ProtocolError("proof_paths_invalid")
+        with self._proof_receipt_lock:
+            prior = dict(self._last_completed_proof_receipt or {})
+        observed_generation = prior.get("edit_generation")
+        if type(observed_generation) is not int:
+            observed_generation = None
+        receipt = dict(
+            self._client.mark_edited(
+                sorted(set(normalized)),
+                observed_generation=observed_generation,
+            )
+        )
+        with self._proof_receipt_lock:
+            self._last_completed_proof_receipt = dict(receipt)
+        return receipt
 
     def cleanup(self) -> None:
         with self._client_close_lock:

@@ -1,4 +1,4 @@
-"""Model-sovereignty coverage for legacy verification continuation hooks."""
+"""Model-sovereignty and bounded verification-continuation coverage."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -57,7 +57,7 @@ def _assert_model_response_stays_sovereign(agent, result):
     ]
 
 
-def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeypatch):
+def test_verify_on_stop_returns_partial_receipt_at_budget_limit(agent, monkeypatch):
     def model_call(_api_kwargs):
         agent._turn_file_mutation_paths = {"changed.py"}
         return _response()
@@ -72,7 +72,20 @@ def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeyp
     ):
         result = agent.run_conversation("edit changed.py")
 
-    _assert_model_response_stays_sovereign(agent, result)
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["partial"] is True
+    assert result["error"] == "verification_evidence_missing"
+    assert result["turn_exit_reason"] == "bounded_proof_gate_unverified"
+    assert "PARTIAL / NOT VERIFIED" in result["final_response"]
+    assert "composed report" not in "\n".join(
+        str(message.get("content") or "") for message in result["messages"]
+    )
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    agent._handle_max_iterations.assert_not_called()
     assert all(
         "_verification_stop_synthetic" not in message
         for message in result["messages"]

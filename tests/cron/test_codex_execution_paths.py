@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import gateway.run as gateway_run
 import run_agent
 from gateway.config import Platform
 from gateway.session import SessionSource
+from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
 def _patch_agent_bootstrap(monkeypatch):
@@ -64,6 +66,8 @@ class _FakeOpenAI:
 class _Codex401ThenSuccessAgent(run_agent.AIAgent):
     refresh_attempts = 0
     last_init = {}
+    cron_context_seen = None
+    global_cron_marker_seen = None
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("skip_context_files", True)
@@ -80,6 +84,10 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
         return True
 
     def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        from tools.approval import _is_cron_session
+
+        type(self).cron_context_seen = _is_cron_session()
+        type(self).global_cron_marker_seen = os.environ.get("HERMES_CRON_SESSION")
         calls = {"api": 0}
 
         def _fake_api_call(api_kwargs):
@@ -109,6 +117,9 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
 
     _Codex401ThenSuccessAgent.refresh_attempts = 0
     _Codex401ThenSuccessAgent.last_init = {}
+    _Codex401ThenSuccessAgent.cron_context_seen = None
+    _Codex401ThenSuccessAgent.global_cron_marker_seen = None
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
 
     success, output, final_response, error = cron_scheduler.run_job(
         {"id": "job-1", "name": "Codex Refresh Test", "prompt": "ping", "model": "gpt-5.3-codex"}
@@ -121,9 +132,18 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.refresh_attempts == 1
     assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+    assert _Codex401ThenSuccessAgent.cron_context_seen is True
+    assert _Codex401ThenSuccessAgent.global_cron_marker_seen is None
+
+    from tools.approval import _is_cron_session
+
+    assert _is_cron_session() is False
 
 
-def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
+def test_gateway_run_agent_codex_path_handles_internal_401_refresh(
+    monkeypatch,
+    tmp_path,
+):
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
@@ -156,12 +176,13 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
+    install_frozen_profile_authority(runner, tmp_path)
     # Ensure model resolution returns the codex model even if xdist
     # leaked env vars cleared HERMES_MODEL.
     monkeypatch.setattr(
         gateway_run.GatewayRunner,
         "_resolve_turn_agent_config",
-        lambda self, msg, model, runtime: {
+        lambda self, msg, model, runtime, **_kwargs: {
             "model": model or "gpt-5.3-codex",
             "runtime": runtime,
         },

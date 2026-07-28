@@ -96,9 +96,7 @@ def _is_webhook_silence_response(content: Any) -> bool:
     """
     return is_autonomous_silence_response(content)
 
-# Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
-# names a profile this gateway does not serve (→ 404). Distinct from None
-# (no prefix / multiplexing off → handle as the default profile).
+# Sentinel returned when a forbidden /p/<profile>/ prefix is supplied.
 _PROFILE_REJECTED = object()
 
 _BUILTIN_DELIVER_PLATFORMS = {
@@ -245,7 +243,26 @@ class WebhookAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _require_single_profile_process(self) -> None:
+        runner = getattr(self, "gateway_runner", None)
+        cfg = getattr(runner, "config", None)
+        if bool(getattr(cfg, "multiplex_profiles", False)):
+            from gateway.run import _require_single_profile_gateway_process
+
+            _require_single_profile_gateway_process(cfg)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        try:
+            self._require_single_profile_process()
+        except RuntimeError as exc:
+            self._set_fatal_error(
+                "webhook_multiplex_unsupported",
+                str(exc),
+                retryable=False,
+            )
+            logger.error("[webhook] Refusing multiplex listener: %s", exc)
+            return False
+
         # Load agent-created subscriptions before validating
         self._reload_dynamic_routes()
 
@@ -289,14 +306,6 @@ class WebhookAdapter(BasePlatformAdapter):
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
-        # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
-        # routes the inbound event to that profile. Same handler; the profile is
-        # captured from the path and stamped onto the SessionSource so the agent
-        # turn resolves that profile's config/skills/credentials. Only honored
-        # when gateway.multiplex_profiles is on (the handler validates).
-        app.router.add_post(
-            "/p/{profile}/webhooks/{route_name}", self._handle_webhook
-        )
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -531,33 +540,11 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
 
     def _resolve_request_profile(self, request: "web.Request"):
-        """Resolve + validate the /p/<profile>/ URL prefix on a webhook request.
+        """Reject profile-prefixed requests; one listener owns one profile."""
 
-        Returns:
-          - ``None`` when no profile prefix is present, or multiplexing is off
-            (the prefix is ignored, request handled as the default profile).
-          - the profile name (str) when present, multiplexing is on, and the
-            profile is one this gateway serves.
-          - ``_PROFILE_REJECTED`` when a prefix is present but the profile is
-            unknown/unconfigured (handler returns 404).
-        """
+        self._require_single_profile_process()
         profile = (request.match_info.get("profile") or "").strip()
-        if not profile:
-            return None
-        runner = self.gateway_runner
-        cfg = getattr(runner, "config", None)
-        if not getattr(cfg, "multiplex_profiles", False):
-            # Prefix supplied but multiplexing is off — ignore it, behave as
-            # the single-profile gateway (don't 404 a would-be valid route).
-            return None
-        try:
-            from hermes_cli.profiles import profiles_to_serve
-            served = {name for name, _ in profiles_to_serve(multiplex=True)}
-        except Exception:
-            return _PROFILE_REJECTED
-        if profile not in served:
-            return _PROFILE_REJECTED
-        return profile
+        return _PROFILE_REJECTED if profile else None
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
@@ -567,7 +554,6 @@ class WebhookAdapter(BasePlatformAdapter):
         route_name = request.match_info.get("route_name", "")
         route_config = self._routes.get(route_name)
 
-        # Multi-profile: resolve + validate the /p/<profile>/ prefix if present.
         profile = self._resolve_request_profile(request)
         if profile is _PROFILE_REJECTED:
             return web.json_response(
@@ -860,8 +846,6 @@ class WebhookAdapter(BasePlatformAdapter):
             user_id=f"webhook:{route_name}",
             user_name=route_name,
         )
-        if profile and isinstance(profile, str):
-            source.profile = profile
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -928,9 +912,8 @@ class WebhookAdapter(BasePlatformAdapter):
         """Mark the per-delivery webhook session ended in state.db.
 
         Resolves the persisted ``session_id`` from the gateway session store
-        using the SAME source the run was keyed on (so profile multiplexing
-        and key construction match exactly), then closes it via the existing
-        ``SessionDB.end_session`` API — never a hand-written UPDATE.
+        using the same source the run was keyed on, then closes it via the
+        existing ``SessionDB.end_session`` API — never a hand-written UPDATE.
         """
         runner = self.gateway_runner
         if runner is None:
@@ -1337,18 +1320,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 success=False, error=f"Unknown platform: {platform_name}"
             )
 
-        # Default adapters first; multiplex may park Slack/etc. only on a
-        # secondary profile (self._profile_adapters). Fall back so webhook
-        # deliver:slack still works when default has slack disabled.
         adapter = self.gateway_runner.adapters.get(target_platform)
-        if not adapter:
-            for _prof, amap in (getattr(self.gateway_runner, "_profile_adapters", None) or {}).items():
-                if not isinstance(amap, dict):
-                    continue
-                cand = amap.get(target_platform)
-                if cand is not None:
-                    adapter = cand
-                    break
         if not adapter:
             return SendResult(
                 success=False,

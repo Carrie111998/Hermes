@@ -81,6 +81,7 @@ def render_account_usage_lines(*args: Any, **kwargs: Any) -> Any:
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from agent.terminal_outcome import TerminalOutcomeKind, normalize_terminal_outcome
 from hermes_cli.config import (
     PINNED_EFFECTIVE_CONFIG_WRITE_BLOCKED,
     cfg_get,
@@ -102,6 +103,8 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_COMPLETION_RETRY_MIN_SECONDS = 0.25
+_COMPLETION_RETRY_STORAGE_ERROR_SECONDS = 1.0
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -2148,9 +2151,8 @@ def _reload_runtime_env_preserving_config_authority() -> None:
 
     if is_multiplex_active():
         # Credentials are resolved from the active profile's secret scope, not
-        # os.environ. Still honor config.yaml's agent.max_turns bridge below
-        # using the scoped home, but never reload .env into global env.
-        _bridge_max_turns_from_config(_hermes_home)
+        # os.environ. Per-profile behavioral settings are read directly by
+        # request-local resolvers; never bridge them into process-global env.
         return
 
     load_hermes_dotenv(
@@ -2222,6 +2224,22 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
 
 def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh."""
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        cfg = _load_gateway_runtime_config()
+        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        raw = (
+            agent_cfg.get("max_turns", 500)
+            if isinstance(agent_cfg, dict)
+            else 500
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 500
+        return value if value > 0 else 500
+
     _reload_runtime_env_preserving_config_authority()
     try:
         return int(os.getenv("HERMES_MAX_ITERATIONS", "500"))
@@ -2232,13 +2250,10 @@ def _current_max_iterations() -> int:
 from contextlib import contextmanager as _contextmanager
 
 
-# Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
-# multiplexer the default profile owns the single shared listener and serves
-# every profile through the /p/<profile>/ URL prefix, so a SECONDARY profile
-# enabling one of these is always a misconfiguration. We skip that secondary
-# profile (SecondaryPortBindingConfigError) so a single bad profile cannot
-# take down the whole multiplexer. The set lives in gateway.config so the
-# dashboard's pre-write validation enforces the same policy.
+# Platforms that bind a host TCP port (HTTP/webhook listeners). The legacy
+# secondary-profile helpers below retain this classification for compatibility,
+# although public startup now rejects same-process multiplexing before adapters
+# start. The set lives in gateway.config so config validation stays consistent.
 from gateway.config import (
     PORT_BINDING_PLATFORM_VALUES as _PORT_BINDING_PLATFORM_VALUES,
     platform_binds_port as _platform_binds_port,
@@ -2254,15 +2269,35 @@ class MultiplexConfigError(RuntimeError):
     """
 
 
+_UNSAFE_SAME_PROCESS_MULTIPLEX_DIAGNOSTIC = (
+    "gateway.multiplex_profiles cannot run in one Hermes process: profiles "
+    "are independent security boundaries, while terminal, browser, tool, and "
+    "runtime state include process-global surfaces. Run one Hermes gateway "
+    "process per profile. If ingress must be shared, route it to isolated "
+    "per-profile processes."
+)
+
+
+def _require_single_profile_gateway_process(config: "GatewayConfig") -> None:
+    """Reject unsafe same-process profile multiplexing before any side effect."""
+
+    if bool(getattr(config, "multiplex_profiles", False)):
+        raise MultiplexConfigError(_UNSAFE_SAME_PROCESS_MULTIPLEX_DIAGNOSTIC)
+
+
 class SecondaryPortBindingConfigError(MultiplexConfigError):
-    """A secondary profile conflicts with the multiplexer's shared listener."""
+    """Legacy secondary-profile configuration conflicts with a listener."""
+
+
+class AsyncDeliveryProfileMismatch(RuntimeError):
+    """A stamped completion disagrees with its semantic routing profile."""
 
 
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
-    Combines the two seams the multiplexer needs:
+    Combines the two profile-scoping seams:
       1. ``set_hermes_home_override`` — redirects ``get_hermes_home()`` (config,
          skills, memory, SOUL, sessions) to the profile's home. Contextvar, so
          it propagates into the agent worker thread via ``copy_context()``.
@@ -2727,6 +2762,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -3373,6 +3409,59 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _format_activity_progress(
+    summary: Mapping[str, Any],
+    *,
+    include_slice: bool = False,
+    include_renewals: bool = False,
+) -> str:
+    """Render compatible activity counters without mixing their scopes.
+
+    ``api_call_count`` is cumulative for the root run, while ``max_iterations``
+    is only the size of the current renewable slice. Pairing those fields can
+    therefore produce impossible-looking values such as ``176/90``. The shared
+    monotonic execution lease is the truthful aggregate denominator. Older
+    agents/test doubles without lease fields degrade to ``call N`` rather than
+    inventing a denominator.
+    """
+
+    if not isinstance(summary, Mapping):
+        return ""
+
+    def _counter(value: Any, *, positive: bool = False) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed < 0 or (positive and parsed <= 0):
+            return None
+        return parsed
+
+    parts: List[str] = []
+    lease_used = _counter(summary.get("execution_lease_used"))
+    lease_max = _counter(summary.get("execution_lease_max"), positive=True)
+    total_calls = _counter(summary.get("api_call_count"))
+    if lease_used is not None and lease_max is not None:
+        parts.append(f"execution {lease_used}/{lease_max}")
+    elif total_calls is not None:
+        parts.append(f"call {total_calls}")
+
+    if include_slice:
+        slice_used = _counter(summary.get("budget_used"))
+        slice_max = _counter(summary.get("budget_max"), positive=True)
+        if slice_used is not None and slice_max is not None:
+            parts.append(f"slice {slice_used}/{slice_max}")
+
+    if include_renewals:
+        renewals = _counter(summary.get("iteration_budget_renewals"))
+        if renewals:
+            parts.append(f"renewals {renewals}")
+
+    return ", ".join(parts)
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -3588,6 +3677,69 @@ def _get_channel_override(
     return None
 
 
+def _get_profile_channel_override(
+    config: Optional[dict],
+    platform: Platform,
+    chat_id: str,
+    *,
+    thread_id: Optional[str] = None,
+    parent_id: Optional[str] = None,
+) -> Optional[ChannelOverride]:
+    """Resolve a channel override from the current profile's raw config.
+
+    ``GatewayRunner.config`` is the listener's constructor-frozen control
+    configuration.  In multiplex mode it necessarily belongs to the primary
+    profile, so it must never be consulted for a secondary profile's
+    per-channel model/provider/prompt policy.  Runtime turns already load the
+    selected profile's raw config under its verified canonical home; resolve
+    the small override projection directly from that mapping.
+
+    Hermes accepts both the modern ``platforms.<name>`` shape and the
+    historical top-level ``<name>`` shape.  The historical bridge wins when
+    both are present, matching ``load_gateway_config``.
+    """
+    if not isinstance(config, dict):
+        return None
+    platform_name = platform.value
+    candidates: list[dict] = []
+
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        platform_config = platforms.get(platform_name)
+        if isinstance(platform_config, dict):
+            candidates.append(platform_config)
+
+    legacy_config = config.get(platform_name)
+    if isinstance(legacy_config, dict):
+        candidates.append(legacy_config)
+
+    override_data: Optional[dict] = None
+    lookup_keys = _channel_override_lookup_keys(
+        chat_id,
+        thread_id=thread_id,
+        parent_id=parent_id,
+    )
+    for platform_config in candidates:
+        overrides = platform_config.get("channel_overrides")
+        if not isinstance(overrides, dict):
+            continue
+        for key in lookup_keys:
+            candidate = overrides.get(key)
+            if candidate is None:
+                # YAML may have parsed an unquoted numeric channel id as int.
+                try:
+                    candidate = overrides.get(int(key))
+                except (TypeError, ValueError):
+                    candidate = None
+            if isinstance(candidate, dict):
+                override_data = candidate
+                break
+
+    if override_data is None:
+        return None
+    return ChannelOverride.from_dict(override_data)
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -3619,9 +3771,13 @@ def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key into its component parts.
 
     Session keys follow the format
-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
+    ``agent:{profile}:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
+    The legacy/default namespace is spelled ``main``; named multiplex
+    profiles use their validated profile id verbatim.
     Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
-    optionally ``thread_id`` keys, or None if the key doesn't match.
+    optionally ``profile`` / ``thread_id`` keys, or None if the key doesn't
+    match. ``profile`` is omitted for the legacy ``main`` namespace so
+    existing single-profile callers keep their byte-identical result shape.
 
     The 6th element is only returned as ``thread_id`` for chat types where
     it is unambiguous (``dm`` and ``thread``).  For group/channel sessions
@@ -3629,12 +3785,22 @@ def _parse_session_key(session_key: str) -> "dict | None":
     thread_id, so we leave ``thread_id`` out to avoid mis-routing.
     """
     parts = session_key.split(":")
-    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+    if len(parts) >= 5 and parts[0] == "agent":
+        namespace = parts[1]
+        if namespace != "main":
+            try:
+                from hermes_cli.profiles import validate_profile_name
+
+                validate_profile_name(namespace)
+            except Exception:
+                return None
         result = {
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
+        if namespace != "main":
+            result["profile"] = namespace
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
@@ -3770,6 +3936,40 @@ def _legacy_handoff_forbidden_by_writer_policy() -> bool:
         return True
 
 
+def _canonicalize_agent_result(agent_result: Any) -> dict:
+    """Copy one agent result with the shared terminal contract applied.
+
+    Gateway result shaping must not drop a status-only failure or preserve
+    contradictory flags.  The returned mapping has mutually exclusive
+    terminal flags and one explicit status/exit reason on every path.
+    """
+
+    normalized = dict(agent_result) if isinstance(agent_result, Mapping) else {}
+    terminal_input: Any = normalized
+    if normalized.get("canonical_workspace_recovery_incomplete"):
+        terminal_input = dict(normalized)
+        terminal_input["incomplete"] = True
+    outcome = normalize_terminal_outcome(terminal_input)
+    normalized.update(
+        {
+            "status": outcome.kind.value,
+            "completed": outcome.completed,
+            "partial": outcome.partial,
+            "interrupted": outcome.interrupted,
+            "failed": outcome.failed,
+            "incomplete": outcome.incomplete,
+        }
+    )
+    exit_reason = normalized.get("turn_exit_reason")
+    if not isinstance(exit_reason, str) or not exit_reason.strip():
+        normalized["turn_exit_reason"] = outcome.reason or outcome.kind.value
+    if not outcome.valid and not normalized.get("error"):
+        normalized["error"] = outcome.reason or "invalid_agent_result"
+    if outcome.contradictory:
+        normalized["terminal_outcome_contradictory"] = True
+    return normalized
+
+
 def _normalize_empty_agent_response(
     agent_result: dict,
     response: str,
@@ -3791,7 +3991,8 @@ def _normalize_empty_agent_response(
     if response:
         return response
 
-    if agent_result.get("failed"):
+    outcome = normalize_terminal_outcome(agent_result)
+    if outcome.kind is TerminalOutcomeKind.FAILED:
         error_detail = agent_result.get("error", "unknown error")
         if agent_result.get("compression_exhausted"):
             return (
@@ -3805,7 +4006,7 @@ def _normalize_empty_agent_response(
         )
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
-    if agent_result.get("interrupted"):
+    if outcome.kind is TerminalOutcomeKind.INTERRUPTED:
         # An interrupted run that did work (api_calls > 0) is the drain of a
         # run the user deliberately stopped or steered — its silence is
         # intentional, and any queued/interrupting message is delivered by
@@ -3821,8 +4022,12 @@ def _normalize_empty_agent_response(
             )
         return response
     if api_calls > 0:
-        if agent_result.get("partial"):
-            err = agent_result.get("error", "processing incomplete")
+        if outcome.kind is TerminalOutcomeKind.PARTIAL:
+            err = (
+                agent_result.get("incomplete_reason")
+                or agent_result.get("error")
+                or "processing incomplete"
+            )
             return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
         return (
             "⚠️ Processing completed but no response was generated. "
@@ -3834,12 +4039,7 @@ def _normalize_empty_agent_response(
     # gateway would otherwise silently drop the turn (response=0 chars) and
     # the user sees no reply at all. Surface a short retry hint so the
     # message isn't lost in silence. (#31884)
-    if (
-        api_calls == 0
-        and not agent_result.get("interrupted")
-        and not agent_result.get("failed")
-        and not agent_result.get("partial")
-    ):
+    if api_calls == 0 and outcome.kind is TerminalOutcomeKind.COMPLETED:
         return (
             "⚠️ Your message wasn't processed (the previous turn was still "
             "being cleaned up). Please send it again."
@@ -3859,19 +4059,28 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """
     if not isinstance(agent_result, dict):
         return False
-    if agent_result.get("interrupted"):
-        return False
-    if (
-        agent_result.get("failed")
-        or agent_result.get("partial")
-        or agent_result.get("error")
-    ):
-        return False
-    if agent_result.get("completed") is False:
-        return False
     if agent_result.get("canonical_workspace_recovery_incomplete"):
         return False
-    return True
+    return normalize_terminal_outcome(agent_result).completed
+
+
+def _classify_agent_processing_outcome(agent_result: dict) -> ProcessingOutcome:
+    """Classify agent work independently from response-delivery success."""
+    if not isinstance(agent_result, dict):
+        return ProcessingOutcome.FAILURE
+
+    normalized_input = agent_result
+    if agent_result.get("canonical_workspace_recovery_incomplete"):
+        normalized_input = dict(agent_result)
+        normalized_input["incomplete"] = True
+    outcome = normalize_terminal_outcome(normalized_input)
+    if outcome.kind is TerminalOutcomeKind.FAILED:
+        return ProcessingOutcome.FAILURE
+    if outcome.kind is TerminalOutcomeKind.INTERRUPTED:
+        return ProcessingOutcome.CANCELLED
+    if outcome.kind is TerminalOutcomeKind.PARTIAL:
+        return ProcessingOutcome.INCOMPLETE
+    return ProcessingOutcome.SUCCESS
 
 
 def _canonical_workspace_failure_result(
@@ -4203,7 +4412,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Initialize startup serialization without stale-state mutation."""
 
         if not self._isolated_runtime:
-            _clean_marker = _hermes_home / ".clean_shutdown"
+            primary_identity = self._verify_served_profile_inventory()[0]
+            _clean_marker = (
+                Path(primary_identity.canonical_home) / ".clean_shutdown"
+            )
             if _clean_marker.exists():
                 logger.info(
                     "Previous gateway exited cleanly — skipping session suspension"
@@ -4382,16 +4594,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise TypeError("require_production_model_sovereignty must be boolean")
         if type(require_capability_canary) is not bool:
             raise TypeError("require_capability_canary must be boolean")
-        from gateway.canonical_writer_boundary import (
-            harden_gateway_process_for_writer_boundary,
-        )
-
-        harden_gateway_process_for_writer_boundary()
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # Profiles are independent security islands. Hermes still has
+        # process-global terminal/browser/tool caches and environment bridges,
+        # so a same-process multiplexer cannot be treated as an isolation
+        # boundary. Refuse it immediately after config resolution: no profile
+        # inventory markers, provider discovery, process-registry checkpoint,
+        # SessionStore/SessionDB, adapter, or listener may exist yet.
+        _require_single_profile_gateway_process(self.config)
+
+        from gateway.canonical_writer_boundary import (
+            harden_gateway_process_for_writer_boundary,
+        )
+
+        harden_gateway_process_for_writer_boundary()
+        # Freeze the listener authority immediately after configuration, before
+        # importing the process-registry singleton or opening SessionStore /
+        # SessionDB. Every profile-bound constructor below receives this exact
+        # generation; startup later only reverifies it.
+        inventory = self._freeze_served_profile_inventory()
+        self._primary_profile_identity = inventory[0]
+        self._served_profile_identities_by_name = {
+            str(identity.profile or "default"): identity
+            for identity in inventory
+        }
+        self._gateway_state_db_path = (
+            Path(self._primary_profile_identity.canonical_home) / "state.db"
+        )
+        self._gateway_sessions_dir = self._freeze_gateway_sessions_dir(
+            self.config.sessions_dir,
+        )
+        # Downstream maintenance/workers still read the config field. Replace
+        # it with the one constructor-frozen path so no later caller can
+        # reinterpret a profile symlink after listener startup.
+        self.config.sessions_dir = self._gateway_sessions_dir
         self._isolated_runtime = self.config.isolated_runtime is True
         self._require_production_model_sovereignty = (
             require_production_model_sovereignty
@@ -4446,6 +4686,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # NOT killed, only ignored by the reset guard.
         from tools.process_registry import process_registry
 
+        try:
+            process_registry.bind_checkpoint_path(
+                Path(self._primary_profile_identity.canonical_home)
+                / "processes.json"
+            )
+        except Exception as exc:
+            raise MultiplexConfigError(
+                "Cannot bind the process registry to the frozen primary "
+                f"profile generation: {exc}"
+            ) from exc
+
         _bg_max_age_hours = getattr(
             self.config.default_reset_policy, "bg_process_max_age_hours", 24
         )
@@ -4455,7 +4706,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else None
         )
         self.session_store = SessionStore(
-            self.config.sessions_dir,
+            self._gateway_sessions_dir,
             self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key,
@@ -4467,6 +4718,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
             before_capability_epoch_rotation_fn=(
                 self._before_capability_epoch_rotation
+            ),
+            db_path=self._gateway_state_db_path,
+            primary_profile_name=str(
+                self._primary_profile_identity.profile or "default"
+            ),
+            served_profile_names=set(
+                self._served_profile_identities_by_name
             ),
         )
         # One enforced loop-side boundary for the synchronous SessionStore.
@@ -4594,6 +4852,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
+        self._completion_retry_lock = threading.Lock()
+        self._completion_retry_timers: Dict[
+            tuple[str, str], threading.Timer
+        ] = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -4710,7 +4972,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from hermes_state import AsyncSessionDB, SessionDB
 
-            self._session_db = AsyncSessionDB(SessionDB())
+            self._session_db = AsyncSessionDB(
+                SessionDB(self._gateway_state_db_path)
+            )
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
             # cli.py's handling of the same init path.  Users hitting NFS-mounted
@@ -4779,15 +5043,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # whitelist (one per profile in multiplex mode).
         from gateway.pairing import PairingStore
 
-        self.pairing_store = PairingStore()
-        self.pairing_stores: Dict[str, "PairingStore"] = {}
+        primary_pairing_profile = str(
+            self._primary_profile_identity.profile or "default"
+        )
+        self.pairing_store = PairingStore(
+            profile=primary_pairing_profile,
+            profile_identity=self._primary_profile_identity,
+        )
+        self.pairing_stores: Dict[str, "PairingStore"] = {
+            primary_pairing_profile: self.pairing_store,
+        }
 
         # Event hook system
         from gateway.hooks import HookRegistry
 
         self.hooks = HookRegistry()
 
-        # Per-chat voice reply mode: "off" | "voice_only" | "all"
+        # Voice is currently supported only by the frozen primary adapter.
+        # Bind every persisted voice artifact to that exact canonical
+        # generation; module-import paths may still point at a mutable profile
+        # alias and are not runtime authority.
+        primary_home = Path(self._primary_profile_identity.canonical_home)
+        self._VOICE_MODE_PATH = primary_home / "gateway_voice_mode.json"
+        self._VOICE_CONTEXT_DIR = primary_home / "state" / "voice_context"
+
+        # Per-chat voice reply mode: "off" | "voice_only" | "all".
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
         # Recent voice transcripts per (guild,user) for duplicate suppression.
         # Protects against the same utterance being emitted twice by the voice
@@ -5275,12 +5555,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source.profile:
                 _profile = source.profile
             else:
-                try:
-                    from hermes_cli.profiles import get_active_profile_name
-
-                    _profile = get_active_profile_name() or "default"
-                except Exception:
-                    _profile = None
+                _profile = str(
+                    getattr(
+                        getattr(self, "_primary_profile_identity", None),
+                        "profile",
+                        "",
+                    )
+                    or "default"
+                )
         return build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
@@ -5603,8 +5885,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             model = runtime_model
 
-        cfg = getattr(self, "config", None)
-        if cfg and source is not None and not sealed_route_pinned:
+        if source is not None and not sealed_route_pinned:
             chat_id = str(source.chat_id) if source.chat_id else ""
             thread_id = (
                 str(source.thread_id) if getattr(source, "thread_id", None) else None
@@ -5614,13 +5895,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if getattr(source, "parent_chat_id", None)
                 else None
             )
-            ch = _get_channel_override(
-                cfg,
+            ch = _get_profile_channel_override(
+                user_config,
                 source.platform,
                 chat_id,
                 thread_id=thread_id,
                 parent_id=parent_id,
             )
+            if ch is None and (
+                user_config is None
+                or not bool(
+                    getattr(
+                        getattr(self, "config", None),
+                        "multiplex_profiles",
+                        False,
+                    )
+                )
+            ):
+                cfg = getattr(self, "config", None)
+                if cfg:
+                    ch = _get_channel_override(
+                        cfg,
+                        source.platform,
+                        chat_id,
+                        thread_id=thread_id,
+                        parent_id=parent_id,
+                    )
             if ch:
                 if ch.model:
                     model = ch.model
@@ -5675,10 +5975,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # guards against bare test runners built via ``object.__new__``.
         _last_good = getattr(self, "_last_resolved_model", None)
         if _last_good is not None:
+            multiplex = bool(
+                getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            )
             if not model:
-                _recovered = _last_good.get(
-                    resolved_session_key or ""
-                ) or _last_good.get("*")
+                _recovered = _last_good.get(resolved_session_key or "")
+                if not _recovered and not multiplex:
+                    _recovered = _last_good.get("*")
                 if _recovered:
                     logger.warning(
                         "Empty model resolved for session=%s — recovering "
@@ -5692,12 +5995,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Cache the good resolution for future recovery turns.
                 if resolved_session_key:
                     _last_good[resolved_session_key] = model
-                _last_good["*"] = model
+                if not multiplex:
+                    _last_good["*"] = model
 
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(
-        self, user_message: str, model: str, runtime_kwargs: dict
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        service_tier: Any = _UNSET,
     ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
@@ -5733,8 +6042,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
 
-        service_tier = getattr(self, "_service_tier", None)
-        if not service_tier:
+        effective_service_tier = (
+            getattr(self, "_service_tier", None)
+            if service_tier is _UNSET
+            else service_tier
+        )
+        if not effective_service_tier:
             route["request_overrides"] = {}
             return route
 
@@ -6712,7 +7025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return []
         path = Path(file_path).expanduser()
         if not path.is_absolute():
-            path = _hermes_home / path
+            path = _gateway_config_home() / path
         if not path.exists():
             logger.warning("Prefill messages file not found: %s", path)
             return []
@@ -6752,17 +7065,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         parent_id: Optional[str] = None,
     ) -> str:
         """Resolve model for this channel: channel_overrides else global default."""
-        config = getattr(self, "config", None)
-        if config:
-            override = _get_channel_override(
-                config,
-                platform,
-                chat_id,
-                thread_id=thread_id,
-                parent_id=parent_id,
+        override = _get_profile_channel_override(
+            user_config,
+            platform,
+            chat_id,
+            thread_id=thread_id,
+            parent_id=parent_id,
+        )
+        if override is None and (
+            user_config is None
+            or not bool(
+                getattr(getattr(self, "config", None), "multiplex_profiles", False)
             )
-            if override and override.model:
-                return override.model
+        ):
+            config = getattr(self, "config", None)
+            if config:
+                override = _get_channel_override(
+                    config,
+                    platform,
+                    chat_id,
+                    thread_id=thread_id,
+                    parent_id=parent_id,
+                )
+        if override and override.model:
+            return override.model
         return _resolve_gateway_model(user_config)
 
     def _get_system_prompt_for_channel(
@@ -6770,27 +7096,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
         chat_id: str,
         *,
+        user_config: Optional[dict] = None,
+        fallback_prompt: Optional[str] = None,
         thread_id: Optional[str] = None,
         parent_id: Optional[str] = None,
     ) -> str:
         """Ephemeral system prompt for this channel/thread.
 
-        Uses ``channel_overrides`` when set, else the global gateway prompt.
-        Legacy ``channel_prompts`` are applied separately via ``event.channel_prompt``
-        in ``run_sync`` (adapter ``resolve_channel_prompt``), so they are not
-        duplicated here.
+        Runtime callers pass the selected profile's raw config and its
+        turn-local fallback prompt.  The typed ``self.config`` and startup
+        snapshot remain only as a compatibility fallback for direct
+        single-profile callers.
         """
-        config = getattr(self, "config", None)
-        if config:
-            override = _get_channel_override(
-                config,
-                platform,
-                chat_id,
-                thread_id=thread_id,
-                parent_id=parent_id,
+        override = _get_profile_channel_override(
+            user_config,
+            platform,
+            chat_id,
+            thread_id=thread_id,
+            parent_id=parent_id,
+        )
+        if override is None and (
+            user_config is None
+            or not bool(
+                getattr(getattr(self, "config", None), "multiplex_profiles", False)
             )
-            if override and override.system_prompt:
-                return (override.system_prompt or "").strip()
+        ):
+            config = getattr(self, "config", None)
+            if config:
+                override = _get_channel_override(
+                    config,
+                    platform,
+                    chat_id,
+                    thread_id=thread_id,
+                    parent_id=parent_id,
+                )
+        if override and override.system_prompt:
+            return (override.system_prompt or "").strip()
+        if fallback_prompt is not None:
+            return fallback_prompt
         return getattr(self, "_ephemeral_system_prompt", None) or ""
 
     @staticmethod
@@ -7070,20 +7413,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
-        pinned_cfg = _load_pinned_effective_config_if_active()
-        if pinned_cfg is not None:
-            return pinned_cfg.get("provider_routing", {}) or {}
-        try:
-            import yaml as _y
-
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return cfg.get("provider_routing", {}) or {}
-        except Exception:
-            pass
-        return {}
+        cfg = _load_gateway_runtime_config()
+        routing = cfg.get("provider_routing", {}) if isinstance(cfg, dict) else {}
+        return routing if isinstance(routing, dict) else {}
 
     @staticmethod
     def _load_fallback_model() -> list | None:
@@ -7093,22 +7425,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         legacy ``fallback_model`` entries. ``fallback_providers`` stays first
         when both keys are present.
         """
-        pinned_cfg = _load_pinned_effective_config_if_active()
-        if pinned_cfg is not None:
-            return get_fallback_chain(pinned_cfg) or None
-        try:
-            import yaml as _y
-
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                fb = get_fallback_chain(cfg)
-                if fb:
-                    return fb
-        except Exception:
-            pass
-        return None
+        cfg = _load_gateway_runtime_config()
+        return get_fallback_chain(cfg) or None
 
     def _refresh_fallback_model(self) -> list | None:
         """Re-read fallback_providers from disk for the next agent create/reuse.
@@ -7437,6 +7755,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return True
 
+        # Host-authored completions are their own FIFO turns.  Never merge
+        # them into a user's text/media envelope, never steer/interrupt with
+        # them, and never emit a user-facing busy acknowledgement.
+        if getattr(event, "internal", False):
+            adapter = self._adapter_for_source(event.source)
+            if not adapter:
+                return False
+            if (
+                self._queue_depth(session_key, adapter=adapter)
+                >= self._BUSY_QUEUE_MAX_PENDING
+            ):
+                logger.warning(
+                    "Dropping internal follow-up for session %s — pending "
+                    "queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                metadata = getattr(event, "metadata", None)
+                future = (
+                    metadata.get("_hermes_internal_delivery_future")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if future is not None and not future.done():
+                    future.set_result(False)
+                return True
+            self._enqueue_fifo(session_key, event, adapter)
+            return True
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self._adapter_for_source(event.source)
@@ -7474,20 +7821,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
-
-        # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
-        if getattr(event, "internal", False):
-            return False
 
         running_agent = self._running_agents.get(session_key)
 
@@ -7693,16 +8026,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             try:
                 summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
                 current_tool = summary.get("current_tool")
                 start_ts = self._running_agents_ts.get(session_key, 0)
                 if start_ts:
                     elapsed_min = int((now - start_ts) / 60)
                     if elapsed_min > 0:
                         status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
+                progress = _format_activity_progress(
+                    summary,
+                    include_slice=True,
+                    include_renewals=True,
+                )
+                if progress:
+                    status_parts.append(progress)
                 if current_tool:
                     status_parts.append(f"running: {current_tool}")
             except Exception:
@@ -7766,7 +8102,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _hint_mode = "interrupt"
                 message = f"{message}\n\n{busy_input_hint_gateway(_hint_mode)}"
-                mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
+                mark_seen(_gateway_config_home() / "config.yaml", BUSY_INPUT_FLAG)
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
@@ -9250,6 +9586,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Reverify before *any* startup filesystem/config/log access. A source
+        # alias may have been retargeted after construction; touching ambient
+        # state first would mix that new generation with constructor-bound DBs.
+        try:
+            self._verify_served_profile_inventory()
+        except MultiplexConfigError as exc:
+            reason = str(exc)
+            logger.error("Gateway profile inventory error: %s", reason)
+            self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+            self._request_clean_exit(reason)
+            self._startup_restore_in_progress = False
+            return True
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -9358,14 +9706,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         except Exception:
             pass
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-
-            _profile = get_active_profile_name()
-            if _profile and _profile != "default":
-                logger.info("Active profile: %s", _profile)
-        except Exception:
-            pass
+        _profile = str(
+            getattr(
+                getattr(self, "_primary_profile_identity", None),
+                "profile",
+                "",
+            )
+            or "default"
+        )
+        if _profile != "default":
+            logger.info("Active profile: %s", _profile)
         try:
             from gateway.status import write_runtime_status
 
@@ -10116,6 +10466,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
 
+        # The process registry is constructed under the launch profile, but a
+        # multiplexing gateway owns several independent durable completion
+        # stores. Restore every validated served home before the one watcher
+        # capable of consuming async-delegation events starts.
+        self._restore_async_delegations_for_served_profiles()
+
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
@@ -10321,6 +10677,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""
+        if bool(getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+            raise RuntimeError(
+                "legacy handoff is disabled for multiplex gateways until the "
+                "handoff row carries typed, frozen profile authority"
+            )
         if _legacy_handoff_forbidden_by_writer_policy():
             raise RuntimeError(
                 "legacy handoff is disabled by the privileged Canonical "
@@ -10722,12 +11083,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _active_profile_name(self) -> str:
         """Return the profile name this gateway represents."""
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-
-            return get_active_profile_name() or "default"
-        except Exception:
-            return "default"
+        return str(
+            getattr(
+                getattr(self, "_primary_profile_identity", None),
+                "profile",
+                "",
+            )
+            or "default"
+        )
 
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
@@ -11191,6 +11554,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            self._cancel_completion_retry_timers()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -11574,6 +11938,131 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
+
+    def _freeze_gateway_sessions_dir(self, configured: "Path") -> "Path":
+        """Bind routing persistence to one constructor-time filesystem target.
+
+        A default/profile-local path is translated from the frozen source
+        alias to its already-canonical home without resolving that alias
+        again. Explicit external paths are canonicalized exactly once.
+        """
+
+        identity = getattr(self, "_primary_profile_identity", None)
+        if identity is None:
+            raise MultiplexConfigError(
+                "Cannot freeze gateway sessions without a primary profile "
+                "identity"
+            )
+        source_home = Path(identity.source_home).expanduser().absolute()
+        canonical_home = Path(identity.canonical_home)
+        candidate = Path(configured).expanduser()
+        candidate = (
+            candidate
+            if candidate.is_absolute()
+            else Path.cwd() / candidate
+        )
+        candidate = candidate.absolute()
+
+        # Preserve the lexical relationship to the frozen source alias. This
+        # avoids a second symlink traversal between inventory capture and
+        # SessionStore construction.
+        try:
+            relative = candidate.relative_to(source_home)
+        except ValueError:
+            relative = None
+        if relative is not None:
+            return canonical_home / relative
+
+        # A caller may already have supplied the canonical profile path.
+        try:
+            canonical_relative = candidate.relative_to(canonical_home)
+        except ValueError:
+            canonical_relative = None
+        if canonical_relative is not None:
+            return canonical_home / canonical_relative
+
+        # External storage remains supported, but its symlink target is frozen
+        # now and never re-resolved by this runner.
+        try:
+            return candidate.resolve(strict=False)
+        except OSError as exc:
+            raise MultiplexConfigError(
+                f"Cannot freeze gateway sessions directory {candidate}: {exc}"
+            ) from exc
+
+    def _freeze_served_profile_inventory(self):
+        """Capture the one listener-lifetime profile identity inventory.
+
+        A symlink alias is not a second tenant.  Letting two profile names
+        resolve to one directory would make adapter, SQLite, and wake-token
+        ownership disagree, so multiplex startup fails before any secondary
+        adapter is connected.  Every adapter and durable-store consumer gets
+        these exact objects; no later startup phase may recapture a generation.
+        """
+
+        cached = getattr(self, "_served_profile_identity_inventory", None)
+        if isinstance(cached, tuple):
+            return cached
+
+        from gateway.api_request_scope import freeze_api_profile_inventory
+        from hermes_cli.profiles import profiles_to_serve
+
+        multiplex = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
+        try:
+            inventory = freeze_api_profile_inventory(
+                profiles_to_serve(multiplex=multiplex)
+            )
+        except Exception as exc:
+            detail = str(exc)
+            if "one canonical home" in detail:
+                detail = (
+                    "multiple profiles resolve to the same Hermes home "
+                    "(symlink aliases are not allowed)"
+                )
+            raise MultiplexConfigError(
+                f"Cannot freeze served-profile identity inventory: {detail}"
+            ) from exc
+        if not inventory:
+            raise MultiplexConfigError(
+                "Served-profile identity inventory is empty"
+            )
+        # Register the same immutable identities for detached async dispatch.
+        # This is a process-local host capability, not persisted profile input.
+        from tools.async_delegation import (
+            register_frozen_event_delivery_inventory,
+        )
+
+        try:
+            register_frozen_event_delivery_inventory(inventory)
+        except Exception as exc:
+            raise MultiplexConfigError(
+                "Cannot publish served-profile identity inventory: "
+                f"{exc}"
+            ) from exc
+        # Publish the runner-local cache only after the process-global
+        # authority accepted the exact inventory.  Otherwise a transient
+        # verification/registration failure would make a retry skip the
+        # registration step and return an unregistered capability set.
+        self._served_profile_identity_inventory = inventory
+        return inventory
+
+    def _verify_served_profile_inventory(self):
+        """Reverify the constructor-frozen inventory without recapturing it."""
+
+        from gateway.api_request_scope import verify_api_profile_identity
+
+        inventory = self._freeze_served_profile_inventory()
+        try:
+            for identity in inventory:
+                verify_api_profile_identity(identity)
+        except Exception as exc:
+            raise MultiplexConfigError(
+                "Served-profile filesystem identity changed after gateway "
+                "construction; restart is required"
+            ) from exc
+        return inventory
 
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
@@ -12120,6 +12609,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             adapter = APIServerAdapter(config)
             adapter.gateway_runner = self
+            inventory = self._freeze_served_profile_inventory()
+            rebind = getattr(adapter, "_rebind_startup_response_store", None)
+            if callable(rebind):
+                rebind(inventory)
+            adapter._api_profile_inventory = inventory
             return adapter
 
         elif platform == Platform.WEBHOOK:
@@ -12578,23 +13072,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 == "pair"
             ):
                 platform_name = source.platform.value if source.platform else "unknown"
+                pairing_store = self._pairing_store_for(source)
+                if pairing_store is None:
+                    logger.error(
+                        "Pairing denied: no frozen pairing store for "
+                        "profile %r",
+                        getattr(source, "profile", None),
+                    )
+                    return None
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                if pairing_store._is_rate_limited(
+                    platform_name,
+                    source.user_id,
+                ):
                     return None
-                code = self.pairing_store.generate_code(
+                code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
                     adapter = self._adapter_for_source(source)
                     if adapter:
+                        pairing_profile = str(
+                            getattr(source, "profile", "") or ""
+                        ).strip()
+                        profile_args = (
+                            f"--profile {pairing_profile} "
+                            if pairing_profile
+                            and pairing_profile != "default"
+                            else ""
+                        )
                         await adapter.send(
                             source.chat_id,
                             f"Hi~ I don't recognize you yet!\n\n"
                             f"Here's your pairing code: `{code}`\n\n"
                             f"Ask the bot owner to run:\n"
-                            f"`hermes pairing approve {platform_name} {code}`",
+                            f"`hermes {profile_args}pairing approve "
+                            f"{platform_name} {code}`",
                         )
                 else:
                     adapter = self._adapter_for_source(source)
@@ -12605,7 +13120,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!",
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(
+                        platform_name,
+                        source.user_id,
+                    )
             return None
 
         # Intercept messages that are responses to a pending /update prompt.
@@ -12816,10 +13334,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     _sa = _stale_agent.get_activity_summary()
                     _stale_idle = _sa.get("seconds_since_activity", float("inf"))
+                    _stale_progress = _format_activity_progress(
+                        _sa,
+                        include_slice=True,
+                        include_renewals=True,
+                    )
                     _stale_detail = (
                         f" | last_activity={_sa.get('last_activity_desc', 'unknown')} "
                         f"({_stale_idle:.0f}s ago) "
-                        f"| iteration={_sa.get('api_call_count', 0)}/{_sa.get('max_iterations', 0)}"
+                        f"| progress={_stale_progress or 'unknown'}"
                     )
                 except Exception:
                     pass
@@ -14644,21 +15167,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         history: List[Dict[str, Any]],
         session_key: Optional[str] = None,
     ) -> Optional[str]:
-        """Run inbound preprocessing under the routed profile when multiplexed."""
-        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return await self._prepare_inbound_message_text(
-                    event=event,
-                    source=source,
-                    history=history,
-                    session_key=session_key,
-                )
-        return await self._prepare_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
-            session_key=session_key,
-        )
+        """Run preprocessing under the exact constructor-frozen profile."""
+
+        with _profile_runtime_scope(
+            self._resolve_profile_home_for_source(source)
+        ):
+            return await self._prepare_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -14716,6 +15235,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, event, source, _quick_key: str, run_generation: int
     ):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        runtime_effect = self._runtime_effect_for_internal_event(event)
         _msg_start_time = time.time()
         _platform_name = (
             source.platform.value
@@ -15476,6 +15996,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # It must never finalize on close() — close()
                                     # would end the live gateway session row.
                                     _hyg_agent._end_session_on_close = False
+                                    # This helper shares the live session id.
+                                    # Teardown must not kill the foreground
+                                    # session's process/browser/sandbox state.
+                                    _hyg_agent._owns_runtime_resources = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
                                     loop = asyncio.get_running_loop()
@@ -15819,7 +16343,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _onb_cfg, PROFILE_BUILD_FLAG
                 ):
                     turn_sidecar_notes.append(profile_build_directive().strip())
-                    mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)
+                    mark_seen(
+                        _gateway_config_home() / "config.yaml",
+                        PROFILE_BUILD_FLAG,
+                    )
                 else:
                     turn_sidecar_notes.append(_intro_note)
             except Exception as _pb_err:
@@ -16049,6 +16576,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 real_user_message_present=_real_user_message_present,
                 canonical_workspace_boundary=_canonical_workspace_boundary,
+                runtime_effect=runtime_effect,
+                _delivery_lifecycle_event=event,
+            )
+            agent_result = _canonicalize_agent_result(agent_result)
+            event.logical_processing_outcome = _classify_agent_processing_outcome(
+                agent_result
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -16609,6 +17142,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._refresh_agent_cache_message_count(
                 session_key, session_entry.session_id
             )
+            if not is_context_overflow_failure:
+                # This host-only marker is the ACK boundary for direct
+                # internal turns and queued FIFO completions alike.  It must
+                # follow every transcript/session write above: adapter
+                # acceptance or a returned agent result is not persistence.
+                self._mark_internal_turn_persisted(event)
 
             # A model-authored structured outcome is a delivery decision, not
             # a transcript mutation. The assistant turn above remains in
@@ -16671,6 +17210,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
 
         except Exception as e:
+            # The user-facing error prose below may be delivered successfully,
+            # but transport success is not task success.  Stamp the logical
+            # failure before any early return so platform lifecycle hooks
+            # cannot emit ✅/processed or advance a recovery cursor for a
+            # swallowed agent/gateway exception.
+            event.logical_processing_outcome = ProcessingOutcome.FAILURE
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -16818,10 +17363,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         inside this method, so contextvars behave correctly in the worker
         thread.
         """
-        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+        with _profile_runtime_scope(
+            self._resolve_profile_home_for_source(source)
+        ):
+            return self._format_session_info()
 
     def _format_session_info(self) -> str:
         """Resolve current model config and return a formatted info block.
@@ -17021,7 +17566,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Only applies when the message originates in a thread.  In per-user
         thread mode (``thread_sessions_per_user=True``) each participant gets
         an isolated session key of the form
-        ``agent:main:{platform}:{chat_type}:{chat_id}:{thread_id}:{user_id}``,
+        ``agent:<profile>:{platform}:{chat_type}:{chat_id}:{thread_id}:{user_id}``,
         so a run started by another user is invisible to the caller's own
         ``/stop``.  This returns the keys of any *actually running* agents
         (not the pending sentinel, not the caller's own key) whose key shares
@@ -17041,8 +17586,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # shared-thread key or any key with a further (user_id) segment
         # (prefix + ":") avoids cross-matching an unrelated thread whose id
         # merely starts with this one.
+        own_parts = str(own_key or "").split(":")
+        if len(own_parts) < 2 or own_parts[0] != "agent":
+            return []
+        namespace = ":".join(own_parts[:2])
         prefix = ":".join([
-            "agent:main",
+            namespace,
             platform,
             chat_type,
             str(chat_id),
@@ -18524,7 +19073,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if lineage is None:
             return _CAPABILITY_GOAL_DISABLED
 
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._adapter_for_source(event.source)
         quick_key = self._session_key_for_source(event.source)
         prior_kickoff_objects: set[int] = set()
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -19588,7 +20137,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # perfectly intentional spoken answer.
         if not response:
             return False
-
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(
             self._voice_key(event.source.platform, chat_id), "off"
@@ -19854,11 +20402,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         resolve from that profile's secret scope. Mirrors the pattern in
         ``_run_agent``.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
-
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
@@ -19919,14 +20462,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
-            pr = self._provider_routing
+            pr = user_config.get("provider_routing", {})
+            if not isinstance(pr, dict):
+                pr = {}
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
-            self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            service_tier = self._resolve_session_service_tier(source=source)
+            fallback_model = (
+                None
+                if self._require_capability_canary
+                else get_fallback_chain(user_config) or None
+            )
+            turn_route = self._resolve_turn_agent_config(
+                prompt,
+                model,
+                runtime_kwargs,
+                service_tier=service_tier,
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -19959,7 +20513,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -19977,12 +20531,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=(
-                        None
-                        if self._require_capability_canary
-                        else self._refresh_fallback_model()
-                    ),
+                    fallback_model=fallback_model,
                     **self._agent_startup_isolation_kwargs(
                         source,
                         production_access=production_access,
@@ -22159,6 +22708,211 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("%s transcription failed: %s", log_context, trans_exc)
             return text, []
 
+    def _validated_async_delivery_profile_homes(
+        self,
+    ) -> Dict[str, tuple[str, "Path"]]:
+        """Return canonical homes this gateway is authorized to drain.
+
+        The async-delegation registry stamps queue events with an opaque,
+        process-private delivery-store token.  The token proves which
+        ``state.db`` owns the row, but a multiplexing gateway must additionally
+        prove that the home belongs to one of the profiles it was configured to
+        serve before opening that database or routing a notification.
+        """
+
+        cached = getattr(self, "_async_delivery_profile_homes", None)
+        if isinstance(cached, dict):
+            return cached
+
+        from tools.async_delegation import (
+            event_delivery_store_from_profile_identity,
+        )
+
+        validated: Dict[str, tuple[str, Path]] = {}
+        stores = {}
+        for identity in self._freeze_served_profile_inventory():
+            try:
+                store = event_delivery_store_from_profile_identity(
+                    identity
+                )
+            except Exception as exc:
+                raise MultiplexConfigError(
+                    "Cannot freeze async-delivery profile home for "
+                    f"{identity.profile!r}: {exc}"
+                ) from exc
+            source_home = Path(store.source_home)
+            canonical_profile = str(store.profile or identity.profile)
+            if store.hermes_home in validated:
+                other_profile = validated[store.hermes_home][0]
+                raise MultiplexConfigError(
+                    f"Profiles {other_profile!r} and {canonical_profile!r} "
+                    "share one async-delivery home"
+                )
+            validated[store.hermes_home] = (
+                canonical_profile,
+                source_home,
+            )
+            stores[store.hermes_home] = store
+
+        self._async_delivery_profile_homes = validated
+        self._async_delivery_profile_stores = stores
+        return validated
+
+    def _completion_event_delivery_context(
+        self,
+        evt: dict,
+    ) -> tuple[Optional[str], Optional["Path"], Optional[str]]:
+        """Resolve trusted profile/home metadata for one completion event.
+
+        Persisted event JSON is intentionally not trusted to name a profile or
+        filesystem path.  A private in-memory registry stamp is accepted only
+        when its canonical home is in the gateway's validated served-profile
+        set. Legacy events without a stamp retain the session-key-only routing
+        behavior and never gain filesystem authority.
+        """
+
+        from tools.async_delegation import (
+            _verify_event_delivery_store,
+            event_has_delivery_store_stamp,
+            get_event_delivery_store,
+        )
+
+        store = get_event_delivery_store(evt)
+        parsed = _parse_session_key(str(evt.get("session_key") or ""))
+        parsed_profile = parsed.get("profile") if parsed else None
+        if store is None:
+            if event_has_delivery_store_stamp(evt):
+                raise AsyncDeliveryProfileMismatch(
+                    "async completion has a forged or stale delivery-store stamp"
+                )
+            return parsed_profile, None, None
+
+        try:
+            _verify_event_delivery_store(store)
+        except Exception as exc:
+            raise AsyncDeliveryProfileMismatch(
+                "async completion profile directory changed after dispatch"
+            ) from exc
+
+        validated = self._validated_async_delivery_profile_homes()
+        served = validated.get(store.hermes_home)
+        if served is None:
+            raise RuntimeError(
+                "async completion belongs to a profile home this gateway "
+                "is not authorized to serve"
+            )
+        served_profile, profile_home = served
+        frozen_store = getattr(
+            self,
+            "_async_delivery_profile_stores",
+            {},
+        ).get(store.hermes_home)
+        if (
+            frozen_store is None
+            or frozen_store.hermes_home != store.hermes_home
+            or frozen_store.source_home != store.source_home
+            or frozen_store.profile_generation != store.profile_generation
+            or str(frozen_store.profile or "default")
+            != str(store.profile or "default")
+        ):
+            raise AsyncDeliveryProfileMismatch(
+                "async completion delivery-store generation is not the "
+                "runner's frozen profile identity"
+            )
+        stamped_profile = str(store.profile or served_profile)
+        if stamped_profile != served_profile:
+            raise AsyncDeliveryProfileMismatch(
+                "async completion delivery-store profile/home mismatch"
+            )
+        if parsed is not None:
+            # Under multiplexing agent:main is specifically the default
+            # profile. In a legacy single-profile gateway the same namespace
+            # belongs to whichever profile launched the process.
+            key_profile = parsed_profile
+            if key_profile is None and bool(
+                getattr(
+                    getattr(self, "config", None),
+                    "multiplex_profiles",
+                    False,
+                )
+            ):
+                key_profile = "default"
+            if key_profile and key_profile != served_profile:
+                raise AsyncDeliveryProfileMismatch(
+                    "async completion session-key profile does not match its "
+                    "delivery store"
+                )
+        # Only structured gateway keys carry a profile namespace that can be
+        # cross-checked against SessionStore/cache routing. API-server sessions
+        # intentionally use arbitrary raw ids; consulting the shared routing
+        # cache for those would let an unrelated/default entry with the same
+        # string falsely quarantine a trusted named-profile completion.
+        if parsed is not None:
+            source_candidate = None
+            try:
+                session_store = getattr(self, "session_store", None)
+                if session_store is not None:
+                    session_store._ensure_loaded()
+                    entry = session_store._entries.get(
+                        str(evt.get("session_key") or "").strip()
+                    )
+                    source_candidate = (
+                        getattr(entry, "origin", None) if entry else None
+                    )
+            except Exception:
+                source_candidate = None
+            if source_candidate is None:
+                source_candidate = self._get_cached_session_source(
+                    str(evt.get("session_key") or "").strip()
+                )
+            source_profile = str(
+                getattr(source_candidate, "profile", "") or ""
+            )
+            if source_profile and source_profile != served_profile:
+                raise AsyncDeliveryProfileMismatch(
+                    "async completion persisted source profile does not match "
+                    "its delivery store"
+                )
+        return (
+            served_profile,
+            profile_home,
+            store.profile_generation,
+        )
+
+    def _restore_async_delegations_for_served_profiles(self) -> int:
+        """Restore every served profile's durable completions exactly once."""
+
+        from tools.process_registry import process_registry
+
+        restored = 0
+        self._validated_async_delivery_profile_homes()
+        for store in getattr(
+            self,
+            "_async_delivery_profile_stores",
+            {},
+        ).values():
+            try:
+                restored += process_registry.restore_async_delegation_completions(
+                    delivery_store=store,
+                    once=True,
+                )
+            except Exception:
+                # One damaged/unavailable profile must not suppress replay for
+                # every other independently served profile.
+                logger.warning(
+                    "Could not restore async delegations for profile %r",
+                    store.profile,
+                    exc_info=True,
+                )
+        if restored:
+            logger.info(
+                "Restored %d durable async-delegation completion(s) across "
+                "%d served profile home(s)",
+                restored,
+                len(self._validated_async_delivery_profile_homes()),
+            )
+        return restored
+
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
 
@@ -22169,16 +22923,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session import SessionSource
 
         session_key = str(evt.get("session_key") or "").strip()
+        try:
+            delivery_profile, _delivery_home, _delivery_generation = (
+                self._completion_event_delivery_context(evt)
+            )
+        except AsyncDeliveryProfileMismatch:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Synthetic completion event has invalid delivery profile: %s",
+                exc,
+            )
+            return None
+
+        def _profile_bound(source):
+            source_profile = str(getattr(source, "profile", "") or "")
+            if not delivery_profile:
+                return source
+            if source_profile and source_profile != delivery_profile:
+                raise AsyncDeliveryProfileMismatch(
+                    "synthetic completion persisted source profile does not "
+                    "match its delivery store"
+                )
+            if source_profile == delivery_profile:
+                return source
+            try:
+                return dataclasses.replace(source, profile=delivery_profile)
+            except Exception:
+                logger.warning(
+                    "Synthetic completion source could not be profile-bound",
+                    exc_info=True,
+                )
+                return None
+
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
 
-        if session_key:
+        parsed_session_key = _parse_session_key(session_key) if session_key else None
+        if parsed_session_key is not None:
+            # Persisted/cache routing is keyed by structured gateway session
+            # keys. Raw API session ids are caller-chosen and can collide with
+            # unrelated entries; they are resolved later through the trusted
+            # delivery profile plus origin_session_id.
             try:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _profile_bound(entry.origin)
+            except AsyncDeliveryProfileMismatch:
+                raise
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -22188,13 +22982,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _profile_bound(cached_source)
 
-            _parsed = _parse_session_key(session_key)
-            if _parsed:
-                derived_platform = _parsed["platform"]
-                derived_chat_type = _parsed["chat_type"]
-                derived_chat_id = _parsed["chat_id"]
+            derived_platform = parsed_session_key["platform"]
+            derived_chat_type = parsed_session_key["chat_type"]
+            derived_chat_id = parsed_session_key["chat_id"]
 
         platform_name = (
             str(evt.get("platform") or derived_platform or "").strip().lower()
@@ -22241,6 +23033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            profile=delivery_profile,
         )
 
     async def _inject_watch_notification(
@@ -22255,6 +23048,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        from agent.runtime_effects import normalize_optional_runtime_effect
+        from gateway.wake import DurableWakeDeferredError
+
+        runtime_effect = normalize_optional_runtime_effect(
+            evt.get("runtime_effect")
+        )
+        try:
+            (
+                delivery_profile,
+                delivery_home,
+                delivery_generation,
+            ) = (
+                self._completion_event_delivery_context(evt)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Watch notification has an unauthorized delivery profile: %s",
+                exc,
+            )
+            return False
+        wake_profile = (
+            delivery_profile
+            if delivery_profile and delivery_profile != "default"
+            else None
+        )
+
+        async def _deliver_api_wake(adapter, raw_session_id: str) -> None:
+            from gateway.wake import deliver_wake
+
+            kwargs = {
+                "text": synth_text,
+                "session_id": raw_session_id,
+                "runtime_effect": runtime_effect,
+                "producer_id": str(
+                    evt.get("delegation_id")
+                    or evt.get("session_id")
+                    or ""
+                ),
+                "profile": wake_profile,
+                "execution_context": evt.get("api_execution_context"),
+            }
+            if delivery_home is not None:
+                kwargs["delivery_home"] = delivery_home
+                kwargs["profile_generation"] = delivery_generation
+                kwargs["durable_wake_required"] = True
+                kwargs["durable_delegation_id"] = str(
+                    evt.get("delegation_id") or ""
+                )
+                kwargs["durable_execution_owner"] = "api"
+                # The API adapter caches SessionDB handles by the currently
+                # scoped home. Enter the exact validated event home both for
+                # compression-tip resolution and for the HTTP self-post.
+                with _profile_runtime_scope(delivery_home):
+                    await deliver_wake(adapter, **kwargs)
+            else:
+                await deliver_wake(adapter, **kwargs)
+
         source = self._build_process_event_source(evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -22270,8 +23120,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _sk and _parse_session_key(_sk) is None:
                     raw_sid = _sk
             if raw_sid:
-                adapter = self.adapters.get(Platform.API_SERVER)
-                from gateway.wake import adapter_supports_push, deliver_wake
+                api_source = SessionSource(
+                    platform=Platform.API_SERVER,
+                    chat_id=raw_sid,
+                    chat_type="dm",
+                    profile=delivery_profile,
+                )
+                adapter = self._adapter_for_source(api_source)
+                if adapter is None:
+                    # A single-profile process owns at most one API listener.
+                    adapter = (
+                        getattr(self, "adapters", {}) or {}
+                    ).get(Platform.API_SERVER)
+                from gateway.wake import adapter_supports_push
                 if adapter is not None and not adapter_supports_push(adapter):
                     try:
                         logger.info(
@@ -22279,8 +23140,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await _deliver_api_wake(adapter, raw_sid)
                         return True
+                    except DurableWakeDeferredError:
+                        # The API boundary proved either zero execution or an
+                        # already-live durable owner. Preserve that typed
+                        # evidence for the outer carrier's no-budget release.
+                        raise
                     except Exception as e:
                         logger.warning(
                             "Watch notification self-post wake failed for "
@@ -22293,7 +23159,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "api_server adapter to self-post through",
                     raw_sid,
                 )
-                return None
+                return (
+                    False
+                    if delivery_profile and delivery_profile != "default"
+                    else None
+                )
             logger.warning(
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
@@ -22304,13 +23174,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hasattr(source.platform, "value")
             else str(source.platform)
         )
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self._adapter_for_source(source)
+        if adapter is None and source.platform == Platform.API_SERVER:
+            adapter = (
+                getattr(self, "adapters", {}) or {}
+            ).get(Platform.API_SERVER)
         if not adapter:
-            return None
+            return (
+                False
+                if getattr(source, "profile", None)
+                not in (None, "", "default")
+                else None
+            )
         from gateway.wake import adapter_supports_push as _wake_push_ok
         if not _wake_push_ok(adapter):
             # Non-push adapter (api_server) resolved WITH routing metadata:
@@ -22318,7 +23193,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which binds chat_id = session_id). handle_message would run the
             # wake under a build_session_key()-derived key that never matches
             # the raw X-Hermes-Session-Id session — self-post instead.
-            from gateway.wake import deliver_wake
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
             try:
                 logger.info(
@@ -22326,8 +23200,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await _deliver_api_wake(adapter, raw_sid)
                 return True
+            except DurableWakeDeferredError:
+                # Do not collapse a proven transient durable-wake rejection
+                # into the generic ambiguous ``False`` result.
+                raise
             except Exception as e:
                 logger.warning(
                     "Watch notification self-post wake failed for session "
@@ -22340,6 +23218,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if runtime_effect is not None:
+                metadata["runtime_effect"] = runtime_effect
+            delivery_future = asyncio.get_running_loop().create_future()
+            metadata["_hermes_internal_delivery_future"] = delivery_future
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -22355,25 +23237,154 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.thread_id,
             )
             await adapter.handle_message(synth_event)
-            return True
+            # ``handle_message`` schedules work and returns immediately.  The
+            # future is resolved either by BasePlatformAdapter after the
+            # awaited handler returns, or by GatewayRunner's in-band FIFO
+            # recursion when this event is consumed inside an existing turn.
+            if not delivery_future.done():
+                # Lightweight adapter doubles (and legacy non-Base adapters)
+                # have no background-task lifecycle to observe: their awaited
+                # handle_message call is the complete handler boundary.
+                if not hasattr(adapter, "_active_sessions"):
+                    delivery_future.set_result(True)
+                    return bool(await delivery_future)
+                try:
+                    adapter_extra = (
+                        getattr(adapter.config, "extra", None) or {}
+                    )
+                    delivery_session_key = build_session_key(
+                        source,
+                        group_sessions_per_user=adapter_extra.get(
+                            "group_sessions_per_user",
+                            True,
+                        ),
+                        thread_sessions_per_user=adapter_extra.get(
+                            "thread_sessions_per_user",
+                            False,
+                        ),
+                        profile=getattr(source, "profile", None),
+                    )
+                except Exception:
+                    delivery_session_key = ""
+                if (
+                    not delivery_session_key
+                    or (
+                        delivery_session_key
+                        not in getattr(adapter, "_active_sessions", {})
+                        and delivery_session_key
+                        not in getattr(adapter, "_pending_messages", {})
+                    )
+                ):
+                    delivery_future.set_result(False)
+            return bool(await delivery_future)
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
 
     @staticmethod
+    def _runtime_effect_for_internal_event(event) -> Optional[dict]:
+        """Read one validated host effect; authored events are powerless."""
+
+        if not getattr(event, "internal", False):
+            return None
+        from agent.runtime_effects import normalize_optional_runtime_effect
+
+        metadata = getattr(event, "metadata", None)
+        raw_effect = (
+            metadata.get("runtime_effect")
+            if isinstance(metadata, dict)
+            else None
+        )
+        return normalize_optional_runtime_effect(raw_effect)
+
+    @staticmethod
+    def _mark_internal_turn_persisted(event) -> None:
+        """Mark one lifecycle event only after transcript/session persistence.
+
+        The lifecycle event may be an authored outer turn carrying an in-band
+        internal FIFO completion.  The marker itself is host-authored and is
+        never trusted from inbound metadata.
+        """
+
+        metadata = getattr(event, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata["_hermes_internal_turn_persisted"] = True
+
+    @classmethod
+    def _settle_internal_delivery_event(cls, event, succeeded: bool) -> None:
+        """Resolve an in-band queued event that never gets its own base task."""
+
+        if not getattr(event, "internal", False):
+            return
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        if succeeded:
+            cls._mark_internal_turn_persisted(event)
+        future = metadata.pop("_hermes_internal_delivery_future", None)
+        if future is not None and not future.done():
+            future.set_result(bool(succeeded))
+
+    @classmethod
+    def _defer_internal_delivery_success(
+        cls,
+        event,
+        lifecycle_event,
+    ) -> None:
+        """Resolve a queued in-band wake only at the outer adapter boundary."""
+
+        if not getattr(event, "internal", False):
+            return
+        metadata = getattr(event, "metadata", None)
+        lifecycle_metadata = getattr(lifecycle_event, "metadata", None)
+        if not isinstance(metadata, dict) or not isinstance(
+            lifecycle_metadata,
+            dict,
+        ):
+            # Without an outer lifecycle persistence boundary, success cannot
+            # be proven.  Fail closed and leave the durable row retryable.
+            cls._settle_internal_delivery_event(event, False)
+            return
+        future = metadata.pop("_hermes_internal_delivery_future", None)
+        if future is None or future.done():
+            return
+        lifecycle_metadata.setdefault(
+            "_hermes_deferred_internal_delivery_futures",
+            [],
+        ).append((future, None))
+
+    @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
         """Return a producer-stable identity when one is available.
 
-        Delegation UUIDs identify one producer completion. Process session IDs
-        are normally unique too, but include the persisted spawn epoch so an
-        explicitly reused ID represents a distinct process incarnation. Legacy
-        process events without ``started_at`` are delivered without deduplication
-        rather than risking suppression of a real completion.
+        Delegation UUIDs identify one producer completion only inside their
+        authoritative profile store.  A multiplex gateway can legitimately
+        serve two stores containing the same UUID, so durable identities include
+        the canonical store home.  Legacy unstamped events retain the historical
+        empty scope. Process session IDs are normally unique too, but include
+        the persisted spawn epoch so an explicitly reused ID represents a
+        distinct process incarnation. Legacy process events without
+        ``started_at`` are delivered without deduplication rather than risking
+        suppression of a real completion.
         """
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
-            return (evt_type, producer_id, "") if producer_id else None
+            if not producer_id:
+                return None
+            from tools.async_delegation import (
+                event_has_delivery_store_stamp,
+                get_event_delivery_store,
+            )
+
+            store = get_event_delivery_store(evt)
+            if event_has_delivery_store_stamp(evt) and store is None:
+                # The caller's authorization gate rejects forged/stale
+                # capabilities before delivery.  Refuse to create an ambient
+                # legacy identity here as a second fail-closed boundary.
+                return None
+            store_scope = store.hermes_home if store is not None else ""
+            return evt_type, producer_id, store_scope
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -22381,7 +23392,188 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return (evt_type, producer_id, started_at)
         return None
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    @staticmethod
+    def _completion_retry_identity(
+        evt: dict,
+    ) -> Optional[tuple[str, str]]:
+        """Return the durable, profile-scoped identity for one retry carrier."""
+
+        if evt.get("type") != "async_delegation":
+            return None
+        delegation_id = str(evt.get("delegation_id") or "")
+        if not delegation_id:
+            return None
+        from tools.async_delegation import (
+            event_has_delivery_store_stamp,
+            get_event_delivery_store,
+        )
+
+        store = get_event_delivery_store(evt)
+        if event_has_delivery_store_stamp(evt) and store is None:
+            # A present but unresolvable capability is forged/stale. Never turn
+            # it into an ambient filesystem lookup or an immortal timer.
+            return None
+        store_key = (
+            str(Path(store.hermes_home).expanduser().resolve())
+            if store is not None
+            else "legacy-ambient-store"
+        )
+        return store_key, delegation_id
+
+    def _schedule_completion_delivery_retry(
+        self,
+        evt: dict,
+        *,
+        minimum_seconds: float = _COMPLETION_RETRY_MIN_SECONDS,
+        _delay_override: Optional[float] = None,
+    ) -> Optional[bool]:
+        """Keep one delayed queue carrier for a pending durable completion.
+
+        ``True`` means a carrier exists, ``None`` means the authoritative row
+        is terminal/missing, and ``False`` means a carrier could not be
+        scheduled. Every timer rechecks the event-scoped durable store before
+        enqueueing, so a foreign fresh lease waits without hot-spinning and a
+        row settled by the old gateway is never replayed.
+        """
+
+        try:
+            identity = self._completion_retry_identity(evt)
+        except Exception:
+            logger.warning(
+                "Could not resolve gateway completion retry identity",
+                exc_info=True,
+            )
+            return False
+        if identity is None:
+            return None
+
+        minimum = max(0.01, float(minimum_seconds))
+        if _delay_override is None:
+            try:
+                from tools.async_delegation import event_delivery_retry_delay
+
+                delay = event_delivery_retry_delay(
+                    evt,
+                    minimum_seconds=minimum,
+                )
+            except Exception:
+                # A transient SQLite error is not evidence that the event is
+                # terminal. Keep a conservative carrier whose callback repeats
+                # the authoritative read.
+                logger.warning(
+                    "Could not inspect async delegation %s retry state; "
+                    "scheduling a conservative gateway recheck",
+                    identity[1],
+                    exc_info=True,
+                )
+                delay = max(
+                    minimum,
+                    _COMPLETION_RETRY_STORAGE_ERROR_SECONDS,
+                )
+        else:
+            delay = max(minimum, float(_delay_override))
+        if delay is None:
+            return None
+
+        timer: threading.Timer
+
+        def _retry() -> None:
+            with self._completion_retry_lock:
+                if self._completion_retry_timers.get(identity) is not timer:
+                    return
+                self._completion_retry_timers.pop(identity, None)
+            if not self._running:
+                # Shutdown/startup recovery restores the still-pending row.
+                return
+            try:
+                from tools.async_delegation import event_delivery_retry_delay
+
+                next_delay = event_delivery_retry_delay(
+                    evt,
+                    minimum_seconds=minimum,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not recheck async delegation %s retry state; "
+                    "retaining its delayed gateway carrier",
+                    identity[1],
+                    exc_info=True,
+                )
+                self._schedule_completion_delivery_retry(
+                    evt,
+                    minimum_seconds=minimum,
+                    _delay_override=max(
+                        minimum,
+                        _COMPLETION_RETRY_STORAGE_ERROR_SECONDS,
+                    ),
+                )
+                return
+            if next_delay is None:
+                return
+            if next_delay > minimum + 0.001:
+                # The foreign lease was renewed. Retain one delayed carrier
+                # until its new deadline instead of spinning the shared queue.
+                self._schedule_completion_delivery_retry(
+                    evt,
+                    minimum_seconds=minimum,
+                    _delay_override=next_delay,
+                )
+                return
+            from tools.process_registry import process_registry
+
+            process_registry.completion_queue.put(evt)
+
+        delay_seconds = float(delay)
+        retry_deadline = time.monotonic() + delay_seconds
+        timer = threading.Timer(delay_seconds, _retry)
+        timer.daemon = True
+        timer._hermes_retry_deadline = retry_deadline
+        with self._completion_retry_lock:
+            existing = self._completion_retry_timers.get(identity)
+            if existing is not None:
+                existing_deadline = float(
+                    getattr(
+                        existing,
+                        "_hermes_retry_deadline",
+                        float("inf"),
+                    )
+                )
+                if existing_deadline <= retry_deadline + 0.001:
+                    return True
+            # Publish only after start succeeds. If replacement scheduling
+            # fails, the older valid carrier remains uncancelled and registered.
+            try:
+                timer.start()
+            except Exception:
+                logger.warning(
+                    "Could not start async delegation %s gateway retry timer",
+                    identity[1],
+                    exc_info=True,
+                )
+                return False
+            if existing is not None:
+                existing.cancel()
+            self._completion_retry_timers[identity] = timer
+        return True
+
+    def _cancel_completion_retry_timers(self) -> None:
+        """Cancel local timers; durable pending rows survive for restoration."""
+
+        retry_lock = getattr(self, "_completion_retry_lock", None)
+        retry_timers = getattr(self, "_completion_retry_timers", None)
+        if retry_lock is None or not isinstance(retry_timers, dict):
+            return
+        with retry_lock:
+            timers = list(retry_timers.values())
+            retry_timers.clear()
+        for timer in timers:
+            timer.cancel()
+
+    async def _classify_completion_target(
+        self,
+        parent_session_id: str,
+        evt: Optional[dict] = None,
+    ) -> str:
         """Classify an async-completion delivery target before adapter acceptance.
 
         Returns one of:
@@ -22400,65 +23592,298 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           continuation exists). The claim should be released so a later
           consumer can retry; the attempt cap bounds the churn.
         """
+        # Push-platform conversations for every multiplexed profile share the
+        # runner-owned gateway SessionStore / SessionDB.  Their profile is a
+        # namespace in the routing key; it does *not* move the transcript into
+        # the profile's durable async-result store.  Stateless/non-push
+        # adapters (currently api_server) are different: their request path
+        # opens state.db under the selected profile home.  Keep those two
+        # authorities separate — the completion row's DB proves who may settle
+        # the result, while the delivery adapter decides which DB owns the
+        # target conversation.
         session_db = getattr(self, "_session_db", None)
+        dedicated_db = None
+        if evt is not None:
+            try:
+                _profile, profile_home, _profile_generation = (
+                    self._completion_event_delivery_context(evt)
+                )
+            except Exception:
+                logger.warning(
+                    "Async-completion pre-flight rejected an unauthorized "
+                    "delivery store",
+                    exc_info=True,
+                )
+                return "retry"
+
+            route_source = self._build_process_event_source(evt)
+            route_adapter = (
+                self._adapter_for_source(route_source)
+                if route_source is not None
+                else None
+            )
+            raw_api_session_id = str(
+                evt.get("origin_session_id") or ""
+            ).strip()
+            raw_session_key = str(evt.get("session_key") or "").strip()
+            if (
+                route_adapter is None
+                and (
+                    (
+                        route_source is not None
+                        and route_source.platform == Platform.API_SERVER
+                    )
+                    or (
+                        raw_api_session_id
+                        and raw_session_key
+                        and _parse_session_key(raw_session_key) is None
+                    )
+                )
+            ):
+                # API completions intentionally carry the caller's raw
+                # X-Hermes-Session-Id rather than a structured gateway key, so
+                # _build_process_event_source() cannot resolve them. A nonempty
+                # origin_session_id is captured only by the host's non-push
+                # dispatch path; use the one shared API listener to classify
+                # its profile-owned conversation DB.
+                route_adapter = (
+                    getattr(self, "adapters", {}) or {}
+                ).get(Platform.API_SERVER)
+
+            from gateway.wake import adapter_supports_push
+
+            uses_profile_session_db = (
+                route_source is not None
+                and route_source.platform == Platform.API_SERVER
+            ) or (
+                route_adapter is not None
+                and not adapter_supports_push(route_adapter)
+            )
+            if uses_profile_session_db and profile_home is not None:
+                try:
+                    from hermes_state import AsyncSessionDB, SessionDB
+
+                    # hermes_state.DEFAULT_DB_PATH is fixed at import time, so
+                    # pass the API request profile's path explicitly. Read-only
+                    # keeps this short-lived classifier from becoming a second
+                    # writer. Push delivery deliberately stays on the shared
+                    # runner DB above.
+                    dedicated_db = SessionDB(
+                        Path(profile_home) / "state.db",
+                        read_only=True,
+                    )
+                    session_db = AsyncSessionDB(dedicated_db)
+                except Exception:
+                    logger.debug(
+                        "Async-completion profile SessionDB open failed for %s",
+                        profile_home,
+                        exc_info=True,
+                    )
+                    if dedicated_db is not None:
+                        try:
+                            await asyncio.to_thread(dedicated_db.close)
+                        except Exception:
+                            logger.debug(
+                                "Partially opened async-completion SessionDB "
+                                "could not be closed",
+                                exc_info=True,
+                            )
+                    return "retry"
         if session_db is None:
             return "retry"
-        try:
-            parent = await session_db.get_session(parent_session_id)
-        except Exception:
-            logger.debug(
-                "Async-completion pre-flight parent lookup failed for %s",
-                parent_session_id, exc_info=True,
-            )
-            return "retry"
-        if parent is None:
-            return "terminal"
-        if not parent.get("ended_at"):
-            return "deliver"
-        if parent.get("end_reason") != "compression":
-            return "terminal"
-        try:
-            tip_session_id = await session_db.get_compression_tip(parent_session_id)
-            if not tip_session_id or tip_session_id == parent_session_id:
-                # Rotation caught mid-flight: parent is compression-ended but
-                # its continuation isn't visible yet. Retry, don't drop.
+
+        async def _classify_with_db() -> str:
+            try:
+                parent = await session_db.get_session(parent_session_id)
+            except Exception:
+                logger.debug(
+                    "Async-completion pre-flight parent lookup failed for %s",
+                    parent_session_id,
+                    exc_info=True,
+                )
                 return "retry"
-            tip = await session_db.get_session(tip_session_id)
-        except Exception:
-            logger.debug(
-                "Async-completion pre-flight tip lookup failed for %s",
-                parent_session_id, exc_info=True,
+            if parent is None:
+                return "terminal"
+            if not parent.get("ended_at"):
+                return "deliver"
+            if parent.get("end_reason") != "compression":
+                return "terminal"
+            try:
+                tip_session_id = await session_db.get_compression_tip(
+                    parent_session_id
+                )
+                if not tip_session_id or tip_session_id == parent_session_id:
+                    # Rotation caught mid-flight: parent is compression-ended
+                    # but its continuation isn't visible yet. Retry, don't
+                    # drop.
+                    return "retry"
+                tip = await session_db.get_session(tip_session_id)
+            except Exception:
+                logger.debug(
+                    "Async-completion pre-flight tip lookup failed for %s",
+                    parent_session_id,
+                    exc_info=True,
+                )
+                return "retry"
+            return (
+                "retry"
+                if tip is None or tip.get("ended_at")
+                else "deliver"
             )
-            return "retry"
-        if tip is None or tip.get("ended_at"):
-            return "retry"
-        return "deliver"
+
+        try:
+            return await _classify_with_db()
+        finally:
+            if dedicated_db is not None:
+                try:
+                    await asyncio.to_thread(dedicated_db.close)
+                except Exception:
+                    logger.debug(
+                        "Async-completion profile SessionDB close failed",
+                        exc_info=True,
+                    )
 
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
-        """Deliver once per live gateway, or return False for a retry.
+        """Deliver one completion, or return False for a replay-safe retry.
 
-        ``True`` means this caller reached adapter acceptance, ``False`` means
-        injection failed and the claim was released for retry, and ``None``
-        means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
-        guarantee is claimed.
+        ``True`` means the synthetic turn returned through its durable agent
+        boundary, ``False`` means injection failed and the claim was released
+        for retry, and ``None`` means another consumer owns/delivered it or the
+        target is terminal. Durable model/tool execution is cross-process
+        at-most-once: an unproven crash gap becomes ``uncertain`` and is
+        quarantined instead of re-executed. The outer delivery carrier may
+        still replay to reconcile an already-committed persistence receipt.
         """
+        try:
+            self._completion_event_delivery_context(evt)
+        except AsyncDeliveryProfileMismatch as exc:
+            # The store token identifies the only DB we may settle, while the
+            # mismatching session/source profile proves injection would cross
+            # a tenant boundary. Quarantine the authoritative row when it can
+            # still be claimed; a forged/stale token cannot resolve a store
+            # and is simply discarded from this process queue.
+            try:
+                from tools.async_delegation import (
+                    claim_event_delivery,
+                    drop_event_delivery,
+                )
+
+                invalid_claim = claim_event_delivery(
+                    evt,
+                    f"gateway-profile-mismatch:{id(self)}",
+                )
+                if invalid_claim is not None:
+                    drop_event_delivery(evt, invalid_claim)
+            except Exception:
+                logger.debug(
+                    "Could not quarantine profile-mismatched async completion",
+                    exc_info=True,
+                )
+            logger.error(
+                "Discarded profile-mismatched async completion: %s",
+                exc,
+            )
+            return None
+        except Exception:
+            # Authorization of the durable store must precede *all* settlement,
+            # including malformed-runtime-effect quarantine. A valid store
+            # outside this gateway's served set may belong to another consumer;
+            # never inject, claim, or terminally settle it here.
+            logger.warning(
+                "Async completion delivery store is not currently routable",
+                exc_info=True,
+            )
+            return False
+
+        from agent.runtime_effects import (
+            RuntimeEffectError,
+            normalize_optional_runtime_effect,
+        )
+
+        try:
+            normalized_runtime_effect = normalize_optional_runtime_effect(
+                evt.get("runtime_effect")
+            )
+        except RuntimeEffectError:
+            delegation_id = str(evt.get("delegation_id") or "")
+            if evt.get("type") == "async_delegation" and delegation_id:
+                try:
+                    from tools.async_delegation import (
+                        claim_event_delivery,
+                        drop_event_delivery,
+                    )
+
+                    invalid_claim = claim_event_delivery(
+                        evt,
+                        f"gateway-invalid:{id(self)}",
+                    )
+                    if invalid_claim is not None:
+                        drop_event_delivery(evt, invalid_claim)
+                except Exception:
+                    logger.debug(
+                        "Could not terminally drop malformed async completion",
+                        exc_info=True,
+                    )
+            logger.error(
+                "Discarded malformed runtime effect on gateway completion",
+                exc_info=True,
+            )
+            return None
+        if "runtime_effect" in evt:
+            # Replace aliases/mutable input with the closed canonical clone
+            # before the next host boundary revalidates it.
+            evt["runtime_effect"] = normalized_runtime_effect
+
+        # A disconnected secondary adapter is a transient routing condition,
+        # not proof that the durable event is undeliverable. Detect it before
+        # claiming so a reconnect delay cannot burn the bounded delivery
+        # attempt budget.
+        if evt.get("type") == "async_delegation":
+            parsed_key = _parse_session_key(
+                str(evt.get("session_key") or "")
+            )
+            if parsed_key is not None:
+                route_source = self._build_process_event_source(evt)
+                if route_source is not None:
+                    route_profile = str(
+                        getattr(route_source, "profile", "") or ""
+                    )
+                    route_adapter = self._adapter_for_source(route_source)
+                    if (
+                        route_adapter is None
+                        and route_source.platform == Platform.API_SERVER
+                    ):
+                        # api_server is one shared port-binding adapter; the
+                        # profile is selected by the self-post URL.
+                        route_adapter = (
+                            getattr(self, "adapters", {}) or {}
+                        ).get(Platform.API_SERVER)
+                    if (
+                        route_profile
+                        and route_profile != "default"
+                        and route_adapter is None
+                    ):
+                        return False
+
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
+        stop_delivery_renewal = lambda: None
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import claim_event_delivery
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
+                    claimed = claim_event_delivery(
+                        evt,
+                        f"gateway:{id(self)}",
+                    )
+                    if claimed is None:
                         return None
+                    durable_claim_id = claimed
                 except Exception as exc:
                     logger.warning(
                         "Could not claim durable async completion %s: %s",
@@ -22473,7 +23898,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # would falsely acknowledge the durable row as delivered.
                 # Verify the target here, before acceptance, and give drops an
                 # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
+                verdict = await self._classify_completion_target(
+                    parent_session_id,
+                    evt,
+                )
                 if verdict == "terminal":
                     logger.warning(
                         "Async delegation %s targets permanently-gone session %s; "
@@ -22483,11 +23911,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if durable_claim_id:
                         try:
-                            from tools.async_delegation import drop_completion_delivery
+                            from tools.async_delegation import drop_event_delivery
 
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
+                            drop_event_delivery(evt, durable_claim_id)
                         except Exception:
                             logger.debug(
                                 "Could not drop durable completion claim",
@@ -22497,10 +23923,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if verdict == "retry":
                     if durable_claim_id:
                         try:
-                            from tools.async_delegation import release_completion_delivery
+                            from tools.async_delegation import (
+                                release_event_delivery_without_attempt,
+                            )
 
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
+                            release_event_delivery_without_attempt(
+                                evt,
+                                durable_claim_id,
                             )
                         except Exception:
                             logger.debug(
@@ -22514,16 +23943,335 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     identity in self._completion_deliveries_inflight
                     or identity in self._completion_deliveries_delivered
                 ):
+                    if durable_claim_id:
+                        try:
+                            from tools.async_delegation import (
+                                release_event_delivery_without_attempt,
+                            )
+
+                            release_event_delivery_without_attempt(
+                                evt,
+                                durable_claim_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Could not release duplicate async completion "
+                                "%s delivery claim",
+                                durable_delegation_id,
+                                exc_info=True,
+                            )
                     return None
                 self._completion_deliveries_inflight.add(identity)
 
-        accepted = False
-        try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
-            if injection_result is not True:
-                return injection_result
-            accepted = True
+        if durable_claim_id:
+            from tools.async_delegation import begin_event_delivery_renewal
 
+            stop_delivery_renewal = begin_event_delivery_renewal(
+                evt,
+                durable_claim_id,
+            )
+
+        accepted = False
+        delivery_settled = False
+        delivery_claim_handled = False
+        wake_claim_id = ""
+        wake_execution_fingerprint = ""
+        wake_execution_completed = False
+        wake_failure_reason = (
+            "durable push wake ended before its persistence receipt was "
+            "committed; outcome may include effects"
+        )
+
+        def _release_delivery_without_attempt() -> bool:
+            """Resolve this carrier lease without spending retry budget."""
+
+            nonlocal delivery_claim_handled
+            if not durable_claim_id:
+                return True
+            stop_delivery_renewal()
+            delivery_claim_handled = True
+            try:
+                from tools.async_delegation import (
+                    release_event_delivery_without_attempt,
+                )
+
+                return bool(
+                    release_event_delivery_without_attempt(
+                        evt,
+                        durable_claim_id,
+                    )
+                )
+            except Exception:
+                # Do not fall through to the ordinary bounded release: a
+                # storage failure cannot invalidate the downstream proof that
+                # this attempt was transient. Leave the lease to expire so a
+                # restart/retry can reconcile it without corrupting budget.
+                logger.warning(
+                    "Could not release durable async completion %s without "
+                    "consuming an attempt",
+                    durable_delegation_id,
+                    exc_info=True,
+                )
+                return False
+
+        try:
+            # Push adapters execute the synthetic turn in this process.  Claim
+            # a second, semantic CAS before model/tools so a crash after turn
+            # persistence but before the outer delivery ACK can never execute
+            # those effects twice.  Non-push/API wakes deliberately claim at
+            # the HTTP request boundary instead.
+            durable_store = None
+            push_source = None
+            push_adapter = None
+            if durable_claim_id:
+                from tools.async_delegation import get_event_delivery_store
+
+                durable_store = get_event_delivery_store(evt)
+                push_source = self._build_process_event_source(evt)
+                if push_source is not None:
+                    push_adapter = self._adapter_for_source(push_source)
+                    if (
+                        push_adapter is None
+                        and push_source.platform == Platform.API_SERVER
+                    ):
+                        push_adapter = (
+                            getattr(self, "adapters", {}) or {}
+                        ).get(Platform.API_SERVER)
+
+            durable_push = False
+            if durable_store is not None and push_adapter is not None:
+                from gateway.wake import adapter_supports_push
+
+                durable_push = adapter_supports_push(push_adapter)
+
+            if durable_push and push_source is not None:
+                from tools.async_delegation import (
+                    claim_durable_wake_execution,
+                    drop_event_delivery,
+                    durable_wake_execution_fingerprint,
+                )
+
+                try:
+                    platform_value = (
+                        push_source.platform.value
+                        if hasattr(push_source.platform, "value")
+                        else str(push_source.platform)
+                    )
+                    wake_execution_fingerprint = (
+                        durable_wake_execution_fingerprint(
+                            delegation_id=durable_delegation_id,
+                            destination={
+                                "platform": platform_value,
+                                "chat_id": str(push_source.chat_id or ""),
+                                "chat_type": str(
+                                    push_source.chat_type or ""
+                                ),
+                                "thread_id": str(
+                                    push_source.thread_id or ""
+                                ),
+                                "profile": str(
+                                    getattr(push_source, "profile", "")
+                                    or "default"
+                                ),
+                                "session_key": str(
+                                    evt.get("session_key") or ""
+                                ),
+                                "parent_session_id": str(
+                                    evt.get("parent_session_id") or ""
+                                ),
+                            },
+                            text=synth_text,
+                            runtime_effect=normalized_runtime_effect,
+                            execution_context=evt.get(
+                                "api_execution_context"
+                            ),
+                            store=durable_store,
+                        )
+                    )
+                    wake_claim = claim_durable_wake_execution(
+                        delegation_id=durable_delegation_id,
+                        idempotency_key=wake_execution_fingerprint,
+                        store=durable_store,
+                    )
+                except Exception:
+                    # No model/tool boundary has started. A transient
+                    # fingerprint/store/CAS outage must preserve the outer
+                    # carrier and its retry budget.
+                    logger.warning(
+                        "Could not establish durable push wake authority for "
+                        "%s before execution",
+                        durable_delegation_id,
+                        exc_info=True,
+                    )
+                    _release_delivery_without_attempt()
+                    return False
+                if wake_claim.state == "completed":
+                    # Crash-gap replay: the synthetic turn already crossed its
+                    # persistence boundary.  Skip model/tools and settle only
+                    # the still-pending outer delivery obligation.
+                    expected_receipt = {
+                        "schema": "hermes.push-wake-persistence-receipt.v1",
+                        "delegation_id": durable_delegation_id,
+                        "status": "persisted",
+                    }
+                    if wake_claim.response != expected_receipt:
+                        logger.error(
+                            "Async delegation %s has a malformed durable push "
+                            "wake receipt; refusing successful replay",
+                            durable_delegation_id,
+                        )
+                        delivery_claim_handled = True
+                        try:
+                            delivery_settled = bool(
+                                drop_event_delivery(
+                                    evt,
+                                    durable_claim_id,
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Could not quarantine malformed durable push "
+                                "wake receipt %s",
+                                durable_delegation_id,
+                                exc_info=True,
+                            )
+                        return None
+                    wake_execution_completed = True
+                elif wake_claim.state == "claimed":
+                    wake_claim_id = wake_claim.claim_id
+                elif wake_claim.state == "in_progress":
+                    # A live owner is executing. Release this delivery lease
+                    # so a later carrier can observe its committed receipt.
+                    _release_delivery_without_attempt()
+                    return False
+                else:
+                    logger.error(
+                        "Async delegation %s durable push wake is uncertain; "
+                        "refusing to execute it again (%s)",
+                        durable_delegation_id,
+                        wake_claim.reason,
+                    )
+                    delivery_claim_handled = True
+                    try:
+                        delivery_settled = bool(
+                            drop_event_delivery(evt, durable_claim_id)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not quarantine uncertain durable push wake "
+                            "%s",
+                            durable_delegation_id,
+                            exc_info=True,
+                        )
+                    return None
+
+            if not wake_execution_completed:
+                try:
+                    injection_result = await self._inject_watch_notification(
+                        synth_text,
+                        evt,
+                    )
+                except Exception as exc:
+                    from gateway.wake import DurableWakeDeferredError
+
+                    if not isinstance(exc, DurableWakeDeferredError):
+                        raise
+                    logger.info(
+                        "Async delegation %s durable wake deferred (%s); "
+                        "preserving delivery retry budget",
+                        durable_delegation_id,
+                        exc.reason,
+                    )
+                    _release_delivery_without_attempt()
+                    return False
+                if injection_result is not True:
+                    if wake_claim_id:
+                        # The handler may already have performed effects even
+                        # though its persistence future failed. Never retry the
+                        # model/tool execution from that ambiguous point.
+                        return None
+                    if injection_result is False and durable_claim_id:
+                        # Non-push delivery owns its semantic CAS at the HTTP
+                        # boundary. A listener/transport outage is transient
+                        # and replay-safe; do not consume the outer budget.
+                        _release_delivery_without_attempt()
+                    return injection_result
+
+                if wake_claim_id:
+                    from tools.async_delegation import (
+                        complete_durable_wake_execution,
+                    )
+
+                    wake_failure_reason = (
+                        "durable push wake crossed its persistence boundary "
+                        "but its receipt could not be committed; outcome may "
+                        "include effects"
+                    )
+                    wake_execution_completed = bool(
+                        complete_durable_wake_execution(
+                            delegation_id=durable_delegation_id,
+                            idempotency_key=wake_execution_fingerprint,
+                            claim_id=wake_claim_id,
+                            response={
+                                "schema": (
+                                    "hermes.push-wake-persistence-receipt.v1"
+                                ),
+                                "delegation_id": durable_delegation_id,
+                                "status": "persisted",
+                            },
+                            store=durable_store,
+                        )
+                    )
+                    if not wake_execution_completed:
+                        return None
+
+            # The durable row remains the authoritative replay state.  The
+            # injection future resolves only after the resulting turn has
+            # crossed its persistence boundary.
+            if durable_claim_id:
+                stop_delivery_renewal()
+                if bool(
+                    getattr(
+                        stop_delivery_renewal,
+                        "ownership_lost",
+                        False,
+                    )
+                ):
+                    logger.warning(
+                        "Async completion %s persisted after its delivery "
+                        "claim was lost; refusing stale-owner ACK",
+                        durable_delegation_id,
+                    )
+                    return False
+                try:
+                    from tools.async_delegation import complete_event_delivery
+
+                    acknowledged = complete_event_delivery(
+                        evt,
+                        durable_claim_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not acknowledge durable async completion %s: %s",
+                        durable_delegation_id, exc,
+                    )
+                    # The inner persistence boundary is already proven.  Only
+                    # the outer receipt write failed, so retries must not
+                    # exhaust the delivery budget.
+                    _release_delivery_without_attempt()
+                    return False
+                if not acknowledged:
+                    logger.warning(
+                        "Async completion %s persistence finished after claim "
+                        "ownership changed; refusing stale-owner settlement",
+                        durable_delegation_id,
+                    )
+                    _release_delivery_without_attempt()
+                    return False
+                delivery_settled = True
+                delivery_claim_handled = True
+
+            accepted = True
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
@@ -22533,34 +24281,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         > self._completion_delivery_retention
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
-
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
             return True
         finally:
+            stop_delivery_renewal()
+            if wake_claim_id and not wake_execution_completed:
+                abandoned = False
+                try:
+                    from tools.async_delegation import (
+                        abandon_durable_wake_execution,
+                    )
+
+                    abandoned = bool(
+                        abandon_durable_wake_execution(
+                            delegation_id=durable_delegation_id,
+                            idempotency_key=wake_execution_fingerprint,
+                            claim_id=wake_claim_id,
+                            reason=wake_failure_reason,
+                            store=durable_store,
+                        )
+                    )
+                except Exception:
+                    logger.critical(
+                        "Could not mark durable push wake %s uncertain after "
+                        "an incomplete execution boundary",
+                        durable_delegation_id,
+                        exc_info=True,
+                    )
+                if abandoned and durable_claim_id and not delivery_settled:
+                    # Only a committed terminal wake disposition authorizes a
+                    # terminal outer quarantine. If that CAS failed, preserve
+                    # the carrier for later reconciliation.
+                    delivery_claim_handled = True
+                    try:
+                        from tools.async_delegation import drop_event_delivery
+
+                        delivery_settled = bool(
+                            drop_event_delivery(evt, durable_claim_id)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not quarantine failed durable push wake %s",
+                            durable_delegation_id,
+                            exc_info=True,
+                        )
+                elif not abandoned:
+                    _release_delivery_without_attempt()
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            if durable_claim_id and not accepted:
+            if (
+                durable_claim_id
+                and not accepted
+                and not delivery_settled
+                and not delivery_claim_handled
+            ):
                 try:
-                    from tools.async_delegation import release_completion_delivery
+                    from tools.async_delegation import release_event_delivery
 
-                    release_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
+                    release_event_delivery(evt, durable_claim_id)
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
 
@@ -22629,6 +24407,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         delivered = await self._deliver_completion_notification(synth_text, evt)
                         if delivered is False:
                             _pr.completion_queue.put(evt)
+                        elif delivered is None:
+                            scheduled = self._schedule_completion_delivery_retry(
+                                evt
+                            )
+                            if scheduled is False:
+                                # Scheduling infrastructure failed. Preserve
+                                # the sole in-memory carrier; authoritative
+                                # terminal state returns None above and is not
+                                # requeued.
+                                _pr.completion_queue.put(evt)
                     except Exception as e:
                         _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
@@ -23072,34 +24860,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not isinstance(persisted, Mapping) or not persisted:
             return
-        override: Dict[str, Any] = {
-            "model": persisted.get("model"),
-            "provider": persisted.get("provider"),
-            "base_url": persisted.get("base_url"),
-        }
-        provider = persisted.get("provider")
-        if provider:
-            # Re-resolve credentials for the persisted provider. On failure
-            # (e.g. credentials were removed since the switch) keep the
-            # credential-less override — _resolve_session_agent_runtime falls
-            # back to env-based resolution and applies model/provider on top.
+        model = str(persisted.get("model") or "").strip()
+        provider = str(persisted.get("provider") or "").strip()
+        if not model or not provider:
+            logger.warning(
+                "Ignoring incomplete persisted session model override"
+            )
+            return
+        try:
+            runtime = _resolve_runtime_agent_kwargs_for_provider(
+                provider,
+                target_model=model,
+            )
+        except Exception:
+            # Do not install a credential-less partial override: a later
+            # fallback could pair the stored model with an unrelated provider.
+            logger.warning(
+                "Ignoring persisted session model override whose provider "
+                "cannot be resolved"
+            )
+            return
+
+        from gateway.api_execution_context import canonicalize_session_endpoint
+
+        stored_endpoint = persisted.get("base_url")
+        if stored_endpoint:
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(
-                    provider,
-                    target_model=persisted.get("model"),
+                if canonicalize_session_endpoint(
+                    stored_endpoint
+                ) != canonicalize_session_endpoint(runtime.get("base_url")):
+                    raise ValueError("endpoint mismatch")
+            except ValueError:
+                # Full endpoint binding prevents a tampered routing row from
+                # redirecting freshly resolved credentials to another host,
+                # port, path, query, or virtual transport.
+                logger.warning(
+                    "Ignoring persisted session model override whose endpoint "
+                    "no longer matches the configured provider"
                 )
-                override["api_key"] = runtime.get("api_key")
-                override["api_mode"] = runtime.get("api_mode")
-                override["credential_pool"] = runtime.get("credential_pool")
-                if not override.get("base_url"):
-                    override["base_url"] = runtime.get("base_url")
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution failed for persisted override "
-                    "(provider=%s); using credential-less override",
-                    provider,
-                    exc_info=True,
-                )
+                return
+        override: Dict[str, Any] = {
+            "model": model,
+            # Preserve the requested named custom identity even when the live
+            # resolver's concrete transport class is simply "custom".
+            "provider": provider,
+            "base_url": runtime.get("base_url"),
+            "api_key": runtime.get("api_key"),
+            "api_mode": runtime.get("api_mode"),
+            "credential_pool": runtime.get("credential_pool"),
+        }
         self._session_model_overrides[session_key] = override
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
@@ -24528,6 +26337,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         real_user_message_present: Optional[bool] = None,
         canonical_workspace_boundary: Optional[str] = None,
+        runtime_effect: Optional[dict] = None,
+        _delivery_lifecycle_event=None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -24538,25 +26349,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message,
-                context_prompt,
-                history,
-                source,
-                session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth,
-                event_message_id=event_message_id,
-                channel_prompt=channel_prompt,
-                moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                real_user_message_present=real_user_message_present,
-                canonical_workspace_boundary=canonical_workspace_boundary,
-            )
-
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_agent_inner(
@@ -24575,6 +26367,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 real_user_message_present=real_user_message_present,
                 canonical_workspace_boundary=canonical_workspace_boundary,
+                runtime_effect=runtime_effect,
+                _delivery_lifecycle_event=_delivery_lifecycle_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24629,50 +26423,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve which profile's HERMES_HOME should serve this inbound source.
 
         Resolution order:
-          1. ``source.profile`` — set by /p/<profile>/ URL prefix, per-credential
-             adapter ownership, OR profile_routes matching at ``build_source`` time.
+          1. ``source.profile`` — an already-stamped adapter/source identity.
           2. ``_profile_name_for_source`` — re-run routing here as a defensive
-             fallback for sources that bypass ``build_source``.
-          3. The active profile (the multiplexer's own home).
+             compatibility fallback for sources that bypass ``build_source``.
+          3. The constructor-frozen primary profile.
+
+        No live profile registry or filesystem-name lookup is allowed here.
+        The selected immutable identity is reverified immediately before its
+        canonical home enters the runtime scope.
         """
-        from hermes_cli.profiles import (
-            get_active_profile_name,
-            get_profile_dir,
-            profile_exists,
-        )
-        from hermes_constants import get_hermes_home
+        from gateway.api_request_scope import verify_api_profile_identity
 
         explicit_profile = (source.profile or "").strip()
         if not explicit_profile:
             explicit_profile = self._profile_name_for_source(source) or ""
-        name = explicit_profile or get_active_profile_name() or "default"
-
+        primary = getattr(self, "_primary_profile_identity", None)
+        inventory = getattr(
+            self,
+            "_served_profile_identity_inventory",
+            None,
+        )
+        by_name = getattr(
+            self,
+            "_served_profile_identities_by_name",
+            None,
+        )
+        if (
+            primary is None
+            or not isinstance(inventory, tuple)
+            or not isinstance(by_name, dict)
+        ):
+            raise RuntimeError(
+                "gateway profile authority was not frozen at construction"
+            )
+        name = explicit_profile or str(primary.profile or "default")
+        identity = by_name.get(name)
+        if identity is None or identity not in inventory:
+            raise RuntimeError(
+                f"Profile {name!r} is not served by this gateway generation"
+            )
         try:
-            if explicit_profile and not profile_exists(explicit_profile):
-                raise RuntimeError(
-                    f"Explicit profile {explicit_profile!r} does not exist"
-                )
-            return get_profile_dir(name)
-        except Exception:
-            if explicit_profile:
-                logger.error(
-                    "Explicit profile resolution blocked for %s/%s "
-                    "(guild_id=%s profile=%r)",
-                    source.platform.value,
-                    source.chat_id,
-                    getattr(source, "guild_id", None),
-                    explicit_profile,
-                    exc_info=True,
-                )
-                raise
-            logger.warning(
-                "Default profile resolution failed for %s/%s; using the "
-                "active HERMES_HOME",
+            verify_api_profile_identity(identity)
+        except Exception as exc:
+            logger.error(
+                "Frozen profile generation rejected for %s/%s "
+                "(guild_id=%s profile=%r); restart is required",
                 source.platform.value,
                 source.chat_id,
+                getattr(source, "guild_id", None),
+                name,
                 exc_info=True,
             )
-            return get_hermes_home()
+            raise RuntimeError(
+                f"Profile {name!r} changed after gateway construction"
+            ) from exc
+        return Path(identity.canonical_home)
 
     async def _run_agent_inner(
         self,
@@ -24691,6 +26496,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         real_user_message_present: Optional[bool] = None,
         canonical_workspace_boundary: Optional[str] = None,
+        runtime_effect: Optional[dict] = None,
+        _delivery_lifecycle_event=None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24706,6 +26513,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if runtime_effect is not None:
+                raise RuntimeError(
+                    "Host runtime effects cannot cross the generic gateway "
+                    "proxy transport"
+                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -24726,6 +26538,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._is_session_run_current(session_key, run_generation)
 
         user_config = _load_gateway_config()
+        # Everything below is request-local profile policy.  Never read or
+        # mutate the runner's primary-profile startup snapshots from a
+        # multiplex turn: concurrent alpha/beta turns otherwise race through
+        # one shared provider/prompt/reasoning/service/fallback state.
+        turn_profile_home = _gateway_config_home()
+        turn_prefill_messages = self._load_prefill_messages()
+        turn_ephemeral_system_prompt = self._load_ephemeral_system_prompt()
+        turn_provider_routing = user_config.get("provider_routing", {})
+        if not isinstance(turn_provider_routing, dict):
+            turn_provider_routing = {}
+        turn_fallback_model = (
+            None
+            if self._require_capability_canary
+            else get_fallback_chain(user_config) or None
+        )
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
@@ -24926,8 +26753,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # other platform / when not in a voice channel.
         _voice_ack_fired = [False]
         _voice_ack_guild: List[Optional[int]] = [None]
+        _voice_ack_adapter = None
         if source.platform == Platform.DISCORD:
-            _va = self.adapters.get(Platform.DISCORD)
+            _voice_ack_adapter = self._adapter_for_source(source)
+            _va = _voice_ack_adapter
             # source.chat_id is the linked text channel; resolve the guild whose
             # voice connection is bound to it (mirrors DiscordAdapter.play_tts).
             _vtc = getattr(_va, "_voice_text_channels", None)
@@ -24945,7 +26774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not _run_still_current():
                 return
             _voice_ack_fired[0] = True
-            _adapter = self.adapters.get(Platform.DISCORD)
+            _adapter = _voice_ack_adapter
             if _adapter is None or not hasattr(_adapter, "play_ack_in_voice"):
                 return
             try:
@@ -25058,7 +26887,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
                             long_tool_hint_fired[0] = True
                             progress_queue.put(tool_progress_hint_gateway())
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                            mark_seen(
+                                _gateway_config_home() / "config.yaml",
+                                TOOL_PROGRESS_FLAG,
+                            )
                 except Exception as _hint_err:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return
@@ -25318,7 +27150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             from agent.redact import RedactingFormatter
 
-            log_dir = _hermes_home / "logs"
+            log_dir = turn_profile_home / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             file_handler = RotatingFileHandler(
                 log_dir / "tool_calls.log",
@@ -25962,6 +27794,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg_channel_prompt = self._get_system_prompt_for_channel(
                 source.platform,
                 source.chat_id or "",
+                user_config=user_config,
+                fallback_prompt=turn_ephemeral_system_prompt,
                 thread_id=getattr(source, "thread_id", None),
                 parent_id=getattr(source, "parent_chat_id", None),
             )
@@ -26008,14 +27842,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "error": "provider_runtime_resolution_failed",
                 }
 
-            pr = self._provider_routing
+            pr = turn_provider_routing
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
                 model=model,
             )
-            self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(
+            service_tier = self._resolve_session_service_tier(
                 source=source, session_key=session_key
             )
             # Set up stream consumer for token streaming or interim commentary.
@@ -26155,7 +27988,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                model,
+                runtime_kwargs,
+                service_tier=service_tier,
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -26358,7 +28196,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 self._apply_fallback_chain_to_agent(
                     agent,
-                    self._refresh_fallback_model(),
+                    turn_fallback_model,
                 )
 
             # Lock released — now schedule cleanup of any cross-process-evicted
@@ -26393,9 +28231,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     ephemeral_system_prompt=combined_ephemeral or None,
-                    prefill_messages=self._prefill_messages or None,
+                    prefill_messages=turn_prefill_messages or None,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -26414,12 +28252,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=getattr(self._session_db, "_db", self._session_db),
-                    # Reload from disk — do not reuse the startup snapshot (#60955).
-                    fallback_model=(
-                        None
-                        if self._require_capability_canary
-                        else self._refresh_fallback_model()
-                    ),
+                    fallback_model=turn_fallback_model,
                     **self._agent_startup_isolation_kwargs(
                         source,
                         production_access=production_access,
@@ -26516,7 +28349,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # live per gateway turn. This only updates agent-local validation
             # state; it does not rebuild system prompt, history, or tool schema.
             self._refresh_adaptive_reasoning_policy(agent, user_config)
-            agent.service_tier = self._service_tier
+            agent.service_tier = service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
             # Must-deliver notes for THIS turn ride the current user message
             # (api_content sidecar), never the system prompt: staged by
@@ -26605,9 +28438,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # explaining that no response arrived (so the agent can adapt
             # rather than hang forever).
             # ------------------------------------------------------------------
-            def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
+            def _clarify_callback_sync(
+                question: str,
+                choices,
+                multi_select: bool = False,
+                raw_choices=None,
+            ) -> str:
                 from tools import clarify_gateway as _clarify_mod
+                from tools.clarify_tool import autonomy_clarify_response
                 import uuid as _uuid
+
+                _clarify_policy = str(
+                    (user_config.get("agent", {}) or {}).get(
+                        "clarify_policy",
+                        "interactive",
+                    )
+                )
+                _autonomy_response = autonomy_clarify_response(
+                    question,
+                    (
+                        list(raw_choices)
+                        if raw_choices is not None
+                        else (list(choices) if choices else None)
+                    ),
+                    policy=_clarify_policy,
+                    multi_select=multi_select,
+                )
+                if _autonomy_response is not None:
+                    logger.info(
+                        "Auto-resolved routine engineering clarification "
+                        "(session=%s, policy=%s)",
+                        session_key,
+                        _clarify_policy,
+                    )
+                    return _autonomy_response
 
                 if not _status_adapter:
                     return ""
@@ -27447,6 +29311,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["user_message_provenance"] = (
                         _persist_user_provenance_override
                     )
+                if runtime_effect is not None:
+                    _conversation_kwargs["runtime_effect"] = runtime_effect
                 # All cache-stable and per-turn mutations are now complete.
                 # Re-attest at the last possible boundary so a session
                 # reasoning override, fast-mode request override, or refreshed
@@ -27455,6 +29321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent,
                     _api_run_message, **_conversation_kwargs
                 )
+                result = _canonicalize_agent_result(result)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -27627,10 +29494,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "final_response": final_response,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
+                    "status": result.get("status"),
                     "failed": result.get("failed", False),
                     "partial": result.get("partial", False),
                     "completed": result.get("completed"),
                     "interrupted": result.get("interrupted", False),
+                    "incomplete": result.get("incomplete", False),
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
                     "compression_exhausted": result.get("compression_exhausted", False),
@@ -27771,6 +29641,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "api_calls": result_holder[0].get("api_calls", 0)
                 if result_holder[0]
                 else 0,
+                "status": result_holder[0].get("status")
+                if result_holder[0]
+                else "failed",
                 "completed": result_holder[0].get("completed")
                 if result_holder[0]
                 else None,
@@ -27780,6 +29653,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "partial": result_holder[0].get("partial", False)
                 if result_holder[0]
                 else False,
+                "incomplete": result_holder[0].get("incomplete", True)
+                if result_holder[0]
+                else True,
+                "turn_exit_reason": result_holder[0].get("turn_exit_reason")
+                if result_holder[0]
+                else "invalid_agent_result",
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 # Soft lock-contention defer (#69870 consumer): distinct from
@@ -27999,10 +29878,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available. Default
-                # heartbeat is terse: elapsed + current tool. Verbose
-                # iteration counter is gated on busy_ack_detail so users
-                # who want it can opt in per platform.
+                # Include agent activity context only when detailed busy status
+                # is enabled. Low-noise surfaces get one edit-in-place elapsed
+                # heartbeat; detailed surfaces get compatible aggregate/slice
+                # counters plus the current action.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
                 _want_iteration_detail = bool(
@@ -28018,12 +29897,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _a = _agent_ref.get_activity_summary()
                         _parts = []
                         if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                            _progress = _format_activity_progress(
+                                _a,
+                                include_slice=True,
+                                include_renewals=True,
                             )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
+                            if _progress:
+                                _parts.append(_progress)
+                            _action = _a.get("current_tool") or _a.get(
+                                "last_activity_desc"
+                            )
+                            if _action:
+                                _parts.append(str(_action))
                         if _parts:
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
@@ -28254,18 +30139,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _last_desc = _activity.get("last_activity_desc", "unknown")
                 _secs_ago = _activity.get("seconds_since_activity", 0)
                 _cur_tool = _activity.get("current_tool")
-                _iter_n = _activity.get("api_call_count", 0)
-                _iter_max = _activity.get("max_iterations", 0)
+                _api_calls_total = _activity.get("api_call_count", 0)
+                _activity_progress = _format_activity_progress(
+                    _activity,
+                    include_slice=True,
+                    include_renewals=True,
+                )
 
                 logger.error(
                     "Agent idle for %.0fs (timeout %.0fs) in session %s "
-                    "| last_activity=%s | iteration=%s/%s | tool=%s",
+                    "| last_activity=%s | progress=%s | tool=%s",
                     _secs_ago,
                     _agent_timeout,
                     session_key,
                     _last_desc,
-                    _iter_n,
-                    _iter_max,
+                    _activity_progress or "unknown",
                     _cur_tool or "none",
                 )
 
@@ -28284,13 +30172,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _cur_tool:
                     _diag_lines.append(
                         f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                        f"({_secs_ago:.0f}s since last activity"
+                        + (
+                            f", {_activity_progress}"
+                            if _activity_progress
+                            else ""
+                        )
+                        + ")."
                     )
                 else:
                     _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
+                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago"
+                        + (
+                            f", {_activity_progress}"
+                            if _activity_progress
+                            else ""
+                        )
+                        + "). "
                         "The agent may have been waiting on an API response."
                     )
                 _diag_lines.append(
@@ -28304,7 +30202,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "messages": result_holder[0].get("messages", [])
                     if result_holder[0]
                     else [],
-                    "api_calls": _iter_n,
+                    "api_calls": _api_calls_total,
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
@@ -28617,7 +30515,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_runtime_effect = None
                 if pending_event is not None:
+                    try:
+                        next_runtime_effect = (
+                            self._runtime_effect_for_internal_event(
+                                pending_event
+                            )
+                        )
+                    except Exception:
+                        self._settle_internal_delivery_event(
+                            pending_event,
+                            False,
+                        )
+                        raise
                     if (
                         getattr(self, "_require_capability_canary", False)
                         and getattr(pending_event, "internal", False)
@@ -28627,6 +30538,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning(
                             "capability goal discarded unsealed queued internal event for session %s",
                             session_key or "?",
+                        )
+                        self._settle_internal_delivery_event(
+                            pending_event,
+                            False,
                         )
                         return result
                     next_source = getattr(pending_event, "source", None) or source
@@ -28642,6 +30557,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.info(
                             "Discarding unavailable goal continuation for session %s",
                             session_key or "?",
+                        )
+                        self._settle_internal_delivery_event(
+                            pending_event,
+                            False,
                         )
                         return result
                     # Resolve the follow-up's session key BEFORE preparing the
@@ -28666,6 +30585,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     )
                     if next_message is None:
+                        self._settle_internal_delivery_event(
+                            pending_event,
+                            False,
+                        )
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -28699,18 +30622,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        runtime_effect=next_runtime_effect,
+                        _delivery_lifecycle_event=_delivery_lifecycle_event,
+                    )
+                except Exception:
+                    if pending_event is not None:
+                        self._settle_internal_delivery_event(
+                            pending_event,
+                            False,
+                        )
+                    raise
+                if pending_event is not None:
+                    self._defer_internal_delivery_success(
+                        pending_event,
+                        _delivery_lifecycle_event,
+                    )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         except asyncio.CancelledError:
             await self._finalize_gateway_goal_turn(
@@ -28851,24 +30789,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id,
-                            session_key or "?",
-                        )
+                        if getattr(_edit_result, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id,
+                                session_key or "?",
+                            )
+                        else:
+                            _edit_error_kind = getattr(
+                                _edit_result, "error_kind", None
+                            )
+                            logger.warning(
+                                "Failed to edit streamed message %s for session %s "
+                                "with plugin-transformed content: %s",
+                                _sc_msg_id,
+                                session_key or "?",
+                                getattr(_edit_result, "error", None)
+                                or "unknown delivery failure",
+                            )
+                            if _edit_error_kind == "dispatch_uncertain":
+                                # Never duplicate an edit whose dispatch may
+                                # have reached the platform.  Preserve the
+                                # uncertainty as a logical partial so lifecycle
+                                # hooks cannot emit a false success.
+                                response["already_sent"] = True
+                                response["completed"] = False
+                                response["partial"] = True
+                                response["incomplete_reason"] = (
+                                    "transformed_stream_edit_dispatch_uncertain"
+                                )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?",
                             _edit_err,
                         )
+
+        if isinstance(response, dict):
+            # Streaming/edit fallbacks may have added a terminal signal after
+            # the agent result was first shaped. Re-apply the same contract
+            # before progress cleanup and before returning to the caller.
+            response = _canonicalize_agent_result(response)
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
@@ -29590,7 +31558,19 @@ async def start_gateway(
         or require_capability_canary
         or require_production_model_sovereignty
     )
-    isolated_runtime = bool(config is not None and config.isolated_runtime is True)
+    # Resolve and reject unsafe same-process multiplexing before hardening,
+    # duplicate-instance takeover, skill sync, logging setup, runner
+    # construction, adapters, stores, or listeners can perform side effects.
+    # GatewayRunner repeats the same guard for direct construction.
+    resolved_config = config if config is not None else load_gateway_config_for_runner()
+    try:
+        _require_single_profile_gateway_process(resolved_config)
+    except MultiplexConfigError as exc:
+        logger.error("Gateway startup refused: %s", exc)
+        print(f"\n❌ Gateway startup refused: {exc}\n")
+        return False
+    config = resolved_config
+    isolated_runtime = config.isolated_runtime is True
     if require_production_model_sovereignty and isolated_runtime:
         raise ValueError(
             "production model-sovereignty and isolated runtime are mutually exclusive"

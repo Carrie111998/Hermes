@@ -33,12 +33,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
+    _canonicalize_agent_result,
     _coerce_gateway_timestamp,
     _canonical_workspace_failure_result,
+    _classify_agent_processing_outcome,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _should_clear_resume_pending_after_turn,
@@ -71,10 +73,79 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+    assert _should_clear_resume_pending_after_turn({"status": "failed"}) is False
+    assert _should_clear_resume_pending_after_turn({
+        "completed": True,
+        "status": "failed",
+    }) is False
     assert _should_clear_resume_pending_after_turn({
         "final_response": "Brain unavailable",
         "canonical_workspace_recovery_incomplete": True,
     }) is False
+
+
+@pytest.mark.parametrize(
+    ("agent_result", "expected"),
+    [
+        ({"completed": True}, ProcessingOutcome.SUCCESS),
+        ({"final_response": "legacy success"}, ProcessingOutcome.SUCCESS),
+        ({"completed": False, "partial": True}, ProcessingOutcome.INCOMPLETE),
+        ({"status": "blocked"}, ProcessingOutcome.INCOMPLETE),
+        (
+            {"canonical_workspace_recovery_incomplete": True},
+            ProcessingOutcome.INCOMPLETE,
+        ),
+        (
+            {"failed": True, "partial": True, "error": "verification missing"},
+            ProcessingOutcome.FAILURE,
+        ),
+        ({"status": "failed"}, ProcessingOutcome.FAILURE),
+        (
+            {"completed": True, "status": "failed"},
+            ProcessingOutcome.FAILURE,
+        ),
+        ({"failed": True, "completed": False}, ProcessingOutcome.FAILURE),
+        ({"error": "boom"}, ProcessingOutcome.FAILURE),
+        ({"interrupted": True}, ProcessingOutcome.CANCELLED),
+    ],
+)
+def test_agent_processing_outcome_is_truthful(agent_result, expected):
+    assert _classify_agent_processing_outcome(agent_result) == expected
+
+
+def test_gateway_result_shaping_emits_one_canonical_terminal_truth():
+    result = _canonicalize_agent_result(
+        {
+            "status": "failed",
+            "completed": True,
+            "partial": True,
+            "error": "boom",
+            "final_response": "diagnostic only",
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["completed"] is False
+    assert result["partial"] is False
+    assert result["interrupted"] is False
+    assert result["failed"] is True
+    assert result["incomplete"] is True
+    assert result["turn_exit_reason"] == "failed"
+    assert result["terminal_outcome_contradictory"] is True
+
+
+def test_gateway_result_shaping_keeps_workspace_recovery_incomplete():
+    result = _canonicalize_agent_result(
+        {
+            "completed": True,
+            "canonical_workspace_recovery_incomplete": True,
+        }
+    )
+
+    assert result["status"] == "partial"
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["incomplete"] is True
 
 
 def test_unexpected_workspace_exception_is_fail_closed_incomplete():

@@ -3216,6 +3216,7 @@ class AIAgent:
         args: Dict[str, Any],
         result: Any,
         is_error: bool,
+        tool_call_id: Optional[str] = None,
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
@@ -3225,10 +3226,152 @@ class AIAgent:
         state dict hasn't been initialised yet (e.g. a tool dispatched
         outside ``run_conversation``).
         """
-        if tool_name not in _FILE_MUTATING_TOOLS:
-            return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
+            return
+        if tool_name == "delegate_task":
+            if not getattr(
+                self,
+                "_isolated_worker_backend_selected",
+                False,
+            ):
+                return
+            try:
+                from tools.terminal_tool import (
+                    isolated_worker_proof_status_for_authority,
+                )
+
+                authority = (
+                    getattr(self, "_workspace_lease_authority", None)
+                    or self.session_id
+                )
+                receipt = isolated_worker_proof_status_for_authority(
+                    str(authority)
+                )
+                generation = receipt.get("edit_generation")
+                baseline = getattr(
+                    self,
+                    "_turn_isolated_worker_baseline_generation",
+                    None,
+                )
+                if type(generation) is not int or type(baseline) is not int:
+                    raise ValueError("delegate_proof_generation_invalid")
+                self._turn_isolated_worker_proof_receipt = dict(receipt)
+                if generation > baseline:
+                    changed = getattr(self, "_turn_file_mutation_paths", None)
+                    if changed is not None:
+                        pending = receipt.get("pending_paths")
+                        paths = (
+                            [
+                                str(path)
+                                for path in pending
+                                if isinstance(path, str) and path
+                            ]
+                            if isinstance(pending, list)
+                            else []
+                        )
+                        changed.update(paths or ["/workspace"])
+            except Exception as exc:
+                self._turn_isolated_worker_proof_error = (
+                    "isolated_worker_delegate_proof_failed:"
+                    f"{type(exc).__name__}"
+                )
+                changed = getattr(self, "_turn_file_mutation_paths", None)
+                if changed is not None:
+                    changed.add("/workspace")
+            return
+        if tool_name == "terminal":
+            try:
+                from agent.tool_runtime_effects import (
+                    consume_tool_runtime_effect,
+                )
+
+                effect = consume_tool_runtime_effect(
+                    tool_name="terminal",
+                    session_id=getattr(self, "session_id", None),
+                    turn_id=getattr(self, "_current_turn_id", None),
+                    tool_call_id=tool_call_id,
+                )
+                if not isinstance(effect, dict):
+                    raise ValueError("isolated_worker_effect_missing")
+                receipt = effect.get("receipt")
+                if receipt is None:
+                    if effect.get("error"):
+                        self._turn_isolated_worker_proof_error = str(
+                            effect["error"]
+                        )
+                    return
+                if not isinstance(receipt, dict):
+                    raise ValueError("proof_receipt_not_mapping")
+                from gateway.isolated_worker import (
+                    PROOF_RECEIPT_SCHEMA,
+                    canonical_lease_id,
+                )
+
+                authority = (
+                    getattr(self, "_workspace_lease_authority", None)
+                    or self.session_id
+                )
+                expected_lease = canonical_lease_id(str(authority))
+                if (
+                    receipt.get("schema") != PROOF_RECEIPT_SCHEMA
+                    or receipt.get("lease_id") != expected_lease
+                    or type(receipt.get("edit_generation")) is not int
+                    or type(receipt.get("verified_generation")) is not int
+                    or receipt["verified_generation"] > receipt["edit_generation"]
+                    or receipt.get("status")
+                    not in {"unverified", "passed", "failed", "stale"}
+                    or receipt.get("applicability")
+                    not in {"applicable", "not_applicable", "unknown"}
+                    or receipt.get("mutation_detection")
+                    not in {"unchanged", "changed", "unknown", "explicit", "status"}
+                    or not isinstance(receipt.get("changed_paths"), list)
+                ):
+                    raise ValueError("proof_receipt_invalid")
+                self._turn_isolated_worker_proof_receipt = dict(receipt)
+                verification = receipt.get("verification")
+                command = args.get("command")
+                if (
+                    not is_error
+                    and isinstance(command, str)
+                    and isinstance(verification, dict)
+                    and verification.get("status") == "passed"
+                    and isinstance(
+                        verification.get("canonical_command"),
+                        str,
+                    )
+                ):
+                    from agent.verification_evidence import (
+                        _find_canonical_match,
+                    )
+
+                    if _find_canonical_match(
+                        command,
+                        [verification["canonical_command"]],
+                    ) is not None:
+                        self._turn_runtime_effect_fresh_proof_observed = True
+                if receipt["mutation_detection"] in {
+                    "changed",
+                    "unknown",
+                    "explicit",
+                }:
+                    changed = getattr(self, "_turn_file_mutation_paths", None)
+                    if changed is not None:
+                        paths = [
+                            str(path)
+                            for path in receipt["changed_paths"]
+                            if isinstance(path, str) and path
+                        ]
+                        changed.update(paths or ["/workspace"])
+            except Exception as exc:
+                self._turn_isolated_worker_proof_error = (
+                    f"isolated_worker_proof_receipt_rejected:{type(exc).__name__}"
+                )
+                changed = getattr(self, "_turn_file_mutation_paths", None)
+                if changed is not None:
+                    changed.add("/workspace")
+            return
+        if tool_name not in _FILE_MUTATING_TOOLS:
             return
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
@@ -3238,6 +3381,14 @@ class AIAgent:
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+            try:
+                data = json.loads(result) if isinstance(result, str) else None
+                if isinstance(data, dict) and data.get("_proof_authority_error"):
+                    self._turn_isolated_worker_proof_error = str(
+                        data["_proof_authority_error"]
+                    )
+            except Exception:
+                pass
         if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
@@ -3709,6 +3860,12 @@ class AIAgent:
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
+            "iteration_budget_renewals": getattr(
+                self, "_budget_renewal_count", 0
+            ),
+            "iteration_budget_stalled_boundaries": getattr(
+                self, "_budget_stagnant_boundary_count", 0
+            ),
             "execution_lease_used": self.execution_lease.used,
             "execution_lease_max": self.execution_lease.max_total,
         }
@@ -3878,6 +4035,299 @@ class AIAgent:
         except Exception:
             pass
 
+    def _workspace_lease_state_lock(self):
+        """Return the per-agent guard for workspace-authority lifecycle state."""
+
+        lock = getattr(self, "_workspace_lease_authority_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._workspace_lease_authority_lock = lock
+        return lock
+
+    def _track_workspace_lease_persistent_runtime_ids(
+        self,
+        runtime_ids,
+    ) -> None:
+        """Remember session identities that must survive the current turn."""
+
+        normalized = {
+            str(runtime_id)
+            for runtime_id in runtime_ids
+            if runtime_id and str(runtime_id) != "default"
+        }
+        if not normalized:
+            return
+        with self._workspace_lease_state_lock():
+            tracked = getattr(
+                self,
+                "_workspace_lease_persistent_runtime_ids",
+                None,
+            )
+            if not isinstance(tracked, set):
+                tracked = set(tracked or ())
+                self._workspace_lease_persistent_runtime_ids = tracked
+            tracked.update(normalized)
+
+    def _track_runtime_resource_task_ids(self, task_ids) -> None:
+        """Remember exact tool task ids whose browser/process state we own."""
+
+        normalized = {
+            str(task_id)
+            for task_id in task_ids
+            if task_id and str(task_id) != "default"
+        }
+        if not normalized:
+            return
+        with self._workspace_lease_state_lock():
+            tracked = getattr(
+                self,
+                "_runtime_resource_task_ids",
+                None,
+            )
+            if not isinstance(tracked, set):
+                tracked = set(tracked or ())
+                self._runtime_resource_task_ids = tracked
+            tracked.update(normalized)
+
+    def _workspace_lease_owner_id(self) -> str:
+        """Return this agent instance's opaque registry-owner identity."""
+
+        owner_id = getattr(
+            self,
+            "_workspace_lease_binding_owner_id",
+            None,
+        )
+        if not isinstance(owner_id, str) or not owner_id:
+            owner_id = uuid.uuid4().hex
+            self._workspace_lease_binding_owner_id = owner_id
+        return owner_id
+
+    def transition_workspace_lease_conversation(
+        self,
+        new_session_id: str,
+        workspace_lease_authority: str,
+        *,
+        retain_existing_aliases: bool,
+    ) -> None:
+        """Stage then commit a trusted conversation identity transition.
+
+        The new alias is claimed before any local identity changes. A conflict
+        therefore leaves the old conversation fully usable. Same-lineage
+        branches retain prior aliases; unrelated resume/new transitions release
+        this agent owner's old aliases only after the new claim is live.
+        """
+
+        if (
+            not isinstance(new_session_id, str)
+            or not new_session_id
+            or new_session_id == "default"
+        ):
+            raise ValueError("workspace_lease_session_id_invalid")
+        if (
+            not isinstance(workspace_lease_authority, str)
+            or not workspace_lease_authority
+            or workspace_lease_authority == "default"
+        ):
+            raise ValueError("workspace_lease_authority_invalid")
+
+        with self._workspace_lease_state_lock():
+            if getattr(self, "_close_started", False):
+                raise RuntimeError("agent_already_closed")
+            if not getattr(
+                self,
+                "_isolated_worker_backend_selected",
+                False,
+            ):
+                self.session_id = new_session_id
+                self._workspace_lease_authority = None
+                self._workspace_lease_persistent_runtime_ids = set()
+                return
+
+            from tools.terminal_tool import (
+                register_workspace_lease_authority,
+                unregister_workspace_lease_authority,
+            )
+
+            owner_id = self._workspace_lease_owner_id()
+            old_authority = str(
+                getattr(self, "_workspace_lease_authority", "") or ""
+            )
+            if (
+                retain_existing_aliases
+                and old_authority
+                and old_authority != workspace_lease_authority
+            ):
+                raise RuntimeError(
+                    "workspace_lease_authority_lineage_mismatch"
+                )
+            old_ids = {
+                str(runtime_id)
+                for runtime_id in getattr(
+                    self,
+                    "_workspace_lease_persistent_runtime_ids",
+                    (),
+                )
+                if runtime_id
+            }
+            old_session_id = str(
+                getattr(self, "session_id", "") or ""
+            )
+            if old_session_id:
+                old_ids.add(old_session_id)
+
+            register_workspace_lease_authority(
+                new_session_id,
+                workspace_lease_authority,
+                owner_id=owner_id,
+            )
+            self.session_id = new_session_id
+            self._workspace_lease_authority = workspace_lease_authority
+            if retain_existing_aliases:
+                old_ids.add(new_session_id)
+                self._workspace_lease_persistent_runtime_ids = old_ids
+                return
+
+            self._workspace_lease_persistent_runtime_ids = {
+                new_session_id
+            }
+            self._workspace_lease_runtime_ids = tuple(
+                runtime_id
+                for runtime_id in getattr(
+                    self,
+                    "_workspace_lease_runtime_ids",
+                    (),
+                )
+                if str(runtime_id) == new_session_id
+            )
+            if old_authority:
+                for old_id in old_ids:
+                    if old_id and old_id != new_session_id:
+                        unregister_workspace_lease_authority(
+                            old_id,
+                            old_authority,
+                            owner_id=owner_id,
+                        )
+
+    def retire_workspace_lease_authority(
+        self,
+        workspace_lease_authority: str,
+    ) -> bool:
+        """Reap an old authority after its conversation switch commits.
+
+        Claim transition and durable session transition are deliberately two
+        phases.  Calling this before the new durable row commits would destroy
+        the old workspace even when the caller subsequently rolls back.
+        """
+
+        if (
+            not isinstance(workspace_lease_authority, str)
+            or not workspace_lease_authority
+            or workspace_lease_authority == "default"
+        ):
+            return False
+        from tools.terminal_tool import (
+            cleanup_workspace_lease_environment_if_unowned,
+        )
+
+        return cleanup_workspace_lease_environment_if_unowned(
+            workspace_lease_authority
+        )
+
+    def release_workspace_lease_authority_bindings(
+        self,
+        *,
+        reset_authority: bool,
+    ) -> tuple[str, ...]:
+        """Release runtime-id bindings owned by this agent's exact authority.
+
+        ``reset_authority`` is true for a new/resumed conversation and hard
+        teardown.  Compression and branch continuations may retain the lineage
+        authority while rotating only the registered session identities.
+        Exact-authority removal in ``terminal_tool`` prevents this cleanup from
+        deleting a binding that another live owner has legitimately replaced.
+        """
+
+        with self._workspace_lease_state_lock():
+            authority = str(
+                getattr(self, "_workspace_lease_authority", "") or ""
+            )
+            runtime_ids = {
+                str(runtime_id)
+                for runtime_id in getattr(
+                    self,
+                    "_workspace_lease_persistent_runtime_ids",
+                    (),
+                )
+                if runtime_id
+            }
+            runtime_ids.update(
+                str(runtime_id)
+                for runtime_id in getattr(
+                    self,
+                    "_workspace_lease_runtime_ids",
+                    (),
+                )
+                if runtime_id
+            )
+            if getattr(
+                self,
+                "_isolated_worker_backend_selected",
+                False,
+            ):
+                current_session_id = str(
+                    getattr(self, "session_id", "") or ""
+                )
+                if current_session_id:
+                    runtime_ids.add(current_session_id)
+                current_task_id = str(
+                    getattr(self, "_current_task_id", "") or ""
+                )
+                if current_task_id:
+                    runtime_ids.add(current_task_id)
+
+            if authority and runtime_ids:
+                try:
+                    from tools.terminal_tool import (
+                        unregister_workspace_lease_authority,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "workspace_lease_authority_release_unavailable"
+                    ) from exc
+
+                # Keep the agent lock while removing the snapshot so a new turn
+                # cannot register another persistent id under the authority
+                # being reset.
+                for runtime_id in runtime_ids:
+                    unregister_workspace_lease_authority(
+                        runtime_id,
+                        authority,
+                        owner_id=self._workspace_lease_owner_id(),
+                    )
+
+            tracked = getattr(
+                self,
+                "_workspace_lease_persistent_runtime_ids",
+                None,
+            )
+            if isinstance(tracked, set):
+                tracked.difference_update(runtime_ids)
+            else:
+                self._workspace_lease_persistent_runtime_ids = set()
+            self._workspace_lease_runtime_ids = tuple(
+                runtime_id
+                for runtime_id in getattr(
+                    self,
+                    "_workspace_lease_runtime_ids",
+                    (),
+                )
+                if str(runtime_id) not in runtime_ids
+            )
+            if reset_authority:
+                self._workspace_lease_authority = None
+                self._isolated_worker_backend_selected = False
+            return tuple(sorted(runtime_ids))
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
@@ -3891,26 +4341,75 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
-        task_id = getattr(self, "session_id", None) or ""
+        with self._workspace_lease_state_lock():
+            if getattr(self, "_close_started", False):
+                return
+            self._close_started = True
+            task_id = getattr(self, "session_id", None) or ""
+            _isolated_worker_selected = bool(
+                getattr(
+                    self,
+                    "_isolated_worker_backend_selected",
+                    False,
+                )
+            )
+            _workspace_authority = str(
+                getattr(self, "_workspace_lease_authority", "") or ""
+            )
+            _owns_runtime_resources = bool(
+                getattr(self, "_owns_runtime_resources", True)
+            )
+            _runtime_resource_task_ids = {
+                str(runtime_id)
+                for runtime_id in getattr(
+                    self,
+                    "_runtime_resource_task_ids",
+                    (),
+                )
+                if runtime_id and str(runtime_id) != "default"
+            }
+            _runtime_resource_task_ids.update(
+                str(runtime_id)
+                for runtime_id in getattr(
+                    self,
+                    "_workspace_lease_persistent_runtime_ids",
+                    (),
+                )
+                if runtime_id and str(runtime_id) != "default"
+            )
+            current_task_id = str(
+                getattr(self, "_current_task_id", "") or ""
+            )
+            if current_task_id and current_task_id != "default":
+                _runtime_resource_task_ids.add(current_task_id)
+            if task_id and task_id != "default":
+                _runtime_resource_task_ids.add(task_id)
 
         # 1. Kill background processes for this task
-        try:
-            from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
-        except Exception:
-            pass
+        if _owns_runtime_resources and not _isolated_worker_selected:
+            for runtime_task_id in sorted(_runtime_resource_task_ids):
+                try:
+                    from tools.process_registry import process_registry
+                    process_registry.kill_all(task_id=runtime_task_id)
+                except Exception:
+                    pass
 
-        # 2. Clean terminal sandbox environments
-        try:
-            cleanup_vm(task_id)
-        except Exception:
-            pass
+        # 2. Clean terminal sandbox environments. Isolated-worker clients are
+        # authority-keyed and may be shared by another live owner; defer their
+        # exact-root cleanup until after owner-scoped claim release below.
+        if _owns_runtime_resources and not _isolated_worker_selected:
+            try:
+                cleanup_vm(task_id)
+            except Exception:
+                pass
 
         # 3. Clean browser daemon sessions
-        try:
-            cleanup_browser(task_id)
-        except Exception:
-            pass
+        if _owns_runtime_resources:
+            for runtime_task_id in sorted(_runtime_resource_task_ids):
+                try:
+                    cleanup_browser(runtime_task_id)
+                except Exception:
+                    pass
 
         # 4. Close active child agents
         try:
@@ -3925,7 +4424,36 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. Release persistent isolated-worker runtime identities only after
+        # children and sandbox processes have stopped using them.
+        try:
+            self.release_workspace_lease_authority_bindings(
+                reset_authority=True,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to release agent workspace lease authority",
+                exc_info=True,
+            )
+        if (
+            _isolated_worker_selected
+            and _workspace_authority
+        ):
+            try:
+                from tools.terminal_tool import (
+                    cleanup_workspace_lease_environment_if_unowned,
+                )
+
+                cleanup_workspace_lease_environment_if_unowned(
+                    _workspace_authority
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to clean unowned workspace lease environment",
+                    exc_info=True,
+                )
+
+        # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3934,7 +4462,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -3945,7 +4473,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 7. Finalize the owned SQLite session row unless this agent is only a
+        # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,
         # or background-review forks that share the live parent's session_id and
@@ -6919,6 +7447,7 @@ class AIAgent:
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
         user_message_provenance: Optional[Dict[str, Any]] = None,
+        runtime_effect: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6963,8 +7492,51 @@ class AIAgent:
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
+                    user_message_provenance=user_message_provenance,
+                    runtime_effect=runtime_effect,
                 )
             finally:
+                if getattr(
+                    self,
+                    "_isolated_worker_backend_selected",
+                    False,
+                ):
+                    try:
+                        from tools.terminal_tool import (
+                            unregister_workspace_lease_authority,
+                        )
+
+                        _runtime_task_id = getattr(
+                            self,
+                            "_current_task_id",
+                            None,
+                        )
+                        _runtime_session_id = getattr(
+                            self,
+                            "_current_workspace_lease_session_runtime_id",
+                            None,
+                        )
+                        _workspace_authority = getattr(
+                            self,
+                            "_workspace_lease_authority",
+                            None,
+                        )
+                        if (
+                            _runtime_task_id
+                            and _workspace_authority
+                            and str(_runtime_task_id)
+                            != str(_runtime_session_id or "")
+                        ):
+                            unregister_workspace_lease_authority(
+                                str(_runtime_task_id),
+                                str(_workspace_authority),
+                                owner_id=self._workspace_lease_owner_id(),
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Failed to release turn workspace authority",
+                            exc_info=True,
+                        )
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
 

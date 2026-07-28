@@ -51,6 +51,7 @@ def _wire_mock_target(adapter: WebhookAdapter, platform_name: str = "telegram"):
 
     mock_runner = MagicMock()
     mock_runner.adapters = {Platform(platform_name): mock_target}
+    mock_runner.config.multiplex_profiles = False
     mock_runner.config.get_home_channel.return_value = None
 
     adapter.gateway_runner = mock_runner

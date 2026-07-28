@@ -66,8 +66,12 @@ def _make_adapter():
     return adapter
 
 
-def _make_runner():
+def _make_runner(hermes_home=None):
     runner = object.__new__(gateway_run.GatewayRunner)
+    if hermes_home is not None:
+        from tests.gateway._profile_authority import install_frozen_profile_authority
+
+        install_frozen_profile_authority(runner, hermes_home)
     runner.adapters = {}
     runner._ephemeral_system_prompt = "Global prompt"
     runner._prefill_messages = []
@@ -239,13 +243,12 @@ async def test_retry_preserves_channel_prompt(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
 
     (tmp_path / "config.yaml").write_text("agent:\n  system_prompt: Global prompt\n", encoding="utf-8")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
     monkeypatch.setattr(
         gateway_run,

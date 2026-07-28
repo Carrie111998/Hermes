@@ -1898,6 +1898,7 @@ class ProcessingOutcome(Enum):
     """Result classification for message-processing lifecycle hooks."""
 
     SUCCESS = "success"
+    INCOMPLETE = "incomplete"
     FAILURE = "failure"
     CANCELLED = "cancelled"
 
@@ -1975,6 +1976,12 @@ class MessageEvent:
     # consume via ``event.metadata.get(...)`` and must not rely on any
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Logical result of the agent run, set by the gateway before response
+    # delivery.  This is intentionally separate from transport success: a
+    # partial/blocked agent receipt can be delivered successfully, but must not
+    # be reported to platform lifecycle hooks as a successful task.
+    logical_processing_outcome: Optional[ProcessingOutcome] = None
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -2497,6 +2504,12 @@ class BasePlatformAdapter(ABC):
     # platforms (Telegram, Discord, Matrix, …) keep the default False and
     # never see these calls.
     supports_status_text: bool = False
+
+    # Whether ``on_processing_complete`` understands the distinct INCOMPLETE
+    # lifecycle outcome.  Until an adapter opts in, map logical incomplete work
+    # to its existing failure presentation instead of silently dropping the
+    # terminal marker.
+    supports_incomplete_processing_outcome: bool = False
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat.
@@ -5202,7 +5215,6 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
-
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
@@ -5426,6 +5438,20 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # These are host-authored lifecycle receipts, never inbound claims.
+        # Clear any carried/stale values before the handler starts; only the
+        # post-persistence gateway boundary may recreate them during this run.
+        _delivery_metadata = getattr(event, "metadata", None)
+        if isinstance(_delivery_metadata, dict):
+            _delivery_metadata.pop(
+                "_hermes_internal_turn_persisted",
+                None,
+            )
+            _delivery_metadata.pop(
+                "_hermes_deferred_internal_delivery_futures",
+                None,
+            )
+
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -5887,12 +5913,27 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            # Determine the lifecycle outcome without conflating successful
+            # transport with successful work.  Delivery failure always wins,
+            # while a successfully delivered partial/blocked receipt retains
+            # the logical outcome assigned by the gateway.
+            delivery_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            logical_outcome = event.logical_processing_outcome
+            if not delivery_ok:
+                processing_outcome = ProcessingOutcome.FAILURE
+            elif (
+                logical_outcome == ProcessingOutcome.INCOMPLETE
+                and not self.supports_incomplete_processing_outcome
+            ):
+                processing_outcome = ProcessingOutcome.FAILURE
+            elif isinstance(logical_outcome, ProcessingOutcome):
+                processing_outcome = logical_outcome
+            else:
+                processing_outcome = ProcessingOutcome.SUCCESS
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+                processing_outcome,
             )
 
             # The active drain owns debounce state. If a queue-mode timer has
@@ -5969,6 +6010,59 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
+            # Internal wake delivery is complete only after the runner has
+            # returned through a real persisted turn.  ``handle_message()``
+            # merely schedules this task, so adapter acceptance is not an ACK.
+            # External/authored events can never supply this host-only future.
+            _internal_delivery_future = None
+            _internal_turn_persisted = False
+            _deferred_internal_deliveries = []
+            _internal_metadata = getattr(event, "metadata", None)
+            if isinstance(_internal_metadata, dict):
+                _internal_turn_persisted = bool(
+                    _internal_metadata.pop(
+                        "_hermes_internal_turn_persisted",
+                        False,
+                    )
+                )
+                if getattr(event, "internal", False):
+                    _internal_delivery_future = _internal_metadata.pop(
+                        "_hermes_internal_delivery_future",
+                        None,
+                    )
+                _deferred_internal_deliveries = (
+                    _internal_metadata.pop(
+                        "_hermes_deferred_internal_delivery_futures",
+                        [],
+                    )
+                )
+            if (
+                _internal_delivery_future is not None
+                and not _internal_delivery_future.done()
+            ):
+                _internal_delivery_future.set_result(
+                    _internal_turn_persisted
+                )
+            if isinstance(_deferred_internal_deliveries, list):
+                for _deferred in _deferred_internal_deliveries:
+                    if (
+                        isinstance(_deferred, tuple)
+                        and len(_deferred) == 2
+                    ):
+                        _future, _succeeded = _deferred
+                        _done = getattr(_future, "done", None)
+                        _set_result = getattr(_future, "set_result", None)
+                        if (
+                            callable(_done)
+                            and callable(_set_result)
+                            and not _done()
+                        ):
+                            _future.set_result(
+                                _internal_turn_persisted
+                                if _succeeded is None
+                                else bool(_succeeded)
+                            )
+
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

@@ -324,6 +324,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"
     agent_running:         "**Gníomhaire ag rith:** {state}"
+    execution_this_run:    "**Forghníomhú sa rith seo:** {progress}"
     state_yes:             "Tá ⚡"
     state_no:              "Níl"
     queued:                "**Tascanna i scuaine:** {count}"

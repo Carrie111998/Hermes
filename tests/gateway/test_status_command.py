@@ -2,6 +2,7 @@ from hermes_state import AsyncSessionDB
 """Tests for gateway /status behavior and token persistence."""
 
 from datetime import datetime
+from pathlib import Path
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +12,27 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+
+
+@pytest.fixture(autouse=True)
+def _reset_gateway_listener_authority(monkeypatch, tmp_path):
+    """Each test models a fresh single-listener gateway process."""
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    default_home = tmp_path / "default-hermes-home"
+    default_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    async_delegation._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        async_delegation._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
 
 
 def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:
@@ -31,10 +53,40 @@ def _make_event(text: str, *, platform: Platform = Platform.TELEGRAM) -> Message
     )
 
 
-def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.TELEGRAM):
+def _make_runner(
+    session_entry: SessionEntry,
+    *,
+    platform: Platform = Platform.TELEGRAM,
+    profile_homes=None,
+):
     from gateway.run import GatewayRunner
+    from gateway.api_request_scope import freeze_api_profile_inventory
+    from hermes_constants import get_hermes_home
+    from tools.async_delegation import (
+        register_frozen_event_delivery_inventory,
+    )
+    from tools.process_registry import process_registry
+
+    served_profiles = tuple(
+        profile_homes or (("default", get_hermes_home()),)
+    )
+    for _profile, home in served_profiles:
+        Path(home).mkdir(parents=True, exist_ok=True)
+    inventory = freeze_api_profile_inventory(served_profiles)
+    register_frozen_event_delivery_inventory(inventory)
+    process_registry.bind_checkpoint_path(
+        Path(inventory[0].canonical_home) / "processes.json"
+    )
 
     runner = object.__new__(GatewayRunner)
+    runner._served_profile_identity_inventory = inventory
+    runner._primary_profile_identity = inventory[0]
+    runner._served_profile_identities_by_name = {
+        identity.profile: identity for identity in inventory
+    }
+    runner._gateway_state_db_path = (
+        Path(inventory[0].canonical_home) / "state.db"
+    )
     runner.config = GatewayConfig(
         platforms={platform: PlatformConfig(enabled=True, token="***")}
     )
@@ -95,6 +147,15 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
         "reasoning_tokens": 0,
     }
     running_agent = MagicMock()
+    running_agent.get_activity_summary.return_value = {
+        "api_call_count": 176,
+        "max_iterations": 90,
+        "budget_used": 86,
+        "budget_max": 90,
+        "iteration_budget_renewals": 1,
+        "execution_lease_used": 176,
+        "execution_lease_max": 900,
+    }
     runner._running_agents[build_session_key(_make_source())] = running_agent
 
     result = await runner._handle_message(_make_event("/status"))
@@ -102,6 +163,13 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
     assert "**Session ID:** `sess-1`" in result
     assert "**Lifetime tokens billed:** 321" in result
     assert "**Agent Running:** Yes ⚡" in result
+    assert (
+        "**Execution this run:** execution 176/900, slice 86/90, renewals 1"
+        in result
+    )
+    assert "iteration 176/90" not in result
+    assert "slice 176/90" not in result
+    assert "call 176/90" not in result
     assert "**Title:**" not in result
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}
@@ -649,8 +717,9 @@ async def test_status_command_bypasses_active_session_guard():
 @pytest.mark.asyncio
 async def test_profile_command_reports_custom_root_profile(monkeypatch, tmp_path):
     """Gateway /profile detects custom-root profiles (not under ~/.hermes)."""
-    from pathlib import Path
-
+    profile_home = tmp_path / "profiles" / "coder"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "unrelated-home")
     session_entry = SessionEntry(
         session_key=build_session_key(_make_source()),
         session_id="sess-1",
@@ -659,11 +728,10 @@ async def test_profile_command_reports_custom_root_profile(monkeypatch, tmp_path
         platform=Platform.TELEGRAM,
         chat_type="dm",
     )
-    runner = _make_runner(session_entry)
-    profile_home = tmp_path / "profiles" / "coder"
-
-    monkeypatch.setenv("HERMES_HOME", str(profile_home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "unrelated-home")
+    runner = _make_runner(
+        session_entry,
+        profile_homes=(("coder", profile_home),),
+    )
 
     result = await runner._handle_profile_command(_make_event("/profile"))
 
@@ -689,9 +757,15 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
         platform=Platform.TELEGRAM,
         chat_type="dm",
     )
-    runner = _make_runner(session_entry)
-    runner.config.multiplex_profiles = True
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    runner = _make_runner(
+        session_entry,
+        profile_homes=(
+            ("default", hermes_home),
+            ("milo", profile_home),
+        ),
+    )
+    runner.config.multiplex_profiles = True
 
     event = _make_event("/profile")
     event.source.profile = "milo"
@@ -720,9 +794,12 @@ async def test_profile_command_ignores_stamp_when_multiplexing_off(monkeypatch, 
         platform=Platform.TELEGRAM,
         chat_type="dm",
     )
-    runner = _make_runner(session_entry)
-    assert runner.config.multiplex_profiles is False
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    runner = _make_runner(
+        session_entry,
+        profile_homes=(("default", hermes_home),),
+    )
+    assert runner.config.multiplex_profiles is False
 
     event = _make_event("/profile")
     event.source.profile = "milo"
@@ -748,8 +825,11 @@ async def test_profile_command_unstamped_source_unchanged(monkeypatch, tmp_path)
         platform=Platform.TELEGRAM,
         chat_type="dm",
     )
-    runner = _make_runner(session_entry)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    runner = _make_runner(
+        session_entry,
+        profile_homes=(("default", hermes_home),),
+    )
 
     result = await runner._handle_profile_command(_make_event("/profile"))
 

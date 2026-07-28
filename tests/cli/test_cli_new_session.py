@@ -37,6 +37,8 @@ class _FakeAgent:
         )
         self.commit_memory_session = MagicMock()
         self._invalidate_system_prompt = MagicMock()
+        self.workspace_transition_calls = []
+        self.workspace_retirement_calls = []
 
         # Token counters (non-zero to verify reset)
         self.session_total_tokens = 1000
@@ -73,6 +75,26 @@ class _FakeAgent:
             self.context_compressor.last_total_tokens = 0
             self.context_compressor.compression_count = 0
             self.context_compressor._context_probed = False
+
+    def transition_workspace_lease_conversation(
+        self,
+        new_session_id,
+        workspace_lease_authority,
+        *,
+        retain_existing_aliases,
+    ):
+        self.workspace_transition_calls.append(
+            (
+                self.session_id,
+                new_session_id,
+                workspace_lease_authority,
+                retain_existing_aliases,
+            )
+        )
+        self.session_id = new_session_id
+
+    def retire_workspace_lease_authority(self, authority):
+        self.workspace_retirement_calls.append(authority)
 
 
 def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
@@ -173,6 +195,49 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     assert cli.session_start > old_session_start
     assert cli.agent.session_start == cli.session_start
     cli.agent._invalidate_system_prompt.assert_called_once()
+    assert cli.agent.workspace_transition_calls == [
+        (
+            old_session_id,
+            cli.session_id,
+            cli.session_id,
+            False,
+        )
+    ]
+    assert cli.agent.workspace_retirement_calls == [old_session_id]
+
+
+def test_new_session_database_failure_rolls_back_live_identity(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    old_history = list(cli.conversation_history)
+
+    with (
+        patch.object(
+            cli._session_db,
+            "create_session",
+            side_effect=RuntimeError("database unavailable"),
+        ),
+        patch("cli._cprint"),
+    ):
+        cli.new_session()
+
+    assert cli.session_id == old_session_id
+    assert cli.agent.session_id == old_session_id
+    assert cli.conversation_history == old_history
+    assert cli._session_db.get_session(old_session_id)["ended_at"] is None
+    assert len(cli.agent.workspace_transition_calls) == 2
+    staged = cli.agent.workspace_transition_calls[0]
+    rolled_back = cli.agent.workspace_transition_calls[1]
+    assert staged[0] == old_session_id
+    assert staged[1] == staged[2]
+    assert staged[3] is False
+    assert rolled_back == (
+        staged[1],
+        old_session_id,
+        old_session_id,
+        False,
+    )
+    assert cli.agent.workspace_retirement_calls == []
 
 
 def test_new_session_queues_boundary_commit_with_snapshot(tmp_path):

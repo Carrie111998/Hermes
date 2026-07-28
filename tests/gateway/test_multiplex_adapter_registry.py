@@ -12,6 +12,25 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 
 
+@pytest.fixture
+def reset_async_delivery_state():
+    """Keep process-global listener authority isolated between runner tests."""
+
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    ad._reset_for_tests()
+    with process_registry._checkpoint_path_lock:
+        previous_checkpoint = process_registry._checkpoint_path
+        process_registry._checkpoint_path = None
+    try:
+        yield
+    finally:
+        ad._reset_for_tests()
+        with process_registry._checkpoint_path_lock:
+            process_registry._checkpoint_path = previous_checkpoint
+
+
 class _FakeAdapter:
     def __init__(self, token=None, config=None):
         self.token = token
@@ -103,6 +122,314 @@ class TestCredentialFingerprint:
         class _Adapter:
             config = _Cfg()
         assert GatewayRunner._adapter_credential_fingerprint(_Adapter()) is None
+
+
+class TestServedProfileHomePreflight:
+    def test_constructor_binds_all_primary_storage_before_alias_retarget(
+        self,
+        tmp_path,
+        monkeypatch,
+        reset_async_delivery_state,
+    ):
+        """state.db, routing, and process recovery remain one generation."""
+
+        from tools.process_registry import process_registry
+
+        old_target = tmp_path / "generation-a"
+        new_target = tmp_path / "generation-b"
+        old_target.mkdir()
+        new_target.mkdir()
+        source = tmp_path / "active-profile"
+        source.symlink_to(old_target, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(source))
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda *, multiplex: [("default", source)],
+        )
+
+        config = GatewayConfig(
+            multiplex_profiles=False,
+            sessions_dir=source / "sessions",
+        )
+        runner = GatewayRunner(config)
+        try:
+            assert runner._gateway_state_db_path == (
+                old_target.resolve() / "state.db"
+            )
+            assert runner._gateway_sessions_dir == (
+                old_target.resolve() / "sessions"
+            )
+            assert runner.session_store.sessions_dir == (
+                old_target.resolve() / "sessions"
+            )
+            assert runner.session_store._db.db_path == (
+                old_target.resolve() / "state.db"
+            )
+            assert runner._session_db._db.db_path == (
+                old_target.resolve() / "state.db"
+            )
+            assert process_registry._checkpoint_file() == (
+                old_target.resolve() / "processes.json"
+            )
+
+            # Prove the bound writers themselves use generation A.
+            runner.session_store._save_sessions_json({})
+            process_registry._write_checkpoint()
+            assert (old_target / "sessions" / "sessions.json").is_file()
+            assert (old_target / "processes.json").is_file()
+
+            source.unlink()
+            source.symlink_to(new_target, target_is_directory=True)
+
+            with pytest.raises(
+                gateway_run.MultiplexConfigError,
+                match="restart is required",
+            ):
+                runner._verify_served_profile_inventory()
+
+            # start() fails before any later startup read/write can touch B.
+            assert asyncio.run(runner.start()) is True
+            assert runner.exit_code == gateway_run.GATEWAY_FATAL_CONFIG_EXIT_CODE
+            assert not (new_target / "state.db").exists()
+            assert not (new_target / "sessions").exists()
+            assert not (new_target / "processes.json").exists()
+            assert process_registry._checkpoint_file() == (
+                old_target.resolve() / "processes.json"
+            )
+        finally:
+            if runner.session_store._db is not None:
+                runner.session_store._db.close()
+            if runner._session_db is not None:
+                runner._session_db._db.close()
+
+    def test_symlink_retarget_between_startup_stages_never_recaptures(
+        self,
+        tmp_path,
+        monkeypatch,
+        reset_async_delivery_state,
+    ):
+        from gateway.run import MultiplexConfigError
+
+        old_target = tmp_path / "old"
+        new_target = tmp_path / "new"
+        old_target.mkdir()
+        new_target.mkdir()
+        source = tmp_path / "profile-link"
+        source.symlink_to(old_target, target_is_directory=True)
+        calls = {"count": 0}
+
+        def _profiles_to_serve(*, multiplex):
+            assert multiplex is False
+            calls["count"] += 1
+            return [("alpha", source)]
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            _profiles_to_serve,
+        )
+        inventory = runner._freeze_served_profile_inventory()
+        assert inventory[0].source_home == str(source.absolute())
+        assert inventory[0].canonical_home == str(old_target.resolve())
+
+        source.unlink()
+        source.symlink_to(new_target, target_is_directory=True)
+
+        # No second startup phase is allowed to capture the new target as
+        # another accepted generation.
+        assert runner._freeze_served_profile_inventory() is inventory
+        assert calls["count"] == 1
+        with pytest.raises(
+            MultiplexConfigError,
+            match="changed after dispatch|Cannot freeze",
+        ):
+            runner._validated_async_delivery_profile_homes()
+
+    def test_failed_global_registration_does_not_publish_runner_cache(
+        self,
+        tmp_path,
+        monkeypatch,
+        reset_async_delivery_state,
+    ):
+        from gateway.run import MultiplexConfigError
+        from tools import async_delegation as ad
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        calls = {"profiles": 0, "register": 0}
+
+        def _profiles_to_serve(*, multiplex):
+            assert multiplex is False
+            calls["profiles"] += 1
+            return [("alpha", profile_home)]
+
+        def _fail_registration(_inventory):
+            calls["register"] += 1
+            raise ValueError("simulated registry rejection")
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            _profiles_to_serve,
+        )
+        original_register = ad.register_frozen_event_delivery_inventory
+        monkeypatch.setattr(
+            ad,
+            "register_frozen_event_delivery_inventory",
+            _fail_registration,
+        )
+
+        with pytest.raises(
+            MultiplexConfigError,
+            match="simulated registry rejection",
+        ):
+            runner._freeze_served_profile_inventory()
+
+        assert not hasattr(runner, "_served_profile_identity_inventory")
+
+        monkeypatch.setattr(
+            ad,
+            "register_frozen_event_delivery_inventory",
+            original_register,
+        )
+        inventory = runner._freeze_served_profile_inventory()
+
+        assert runner._served_profile_identity_inventory is inventory
+        assert calls == {"profiles": 2, "register": 1}
+
+    def test_second_runner_cannot_replace_live_process_inventory(
+        self,
+        tmp_path,
+        monkeypatch,
+        reset_async_delivery_state,
+    ):
+        from gateway.run import MultiplexConfigError
+
+        first_home = tmp_path / "first"
+        second_home = tmp_path / "second"
+        first_home.mkdir()
+        second_home.mkdir()
+        served = {"home": first_home}
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda *, multiplex: [("alpha", served["home"])],
+        )
+
+        first = GatewayRunner.__new__(GatewayRunner)
+        first.config = GatewayConfig(multiplex_profiles=False)
+        first_inventory = first._freeze_served_profile_inventory()
+
+        # Registering the exact same authority is idempotent.
+        same = GatewayRunner.__new__(GatewayRunner)
+        same.config = GatewayConfig(multiplex_profiles=False)
+        same_inventory = same._freeze_served_profile_inventory()
+        assert same_inventory == first_inventory
+
+        # A distinct live runner cannot invalidate the first listener's
+        # detached-delivery authority.
+        served["home"] = second_home
+        conflicting = GatewayRunner.__new__(GatewayRunner)
+        conflicting.config = GatewayConfig(multiplex_profiles=False)
+        with pytest.raises(
+            MultiplexConfigError,
+            match="different frozen event-delivery inventory",
+        ):
+            conflicting._freeze_served_profile_inventory()
+        assert not hasattr(
+            conflicting,
+            "_served_profile_identity_inventory",
+        )
+        assert first._freeze_served_profile_inventory() is first_inventory
+
+
+class TestFrozenRuntimeProfileScope:
+    @pytest.mark.asyncio
+    async def test_single_profile_wrappers_use_one_verified_canonical_home(
+        self,
+        tmp_path,
+    ):
+        from gateway.api_request_scope import capture_api_profile_identity
+        from hermes_constants import get_hermes_home
+        from gateway.session import SessionSource
+
+        old_target = tmp_path / "profile-a"
+        new_target = tmp_path / "profile-b"
+        old_target.mkdir()
+        new_target.mkdir()
+        source_alias = tmp_path / "profile"
+        source_alias.symlink_to(old_target, target_is_directory=True)
+        identity = capture_api_profile_identity("alpha", source_alias)
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        runner._primary_profile_identity = identity
+        runner._served_profile_identity_inventory = (identity,)
+        runner._served_profile_identities_by_name = {"alpha": identity}
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat",
+            chat_type="dm",
+        )
+        observed = []
+
+        async def _agent_inner(*_args, **_kwargs):
+            observed.append(("agent", get_hermes_home()))
+            return {"final_response": "ok"}
+
+        async def _preprocess(**_kwargs):
+            observed.append(("preprocess", get_hermes_home()))
+            return "ok"
+
+        async def _background(*_args, **_kwargs):
+            observed.append(("background", get_hermes_home()))
+
+        def _session_info():
+            observed.append(("session-info", get_hermes_home()))
+            return "ok"
+
+        runner._run_agent_inner = _agent_inner
+        runner._prepare_inbound_message_text = _preprocess
+        runner._run_background_task_inner = _background
+        runner._format_session_info = _session_info
+
+        await runner._run_agent("message", "context", [], source, "sid")
+        await runner._prepare_profile_scoped_inbound_message_text(
+            event=object(),
+            source=source,
+            history=[],
+        )
+        await runner._run_background_task("task", source, "task-id")
+        assert runner._reset_notice_session_info(source) == "ok"
+        assert {home for _kind, home in observed} == {
+            old_target.resolve()
+        }
+
+        source_alias.unlink()
+        source_alias.symlink_to(new_target, target_is_directory=True)
+        before = list(observed)
+
+        with pytest.raises(RuntimeError, match="changed after"):
+            await runner._run_agent(
+                "message",
+                "context",
+                [],
+                source,
+                "sid",
+            )
+        with pytest.raises(RuntimeError, match="changed after"):
+            await runner._prepare_profile_scoped_inbound_message_text(
+                event=object(),
+                source=source,
+                history=[],
+            )
+        with pytest.raises(RuntimeError, match="changed after"):
+            await runner._run_background_task("task", source, "task-id")
+        with pytest.raises(RuntimeError, match="changed after"):
+            runner._reset_notice_session_info(source)
+        assert observed == before
 
 
 class TestProfileMessageHandler:
@@ -447,81 +774,6 @@ class TestSecondaryProfileConfigHandling:
         assert "webhook" in message
         assert "telegram" not in message
         assert "reviewer" not in runner._profile_adapters
-
-    @pytest.mark.asyncio
-    async def test_multiplexer_skips_bad_profile_and_continues(self, monkeypatch, caplog):
-        from pathlib import Path
-        from gateway.config import GatewayConfig
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = GatewayConfig(multiplex_profiles=True)
-        runner.adapters = {}
-        runner._profile_adapters = {}
-
-        async def fake_start_one(profile_name, profile_home, claimed):
-            if profile_name == "bad":
-                from gateway.run import SecondaryPortBindingConfigError
-                raise SecondaryPortBindingConfigError("bad enables webhook")
-            runner._profile_adapters[profile_name] = {}
-            return 2
-
-        monkeypatch.setattr(
-            "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [
-                ("default", Path("/tmp/default")),
-                ("bad", Path("/tmp/bad")),
-                ("good", Path("/tmp/good")),
-            ],
-        )
-        monkeypatch.setattr(
-            "hermes_cli.profiles.get_active_profile_name",
-            lambda: "default",
-        )
-        monkeypatch.setattr(runner, "_start_one_profile_adapters", fake_start_one)
-        monkeypatch.setattr(
-            "gateway.status.write_runtime_status",
-            lambda **kwargs: None,
-        )
-
-        caplog.set_level(logging.WARNING, logger="gateway.run")
-        connected = await runner._start_secondary_profile_adapters()
-
-        assert connected == 2
-        assert "good" in runner._profile_adapters
-        assert "bad" not in runner._profile_adapters
-        assert "Skipping secondary profile 'bad'" in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_multiplexer_propagates_security_config_error(self, monkeypatch):
-        from pathlib import Path
-        from gateway.config import GatewayConfig
-        from gateway.run import MultiplexConfigError
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = GatewayConfig(multiplex_profiles=True)
-        runner.adapters = {}
-        runner._profile_adapters = {}
-
-        async def fake_start_one(profile_name, profile_home, claimed):
-            raise MultiplexConfigError(
-                f"Profile '{profile_name}' enables open policy without allow-all opt-in"
-            )
-
-        monkeypatch.setattr(
-            "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [
-                ("default", Path("/tmp/default")),
-                ("unsafe", Path("/tmp/unsafe")),
-            ],
-        )
-        monkeypatch.setattr(
-            "hermes_cli.profiles.get_active_profile_name",
-            lambda: "default",
-        )
-        monkeypatch.setattr(runner, "_start_one_profile_adapters", fake_start_one)
-
-        with pytest.raises(MultiplexConfigError, match="open policy"):
-            await runner._start_secondary_profile_adapters()
 
     @pytest.mark.asyncio
     async def test_open_policy_uses_fatal_config_error(self, monkeypatch):

@@ -322,6 +322,7 @@ gateway:
     context_used:          "**السياق:** ~{used} رمزًا"
     tokens:                "**رموز API التراكمية (تُعاد كل استدعاء):** {tokens}"
     agent_running:         "**الوكيل قيد التشغيل:** {state}"
+    execution_this_run:    "**التنفيذ في هذا التشغيل:** {progress}"
     state_yes:             "نعم ⚡"
     state_no:              "لا"
     queued:                "**المتابعات في الطابور:** {count}"

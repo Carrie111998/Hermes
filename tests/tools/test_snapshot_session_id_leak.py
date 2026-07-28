@@ -13,6 +13,8 @@ stale value and its ``echo $HERMES_SESSION_ID`` reported a FOREIGN session's id
 The fix strips the per-session bridged vars (HERMES_SESSION_* / UI /
 CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
 ``tools/environments/base.py``; they are re-injected fresh on every command.
+That contract includes exact-name task authority such as the capability epoch
+and cron marker, not only variables under the ``HERMES_SESSION_*`` prefix.
 """
 
 import os
@@ -62,6 +64,8 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_CRON_SESSION" in snippet
+    assert "HERMES_CAPABILITY_EPOCH_SHA256" in snippet
     assert "grep -vE" not in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -88,32 +92,52 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
     env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
     env.init_session()
     try:
-        def run_as(sid):
+        def run_as(sid, capability_epoch, *, cron_session):
             out = {}
 
             def worker():
                 for v in _VAR_MAP.values():
                     v.set(_UNSET)
-                set_session_vars(session_key="k" + sid, session_id=sid, source="desktop")
-                out["r"] = env.execute('echo "[$HERMES_SESSION_ID]"')
+                set_session_vars(
+                    session_key="k" + sid,
+                    session_id=sid,
+                    source="desktop",
+                    capability_epoch_sha256=capability_epoch,
+                    cron_session=cron_session,
+                )
+                out["r"] = env.execute(
+                    'printf "[%s|%s|%s]\\n" "$HERMES_SESSION_ID" '
+                    '"$HERMES_CAPABILITY_EPOCH_SHA256" "$HERMES_CRON_SESSION"'
+                )
 
             t = threading.Thread(target=worker)
             t.start()
             t.join()
             return out["r"].get("output", "")
 
-        out_a = run_as("SIDAAA")
-        out_b = run_as("SIDBBB")
+        epoch_a = "a" * 64
+        epoch_b = "b" * 64
+        out_a = run_as("SIDAAA", epoch_a, cron_session=True)
+        out_b = run_as("SIDBBB", epoch_b, cron_session=False)
 
-        assert "SIDAAA" in out_a, f"session A saw {out_a!r}"
-        # The core assertion: B must see its OWN id, not A's leaked via snapshot.
-        assert "SIDBBB" in out_b, f"session B saw {out_b!r}"
+        assert f"[SIDAAA|{epoch_a}|1]" in out_a, f"session A saw {out_a!r}"
+        # The core assertion: B must see its OWN task-local values, not A's
+        # session identity or authority leaked via the shared snapshot.
+        assert f"[SIDBBB|{epoch_b}|]" in out_b, f"session B saw {out_b!r}"
         assert "SIDAAA" not in out_b, f"session B leaked A's id: {out_b!r}"
+        assert epoch_a not in out_b, f"session B leaked A's capability epoch: {out_b!r}"
+        assert "|1]" not in out_b, f"session B leaked A's cron authority: {out_b!r}"
 
-        # And the snapshot file must not carry the session id at all.
+        # And the snapshot file must not carry any task-local authority at all.
         snap = env._snapshot_path
         if os.path.exists(snap):
             with open(snap) as f:
-                assert "HERMES_SESSION_ID" not in f.read()
+                snapshot = f.read()
+            for name in (
+                "HERMES_SESSION_ID",
+                "HERMES_CAPABILITY_EPOCH_SHA256",
+                "HERMES_CRON_SESSION",
+            ):
+                assert name not in snapshot
     finally:
         env.cleanup()

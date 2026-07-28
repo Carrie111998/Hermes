@@ -51,6 +51,15 @@ def _confirmed_local_cleanup_ref() -> list[dict]:
     }]
 
 
+def _runtime_effect():
+    return {
+        "schema": "hermes.runtime-effect.v1",
+        "kind": "isolated_workspace_may_have_changed.v1",
+        "workspace_lease_authority": "conversation-root-api-test",
+        "baseline_edit_generation": 29,
+    }
+
+
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
 # ---------------------------------------------------------------------------
@@ -774,6 +783,7 @@ class TestAgentExecution:
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_id = "session-123"
         mock_agent.session_prompt_tokens = 1
         mock_agent.session_completion_tokens = 2
         mock_agent.session_total_tokens = 3
@@ -789,21 +799,23 @@ class TestAgentExecution:
                 model_options=model_options,
             )
 
-        # _run_agent annotates result with the effective agent.session_id
-        # when it's a real string, so the response-header writer can track
-        # compression-triggered session rotations (#16938). The mock agent
-        # here doesn't set an explicit session_id string so the guard skips
-        # the annotation — header will fall back to the provided session_id.
+        # _run_agent validates and annotates the effective agent.session_id so
+        # response writers can track compression-triggered rotations (#16938).
         assert result["final_response"] == "ok"
+        assert result["session_id"] == "session-123"
         assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
         create_kwargs = mock_create_agent.call_args.kwargs
         assert create_kwargs["requested_model"] == "MiniMax-M3"
         assert create_kwargs["requested_provider"] == "minimax"
         assert create_kwargs["model_options"] == model_options
+        request_authority = adapter._api_request_scope("request")
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
             conversation_history=[],
-            task_id="session-123",
+            task_id=request_authority.bind(
+                "task",
+                "session-123",
+            ).internal_key,
         )
 
     def test_create_agent_honors_request_model_provider_and_options(self, adapter, monkeypatch):
@@ -958,10 +970,15 @@ class TestRunEventCallback:
         run_id = "run_subagent_events"
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
-        adapter._run_streams[run_id] = queue
-        adapter._run_statuses.pop(run_id, None)
+        run_scope = adapter._api_request_scope("run", run_id)
+        adapter._run_streams[run_scope] = queue
+        adapter._run_statuses.pop(run_scope, None)
 
-        callback = adapter._make_run_event_callback(run_id, loop)
+        callback = adapter._make_run_event_callback(
+            run_id,
+            loop,
+            run_scope=run_scope,
+        )
 
         callback(
             "subagent.start",
@@ -1000,7 +1017,10 @@ class TestRunEventCallback:
         assert complete_event["api_calls"] == 2
         assert "timed out after 300s" in complete_event["summary"]
 
-        assert adapter._run_statuses[run_id]["last_event"] == "subagent.complete"
+        assert (
+            adapter._run_statuses[run_scope]["last_event"]
+            == "subagent.complete"
+        )
 
     @pytest.mark.asyncio
     async def test_subagent_events_redact_secrets_and_carry_child_session(self, adapter):
@@ -1011,10 +1031,15 @@ class TestRunEventCallback:
         run_id = "run_subagent_redact"
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
-        adapter._run_streams[run_id] = queue
-        adapter._run_statuses.pop(run_id, None)
+        run_scope = adapter._api_request_scope("run", run_id)
+        adapter._run_streams[run_scope] = queue
+        adapter._run_statuses.pop(run_scope, None)
 
-        callback = adapter._make_run_event_callback(run_id, loop)
+        callback = adapter._make_run_event_callback(
+            run_id,
+            loop,
+            run_scope=run_scope,
+        )
         secret = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
         callback(
             "subagent.complete",
@@ -1639,6 +1664,98 @@ class TestToolsetsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_invalid_agent_session_id_is_controlled_500_and_not_cached(
+        self,
+        adapter,
+    ):
+        """A trusted-looking result ID cannot alias the authoritative session."""
+
+        app = _create_app(adapter)
+        result = {
+            "final_response": "must not be returned",
+            "messages": [],
+            "api_calls": 1,
+            "session_id": " internal-alias ",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new=AsyncMock(
+                    return_value=(
+                        result,
+                        {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    )
+                ),
+            ) as mock_run:
+                for _ in range(2):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        headers={"Idempotency-Key": "invalid-result-session"},
+                        json={
+                            "model": "hermes-agent",
+                            "messages": [
+                                {"role": "user", "content": "Hello"}
+                            ],
+                        },
+                    )
+                    assert resp.status == 500
+                    payload = await resp.json()
+                    assert (
+                        payload["error"]["code"]
+                        == "invalid_internal_session_id"
+                    )
+                    assert "X-Hermes-Session-Id" not in resp.headers
+                    assert "internal-alias" not in await resp.text()
+
+        # Validation happens before IdempotencyCache.get_or_set retains the
+        # value, so the second request must execute rather than replay it.
+        assert mock_run.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stream_invalid_agent_session_id_ends_with_controlled_error(
+        self,
+        adapter,
+    ):
+        async def _mock_run_agent(**kwargs):
+            kwargs["stream_delta_callback"]("untrusted partial output")
+            return (
+                {
+                    "final_response": "untrusted partial output",
+                    "messages": [],
+                    "api_calls": 1,
+                    "session_id": "../escaped-result",
+                },
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                side_effect=_mock_run_agent,
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert '"finish_reason": "error"' in body
+        assert '"error_code": "invalid_internal_session_id"' in body
+        assert "../escaped-result" not in body
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
@@ -2524,6 +2641,85 @@ class TestDeriveChatSessionId:
 
 class TestResponsesEndpoint:
     @pytest.mark.asyncio
+    async def test_invalid_agent_session_id_is_not_stored_or_returned(
+        self,
+        adapter,
+    ):
+        app = _create_app(adapter)
+        with patch.object(
+            adapter._response_store,
+            "put",
+            wraps=adapter._response_store.put,
+        ) as store_put:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(
+                    adapter,
+                    "_run_agent",
+                    new=AsyncMock(
+                        return_value=(
+                            {
+                                "final_response": "must not be returned",
+                                "messages": [],
+                                "api_calls": 1,
+                                "session_id": " bad-response-session ",
+                            },
+                            {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0,
+                            },
+                        )
+                    ),
+                ):
+                    resp = await cli.post(
+                        "/v1/responses",
+                        json={"input": "Hello"},
+                    )
+                    payload = await resp.json()
+
+        assert resp.status == 500
+        assert payload["error"]["code"] == "invalid_internal_session_id"
+        assert "X-Hermes-Session-Id" not in resp.headers
+        assert store_put.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_corrupt_previous_response_session_id_is_controlled_500(
+        self,
+        adapter,
+    ):
+        adapter._response_store.put(
+            "resp_corrupt_session",
+            {
+                "response": {
+                    "id": "resp_corrupt_session",
+                    "status": "completed",
+                },
+                "conversation_history": [],
+                "session_id": "../stored-alias",
+            },
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "input": "Continue",
+                        "previous_response_id": "resp_corrupt_session",
+                    },
+                )
+                payload = await resp.json()
+
+        assert resp.status == 500
+        assert payload["error"]["code"] == "invalid_internal_session_id"
+        assert "../stored-alias" not in str(payload)
+        mock_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_missing_input_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3299,6 +3495,53 @@ class TestResponsesEndpoint:
 
 class TestResponsesStreaming:
     @pytest.mark.asyncio
+    async def test_invalid_agent_session_id_emits_failed_and_stores_safe_chain(
+        self,
+        adapter,
+    ):
+        async def _mock_run_agent(**kwargs):
+            kwargs["stream_delta_callback"]("partial")
+            return (
+                {
+                    "final_response": "partial",
+                    "messages": [],
+                    "api_calls": 1,
+                    "session_id": "bad\r\nheader",
+                },
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                side_effect=_mock_run_agent,
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"input": "hello", "stream": True},
+                )
+                safe_session_id = resp.headers["X-Hermes-Session-Id"]
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "event: response.failed" in body
+        assert '"code": "invalid_internal_session_id"' in body
+        assert "bad\\r\\nheader" not in body
+        response_id = None
+        for line in body.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = json.loads(line[len("data: "):])
+            if payload.get("type") == "response.failed":
+                response_id = payload["response"]["id"]
+                break
+        assert response_id
+        stored = adapter._response_store.get(response_id)
+        assert stored["session_id"] == safe_session_id
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_responses_sse(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3624,7 +3867,7 @@ class TestResponsesStreaming:
                     instructions=None,
                     conversation=None,
                     store=True,
-                    session_id=None,
+                    session_id="cancelled-stream-session",
                     cleanup_ref=_confirmed_local_cleanup_ref(),
                 )
 
@@ -3693,7 +3936,7 @@ class TestResponsesStreaming:
                 instructions=None,
                 conversation=None,
                 store=True,
-                session_id=None,
+                session_id="disconnected-stream-session",
                 cleanup_ref=_confirmed_local_cleanup_ref(),
             )
 
@@ -4352,7 +4595,6 @@ class TestChatCompletionsAgentIncomplete:
             "completed": False,
             "partial": True,
             "outcome_code": "output_truncated",
-            "error": "Response truncated due to output length limit",
             "messages": [],
             "api_calls": 1,
         }
@@ -4433,7 +4675,9 @@ class TestChatCompletionsAgentIncomplete:
             data = await resp.json()
             assert data["error"]["code"] == "agent_incomplete"
             assert "truncated" in data["error"]["message"].lower()
-            assert data["error"]["hermes"]["partial"] is True
+            # Terminal flags are mutually exclusive; failure outranks the
+            # contradictory partial flag.
+            assert data["error"]["hermes"]["partial"] is False
             assert data["error"]["hermes"]["failed"] is True
             assert resp.headers.get("X-Hermes-Completed") == "false"
 
@@ -4806,6 +5050,566 @@ class TestSessionIdHeader:
             assert call_kwargs["session_id"] == "my-session-123"
 
     @pytest.mark.asyncio
+    async def test_idempotency_is_scoped_by_session_within_one_profile(
+        self,
+        auth_adapter,
+    ):
+        """A cached response for one session cannot satisfy another session."""
+
+        import gateway.platforms.api_server as api_server_module
+
+        app = web.Application()
+        app["api_server_adapter"] = auth_adapter
+        app.router.add_post(
+            "/v1/chat/completions",
+            auth_adapter._handle_chat_completions,
+        )
+        auth_adapter._idempotency_cache = api_server_module._IdempotencyCache()
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "same request"}],
+            "stream": False,
+        }
+        base_headers = {
+            "Authorization": "Bearer sk-secret",
+            "Idempotency-Key": "client-shared-idempotency-key",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as mock_run:
+                mock_run.side_effect = [
+                    (
+                        {
+                            "final_response": "default-session",
+                            "messages": [],
+                            "api_calls": 1,
+                        },
+                        usage,
+                    ),
+                    (
+                        {
+                            "final_response": "other-session",
+                            "messages": [],
+                            "api_calls": 1,
+                        },
+                        usage,
+                    ),
+                ]
+
+                session_ids = (
+                    "shared-session",
+                    "other-session",
+                    # Same process/profile + same session is the legitimate
+                    # retry and must reuse the first completed turn.
+                    "shared-session",
+                )
+                contents = []
+                for session_id in session_ids:
+                    response = await cli.post(
+                        "/v1/chat/completions",
+                        headers={
+                            **base_headers,
+                            "X-Hermes-Session-Id": session_id,
+                        },
+                        json=payload,
+                    )
+                    assert response.status == 200
+                    body = await response.json()
+                    contents.append(
+                        body["choices"][0]["message"]["content"]
+                    )
+
+        assert contents == [
+            "default-session",
+            "other-session",
+            "default-session",
+        ]
+        assert mock_run.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_body_runtime_effect_is_untrusted_and_ignored(self, auth_adapter):
+        """A caller cannot mint a host effect through OpenAI-compatible JSON."""
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter, "_run_agent", new_callable=AsyncMock
+            ) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "runtime-effect-body",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "runtime_effect": _runtime_effect(),
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["runtime_effect"] is None
+
+    @pytest.mark.asyncio
+    async def test_guessed_internal_wake_header_cannot_forge_effect(
+        self, auth_adapter,
+    ):
+        """Only a live process-local one-use capability can cross the API seam."""
+        from gateway.wake import INTERNAL_WAKE_TOKEN_HEADER
+
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter, "_run_agent", new_callable=AsyncMock
+            ) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "runtime-effect-forgery",
+                        "Authorization": "Bearer sk-secret",
+                        INTERNAL_WAKE_TOKEN_HEADER: "attacker-authored-token",
+                        "Idempotency-Key": "attacker-authored-key",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                body = await resp.json()
+
+        assert resp.status == 403
+        assert body["error"]["code"] == "invalid_internal_wake"
+        mock_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_use_internal_wake_capability_passes_exact_effect(
+        self, auth_adapter,
+    ):
+        from gateway.wake import (
+            INTERNAL_WAKE_TOKEN_HEADER,
+            _internal_wake_idempotency_key,
+            mint_internal_wake_token,
+        )
+
+        effect = _runtime_effect()
+        text = "host-authored completion"
+        session_id = "runtime-effect-valid-token"
+        producer_id = "deleg-api-valid-token"
+        idempotency_key = _internal_wake_idempotency_key(
+            producer_id=producer_id,
+            session_id=session_id,
+            text=text,
+            runtime_effect=effect,
+        )
+        token = mint_internal_wake_token(
+            session_id=session_id,
+            text=text,
+            runtime_effect=effect,
+            producer_id=producer_id,
+        )
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        headers = {
+            "X-Hermes-Session-Id": session_id,
+            "Authorization": "Bearer sk-secret",
+            INTERNAL_WAKE_TOKEN_HEADER: token,
+            "Idempotency-Key": idempotency_key,
+        }
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": text}],
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter, "_run_agent", new_callable=AsyncMock
+            ) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                )
+                accepted = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                replay = await cli.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+
+        assert accepted.status == 200
+        assert mock_run.await_count == 1
+        assert mock_run.call_args.kwargs["runtime_effect"] == effect
+        assert replay.status == 403
+
+    @pytest.mark.asyncio
+    async def test_fresh_wake_tokens_with_same_idempotency_key_execute_once(
+        self, auth_adapter, monkeypatch,
+    ):
+        """Retry after server acceptance reuses the completed host turn."""
+        import gateway.platforms.api_server as api_server_module
+        from gateway.wake import (
+            INTERNAL_WAKE_TOKEN_HEADER,
+            _internal_wake_idempotency_key,
+            mint_internal_wake_token,
+        )
+
+        monkeypatch.setattr(
+            auth_adapter,
+            "_idempotency_cache",
+            api_server_module._IdempotencyCache(),
+        )
+        effect = _runtime_effect()
+        text = "host-authored retry completion"
+        session_id = "runtime-effect-idempotent-retry"
+        producer_id = "deleg-api-idempotent-retry"
+        idempotency_key = _internal_wake_idempotency_key(
+            producer_id=producer_id,
+            session_id=session_id,
+            text=text,
+            runtime_effect=effect,
+        )
+        tokens = [
+            mint_internal_wake_token(
+                session_id=session_id,
+                text=text,
+                runtime_effect=effect,
+                producer_id=producer_id,
+            )
+            for _ in range(2)
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        payload = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": text}],
+            "stream": False,
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter, "_run_agent", new_callable=AsyncMock
+            ) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                )
+                responses = []
+                for token in tokens:
+                    response = await cli.post(
+                        "/v1/chat/completions",
+                        headers={
+                            "X-Hermes-Session-Id": session_id,
+                            "Authorization": "Bearer sk-secret",
+                            INTERNAL_WAKE_TOKEN_HEADER: token,
+                            "Idempotency-Key": idempotency_key,
+                        },
+                        json=payload,
+                    )
+                    await response.read()
+                    responses.append(response)
+
+        assert [response.status for response in responses] == [200, 200]
+        assert mock_run.await_count == 1
+        assert mock_run.call_args.kwargs["runtime_effect"] == effect
+
+    @pytest.mark.asyncio
+    async def test_no_effect_wake_preserves_memory_route_and_executes_once(
+        self, auth_adapter, monkeypatch,
+    ):
+        """Detached completion retries retain host route/memory semantics."""
+
+        import gateway.platforms.api_server as api_server_module
+        from gateway.wake import (
+            INTERNAL_WAKE_TOKEN_HEADER,
+            _internal_wake_idempotency_key,
+            mint_internal_wake_token,
+        )
+
+        monkeypatch.setattr(
+            auth_adapter,
+            "_idempotency_cache",
+            api_server_module._IdempotencyCache(),
+        )
+        context = {
+            "schema": "hermes.api-detached-execution-context.v1",
+            "gateway_session_key": "memory:stable:api-42",
+            "request_model": "openai/gpt-5",
+            "request_provider": "openai",
+            "model_options": {
+                "reasoning": {"enabled": True, "effort": "high"},
+                "service_tier": "priority",
+            },
+            "route_alias": "",
+            "route_model": "",
+            "route_provider": "",
+            "route_semantic_sha256": "",
+            "session_model": "",
+            "confirmed_runtime_lock": False,
+            "requested_runtime": {
+                "model": "openai/gpt-5",
+                "provider": "openai",
+            },
+            "route_source": "raw_request",
+            "effective_model": "openai/gpt-5",
+            "effective_provider": "openai",
+            "effective_transport_sha256": (
+                __import__(
+                    "gateway.api_execution_context",
+                    fromlist=["transport_semantic_digest"],
+                ).transport_semantic_digest(
+                    model="openai/gpt-5",
+                    provider="openai",
+                    base_url="",
+                    api_mode="",
+                )
+            ),
+        }
+        text = "ordinary host completion"
+        session_id = "ordinary-wake-session"
+        producer_id = "deleg-ordinary-wake"
+        idempotency_key = _internal_wake_idempotency_key(
+            producer_id=producer_id,
+            session_id=session_id,
+            text=text,
+            execution_context=context,
+        )
+        tokens = [
+            mint_internal_wake_token(
+                session_id=session_id,
+                text=text,
+                execution_context=context,
+                producer_id=producer_id,
+            )
+            for _ in range(2)
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        payload = {
+            "model": "openai/gpt-5",
+            "provider": "openai",
+            "model_options": context["model_options"],
+            "messages": [{"role": "user", "content": text}],
+            "stream": False,
+        }
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter, "_run_agent", new_callable=AsyncMock
+            ) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                )
+                responses = []
+                for token in tokens:
+                    response = await cli.post(
+                        "/v1/chat/completions",
+                        headers={
+                            "X-Hermes-Session-Id": session_id,
+                            "X-Hermes-Session-Key": (
+                                "memory:stable:api-42"
+                            ),
+                            "Authorization": "Bearer sk-secret",
+                            INTERNAL_WAKE_TOKEN_HEADER: token,
+                            "Idempotency-Key": idempotency_key,
+                        },
+                        json=payload,
+                    )
+                    await response.read()
+                    responses.append(response)
+
+        assert [response.status for response in responses] == [200, 200]
+        assert mock_run.await_count == 1
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["gateway_session_key"] == "memory:stable:api-42"
+        assert kwargs["requested_model"] == "openai/gpt-5"
+        assert kwargs["requested_provider"] == "openai"
+        assert kwargs["model_options"] == context["model_options"]
+        assert kwargs["api_execution_context"] == context
+        assert kwargs["runtime_effect"] is None
+
+    @pytest.mark.asyncio
+    async def test_detached_wake_reuses_origin_agent_and_cache_signature(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        """An unchanged detached turn is a natural cache continuation."""
+
+        import gateway.platforms.api_server as api_server_module
+        from gateway.wake import (
+            INTERNAL_WAKE_TOKEN_HEADER,
+            _internal_wake_idempotency_key,
+            mint_internal_wake_token,
+        )
+
+        instances = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                self.model = kwargs["model"]
+                self.provider = kwargs.get("provider") or ""
+                self.session_id = kwargs["session_id"]
+                self.ephemeral_system_prompt = kwargs.get(
+                    "ephemeral_system_prompt"
+                )
+                self.session_prompt_tokens = 0
+                self.session_completion_tokens = 0
+                self.session_total_tokens = 0
+                self._interrupt_requested = False
+                self._last_compaction_in_place = False
+                self.run_calls = []
+                instances.append(self)
+
+            def run_conversation(self, **kwargs):
+                self.run_calls.append(kwargs)
+                return {
+                    "final_response": f"turn-{len(self.run_calls)}",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                }
+
+            def release_clients(self):
+                return None
+
+        _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
+        monkeypatch.setattr(
+            auth_adapter,
+            "_idempotency_cache",
+            api_server_module._IdempotencyCache(),
+        )
+        monkeypatch.setattr(
+            auth_adapter,
+            "_session_model_override_for",
+            lambda *_args: None,
+        )
+        session_id = "cache-continuity-session"
+        memory_key = "memory:stable:cache-continuity"
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {
+            "id": session_id,
+            "message_count": 0,
+            "ended_at": None,
+        }
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        model_options = {
+            "reasoning": {"enabled": True, "effort": "high"},
+            "service_tier": "priority",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Id": session_id,
+                    "X-Hermes-Session-Key": memory_key,
+                },
+                json={
+                    "model": "hermes-agent",
+                    "model_options": model_options,
+                    "messages": [{"role": "user", "content": "start"}],
+                },
+            )
+            assert first.status == 200
+            await first.read()
+            assert len(instances) == 1
+            original_agent = instances[0]
+            original_signature = original_agent._api_cache_signature
+            context = original_agent._api_detached_execution_context
+            assert context["gateway_session_key"] == memory_key
+
+            completion_text = "detached child completed"
+            producer_id = "deleg-cache-continuity"
+            idempotency_key = _internal_wake_idempotency_key(
+                producer_id=producer_id,
+                session_id=session_id,
+                text=completion_text,
+                execution_context=context,
+            )
+            token = mint_internal_wake_token(
+                session_id=session_id,
+                text=completion_text,
+                execution_context=context,
+                producer_id=producer_id,
+            )
+            wake = await cli.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Id": session_id,
+                    "X-Hermes-Session-Key": memory_key,
+                    "Idempotency-Key": idempotency_key,
+                    INTERNAL_WAKE_TOKEN_HEADER: token,
+                },
+                json={
+                    "model": "hermes-agent",
+                    "model_options": model_options,
+                    "messages": [
+                        {"role": "user", "content": completion_text}
+                    ],
+                    "stream": False,
+                },
+            )
+            assert wake.status == 200
+            await wake.read()
+
+        assert len(instances) == 1
+        assert len(original_agent.run_calls) == 2
+        assert original_agent._api_cache_signature == original_signature
+        cache_key = auth_adapter._api_request_scope(
+            "agent-session",
+            session_id,
+        )
+        cache_entry = auth_adapter._api_agent_cache[cache_key]
+        assert cache_entry["agent"] is original_agent
+        assert cache_entry["signature"] == original_signature
+
+    @pytest.mark.asyncio
     async def test_traversal_session_id_header_rejected(self, auth_adapter):
         """Security (#5958): a path-traversal X-Hermes-Session-Id must be
         rejected with 400 so it can't reach the filesystem artifact paths
@@ -5011,6 +5815,7 @@ class TestSessionKeyHeader:
         def _fake_create_agent(**kwargs):
             captured_kwargs.update(kwargs)
             mock_agent = MagicMock()
+            mock_agent.session_id = kwargs["session_id"]
             mock_agent.run_conversation.return_value = {"final_response": "ok", "messages": []}
             mock_agent.session_prompt_tokens = 0
             mock_agent.session_completion_tokens = 0
@@ -5104,6 +5909,66 @@ class TestModelRoutesParsing:
         routes = {"minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"}}
         adapter = _make_routing_adapter(routes)
         assert adapter._model_routes == routes
+
+    def test_named_profile_routes_never_fall_back_to_default_adapter(
+        self,
+        monkeypatch,
+    ):
+        """The shared listener resolves routing from the active profile."""
+
+        import gateway.platforms.api_server as api_server_module
+
+        adapter = _make_routing_adapter(
+            {
+                "shared": {
+                    "model": "default/model",
+                    "provider": "default-provider",
+                }
+            }
+        )
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {
+                "platforms": {
+                    "api_server": {
+                        "extra": {
+                            "model_routes": {
+                                "shared": {
+                                    "model": "alpha/model",
+                                    "provider": "alpha-provider",
+                                }
+                            },
+                            "direct_model_requests": True,
+                        }
+                    }
+                }
+            },
+        )
+
+        assert adapter._resolve_route("shared") == {
+            "model": "default/model",
+            "provider": "default-provider",
+        }
+        token = api_server_module._api_request_profile.set("alpha")
+        try:
+            assert adapter._resolve_route("shared") == {
+                "model": "alpha/model",
+                "provider": "alpha-provider",
+            }
+            assert adapter._direct_model_requests_enabled() is True
+        finally:
+            api_server_module._api_request_profile.reset(token)
+
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"platforms": {"api_server": {"extra": {}}}},
+        )
+        token = api_server_module._api_request_profile.set("empty-profile")
+        try:
+            assert adapter._resolve_route("shared") is None
+            assert adapter._direct_model_requests_enabled() is False
+        finally:
+            api_server_module._api_request_profile.reset(token)
 
     def test_non_dict_routes_config_is_ignored(self):
         adapter = _make_routing_adapter("not-a-dict")
@@ -5356,9 +6221,15 @@ class TestModelRoutesAgentCreation:
     def test_session_override_lookup_reads_gateway_runner(self, monkeypatch):
         """_session_model_override_for consults GatewayRunner._session_model_overrides."""
         adapter = _make_routing_adapter({})
+        scoped_key = adapter._api_internal_session_key(
+            "chan-1",
+            kind="runner-model",
+        )
 
         class FakeRunner:
-            _session_model_overrides = {"chan-1": {"model": "user/model"}}
+            _session_model_overrides = {
+                scoped_key: {"model": "user/model"},
+            }
 
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: FakeRunner())
         assert adapter._session_model_override_for("chan-1") == {"model": "user/model"}
@@ -5821,7 +6692,14 @@ class TestCreateAgentModelRecovery:
         monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "minimax/minimax-m3")
         adapter._create_agent(session_id="api-session", gateway_session_key="stable-chan-1")
         assert captured[0]["model"] == "minimax/minimax-m3"
-        assert adapter._last_resolved_model["stable-chan-1"] == "minimax/minimax-m3"
+        resolved_key = adapter._api_request_scope(
+            "last-model",
+            "stable-chan-1",
+        )
+        assert (
+            adapter._last_resolved_model[resolved_key]
+            == "minimax/minimax-m3"
+        )
 
         # Turn 2: transient empty resolution, no provider catalog default —
         # must recover the model from turn 1, not build model="".
@@ -5854,7 +6732,10 @@ class TestCreateAgentModelRecovery:
 
         # Only the "*" process-wide fallback may exist — never one entry per
         # ephemeral session_id.
-        assert list(adapter._last_resolved_model.keys()) == ["*"]
+        keys = list(adapter._last_resolved_model)
+        assert len(keys) == 1
+        assert keys[0].kind == "last-model-global"
+        assert keys[0].raw_id == "*"
 
     def test_create_agent_wraps_runtime_credential_failure_as_provider_auth_error(self, monkeypatch):
         """_create_agent() must convert a RuntimeError from

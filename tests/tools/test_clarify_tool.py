@@ -5,12 +5,239 @@ from typing import List, Optional
 
 
 from tools.clarify_tool import (
+    autonomy_clarify_response,
     clarify_tool,
     check_clarify_requirements,
     MAX_CHOICES,
     CLARIFY_SCHEMA,
     _flatten_choice,
 )
+
+
+class TestAutonomyClarifyPolicy:
+    def test_interactive_policy_never_auto_resolves(self):
+        assert (
+            autonomy_clarify_response(
+                "Should I run the focused tests?",
+                ["Run them", "Skip them"],
+                policy="interactive",
+            )
+            is None
+        )
+
+    def test_blockers_only_auto_resolves_routine_engineering_work(self):
+        for question in (
+            "Should I inspect the repository and run pytest?",
+            "Should I inspect the error message and run tests?",
+            "Should I review the POST request and run pytest?",
+            "Should I test the email validation helper locally?",
+            "Should I inspect the contact form code and run tests?",
+            "Would you like me to run the focused tests?",
+            "Do you want me to check the local patch?",
+            "Shall I run pytest?",
+            "Да проверя ли локалния код?",
+            "Да прегледам кода и да пусна тестовете?",
+        ):
+            response = autonomy_clarify_response(
+                question,
+                ["Proceed", "Stop"],
+                policy="blockers_only",
+            )
+
+            assert response is not None
+            assert "Proceed now" in response
+            assert "micro-approval" in response
+
+    def test_blockers_only_auto_resolves_open_ended_bulgarian_technical_choice(self):
+        response = autonomy_clarify_response(
+            "Коя техническа реализация да избера за локалния код?",
+            policy="blockers_only",
+        )
+
+        assert response is not None
+
+    def test_blockers_only_keeps_deploy_and_merge_interactive(self):
+        for question in (
+            "Should I merge and deploy this to production?",
+            "Да направя ли мърдж и деплой?",
+            "Should I run tests and then restart production?",
+        ):
+            assert (
+                autonomy_clarify_response(
+                    question,
+                    ["Yes", "No"],
+                    policy="blockers_only",
+                )
+                is None
+            )
+
+    def test_negated_external_action_does_not_block_local_work(self):
+        response = autonomy_clarify_response(
+            "Should I implement and test the local patch without push or deploy?",
+            ["Proceed", "Stop"],
+            policy="blockers_only",
+        )
+
+        assert response is not None
+
+    def test_user_only_and_business_decisions_remain_interactive(self):
+        for question in (
+            "What is the login password?",
+            "Which business priority should the customer promise use?",
+            "Бюджетът да бъде ли увеличен?",
+        ):
+            assert (
+                autonomy_clarify_response(
+                    question,
+                    ["A", "B"],
+                    policy="blockers_only",
+                )
+                is None
+            )
+
+    def test_open_ended_technical_question_is_not_silently_answered(self):
+        assert (
+            autonomy_clarify_response(
+                "What architecture should the business adopt?",
+                policy="blockers_only",
+            )
+            is None
+        )
+
+    def test_external_action_mixed_with_safe_work_remains_interactive(self):
+        for question in (
+            "Should I run tests and open a pull request?",
+            "Should I inspect the patch and email results to the customer?",
+            "Да пусна ли тестовете и да изпратя съобщение на клиента?",
+            "Should I run tests and upload the artifact to S3?",
+            "Should I inspect the diff and create an S3 bucket?",
+            "Should I review and approve the pull request?",
+            "Should I inspect the patch and close the GitHub issue?",
+            "Should I run tests and grant Alice admin access?",
+            "Should I run tests and delete the remote branch?",
+        ):
+            assert (
+                autonomy_clarify_response(
+                    question,
+                    ["Proceed", "Stop"],
+                    policy="blockers_only",
+                )
+                is None
+            )
+
+    def test_high_impact_choice_is_not_hidden_by_generic_question(self):
+        assert (
+            autonomy_clarify_response(
+                "How should I continue after the tests?",
+                ["Keep the patch local", "Deploy to production"],
+                policy="blockers_only",
+            )
+            is None
+        )
+
+    def test_unclassified_choice_keeps_strict_local_question_interactive(self):
+        assert (
+            autonomy_clarify_response(
+                "Should I run the focused tests?",
+                [
+                    {"label": "Proceed", "description": "Upload to S3 after"},
+                    "Stop",
+                ],
+                policy="blockers_only",
+            )
+            is None
+        )
+
+    def test_opaque_choices_are_not_silently_authorized(self):
+        for choices in (
+            ["Option A", "Option B"],
+            ["A", "B"],
+            ["Вариант А", "Вариант Б"],
+            ["1", "2"],
+        ):
+            assert (
+                autonomy_clarify_response(
+                    "Which technical approach should I choose for the local code?",
+                    choices,
+                    policy="blockers_only",
+                )
+                is None
+            )
+
+    def test_generic_bulgarian_mutation_requires_explicit_local_scope(self):
+        for question in (
+            "Да направя ли промяна?",
+            "Да приложа ли промяна?",
+            "Да подготвя ли поправка?",
+        ):
+            assert (
+                autonomy_clarify_response(
+                    question,
+                    ["Продължи", "Спри"],
+                    policy="blockers_only",
+                )
+                is None
+            )
+
+        assert (
+            autonomy_clarify_response(
+                "Да направя ли локалната промяна?",
+                ["Продължи", "Спри"],
+                policy="blockers_only",
+            )
+            is not None
+        )
+
+    def test_structured_or_nested_choice_metadata_is_never_auto_authorized(self):
+        for choices in (
+            [
+                {"label": "Proceed", "description": "Deploy to production"},
+                "Stop",
+            ],
+            [
+                [{"label": "Proceed", "description": "Deploy to production"}],
+                "Stop",
+            ],
+        ):
+            assert (
+                autonomy_clarify_response(
+                    "Should I run the focused tests?",
+                    choices,
+                    policy="blockers_only",
+                )
+                is None
+            )
+
+    def test_multi_select_is_never_resolved_with_canned_prose(self):
+        assert (
+            autonomy_clarify_response(
+                "Should I run the focused tests?",
+                ["Run them", "Skip them"],
+                policy="blockers_only",
+                multi_select=True,
+            )
+            is None
+        )
+
+    def test_explicit_user_preference_remains_interactive(self):
+        for question in (
+            "Which design would you personally prefer after the review?",
+            "Кой дизайн предпочиташ след прегледа?",
+        ):
+            assert (
+                autonomy_clarify_response(
+                    question,
+                    ["A", "B"],
+                    policy="blockers_only",
+                )
+                is None
+            )
+
+    def test_default_config_declares_supported_policy_key(self):
+        from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
+
+        assert DEFAULT_CONFIG["agent"]["clarify_policy"] == "interactive"
+        assert _validate_config_key("agent.clarify_policy") == (True, None)
 
 
 class TestClarifyToolBasics:
@@ -77,6 +304,36 @@ class TestClarifyToolChoicesValidation:
         clarify_tool("Pick one", choices=many_choices, callback=mock_callback)
 
         assert len(choices_passed) == MAX_CHOICES
+
+    def test_authorization_callback_receives_untruncated_raw_choices(self):
+        seen = []
+
+        def policy_callback(
+            question,
+            choices,
+            multi_select=False,
+            raw_choices=None,
+        ):
+            seen.extend(raw_choices or [])
+            auto = autonomy_clarify_response(
+                question,
+                raw_choices,
+                policy="blockers_only",
+                multi_select=multi_select,
+            )
+            return auto or "interactive-required"
+
+        result = json.loads(
+            clarify_tool(
+                "Should I run the focused tests?",
+                choices=["Proceed", "Stop", "Cancel", "Run them", "Deploy to production"],
+                callback=policy_callback,
+            )
+        )
+
+        assert seen[-1] == "Deploy to production"
+        assert len(result["choices_offered"]) == MAX_CHOICES
+        assert result["user_response"] == "interactive-required"
 
     def test_empty_choices_become_none(self):
         """Empty choices list should become None (open-ended)."""
@@ -240,6 +497,15 @@ class TestClarifySchema:
         """Schema should have a description."""
         assert "description" in CLARIFY_SCHEMA
         assert len(CLARIFY_SCHEMA["description"]) > 50
+
+    def test_schema_scopes_autonomous_edits_to_requested_implementation(self):
+        """Analysis/review prompts must not become implicit edit authority."""
+        description = CLARIFY_SCHEMA["description"].lower()
+        assert "asked you to implement, change, build, or fix" in description
+        assert "within that requested scope" in description
+        assert "planning" in description
+        assert "inspect and report without making edits" in description
+        assert "unless the user also asked for a change" in description
 
     def test_schema_question_required(self):
         """Question parameter should be required."""

@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
+from agent.terminal_outcome import normalize_terminal_outcome
 from agent.tool_guardrails import classify_tool_failure
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -520,6 +521,45 @@ def _get_max_async_children() -> int:
             "delegations too. Remove the stale key from config.yaml."
         )
     return _get_max_concurrent_children()
+
+
+def _isolated_worker_selected_for_delegation(parent_agent) -> bool:
+    """Validate the trusted parent flag against the live backend selection.
+
+    Once turn setup has marked a parent as isolated-worker backed, delegation
+    may not silently downgrade that security boundary because an import,
+    config read, or backend probe failed. A false trusted flag is the normal
+    non-isolated path and avoids importing the optional runtime.
+    """
+
+    if getattr(
+        parent_agent,
+        "_isolated_worker_backend_selected",
+        False,
+    ) is not True:
+        return False
+    try:
+        from tools.terminal_tool import isolated_worker_backend_selected
+
+        selected = bool(isolated_worker_backend_selected())
+    except Exception as exc:
+        raise RuntimeError(
+            "isolated_worker_delegation_detection_failed"
+        ) from exc
+    if not selected:
+        raise RuntimeError(
+            "isolated_worker_delegation_state_mismatch"
+        )
+    return True
+
+
+def _agent_workspace_lease_owner_id(agent) -> Optional[str]:
+    owner_id = getattr(
+        agent,
+        "_workspace_lease_binding_owner_id",
+        None,
+    )
+    return owner_id if isinstance(owner_id, str) and owner_id else None
 
 
 def _get_child_timeout() -> Optional[float]:
@@ -1524,6 +1564,67 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Isolated-worker children share one root-owned workspace lease.  Keep the
+    # authority separate from transcript/session identity: neither the model
+    # nor the child can select or rebind it.
+    _workspace_lease_authority = (
+        getattr(parent_agent, "_workspace_lease_authority", None)
+        or getattr(parent_agent, "session_id", None)
+    )
+    _trusted_isolated_worker = (
+        getattr(
+            parent_agent,
+            "_isolated_worker_backend_selected",
+            False,
+        )
+        is True
+    )
+    if _workspace_lease_authority and _trusted_isolated_worker:
+        child._workspace_lease_authority = _workspace_lease_authority
+        _registered_workspace_identities = []
+        _unregister_workspace_lease_authority = None
+        _child_workspace_owner = _agent_workspace_lease_owner_id(child)
+        try:
+            _isolated_worker_selected_for_delegation(parent_agent)
+            child._isolated_worker_backend_selected = True
+            from tools.terminal_tool import (
+                register_workspace_lease_authorities,
+                unregister_workspace_lease_authority as _unregister_workspace_lease_authority,
+            )
+
+            _registered_workspace_identities = list(
+                register_workspace_lease_authorities(
+                    tuple(
+                        str(value)
+                        for value in (
+                            getattr(child, "session_id", None),
+                            subagent_id,
+                        )
+                        if value
+                    ),
+                    str(_workspace_lease_authority),
+                    owner_id=_child_workspace_owner,
+                )
+            )
+            child._workspace_lease_runtime_ids = tuple(
+                _registered_workspace_identities
+            )
+        except Exception:
+            if callable(_unregister_workspace_lease_authority):
+                for _registered_identity in _registered_workspace_identities:
+                    _unregister_workspace_lease_authority(
+                        _registered_identity,
+                        str(_workspace_lease_authority),
+                        owner_id=_child_workspace_owner,
+                    )
+            try:
+                child.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close child after authority bind failure",
+                    exc_info=True,
+                )
+            raise
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -2291,30 +2392,37 @@ def _run_single_child(
 
         duration = round(time.monotonic() - child_start, 2)
 
+        terminal_outcome = normalize_terminal_outcome(result)
+        if not isinstance(result, dict):
+            # The canonicalizer fails malformed results closed.  Keep the
+            # remainder of this boundary diagnostic-safe as well.
+            result = {}
         summary = result.get("final_response") or ""
-        completed = result.get("completed", False)
-        partial = bool(result.get("partial", False))
-        interrupted = result.get("interrupted", False)
+        completed = terminal_outcome.completed
+        partial = terminal_outcome.partial
+        failed = terminal_outcome.failed
+        interrupted = terminal_outcome.interrupted
         api_calls = result.get("api_calls", 0)
 
-        # The child emits the literal "(empty)" sentinel (see run_agent.py) when
-        # it gives up after repeated empty-LLM-response retries — typically a
-        # transport bug (misrouted provider, adapter returning empty
-        # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
-        # it instead of silently accepting zero-content "success".
+        # The child can emit the literal "(empty)" sentinel (see run_agent.py)
+        # after repeated empty responses.  It is not usable task output, but
+        # text inspection cannot override the shared terminal authority.
         _empty_sentinel = summary.strip() == "(empty)"
+        _has_usable_summary = bool(summary.strip()) and not _empty_sentinel
 
-        if interrupted:
+        if failed:
+            # Diagnostic text from a failed child is evidence, not success.
+            # Keep it in ``summary`` for the parent without promoting the
+            # child merely because it managed to explain the failure.
+            status = "failed"
+        elif interrupted:
             status = "interrupted"
         elif partial:
-            # A runtime-boundary receipt is useful evidence, not task
-            # completion. Preserve it for the parent while keeping the child
-            # explicitly resumable.
+            # Missing summary text is a usability diagnostic, never authority
+            # to rewrite the shared terminal outcome.  Preserve PARTIAL and
+            # expose the missing result separately below.
             status = "partial"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif completed:
             status = "completed"
         else:
             status = "failed"
@@ -2361,13 +2469,25 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
-        # Determine exit reason
-        if interrupted:
+        # Preserve the child's exact terminal boundary whenever it supplied
+        # one. Do not overwrite provider failures or other abnormal exits with
+        # a fabricated max-iteration reason.
+        raw_exit_reason = str(result.get("turn_exit_reason") or "").strip()
+        if status == "failed":
+            if raw_exit_reason:
+                exit_reason = raw_exit_reason
+            else:
+                exit_reason = "failed"
+        elif interrupted:
             exit_reason = "interrupted"
+        elif status == "completed":
+            exit_reason = raw_exit_reason or "completed"
+        elif raw_exit_reason:
+            exit_reason = raw_exit_reason
+        elif partial and not _has_usable_summary:
+            exit_reason = "max_iterations"
         elif partial:
-            exit_reason = str(result.get("turn_exit_reason") or "partial")
-        elif completed:
-            exit_reason = "completed"
+            exit_reason = "partial"
         else:
             exit_reason = "max_iterations"
 
@@ -2380,6 +2500,11 @@ def _run_single_child(
             "task_index": task_index,
             "status": status,
             "summary": summary,
+            "usable_result": bool(
+                _has_usable_summary
+                and status in {"completed", "partial"}
+            ),
+            "summary_missing": not _has_usable_summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
@@ -2411,8 +2536,12 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if terminal_outcome.contradictory:
+            entry["terminal_outcome_contradictory"] = True
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            entry["error"] = (
+                result.get("error") or "Subagent did not produce a response."
+            )
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -2548,6 +2677,31 @@ def _run_single_child(
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
             _unregister_subagent(_subagent_id)
+        _workspace_authority = getattr(
+            child,
+            "_workspace_lease_authority",
+            None,
+        )
+        if _workspace_authority:
+            try:
+                from tools.terminal_tool import (
+                    unregister_workspace_lease_authority,
+                )
+
+                for _runtime_identity in (
+                    getattr(child, "_workspace_lease_runtime_ids", ())
+                ):
+                    if _runtime_identity:
+                        unregister_workspace_lease_authority(
+                            str(_runtime_identity),
+                            str(_workspace_authority),
+                            owner_id=_agent_workspace_lease_owner_id(child),
+                        )
+            except Exception:
+                logger.warning(
+                    "Failed to release child workspace lease authority",
+                    exc_info=True,
+                )
 
         if child_pool is not None and leased_cred_id is not None:
             try:
@@ -2887,6 +3041,13 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    # Validate the boundary before creating logs or child agents. If an
+    # isolated parent cannot prove the live backend state, delegation has no
+    # authority to dispatch and must leave no partial child lifecycle behind.
+    _runtime_isolated_worker_selected = (
+        _isolated_worker_selected_for_delegation(parent_agent)
+    )
+
     overall_start = time.monotonic()
     results = []
 
@@ -2920,7 +3081,44 @@ def delegate_task(
     from tools.async_delegation import _current_origin_session_id
 
     _origin_wake_sid = _current_origin_session_id()
+    # Capture the host-authored API execution envelope at the same pre-child
+    # boundary as the raw wake session id.  Child construction rewrites
+    # session ContextVars, while this parent-owned attribute is immutable for
+    # the current API turn.  Ephemeral prompts are explicitly never persisted,
+    # so such turns are forced synchronous instead of writing prompt text into
+    # the durable delegation ledger.
+    _api_execution_context = None
+    _api_detached_ineligible_reason = ""
+    if str(getattr(parent_agent, "platform", "") or "") == "api_server":
+        if str(getattr(parent_agent, "ephemeral_system_prompt", "") or ""):
+            _api_detached_ineligible_reason = (
+                "the originating API turn has an ephemeral system prompt "
+                "that must never be persisted"
+            )
+        else:
+            try:
+                from gateway.api_execution_context import (
+                    normalize_api_execution_context,
+                )
 
+                _api_execution_context = normalize_api_execution_context(
+                    getattr(
+                        parent_agent,
+                        "_api_detached_execution_context",
+                        None,
+                    ),
+                    allow_none=False,
+                )
+            except Exception:
+                _api_detached_ineligible_reason = str(
+                    getattr(
+                        parent_agent,
+                        "_api_detached_ineligible_reason",
+                        "",
+                    )
+                    or "the API execution route cannot be represented by "
+                    "the safe durable completion schema"
+                )
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
@@ -3100,7 +3298,12 @@ def delegate_task(
                         )
                         dur = entry.get("duration_seconds", 0)
                         status = entry.get("status", "?")
-                        icon = "✓" if status == "completed" else "✗"
+                        if status == "completed":
+                            icon = "✓"
+                        elif status == "partial":
+                            icon = "⚠"
+                        else:
+                            icon = "✗"
                         remaining = n_tasks - completed_count
                         completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
                         if spinner_ref:
@@ -3182,8 +3385,10 @@ def delegate_task(
         except Exception:
             _async_ok = True
 
+        if _api_detached_ineligible_reason:
+            _async_ok = False
         _wake_sid = ""
-        if not _async_ok:
+        if not _async_ok and not _api_detached_ineligible_reason:
             # The adapter itself cannot push, but if a raw session id is
             # bound (the API server always binds one — see
             # ApiServerAdapter._bind_api_server_session), gateway.wake can
@@ -3212,13 +3417,21 @@ def delegate_task(
             )
             _sync_result = _execute_and_aggregate()
             if isinstance(_sync_result, dict):
-                _sync_result["note"] = (
-                    "background=true is not available in this session — it cannot "
-                    "receive a detached subagent result after the turn ends (a "
-                    "one-shot runner such as `hermes -z`, a cron job, a Kanban "
-                    "worker, or a stateless HTTP endpoint). The subagent(s) ran "
-                    "SYNCHRONOUSLY and the result is included above."
-                )
+                if _api_detached_ineligible_reason:
+                    _sync_result["note"] = (
+                        "background=true was executed SYNCHRONOUSLY because "
+                        f"{_api_detached_ineligible_reason}. The exact API "
+                        "execution contract was preserved without persisting "
+                        "ephemeral or unsafe request state."
+                    )
+                else:
+                    _sync_result["note"] = (
+                        "background=true is not available in this session — it cannot "
+                        "receive a detached subagent result after the turn ends (a "
+                        "one-shot runner such as `hermes -z`, a cron job, a Kanban "
+                        "worker, or a stateless HTTP endpoint). The subagent(s) ran "
+                        "SYNCHRONOUSLY and the result is included above."
+                    )
             return json.dumps(_sync_result, ensure_ascii=False)
 
         _session_key = get_current_session_key(default="")
@@ -3319,6 +3532,70 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _runtime_effect = None
+        if _runtime_isolated_worker_selected:
+            from agent.runtime_effects import (
+                build_isolated_workspace_runtime_effect,
+            )
+
+            _workspace_authority = getattr(
+                parent_agent,
+                "_workspace_lease_authority",
+                None,
+            )
+            if not _workspace_authority:
+                _root_reader = getattr(
+                    parent_agent,
+                    "_conversation_root_id",
+                    None,
+                )
+                if callable(_root_reader):
+                    _workspace_authority = _root_reader()
+            if not _workspace_authority:
+                _workspace_authority = getattr(
+                    parent_agent,
+                    "session_id",
+                    None,
+                )
+            if not isinstance(_workspace_authority, str) or not _workspace_authority:
+                raise RuntimeError(
+                    "async_delegation_workspace_authority_missing"
+                )
+            _baseline_generation = None
+            try:
+                from tools.terminal_tool import (
+                    isolated_worker_proof_status_for_authority,
+                )
+
+                _baseline_receipt = (
+                    isolated_worker_proof_status_for_authority(
+                        _workspace_authority
+                    )
+                )
+                _candidate_generation = _baseline_receipt.get(
+                    "edit_generation"
+                )
+                if (
+                    type(_candidate_generation) is not int
+                    or _candidate_generation < 0
+                ):
+                    raise ValueError(
+                        "async_delegation_baseline_generation_invalid"
+                    )
+                _baseline_generation = _candidate_generation
+            except Exception:
+                # A failed dispatch-time read is represented explicitly as a
+                # null baseline.  The completion turn then fails closed
+                # instead of silently treating an unknown epoch as unchanged.
+                logger.warning(
+                    "Async delegation could not capture the isolated-worker "
+                    "baseline; completion will require fail-closed proof",
+                    exc_info=True,
+                )
+            _runtime_effect = build_isolated_workspace_runtime_effect(
+                _workspace_authority,
+                _baseline_generation,
+            )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3338,6 +3615,8 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            runtime_effect=_runtime_effect,
+            api_execution_context=_api_execution_context,
         )
 
         if dispatch.get("status") == "dispatched":

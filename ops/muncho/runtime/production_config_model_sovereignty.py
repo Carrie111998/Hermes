@@ -41,6 +41,16 @@ MAX_CONFIG_BYTES = 1024 * 1024
 GATEWAY_UNIT = "hermes-cloud-gateway.service"
 SYSTEMCTL_PATH = "/usr/bin/systemctl"
 _STOPPED_GATEWAY_STATES = frozenset({"failed", "inactive"})
+_PRODUCTION_GATEWAY_NOTIFY_INTERVAL = 180
+_PRODUCTION_DISCORD_DISPLAY_POLICY = {
+    "tool_progress": "off",
+    "interim_assistant_messages": False,
+    "thinking_progress": False,
+    "show_reasoning": False,
+    "streaming": False,
+    "long_running_notifications": True,
+    "busy_ack_detail": False,
+}
 
 PLAN_SCHEMA = "muncho-production-model-sovereignty-config-plan.v1"
 RECEIPT_SCHEMA = "muncho-production-model-sovereignty-config-receipt.v1"
@@ -51,8 +61,9 @@ MUTATIONS = (
     "agent.adaptive_reasoning={enabled:true,max_effort:max}",
     "agent.background_review_enabled=false",
     "agent.tool_use_enforcement=true",
-    "agent.verify_on_stop=false",
-    "agent.verification_ledger_enabled=false",
+    "agent.verify_on_stop=true",
+    "agent.verification_ledger_enabled=true",
+    "agent.gateway_notify_interval=180",
     "agent.environment_hint.remove_stale_gpt_5_5_clause",
     "compression.abort_on_summary_failure=true",
     "auxiliary.compression={provider:openai-codex,model:gpt-5.6-sol}",
@@ -66,6 +77,7 @@ MUTATIONS = (
     "command_allowlist=[]",
     "plugins={enabled:[],disabled:[]}",
     "hooks={};hooks_auto_accept=false",
+    "display.platforms.discord=final_answer_first_low_noise",
 )
 _STALE_MODEL_SENTENCE = (
     "gpt-5.6-sol; do not route GPT-5.5 through OPENAI_API_KEY."
@@ -292,10 +304,30 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ConfigGateError("config_background_review_policy_drifted")
     agent["background_review_enabled"] = False
     agent["tool_use_enforcement"] = True
-    if agent.get("verify_on_stop") not in {None, False}:
+    verify_on_stop_source = agent.get("verify_on_stop")
+    if (
+        verify_on_stop_source is not None
+        and type(verify_on_stop_source) is not bool
+    ):
         raise ConfigGateError("config_verify_on_stop_drifted")
-    agent["verify_on_stop"] = False
-    agent["verification_ledger_enabled"] = False
+    verification_ledger_source = agent.get("verification_ledger_enabled")
+    if (
+        verification_ledger_source is not None
+        and type(verification_ledger_source) is not bool
+    ):
+        raise ConfigGateError("config_verification_ledger_drifted")
+    agent["verify_on_stop"] = True
+    agent["verification_ledger_enabled"] = True
+    notify_interval_source = agent.get("gateway_notify_interval")
+    if (
+        notify_interval_source is not None
+        and (
+            type(notify_interval_source) is not int
+            or notify_interval_source < 0
+        )
+    ):
+        raise ConfigGateError("config_gateway_notify_interval_drifted")
+    agent["gateway_notify_interval"] = _PRODUCTION_GATEWAY_NOTIFY_INTERVAL
 
     compression = _required_mapping(target, "compression")
     if compression.get("abort_on_summary_failure") not in {False, True}:
@@ -384,6 +416,17 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     target["hooks"] = {}
     if target.get("hooks_auto_accept") is not False:
         raise ConfigGateError("config_hook_acceptance_drifted")
+
+    display = target.setdefault("display", {})
+    if not isinstance(display, dict):
+        raise ConfigGateError("config_display_surface_drifted")
+    display_platforms = display.setdefault("platforms", {})
+    if not isinstance(display_platforms, dict):
+        raise ConfigGateError("config_display_platforms_surface_drifted")
+    discord_display = display_platforms.setdefault("discord", {})
+    if not isinstance(discord_display, dict):
+        raise ConfigGateError("config_discord_display_surface_drifted")
+    discord_display.update(copy.deepcopy(_PRODUCTION_DISCORD_DISPLAY_POLICY))
     return target
 
 
@@ -405,6 +448,8 @@ def _transform(raw: bytes) -> bytes:
         raise ConfigGateError("config_tool_use_source_drifted")
     if agent.get("verify_on_stop") is not None:
         raise ConfigGateError("config_verify_on_stop_source_drifted")
+    if agent.get("verification_ledger_enabled") is not None:
+        raise ConfigGateError("config_verification_ledger_source_drifted")
     if _STALE_MODEL_SENTENCE not in str(agent.get("environment_hint") or ""):
         raise ConfigGateError("config_environment_hint_source_drifted")
     kanban = _required_mapping(source, "kanban")
