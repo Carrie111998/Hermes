@@ -38,7 +38,26 @@ def test_sqlite_multi_host_configuration_fails_closed():
         )
 
 
+def test_postgres_declares_multi_host_fenced_authority_contract():
+    result = authority_store.status(
+        {
+            "agentic": {
+                "authority_store": {
+                    "backend": "postgres",
+                    "deployment_scope": "multi_host",
+                }
+            }
+        }
+    )
+    assert result["transactional"] is True
+    assert result["multi_host"] is True
+    assert result["resource_fencing"] is True
+    assert result["ready"] is True
+
+
 def test_unknown_backend_never_silently_falls_back_to_sqlite():
+    # Use a backend name that will never exist; must fail closed, never
+    # silently degrade to SQLite.
     with pytest.raises(
         authority_store.AuthorityStoreConfigurationError,
         match="not installed",
@@ -47,7 +66,7 @@ def test_unknown_backend_never_silently_falls_back_to_sqlite():
             {
                 "agentic": {
                     "authority_store": {
-                        "backend": "postgres",
+                        "backend": "cassandra_nonexistent",
                         "deployment_scope": "multi_host",
                     }
                 }

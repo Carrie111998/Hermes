@@ -5,19 +5,23 @@ on:
     branches: [main]
     paths:
       - 'hermes_cli/postgres_authority.py'
+      - 'hermes_cli/authority_store.py'
       - 'tests/test_postgres_authority.py'
+      - 'tests/hermes_cli/test_authority_store.py'
       - '.github/workflows/postgres-authority.yml'
   pull_request:
     branches: [main]
     paths:
       - 'hermes_cli/postgres_authority.py'
+      - 'hermes_cli/authority_store.py'
       - 'tests/test_postgres_authority.py'
+      - 'tests/hermes_cli/test_authority_store.py'
       - '.github/workflows/postgres-authority.yml'
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    
+
     services:
       postgres:
         image: postgres:16
@@ -32,35 +36,45 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           version: "0.8.0"
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      
+
       - name: Install dependencies
         run: |
           uv sync --extra dev --extra postgres
-      
-      - name: Run Postgres authority tests
+
+      - name: Run authority store unit tests (no Postgres required)
+        run: |
+          uv run pytest -v tests/hermes_cli/test_authority_store.py
+
+      - name: Run Postgres authority tests (full adversarial suite)
         env:
+          # CI uses the Docker service container with TCP auth.
           AUTHORITY_POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/charterforge_test
         run: |
           uv run pytest -v tests/test_postgres_authority.py
-      
-      - name: Verify postgres_authority module
+
+      - name: Verify postgres_authority module API
         run: |
           uv run python -c "
           from hermes_cli.postgres_authority import (
-              connect, init_schema, claim_task, complete_task,
+              connect, init_schema, get_schema_version,
+              claim_task, reclaim_task, get_claim,
+              release_claim, complete_task,
+              issue_permit, consume_permit, revoke_permit,
+              record_effect, get_effect,
+              get_active_runs, cleanup_expired_claims,
               get_authority_backend, SCHEMA_VERSION
           )
           print(f'✓ postgres_authority module loaded')
@@ -70,20 +84,20 @@ jobs:
 
   build-with-postgres:
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           version: "0.8.0"
-      
+
       - name: Build with postgres extra
         run: |
           uv build --wheel --sdist
           uv pip install --python 3.12 dist/charterforge-0.*-py3-none-any.whl[postgres]
-      
+
       - name: Verify psycopg installed
         run: |
           python -c "import psycopg; print(f'✓ psycopg {psycopg.__version__}')"
