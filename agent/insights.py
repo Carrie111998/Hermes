@@ -289,40 +289,68 @@ class InsightsEngine:
         ]
 
     def _get_skill_usage(self, cutoff: float, source: str = None) -> List[Dict]:
-        """Extract per-skill usage from assistant tool calls."""
-        skill_counts: Dict[str, Dict[str, Any]] = {}
+        """Extract per-skill usage from successful, canonical skill actions.
 
+        Windowed by each call's own message timestamp (not the session's
+        ``started_at``), so a long-lived session that spans the cutoff still
+        reports only the actions that actually happened inside the window.
+
+        Each ``skill_view``/``skill_manage`` call is correlated against its
+        tool-result message via ``tool_call_id``:
+
+        - Calls whose result positively marks ``"success": false`` are
+          excluded (a failed lookup/edit is not usage).
+        - ``skill_view`` loads prefer ``result["path"]`` (the resolved
+          ``category/skill/SKILL.md`` location, trailing ``/SKILL.md``
+          stripped) as the canonical identity, so short (``skill``),
+          categorized (``category/skill``), and colon-qualified
+          (``category:skill``) spellings of the same skill coalesce into one
+          entry instead of splitting — and two different skills that happen
+          to share a bare frontmatter ``name`` in different categories stay
+          distinct. Plugin skills have no ``path``; those fall back to the
+          already-qualified ``result["name"]`` (``plugin:skill``).
+        - ``skill_view`` calls whose result read a supporting file
+          (``result["file"]`` set to something other than ``SKILL.md`` — i.e. a
+          ``references/*``/``templates/*``/``assets/*``/``scripts/*`` read) are
+          not counted as a top-level SKILL.md load.
+
+        When a call has no ``tool_call_id`` or no correlated result (older
+        rows, interrupted turns), it falls back to the raw argument name and is
+        still counted — we never invent a failure or a canonical identity we
+        can't verify from actual tool-result metadata.
+        """
         if source:
             cursor = self._conn.execute(
-                """SELECT m.tool_calls, m.timestamp
+                """SELECT m.session_id, m.tool_calls, m.timestamp
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?
+                   WHERE m.timestamp >= ? AND s.source = ?
                      AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
                 (cutoff, source),
             )
         else:
             cursor = self._conn.execute(
-                """SELECT m.tool_calls, m.timestamp
+                """SELECT m.session_id, m.tool_calls, m.timestamp
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?
+                   WHERE m.timestamp >= ?
                      AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
                 (cutoff,),
             )
 
+        calls: List[Dict[str, Any]] = []
+        session_ids: set = set()
         for row in cursor.fetchall():
             try:
-                calls = row["tool_calls"]
-                if isinstance(calls, str):
-                    calls = json.loads(calls)
-                if not isinstance(calls, list):
+                tool_calls = row["tool_calls"]
+                if isinstance(tool_calls, str):
+                    tool_calls = json.loads(tool_calls)
+                if not isinstance(tool_calls, list):
                     continue
             except (json.JSONDecodeError, TypeError):
                 continue
 
-            timestamp = row["timestamp"]
-            for call in calls:
+            for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
                 func = call.get("function", {})
@@ -343,24 +371,102 @@ class InsightsEngine:
                 if not isinstance(skill_name, str) or not skill_name.strip():
                     continue
 
-                entry = skill_counts.setdefault(
-                    skill_name,
-                    {
-                        "skill": skill_name,
-                        "view_count": 0,
-                        "manage_count": 0,
-                        "last_used_at": None,
-                    },
-                )
-                if tool_name == "skill_view":
-                    entry["view_count"] += 1
-                else:
-                    entry["manage_count"] += 1
+                calls.append({
+                    "session_id": row["session_id"],
+                    "timestamp": row["timestamp"],
+                    "tool_name": tool_name,
+                    "call_id": call.get("id"),
+                    "args_name": skill_name,
+                })
+                session_ids.add(row["session_id"])
 
-                if timestamp is not None and (
-                    entry["last_used_at"] is None or timestamp > entry["last_used_at"]
+        if not calls:
+            return []
+
+        # Correlate against tool-result rows (role='tool') to know whether a
+        # call succeeded and, for skill_view, to read the tool's resolved
+        # canonical name / file field. A result always lands at or after its
+        # call's timestamp, so the same cutoff bounds this fetch too.
+        results_by_call: Dict[tuple, Any] = {}
+        placeholders = ",".join("?" for _ in session_ids)
+        result_cursor = self._conn.execute(
+            f"""SELECT session_id, tool_call_id, content FROM messages
+                WHERE role = 'tool' AND tool_call_id IS NOT NULL
+                  AND timestamp >= ? AND session_id IN ({placeholders})""",
+            (cutoff, *session_ids),
+        )
+        for row in result_cursor.fetchall():
+            results_by_call[(row["session_id"], row["tool_call_id"])] = row["content"]
+
+        skill_counts: Dict[str, Dict[str, Any]] = {}
+
+        for call in calls:
+            result_content = None
+            if call["call_id"] is not None:
+                result_content = results_by_call.get((call["session_id"], call["call_id"]))
+
+            result_data = None
+            if isinstance(result_content, str):
+                try:
+                    parsed = json.loads(result_content)
+                    if isinstance(parsed, dict):
+                        result_data = parsed
+                except (json.JSONDecodeError, TypeError):
+                    result_data = None
+
+            succeeded = result_data is not None and result_data.get("success") is True
+            failed = result_data is not None and result_data.get("success") is False
+            if failed:
+                continue
+
+            canonical_name = call["args_name"]
+            is_reference_read = False
+            if call["tool_name"] == "skill_view" and succeeded:
+                file_field = result_data.get("file")
+                if (
+                    isinstance(file_field, str)
+                    and file_field.rsplit("/", 1)[-1] != "SKILL.md"
                 ):
-                    entry["last_used_at"] = timestamp
+                    is_reference_read = True
+                else:
+                    path_field = result_data.get("path")
+                    name_field = result_data.get("name")
+                    if isinstance(path_field, str) and path_field.strip():
+                        # Bare frontmatter names collide across categories
+                        # (e.g. two unrelated "axolotl" skills) — the
+                        # resolved path is the collision-safe identity.
+                        canonical_name = (
+                            path_field[: -len("/SKILL.md")]
+                            if path_field.endswith("/SKILL.md")
+                            else path_field
+                        )
+                    elif isinstance(name_field, str) and name_field.strip():
+                        # Plugin skills (namespace:bare) have no path; the
+                        # qualified name is already collision-safe.
+                        canonical_name = name_field
+
+            if is_reference_read:
+                continue
+
+            entry = skill_counts.setdefault(
+                canonical_name,
+                {
+                    "skill": canonical_name,
+                    "view_count": 0,
+                    "manage_count": 0,
+                    "last_used_at": None,
+                },
+            )
+            if call["tool_name"] == "skill_view":
+                entry["view_count"] += 1
+            else:
+                entry["manage_count"] += 1
+
+            timestamp = call["timestamp"]
+            if timestamp is not None and (
+                entry["last_used_at"] is None or timestamp > entry["last_used_at"]
+            ):
+                entry["last_used_at"] = timestamp
 
         return list(skill_counts.values())
 

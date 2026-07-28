@@ -1,5 +1,6 @@
 """Tests for agent/insights.py — InsightsEngine analytics and reporting."""
 
+import json
 import time
 import pytest
 
@@ -56,6 +57,7 @@ def populated_db(db):
         role="assistant",
         content="Let me load the PR workflow skill.",
         tool_calls=[{"function": {"name": "skill_view", "arguments": '{"name":"github-pr-workflow"}'}}],
+        timestamp=now - 2 * day + 1800,
     )
     db.append_message("s1", role="user", content="Thanks!")
     db.append_message("s1", role="assistant", content="You're welcome!")
@@ -99,6 +101,7 @@ def populated_db(db):
         role="assistant",
         content="Load the debugging skill.",
         tool_calls=[{"function": {"name": "skill_view", "arguments": '{"name":"systematic-debugging"}'}}],
+        timestamp=now - 10 * day + 1800,
     )
 
     # Session 4: Discord, same model as s1, ended, 1 day ago
@@ -120,6 +123,7 @@ def populated_db(db):
             {"function": {"name": "skill_view", "arguments": '{"name":"github-pr-workflow"}'}},
             {"function": {"name": "skill_manage", "arguments": '{"name":"github-code-review"}'}},
         ],
+        timestamp=now - 1 * day + 300,
     )
 
     # Session 5: Old session, 45 days ago (should be excluded from 30-day window)
@@ -133,6 +137,19 @@ def populated_db(db):
     db.update_token_counts("s_old", input_tokens=5000, output_tokens=2000)
     db.append_message("s_old", role="user", content="old message")
     db.append_message("s_old", role="assistant", content="old reply")
+    # This session started 45 days ago (excluded from `_get_sessions`'s
+    # started_at window at any of the day cutoffs these tests use), but it
+    # received a skill_view call just now — e.g. a long-lived/resumed session.
+    # The skill action must still be windowed by its own message timestamp,
+    # not the session's started_at (#regression: skill action windows must
+    # follow message time).
+    db.append_message(
+        "s_old",
+        role="assistant",
+        content="Load a skill in this old session.",
+        tool_calls=[{"function": {"name": "skill_view", "arguments": '{"name":"ancient-session-skill"}'}}],
+        timestamp=now - 3600,
+    )
 
     db._conn.commit()
     return db
@@ -428,10 +445,14 @@ class TestInsightsPopulated:
         report = engine.generate(days=30)
         skills = report["skills"]
 
-        assert skills["summary"]["distinct_skills_used"] == 3
-        assert skills["summary"]["total_skill_loads"] == 3
+        # 4 distinct skills: github-pr-workflow, systematic-debugging,
+        # github-code-review, plus ancient-session-skill (s_old's session
+        # started 45 days ago, but its skill_view call happened an hour ago —
+        # see the message-timestamp windowing test below).
+        assert skills["summary"]["distinct_skills_used"] == 4
+        assert skills["summary"]["total_skill_loads"] == 4
         assert skills["summary"]["total_skill_edits"] == 1
-        assert skills["summary"]["total_skill_actions"] == 4
+        assert skills["summary"]["total_skill_actions"] == 5
 
         top_skill = skills["top_skills"][0]
         assert top_skill["skill"] == "github-pr-workflow"
@@ -445,12 +466,34 @@ class TestInsightsPopulated:
         report = engine.generate(days=3)
         skills = report["skills"]
 
-        assert skills["summary"]["distinct_skills_used"] == 2
-        assert skills["summary"]["total_skill_loads"] == 2
+        # github-pr-workflow (s1 + s4), github-code-review (s4), and
+        # ancient-session-skill (s_old, message an hour ago) fall inside the
+        # 3-day window; systematic-debugging's call happened 10 days ago.
+        assert skills["summary"]["distinct_skills_used"] == 3
+        assert skills["summary"]["total_skill_loads"] == 3
         assert skills["summary"]["total_skill_edits"] == 1
 
         skill_names = [s["skill"] for s in skills["top_skills"]]
         assert "systematic-debugging" not in skill_names
+        assert "ancient-session-skill" in skill_names
+
+    def test_skill_action_windowed_by_message_timestamp_not_session_start(
+        self, populated_db
+    ):
+        """A skill action's own message timestamp gates inclusion, not the
+        session's started_at — s_old started 45 days ago (clearly excluded
+        from session-level stats at a 3-day cutoff) but its skill_view call
+        happened an hour ago and must still be reported.
+        """
+        engine = InsightsEngine(populated_db)
+        cutoff = time.time() - 3 * 86400
+
+        sessions = engine._get_sessions(cutoff)
+        assert not any(s["id"] == "s_old" for s in sessions)
+
+        skill_usage = engine._get_skill_usage(cutoff)
+        skill_names = [s["skill"] for s in skill_usage]
+        assert "ancient-session-skill" in skill_names
 
     def test_activity_patterns(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -505,6 +548,265 @@ class TestInsightsPopulated:
 
         # All 5 sessions should be included
         assert report["overview"]["total_sessions"] == 5
+
+    def test_skill_breakdown_source_filter(self, populated_db):
+        """Skill breakdown source filtering still works after the fix."""
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, source="cli")
+        skills = report["skills"]
+
+        skill_names = [s["skill"] for s in skills["top_skills"]]
+        # github-code-review (skill_manage) only occurs in s4, which is a
+        # discord session — it must not leak into the cli-only breakdown.
+        assert "github-code-review" not in skill_names
+        # github-pr-workflow, systematic-debugging, and ancient-session-skill
+        # all occur in cli sessions (s1, s3, s_old) and remain visible.
+        assert "github-pr-workflow" in skill_names
+        assert "systematic-debugging" in skill_names
+        assert "ancient-session-skill" in skill_names
+
+        pr_workflow = next(s for s in skills["top_skills"] if s["skill"] == "github-pr-workflow")
+        # Only s1 (cli) contributes here — s4's view is on discord.
+        assert pr_workflow["view_count"] == 1
+
+
+# =========================================================================
+# Skill usage accuracy — alias coalescing, reference reads, failed calls
+# =========================================================================
+
+class TestSkillUsageAccuracy:
+    """Regression tests for accurate, canonical skill-usage accounting.
+
+    These correlate assistant ``tool_calls`` with their ``role='tool'``
+    result message via ``tool_call_id``, the same way a real
+    skill_view/skill_manage turn is persisted.
+    """
+
+    @staticmethod
+    def _skill_view_call(call_id, name, file_path=None):
+        args = {"name": name}
+        if file_path:
+            args["file_path"] = file_path
+        return {
+            "id": call_id, "type": "function",
+            "function": {"name": "skill_view", "arguments": json.dumps(args)},
+        }
+
+    @staticmethod
+    def _skill_manage_call(call_id, action, name, **kwargs):
+        args = {"action": action, "name": name, **kwargs}
+        return {
+            "id": call_id, "type": "function",
+            "function": {"name": "skill_manage", "arguments": json.dumps(args)},
+        }
+
+    def test_alias_forms_coalesce_to_canonical_name(self, db):
+        """skill_view accepts short, categorized, and colon-qualified
+        spellings of the same skill; the tool's resolved path
+        (read from the successful result, not the raw argument or the bare
+        frontmatter name) must coalesce them into one entry keyed by
+        ``category/skill`` instead of splitting usage across three
+        different keys — and instead of collapsing onto the bare
+        (collision-prone) frontmatter name.
+        """
+        db.create_session(session_id="alias", source="cli", model="test")
+
+        db.append_message(
+            "alias", role="assistant", content="short form",
+            tool_calls=[self._skill_view_call("call_1", "axolotl")],
+        )
+        db.append_message(
+            "alias", role="tool", tool_call_id="call_1",
+            content=json.dumps({"success": True, "name": "axolotl", "path": "mlops/axolotl/SKILL.md"}),
+        )
+
+        db.append_message(
+            "alias", role="assistant", content="categorized form",
+            tool_calls=[self._skill_view_call("call_2", "mlops/axolotl")],
+        )
+        db.append_message(
+            "alias", role="tool", tool_call_id="call_2",
+            content=json.dumps({"success": True, "name": "axolotl", "path": "mlops/axolotl/SKILL.md"}),
+        )
+
+        db.append_message(
+            "alias", role="assistant", content="colon fallback form",
+            tool_calls=[self._skill_view_call("call_3", "mlops:axolotl")],
+        )
+        db.append_message(
+            "alias", role="tool", tool_call_id="call_3",
+            content=json.dumps({"success": True, "name": "axolotl", "path": "mlops/axolotl/SKILL.md"}),
+        )
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        assert skills["summary"]["distinct_skills_used"] == 1
+        assert skills["summary"]["total_skill_loads"] == 3
+        top = skills["top_skills"][0]
+        assert top["skill"] == "mlops/axolotl"
+        assert top["view_count"] == 3
+
+    def test_same_bare_name_different_category_not_merged(self, db):
+        """Two unrelated skills that happen to share a bare frontmatter
+        ``name`` (e.g. both called "axolotl") but live in different
+        categories resolve to different ``path`` values and must stay
+        distinct entries — collapsing onto the bare name would silently
+        merge unrelated skills' usage counts.
+        """
+        db.create_session(session_id="collision", source="cli", model="test")
+
+        db.append_message(
+            "collision", role="assistant", content="load mlops axolotl",
+            tool_calls=[self._skill_view_call("call_1", "mlops/axolotl")],
+        )
+        db.append_message(
+            "collision", role="tool", tool_call_id="call_1",
+            content=json.dumps({"success": True, "name": "axolotl", "path": "mlops/axolotl/SKILL.md"}),
+        )
+
+        db.append_message(
+            "collision", role="assistant", content="load research axolotl",
+            tool_calls=[self._skill_view_call("call_2", "research/axolotl")],
+        )
+        db.append_message(
+            "collision", role="tool", tool_call_id="call_2",
+            content=json.dumps({"success": True, "name": "axolotl", "path": "research/axolotl/SKILL.md"}),
+        )
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        assert skills["summary"]["distinct_skills_used"] == 2
+        skill_names = {s["skill"] for s in skills["top_skills"]}
+        assert skill_names == {"mlops/axolotl", "research/axolotl"}
+        for entry in skills["top_skills"]:
+            assert entry["view_count"] == 1
+
+    def test_plugin_skill_without_path_uses_qualified_name(self, db):
+        """Plugin skills have no ``path`` in their result — the tool's
+        already-qualified ``namespace:bare`` name is the canonical identity.
+        """
+        db.create_session(session_id="plugin", source="cli", model="test")
+
+        db.append_message(
+            "plugin", role="assistant", content="load a plugin skill",
+            tool_calls=[self._skill_view_call("call_1", "my-plugin:axolotl")],
+        )
+        db.append_message(
+            "plugin", role="tool", tool_call_id="call_1",
+            content=json.dumps({"success": True, "name": "my-plugin:axolotl"}),
+        )
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        assert skills["summary"]["distinct_skills_used"] == 1
+        top = skills["top_skills"][0]
+        assert top["skill"] == "my-plugin:axolotl"
+        assert top["view_count"] == 1
+
+    def test_reference_file_read_not_counted_as_load(self, db):
+        """A skill_view(file_path='references/...') read must not inflate
+        the top-level SKILL.md load count for that skill.
+        """
+        db.create_session(session_id="refs", source="cli", model="test")
+
+        db.append_message(
+            "refs", role="assistant", content="load the skill",
+            tool_calls=[self._skill_view_call("call_1", "axolotl")],
+        )
+        db.append_message(
+            "refs", role="tool", tool_call_id="call_1",
+            content=json.dumps({"success": True, "name": "axolotl", "path": "axolotl/SKILL.md"}),
+        )
+
+        db.append_message(
+            "refs", role="assistant", content="check the reference doc",
+            tool_calls=[self._skill_view_call("call_2", "axolotl", file_path="references/api.md")],
+        )
+        db.append_message(
+            "refs", role="tool", tool_call_id="call_2",
+            content=json.dumps({
+                "success": True, "name": "axolotl",
+                "file": "references/api.md", "content": "...", "file_type": ".md",
+            }),
+        )
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        assert skills["summary"]["distinct_skills_used"] == 1
+        assert skills["summary"]["total_skill_loads"] == 1
+        top = skills["top_skills"][0]
+        assert top["view_count"] == 1
+
+    def test_failed_skill_action_excluded(self, db):
+        """A skill_manage call whose tool result reports success=False must
+        not be counted as usage.
+        """
+        db.create_session(session_id="failed", source="cli", model="test")
+
+        db.append_message(
+            "failed", role="assistant", content="patch a skill that doesn't exist",
+            tool_calls=[self._skill_manage_call(
+                "call_1", "patch", "nonexistent-skill",
+                old_string="x", new_string="y",
+            )],
+        )
+        db.append_message(
+            "failed", role="tool", tool_call_id="call_1",
+            content=json.dumps({
+                "success": False,
+                "error": "Skill 'nonexistent-skill' not found in active profile 'default'.",
+            }),
+        )
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        assert skills["summary"]["total_skill_actions"] == 0
+        assert skills["top_skills"] == []
+
+    def test_successful_correlated_call_still_counts(self, db):
+        """A correlated, successful skill_manage call is counted normally —
+        the failure exclusion must not become an accidental allowlist.
+        """
+        db.create_session(session_id="ok", source="cli", model="test")
+
+        db.append_message(
+            "ok", role="assistant", content="patch the skill",
+            tool_calls=[self._skill_manage_call(
+                "call_1", "patch", "axolotl", old_string="x", new_string="y",
+            )],
+        )
+        db.append_message(
+            "ok", role="tool", tool_call_id="call_1",
+            content=json.dumps({
+                "success": True,
+                "message": "Patched SKILL.md in skill 'axolotl' (1 replacement).",
+            }),
+        )
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        assert skills["summary"]["total_skill_edits"] == 1
+        top = skills["top_skills"][0]
+        assert top["skill"] == "axolotl"
+        assert top["manage_count"] == 1
 
 
 # =========================================================================
