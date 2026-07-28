@@ -191,7 +191,7 @@ export const ruOverrides = {
       inputTitle: 'Требуется ввод',
       inputBody: 'Hermes ожидает вашего ответа.',
       turnDoneTitle: 'Hermes завершил работу',
-      turnDoneBody: 'Ответ готов.',
+      turnDoneBody: '',
       turnErrorTitle: 'Ошибка выполнения',
       backgroundDoneTitle: 'Фоновая задача завершена',
       backgroundFailedTitle: 'Фоновая задача завершилась с ошибкой',
@@ -219,7 +219,6 @@ export const ruOverrides = {
     search: 'Поиск',
     searchTitle: 'Поиск сессий, разделов и действий',
     swapSidebarSides: 'Поменять стороны панелей',
-    swapSidebarSidesTitle: 'Поменять местами панели сессий и файлового браузера',
     hideRightSidebar: 'Скрыть правую панель',
     showRightSidebar: 'Показать правую панель',
     muteHaptics: 'Отключить тактильную отдачу',
@@ -282,6 +281,7 @@ export const ruOverrides = {
       'view.toggleSidebar': 'Переключить боковую панель сессий',
       'view.toggleRightSidebar': 'Переключить файловый браузер',
       'view.toggleReview': 'Показать / скрыть панель обзора',
+      'view.toggleStatusbar': 'Показать или скрыть строку состояния',
       'view.showFiles': 'Показать файловый браузер',
       'view.showTerminal': 'Показать / скрыть терминал',
       'view.newTerminal': 'Новый терминал',
@@ -375,7 +375,7 @@ export const ruOverrides = {
     plugins: {
       title: 'Плагины приложения',
       blurb:
-        'Расширения интерфейса, загруженные в приложение: встроенные в сборку или добавленные в папку desktop-plugins, в том числе созданные Hermes. Отключённый плагин выгружается сразу и остаётся отключённым после перезапуска.',
+        'Плагины встроены в приложение или добавлены в папку desktop-plugins. При отключении плагин выгружается сразу.',
       count: count => `Установлено: ${count}`,
       openFolder: 'Открыть папку плагинов',
       rescan: 'Обновить список',
@@ -389,9 +389,9 @@ export const ruOverrides = {
     notifications: {
       title: 'Уведомления',
       intro:
-        'Системные уведомления рабочего стола не зависят от уведомлений внутри приложения. Эти настройки сохраняются отдельно на каждом устройстве.',
+        'Это уведомления ОС, а не всплывающие уведомления внутри приложения. На каждом устройстве они настраиваются отдельно.',
       enableAll: 'Включить все',
-      enableAllDesc: 'Главный переключатель. Выключите его, чтобы отключить все перечисленные ниже уведомления.',
+      enableAllDesc: 'Если выключить этот параметр, перечисленные ниже уведомления не будут приходить.',
       focusedHint: 'Уведомления о завершении отправляются только тогда, когда Hermes работает в фоне.',
       kinds: {
         approval: {
@@ -408,7 +408,7 @@ export const ruOverrides = {
         },
         turnError: {
           label: 'Ошибки хода',
-          description: 'Когда ход завершается с ошибкой.'
+          description: 'Когда ход завершился с ошибкой, пока Hermes работал в фоне.'
         },
         backgroundDone: {
           label: 'Фоновая команда завершена',
@@ -455,8 +455,7 @@ export const ruOverrides = {
     },
     appearance: {
       title: 'Внешний вид',
-      intro:
-        'Настройки отображения только для десктопа. Режим управляет яркостью; тема управляет палитрой акцентов и стилем чата.',
+      intro: 'Только для Hermes Desktop. Режим задаёт яркость, а тема — палитру и оформление чата.',
       colorMode: 'Цветовой режим',
       colorModeDesc: 'Выберите режим вручную или используйте системные настройки.',
       toolViewTitle: 'Отображение вызовов инструментов',
@@ -601,8 +600,7 @@ export const ruOverrides = {
       saving: 'Сохранение…'
     },
     envActions: {
-      actionsFor: label => `Действия для ${label}`,
-      credentialActions: 'Действия с ключом',
+      actions: 'Действия',
       manageInKeys: 'Открыть раздел «API-ключи»',
       docs: 'Документация',
       hideValue: 'Скрыть значение',
@@ -618,7 +616,7 @@ export const ruOverrides = {
       title: 'Подключение к шлюзу',
       envOverride: 'переопределено переменными окружения',
       intro:
-        'По умолчанию Hermes Desktop запускает локальный шлюз. Удалённый шлюз позволяет подключиться к уже запущенному бэкенду Hermes на другом компьютере или за доверенным прокси. Для каждого профиля можно выбрать отдельный удалённый сервер.',
+        'По умолчанию используется локальный шлюз. Чтобы управлять удалённым бэкендом Hermes, выберите удалённый шлюз. Ниже можно задать отдельные подключения для профилей.',
       appliesTo: 'Применяется к',
       allProfiles: 'Все профили',
       defaultConnection: 'Соединение по умолчанию для профилей без собственных настроек.',
@@ -1578,9 +1576,9 @@ export const ruOverrides = {
     showAllProfiles: 'Показать все профили',
     switchToProfile: name => `Переключиться на ${name}`,
     manageProfiles: 'Управление профилями…',
-    actionsFor: name => `Действия для ${name}`,
+    actions: 'Действия',
     color: 'Цвет…',
-    colorFor: name => `Цвет для ${name}`,
+    colorFor: 'Цвет',
     setColor: color => `Установить цвет ${color}`,
     autoColor: 'Авто',
     noProfiles: 'Профилей пока нет.',
@@ -1715,7 +1713,6 @@ export const ruOverrides = {
     showRuns: 'Показать запуски',
     hideRuns: 'Скрыть запуски',
     runHistory: 'История запусков',
-    actionsFor: title => `Действия для ${title}`,
     actionsTitle: 'Действия с задачей',
     resume: 'Возобновить задачу',
     pause: 'Поставить на паузу',
@@ -1824,10 +1821,7 @@ export const ruOverrides = {
     open: 'Открыть'
   },
 
-  artifactPane: {
-    tabFallback: 'Артефакт',
-    modePreview: 'ПРЕДПРОСМОТР',
-    modeSource: 'ИСХОДНЫЙ КОД',
+  artifactPreview: {
     versionOf: (current, total) => `Версия ${current} из ${total}`,
     olderVersion: 'Предыдущая версия',
     newerVersion: 'Следующая версия',
@@ -1864,11 +1858,11 @@ export const ruOverrides = {
     allPinned: 'Все здесь закреплены. Открепите чат, чтобы он появился в недавних.',
     shiftClickHint: 'Shift+клик для закрепления · перетаскивание для изменения порядка',
     noWorkspace: 'Нет рабочей области',
-    noProject: 'Нет проекта',
     projectEmpty: 'Сессий пока нет',
     noSessions: 'Нет сессий',
     projects: {
       sectionLabel: 'Проекты',
+      home: 'Главная',
       newButton: 'Новый проект',
       createTitle: 'Новый проект',
       createDesc: 'Укажите название проекта и добавьте одну или несколько папок.',
@@ -1886,7 +1880,7 @@ export const ruOverrides = {
       primaryBadge: 'основная',
       removeFolder: 'Удалить',
       create: 'Создать',
-      menu: 'Действия с проектом',
+      menu: 'Действия',
       menuRename: 'Переименовать',
       menuAppearance: 'Оформление',
       noColor: 'Без цвета',
@@ -1949,7 +1943,6 @@ export const ruOverrides = {
       openInNewTab: 'Открыть в новой вкладке',
       openInSplit: 'Открыть в разделённом виде',
       copyIdFailed: 'Не удалось скопировать ID сессии',
-      actionsFor: title => `Действия для ${title}`,
       sessionActions: 'Действия сессии',
       sessionRunning: 'Сессия выполняется',
       needsInput: 'Требуется ваш ввод',
@@ -1961,7 +1954,7 @@ export const ruOverrides = {
       renamed: 'Сессия переименована',
       renameFailed: 'Ошибка переименования',
       renameTitle: 'Переименовать сессию',
-      renameDesc: 'Дайте чату запоминающееся название. Оставьте пустым для очистки.',
+      renameDesc: 'Оставьте поле пустым, чтобы удалить название.',
       untitledPlaceholder: 'Сессия без названия',
       untitledChat: id => `Чат ${id}`,
       ageNow: 'сейчас',
@@ -2477,9 +2470,9 @@ export const ruOverrides = {
       connectionSsh: host => `SSH: ${host}`,
       connectionRemote: host => `Удалённый бэкенд: ${host}`,
       connectionCloud: host => `Hermes Cloud: ${host}`,
-      connectionCloudTooltip: host => `Подключено к Hermes Cloud: ${host} · нажмите, чтобы настроить`,
-      connectionSshTooltip: host => `Подключено к ${host} по SSH · нажмите, чтобы настроить`,
-      connectionRemoteTooltip: host => `Подключено к удалённому бэкенду: ${host} · нажмите, чтобы настроить`,
+      connectionCloudTooltip: host => `Hermes Cloud · ${host}`,
+      connectionSshTooltip: host => `SSH · ${host}`,
+      connectionRemoteTooltip: host => `Удалённый бэкенд · ${host}`,
       backendLabel: version => `бэкенд v${version}`,
       commit: sha => `коммит ${sha}`,
       branch: branch => `ветка ${branch}`,
@@ -2494,8 +2487,9 @@ export const ruOverrides = {
       gatewayConnecting: 'подключение',
       gatewayOffline: 'офлайн',
       gatewayRestarting: 'перезапуск…',
-      gatewayTitle: 'Статус шлюза инференса Hermes',
+      gatewayTitle: 'Шлюз',
       customizeTitle: 'Показывать в строке состояния',
+      hideStatusbar: 'Скрыть строку состояния',
       toggleApprovalMode: 'Подтверждения',
       toggleBackendVersion: 'Версия бэкенда',
       toggleCommandCenter: 'Центр управления',
@@ -2518,7 +2512,6 @@ export const ruOverrides = {
       starmap: 'Граф памяти',
       openStarmap: 'Открыть граф памяти',
       turnRunning: 'Выполняется',
-      currentTurnElapsed: 'Текущий ход занял',
       contextUsage: 'Использование контекста',
       contextUsagePanel: {
         categories: {
@@ -2537,13 +2530,10 @@ export const ruOverrides = {
         title: 'Использование контекста',
         tokenSummary: (used, max) => `${used} из ${max} токенов`
       },
-      openContextUsage: 'Показать состав контекста',
       session: 'Сессия',
-      runtimeSessionElapsed: 'Длительность сессии',
       yoloOn:
-        'YOLO включён: опасные команды подтверждаются автоматически. Нажмите, чтобы выключить; Shift+нажатие изменяет настройку для всех сессий.',
-      yoloOff:
-        'YOLO выключен. Нажмите, чтобы автоматически подтверждать опасные команды; Shift+нажатие изменяет настройку для всех сессий.',
+        'YOLO включён: опасные команды подтверждаются автоматически. Shift+клик переключает режим для всех сессий.',
+      yoloOff: 'YOLO выключен. Shift+клик переключает режим для всех сессий.',
       modelNone: 'нет',
       noModel: 'нет модели',
       switchModel: 'Сменить модель',
@@ -2564,7 +2554,7 @@ export const ruOverrides = {
     remotePickerTitle: 'Выбор удалённой папки',
     remotePickerDescription: 'Просмотр папок на подключённом бэкенде.',
     remotePickerSelect: 'Выбрать папку',
-    folderTip: cwd => `${cwd} — нажмите, чтобы сменить папку`,
+    folderTip: cwd => cwd,
     openFolder: 'Открыть папку',
     refreshTree: 'Обновить дерево',
     collapseAll: 'Свернуть все папки',
@@ -2743,6 +2733,9 @@ export const ruOverrides = {
       loadingResponse: 'Hermes загружает ответ',
       resumeWhenBackgroundDone: count => `Возобновление после завершения фоновых задач: ${count}…`,
       thinking: 'Думаю',
+      thought: 'Подумал',
+      thoughtBriefly: 'Подумал недолго',
+      thoughtFor: duration => `Думал ${duration}`,
       today: time => `Сегодня, ${time}`,
       yesterday: time => `Вчера, ${time}`,
       copy: 'Копировать',
@@ -2801,7 +2794,6 @@ export const ruOverrides = {
         'Hermes больше не ожидает ответа на этот вопрос. Выберите вариант, чтобы добавить его в поле ввода нового сообщения.'
     },
     tool: {
-      code: 'Код',
       copyCode: 'Копировать код',
       renderingImage: 'Рендеринг изображения',
       copyOutput: 'Копировать вывод',
