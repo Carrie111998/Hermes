@@ -92,9 +92,9 @@ class TestKlibCommands:
         assert requests[0].url.params["q"] == "cache invalidation"
         assert requests[0].url.params["mode"] == "lexical"
         assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
-        assert "docs/1.md" in result
-        assert "docs/5.md" in result
-        assert "docs/6.md" not in result
+        assert r"docs/1\.md" in result
+        assert r"docs/5\.md" in result
+        assert r"docs/6\.md" not in result
         assert "top 5 of 7" in result
         assert len(result) <= 2800
 
@@ -123,12 +123,12 @@ class TestKlibCommands:
         _install_transport(monkeypatch, mod, handler)
         result = _run(mod._handle_klib("duplicate files"))
 
-        assert result.count("docs/shared.md") == 1
+        assert result.count(r"docs/shared\.md") == 1
         assert "first hit" in result
         assert "duplicate hit" not in result
-        assert "docs/4.md" in result
-        assert "docs/5.md" not in result
-        assert "Showing top 5 of 6 distinct files." in result
+        assert r"docs/4\.md" in result
+        assert r"docs/5\.md" not in result
+        assert r"Showing top 5 of 6 distinct files\." in result
 
     def test_query_overfetches_past_file_dominated_server_limit(
         self, monkeypatch
@@ -155,10 +155,10 @@ class TestKlibCommands:
 
         assert len(requests) == 1
         assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
-        assert "docs/dominant.md" in result
-        assert "docs/other-1.md" in result
-        assert "docs/other-2.md" in result
-        assert "docs/other-3.md" in result
+        assert r"docs/dominant\.md" in result
+        assert r"docs/other\-1\.md" in result
+        assert r"docs/other\-2\.md" in result
+        assert r"docs/other\-3\.md" in result
         assert "Showing top 4 of 4 distinct files." not in result
 
     def test_successful_query_with_zero_results_is_friendly(self, monkeypatch):
@@ -245,7 +245,7 @@ class TestKlibCommands:
 
         result = _run(mod._handle_klib(raw_args))
 
-        assert "Usage: /klib <query>" in result
+        assert r"Usage: /klib <query\>" in result
         assert calls == []
 
     def test_key_file_read_failure_is_friendly(self, monkeypatch, tmp_path):
@@ -313,8 +313,10 @@ class TestKlibCommands:
         assert len(requests) == 1
         assert requests[0].url.path == "/read"
         assert requests[0].url.params["path"] == "docs/manual.md"
-        assert "docs/manual.md" in result
-        assert "# Manual\n\nFull text from klib." in result
+        assert r"docs/manual\.md" in result
+        assert r"\# Manual" in result
+        assert "Full text from klib\\." in result
+        assert "\n\n" in result
         assert len(result) <= 2800
 
     def test_read_404_is_a_friendly_not_found_message(self, monkeypatch):
@@ -405,5 +407,83 @@ class TestKlibCommands:
 
         result = _run(mod._handle_klib(raw_args))
 
-        assert "Usage: /klib read <path>" in result
+        assert r"Usage: /klib read <path\>" in result
         assert calls == []
+
+    def test_query_escapes_markdownv2_file_path(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "path": "wiki/ccs/ccj-issue-108.md",
+                            "snippet": "relevant page",
+                        }
+                    ]
+                },
+            ),
+        )
+
+        result = _run(mod._handle_klib("issue lookup"))
+
+        assert r"wiki/ccs/ccj\-issue\-108\.md" in result
+
+    def test_query_escapes_markdownv2_snippet(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "path": "docs/cost.md",
+                            "snippet": "cost > $100 (approx) [see note].!",
+                        }
+                    ]
+                },
+            ),
+        )
+
+        result = _run(mod._handle_klib("cost"))
+
+        assert r"cost \> $100 \(approx\) \[see note\]\.\!" in result
+
+    def test_semantic_prefix_sends_semantic_mode(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"results": []})
+
+        _install_transport(monkeypatch, mod, handler)
+        _run(mod._handle_klib("semantic cache invalidation"))
+
+        assert len(requests) == 1
+        assert requests[0].url.params["q"] == "cache invalidation"
+        assert requests[0].url.params["mode"] == "semantic"
+
+    def test_plain_query_explicitly_defaults_to_lexical_mode(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"results": []})
+
+        _install_transport(monkeypatch, mod, handler)
+        _run(mod._handle_klib("cache invalidation"))
+
+        assert len(requests) == 1
+        assert requests[0].url.params["q"] == "cache invalidation"
+        assert requests[0].url.params["mode"] == "lexical"

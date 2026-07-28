@@ -18,9 +18,12 @@ klib:
 ```text
 /klib <query>
 /klib read <path>
+/klib semantic <query>
 ```
 
-Queries use klib's lexical search mode and show at most five distinct files.
+Queries use klib's lexical search mode by default and show at most five
+distinct files. Prefix a query with the case-sensitive `semantic ` keyword to
+use klib's semantic search mode instead.
 Repeated line hits from the same file are collapsed using the first hit in
 klib's response. The `read` form fetches and returns the full page text, with
 the Telegram reply capped at 2800 characters.
@@ -28,6 +31,13 @@ the Telegram reply capped at 2800 characters.
 The `read` sub-command recognizes a case-sensitive `read ` prefix. As a
 consequence, a search phrase beginning with those exact characters (for
 example, `/klib read the manual`) is interpreted as a page path.
+
+The `semantic` mode recognizes a case-sensitive `semantic ` prefix. As a
+consequence, a search phrase beginning with those exact characters (for
+example, `/klib semantic architecture`) is interpreted as a semantic-mode
+query rather than a literal query beginning with `semantic`; that ambiguity
+is an accepted tradeoff for simple slash dispatch. The `semantic ` prefix is
+distinct from the `read ` prefix, so it does not select page-reading mode.
 
 When `key_file` is set, the plugin reads and trims the file contents and sends
 them as the `Authorization: Bearer <key>` HTTP request header. If `key_file` is omitted, the

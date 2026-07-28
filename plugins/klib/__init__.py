@@ -4,6 +4,7 @@ The ``/klib <query>`` command calls klib's ``GET /query`` endpoint using
 lexical search by default.  When ``klib.key_file`` is configured, the file's
 trimmed contents are sent as an ``Authorization: Bearer <key>`` request header.
 The ``/klib read <path>`` command calls klib's ``GET /read`` endpoint.
+The ``/klib semantic <query>`` form requests semantic search.
 
 The command is intentionally fail-closed and never raises to its caller:
 missing or disabled configuration, authentication-file failures, HTTP errors,
@@ -14,6 +15,7 @@ messages instead.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,33 @@ _FETCH_LIMIT = 25
 _MAX_REPLY_LENGTH = 2800
 _SNIPPET_LENGTH = 150
 
+# Keep this local because klib is platform-agnostic; importing the Telegram
+# adapter's private helper would couple this plugin to one gateway platform
+# and would require changing a forbidden file.
+_MDV2_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#\+\-=|{}.!\\])")
+
+
+def _escape_mdv2(text: str) -> str:
+    """Escape Telegram MarkdownV2 special characters in dynamic text."""
+    return _MDV2_ESCAPE_RE.sub(r"\\\1", text)
+
+
+def _truncate_display(value: str, length: int) -> str:
+    """Normalize, escape, and truncate a dynamic value safely for MarkdownV2."""
+    normalized = " ".join(value.split())
+    return _truncate_reply(_escape_mdv2(normalized), length)
+
+
+def _static_reply(value: str) -> str:
+    """Escape static reply text whose punctuation must also be valid MDV2."""
+    return _escape_mdv2(value)
+
+
+_NOT_CONFIGURED_REPLY = _static_reply(
+    "klib: not configured or disabled. An admin must set "
+    "klib.enabled: true and klib.base_url in config.yaml first."
+)
+
 
 def _load_klib_config() -> dict[str, Any]:
     """Load the top-level klib config block, failing closed on any error."""
@@ -45,18 +74,16 @@ def _load_klib_config() -> dict[str, Any]:
         return {}
 
 
-def _truncate(value: str, length: int) -> str:
-    value = " ".join(value.split())
-    if len(value) <= length:
-        return value
-    return value[: max(0, length - 1)].rstrip() + "…"
-
-
 def _truncate_reply(value: str, length: int) -> str:
-    """Truncate a reply without collapsing whitespace in full-text content."""
+    """Truncate escaped reply text without leaving an incomplete escape."""
     if len(value) <= length:
         return value
-    return value[: max(0, length - 1)].rstrip() + "…"
+    truncated = value[: max(0, length - 1)].rstrip()
+    # Escaped MarkdownV2 punctuation is a two-character sequence.  Avoid
+    # cutting between the backslash and the character it protects.
+    if len(truncated) and (len(truncated) - len(truncated.rstrip("\\"))) % 2:
+        truncated = truncated[:-1].rstrip()
+    return truncated + "…"
 
 
 def _value_from_item(item: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -87,9 +114,12 @@ def _format_results(query: str, results: list[Any]) -> str:
     # misleading when several hits came from the same file.
     total = len(distinct_results)
     if total == 0:
-        return f"klib: no results found for {_truncate(query, 500)!r}."
+        return (
+            f"klib: no results found for '{_truncate_display(query, 500)}'"
+            f"{_static_reply('.')}"
+        )
 
-    lines = [f"klib results for {_truncate(query, 300)!r}:"]
+    lines = [f"klib results for '{_truncate_display(query, 300)}':"]
     shown = min(total, _RESULT_LIMIT)
     for index, item in enumerate(distinct_results[:_RESULT_LIMIT], start=1):
         if isinstance(item, dict):
@@ -101,33 +131,34 @@ def _format_results(query: str, results: list[Any]) -> str:
             label = ""
             snippet = str(item)
 
-        label = _truncate(label or f"Result {index}", 180)
-        snippet = _truncate(snippet, _SNIPPET_LENGTH)
-        line = f"{index}. {label}"
+        label = _truncate_display(label or f"Result {index}", 180)
+        snippet = _truncate_display(snippet, _SNIPPET_LENGTH)
+        line = (
+            f"{_escape_mdv2(str(index))}{_static_reply('.')} {label}"
+        )
         if snippet:
             line += f" — {snippet}"
         lines.append(line)
 
     if total > shown:
-        lines.append(f"Showing top {shown} of {total} distinct files.")
+        lines.append(
+            f"Showing top {_escape_mdv2(str(shown))} of "
+            f"{_escape_mdv2(str(total))} distinct files{_static_reply('.')}"
+        )
 
     reply = "\n".join(lines)
-    if len(reply) <= _MAX_REPLY_LENGTH:
-        return reply
-    return reply[: _MAX_REPLY_LENGTH - 1].rstrip() + "…"
+    return _truncate_reply(reply, _MAX_REPLY_LENGTH)
 
 
 async def _query_klib(
     query: str,
     cfg: dict[str, Any],
+    mode: str = "lexical",
 ) -> str:
     """Run the configured request and convert every expected failure to text."""
     base_url = cfg.get("base_url")
     if not isinstance(base_url, str) or not base_url.strip():
-        return (
-            "klib: not configured or disabled. An admin must set "
-            "klib.enabled: true and klib.base_url in config.yaml first."
-        )
+        return _NOT_CONFIGURED_REPLY
     base_url = base_url.strip()
 
     headers: dict[str, str] = {}
@@ -137,7 +168,7 @@ async def _query_klib(
             api_key = Path(str(key_file)).read_text(encoding="utf-8").strip()
             headers["Authorization"] = f"Bearer {api_key}"
         except Exception:
-            return "klib: could not read the configured API key file."
+            return _static_reply("klib: could not read the configured API key file.")
 
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
@@ -145,26 +176,29 @@ async def _query_klib(
                 f"{base_url.rstrip('/')}/query",
                 params={
                     "q": query,
-                    "mode": "lexical",
+                    "mode": mode,
                     "limit": _FETCH_LIMIT,
                 },
                 headers=headers,
             )
     except httpx.TimeoutException:
-        return "klib: query timed out."
+        return _static_reply("klib: query timed out.")
     except httpx.RequestError:
-        return "klib: could not reach the klib service."
+        return _static_reply("klib: could not reach the klib service.")
 
     if not 200 <= response.status_code < 300:
-        return f"klib: service returned HTTP status {response.status_code}."
+        return (
+            "klib: service returned HTTP status "
+            f"{_escape_mdv2(str(response.status_code))}{_static_reply('.')}"
+        )
 
     try:
         payload = response.json()
     except Exception:
-        return "klib: received an invalid JSON response."
+        return _static_reply("klib: received an invalid JSON response.")
 
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-        return "klib: received an invalid response format."
+        return _static_reply("klib: received an invalid response format.")
     return _format_results(query, payload["results"])
 
 
@@ -175,10 +209,7 @@ async def _read_klib(
     """Read a klib page and convert every expected failure to text."""
     base_url = cfg.get("base_url")
     if not isinstance(base_url, str) or not base_url.strip():
-        return (
-            "klib: not configured or disabled. An admin must set "
-            "klib.enabled: true and klib.base_url in config.yaml first."
-        )
+        return _NOT_CONFIGURED_REPLY
     base_url = base_url.strip()
 
     headers: dict[str, str] = {}
@@ -188,7 +219,7 @@ async def _read_klib(
             api_key = Path(str(key_file)).read_text(encoding="utf-8").strip()
             headers["Authorization"] = f"Bearer {api_key}"
         except Exception:
-            return "klib: could not read the configured API key file."
+            return _static_reply("klib: could not read the configured API key file.")
 
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
@@ -198,28 +229,37 @@ async def _read_klib(
                 headers=headers,
             )
     except httpx.TimeoutException:
-        return "klib: read request timed out."
+        return _static_reply("klib: read request timed out.")
     except httpx.RequestError:
-        return "klib: could not reach the klib service."
+        return _static_reply("klib: could not reach the klib service.")
 
     if response.status_code == 404:
-        return f"klib: page not found for {_truncate(path, 500)!r}."
+        return (
+            f"klib: page not found for '{_truncate_display(path, 500)}'"
+            f"{_static_reply('.')}"
+        )
     if not 200 <= response.status_code < 300:
-        return f"klib: service returned HTTP status {response.status_code}."
+        return (
+            "klib: service returned HTTP status "
+            f"{_escape_mdv2(str(response.status_code))}{_static_reply('.')}"
+        )
 
     try:
         payload = response.json()
     except Exception:
-        return "klib: received an invalid JSON response."
+        return _static_reply("klib: received an invalid JSON response.")
 
     if (
         not isinstance(payload, dict)
         or not isinstance(payload.get("path"), str)
         or not isinstance(payload.get("raw"), str)
     ):
-        return "klib: received an invalid response format."
+        return _static_reply("klib: received an invalid response format.")
 
-    reply = f"klib: {payload['path'].strip()}\n{payload['raw']}"
+    reply = (
+        f"klib: {_escape_mdv2(payload['path'].strip())}\n"
+        f"{_escape_mdv2(payload['raw'])}"
+    )
     return _truncate_reply(reply, _MAX_REPLY_LENGTH)
 
 
@@ -228,7 +268,7 @@ async def _handle_klib(raw_args: str) -> str:
     try:
         query = raw_args.strip()
         if not query:
-            return (
+            return _static_reply(
                 "Usage: /klib <query>\n"
                 "Usage: /klib read <path>\n"
                 "Search the klib knowledge library or read a full page."
@@ -237,23 +277,41 @@ async def _handle_klib(raw_args: str) -> str:
         # This is a case-sensitive literal "read " prefix.  A search for a
         # phrase such as "read the manual" is therefore treated as a read;
         # that ambiguity is an accepted tradeoff for simple slash dispatch.
-        if query == "read" or query.startswith("read "):
+        is_read = query == "read" or query.startswith("read ")
+        if is_read:
             path = query[5:].strip() if query.startswith("read ") else ""
             if not path:
-                return "Usage: /klib read <path>\nRead the full text of a klib page."
+                return _static_reply(
+                    "Usage: /klib read <path>\nRead the full text of a klib page."
+                )
+
+        mode = "lexical"
+        if query == "semantic" or query.startswith("semantic "):
+            # This is a case-sensitive literal "semantic " prefix.  A search
+            # phrase beginning with those exact characters is therefore
+            # interpreted as a semantic-mode query; that ambiguity is an
+            # accepted tradeoff for simple slash dispatch.  It cannot collide
+            # with the separate case-sensitive "read " prefix above.
+            query = (
+                query[len("semantic ") :].strip()
+                if query.startswith("semantic ")
+                else ""
+            )
+            if not query:
+                return _static_reply("Usage: /klib semantic <query>")
+            mode = "semantic"
 
         cfg = _load_klib_config()
         if not cfg.get("enabled") or not cfg.get("base_url"):
-            return (
-                "klib: not configured or disabled. An admin must set "
-                "klib.enabled: true and klib.base_url in config.yaml first."
-            )
-        if query.startswith("read "):
+            return _NOT_CONFIGURED_REPLY
+        if is_read:
             return await _read_klib(path, cfg)
-        return await _query_klib(query, cfg)
+        return await _query_klib(query, cfg, mode=mode)
     except Exception:
         logger.exception("klib: unexpected command failure")
-        return "klib: an unexpected error occurred while processing the query."
+        return _static_reply(
+            "klib: an unexpected error occurred while processing the query."
+        )
 
 
 def register(ctx) -> None:
@@ -261,5 +319,5 @@ def register(ctx) -> None:
         "klib",
         handler=_handle_klib,
         description="Search the klib knowledge library or read a full page.",
-        args_hint="<query> | read <path>",
+        args_hint="<query> | read <path> | semantic <query>",
     )
