@@ -2022,6 +2022,9 @@ class TestKanbanGuidance:
         # Acceptance work the body asks for stays in the current card.
         assert "Acceptance work the body asks for" in KANBAN_GUIDANCE
         assert "current card" in KANBAN_GUIDANCE
+        assert "Acceptance criteria in the current card are authoritative" in KANBAN_GUIDANCE
+        assert "never relabel a required failing gate" in KANBAN_GUIDANCE
+        assert "pre-existing or out-of-scope" in KANBAN_GUIDANCE
 
         # Child tasks are created only when the body explicitly authorizes
         # decomposition — the broad instruction that produced duplicate
