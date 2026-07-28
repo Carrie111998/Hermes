@@ -22600,7 +22600,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use the already-formatted synth_text as the per-process output,
             # bounded. The synth_text was produced by format_process_notification
             # which already includes command/exit_code info.
-            output_tail = str(evt.get("output", "") or "")
+            # Route through secret redaction — process stdout/stderr can carry
+            # tokens in curl output, env-var leaks, and SDK stack traces.
+            output_tail = _redact_gateway_user_facing_secrets(
+                str(evt.get("output", "") or "")
+            )
             if len(output_tail) > MAX_OUTPUT:
                 output_tail = output_tail[-MAX_OUTPUT:]
                 output_tail = f"...(truncated) {output_tail}"
